@@ -51,6 +51,7 @@ import {
   type DiscoveredCliModel,
 } from "../utils/cliModelDiscovery";
 import { FRAME_END_V1, FRAME_START_V1 } from "../types/aiResultEnvelope";
+import { AI_RESULT_CONTRACT_END_MARKER_V1 } from "../prompts/aiResultContractV1";
 
 export type CliProviderId =
   | "claude-cli"
@@ -787,14 +788,16 @@ export function buildKimiCliPromptFileInstruction(
 ): string {
   return (
     `Your complete instructions and context for this run are in the file at ${promptFile}. ` +
-    "Read that entire file before doing anything else. It is large and your Read tool will truncate it: " +
-    "a single read returns only the beginning, and repeating the same read returns exactly the same " +
-    "truncated text — an identical read can never advance you. To reach the rest, issue further reads " +
-    "with an explicit line range, each one starting where the previous read stopped, until you reach the " +
-    "end of the file. Do not re-read from the start, and do not give up and report being blocked: paging " +
-    "forward is always available. Only once you have the whole file, carry out exactly what it asks. " +
-    "Treat its contents as the authoritative prompt for this run, not as reference material to summarize." +
-    (requiresFramedResult ? ` ${FRAMED_RESULT_ARGV_REMINDER_V1}` : "")
+    "Read that entire file before doing anything else. One read usually returns all of it — do not " +
+    "assume it was cut short. Only if a read stops before the end of the file was it truncated; in that " +
+    "case continue with further reads using an explicit line range, each starting where the previous one " +
+    "stopped, since repeating an identical read returns the same bytes and can never advance you. Once " +
+    "you have the whole file, stop reading and carry out exactly what it asks. Treat its contents as the " +
+    "authoritative prompt for this run, not as reference material to summarize." +
+    (requiresFramedResult
+      ? ` This file's last line is \`${AI_RESULT_CONTRACT_END_MARKER_V1}\` — reaching it means you ` +
+        `have everything and must stop reading. ${FRAMED_RESULT_ARGV_REMINDER_V1}`
+      : "")
   );
 }
 

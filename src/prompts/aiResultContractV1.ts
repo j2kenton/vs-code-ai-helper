@@ -20,6 +20,17 @@ import { CompletedContentV1 } from "../types/aiResultEnvelope";
 export const AI_RESULT_CONTRACT_ID_V1 = "ensemble.aiResultContract.v1";
 export const AI_RESULT_CONTRACT_VERSION_V1 = 1;
 
+/**
+ * The contract block's final line, and therefore the last line of any prompt
+ * file that carries it. Exported so a `promptTransport: "file"` provider can
+ * tell its model how to recognise a COMPLETE read — see
+ * `buildKimiCliPromptFileInstruction`. Without a positive completion signal a
+ * model has no way to distinguish "the file ended" from "my read was cut off",
+ * and will burn its tool budget re-reading (observed live 2026-08-23: 28
+ * identical reads of a file it had already received in full).
+ */
+export const AI_RESULT_CONTRACT_END_MARKER_V1 = "=== END ENSEMBLE RESULT CONTRACT ===";
+
 /** Envelope kinds a registry row may permit a provider to return (plan §3.5). */
 export type PermittedEnvelopeKindV1 = "completed" | "questions" | "cancelled" | "failed";
 
@@ -200,6 +211,6 @@ export function buildAiResultContractPromptV1(input: AiResultContractPromptInput
       "with no exploratory notes (\"let me check...\", \"let me verify...\") before or " +
       "after it, even if your process involved a lot of that."
   );
-  lines.push("=== END ENSEMBLE RESULT CONTRACT ===");
+  lines.push(AI_RESULT_CONTRACT_END_MARKER_V1);
   return lines.join("\n");
 }
