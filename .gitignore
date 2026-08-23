@@ -5,6 +5,13 @@ node_modules/
 dist/
 out/
 out-test/
+# Not a project output path — no tsconfig or npm script emits here. An
+# agentic run compiled the tree with a custom --outDir on 2026-08-23 and left
+# 12.6MB behind, untracked and unignored, where a `git add -A` would have
+# swept it into a commit. Same class as the /implementation.md and
+# /plan-final.md entries below: a stray write from a CLI run inventing a path
+# outside the project's vocabulary. The real output dirs are dist/ and out/.
+.test-out/
 *.vsix
 
 # Logs
