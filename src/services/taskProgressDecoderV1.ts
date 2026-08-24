@@ -136,6 +136,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "overriddenEscalations",
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
+  "checklistProgressUnreliableReason",
   "zeroChangeImplRounds",
   "pendingImplReviewFiles",
   "reviewInvalidatedByRound",
@@ -663,7 +664,14 @@ function validateReviewScoreHistory(
         if (!isPlainObject(blocker)) {
           return "reviewScoreHistory entry blockers entries must be objects";
         }
-        const allowedBlockerKeys = new Set(["category", "resolver", "subject"]);
+        const allowedBlockerKeys = new Set([
+          "category",
+          "resolver",
+          "subject",
+          "id",
+          "lineage",
+          "description",
+        ]);
         for (const key of Object.keys(blocker)) {
           if (!allowedBlockerKeys.has(key)) {
             return `reviewScoreHistory entry blocker has an unknown property ${JSON.stringify(key)}`;
@@ -673,6 +681,45 @@ function validateReviewScoreHistory(
           const field = blocker[key];
           if (typeof field !== "string" || field.length === 0 || field.length > 200) {
             return `reviewScoreHistory entry blocker ${key} must be a bounded non-empty string`;
+          }
+        }
+        const id = blocker["id"];
+        if (id !== undefined && (typeof id !== "string" || id.length === 0 || id.length > MAX_ID_LENGTH)) {
+          return "reviewScoreHistory entry blocker id must be a bounded non-empty string";
+        }
+        const description = blocker["description"];
+        if (
+          description !== undefined &&
+          (typeof description !== "string" || description.length === 0 || description.length > 500)
+        ) {
+          return "reviewScoreHistory entry blocker description must be a bounded non-empty string";
+        }
+        const lineage = blocker["lineage"];
+        if (lineage !== undefined) {
+          if (!isPlainObject(lineage)) {
+            return "reviewScoreHistory entry blocker lineage must be an object";
+          }
+          const kind = lineage["kind"];
+          if (kind === "new") {
+            const allowedLineageKeys = new Set(["kind"]);
+            for (const key of Object.keys(lineage)) {
+              if (!allowedLineageKeys.has(key)) {
+                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
+              }
+            }
+          } else if (kind === "same" || kind === "narrowed") {
+            const allowedLineageKeys = new Set(["kind", "refId"]);
+            for (const key of Object.keys(lineage)) {
+              if (!allowedLineageKeys.has(key)) {
+                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
+              }
+            }
+            const refId = lineage["refId"];
+            if (typeof refId !== "string" || refId.length === 0 || refId.length > MAX_ID_LENGTH) {
+              return "reviewScoreHistory entry blocker lineage refId must be a bounded non-empty string";
+            }
+          } else {
+            return "reviewScoreHistory entry blocker lineage kind must be new, same, or narrowed";
           }
         }
       }
@@ -1167,6 +1214,17 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.checklistProgressUnreliable = value;
+        break;
+      }
+      case "checklistProgressUnreliableReason": {
+        // Mirrors pausedReason's bound: one diagnostic sentence, never free text.
+        if (typeof value !== "string" || value.length === 0 || value.length > 2000) {
+          return recovery(
+            "invalidFieldValue",
+            "checklistProgressUnreliableReason must be a bounded non-empty string"
+          );
+        }
+        draft.checklistProgressUnreliableReason = value;
         break;
       }
       case "zeroChangeImplRounds": {

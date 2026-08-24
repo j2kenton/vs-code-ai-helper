@@ -16,7 +16,8 @@ import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../ut
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
-import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
+import { firstUnmetStagePrerequisiteV1, resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
+import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
 import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
@@ -33,9 +34,20 @@ import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
-import { listUncheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import {
+  listOutstandingManualVerificationItemsV1,
+  listUncheckedChecklistItemTextsV1,
+} from "../utils/implementationChecklist";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
+import {
+  deriveOwedContinuationRecordV1,
+  deriveSchedulingPostureV1,
+  describeSchedulingPostureV1,
+  SchedulingIntentStoreV1,
+  SchedulingPostureV1,
+} from "../state/schedulingIntentV1";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -141,6 +153,33 @@ function readOutstandingChecklistItemsForTooltipV1(
 }
 
 /**
+ * Best-effort, synchronous read of plan-final.md's still-undone manual-
+ * verification / human-operator steps (task "Actionable Hand-offs", PART 2 —
+ * "Render the priority marker at hand-off ... task tree"). These items never
+ * held the completeness gate open (they carry
+ * `EXCLUDED_CHECKLIST_ITEM_MARKER_V1`), so they were previously invisible
+ * everywhere once the rest of the plan finished — a task could show as done
+ * while nine manual checks nobody was ever told about sat unticked in the
+ * plan file. Same synchronous/best-effort shape as
+ * `readOutstandingChecklistItemsForTooltipV1` above, for the same reason
+ * (`TreeItem.tooltip` has no async form).
+ */
+function readOutstandingManualStepsForTooltipV1(
+  task: IncompleteTask,
+  limit: number = 5
+): { items: readonly string[]; total: number } {
+  try {
+    const content = fs.readFileSync(
+      path.join(task.folderUri.fsPath, IMPLEMENTATION_FILENAME),
+      "utf8"
+    );
+    return listOutstandingManualVerificationItemsV1(content, limit);
+  } catch {
+    return { items: [], total: 0 };
+  }
+}
+
+/**
  * Most-recent-first ordering for a task's pending `WorkflowDecisionV1`
  * records, so the tooltip and the "Review Pending Decision" affordance both
  * lead with whichever decision was posted last. Exported for direct unit
@@ -157,7 +196,12 @@ export function sortPendingDecisionsByRecencyV1(
  */
 function buildTaskTooltip(
   task: IncompleteTask,
-  pendingDecisions: readonly WorkflowDecisionV1[] = []
+  pendingDecisions: readonly WorkflowDecisionV1[] = [],
+  /** Always-present "what happens next" posture (task "Actionable Hand-offs",
+   * PART 6) — `undefined` only when no Memento was available to build the
+   * ledger store from (e.g. a bare unit-test construction), in which case
+   * the line is omitted rather than rendered as a false "unknown". */
+  schedulingPosture?: SchedulingPostureV1
 ): vscode.MarkdownString {
   const lines: string[] = [`**${task.folderName}**`, ""];
 
@@ -204,8 +248,26 @@ function buildTaskTooltip(
   // is discoverability only, never the decision surface itself.
   if (pendingDecisions.length > 0) {
     for (const decision of pendingDecisions) {
+      // Shared hand-off contract (task PART 1/5): a decision that supplies
+      // `gating` renders its real content here, matching the Chat With AI
+      // decision card (`chatView.ts`); one that does not (any record
+      // predating PART 5 — every production creation site, including
+      // `reviewActions.ts`'s `providerChainExhausted`, now supplies it)
+      // falls back to an explicit "not recorded" line. The absence reason is
+      // deliberately `"unknown"`, not `"legacyRecord"`: this renderer has no
+      // way to distinguish a record that predates the field from one created
+      // today by a call site that regresses and omits it, so claiming
+      // "older record" for both would assert something not provably true for
+      // the second case — a repeat of the very defect this field exists to
+      // fix (see `workflowDecisionGatingInventoryV1.test.ts`).
+      const gatingLine = renderHandoffFieldLineV1(
+        "decisionRecord",
+        "gating",
+        decision.gating !== undefined ? { gating: decision.gating } : undefined,
+        "unknown"
+      ).text;
       lines.push(
-        `$(warning) **Decision waiting** (${STAGE_DISPLAY_NAMES[decision.stage]}) — ${decision.whatHappened} _Review it in Chat With AI._`,
+        `$(warning) **Decision waiting** (${STAGE_DISPLAY_NAMES[decision.stage]}) — ${decision.whatHappened} _Review it in Chat With AI._ ${gatingLine}`,
         ""
       );
     }
@@ -228,6 +290,39 @@ function buildTaskTooltip(
         : "";
     lines.push(
       `$(warning) **Plan checklist is not a complete record** — a round landed changes it could not check off, so its counts understate what is done and no longer gate advancement. Tick the missed items in \`plan-final.md\`, then run **Ensemble: Mark Plan Checklist Reconciled** on this task to restore them.${outstandingSuffix}`,
+      ""
+    );
+  }
+
+  // Manual-verification / human-operator steps still undone — sorted
+  // HIGH-priority-first by `listOutstandingManualVerificationItemsV1` (task
+  // "Actionable Hand-offs", PART 2). Shown regardless of stage: these items
+  // never gated advancement, so they can still be sitting untouched after
+  // the task otherwise reads as finished.
+  const manualSteps = readOutstandingManualStepsForTooltipV1(task);
+  if (manualSteps.total > 0) {
+    lines.push(
+      `$(checklist) **Manual steps to do** — ${manualSteps.items.join("; ")}` +
+        (manualSteps.total > manualSteps.items.length
+          ? ` (+${manualSteps.total - manualSteps.items.length} more)`
+          : "") +
+        ".",
+      ""
+    );
+  }
+
+  // "What happens next" — the workflow starts rounds on its own (12
+  // `scheduleAutomationChain` call sites) with nothing previously announcing
+  // it beforehand, so identical, fully-determined behaviour read as
+  // arbitrary (task "Actionable Hand-offs", PART 6). Always present when a
+  // posture could be computed: exactly one of running / scheduled /
+  // owed-but-will-not-retry / waiting-for-you / unknown, rendered through the
+  // same shared hand-off contract every other surface in this task uses.
+  if (schedulingPosture) {
+    const fields = describeSchedulingPostureV1(schedulingPosture);
+    const rendered = renderRequiredHandoffFieldsV1("scheduledWork", fields);
+    lines.push(
+      `$(watch) **What happens next** — ${rendered.map((line) => line.text).join(" ")}`,
       ""
     );
   }
@@ -310,7 +405,11 @@ export class TaskNode extends vscode.TreeItem {
      * command can route to the right decision's stage without re-querying
      * the store.
      */
-    pendingDecisions: readonly WorkflowDecisionV1[] = []
+    pendingDecisions: readonly WorkflowDecisionV1[] = [],
+    /** This task's always-present scheduling posture (task "Actionable
+     * Hand-offs", PART 6), or `undefined` when no Memento was available to
+     * build the ledger store. */
+    schedulingPosture?: SchedulingPostureV1
   ) {
     // An interrupted creation (plan §4.7 recovery row) has no stages to show
     // — getStageNodes() is never called for it (see getChildren) — so it
@@ -417,7 +516,7 @@ export class TaskNode extends vscode.TreeItem {
      * "Review Pending Decision" command to route to the right stage. */
     this.pendingDecision = sortedPendingDecisions[0];
 
-    this.tooltip = buildTaskTooltip(task, sortedPendingDecisions);
+    this.tooltip = buildTaskTooltip(task, sortedPendingDecisions, schedulingPosture);
 
     // Centralized context value construction via buildTaskContextValue
     this.contextValue = buildTaskContextValue({
@@ -456,7 +555,12 @@ export class StageNode extends vscode.TreeItem {
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
     hasBackup: boolean = false,
-    redoAvailable: boolean = false
+    redoAvailable: boolean = false,
+    /** The first artifact this stage's action needs but doesn't currently
+     * have, so the tooltip can say so before the user clicks and hits the
+     * refusal — `undefined` when the stage has no declared requirement or
+     * every requirement is met. */
+    missingPrerequisite?: StageArtifactRequirementV1
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -614,6 +718,12 @@ export class StageNode extends vscode.TreeItem {
         ? "\n\n⏳ Review in progress: re-evaluating this artifact against the current HEAD."
         : `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
           "re-run Review with AI to assess the current state.";
+    }
+    if (missingPrerequisite) {
+      tooltipStr +=
+        `\n\n⚠ This stage needs ${missingPrerequisite.requirementLabel}, produced by the ` +
+        `${missingPrerequisite.producedByStage} stage — currently missing. Running this stage's ` +
+        "action now will refuse with the same reason.";
     }
     if (isScheduled) {
       this.description = this.description
@@ -823,6 +933,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private readonly workflowDecisionStore?: WorkflowDecisionStoreV1;
   private readonly workflowDecisionSub?: vscode.Disposable;
 
+  /**
+   * Reads the scheduling-intent ledger for the "what happens next" tooltip
+   * line (task "Actionable Hand-offs", PART 6). Same Memento-sharing
+   * rationale as `workflowDecisionStore` above. `undefined` when no Memento
+   * was supplied, in which case no task shows a scheduling posture line.
+   */
+  private readonly schedulingIntentStore?: SchedulingIntentStoreV1;
+  private readonly schedulingIntentSub?: vscode.Disposable;
+
   constructor(
     private readonly inventory: TaskInventory,
     private readonly currentTaskStore?: CurrentTaskStore,
@@ -869,12 +988,62 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // without waiting for an unrelated refresh (AC-06: "visible until
       // resolved", not "visible until the next coincidental refresh").
       this.workflowDecisionSub = this.workflowDecisionStore.onDidChange(() => this._onDidChangeTreeData.fire());
+      this.schedulingIntentStore = new SchedulingIntentStoreV1(state);
+      this.schedulingIntentSub = this.schedulingIntentStore.onDidChange(() => this._onDidChangeTreeData.fire());
     }
   }
 
   dispose(): void {
     this.operationsSub.dispose();
     this.workflowDecisionSub?.dispose();
+    this.schedulingIntentSub?.dispose();
+  }
+
+  /**
+   * The task's always-present scheduling posture (task "Actionable
+   * Hand-offs", PART 6): exactly one of running / scheduled /
+   * owed-but-will-not-retry / waiting-for-you / unknown, derived from the
+   * ledger plus the live in-flight-operation registry (authoritative for
+   * "executing now" even when a chain's own `running` write was missed).
+   * `undefined` when no `schedulingIntentStore` was built (no Memento
+   * supplied — minimal test stubs), in which case the tooltip omits the line
+   * entirely rather than rendering a false "unknown".
+   *
+   * Review-flagged (2026-08-23, twice): this used to derive the posture
+   * directly from `task.progress.implRecovery` (a live read) rather than the
+   * ledger, an unapproved substitute for the plan's "rendered only from the
+   * ledger" contract. `getChildren` was already `async`, so — mirroring
+   * `chatView.ts`'s chat-header posture exactly — this now awaits its own
+   * self-healing push into the ledger and then reads the ledger BACK
+   * (`getOwedContinuation`) for the actual derivation, rather than deriving
+   * from `owedSource` directly. This still stays exactly as fresh as a live
+   * read, since the ledger's value at this point IS this render's read.
+   */
+  private async computeSchedulingPosture(task: IncompleteTask, taskId: string): Promise<SchedulingPostureV1 | undefined> {
+    if (!this.schedulingIntentStore) {
+      return undefined;
+    }
+    const owedSource = task.progress.implRecovery
+      ? {
+          reason: task.progress.implRecovery.reason,
+          at: task.progress.implRecovery.at,
+          leaseUntil: task.progress.implRecovery.leaseUntil,
+          quarantinedFiles: task.progress.pendingImplReviewFiles ?? [],
+          dispatch: task.progress.implRecovery.dispatch,
+        }
+      : undefined;
+    // PART 6.5: self-heal the ledger from this render's already-scanned
+    // `TaskProgress` — see schedulingIntentV1.ts's `OwedContinuationRecordV1`
+    // doc comment. Awaited (not fire-and-forget) so the read-back below
+    // reflects this render's push rather than a stale prior value.
+    await this.schedulingIntentStore.recordOwedContinuation(taskId, owedSource);
+    const ledgerOwedSource = this.schedulingIntentStore.getOwedContinuation(taskId);
+    return deriveSchedulingPostureV1({
+      entries: this.schedulingIntentStore.listForTask(taskId),
+      owedContinuation: deriveOwedContinuationRecordV1(taskId, ledgerOwedSource),
+      hasCoverage: this.schedulingIntentStore.hasCoverage(taskId),
+      inFlight: taskOperations.rootOperationIdFor(task.canonicalId ?? task.folderUri.fsPath) !== undefined,
+    });
   }
 
   /**
@@ -934,7 +1103,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this._onDidChangeTreeData.fire();
 
     // Force reveal all nodes to ensure they are expanded
-    const nodes = this.getTaskNodes();
+    const nodes = await this.getTaskNodes();
     for (const node of nodes) {
       if (!(node instanceof TaskNode)) continue;
       try {
@@ -1123,7 +1292,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     }
   }
 
-  private getTaskNodes(): TaskTreeNode[] {
+  private async getTaskNodes(): Promise<TaskTreeNode[]> {
     const tasks = this.loadTasks();
     const visible = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
 
@@ -1158,8 +1327,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // legacy task objects that have no canonicalId.
     const currentTaskCanonicalId = this.currentTaskStore?.get();
 
-    const nodes: TaskTreeNode[] = ordered.map(
-      (task) => {
+    const nodes: TaskTreeNode[] = await Promise.all(ordered.map(
+      async (task) => {
         const taskId = taskIdentityKey(task);
         const isCurrent =
           currentTaskCanonicalId !== undefined &&
@@ -1175,6 +1344,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
               )
             : undefined;
         const pendingDecisions = this.workflowDecisionStore?.listPending(taskId) ?? [];
+        const schedulingPosture = await this.computeSchedulingPosture(task, taskId);
         return new TaskNode(
           task,
           shouldExpand(task),
@@ -1183,10 +1353,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           this.isMetaManaged,
           this.collapseEpoch,
           creationFootprint,
-          pendingDecisions
+          pendingDecisions,
+          schedulingPosture
         );
       }
-    );
+    ));
 
     // Rebuild the folder→node cache so getParent and getTaskNodeById work
     this.taskNodesByFolder.clear();
@@ -1260,6 +1431,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         );
       }
 
+      // Say what a stage's action needs BEFORE the attempt, not only in the
+      // refusal after clicking it (plan §"Also in scope: say which
+      // artifacts a stage needs before it can run"). Covers every
+      // artifact-gated action for the stage — Review, Apply Review, and Run
+      // Implementation — not only Review, since a review stage's Apply
+      // action or the Implementation stage's Run action can each refuse for
+      // a requirement the Review check alone would not have caught. Reads
+      // from the same requirement records the actual refusal text uses
+      // (stageActionRequirementMessageV1), so the two can never disagree.
+      let missingPrerequisite: StageArtifactRequirementV1 | undefined;
+      if (status === "current") {
+        missingPrerequisite = await firstUnmetStagePrerequisiteV1(stage, task.folderUri);
+      }
+
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
 
       // Backup availability drives the has-backup context token (Revert
@@ -1296,7 +1481,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           isStageScheduled,
           this.isMetaManaged,
           hasBackup,
-          redoAvailable
+          redoAvailable,
+          missingPrerequisite
         )
       );
     }

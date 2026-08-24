@@ -162,6 +162,246 @@ export function blockerIdentities(blockers: readonly ReviewBlocker[]): ReviewBlo
   return blockers.slice(0, MAX_REVIEW_BLOCKER_IDENTITIES).map(blockerIdentity);
 }
 
+/**
+ * Resolve this round's blockers against the PRIOR round's ID'd blocker list
+ * (the same list injected into this round's re-review prompt via
+ * {@link formatPriorBlockerLineageListV1}), assigning each an opaque stable
+ * id and, where the reviewer declared one, a lineage:
+ *
+ *  - No prior list at all (this stage's first scored round) → every blocker
+ *    is lineage-unknown, regardless of what bracket it carries. There is
+ *    nothing it could have been "new" relative to yet, and citing an id from
+ *    an empty list can never be a valid citation — see the plan's "first
+ *    round (no prior list to cite)" rule. A fresh id is still assigned so a
+ *    LATER round can legitimately cite it.
+ *  - A prior list exists, but the line carried no lineage bracket at all →
+ *    lineage-unknown (older prompt, non-compliant provider). Fresh id.
+ *  - `[new]` → lineage "new". Fresh id.
+ *  - `[same:<id>]` / `[narrowed:<id>]` citing an id actually present in the
+ *    prior list → that declared lineage, and the id is CARRIED FORWARD
+ *    (not regenerated) so the same underlying issue keeps one stable id
+ *    across every round the reviewer keeps citing it.
+ *  - `[same:<id>]` / `[narrowed:<id>]` citing an id NOT in the prior list →
+ *    lineage-unknown. Never best-effort matched to some other id — an
+ *    invalid citation is exactly as uninformative as no citation at all.
+ *
+ * `attemptId` seeds fresh ids (`${attemptId}-${index}`) so they are unique
+ * per round without needing any shared counter state. The separator MUST
+ * stay a hyphen, never a colon: a generated id is injected verbatim into the
+ * next round's prompt via {@link formatPriorBlockerLineageListV1} for the
+ * reviewer to cite back in a `[same:<id>]`/`[narrowed:<id>]` bracket, and
+ * both `BLOCKER_LINE_RE` and `parseLineageBracket` in reviewReadiness.ts
+ * only accept `[\w-]+` inside that bracket — a colon in the id would make
+ * every citation of it unparseable, silently degrading to lineage-unknown.
+ */
+export function resolveBlockerLineageV1(
+  blockers: readonly ReviewBlocker[],
+  priorBlockers: readonly ReviewBlockerIdentity[] | undefined,
+  attemptId: string
+): ReviewBlockerIdentity[] {
+  const priorById = new Map<string, ReviewBlockerIdentity>();
+  for (const prior of priorBlockers ?? []) {
+    if (prior.id !== undefined) {
+      priorById.set(prior.id, prior);
+    }
+  }
+  const hasPriorList = (priorBlockers ?? []).length > 0;
+  return blockers.slice(0, MAX_REVIEW_BLOCKER_IDENTITIES).map((blocker, index) => {
+    const base = blockerIdentity(blocker);
+    const description = blocker.description.slice(0, 200);
+    const freshId = `${attemptId}-${index}`;
+    if (!hasPriorList || !blocker.lineage) {
+      return { ...base, id: freshId, description };
+    }
+    if (blocker.lineage.kind === "new") {
+      return { ...base, id: freshId, lineage: blocker.lineage, description };
+    }
+    const cited = priorById.get(blocker.lineage.refId);
+    if (!cited?.id) {
+      return { ...base, id: freshId, description };
+    }
+    return { ...base, id: cited.id, lineage: blocker.lineage, description };
+  });
+}
+
+/**
+ * Render the prior round's ID'd blocker list for injection into a re-review
+ * prompt (`{{priorBlockerLineageList}}`), so the reviewer has ids to cite in
+ * its own lineage brackets this round. Absent/empty input (a first review
+ * round, or a prior round predating id tracking) renders explicit guidance
+ * to omit the bracket rather than a blank or misleading section.
+ */
+export function formatPriorBlockerLineageListV1(
+  priorBlockers: readonly ReviewBlockerIdentity[] | undefined
+): string {
+  const idBearing = (priorBlockers ?? []).filter((b) => b.id !== undefined);
+  if (idBearing.length === 0) {
+    return (
+      "(No previous round's blockers are recorded for this stage — either this is the first review " +
+      "round, or the previous round predates lineage tracking. Do not add a third lineage bracket to " +
+      "any blocker line this round; there is nothing yet to cite.)"
+    );
+  }
+  return idBearing
+    .map((b) => `- id: ${b.id} | [${b.category}] [${b.resolver}] ${b.description ?? b.subject}`)
+    .join("\n");
+}
+
+/** One review round's diagnosed relationship to the churn-ceiling window it
+ * sits in — see {@link classifyChurnLineageV1}. */
+export type ChurnLineageDiagnosisV1 =
+  | { kind: "unchanged"; description: string }
+  | { kind: "narrowing" }
+  | { kind: "shifting" }
+  | { kind: "insufficient-evidence"; perRoundSummaries: string[] };
+
+/**
+ * Diagnose WHY a churn-ceiling window (see {@link shouldEscalateChurnCeiling})
+ * stopped falling, using only lineage the reviewer itself declared —
+ * never inferred from prose similarity. Distinguishes three causes that all
+ * hold `taskFixableCount` flat and therefore look identical to the plain
+ * churn counter:
+ *
+ *  - `unchanged`: the same blocker id was cited `same` (never `narrowed`,
+ *    never a new id) across every round in the window — true churn, the
+ *    requirement itself may need reconsidering.
+ *  - `narrowing`: at least one blocker was cited `narrowed` somewhere in the
+ *    window — real progress the flat count can't see.
+ *  - `shifting`: the id set changed round to round with no declared
+ *    narrowing — a different blocker each time, not one stuck defect.
+ *  - `insufficient-evidence`: at least one round AFTER the window's first
+ *    (baseline) round has a task-fixable blocker with no declared, resolved
+ *    lineage (lineage-unknown, or an older entry predating this field) — the
+ *    window cannot be classified from lineage alone. Reports the honest
+ *    per-round list instead of guessing. The window's first round is exempt:
+ *    it only supplies the baseline ids that LATER rounds cite, so its own
+ *    lineage field (which resolveBlockerLineageV1 always leaves undefined
+ *    when there was no prior list to cite, e.g. a stage's actual first
+ *    scored round) carries no information the classification below uses.
+ */
+export function classifyChurnLineageV1(
+  history: readonly ReviewScoreHistoryEntry[],
+  stage: TaskStage,
+  stagnantRounds: number
+): ChurnLineageDiagnosisV1 {
+  const scored = history.filter((entry) => entry.stage === stage && entry.score !== null);
+  const windowSize = Math.max(1, Math.floor(stagnantRounds || 1)) + 1;
+  const recent = scored.slice(-windowSize);
+
+  const fixableOf = (entry: ReviewScoreHistoryEntry | undefined): ReviewBlockerIdentity[] =>
+    (entry?.blockers ?? []).filter((b) => b.resolver === "task-fixable");
+
+  const perRoundSummaries = recent.map((entry) => {
+    const fixable = fixableOf(entry);
+    return fixable.length === 0
+      ? "(no task-fixable blockers recorded)"
+      : fixable.map((b) => b.description ?? b.subject).join("; ");
+  });
+
+  // NOTE: every blocker resolved by resolveBlockerLineageV1 gets a fresh id
+  // even when its lineage is unknown (see that function's doc) — an id alone
+  // proves nothing about whether the reviewer's lineage was actually
+  // resolvable. Only `lineage !== undefined` means the reviewer's bracket was
+  // present and (for same/narrowed) successfully cited a real prior id. The
+  // window's first (baseline) round is exempt — see the doc comment above.
+  const hasUsableLineage = recent
+    .slice(1)
+    .every((entry) => fixableOf(entry).every((b) => b.lineage !== undefined));
+  if (recent.length < windowSize || !hasUsableLineage) {
+    return { kind: "insufficient-evidence", perRoundSummaries };
+  }
+
+  let anyNarrowed = false;
+  let anyUnresolvedTransition = false;
+  for (let i = 1; i < recent.length; i++) {
+    const prevIds = new Set(fixableOf(recent[i - 1]).map((b) => b.id));
+    const currFixable = fixableOf(recent[i]);
+    const currIds = new Set(currFixable.map((b) => b.id));
+    for (const b of currFixable) {
+      if (b.lineage?.kind === "narrowed") {
+        anyNarrowed = true;
+      }
+    }
+    const setsEqual = prevIds.size === currIds.size && [...prevIds].every((id) => currIds.has(id));
+    if (!setsEqual) {
+      anyUnresolvedTransition = true;
+    }
+  }
+
+  if (anyNarrowed) {
+    return { kind: "narrowing" };
+  }
+  if (!anyUnresolvedTransition) {
+    const description = fixableOf(recent[0])[0]?.description ?? "the same blocker";
+    return { kind: "unchanged", description };
+  }
+  return { kind: "shifting" };
+}
+
+/** One-sentence, human-facing rendering of {@link ChurnLineageDiagnosisV1},
+ * for folding into an escalation reason. */
+export function describeChurnLineageDiagnosisV1(diagnosis: ChurnLineageDiagnosisV1): string {
+  switch (diagnosis.kind) {
+    case "unchanged":
+      return (
+        `The reviewer has cited the SAME blocker as unresolved every round in this window: ` +
+        `"${diagnosis.description}". Consider whether the requirement itself is achievable as written, ` +
+        "not just whether another round can fix it."
+      );
+    case "narrowing":
+      return (
+        "At least one blocker in this window was declared narrowed by the reviewer, not merely " +
+        "unresolved — this is real progress the round count alone cannot see."
+      );
+    case "shifting":
+      return (
+        "A different blocker showed up each round in this window rather than the same one persisting " +
+        "— this may point to an unstable or under-specified requirement rather than one stuck defect."
+      );
+    case "insufficient-evidence":
+      return (
+        "The reviewer did not declare citable lineage for every round in this window, so the cause " +
+        `cannot be classified from lineage alone. Per-round task-fixable blockers: ` +
+        diagnosis.perRoundSummaries.map((s, i) => `round ${i + 1}: ${s}`).join(" | ")
+      );
+  }
+}
+
+/**
+ * Build the full churn-ceiling escalation reason, including the leading
+ * sentence that must MATCH the diagnosis rather than unconditionally
+ * asserting churn. Only `unchanged` is actually churn; `narrowing` is
+ * declared progress the flat round count cannot see, `shifting` points at an
+ * unstable requirement rather than one stuck defect, and
+ * `insufficient-evidence` means the cause genuinely cannot be told apart yet
+ * — labeling any of those three "churning, not converging" is the exact
+ * inverted-guidance defect this task exists to fix (see the plan's "The
+ * worse case").
+ */
+export function buildChurnEscalationReasonV1(
+  stageDisplayName: string,
+  stagnantRounds: number,
+  diagnosis: ChurnLineageDiagnosisV1
+): string {
+  const leadingClause =
+    diagnosis.kind === "narrowing"
+      ? "The blocker count alone has not fallen, but the reviewer has declared real narrowing " +
+        "progress within this window — this is not churn."
+      : diagnosis.kind === "shifting"
+        ? "A different blocker has come up each round rather than one persisting, which may point " +
+          "to an unstable or under-specified requirement rather than simple churn."
+        : diagnosis.kind === "insufficient-evidence"
+          ? "The blocker count has not fallen, and the reviewer's declared lineage is incomplete for " +
+            "this window, so whether this is churn cannot yet be determined from lineage alone."
+          : "Automated iteration is churning, not converging.";
+  return (
+    `${stageDisplayName} has completed ${stagnantRounds} consecutive rounds without reducing the ` +
+    "number of task-fixable blockers (churn ceiling, ensemble.resilience.churnCeilingRounds). " +
+    `${leadingClause} ` +
+    describeChurnLineageDiagnosisV1(diagnosis)
+  );
+}
+
 function identityKeySet(blockers: readonly ReviewBlockerIdentity[]): Set<string> {
   return new Set(blockers.map((b) => `${b.category}|${b.resolver}|${b.subject}`));
 }
@@ -690,7 +930,37 @@ export function decidePostReviewActionV1(input: {
   stages: readonly TaskStage[];
   /** Whether the plan of record still has unticked checklist items. */
   hasUntickedChecklistItems: boolean;
+  /**
+   * Whether a continuation round is currently owed for this task
+   * (`TaskProgress.implRecovery` present) — outranks blocker/checklist
+   * routing (task "Actionable Hand-offs", "The worse case"). While a
+   * continuation is owed, Review/Apply Review/Fast Forward all refuse (a
+   * review must not run against edits no round has reported), so
+   * recommending "apply-review" here is always wrong: it points at the one
+   * set of actions guaranteed to refuse, while withholding the one action
+   * that can actually drain the continuation. Optional so every existing
+   * caller keeps behaving exactly as before until it is threaded through —
+   * `undefined`/`false` is indistinguishable from "no continuation owed".
+   */
+  continuationOwed?: boolean;
+  /**
+   * Count of files quarantined behind an owed continuation
+   * (`TaskProgress.pendingImplReviewFiles.length`). A non-empty quarantine
+   * with no `implRecovery` record would still mean edits are waiting on a
+   * round that has not reported them, so this is checked independently of
+   * `continuationOwed` rather than folded into it.
+   */
+  pendingImplReviewFilesCount?: number;
 }): PostReviewActionDecisionV1 {
+  if (input.continuationOwed === true || (input.pendingImplReviewFilesCount ?? 0) > 0) {
+    return {
+      action: "implementation",
+      reason:
+        "A continuation round is owed for this task — a prior round's edits have not yet been reported. " +
+        "Review, Apply Review, and Fast Forward will all refuse until it is drained. Implementation is the " +
+        "only action that can claim and complete it.",
+    };
+  }
   const candidates = input.stages
     .map((stage) => latestReviewForStageV1(input.history, stage))
     .filter((entry): entry is ReviewScoreHistoryEntry => entry !== undefined);

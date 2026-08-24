@@ -28,6 +28,7 @@
  */
 
 import { TaskStage } from "./taskProgress";
+import { HandoffGatingV1 } from "./handoffGuidanceV1";
 
 /** One selectable effect of choosing a decision's option. */
 export type WorkflowDecisionOptionEffectV1 =
@@ -78,6 +79,21 @@ export interface WorkflowDecisionV1 {
   readonly recommendation: WorkflowDecisionRecommendationV1;
   /** Evidence the system already holds, for case-4 decisions (module header). */
   readonly evidence?: readonly WorkflowDecisionEvidenceItemV1[];
+  /**
+   * Hand-off contract field 6 (task: "Actionable Hand-offs", PART 5) — whether
+   * resolving THIS decision actually unblocks task progress, so a user facing
+   * several outstanding decisions can tell which one is gating without
+   * inferring it (the reconciliation decision's worked example: it was
+   * answered while the task stayed paused by an unrelated escalation, and
+   * nothing said the two were different).
+   *
+   * Optional on the persisted type ONLY for backward compatibility with
+   * records written before this field existed (every current production
+   * creation site supplies it — see `workflowDecisionGatingInventoryV1.test.ts`).
+   * Every renderer treats an absent value as an explicit "not recorded"
+   * statement (`handoffGuidanceV1.ts`), never as "not gating".
+   */
+  readonly gating?: HandoffGatingV1;
   readonly createdAt: string;
   readonly state: WorkflowDecisionStateV1;
   readonly resolvedOptionId?: string;
@@ -98,6 +114,25 @@ export interface CreateWorkflowDecisionInputV1 {
   readonly options: readonly WorkflowDecisionOptionV1[];
   readonly recommendation: WorkflowDecisionRecommendationV1;
   readonly evidence?: readonly WorkflowDecisionEvidenceItemV1[];
+  /**
+   * Required for every NEW call site (task PART 5's creation-time guard).
+   * Left optional on this input type, rather than a mandatory property,
+   * because `createWorkflowDecisionV1` is also exercised directly by tests
+   * validating its other required-shape rules independent of gating.
+   *
+   * The actual enforcement is `assertGatingRequirementV1`
+   * (`src/utils/workflowDecisionDispatchV1.ts`), called by the single
+   * dispatch chokepoint `postWorkflowDecisionV1` before any decision is
+   * persisted: it throws unconditionally for any decision key that omits
+   * `gating`, so a BRAND-NEW call site cannot silently omit it — a
+   * source-grep audit alone could only ever check sites it already knew
+   * about. `src/test/workflowDecisionGatingInventoryV1.test.ts` additionally
+   * documents, per known source file, that every current production call
+   * site supplies `gating` in source. `createWorkflowDecisionV1` still
+   * validates the shape of whatever `gating` IS supplied, so a call site that
+   * passes it cannot pass a malformed one.
+   */
+  readonly gating?: HandoffGatingV1;
   readonly createdAt: string;
 }
 
@@ -190,6 +225,22 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
   if (!isNonEmptyString(input.createdAt) || Number.isNaN(Date.parse(input.createdAt))) {
     return { ok: false, reason: "a decision requires a valid \"createdAt\" timestamp" };
   }
+  // `gating` itself stays optional (see the field's doc comment on
+  // `CreateWorkflowDecisionInputV1` for why), but a value that IS supplied
+  // must be well-formed — a caller cannot pass a gating claim with no
+  // supporting detail, since "does this unblock the task" with no "why" is
+  // exactly the unexplained-consequence defect this whole task exists to fix.
+  if (input.gating !== undefined) {
+    if (typeof input.gating.holdsTaskPaused !== "boolean") {
+      return { ok: false, reason: "a supplied \"gating\" requires a boolean \"holdsTaskPaused\"" };
+    }
+    if (typeof input.gating.unblocksProgress !== "boolean") {
+      return { ok: false, reason: "a supplied \"gating\" requires a boolean \"unblocksProgress\"" };
+    }
+    if (!isNonEmptyString(input.gating.detail)) {
+      return { ok: false, reason: "a supplied \"gating\" requires a non-empty \"detail\"" };
+    }
+  }
 
   return {
     ok: true,
@@ -203,6 +254,7 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       options: input.options,
       recommendation,
       ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+      ...(input.gating !== undefined ? { gating: input.gating } : {}),
       createdAt: input.createdAt,
       state: "pending",
     },

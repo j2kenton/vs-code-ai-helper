@@ -332,6 +332,26 @@ export interface TaskProgress {
   checklistProgressUnreliable?: boolean;
 
   /**
+   * Plain-language reason `checklistProgressUnreliable` was set (task:
+   * "Actionable Hand-offs", PART 5) — e.g. "this round changed no files and
+   * landed no checklist ticks, but the most recent review already scored the
+   * work at or above the auto-advance threshold with zero blockers". The
+   * reconciliation decision (`reconcilePlanChecklist.ts`) cites this instead
+   * of only the weaker "N items are unticked" count, since the stronger
+   * discriminating fact (WHY the counts are being distrusted, e.g. a
+   * disputed auto-ticking mechanism) is what actually lets a human judge
+   * whether "Mark reconciled" is safe.
+   *
+   * Optional, and NOT YET populated by any write path as of this field's
+   * introduction — every current latch site lives in `reviewActions.ts`,
+   * which this task's plan defers editing until a concurrent task closes
+   * (PART 9). Until then this is uniformly absent, and the reconciliation
+   * decision renders that absence as an explicit "not recorded (older
+   * record)" statement rather than silently omitting the citation.
+   */
+  checklistProgressUnreliableReason?: string;
+
+  /**
    * Consecutive completed implementation rounds (for the task's current
    * stage) that changed zero files — the durable form of the no-progress
    * breaker's counter (2c, `ensemble.resilience.noProgressBreakerRounds`).
@@ -536,7 +556,44 @@ export interface ReviewBlockerIdentity {
   /** File-ish token named by the blocker when one exists, else a normalized
    * prose prefix — the "what is this blocker about" key. */
   subject: string;
+  /**
+   * Opaque stable ID for this blocker, assigned when it is first persisted
+   * to history (a `[new]`/lineage-unknown round) and carried forward
+   * unchanged on every later round whose reviewer declares `[same:<id>]` or
+   * `[narrowed:<id>]` against it — see resolveBlockerLineageV1
+   * (reviewRouting.ts). Absent on entries written before this field existed.
+   */
+  id?: string;
+  /**
+   * This round's declared lineage against the round's own PRIOR blocker
+   * list (the one injected into its re-review prompt), as parsed from the
+   * reviewer's own third bracket. Absent means lineage-unknown — no bracket
+   * was emitted, it cited an id absent from the prior list, or there was no
+   * prior list to cite (a first round). Never inferred from prose: the
+   * reviewer declares it or it is unknown, per blockerLineageV1's contract.
+   */
+  lineage?: BlockerLineageDeclaration;
+  /**
+   * Truncated original description (distinct from the compact `subject`
+   * comparison key), kept only so a later round's re-review prompt can show
+   * enough context for the reviewer to recognize its own prior finding when
+   * deciding whether to cite it. Never used for identity comparisons.
+   */
+  description?: string;
 }
+
+/**
+ * A reviewer's declared relationship between one of this round's blockers
+ * and a specific blocker from the prior round's ID'd list — see
+ * `ReviewBlockerIdentity.lineage` and `resolveBlockerLineageV1`
+ * (reviewRouting.ts). `refId` is the id exactly as cited by the reviewer,
+ * which may not actually exist in the prior list (an unknown-id citation is
+ * resolved to lineage-unknown by the caller, not by this type).
+ */
+export type BlockerLineageDeclaration =
+  | { kind: "new" }
+  | { kind: "same"; refId: string }
+  | { kind: "narrowed"; refId: string };
 
 /** One row of `TaskProgress.reviewScoreHistory`. */
 export interface ReviewScoreHistoryEntry {

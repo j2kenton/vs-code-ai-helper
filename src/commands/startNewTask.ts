@@ -30,6 +30,7 @@ import {
   getWorkflowPathRegistryV1,
   resolveWorkflowAllocatedFsPathV1,
 } from "../services/workflowRuntimeServicesV1";
+import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 
 /**
  * Describe a `TaskCreationIntentStoreResultV1` for a diagnostics log line.
@@ -496,6 +497,19 @@ async function createTask(
       await ensureAutomaticMetaGitIgnore(context, workspaceRoot);
     } catch (err) {
       console.error("Automatic meta .gitignore maintenance failed", err);
+    }
+    // Mark the scheduling-intent ledger's coverage marker at creation (task
+    // "Actionable Hand-offs", PART 6): without this, a brand-new task that
+    // has not yet passed through the `scheduleAutomationChain` chokepoint
+    // would have an empty ledger indistinguishable from "never observed",
+    // and would report the safe-but-wrong `unknown` posture instead of the
+    // correct `waitingForYou` for its entire early life. Non-fatal, mirroring
+    // the git-ignore maintenance above — a marker write failure must not fail
+    // task creation, which has already succeeded by this point.
+    try {
+      await new SchedulingIntentStoreV1(context.workspaceState).markCoverage(taskFolderPath);
+    } catch (err) {
+      console.error("Scheduling-intent coverage marker failed", err);
     }
   }
 

@@ -2896,6 +2896,12 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     const restoreOption = decision.options.find((o) => o.optionId === "restore");
     assert.ok(restoreOption?.destructive, "the restore option must be flagged destructive");
     assert.match(restoreOption.consequence, /discard/i);
+    // Task "Actionable Hand-offs" PART 5: the continuation is already
+    // scheduled regardless of this decision, so resolving it never itself
+    // unblocks the task.
+    assert.equal(decision.gating?.holdsTaskPaused, false);
+    assert.equal(decision.gating?.unblocksProgress, false);
+    assert.match(decision.gating?.detail ?? "", /scheduled continuation/i);
   });
 
   void it("cap exhaustion on the rejected-summary path escalates to human instead of looping", async () => {

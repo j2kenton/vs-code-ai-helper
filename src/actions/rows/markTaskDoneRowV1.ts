@@ -21,6 +21,7 @@ import { TaskActionOutcomeV1 } from "../../types/taskActionOutcomeV1";
 import { PUBLISH_STAGE } from "../../types/taskProgress";
 import { applyMarkTaskDonePolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
+import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
 import {
   LifecyclePolicyFailureError,
   LifecycleStageMismatchError,
@@ -110,6 +111,11 @@ export async function executeMarkTaskDoneV1(
   if (!patched) {
     return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
   }
+
+  // PART 6.5 (review-flagged 2026-08-23): `applyMarkTaskDonePolicyV1` clears
+  // `implRecovery` unconditionally on every successful completion — push that
+  // fact into the scheduling-intent ledger right after the CAS resolves.
+  await syncOwedContinuationLedgerBestEffortV1(input.taskFolderPath, undefined);
 
   return {
     kind: "completed",

@@ -108,6 +108,8 @@ export async function applyCurrentStageAction(
         ((
           await readPlanOfRecordV1(vscode.Uri.file(resolvedTask.taskFolderPath))
         ).counts?.remaining ?? 0) > 0,
+      continuationOwed: resolvedTask.progress.implRecovery !== undefined,
+      pendingImplReviewFilesCount: resolvedTask.progress.pendingImplReviewFiles?.length ?? 0,
     });
     if (decision.action === "apply-review") {
       // Say WHY the button did something other than the stage's usual action.

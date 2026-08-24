@@ -151,12 +151,14 @@ export async function escalateReviewToHuman(
         kind === "plateau"
           ? `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
             "How would you like to proceed — keep iterating (resume the task and I'll try again), make manual changes yourself, " +
-            "or accept the current state and advance anyway?"
+            "reconsider the requirement itself (check the plan's non-goals and prior decisions — it may be asking " +
+            "for something no implementation can satisfy as written), or accept the current state and advance anyway?"
           : `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
             "If a Fast Forward run is active with 'survive escalation' enabled, it may continue iterating to the " +
             "end of its current attempt budget before this pause takes effect (you'll see a follow-up notification " +
             "if so). Once the pause holds, how would you like to proceed — keep iterating (resume the task and " +
-            "I'll try again), make manual changes yourself, or accept the current state and advance anyway?",
+            "I'll try again), make manual changes yourself, reconsider the requirement itself (check the plan's " +
+            "non-goals and prior decisions), or accept the current state and advance anyway?",
     };
 
     const blockedReason =

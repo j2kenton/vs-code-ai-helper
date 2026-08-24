@@ -326,6 +326,15 @@ export async function setTaskStage(
       arg: { taskFolderPath: task.taskFolderPath },
       taskKey: task.taskFolderPath,
       chainId: "auto-review",
+      intent: {
+        trigger: "review after moving into a review-eligible stage",
+        // Structural, not gated by a single toggle setting — driven by the
+        // stage-transition kind itself (AUTO_REVIEW_ELIGIBLE_KINDS).
+        settingKey: undefined,
+        expectedTiming: "immediately — this stage transition dispatches it now",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — run the review manually.",
+      },
     });
   }
 }

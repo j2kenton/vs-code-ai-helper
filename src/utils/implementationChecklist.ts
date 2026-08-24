@@ -821,6 +821,93 @@ export function listUncheckedChecklistItemTextsV1(
 }
 
 /**
+ * The priority an item's own authored text declares for field 5 of the
+ * shared hand-off contract (`HandoffImpactV1`'s `"priority"` kind, task
+ * "Actionable Hand-offs", PART 2) — HIGH when a failure here would be silent
+ * or damaging, LOW when it would be loud and recoverable. `undefined` when
+ * the text carries no such marker at all, which is the expected shape for
+ * every plan written before this contract existed: those items must sort and
+ * render exactly as they did before, never inferred into a priority they
+ * never declared.
+ */
+export type ChecklistItemPriorityV1 = "high" | "low";
+
+/**
+ * Matches the literal rendering `renderHandoffFieldLineV1` produces for a
+ * `manualVerificationItem`'s "impact" field — `"Priority: HIGH — <cost of
+ * failure>"` (see `formatFieldValueV1` in `handoffGuidanceV1.ts`) — so the
+ * checklist-authoring prompts and this parser share one vocabulary instead of
+ * each inventing their own marker syntax. Case-insensitive because the prompt
+ * asks the model to write the label, not a fixed machine token.
+ */
+const CHECKLIST_ITEM_PRIORITY_PATTERN = /priority:\s*(high|low)\b/i;
+
+/** Parses the priority a checklist item's own text declares, or `undefined`
+ * when it declares none — see {@link ChecklistItemPriorityV1}. */
+export function parseChecklistItemPriorityV1(itemText: string): ChecklistItemPriorityV1 | undefined {
+  const match = CHECKLIST_ITEM_PRIORITY_PATTERN.exec(itemText);
+  return match?.[1] ? (match[1].toLowerCase() as ChecklistItemPriorityV1) : undefined;
+}
+
+/** Stable sort rank for {@link listOutstandingManualVerificationItemsV1}: HIGH
+ * first, then items with no declared priority, then LOW last. Kept as one
+ * rank per item (not a HIGH/LOW-only partition) specifically so a list with
+ * zero markers has every item at the same rank — a stable sort over equal
+ * ranks cannot reorder anything, which is what keeps an older, marker-less
+ * plan rendering unchanged. */
+function checklistItemPriorityRank(priority: ChecklistItemPriorityV1 | undefined): number {
+  if (priority === "high") {
+    return 0;
+  }
+  if (priority === "low") {
+    return 2;
+  }
+  return 1;
+}
+
+/**
+ * Outstanding manual-verification / human-operator steps — items carrying
+ * `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` whose box is still unchecked — sorted
+ * so a HIGH-priority item (per {@link parseChecklistItemPriorityV1}) always
+ * renders before a LOW one, per the task's "Render the priority marker at
+ * hand-off" requirement: a user deciding which of several manual checks to
+ * actually do should see the ones a silent failure would hurt first, not in
+ * whatever order the plan happened to list them.
+ *
+ * These items are deliberately excluded from
+ * {@link listUncheckedChecklistItemTextsV1} (they never hold the completeness
+ * gate open), so that function cannot be reused for this — a manual step is
+ * "outstanding" in the everyday sense (nobody has done it yet) without ever
+ * being "outstanding" in the gating sense that function reports.
+ *
+ * A plan with no priority markers at all sorts identically to document
+ * order (stable sort over equal ranks — see
+ * {@link checklistItemPriorityRank}), so this is a pure addition for older
+ * plans: nothing about their rendering changes.
+ */
+export function listOutstandingManualVerificationItemsV1(
+  planOfRecord: string,
+  limit: number = 10
+): UncheckedChecklistItemsV1 {
+  const outstanding = itemsInLatestRendering(planOfRecord).filter(
+    (item) => item.excluded && !item.checked
+  );
+  const sorted = outstanding
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      const rankDiff =
+        checklistItemPriorityRank(parseChecklistItemPriorityV1(a.item.text)) -
+        checklistItemPriorityRank(parseChecklistItemPriorityV1(b.item.text));
+      return rankDiff !== 0 ? rankDiff : a.index - b.index;
+    })
+    .map(({ item }) => item);
+  return {
+    items: sorted.slice(0, limit).map((item) => unescapeChecklistItemTextV1(item.text)),
+    total: sorted.length,
+  };
+}
+
+/**
  * Of `candidateTexts` (e.g. a reviewer's `## Verified Complete` list), return
  * the plan of record's OWN item text for each candidate that currently
  * resolves to an unchecked, non-excluded item — matched the same way a

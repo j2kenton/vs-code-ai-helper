@@ -973,7 +973,22 @@ export async function postReconcilePlanChecklistDecisionV1(
   folderUri: vscode.Uri,
   canonicalId: string,
   taskFolderPath: string,
-  progress: { currentStage: TaskStage; displayName?: string; pendingImplReviewFiles?: string[] },
+  progress: {
+    currentStage: TaskStage;
+    displayName?: string;
+    pendingImplReviewFiles?: string[];
+    /**
+     * The recorded reason `checklistProgressUnreliable` was set
+     * (`TaskProgress.checklistProgressUnreliableReason`), if any — the
+     * stronger discriminating fact the reconciliation decision cites instead
+     * of only the weaker "N items unticked" count (task PART 5). Optional in
+     * this narrowed parameter shape because every current caller may pass
+     * either a full `TaskProgress` (which may or may not carry it, depending
+     * on when the latch was set) or a hand-built object; absence renders an
+     * explicit "not recorded" statement below rather than silence.
+     */
+    checklistProgressUnreliableReason?: string;
+  },
   roundSummaryChecklistClaim?: MergeChecklistProgressResultV1,
   pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[]
 ): Promise<ReconcileDecisionPostResultV1> {
@@ -1053,7 +1068,26 @@ export async function postReconcilePlanChecklistDecisionV1(
       whyUserNeeded:
         "Ticking a box cannot be distinguished from ticking the LAST box, so no automatic check can tell a " +
         "partial edit from a finished reconciliation — only a human confirming the checklist now matches the " +
-        "work can safely restore the completeness gate.",
+        "work can safely restore the completeness gate. " +
+        // The stronger discriminating fact (task PART 5): WHY the counts were
+        // distrusted in the first place, not only how many items are still
+        // unticked. Absence is stated explicitly rather than silently
+        // omitted — no write path populates this yet (see
+        // TaskProgress.checklistProgressUnreliableReason's doc comment), so
+        // every current record legitimately renders the "not recorded" case.
+        (progress.checklistProgressUnreliableReason
+          ? `Recorded reason the checklist was flagged unreliable: ${progress.checklistProgressUnreliableReason}`
+          : "Recorded reason the checklist was flagged unreliable: not recorded (older record) — this task " +
+            "was latched before that reason was captured, so judge the existing ticks on their own merits " +
+            "rather than assuming they are trustworthy."),
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: false,
+        detail:
+          "This does not resume the task by itself. The completeness gate only affects automatic stage " +
+          "advancement — if this task is currently paused, that pause comes from something else entirely " +
+          "(check for a separate escalation/decision); answering this alone will not resume it.",
+      },
       options: [
         ...(coveredItemsCount > 0
           ? [

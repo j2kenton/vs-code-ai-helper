@@ -8,17 +8,18 @@ import { NotificationRouter, getNotificationRouterStatus } from "../utils/notifi
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   appendChatInteraction,
+  appendChatMessageV1,
   CHAT_HISTORY_FILENAME,
   ChatDocumentInteractionV1,
   ChatHistoryRecoveryErrorV1,
   ChatMessage,
   loadTranscriptWithMigration,
+  onDidChangeChatHistoryV1,
   readChatDocumentIdentityV1,
   readChatInteractions,
   recordChatInteractionAnswers,
   resetChatHistoryV1,
   settleChatInteraction,
-  writeChatHistory,
 } from "../utils/chatHistoryStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
@@ -30,6 +31,14 @@ import {
 } from "../types/structuredQuestionV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
+import {
+  deriveOwedContinuationRecordV1,
+  deriveSchedulingPostureV1,
+  describeSchedulingPostureV1,
+  SchedulingIntentStoreV1,
+} from "../state/schedulingIntentV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 export type { ChatMessage };
 
@@ -253,6 +262,51 @@ function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined):
 }
 
 /**
+ * The set of transcript indices holding a `question` entry that is still
+ * genuinely awaiting an answer (Part 4 of "Actionable Hand-offs"). A
+ * question's persisted `pending` flag is never rewritten once set (module
+ * comment on `ChatMessage.pending`), and settlement is defined as "the user
+ * sends a follow-up message" — NOT "any later entry exists". Checking only
+ * the transcript's last entry (as an earlier version of this function did)
+ * falsely settles a question the moment ANY later entry is appended, even an
+ * unrelated assistant/system message the user never answered — recreating
+ * the exact stale-pending defect this function exists to fix, just inverted
+ * (false-settled instead of stuck-pending). Scanning forward and treating
+ * only a `role: "user"` entry as a settling event is what the module comment
+ * actually specifies.
+ *
+ * Correlation (review-flagged, 2026-08-22): when more than one question is
+ * still unanswered when a `user` entry arrives — `ask()` has no lock
+ * preventing a second question from stacking before the first is answered —
+ * a single reply settles only the MOST RECENT of them, never all of them at
+ * once. Settling every earlier stacked question off one reply had no
+ * correlation to which question the reply actually addressed, and silently
+ * dropped the older one(s) as answered forever with no record of what (if
+ * anything) actually answered them.
+ */
+function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): ReadonlySet<number> {
+  const awaiting = new Set<number>();
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.role === "question" && entry.pending === true) {
+      awaiting.add(i);
+      continue;
+    }
+    if (entry.role === "user" && awaiting.size > 0) {
+      // Settle only the nearest still-unanswered question — the one this
+      // reply most plausibly addresses — leaving any older stacked question
+      // genuinely awaiting until its own later reply arrives.
+      let nearest = -1;
+      for (const index of awaiting) {
+        if (index > nearest) nearest = index;
+      }
+      awaiting.delete(nearest);
+    }
+  }
+  return awaiting;
+}
+
+/**
  * Notification demotion for a posted `WorkflowDecisionV1` (task: "Replace
  * hidden notification decision buttons with explained, selectable
  * decisions"). The notification only ANNOUNCES that a decision is waiting
@@ -311,6 +365,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * the next time a write for that task succeeds. */
   private warnedTasks = new Set<string>();
   private readonly operationsSub: vscode.Disposable;
+  private readonly decisionsSub: vscode.Disposable;
+  private readonly chatHistorySub: vscode.Disposable;
   /** Set only once wired from extension.ts (see ChatInteractionServicesV1's doc comment). */
   private interactionServices?: ChatInteractionServicesV1;
   /**
@@ -323,9 +379,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * threaded through as a single shared instance.
    */
   readonly workflowDecisionStore: WorkflowDecisionStoreV1;
+  /**
+   * The scheduling-intent ledger's store (task "Actionable Hand-offs", PART
+   * 6), backed by the same Memento as `workflowDecisionStore`. Drives the
+   * chat panel's "what happens next" header line — the second of the two
+   * required always-present surfaces (the task-tree tooltip is the first,
+   * `taskTreeProvider.ts`).
+   */
+  private readonly schedulingIntentStore: SchedulingIntentStoreV1;
+  private readonly schedulingIntentSub: vscode.Disposable;
 
   constructor(private readonly state: vscode.Memento) {
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
+    this.schedulingIntentStore = new SchedulingIntentStoreV1(state);
+    // Same rationale as `decisionsSub` below: a ledger write from anywhere
+    // else sharing this Memento (the tree provider's chokepoint writes, a
+    // recovery sweep) must not leave an already-open panel showing a stale
+    // "what happens next" line.
+    this.schedulingIntentSub = this.schedulingIntentStore.onDidChange(() => {
+      if (!this.target || !this.view) return;
+      void this.render().catch(() => undefined);
+    });
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose. Only re-render when there is a
     // target to render — operations on other tasks must not rebuild this view.
@@ -333,10 +407,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (!this.target || !this.view) return;
       void this.render().catch(() => undefined);
     });
+    // A decision resolved (or posted) from anywhere else — another window,
+    // an automated dispatch, a different provider instance sharing this same
+    // Memento — must not leave THIS panel showing a stale card for a record
+    // that has already settled elsewhere (Part 4: rendered state must be
+    // derived from persisted state, re-derived whenever the store changes).
+    this.decisionsSub = this.workflowDecisionStore.onDidChange(() => {
+      if (!this.target || !this.view) return;
+      void this.render().catch(() => undefined);
+    });
+    // The persisted chat store's own change signal (Part 4.1's other half):
+    // `actions/rows/chatSendRowV1.ts` and `globalAssistantSendRowV1.ts` write
+    // chat-v1.json directly through `writeChatHistory`, bypassing this
+    // provider's own append()/ask() methods (which already call render()
+    // themselves after writing). Without this subscription, a write from one
+    // of those row actions — or from a second provider instance sharing the
+    // same task — left an already-open panel on the SAME target stale until
+    // some unrelated trigger (a task-operation or decision change) happened
+    // to re-render it. Scoped to `this.target` exactly like the other two.
+    this.chatHistorySub = onDidChangeChatHistoryV1((change) => {
+      if (!this.target || !this.view) return;
+      if (!sameIdentity(this.target, change)) return;
+      void this.render().catch(() => undefined);
+    });
   }
 
   dispose(): void {
     this.operationsSub.dispose();
+    this.decisionsSub.dispose();
+    this.chatHistorySub.dispose();
+    this.schedulingIntentSub.dispose();
   }
 
   setDefaultTargetFactory(factory: () => Promise<ChatTarget | undefined>): void {
@@ -379,9 +479,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           // Resume ONLY on a confirmed submit: resuming an action whose
           // answer never landed would run it against a question it has no
           // answer for. `submitInteractionAnswers` has already reported the
-          // reason to the user on every false path.
-          if (await this.submitInteractionAnswers(clientRef, message.answers)) {
-            await this.resumeInteraction(clientRef);
+          // reason to the user (and the transcript) on every false path.
+          // The submission is acknowledged IMMEDIATELY (inside
+          // submitInteractionAnswers, before Resume — a potentially
+          // long-running provider-backed round — is even invoked below), so
+          // the user is never left staring at silence while a slow round
+          // runs. `resumeInteraction`'s own message then reports only the
+          // resume outcome, not a second "answer submitted" claim.
+          if (
+            await this.submitInteractionAnswers(
+              clientRef,
+              message.answers,
+              "Recorded: your answer was submitted. Resuming…"
+            )
+          ) {
+            await this.resumeInteraction(clientRef, "Resumed — the action is continuing.");
           }
         } else {
           await this.resumeInteraction(clientRef);
@@ -755,40 +867,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * wired yet — matching Resume's "not available yet" degradation) does the
    * mirror get updated. A caller must not invoke a provider from answering
    * alone (plan product decisions); that only happens on explicit Resume.
+   *
+   * Every outcome is acknowledged in the transcript (contract field 7): a
+   * decline (invalid answers, no matching question, a rejected/erroring
+   * service call, a failed mirror write) leaves a visible "declined, because
+   * X" trace rather than only a `NotificationRouter` entry, which can stack
+   * or be dismissed unseen. `successMessage` is overridden by the
+   * confirmInteraction path below so the acknowledgement that the ANSWER
+   * landed posts immediately here — before Resume (a potentially long-running
+   * provider-backed round) even starts — rather than being folded into
+   * resumeInteraction's own message and deferred until that round finishes
+   * (review-flagged, 2026-08-22: the immediate half of the acknowledgement
+   * must not wait on the slow half).
    */
   /** Returns whether the answers were accepted, so a combined Confirm can
    * decide whether resuming is safe — resuming an action whose answer never
    * landed would run it against a question it has no answer for. */
   private async submitInteractionAnswers(
     clientRef: ChatInteractionClientRefV1,
-    rawAnswers: unknown
+    rawAnswers: unknown,
+    successMessage = "Recorded: your answer was submitted."
   ): Promise<boolean> {
     if (!this.target) return false;
     const identity = this.target;
     const decoded = decodeStructuredAnswersArrayV1(rawAnswers);
     if (!decoded.ok) {
-      NotificationRouter.showWarning(`Could not submit your answers: ${decoded.reason}`);
+      const message = `Could not submit your answers: ${decoded.reason}`;
+      NotificationRouter.showWarning(message);
+      await this.append("assistant", message, identity.stage, identity);
       return false;
     }
-    const submitted = await this.runQueued(identity.taskFolderPath, () =>
+    const result = await this.runQueued(identity.taskFolderPath, () =>
       this.doSubmitInteractionAnswers(identity, clientRef, decoded.answers)
     );
+    if (!result.ok) {
+      await this.append("assistant", result.message, identity.stage, identity);
+    } else {
+      await this.append("assistant", successMessage, identity.stage, identity);
+    }
     if (sameIdentity(this.target, identity)) {
       await this.render();
     }
-    return submitted;
+    return result.ok;
   }
 
   private async doSubmitInteractionAnswers(
     identity: ChatIdentity,
     clientRef: ChatInteractionClientRefV1,
     answers: readonly StructuredAnswerV1[]
-  ): Promise<boolean> {
+  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
     if (this.interactionServices) {
       const ref = await this.resolveInteractionRef(identity, clientRef);
       if (!ref) {
-        NotificationRouter.showWarning("Could not submit answers: no matching question exists in this task's chat.");
-        return false;
+        const message = "Could not submit answers: no matching question exists in this task's chat.";
+        NotificationRouter.showWarning(message);
+        return { ok: false, message };
       }
       let result: ChatInteractionServiceResultV1;
       try {
@@ -798,14 +931,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           crypto.randomBytes(16).toString("hex")
         );
       } catch (error) {
-        NotificationRouter.showWarning(
-          `Could not submit answers. (${error instanceof Error ? error.message : String(error)})`
-        );
-        return false;
+        const message = `Could not submit answers. (${error instanceof Error ? error.message : String(error)})`;
+        NotificationRouter.showWarning(message);
+        return { ok: false, message };
       }
       if (!result.ok) {
-        NotificationRouter.showWarning(`Could not submit answers: ${result.reason}`);
-        return false;
+        const message = `Could not submit answers: ${result.reason}`;
+        NotificationRouter.showWarning(message);
+        return { ok: false, message };
       }
     }
     try {
@@ -824,24 +957,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // must not stop a combined Confirm from resuming. Reporting false here
       // would strand an action whose answer is already settled.
     }
-    return true;
+    return { ok: true };
   }
 
-  /** Cancel the current target's unresolved interaction (plan §6.1's Cancel control). Never invokes a provider. */
+  /**
+   * Cancel the current target's unresolved interaction (plan §6.1's Cancel
+   * control). Never invokes a provider. Every outcome — success or a decline
+   * (no matching question, the service refusing, or an unexpected error) —
+   * is acknowledged in the transcript (contract field 7): the question card
+   * simply vanishes from the panel otherwise, and a decline that only
+   * reaches `NotificationRouter` reads identically to the click never
+   * registering, which is exactly the ambiguity this task exists to close.
+   */
   private async cancelInteraction(clientRef: ChatInteractionClientRefV1): Promise<void> {
     if (!this.target) return;
     const identity = this.target;
+    let cancelled = false;
+    let declineMessage: string | undefined;
     await this.runQueued(identity.taskFolderPath, async () => {
       try {
         if (this.interactionServices) {
           const ref = await this.resolveInteractionRef(identity, clientRef);
           if (!ref) {
-            NotificationRouter.showWarning("Could not cancel: no matching question exists in this task's chat.");
+            declineMessage = "Could not cancel: no matching question exists in this task's chat.";
+            NotificationRouter.showWarning(declineMessage);
             return;
           }
           const result = await this.interactionServices.cancel(ref);
           if (!result.ok) {
-            NotificationRouter.showWarning(`Could not cancel: ${result.reason}`);
+            declineMessage = `Could not cancel: ${result.reason}`;
+            NotificationRouter.showWarning(declineMessage);
             return;
           }
         }
@@ -851,12 +996,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           clientRef.interactionId,
           "cancelled"
         );
+        cancelled = true;
       } catch (error) {
-        NotificationRouter.showWarning(
-          `Could not cancel this question. (${error instanceof Error ? error.message : String(error)})`
-        );
+        declineMessage = `Could not cancel this question. (${error instanceof Error ? error.message : String(error)})`;
+        NotificationRouter.showWarning(declineMessage);
       }
     });
+    if (cancelled) {
+      await this.append(
+        "assistant",
+        "Recorded: question cancelled — the action that asked it will not continue.",
+        identity.stage,
+        identity
+      );
+    } else if (declineMessage) {
+      await this.append("assistant", declineMessage, identity.stage, identity);
+    }
     if (sameIdentity(this.target, identity)) {
       await this.render();
     }
@@ -866,13 +1021,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * Resume the current target's unresolved interaction (plan §6.1's Resume
    * control). Requires the production action coordinator; until it is wired
    * (see ChatInteractionServicesV1's doc comment) this surfaces a clear
-   * "not available yet" message rather than silently doing nothing.
+   * "not available yet" message rather than silently doing nothing — and,
+   * like Cancel above, that refusal is also recorded in the transcript so it
+   * is legible as "declined, because X" rather than a click that appeared to
+   * do nothing.
+   *
+   * `successMessage` defaults to the standalone-Resume wording; the combined
+   * Confirm path overrides it, since submitInteractionAnswers has already
+   * posted its own "your answer was submitted" acknowledgement immediately —
+   * repeating that claim here would be redundant.
    */
-  private async resumeInteraction(clientRef: ChatInteractionClientRefV1): Promise<void> {
+  private async resumeInteraction(
+    clientRef: ChatInteractionClientRefV1,
+    successMessage = "Recorded: your answer was submitted and the action is resuming."
+  ): Promise<void> {
     if (!this.target) return;
+    const unavailableIdentity = this.target;
     if (!this.interactionServices?.resume) {
       NotificationRouter.showWarning(
         "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow."
+      );
+      await this.append(
+        "assistant",
+        "Not resumed: Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
+        unavailableIdentity.stage,
+        unavailableIdentity
       );
       return;
     }
@@ -880,16 +1053,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const services = this.interactionServices;
     const resume = (r: ChatInteractionRefV1, id: string): Promise<ChatInteractionResumeResultV1> =>
       services.resume!(r, id);
+    let resumed = false;
+    let declineMessage: string | undefined;
     await this.runQueued(identity.taskFolderPath, async () => {
       try {
         const ref = await this.resolveInteractionRef(identity, clientRef);
         if (!ref) {
-          NotificationRouter.showWarning("Could not resume: no matching question exists in this task's chat.");
+          declineMessage = "Could not resume: no matching question exists in this task's chat.";
+          NotificationRouter.showWarning(declineMessage);
           return;
         }
         const result = await resume(ref, crypto.randomBytes(16).toString("hex"));
         if (!result.ok) {
-          NotificationRouter.showWarning(`Could not resume: ${result.reason}`);
+          declineMessage = `Could not resume: ${result.reason}`;
+          NotificationRouter.showWarning(declineMessage);
           return;
         }
         await settleChatInteraction(
@@ -898,15 +1075,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           clientRef.interactionId,
           result.settlement
         );
+        resumed = true;
       } catch (error) {
-        NotificationRouter.showWarning(
-          `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`
-        );
+        declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
+        NotificationRouter.showWarning(declineMessage);
       }
     });
+    if (resumed) {
+      await this.append("assistant", successMessage, identity.stage, identity);
+    } else if (declineMessage) {
+      await this.append("assistant", declineMessage, identity.stage, identity);
+    }
     if (sameIdentity(this.target, identity)) {
       await this.render();
     }
+  }
+
+  /**
+   * The decision's own record carries only `taskCanonicalId` + `stage`, not
+   * the `taskFolderPath` a transcript append needs — so the identity used to
+   * acknowledge a resolution is `this.target` when it is still the exact
+   * task/stage the decision belonged to (the only case a webview click could
+   * actually have come from). A decision resolved after the user switched
+   * chats in the interim (a narrow race) still resolves correctly in the
+   * store; it just has nowhere to append a visible acknowledgement, which is
+   * no worse than today's silence.
+   */
+  private identityForDecision(decision: WorkflowDecisionV1): ChatIdentity | undefined {
+    return this.target &&
+      this.target.kind !== "global" &&
+      this.target.canonicalId === decision.taskCanonicalId &&
+      this.target.stage === decision.stage
+      ? this.target
+      : undefined;
   }
 
   /**
@@ -918,24 +1119,92 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    *
    * `alreadySettled` is presented as an informational notice, never a
    * warning/error — task: "an already-answered decision is not an error".
+   *
+   * Every resolution is also acknowledged directly in the transcript
+   * (task: "a no-op option must acknowledge the click ... the user cannot
+   * distinguish 'recorded, and it does nothing' from 'the click was lost'"),
+   * because the decision card itself simply disappears from the panel the
+   * moment it resolves — with no acknowledgement anywhere else, that read
+   * exactly like the click being lost.
+   *
+   * The race outcomes (`missing`, `rejected`, `alreadySettled`) are no
+   * exception (review-flagged, 2026-08-22): they used to be reported only
+   * through `NotificationRouter`, which stacks and can be dismissed unseen —
+   * the same acknowledgement gap this task exists to close for every other
+   * decline path. `clickIdentity` is captured before the resolve() await so a
+   * target switch mid-race still acknowledges the task the click actually
+   * came from, not whatever is open when the store call returns.
    */
   private async resolveWorkflowDecision(decisionId: string, optionId: string): Promise<void> {
+    const clickIdentity =
+      this.target && this.target.kind !== "global" ? this.target : undefined;
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
     if (result.kind === "missing") {
-      NotificationRouter.showWarning("This decision is no longer pending — it may have already been resolved elsewhere.");
+      const message = "This decision is no longer pending — it may have already been resolved elsewhere.";
+      NotificationRouter.showWarning(message);
+      if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else if (result.kind === "rejected") {
-      NotificationRouter.showWarning(`Could not record your choice: ${result.reason}`);
+      const message = `Could not record your choice: ${result.reason}`;
+      NotificationRouter.showWarning(message);
+      if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else if (result.kind === "alreadySettled") {
-      NotificationRouter.showInformation("This decision was already submitted.");
+      const message = "This decision was already submitted.";
+      NotificationRouter.showInformation(message);
+      const identity = this.identityForDecision(result.decision) ?? clickIdentity;
+      if (identity) await this.append("assistant", message, result.decision.stage, identity);
+    } else if (result.kind === "orphaned") {
+      // The operation this decision was gating already ended (its cleanup
+      // write failed, but the continuation is gone regardless) — review
+      // blocker round 3. Refuse before dispatching anything, and say so
+      // rather than leaving the click looking lost.
+      const message =
+        "This decision's operation has already ended, so this answer can no longer be applied. It will clear on its own.";
+      NotificationRouter.showInformation(message);
+      if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else {
-      const { option } = result;
+      const { decision, option } = result;
+      const identity = this.identityForDecision(decision);
+      if (identity) {
+        const ackText =
+          option.effect.kind === "doNothing"
+            ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
+            : `Recorded: "${option.label}" — applying now. ${option.consequence}`;
+        await this.append("assistant", ackText, decision.stage, identity);
+      }
       if (option.effect.kind === "command") {
         try {
-          await vscode.commands.executeCommand(option.effect.command, ...(option.effect.args ?? []));
-        } catch (error) {
-          NotificationRouter.showWarning(
-            `"${option.label}" could not be completed. (${error instanceof Error ? error.message : String(error)})`
+          // Some dispatched commands (e.g. goToReviewAndApplyV1) report a
+          // failed multi-step sequence by resolving `false` rather than
+          // throwing — `setTaskStage` reports its own failures by
+          // notification and then returns normally (see
+          // goToReviewAndApplyV1.ts), so the only trustworthy signal here is
+          // the resolved value. Treating only a thrown error as failure left
+          // the "applying now" acknowledgement above standing uncorrected
+          // even when the command it described did not actually happen.
+          const result = await vscode.commands.executeCommand(
+            option.effect.command,
+            ...(option.effect.args ?? [])
           );
+          if (result === false && identity) {
+            await this.append(
+              "assistant",
+              `"${option.label}" did not complete — see the notification for why. The task may still be in ` +
+                "its previous state.",
+              decision.stage,
+              identity
+            );
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          NotificationRouter.showWarning(`"${option.label}" could not be completed. (${message})`);
+          if (identity) {
+            await this.append(
+              "assistant",
+              `"${option.label}" could not be completed. (${message})`,
+              decision.stage,
+              identity
+            );
+          }
         }
       }
     }
@@ -944,8 +1213,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
     try {
-      const current = await loadTranscriptWithMigration(identity.taskFolderPath, identity.canonicalId, this.state);
-      await writeChatHistory(identity.taskFolderPath, [...current, message], identity.canonicalId);
+      // Review-flagged (2026-08-23): this used to read a full transcript
+      // snapshot via `loadTranscriptWithMigration` and then call
+      // `writeChatHistory` with that snapshot plus `message` appended —
+      // `writeChatHistory` writes its caller-supplied list verbatim, so any
+      // message a DIFFERENT writer appended between the read and the write
+      // (e.g. the scheduling-intent auto-start announcement) was silently
+      // discarded. `appendChatMessageV1` instead re-reads the CURRENT
+      // document inside the shared per-document queue and appends onto its
+      // actual current messages, so no racing writer's message can be lost.
+      // A first-time migration still runs (its own read has no queue to
+      // race against a same-process appender before this document exists),
+      // so touch it once to trigger migration, then append atomically.
+      await loadTranscriptWithMigration(identity.taskFolderPath, identity.canonicalId, this.state);
+      await appendChatMessageV1(identity.taskFolderPath, message, identity.canonicalId);
       this.warnedTasks.delete(identity.taskFolderPath);
     } catch (error) {
       // A persistence failure must not surface as a chat-send failure, and
@@ -1095,20 +1376,72 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // reads as "the computer is working, leave it alone" and is exactly
     // backwards when it's actually this chat that's waiting on the user.
     const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
-    // A trailing pending question (no reply after it yet) is the one case
-    // that genuinely needs the user's attention rather than just being more
-    // conversation — computed here (ahead of busy/waitingForUser) so it can
-    // win over an operation that is still technically running: a question
-    // posted mid-operation means the operation is now blocked on the user,
-    // not "busy", no matter what targetOps still reports.
-    const lastEntry = entries[entries.length - 1];
-    const hasPendingQuestion = lastEntry?.role === "question" && lastEntry.pending;
-    const waitingForUser =
-      interaction !== undefined ||
-      hasPendingQuestion ||
-      pendingDecisions.length > 0 ||
-      targetOps.some((op) => op.waitingForUser);
+    // A trailing pending question (no reply after it yet) drives only the
+    // per-message "— awaiting your answer" label further down; it plays no
+    // part in busy/waitingForUser/badge, which are derived exclusively from
+    // live `taskOperations` entries below (a persisted-only question is real
+    // and still renders with that label, but does not by itself justify an
+    // ACTIVE posture claim — see the block below).
+    const awaitingQuestionIndices = computeAwaitingQuestionIndices(entries);
+    // `busy` and `waitingForUser` are the panel's two ACTIVE POSTURE banners
+    // (the `b` element in the webview: "Waiting for the AI…" with a spinner,
+    // or "Waiting for your answer" without one). Both are held to the exact
+    // same rule, per AC3's own text verbatim: "The chat panel cannot show a
+    // pending posture without a live in-flight transaction." Neither may ever
+    // be sourced from a persisted, potentially-stale record — only a live
+    // `taskOperations` entry can set either one, and both fall the instant
+    // that entry ends, since nothing else survives to justify an ACTIVE claim
+    // once the round that created it has finished.
+    //
+    // Review-flagged (2026-08-22, rounds 2-3): an earlier version of this
+    // code also set `waitingForUser` from a persisted-but-not-live
+    // `openInteraction`/`openQuestion`/`openDecision` record, reasoning that
+    // Part 4.2's "settled renders settled... with or without controls"
+    // implied the converse (unsettled renders as an ACTIVE waiting posture).
+    // The review (rounds 2-4) rejected that reading: Part 4.2 requires the
+    // record's CONTENT and answer controls to keep rendering — which
+    // `renderInteraction`, `renderDecisions`, and each message's
+    // `awaitingAnswer` label (below) do UNCONDITIONALLY, regardless of
+    // `waitingForUser` — not that the panel additionally assert an active
+    // "waiting" banner with zero live evidence that anything is in flight.
+    // Doing so left `waitingForUser === true` even when NO `taskOperations`
+    // entry existed anywhere for the task, which is exactly the "pending
+    // posture without a live in-flight transaction" AC3 prohibits. A record
+    // that is merely unresolved is not itself a transaction — the content it
+    // carries is real and stays visible either way, but the posture claim is
+    // not.
+    //
+    // `waitingForUserSource` is therefore now `"liveOperation" | undefined`
+    // only — kept as a named/verifiable source (not a bare boolean) so a
+    // future addition can't quietly reintroduce an unbacked claim without
+    // updating this type. The invariant tests in
+    // chatViewWorkflowDecision.test.ts ("waitingForUser is only ever
+    // asserted from a live operation" and "neither active posture is shown
+    // for a persisted-only record, even with all three waiting sources open
+    // at once") verify both directions: `true` only ever traces to a live
+    // `taskOperations` entry, and all three persisted-only sources — alone or
+    // combined, with zero live operations — leave both `busy` and
+    // `waitingForUser` false while their content still renders in full.
+    const waitingForUserSource: "liveOperation" | undefined = targetOps.some((op) => op.waitingForUser)
+      ? "liveOperation"
+      : undefined;
+    const waitingForUser = waitingForUserSource !== undefined;
     const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
+    // Part 4.3: "Where a transport genuinely reports nothing until it
+    // finishes, render that statement explicitly (contract rule: explicit
+    // unknown, not implied wait)." Most busy operations never call
+    // `TaskOperationHandle.report(detail)`, so a bare "Waiting for the AI…"
+    // reads as an implied wait with no way to tell whether progress is being
+    // narrated or not. `busyDetail` surfaces the most recently started
+    // non-waiting op's `detail` when one exists (e.g. a review loop's
+    // "iteration 2/3"); when none of the live ops have reported anything,
+    // it is left `undefined` and the webview renders the explicit
+    // no-status-available statement instead of a bare spinner.
+    const busyDetail = busy
+      ? [...targetOps]
+          .filter((op) => !op.waitingForUser && op.detail !== undefined)
+          .sort((a, b) => b.startedAt - a.startedAt)[0]?.detail
+      : undefined;
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -1125,32 +1458,165 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // cannot import host-side code, so the HH:mm label and its full-date
     // tooltip are pre-formatted here from `entry.at` (an ISO string) using
     // the same helper the Notifications view uses.
-    const displayEntries = entries.map((entry) => {
+    //
+    // `awaitingAnswer` (not the raw persisted `pending` flag) drives the
+    // "— awaiting your answer" label: `pending` stays true on a `question`
+    // message forever once a follow-up reply supersedes it (module comment
+    // on `ChatMessage.pending` — a question is pending "until the user sends
+    // a follow-up message", and nothing ever rewrites the earlier message),
+    // so rendering straight off `pending` kept showing already-answered
+    // escalation questions as still awaiting an answer even after the user
+    // had replied (the "7 persisted, 6 visible" defect: the extra entry was
+    // this stale label, not a missing render). `computeAwaitingQuestionIndices`
+    // (the same source `awaitingQuestionIndices` above uses, so the two can
+    // never disagree) settles a question only on a later `role: "user"` entry — an unrelated
+    // assistant/system message appended after it must NOT falsely settle it.
+    const displayEntries = entries.map((entry, index) => {
       const date = new Date(entry.at);
       return {
         ...entry,
         text: stripAttributionHeaders(entry.text),
         atLabel: formatTimestampForDisplay(date),
         atTitle: date.toLocaleString(),
+        awaitingAnswer: awaitingQuestionIndices.has(index),
       };
     });
+    // The webview script cannot import host-side code (see the comment on
+    // `displayEntries` above), so the hand-off contract's "gating" line is
+    // pre-rendered here. A decision that supplies `gating` (task PART 5)
+    // renders its real content; one that does not (any record persisted
+    // before PART 5 — every production creation site, including
+    // `reviewActions.ts`'s `providerChainExhausted`, now supplies it, tracked
+    // in `workflowDecisionGatingInventoryV1.test.ts`) falls back to an
+    // explicit "not recorded" line. The absence reason passed is deliberately
+    // `"unknown"`, not `"legacyRecord"`: this renderer cannot tell a record
+    // that predates the field apart from one created today by a call site
+    // that regresses and omits it, so claiming "older record" for both would
+    // assert something not provably true — the exact "absence is never
+    // positive evidence" defect this contract exists to fix.
+    //
+    // The card's highlight (`isGating`) is derived from `holdsTaskPaused`,
+    // NOT `unblocksProgress`: whether THIS decision is the reason the task is
+    // currently paused (ownership) is a different fact from whether choosing
+    // an option here is expected to move the task forward (see
+    // `HandoffGatingV1`'s doc comment) — a decision can hold the task paused
+    // without every option being guaranteed to unblock it (e.g. a "wait"
+    // choice), and conflating the two either falsely denies pause ownership
+    // or falsely promises an unblock.
+    const displayDecisions = pendingDecisions.map((decision) => ({
+      ...decision,
+      gatingLine: renderHandoffFieldLineV1(
+        "decisionRecord",
+        "gating",
+        decision.gating !== undefined ? { gating: decision.gating } : undefined,
+        "unknown"
+      ).text,
+      isGating: decision.gating?.holdsTaskPaused === true,
+    }));
+    // "What happens next" — the chat panel's half of the always-present
+    // scheduling posture (task "Actionable Hand-offs", PART 6; the task-tree
+    // tooltip built in `taskTreeProvider.ts`'s `computeSchedulingPosture` is
+    // the other, structurally identical half). A failure deriving/rendering
+    // the posture must still render the contract's explicit-unknown line
+    // (review-flagged 2026-08-23: this used to leave the line unset on any
+    // exception, which the webview then hides entirely — silence, not the
+    // required "unknown" statement, exactly the "absence is never positive
+    // evidence" defect this contract exists to prevent).
+    let schedulingPostureLine: string | undefined;
+    if (target && target.kind !== "global") {
+      try {
+        const progressResult = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+        // A failed/unreadable progress read is NOT evidence that no
+        // continuation is owed (review-flagged 2026-08-23) — it means this
+        // render cannot establish that fact at all, so it must not feed
+        // `owedContinuation: undefined` into the posture (which would read as
+        // a positive "nothing owed" and could fall through to the false
+        // `waitingForYou` posture). `owedContinuationUnknown` forces the
+        // explicit `unknown` fallback instead whenever the read did not
+        // succeed.
+        const progress = progressResult.ok ? progressResult.decoded.progress : undefined;
+        const owedSource = progress?.implRecovery
+          ? {
+              reason: progress.implRecovery.reason,
+              at: progress.implRecovery.at,
+              leaseUntil: progress.implRecovery.leaseUntil,
+              quarantinedFiles: progress.pendingImplReviewFiles ?? [],
+              dispatch: progress.implRecovery.dispatch,
+            }
+          : undefined;
+        // PART 6.5 (review-flagged 2026-08-23, resolved this round): every
+        // `implRecovery` mutation site now pushes through
+        // `syncOwedContinuationLedgerBestEffortV1` right after its own CAS
+        // resolves (see `schedulingIntentV1.ts`'s `OwedContinuationRecordV1`
+        // doc comment for the full nine-site inventory) — the ledger is no
+        // longer a "some sites missing" degraded fallback. This render still
+        // performs its own fresh `TaskProgress` read (the one piece no other
+        // site can substitute for: a DIFFERENT window's direct file mutation,
+        // or a process that died between committing the CAS and running its
+        // ledger push) and writes it through here, but posture is now
+        // DERIVED FROM THE LEDGER's own read-back — never from `owedSource`
+        // directly — so this satisfies AC5's "rendered only from the ledger"
+        // contract while staying exactly as fresh as a live read (the
+        // ledger's value IS this read, one line earlier).
+        if (progressResult.ok) {
+          await this.schedulingIntentStore.recordOwedContinuation(target.canonicalId, owedSource);
+        }
+        const ledgerOwedSource = this.schedulingIntentStore.getOwedContinuation(target.canonicalId);
+        // A failed/unreadable progress read cannot establish the fact live —
+        // the ledger's last-recorded value (from this window's own most
+        // recent successful push, at this render or at any mutation site) is
+        // still positive evidence and is preferred over forcing `unknown`;
+        // only a ledger that has NEVER recorded anything for this task
+        // degrades to `unknown` via `owedContinuationUnknown` below.
+        const posture = deriveSchedulingPostureV1({
+          entries: this.schedulingIntentStore.listForTask(target.canonicalId),
+          owedContinuation: deriveOwedContinuationRecordV1(target.canonicalId, ledgerOwedSource),
+          hasCoverage: this.schedulingIntentStore.hasCoverage(target.canonicalId),
+          inFlight: taskOperations.rootOperationIdFor(target.canonicalId) !== undefined,
+          owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
+        });
+        schedulingPostureLine = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture))
+          .map((line) => line.text)
+          .join(" ");
+      } catch {
+        // A failure deriving the posture is exactly the "cannot establish
+        // the fact" case the `unknown` posture exists for — never silence,
+        // never a guess at `waitingForYou`/`running`.
+        schedulingPostureLine = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1({ kind: "unknown" }))
+          .map((line) => line.text)
+          .join(" ");
+      }
+      // The progress read above is async: a target switch mid-read must drop
+      // this stale render rather than painting one task's scheduling posture
+      // into another's (or the global assistant's) header — same rule the
+      // transcript read above is already held to.
+      if (!sameIdentity(target, this.target)) return;
+    }
     // A small badge on the view itself draws the eye even when this panel is
     // present but not the currently focused element, mirroring how other
-    // views badge unread/actionable counts.
+    // views badge unread/actionable counts. It asserts the exact same claim
+    // as the `waitingForUser` banner ("something needs you right now"), just
+    // on a different widget, so it is held to the identical AC3 rule: only a
+    // live `taskOperations` entry may justify it. A pending question, open
+    // interaction, or pending decision with no live operation behind it
+    // (e.g. after a window reload) is real and still renders in the panel
+    // body either way — it just no longer lights this badge, since nothing
+    // live is actually happening right now.
     if (this.view) {
-      this.view.badge = hasPendingQuestion || interaction !== undefined || pendingDecisions.length > 0
-        ? { value: 1, tooltip: "Waiting for your answer" }
-        : undefined;
+      this.view.badge = waitingForUser ? { value: 1, tooltip: "Waiting for your answer" } : undefined;
     }
     await this.view?.webview.postMessage({
       type: "state",
       target: this.target,
       label,
+      schedulingPostureLine,
       entries: displayEntries,
       interaction,
-      decisions: pendingDecisions,
+      decisions: displayDecisions,
       busy,
+      busyDetail,
       waitingForUser,
+      waitingForUserSource,
       errorMessage,
       emptyNotice,
     });
@@ -1183,6 +1649,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: 0 0 var(--ensemble-space-3);
           padding-bottom: var(--ensemble-space-2);
           border-bottom: var(--ensemble-border-width) solid var(--vscode-panel-border);
+        }
+        #scheduling-posture {
+          color: var(--vscode-descriptionForeground);
+          font-size: 0.9em;
+          margin: 0 0 var(--ensemble-space-3);
+          display: none;
+        }
+        #scheduling-posture.visible {
+          display: block;
         }
         #messages {
           margin: 0 0 var(--ensemble-space-2);
@@ -1358,16 +1833,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-option-consequence { margin: 0 0 0 1.5em; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
         .decision-option-destructive { color: var(--vscode-inputValidation-errorForeground); font-weight: bold; }
         .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--vscode-descriptionForeground); }
+        .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+        .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
+        .decision-gating.decision-gating-active { color: var(--vscode-inputValidation-warningForeground); font-weight: bold; }
+        .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
       </style>
       </head><body>
-      <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
+      <div id="context" role="status">Loading chat…</div><div id="scheduling-posture" role="status"></div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="interaction" role="form" aria-label="Question from the AI"></div>
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">Waiting for the AI…</span></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -1523,7 +2002,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if(!decisions || !decisions.length){ dc.style.display='none'; return; }
         dc.style.display='block';
         for(const dcs of decisions){
-          const card=document.createElement('div'); card.className='decision-card';
+          const card=document.createElement('div'); card.className='decision-card'+(dcs.isGating?' decision-card-gating':'');
           const err=document.createElement('div'); err.className='interaction-error';
           card.appendChild(err);
           const title=document.createElement('div'); title.className='interaction-title';
@@ -1570,6 +2049,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             rec.textContent='No recommendation: '+dcs.recommendation.reasoning;
           }
           card.appendChild(rec);
+          // Whether resolving this decision actually unblocks the task —
+          // pre-rendered host-side (chatView.ts) via the shared hand-off
+          // contract, including its "not recorded" fallback for records
+          // that predate this metadata.
+          const gating=document.createElement('div'); gating.className='decision-gating'+(dcs.isGating?' decision-gating-active':'');
+          gating.textContent=dcs.gatingLine;
+          card.appendChild(gating);
+          // Paused-answer sequencing (task PART 5, verified against
+          // workflowDecisionStoreV1.ts's resolve(): it never reads task-pause
+          // state, so a decision is always retained and its effect always
+          // dispatched immediately, whether the task is paused or active).
+          // Stated at the point of asking, for every decision, rather than
+          // left for the user to discover after answering. Worded to avoid
+          // two overclaims a reviewer caught in an earlier draft: (1) the
+          // dispatched command can still refuse on its own terms — recording
+          // your choice is not a promise the action succeeds — and (2)
+          // recording an answer does not itself resume a paused task unless
+          // the option's own effect does so, which is what the "Unblocks"
+          // line right above already states per-decision.
+          const pausedNote=document.createElement('div'); pausedNote.className='decision-paused-note';
+          pausedNote.textContent='Your choice is recorded immediately, whether the task is paused or active. The action it runs can still refuse on its own terms, and recording your choice does not by itself resume the task — see "Unblocks" above.';
+          card.appendChild(pausedNote);
           const actions=document.createElement('div'); actions.className='interaction-actions';
           const confirmBtn=document.createElement('button'); confirmBtn.type='button'; confirmBtn.textContent='Confirm';
           confirmBtn.addEventListener('click',()=>{
@@ -1595,6 +2096,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
+        sp.textContent=s.schedulingPostureLine??'';sp.classList.toggle('visible',!!s.schedulingPostureLine);
         m.replaceChildren(...s.entries.map(x=>{
           const row=document.createElement('div');row.className='msg-row';
           const meta=document.createElement('div');meta.className='msg-meta';
@@ -1610,7 +2112,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
           });
           meta.appendChild(copyBtn);meta.appendChild(time);
-          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;
+          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.awaitingAnswer?' — awaiting your answer':'')+'] '+x.text;
           row.appendChild(d);row.appendChild(meta);
           return row;
         }));
@@ -1618,9 +2120,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         renderDecisions(s.decisions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
-        if(s.busy){bs.style.display='inline-block';bt.textContent='Waiting for the AI…';b.style.display='block';}
-        else if(s.waitingForUser){bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';}
-        else{b.style.display='none';}
+        if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyDetail?('Waiting for the AI… ('+s.busyDetail+')'):'Waiting for the AI… — no status is available until this finishes';b.style.display='block';b.title='';}
+        else if(s.waitingForUser){
+          bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';
+          b.title=s.waitingForUserSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
+        }
+        else{b.style.display='none';b.title='';}
         currentKey=nextKey;
         requestAnimationFrame(()=>{
           if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}

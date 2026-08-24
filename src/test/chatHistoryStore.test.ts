@@ -37,6 +37,7 @@ import {
   ChatMessage,
   GLOBAL_ASSISTANT_CANONICAL_ID,
   appendChatInteraction,
+  appendChatMessageV1,
   chatHistoryFileExists,
   loadTranscriptWithMigration,
   readChatHistory,
@@ -139,6 +140,50 @@ void describe("chatHistoryStore round-trip", () => {
       assert.equal(raw.resetEpoch, 0);
       assert.deepEqual(raw.interactions, []);
     } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("round-trips a proposedStageAction through write and read (chatWithStage.ts reads this back to dispatch the action)", async () => {
+    const folder = makeTaskFolder();
+    try {
+      const withAction: ChatMessage = {
+        role: "assistant",
+        text: "Done — moving this task to impl.",
+        stage: "impl",
+        at: "2026-01-01T00:00:00.000Z",
+        proposedStageAction: { id: "setTaskStage", payload: { stage: "impl" } },
+      };
+      await writeChatHistory(folder, [message("please move to impl"), withAction]);
+      const read = await readChatHistory(folder);
+      const last = read[read.length - 1]!;
+      assert.deepEqual(last.proposedStageAction, { id: "setTaskStage", payload: { stage: "impl" } });
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("quarantines a message with a malformed proposedStageAction (missing id) rather than passing it through", async () => {
+    const folder = makeTaskFolder();
+    const channel = vscode.window.createOutputChannel("test-capture") as unknown as { lines: string[] };
+    const originalCreate = (vscode.window as unknown as Record<string, unknown>).createOutputChannel;
+    (vscode.window as unknown as Record<string, unknown>).createOutputChannel = () => channel;
+    resetChatHistoryDiagnosticsChannelForTestV1();
+    try {
+      fs.writeFileSync(
+        path.join(folder, CHAT_HISTORY_FILENAME),
+        JSON.stringify({
+          version: 1,
+          messages: [
+            { role: "assistant", text: "bad", stage: "impl", at: "2026-01-01T00:00:00.000Z", proposedStageAction: {} },
+          ],
+        })
+      );
+      const read = await readChatHistory(folder);
+      assert.deepEqual(read, [], "a message with a malformed proposedStageAction must not be accepted");
+      assert.ok(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)));
+    } finally {
+      (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
       fs.rmSync(folder, { recursive: true, force: true });
     }
   });
@@ -297,6 +342,111 @@ void describe("chatHistoryStore round-trip", () => {
         messages.some((m) => m.legacyRecovery === "legacyQuestion"),
         "the legacy recovery record must survive compaction despite being the oldest, non-pending message"
       );
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a concurrent writer)", () => {
+  void it("appends onto the CURRENT document rather than a stale snapshot, never losing a concurrently-written message", async () => {
+    const folder = makeTaskFolder();
+    try {
+      await writeChatHistory(folder, [message("seed")]);
+      // Two concurrent appenders, neither aware of the other — exactly the
+      // shape of the bug this function exists to fix (the auto-start
+      // announcement racing the task's own round writing its own chat
+      // messages, with no shared queue protecting either write).
+      await Promise.all([
+        appendChatMessageV1(folder, message("first")),
+        appendChatMessageV1(folder, message("second")),
+      ]);
+      const read = await readChatHistory(folder);
+      const texts = read.map((m) => m.text);
+      assert.deepEqual(
+        new Set(texts),
+        new Set(["seed", "first", "second"]),
+        "both concurrent appends must survive — neither may silently overwrite the other's write"
+      );
+      assert.equal(read.length, 3);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it(
+    "many concurrent appenders against an EXISTING document all survive, deterministically " +
+      "(review-flagged 2026-08-23: replaceFileExact's revision-check-then-rename is two separate " +
+      "steps, so two in-process callers could interleave between them and lose a message with no " +
+      "reported conflict — a real-filesystem Promise.all test alone could not force that exact " +
+      "interleaving; withChatDocumentQueueV1 now serializes every in-process caller so this is no " +
+      "longer timing-dependent at all)",
+    async () => {
+      const folder = makeTaskFolder();
+      try {
+        await writeChatHistory(folder, [message("seed")]);
+        const concurrency = 20;
+        await Promise.all(
+          Array.from({ length: concurrency }, (_, i) => appendChatMessageV1(folder, message(`writer-${i}`)))
+        );
+        const read = await readChatHistory(folder);
+        const texts = read.map((m) => m.text);
+        assert.deepEqual(
+          new Set(texts),
+          new Set(["seed", ...Array.from({ length: concurrency }, (_, i) => `writer-${i}`)]),
+          "every one of the 20 concurrent appends against the same existing document must survive"
+        );
+        assert.equal(read.length, concurrency + 1, "no message may be silently discarded by another writer");
+      } finally {
+        fs.rmSync(folder, { recursive: true, force: true });
+      }
+    }
+  );
+
+  void it("creates a fresh document when none exists yet", async () => {
+    const folder = makeTaskFolder();
+    try {
+      await appendChatMessageV1(folder, message("first ever message"));
+      const read = await readChatHistory(folder);
+      assert.deepEqual(read.map((m) => m.text), ["first ever message"]);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("two concurrent appenders racing to create the FIRST chat-v1.json both survive (review-flagged 2026-08-23)", async () => {
+    // The narrower, more dangerous race than the seeded-document case above:
+    // no document exists yet, so BOTH callers attempt an exclusive create and
+    // exactly one wins. `persistDocument` used to resolve the loser's
+    // `targetExists` conflict by blindly replacing the winner's freshly
+    // created document with the loser's own (necessarily empty-based) bytes,
+    // discarding the winner's message entirely. The fix surfaces that
+    // conflict as a retryable signal instead, so the loser re-reads the
+    // winner's real document and appends onto it.
+    const folder = makeTaskFolder();
+    try {
+      await Promise.all([
+        appendChatMessageV1(folder, message("alpha")),
+        appendChatMessageV1(folder, message("beta")),
+      ]);
+      const read = await readChatHistory(folder);
+      const texts = read.map((m) => m.text);
+      assert.deepEqual(
+        new Set(texts),
+        new Set(["alpha", "beta"]),
+        "neither first-writer's message may be discarded by the other"
+      );
+      assert.equal(read.length, 2);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("refuses an oversized message rather than truncating it", async () => {
+    const folder = makeTaskFolder();
+    try {
+      const huge = message("x".repeat(CHAT_HISTORY_MAX_MESSAGE_BYTES + 1));
+      await assert.rejects(() => appendChatMessageV1(folder, huge), /65536-byte limit/);
     } finally {
       fs.rmSync(folder, { recursive: true, force: true });
     }

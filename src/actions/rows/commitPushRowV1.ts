@@ -511,7 +511,7 @@ export async function executeCommitPushV1(
     cancellable: true,
   });
   if (!op) {
-    showTaskBusyWarning(lockKey);
+    await showTaskBusyWarning(lockKey);
     return mapCommitAndPushCoreResultToOutcomeV1(
       { kind: "notCompleted", reason: "unexpectedError" },
       context

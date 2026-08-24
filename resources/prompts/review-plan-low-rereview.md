@@ -34,6 +34,10 @@ Then structure your review as:
 
 {{previousReview}}
 
+## Previous Round's Blockers (for lineage citation)
+
+{{priorBlockerLineageList}}
+
 ## Revised Plan Under Review
 
 {{plan}}

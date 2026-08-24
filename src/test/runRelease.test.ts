@@ -341,7 +341,7 @@ void describe("automatic implementation dispatch gate", () => {
       assert.equal(dispatches.length, 1);
       const dispatched = dispatches[0];
       assert.ok(dispatched);
-      const { stillEnabled, ...dispatchShape } = dispatched as AutomationDispatch;
+      const { stillEnabled, intent, ...dispatchShape } = dispatched as AutomationDispatch;
       assert.deepEqual(
         dispatchShape,
         {
@@ -364,6 +364,20 @@ void describe("automatic implementation dispatch gate", () => {
         typeof stillEnabled,
         "function",
         "automatic implementation must carry the fire-time settings re-check"
+      );
+      // Task "Actionable Hand-offs", PART 9: this call site's scheduling
+      // intent, enriched so the ledger renders more than a generic
+      // command-derived entry for it.
+      assert.deepEqual(
+        intent,
+        {
+          trigger: "auto-implement after review completes",
+          settingKey: "ensemble.autoImplementAfterReview",
+          expectedTiming: "immediately, once this review finishes",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — run Implementation manually.",
+        },
+        "automatic implementation must carry enriched scheduling-intent metadata"
       );
 
       assert.equal(

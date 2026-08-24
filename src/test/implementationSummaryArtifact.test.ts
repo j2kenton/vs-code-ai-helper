@@ -49,11 +49,13 @@ import {
   filterUncheckedPlanItemsV1,
   hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
+  listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
   NO_CHECKLIST_CHANGE_MARKER_V1,
   normalizeChecklistItemTextV1,
+  parseChecklistItemPriorityV1,
   RETROACTIVE_TICK_MARKER_V1,
   scopeToLatestChecklistV1,
   splitSummaryAtEchoV1,
@@ -2157,6 +2159,79 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
         "wire the completeness gate",
       ]);
       assert.deepEqual(resolved, ["Wire the completeness gate"]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseChecklistItemPriorityV1 / listOutstandingManualVerificationItemsV1
+// (task "Actionable Hand-offs", PART 2): the manual-verification/human-
+// operator items a plan marks excluded were previously invisible everywhere
+// once the rest of the plan finished. These name them, and sort a HIGH-cost
+// one ahead of a LOW-cost one so a time-pressed operator can check three
+// things instead of nine.
+// ---------------------------------------------------------------------------
+void describe("parseChecklistItemPriorityV1", () => {
+  void it("parses HIGH and LOW case-insensitively from the rendered hand-off contract wording", () => {
+    assert.equal(parseChecklistItemPriorityV1("Priority: HIGH — silent data loss."), "high");
+    assert.equal(parseChecklistItemPriorityV1("priority: low — loud and recoverable."), "low");
+    assert.equal(parseChecklistItemPriorityV1("some text priority: High in the middle"), "high");
+  });
+
+  void it("returns undefined when the text declares no priority", () => {
+    assert.equal(parseChecklistItemPriorityV1("Just an ordinary step."), undefined);
+  });
+});
+
+void describe("listOutstandingManualVerificationItemsV1", () => {
+  const PLAN_WITH_PRIORITIES = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Wire the completeness gate",
+    `- [ ] Confirm the low-risk report count. Priority: LOW — a wrong count is loud and recoverable. ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    `- [x] Already-done manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    `- [ ] Confirm the write path landed bytes correctly. Priority: HIGH — a wrong byte is silent and damaging. ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    `- [ ] Deploy the classifier change to production ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+  ].join("\n");
+
+  void it("lists only unchecked, excluded (manual) items, HIGH priority first", () => {
+    const result = listOutstandingManualVerificationItemsV1(PLAN_WITH_PRIORITIES);
+    assert.deepEqual(result.items, [
+      `Confirm the write path landed bytes correctly. Priority: HIGH — a wrong byte is silent and damaging. ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `Deploy the classifier change to production ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `Confirm the low-risk report count. Priority: LOW — a wrong count is loud and recoverable. ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ]);
+    assert.equal(result.total, 3, "the gating item and the already-checked manual item must not appear");
+  });
+
+  void it("bounds the preview to `limit` while `total` still reports the true count", () => {
+    const result = listOutstandingManualVerificationItemsV1(PLAN_WITH_PRIORITIES, 1);
+    assert.deepEqual(result.items, [
+      `Confirm the write path landed bytes correctly. Priority: HIGH — a wrong byte is silent and damaging. ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ]);
+    assert.equal(result.total, 3);
+  });
+
+  void it("leaves a plan with no priority markers in document order — old plans render unchanged", () => {
+    const noMarkers = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      `- [ ] First manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `- [ ] Second manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `- [ ] Third manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ].join("\n");
+    const result = listOutstandingManualVerificationItemsV1(noMarkers);
+    assert.deepEqual(result.items, [
+      `First manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `Second manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `Third manual step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ]);
+  });
+
+  void it("returns an empty result when there is no checklist or nothing manual is outstanding", () => {
+    assert.deepEqual(listOutstandingManualVerificationItemsV1("# Just prose, no checklist."), {
+      items: [],
+      total: 0,
     });
   });
 });

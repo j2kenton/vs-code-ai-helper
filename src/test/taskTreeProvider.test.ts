@@ -1389,6 +1389,44 @@ void describe("TaskTreeProvider — pending workflow decisions (task: hidden-but
     }
   });
 
+  // Task "Actionable Hand-offs" PART 5: the tooltip's gating line must match
+  // Chat With AI's — real content when the decision supplies `gating`, an
+  // explicit "not recorded" statement when it does not.
+  void it("tooltip renders a decision's own gating claim, or an explicit not-recorded fallback", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    await store.post(
+      decisionInput({
+        gating: { holdsTaskPaused: true, unblocksProgress: true, detail: "Resuming answers the paused escalation." },
+      })
+    );
+
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      const node = await firstTaskNode(provider);
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.match(tooltipValue, /Resuming answers the paused escalation\./);
+      assert.doesNotMatch(tooltipValue, /not recorded/i);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("tooltip renders an explicit not-recorded gating line for a decision that omits it", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    await store.post(decisionInput());
+
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      const node = await firstTaskNode(provider);
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.match(tooltipValue, /not recorded — unknown/i);
+    } finally {
+      provider.dispose();
+    }
+  });
+
   void it("shows no decision state for a task with nothing pending", async () => {
     const memento = new FakeMemento() as unknown as vscode.Memento;
     const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
@@ -1453,6 +1491,136 @@ void describe("TaskTreeProvider — pending workflow decisions (task: hidden-but
       } finally {
         sub.dispose();
       }
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+// Review-flagged 2026-08-23 (twice): the task-tree tooltip's scheduling
+// posture used to derive the owed-continuation fact directly from the live
+// `TaskProgress` read rather than the scheduling-intent ledger, an
+// unapproved substitute for the plan's "rendered only from the ledger"
+// contract. `getChildren` is `async`, so the fix awaits the same
+// push-then-read-back sequence `chatView.ts`'s chat-header already uses.
+void describe("TaskTreeProvider — scheduling posture reads back from the ledger (task: actionable hand-offs)", () => {
+  class FakeMemento {
+    private readonly values = new Map<string, unknown>();
+    get<T>(key: string, defaultValue: T): T {
+      return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+    }
+    update(key: string, value: unknown): Promise<void> {
+      this.values.set(key, value);
+      return Promise.resolve();
+    }
+  }
+
+  const TASK_FS_PATH = "/workspace/tasks/owed-continuation-task";
+
+  function makeOwedTaskInventory(): import("../state/taskInventory").TaskInventory {
+    return {
+      getTasks: () => [
+        {
+          taskFolderPath: TASK_FS_PATH,
+          folderName: "owed-continuation-task",
+          progress: {
+            currentStage: "impl" as TaskStage,
+            status: "active",
+            taskFolder: "owed-continuation-task",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            updatedAt: "2026-08-19T00:00:00.000Z",
+            implRecovery: {
+              sourceAttemptId: "attempt-1",
+              reason: "the round's report was unusable",
+              trigger: "roundIncomplete",
+              mode: "unconstrained",
+              dispatch: "pending",
+              at: "2026-08-21T08:33:00.000Z",
+            },
+            pendingImplReviewFiles: ["src/a.ts", "src/b.ts"],
+          },
+          canonicalId: TASK_FS_PATH,
+        },
+      ],
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+  }
+
+  /** getChildren() fires setContext via executeCommand; the stub throws on unregistered commands. */
+  async function withStubbedCommands<T>(callback: () => Promise<T>): Promise<T> {
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const previous = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+    try {
+      return await callback();
+    } finally {
+      commandsStub._executeCommandOverride = previous;
+    }
+  }
+
+  async function firstTaskNode(provider: TaskTreeProvider): Promise<TaskNode> {
+    const roots = await withStubbedCommands(() => provider.getChildren());
+    const node = roots.find((n): n is TaskNode => n instanceof TaskNode);
+    assert.ok(node, "the single task renders a TaskNode");
+    return node;
+  }
+
+  void it("renders the owed-continuation posture derived from the task's live implRecovery record", async () => {
+    // dispatch: "pending" -> `deriveSchedulingPostureV1` routes this to the
+    // "scheduled" posture (a pending record is retried automatically by the
+    // periodic sweep), not "owedWillNotRetry" — see that function's own
+    // review-flagged 2026-08-23 comment on why a retryable record must not
+    // be described as needing manual intervention.
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const provider = new TaskTreeProvider(makeOwedTaskInventory(), undefined, memento);
+    try {
+      const node = await firstTaskNode(provider);
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.match(tooltipValue, /owed implementation continuation is queued and will be retried automatically/i);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("reads the posture BACK from the scheduling-intent ledger rather than the raw live read (proves the render is ledger-authoritative)", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const provider = new TaskTreeProvider(makeOwedTaskInventory(), undefined, memento);
+    try {
+      // Force the ledger read-back to disagree with the task's own live
+      // `implRecovery.dispatch` ("pending" -> would-retry). If the render
+      // still derives directly from the live read (the defect this test
+      // guards against), the spy below is never consulted and the tooltip
+      // shows the "pending" text regardless. If the render genuinely reads
+      // the ledger back after pushing, this override — which fires on every
+      // `getOwedContinuation` call, including the one this render performs
+      // right after its own push — is what the posture is built from.
+      const store = (provider as unknown as {
+        schedulingIntentStore?: { getOwedContinuation: (id: string) => unknown };
+      }).schedulingIntentStore;
+      assert.ok(store, "provider built a schedulingIntentStore from the supplied Memento");
+      store.getOwedContinuation = (): unknown => ({
+        reason: "a different, ledger-only reason",
+        at: "2026-08-21T09:00:00.000Z",
+        leaseUntil: "2026-08-21T09:45:00.000Z",
+        quarantinedFiles: ["ledger-only-file.ts"],
+        dispatch: "dispatched",
+      });
+
+      const node = await firstTaskNode(provider);
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.match(
+        tooltipValue,
+        /a different, ledger-only reason/i,
+        "posture text reflects the ledger read-back, not the raw task.progress.implRecovery record"
+      );
+      assert.match(
+        tooltipValue,
+        /will not re-fire automatically/i,
+        "dispatch state comes from the ledger's read-back value (\"dispatched\"), not the live record's (\"pending\")"
+      );
     } finally {
       provider.dispose();
     }

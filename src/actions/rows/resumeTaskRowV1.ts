@@ -35,6 +35,7 @@ import { STAGE_ORDER, TaskStage } from "../../types/taskProgress";
 import { deriveTaskBindingV1 } from "../../types/taskBindingV1";
 import { applyReopenPolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
+import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
 import {
   LifecycleBindingInvalidError,
   LifecycleCompletionMarkerMismatchError,
@@ -174,6 +175,11 @@ export async function executeResumeTaskV1(
   if (!patched) {
     return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
   }
+
+  // PART 6.5 (review-flagged 2026-08-23): `applyReopenPolicyV1` clears
+  // `implRecovery` unconditionally on every successful reopen — push that
+  // fact into the scheduling-intent ledger right after the CAS resolves.
+  await syncOwedContinuationLedgerBestEffortV1(input.taskFolderPath, undefined);
 
   return {
     kind: "completed",

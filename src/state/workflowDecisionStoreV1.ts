@@ -31,6 +31,37 @@ function changeEmitterFor(state: vscode.Memento): vscode.EventEmitter<void> {
   return emitter;
 }
 
+/**
+ * In-process tombstone for a decision whose owning continuation has already
+ * ended (cancellation, or an extension-restart sweep) but whose durable
+ * `dismiss` write itself failed (e.g. a rejected `Memento.update`) — task
+ * "Actionable Hand-offs" review, architectural blocker round 3: a failed
+ * cleanup write must not leave the record presenting as answerable just
+ * because the PERSISTED state still reads `"pending"`.
+ *
+ * Deliberately process-wide rather than per-`Memento`: a decisionId is
+ * globally unique (`crypto.randomUUID()`), so there is nothing to key it
+ * against, and the failure this guards is itself an in-process fact (no
+ * continuation exists to resume) independent of which storage instance
+ * observes it. `workflowDecisionDispatchV1.ts` marks/clears this set; this
+ * store only reads it, at the two points a stale-but-still-pending record
+ * could otherwise be treated as live: listing what's pending, and resolving
+ * an answer against it.
+ */
+const orphanedDecisionIds = new Set<string>();
+
+export function markWorkflowDecisionOrphanedV1(decisionId: string): void {
+  orphanedDecisionIds.add(decisionId);
+}
+
+export function clearWorkflowDecisionOrphanedV1(decisionId: string): void {
+  orphanedDecisionIds.delete(decisionId);
+}
+
+export function isWorkflowDecisionOrphanedV1(decisionId: string): boolean {
+  return orphanedDecisionIds.has(decisionId);
+}
+
 export type PostWorkflowDecisionResultV1 =
   | { readonly ok: true; readonly decision: WorkflowDecisionV1 }
   | { readonly ok: false; readonly reason: string };
@@ -44,7 +75,17 @@ export type ResolveWorkflowDecisionResultV1 =
    */
   | { readonly kind: "alreadySettled"; readonly decision: WorkflowDecisionV1 }
   | { readonly kind: "missing" }
-  | { readonly kind: "rejected"; readonly reason: string };
+  | { readonly kind: "rejected"; readonly reason: string }
+  /**
+   * The decision's owning in-process continuation has already ended (its
+   * dismissal write failed, so the persisted record may still read
+   * `"pending"`, but nothing is left to act on an answer). Distinct from
+   * `alreadySettled`: the store record itself may not be settled yet — this
+   * fires from the in-process tombstone, ahead of and independent of the
+   * persisted state, so the caller never dispatches an option's effect into
+   * a continuation that no longer exists.
+   */
+  | { readonly kind: "orphaned" };
 
 export type DismissWorkflowDecisionResultV1 =
   | { readonly kind: "dismissed"; readonly decision: WorkflowDecisionV1 }
@@ -117,12 +158,19 @@ export class WorkflowDecisionStoreV1 {
     return { ok: true, decision: created.decision };
   }
 
-  /** Every pending decision, optionally filtered to one task. */
+  /**
+   * Every pending decision, optionally filtered to one task. Excludes
+   * decisions marked orphaned in-process (see `isWorkflowDecisionOrphanedV1`)
+   * even though their persisted `state` may still read `"pending"` — a
+   * failed cleanup write must not keep presenting the record as answerable.
+   */
   listPending(taskCanonicalId?: string): readonly WorkflowDecisionV1[] {
     const needle = taskCanonicalId !== undefined ? normalizePath(taskCanonicalId) : undefined;
     return this.all().filter(
       (decision) =>
-        decision.state === "pending" && (needle === undefined || normalizePath(decision.taskCanonicalId) === needle)
+        decision.state === "pending" &&
+        !isWorkflowDecisionOrphanedV1(decision.decisionId) &&
+        (needle === undefined || normalizePath(decision.taskCanonicalId) === needle)
     );
   }
 
@@ -135,8 +183,27 @@ export class WorkflowDecisionStoreV1 {
    * caller must resolve here FIRST and only then execute the option's
    * effect, so a second press of an already-resolved control reports
    * `alreadySettled` instead of dispatching the effect twice.
+   *
+   * Paused-answer sequencing (task "Actionable Hand-offs", PART 5, verified
+   * 2026-08-23): this method carries no coupling to `TaskProgress.status` at
+   * all — it never reads it and never refuses on it. A decision is therefore
+   * ALWAYS retained and its option's effect ALWAYS dispatched (by
+   * `ChatViewProvider.resolveWorkflowDecision`, `views/chatView.ts`)
+   * immediately upon resolving, whether the owning task is paused or active.
+   * There is no "accept, then silently drop while paused" path to guard
+   * against here; the answer is never queued or deferred. Whether the
+   * dispatched effect's own command then does something useful on a paused
+   * task is that command's own concern, not this store's.
    */
   async resolve(decisionId: string, optionId: string): Promise<ResolveWorkflowDecisionResultV1> {
+    if (isWorkflowDecisionOrphanedV1(decisionId)) {
+      // The waiter that could act on this answer is already gone (its
+      // dismissal write failed but the continuation still ended). Refuse
+      // BEFORE touching persisted state, so a race between a stale rendered
+      // control and a background retry can never dispatch an option's
+      // effect into nothing.
+      return { kind: "orphaned" };
+    }
     const existing = this.all();
     const index = existing.findIndex((decision) => decision.decisionId === decisionId);
     if (index === -1) {

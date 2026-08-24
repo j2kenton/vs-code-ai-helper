@@ -752,6 +752,106 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
     }
   });
 
+  // Task "Actionable Hand-offs" PART 5: the reconciliation decision must cite
+  // the recorded reason the checklist was flagged unreliable — the stronger
+  // discriminating fact — not only the weaker unticked-item count, and must
+  // state plainly that answering it does not itself resume the task (the
+  // worked example: it was answered while an unrelated escalation, not this
+  // latch, was what held the task paused).
+  void it("cites the recorded checklistProgressUnreliableReason in whyUserNeeded when present", async () => {
+    const name = "reason-present";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+      checklistProgressUnreliableReason:
+        "This round changed no files and landed no checklist ticks, but the most recent review already scored " +
+        "the work above the auto-advance threshold with zero blockers.",
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.match(
+        decision.whyUserNeeded,
+        /most recent review already scored the work above the auto-advance threshold/
+      );
+      assert.doesNotMatch(decision.whyUserNeeded, /not recorded \(older record\)/i);
+      assert.equal(decision.gating?.holdsTaskPaused, false);
+      assert.equal(decision.gating?.unblocksProgress, false);
+      assert.match(decision.gating?.detail ?? "", /does not resume the task/i);
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("cites an explicit 'not recorded' statement when checklistProgressUnreliableReason is absent", async () => {
+    const name = "reason-absent";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.match(decision.whyUserNeeded, /not recorded \(older record\)/i);
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   void it("surfaces the triggering round's own checklist claim when the caller has one in scope", async () => {
     // The two reviewActions.ts call sites (round-completion write path) pass
     // their already-computed `mergeChecklistProgressV1` result in — this is

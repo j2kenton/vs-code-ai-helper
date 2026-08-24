@@ -102,6 +102,7 @@ import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
+import { dismissOrphanedAwaitedDecisionsV1 } from "./utils/workflowDecisionDispatchV1";
 import { setInertTrailingObserverV1 } from "./types/aiResultEnvelope";
 import { setLmToolSessionObserverV1, setLmToolSessionRequestIssuedObserverV1 } from "./services/languageModelToolSessionV1";
 import { setReadToolCallObserverV1 } from "./services/readToolSessionHandlerV1";
@@ -161,7 +162,7 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
 /**
  * This method is called when your extension is activated.
  */
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log("Ensemble is now active!");
   setExtensionContextV1(context);
 
@@ -373,7 +374,9 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         if (actionKey === CHAT_SEND_ACTION_KEY_V1) {
           return await resumeChatSendInteractionV1(
+            context,
             inventory,
+            currentTaskStore,
             chatViewProvider,
             ref,
             resumeIdempotencyId,
@@ -499,6 +502,23 @@ export function activate(context: vscode.ExtensionContext): void {
   for (const operation of pendingOperations.recoverable()) {
     void pendingOperations.update(operation.id, "needs-reconciliation");
   }
+
+  // A `WorkflowDecisionV1` posted by `awaitWorkflowDecisionAnswerV1` (task
+  // "Actionable Hand-offs" review, architectural blocker) can only ever be
+  // settled by the in-process `Promise` that posted it. If this activation
+  // is a restart (window reload, crash, update) that happened while one was
+  // still pending, that promise — and the round it was gating — is gone;
+  // left alone the record would keep presenting as an answerable gate for
+  // work that no longer exists. This is `await`ed (not fire-and-forget) so
+  // it genuinely runs before commands become available: `activate` is
+  // `async`, and VS Code does not treat the extension as activated — or
+  // dispatch any command against it — until the promise this function
+  // returns has settled, which only happens once every statement below,
+  // including this one, has completed. This mirrors the cancellation-time
+  // dismiss the helper itself does for the in-session case.
+  await dismissOrphanedAwaitedDecisionsV1(context.workspaceState).catch((err) =>
+    console.error("Orphaned workflow-decision sweep failed", err)
+  );
 
   // Read-only classification of legacy `creating` folders, published as a
   // barrier that both the first task-inventory publication (below) and every

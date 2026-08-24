@@ -267,6 +267,13 @@ export async function generatePlanWithAI(
           getAutoReviewAfterPlanMode(),
           currentChainedReviewMode()
         ) !== "off",
+      intent: {
+        trigger: "auto-review after plan generation completes",
+        settingKey: "ensemble.autoReviewAfterPlan",
+        expectedTiming: "immediately, once plan generation finishes",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — run the review manually.",
+      },
     });
   }
 
@@ -768,6 +775,13 @@ export async function resumeGeneratePlanInteractionV1(
       taskKey: ownedTask.taskFolderPath,
       chainId: "auto-review",
       stillEnabled: () => getAutoReviewAfterPlanMode() !== "off",
+      intent: {
+        trigger: "auto-review after plan generation completes",
+        settingKey: "ensemble.autoReviewAfterPlan",
+        expectedTiming: "immediately, once plan generation finishes",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — run the review manually.",
+      },
     });
   }
 

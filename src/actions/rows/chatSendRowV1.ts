@@ -15,13 +15,17 @@ import {
 import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 
-import { readChatHistory, writeChatHistory, describeWorkflowStoreFailureV1 } from "../../utils/chatHistoryStore";
+import { appendChatMessageV1, describeWorkflowStoreFailureV1 } from "../../utils/chatHistoryStore";
 import { TaskStage } from "../../types/taskProgress";
 import {
   FileUpdateEnvelope,
   planFileUpdate,
   splitFileUpdateEnvelopes,
 } from "../../utils/chatFileUpdateEnvelope";
+import {
+  planStageAction,
+  splitStageActionEnvelopes,
+} from "../../utils/chatStageActionEnvelope";
 import {
   ensureWorkflowTaskFolderRootV1,
   getWorkflowFileStoreV1,
@@ -138,25 +142,40 @@ async function promoteChatSendContentV1(
     throw new ChatSendPromotionErrorV1("chatSend.v1 received a non-chat-message completed content");
   }
   const input = context.validatedInput as ChatSendActionInputV1;
-  // The envelope must never survive into the displayed/persisted text,
-  // whether or not it is applied — strip it unconditionally before anything
-  // else touches content.text.
-  const { text: strippedText, updates } = splitFileUpdateEnvelopes(content.text);
+  // Neither envelope kind may survive into the displayed/persisted text,
+  // whether or not it is applied — strip both unconditionally before
+  // anything else touches content.text.
+  const { text: fileStrippedText, updates } = splitFileUpdateEnvelopes(content.text);
+  const { text: strippedText, actions } = splitStageActionEnvelopes(fileStrippedText);
+  // Execution needs vscode.window (a confirmation dialog), unavailable
+  // inside this pure promotion path, so a single recognized proposal is
+  // carried on the persisted message for chatWithStage.ts to execute once
+  // this promotion returns. Zero, multiple, or unrecognized proposals are
+  // decided right here by planStageAction, since that verdict needs no UI.
+  const stagePlan = planStageAction(actions);
+  const proposedStageAction = stagePlan.action === "propose" ? stagePlan.proposal : undefined;
+  const actionOutcomeNote = stagePlan.action === "reject" ? stagePlan.note : undefined;
   if (input.taskFolderPath) {
     let finalText = strippedText;
-    const outcomeNote = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, updates);
-    if (outcomeNote) {
-      finalText = finalText.length > 0 ? `${finalText}\n\n${outcomeNote}` : outcomeNote;
+    const fileOutcomeNote = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, updates);
+    for (const note of [fileOutcomeNote, actionOutcomeNote]) {
+      if (note) {
+        finalText = finalText.length > 0 ? `${finalText}\n\n${note}` : note;
+      }
     }
     const canonicalId = input.canonicalId ?? input.taskFolderPath;
-    const history = await readChatHistory(input.taskFolderPath, canonicalId);
-    history.push({
+    // Review-flagged (2026-08-23): a caller-computed read-then-full-write
+    // (readChatHistory + writeChatHistory) silently discards any message a
+    // concurrent writer (e.g. the scheduling-intent auto-start announcement)
+    // appends in between. `appendChatMessageV1` re-reads and appends onto
+    // the CURRENT document inside the shared per-document queue instead.
+    await appendChatMessageV1(input.taskFolderPath, {
       role: "assistant",
       text: finalText,
       stage: (context.stage as TaskStage) ?? "desc",
       at: new Date().toISOString(),
-    });
-    await writeChatHistory(input.taskFolderPath, history, canonicalId);
+      ...(proposedStageAction ? { proposedStageAction } : {}),
+    }, canonicalId);
   }
   return "completed";
 }

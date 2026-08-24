@@ -54,8 +54,10 @@ import {
   claimImplRecoveryDispatchV1,
   ClaimedImplRecoveryV1,
   escalateClaimedSummaryOnlyIfUnavailableV1,
+  owedContinuationSourceV1,
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
+import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
 import {
   isSummaryOnlyDispatchAvailableV1,
   runSummaryOnlyContinuationV1,
@@ -165,6 +167,8 @@ import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
+import { stageActionRequirementMessageV1 } from "../utils/stageArtifactRequirementsV1";
+import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
 import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
 import {
   postReconcilePlanChecklistDecisionV1,
@@ -201,6 +205,7 @@ import {
   readEffectivePlanChecklistProgressV1,
 } from "../utils/effectiveReviewProgress";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
+import { SchedulingIntentMetadataV1 } from "../state/schedulingIntentV1";
 import {
   buildPlanItemVerificationSection,
   buildVerifiedChecksSection,
@@ -221,14 +226,17 @@ import {
   recordTaskImplementationBaselineShaIfAbsentV1,
 } from "../utils/taskImplementationBaselineV1";
 import {
-  blockerIdentities,
+  buildChurnEscalationReasonV1,
+  classifyChurnLineageV1,
   decidePostReviewActionV1,
   decideReviewRoute,
   degenerateReviewRejectionReason,
   IMPL_REVIEW_STAGES_V1,
   detectBlockerSetStall,
   detectPlateau,
+  formatPriorBlockerLineageListV1,
   latestQualifyingReviewMeetsThresholdV1,
+  resolveBlockerLineageV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
   rubricCapLikelyBlockedAdvance,
@@ -236,8 +244,8 @@ import {
   shouldTripNoProgressBreaker,
   STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
+import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV1";
 import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
-import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import {
   getAutoAdvanceMode,
@@ -364,6 +372,13 @@ export function scheduleAutomaticImplementationAfterReview(
       // Re-checked at fire time: the review that scheduled this can run for
       // minutes, and the user may disable auto-implement in the meantime.
       stillEnabled: () => isAutoImplementAfterReviewEnabled(),
+      intent: {
+        trigger: "auto-implement after review completes",
+        settingKey: "ensemble.autoImplementAfterReview",
+        expectedTiming: "immediately, once this review finishes",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — run Implementation manually.",
+      },
     },
     parentOperation
   );
@@ -474,14 +489,11 @@ type ReviewCommandArg =
        * never by a UI surface — same contract as `followUpReviewMode` above.
        *
        * Marks an invocation with no human attached to answer a question.
-       * `runImplementationWithAI`'s pre-run routing check awaits a
-       * `showWarningMessage`, and a VS Code notification carrying buttons does
-       * not auto-dismiss: unanswered, that promise never settles, and it is
-       * awaited inside a tracked operation holding the task's chain guard. An
-       * automation chain that hit it would hang forever rather than run the
-       * round. The unit suite cannot catch this — the harness stubs
-       * `showWarningMessage` to resolve immediately — so the marker is the
-       * guard.
+       * `runImplementationWithAI`'s pre-run routing check posts a
+       * `WorkflowDecisionV1` when task-fixable blockers stand — a decision
+       * record only a human is there to act on, so an automation dispatch
+       * skips posting it entirely rather than adding a decision nobody will
+       * ever see.
        */
       automationDispatch?: true;
     }
@@ -2082,6 +2094,14 @@ export async function handleReviewRoutingOutcome(options: {
       NotificationRouter.showWarning(rejectionReason);
       return { escalated: false };
     }
+    // Part 10: resolve this round's blockers against the PRIOR round's ID'd
+    // list for this same stage, so a reviewer's declared `[same:<id>]` /
+    // `[narrowed:<id>]` citation carries its id forward instead of minting a
+    // fresh, unlinkable one every round — see resolveBlockerLineageV1's doc
+    // comment for the first-round/unknown-citation edge cases.
+    const priorEntryForStage = [...(progressBefore.reviewScoreHistory ?? [])]
+      .reverse()
+      .find((entry) => entry.stage === targetStage);
     const historyEntry = {
       stage: targetStage,
       score,
@@ -2089,7 +2109,7 @@ export async function handleReviewRoutingOutcome(options: {
       at: new Date().toISOString(),
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
-      blockers: blockerIdentities(blockers),
+      blockers: resolveBlockerLineageV1(blockers, priorEntryForStage?.blockers, reviewAttemptId),
       ...(reviewer ? { reviewer } : {}),
     };
     const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
@@ -2126,13 +2146,55 @@ export async function handleReviewRoutingOutcome(options: {
         updated.reviewScoreHistory ?? [],
         targetStage
       );
+      // Part 10: the flat churn count alone can't distinguish "the same
+      // blocker, unchanged" (true churn) from "narrowing" (real progress the
+      // count can't see) or "a different blocker each round" (an unstable
+      // requirement) — only the reviewer's own declared lineage can. When
+      // any round in the window lacks it, say so honestly instead of
+      // guessing from prose.
+      const lineageDiagnosis = classifyChurnLineageV1(
+        updated.reviewScoreHistory ?? [],
+        targetStage,
+        stagnantRounds
+      );
+      // The leading sentence must follow the diagnosis rather than
+      // unconditionally asserting churn — see buildChurnEscalationReasonV1's
+      // doc comment for why this matters (the plan's "The worse case").
+      let reason = buildChurnEscalationReasonV1(
+        STAGE_DISPLAY_NAMES[targetStage],
+        stagnantRounds,
+        lineageDiagnosis
+      );
+      // Surface a plan.md vs plan-final.md disagreement on the blocked
+      // requirement as its own distinct cause — only from a direct textual
+      // comparison, never inferred.
+      try {
+        const planContentForMismatch = await readNonEmptyText(await resolveCurrentPlanUri(folderUri));
+        const planFinalForMismatch = (await readPlanOfRecordV1(folderUri)).text;
+        if (planContentForMismatch && planFinalForMismatch) {
+          for (const blocker of blockers) {
+            if (blocker.resolver !== "task-fixable") {
+              continue;
+            }
+            const mismatch = detectPlanArtifactDisagreementV1(
+              blocker.description,
+              planContentForMismatch,
+              planFinalForMismatch
+            );
+            if (mismatch) {
+              reason += ` ${mismatch}`;
+              break;
+            }
+          }
+        }
+      } catch {
+        // Best-effort enrichment only — never block the escalation itself.
+      }
       const escalated = await escalateReviewToHuman(
         folderUri,
         targetStage,
         "plateau",
-        `${STAGE_DISPLAY_NAMES[targetStage]} has completed ${stagnantRounds} consecutive rounds without ` +
-          "reducing the number of task-fixable blockers (churn ceiling, " +
-          "ensemble.resilience.churnCeilingRounds). Automated iteration is churning, not converging.",
+        reason,
         reviewAttemptId,
         updated,
         false
@@ -2717,6 +2779,13 @@ async function routeReviewOutcomeV1(
                     // Dropped at fire time if auto-advance was turned off
                     // while this chain waited for the root operation to end.
                     stillEnabled: () => isAutoAdvanceEnabled(),
+                    intent: {
+                      trigger: "auto-review after advancing to the next stage",
+                      settingKey: "ensemble.autoAdvanceEnabled",
+                      expectedTiming: "once this stage's operation lock releases",
+                      willRetry: false,
+                      retryNote: "Not retried automatically if dropped — run the review manually.",
+                    },
                   },
                   operation
                 );
@@ -3100,6 +3169,18 @@ export async function pauseTaskForExhaustedChainV1(
         "(a known outage, a misconfigured model) in a way the code cannot detect.",
       options,
       recommendation,
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail:
+          "This decision is what is holding the task paused. \"Retry now\" resumes the task immediately (it " +
+          "still will not rerun the stage for you). \"Adjust provider settings\" opens Settings but does not " +
+          "resume the task by itself — pick Retry or Wait for reset afterward." +
+          (quotaParkRecord?.resetAt !== undefined
+            ? ` "Wait for reset" keeps the task paused but schedules an automatic retry at ${quotaParkRecord.resetAt}.`
+            : "") +
+          " \"Leave paused\" does nothing and the task stays paused until you choose one of the other options.",
+      },
     },
     target
   );
@@ -3155,6 +3236,18 @@ export async function runReviewForFolder(
   }
   if (previousReview !== undefined) {
     variables.previousReview = previousReview;
+    // Part 10: give this re-review the prior round's ID'd blocker list so it
+    // can declare lineage (`[same:<id>]` / `[narrowed:<id>]` / `[new]`)
+    // against something concrete, rather than inventing ids or citing
+    // nothing. Read once here (not just inside the impl-review branch below)
+    // so plan re-reviews get it too.
+    const priorHistoryForLineage = (await readTaskProgressAdvisoryV1(folderUri))?.reviewScoreHistory;
+    const priorEntryForLineage = [...(priorHistoryForLineage ?? [])]
+      .reverse()
+      .find((entry) => entry.stage === targetStage);
+    variables.priorBlockerLineageList = formatPriorBlockerLineageListV1(
+      priorEntryForLineage?.blockers
+    );
   }
 
   // 2i: stamp the commit this review actually assesses, and — for a
@@ -3202,7 +3295,7 @@ export async function runReviewForFolder(
     const planContent = await readNonEmptyText(planUri);
     if (!planContent) {
       NotificationRouter.showWarning(
-        "No plan found (or it is empty). Generate or write a plan first."
+        stageActionRequirementMessageV1("reviewPlan", 0)
       );
       return;
     }
@@ -3237,7 +3330,7 @@ export async function runReviewForFolder(
     const planContent = await readNonEmptyText(planUri);
     if (!planContent) {
       NotificationRouter.showWarning(
-        "No plan found (or it is empty). Generate or write a plan before reviewing implementation."
+        stageActionRequirementMessageV1("reviewImplementation", 0)
       );
       return;
     }
@@ -3252,8 +3345,7 @@ export async function runReviewForFolder(
     const implementationContent = await readImplementationReviewContent(folderUri);
     if (!implementationContent) {
       NotificationRouter.showWarning(
-        `No implementation notes found (${IMPLEMENTATION_SUMMARY_FILENAME} and plan-final.md are ` +
-          "missing or empty). Run the implementation step first."
+        stageActionRequirementMessageV1("reviewImplementation", 1)
       );
       return;
     }
@@ -3996,7 +4088,7 @@ export async function applyReviewWithAI(
     const planContent = await readNonEmptyText(currentPlanUri);
     if (!planContent) {
       NotificationRouter.showWarning(
-        "No plan found (or it is empty). Nothing to apply the review to."
+        stageActionRequirementMessageV1("applyReviewPlan", 0)
       );
       return;
     }
@@ -5129,7 +5221,7 @@ async function applyImplementationReviewWithAI(
     canonicalUri = await materializeCanonicalIfNeeded(folderUri);
   } catch {
     NotificationRouter.showWarning(
-      "No plan-final.md found. Nothing to apply the review to."
+      stageActionRequirementMessageV1("applyReviewImplementation", 0)
     );
     return false;
   }
@@ -5137,7 +5229,7 @@ async function applyImplementationReviewWithAI(
   const planOfRecordNotes = await readNonEmptyText(canonicalUri);
   if (!planOfRecordNotes) {
     NotificationRouter.showWarning(
-      "No plan-final.md found. Nothing to apply the review to."
+      stageActionRequirementMessageV1("applyReviewImplementation", 0)
     );
     return false;
   }
@@ -5608,6 +5700,13 @@ export async function nextStage(
         arg: target,
         taskKey,
         stillEnabled: () => completeAndMoveOnTriggersAI(),
+        intent: {
+          trigger: "Complete & Move On triggers AI: generate the plan for the next stage",
+          settingKey: "ensemble.completeAndMoveOnTriggersAI",
+          expectedTiming: "immediately — this stage transition dispatches it now",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — generate the plan manually.",
+        },
       });
       return;
     }
@@ -5621,6 +5720,13 @@ export async function nextStage(
         arg: { ...target, automationDispatch: true },
         taskKey,
         stillEnabled: () => completeAndMoveOnTriggersAI(),
+        intent: {
+          trigger: "Complete & Move On triggers AI: run implementation for the next stage",
+          settingKey: "ensemble.completeAndMoveOnTriggersAI",
+          expectedTiming: "immediately — this stage transition dispatches it now",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — run Implementation manually.",
+        },
       });
       return;
     }
@@ -5637,6 +5743,13 @@ export async function nextStage(
       const reviewScheduled = await scheduleAutomationChain({
         command: publishCommand,
         arg: target,
+        intent: {
+          trigger: "Complete & Move On triggers AI: run the Publish review",
+          settingKey: "ensemble.completeAndMoveOnTriggersAI",
+          expectedTiming: "immediately — this stage transition dispatches it now",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — run the review manually.",
+        },
         taskKey,
         chainId: "auto-review",
         stillEnabled: () => completeAndMoveOnTriggersAI(),
@@ -5747,6 +5860,13 @@ export async function nextStage(
       taskKey: resolved.folderUri.fsPath,
       chainId: "auto-review",
       stillEnabled: () => completeAndMoveOnTriggersAI(),
+      intent: {
+        trigger: "Complete & Move On triggers AI: review after advancing to the next stage",
+        settingKey: "ensemble.completeAndMoveOnTriggersAI",
+        expectedTiming: "immediately — this stage transition dispatches it now",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — run the review manually.",
+      },
     });
   }
 }
@@ -5996,7 +6116,7 @@ export async function generateImplementationWithAI(
       }
       if (!planFinalContent) {
         NotificationRouter.showWarning(
-          "No plan found. Advance to the Implementation stage first."
+          stageActionRequirementMessageV1("generateImplementationChecklist", 0)
         );
         return;
       }
@@ -6924,31 +7044,82 @@ async function executeImplementationRun(
         history: priorProgress?.reviewScoreHistory,
         stages: IMPL_REVIEW_STAGES_V1,
         hasUntickedChecklistItems: (remainingChecklistProgress?.remaining ?? 0) > 0,
+        continuationOwed: (persistedRounds ?? priorProgress)?.implRecovery !== undefined,
+        pendingImplReviewFilesCount:
+          (persistedRounds ?? priorProgress)?.pendingImplReviewFiles?.length ?? 0,
       });
       if (sterileRoundDecision.action === "apply-review") {
-        NotificationRouter.showWarning(
-          `Implementation changed no files. ${sterileRoundDecision.reason} ` +
-            "Running Implementation again will give the same result.",
-          undefined,
-          undefined,
-          undefined,
+        // Migrated off the single-action-button `NotificationRouter.showWarning`
+        // notification onto a `WorkflowDecisionV1` record (task "Actionable
+        // Hand-offs", "The worse case", fix part 2) — a message with a button
+        // that changes what happens next is a decision, not a notification,
+        // and this one decides from the same routing `preImplementationRouting`
+        // does (this round just ran at `impl`, where every apply command
+        // refuses — see goToReviewAndApplyV1).
+        const targetReviewStage: TaskStage =
+          sterileRoundDecision.reviewStage === "impl-high-review"
+            ? "impl-high-review"
+            : "impl-low-review";
+        const sterileStage = priorProgress?.currentStage ?? postRunReviewStage;
+        const target: ChatTarget = {
+          canonicalId: folderUri.fsPath,
+          taskFolderPath: folderUri.fsPath,
+          stage: sterileStage,
+          taskName: priorProgress?.displayName,
+        };
+        const sterileDecisionPosted = await postWorkflowDecisionV1(
           {
-            // Moves to the review stage first — this round just ran at
-            // `impl`, where every apply command refuses. See
-            // goToReviewAndApplyV1.
-            command: "vs-code-ai-helper.goToReviewAndApply",
-            title: "Go to Review & Apply",
-            args: [
+            decisionKey: "sterileRoundRouting",
+            taskCanonicalId: folderUri.fsPath,
+            stage: sterileStage,
+            whatHappened: `Implementation changed no files. ${sterileRoundDecision.reason}`,
+            whyUserNeeded:
+              "Implementation only reads the plan checklist, so running it again will give the same " +
+              "result — only Apply Review can fix what the newest review still reports.",
+            options: [
               {
-                taskFolderPath: folderUri.fsPath,
-                reviewStage:
-                  sterileRoundDecision.reviewStage === "impl-high-review"
-                    ? "impl-high-review"
-                    : "impl-low-review",
+                optionId: "goToReviewAndApply",
+                label: "Go to Review & Apply",
+                consequence:
+                  `Moves the task to ${STAGE_DISPLAY_NAMES[targetReviewStage]} and opens Apply Review, ` +
+                  "which can fix the blockers Implementation cannot see.",
+                effect: {
+                  kind: "command",
+                  command: "vs-code-ai-helper.goToReviewAndApply",
+                  args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetReviewStage }],
+                },
+              },
+              {
+                optionId: "notNow",
+                label: "Not now",
+                consequence:
+                  "Does nothing. Review the implementation run log and use Apply Review yourself when ready.",
+                effect: { kind: "doNothing" },
               },
             ],
-          }
+            recommendation: {
+              kind: "option",
+              optionId: "goToReviewAndApply",
+              reasoning:
+                "Apply Review is the only action that can fix what the newest review still reports; " +
+                "running Implementation again will give the same (unchanged) result.",
+            },
+            gating: {
+              holdsTaskPaused: false,
+              unblocksProgress: false,
+              detail:
+                "This does not pause or resume the task — it only offers a shortcut to the review stage. " +
+                "\"Not now\" does nothing further; you can still run Apply Review manually at any time.",
+            },
+          },
+          target
         );
+        if (!sterileDecisionPosted) {
+          NotificationRouter.showWarning(
+            `Implementation changed no files. ${sterileRoundDecision.reason} ` +
+              "Running Implementation again will give the same result."
+          );
+        }
       } else {
         NotificationRouter.showInformation(
           "Implementation finished with no file changes — the model reported the current state already " +
@@ -7441,6 +7612,18 @@ async function executeImplementationRun(
       return promotedBase;
     });
 
+    // PART 6.5 (review-flagged 2026-08-23): `promotePendingImplReviewFiles`
+    // above clears `implRecovery` unconditionally whenever this round
+    // produced a usable summary (`summaryIssue === undefined`), and otherwise
+    // leaves it untouched — either way `persistedAfterRun.implRecovery` (once
+    // the CAS above has actually resolved) is the ground truth. Push it into
+    // the scheduling-intent ledger right after the CAS resolves, never from
+    // inside the callback, which may re-run on a retry.
+    await syncOwedContinuationLedgerBestEffortV1(
+      folderUri.fsPath,
+      owedContinuationSourceV1(persistedAfterRun?.implRecovery, persistedAfterRun?.pendingImplReviewFiles ?? [])
+    );
+
     // Visibility for the excluded remainder (finding 2's acceptance
     // criterion): paths that changed in the workspace during the round
     // without the round claiming them are recorded in the run file rather
@@ -7655,7 +7838,8 @@ async function executeImplementationRun(
     // "auto-review" chainId so they can never duplicate each other.
     const dispatchReviewChainAfterLockRelease = (
       command: string,
-      stillEnabled: () => boolean
+      stillEnabled: () => boolean,
+      intent: SchedulingIntentMetadataV1
     ): void => {
       void scheduleAutomationChain(
         {
@@ -7667,6 +7851,7 @@ async function executeImplementationRun(
           // hold the lock for minutes, and the user may turn the automation
           // off in the meantime — the queued chain must then drop.
           stillEnabled,
+          intent,
         },
         options.parentOperation
       );
@@ -7705,7 +7890,14 @@ async function executeImplementationRun(
                   ? "vs-code-ai-helper.fastForwardReviewWithAI"
                   : "vs-code-ai-helper.runReviewWithAI",
                 () =>
-                  strongestAutoTriggerMode(getAutoAdvanceMode(), fireTimeFollowUpMode()) !== "off"
+                  strongestAutoTriggerMode(getAutoAdvanceMode(), fireTimeFollowUpMode()) !== "off",
+                {
+                  trigger: "auto-advance review after implementation completes",
+                  settingKey: "ensemble.autoAdvanceEnabled",
+                  expectedTiming: "once this round's operation lock releases",
+                  willRetry: false,
+                  retryNote: "Not retried automatically if dropped — run the review manually.",
+                }
               );
             }
           }
@@ -7737,7 +7929,14 @@ async function executeImplementationRun(
             strongestAutoTriggerMode(
               getAutoReviewAfterImplementationMode(),
               fireTimeFollowUpMode()
-            ) !== "off"
+            ) !== "off",
+          {
+            trigger: "auto-review after implementation completes",
+            settingKey: "ensemble.autoReviewAfterImplementation",
+            expectedTiming: "once this round's operation lock releases",
+            willRetry: false,
+            retryNote: "Not retried automatically if dropped — run the review manually.",
+          }
         );
       }
     }
@@ -7883,7 +8082,7 @@ export async function runImplementationWithAI(
     let planFinalContent = await readNonEmptyText(canonicalUri);
     if (!planFinalContent) {
       NotificationRouter.showWarning(
-        "No plan-final.md found. Advance to the Implementation stage first."
+        stageActionRequirementMessageV1("runImplementation", 0)
       );
       return;
     }
@@ -8012,12 +8211,19 @@ export async function runImplementationWithAI(
       stages: IMPL_REVIEW_STAGES_V1,
       hasUntickedChecklistItems:
         ((await readPlanOfRecordV1(resolved.folderUri)).counts?.remaining ?? 0) > 0,
+      continuationOwed: resolved.progress.implRecovery !== undefined,
+      pendingImplReviewFilesCount: resolved.progress.pendingImplReviewFiles?.length ?? 0,
     });
-    // Never ask a question nobody is there to answer. An automation chain
-    // proceeds straight to the round: the standing-blockers notice appended
-    // to its prompt below still puts the blockers in front of the model, and
-    // the zero-file-change warning after the round still offers the user the
-    // Apply Review button — so the chain loses the prompt, not the routing.
+    // Advisory only — never gates this run. The pre-migration dialog already
+    // defaulted to proceeding whenever it was not answered with "Go to
+    // Review & Apply" (comment above: "defaulting to proceeding keeps every
+    // existing automated caller behaving exactly as before"); replacing an
+    // awaited blocking notification with an asynchronously-resolved decision
+    // record must not turn that default-proceed behavior into a default-stop
+    // one — the record is posted so the choice is visible and actionable in
+    // Chat, and this round runs immediately after, exactly as an unanswered
+    // dialog used to fall through. Automation dispatches skip the post
+    // entirely: no human is there to act on it.
     if (preRunDecision.action === "apply-review" && !isAutomationDispatchV1(arg)) {
       // One sentence of what is wrong, one of what to do. Explaining the
       // mechanism accurately while leaving the user with no idea which button
@@ -8036,19 +8242,82 @@ export async function runImplementationWithAI(
         preRunDecision.reviewStage === "impl-high-review"
           ? "impl-high-review"
           : "impl-low-review";
-      const choice = await vscode.window.showWarningMessage(
-        `${preRunDecision.reason} Running Implementation now will most likely change nothing.`,
-        { modal: false },
-        "Go to Review & Apply",
-        "Run Implementation Anyway"
+      // Migrated off `vscode.window.showWarningMessage` (task "Actionable
+      // Hand-offs", "The worse case", fix part 2): the raw notification
+      // blocked awaiting an answer inside this tracked operation, which is
+      // why an automation dispatch needed its own bypass marker above to
+      // avoid hanging forever on a question nobody was there to answer. A
+      // `WorkflowDecisionV1` is posted and resolved asynchronously — this
+      // function does not await it, so the operation's lock is never held on
+      // a human answer.
+      const target: ChatTarget = {
+        canonicalId: resolved.folderUri.fsPath,
+        taskFolderPath: resolved.folderUri.fsPath,
+        stage: resolved.progress.currentStage,
+        taskName: resolved.progress.displayName,
+      };
+      const decision = await postWorkflowDecisionV1(
+        {
+          decisionKey: "preImplementationRouting",
+          taskCanonicalId: resolved.folderUri.fsPath,
+          stage: resolved.progress.currentStage,
+          whatHappened: `${preRunDecision.reason} Implementation is running now anyway — it will most likely change nothing.`,
+          whyUserNeeded:
+            "Implementation only reads the plan checklist, so it cannot fix what the newest review still " +
+            "reports — this offers a shortcut to the review stage instead of leaving you to notice, after " +
+            "the round finishes having changed nothing, that Apply Review was the action you needed.",
+          options: [
+            {
+              optionId: "goToReviewAndApply",
+              label: "Go to Review & Apply",
+              consequence:
+                `Moves the task to ${STAGE_DISPLAY_NAMES[targetReviewStage]} and opens Apply Review, which ` +
+                "can fix the blockers Implementation cannot see (Implementation only reads the plan checklist). " +
+                "Moving stages first requests the Implementation round already running to cancel — a task " +
+                "never has two automations running against it at once — so this also stops the current run.",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.goToReviewAndApply",
+                args: [{ taskFolderPath: resolved.folderUri.fsPath, reviewStage: targetReviewStage }],
+              },
+            },
+            {
+              optionId: "letItRun",
+              label: "Let Implementation Run",
+              consequence:
+                "Does nothing further. Implementation keeps running as already started, and will most " +
+                "likely change nothing while the standing blockers remain.",
+              effect: { kind: "doNothing" },
+            },
+          ],
+          recommendation: {
+            kind: "option",
+            optionId: "goToReviewAndApply",
+            reasoning:
+              "Apply Review is the only action that can fix what the newest review still reports; " +
+              "Implementation is structurally blind to it and will most likely change nothing.",
+          },
+          gating: {
+            holdsTaskPaused: false,
+            unblocksProgress: false,
+            detail:
+              "This does not pause or resume the task. \"Go to Review & Apply\" requests the Implementation " +
+              "round already running to cancel first, since moving stages always stops whatever the outgoing " +
+              "stage was doing; \"Let Implementation Run\" leaves the current run going untouched.",
+          },
+        },
+        target
       );
-      if (choice === "Go to Review & Apply") {
-        await goToReviewAndApplyV1({
-          taskFolderPath: resolved.folderUri.fsPath,
-          reviewStage: targetReviewStage,
-        });
-        return;
+      if (!decision) {
+        // No activating extension context to post through (e.g. a unit-test
+        // harness stubbing only the write path) — fall back to the direct
+        // notification so the choice is not lost entirely.
+        NotificationRouter.showWarning(
+          `${preRunDecision.reason} Running Implementation now will most likely change nothing.`
+        );
       }
+      // Falls through to run Implementation — see the comment above this
+      // block for why this must not gate the current run.
     }
 
     const contextPackContent = await generateContextPack(
@@ -8262,11 +8531,38 @@ export async function applyReviewEditWithAI(
     // persisted after that snapshot was taken at command entry.
     const progressForApply = await readTaskProgressAdvisoryV1(resolved.folderUri);
     if (progressForApply?.reviewInvalidatedByRound?.stage === stage) {
-      NotificationRouter.showWarning(
-        "An implementation round changed the workspace after this review was written " +
+      // When the invalidation is caused by a STILL-owed continuation, the
+      // plain "run the review again" line hides the actual blocker (a
+      // continuation round is queued or already claimed, and re-running the
+      // review will hit the same refusal) — route through the refusal
+      // explainer instead, which names the lease, the quarantined files, and
+      // whether retrying can help at all (task "Actionable Hand-offs",
+      // "Also in scope: when an action refuses, say what is blocking it and
+      // when it clears"). A cleared/absent `implRecovery` (the round was
+      // already claimed and completed, or never quarantined anything) falls
+      // back to the plain message unchanged.
+      const message = progressForApply.implRecovery
+        ? describeOwedContinuationRefusalV1(
+            progressForApply.implRecovery,
+            progressForApply.pendingImplReviewFiles ?? [],
+            progressForApply.incompleteRoundContinuations ?? 0
+          )
+        : "An implementation round changed the workspace after this review was written " +
           "(the round ended without a usable report), so the review no longer describes " +
-          "the tree. Run the review again before applying it."
-      );
+          "the tree. Run the review again before applying it.";
+      NotificationRouter.showWarning(message);
+      if (progressForApply.implRecovery) {
+        try {
+          await writeRunLog(
+            resolved.folderUri,
+            "declined",
+            stage,
+            `# Action Declined\n\nStatus: declined (owed continuation)\n\n${message}`
+          );
+        } catch {
+          // Courtesy history record only — the refusal above already ran.
+        }
+      }
       return;
     }
     const reviewValidation = validateReviewOutput(reviewContent);
@@ -8814,8 +9110,8 @@ async function buildReviewResumeVariablesV1(
     return {
       ok: false,
       warning: isPlanReview
-        ? "No plan found (or it is empty). Generate or write a plan first."
-        : "No plan found (or it is empty). Generate or write a plan before reviewing implementation.",
+        ? stageActionRequirementMessageV1("reviewPlan", 0)
+        : stageActionRequirementMessageV1("reviewImplementation", 0),
     };
   }
   variables.plan = planContent;
@@ -8845,7 +9141,7 @@ async function buildReviewResumeVariablesV1(
     if (!implementationContent) {
       return {
         ok: false,
-        warning: `No implementation notes found (${IMPLEMENTATION_SUMMARY_FILENAME} and plan-final.md are missing or empty). Run the implementation step first.`,
+        warning: stageActionRequirementMessageV1("reviewImplementation", 1),
       };
     }
     if (isUnusableImplementationSummaryV1(implementationContent)) {

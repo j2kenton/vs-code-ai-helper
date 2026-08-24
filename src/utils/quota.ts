@@ -6,6 +6,8 @@ import { taskOperations } from "./taskOperations";
 import { NotificationRouter } from "./notificationRouter";
 import { parseModelSelection } from "../runners/providers";
 import { getResilienceSettings, resolveQuotaAccountKeyV1 } from "../config/settings";
+import { awaitWorkflowDecisionAnswerV1 } from "./workflowDecisionDispatchV1";
+import { ChatTarget } from "../views/chatView";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -507,14 +509,56 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   taskOperations.setWaitingForUser(request.taskFolderUri.fsPath, true);
   // Also route into the internal Notifications panel as a terminal/error
   // record (per severity policy: exhausted credits block the run). The
-  // interactive choice itself must stay a real modal below — "Resume" vs
+  // interactive choice itself must stay a real decision below — "Resume" vs
   // "Switch model" are genuine alternative actions the caller branches on.
   NotificationRouter.showError("AI credits are exhausted. Can't proceed without your input — resume when credits restore, or switch model.");
-  const choice = await vscode.window.showWarningMessage("AI credits are exhausted.", "Resume when credits restore", "Switch model");
+  // Migrated off `vscode.window.showWarningMessage` (task "Actionable
+  // Hand-offs", Part 11 notification audit, site #23): this caller `await`s
+  // the answer and branches on it, so — unlike the two advisory,
+  // fire-and-forget dialogs already migrated in reviewActions.ts — it needs
+  // `awaitWorkflowDecisionAnswerV1`, not `postWorkflowDecisionV1`.
+  const target: ChatTarget = {
+    canonicalId: request.taskFolderUri.fsPath,
+    taskFolderPath: request.taskFolderUri.fsPath,
+    stage: request.stage,
+  };
+  const chosenOptionId = await awaitWorkflowDecisionAnswerV1(
+    {
+      decisionKey: "quotaExhaustedDuringRun",
+      taskCanonicalId: request.taskFolderUri.fsPath,
+      stage: request.stage,
+      whatHappened: "AI credits are exhausted, so this run cannot proceed.",
+      whyUserNeeded: "The run cannot continue without your choice, and the extension cannot resume credits or switch models on its own.",
+      options: [
+        {
+          optionId: "resume",
+          label: "Resume when credits restore",
+          consequence: "Waits and retries this same request once credits are available again; nothing runs until then.",
+          effect: { kind: "doNothing" },
+        },
+        {
+          optionId: "switch",
+          label: "Switch model",
+          consequence: "Opens model selection so a different model (with its own credit pool) can be used instead of retrying this one.",
+          effect: { kind: "doNothing" },
+        },
+      ],
+      recommendation: {
+        kind: "none",
+        reasoning: "Only you know whether waiting for credits to restore or switching models is preferable right now.",
+      },
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail: "The run is waiting on this exact choice; answering it either resumes the run or lets you pick a different model to run instead.",
+      },
+    },
+    target
+  );
   taskOperations.report(request.taskFolderUri.fsPath, undefined);
   taskOperations.setWaitingForUser(request.taskFolderUri.fsPath, false);
-  if (choice === "Switch model") { await switchModel?.(); return "switch"; }
-  return choice === "Resume when credits restore" ? "resume" : undefined;
+  if (chosenOptionId === "switch") { await switchModel?.(); return "switch"; }
+  return chosenOptionId === "resume" ? "resume" : undefined;
 }
 
 // ─── Session-observed quota status ──────────────────────────────────────────

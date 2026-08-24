@@ -249,7 +249,7 @@ void describe("runTrackedOperation", () => {
     linkedPre.dispose();
   });
 
-  void it("showTaskBusyWarning surfaces the busy operation's own label", () => {
+  void it("showTaskBusyWarning surfaces the busy operation's own label", async () => {
     const taskPath = `/tmp/rto-label-${Math.random()}`;
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
@@ -257,7 +257,7 @@ void describe("runTrackedOperation", () => {
     try {
       const handle = taskOperations.begin(taskPath, { label: "Running Implementation" });
       assert.ok(handle);
-      showTaskBusyWarning(taskPath);
+      await showTaskBusyWarning(taskPath);
       assert.ok(
         surface.entries.some((e) => e.message.includes("Running Implementation")),
         `expected the busy label in the warning; got: ${JSON.stringify(surface.entries)}`

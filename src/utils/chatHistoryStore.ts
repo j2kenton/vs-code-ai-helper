@@ -145,16 +145,52 @@ export { GLOBAL_ASSISTANT_CANONICAL_ID };
  *
  * CONCURRENCY — as before (see the historical note preserved in
  * DISCLAIMER.md and plans/2026-07-14_task_5/task.md): writes to one task's
- * transcript are serialized only within this extension-host window (the
- * per-task queue in ChatViewProvider), not by a cross-process lease. This
- * remains a deliberate, weaker guarantee than task-progress.json's
- * `patchTaskProgress` lease.
+ * transcript are serialized only within this extension-host window, not by a
+ * cross-process lease. This remains a deliberate, weaker guarantee than
+ * task-progress.json's `patchTaskProgress` lease. Review-flagged (2026-08-23):
+ * that in-process guarantee used to depend on every writer sharing
+ * ChatViewProvider's own separate per-task queue, which not every caller did
+ * (e.g. `appendChatMessageV1` callers outside it) — a real gap, since
+ * `WorkflowFileStoreV1.replaceFileExact`'s revision-check-then-rename is two
+ * separate steps and two concurrent in-process callers could interleave
+ * between them, silently losing one writer's message with no reported
+ * conflict. Every read-modify-write cycle in this module (writeChatHistory,
+ * appendChatMessageV1, appendChatInteraction, readChatInteractions'
+ * reconciliation, recordChatInteractionAnswers, settleChatInteraction,
+ * resetChatHistoryV1) now goes through `withChatDocumentQueueV1`, a per-
+ * document in-process serialization queue — see its doc comment — so the
+ * in-process guarantee this paragraph promises is actually enforced module-
+ * wide, not only for callers that happen to share one particular provider's
+ * queue.
  */
 
 const CHAT_HISTORY_SCHEMA_VERSION = 1;
 export const CHAT_HISTORY_MAX_MESSAGES = 200;
 export const CHAT_HISTORY_MAX_FILE_BYTES = 4 * 1024 * 1024;
 export const CHAT_HISTORY_MAX_MESSAGE_BYTES = 64 * 1024;
+
+/**
+ * Fires after every successful write to a task's chat-v1.json, from
+ * `persistDocument` — the single choke point every writer in this module
+ * (writeChatHistory, appendChatInteraction, recordChatInteractionAnswers,
+ * settleChatInteraction, resetChatHistoryV1, the legacy-migration commit)
+ * already funnels through. This is the "persisted chat store" half of Part
+ * 4.1's "make rendering a function of the persisted chat file ..., re-derived
+ * on store change": `ChatViewProvider` only re-rendered on `taskOperations`
+ * and `workflowDecisionStore` changes, so a write from OUTSIDE that provider
+ * instance — `actions/rows/chatSendRowV1.ts` and
+ * `actions/rows/globalAssistantSendRowV1.ts` both call `writeChatHistory`
+ * directly — left an already-open panel showing that target stale until some
+ * unrelated trigger happened to re-render it.
+ */
+const chatHistoryChangeEmitterV1 = new vscode.EventEmitter<{
+  readonly taskFolderPath: string;
+  readonly canonicalId: string;
+}>();
+export const onDidChangeChatHistoryV1: vscode.Event<{
+  readonly taskFolderPath: string;
+  readonly canonicalId: string;
+}> = chatHistoryChangeEmitterV1.event;
 
 /**
  * The fail-closed recovery condition (plan §5.1/§3.7's `chatRecoveryRequired`):
@@ -189,6 +225,17 @@ export interface ChatMessage {
    * never carry controls or Resume a provider.
    */
   legacyRecovery?: "legacyPendingAssistant" | "legacyQuestion";
+  /**
+   * A recognized stage-chat `[[ACTION:id]]` envelope extracted from this
+   * assistant message's raw response text by `promoteChatSendContentV1`
+   * (`actions/rows/chatSendRowV1.ts`), awaiting execution. Execution needs
+   * `vscode.window` (a confirmation dialog), which is unavailable inside the
+   * pure promotion path, so `chatWithStage.ts` reads this back once the
+   * message is persisted, executes it, and appends a follow-up assistant
+   * message with the outcome. Never read a second time for the same message,
+   * so an action is never executed twice.
+   */
+  proposedStageAction?: { id: string; payload?: unknown };
 }
 
 /** The display-mirror states a structured-question interaction can be in (plan §5.1/§5.5). */
@@ -543,6 +590,17 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
     ) {
       return undefined;
     }
+    if (e.proposedStageAction !== undefined) {
+      const proposal = e.proposedStageAction;
+      if (
+        typeof proposal !== "object" ||
+        proposal === null ||
+        typeof (proposal as Record<string, unknown>).id !== "string" ||
+        ((proposal as Record<string, unknown>).id as string).length === 0
+      ) {
+        return undefined;
+      }
+    }
     if (e.stage === null || e.stage === undefined) {
       // A null stage snapshot is legal only on a migrated legacy recovery
       // record (plan §5.2's "Missing stage → snapshot null").
@@ -558,6 +616,9 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
       ...(e.pending !== undefined ? { pending: e.pending } : {}),
       ...(e.legacyRecovery !== undefined
         ? { legacyRecovery: e.legacyRecovery as "legacyPendingAssistant" | "legacyQuestion" }
+        : {}),
+      ...(e.proposedStageAction !== undefined
+        ? { proposedStageAction: e.proposedStageAction as { id: string; payload?: unknown } }
         : {}),
     });
   }
@@ -890,6 +951,70 @@ function enforceDocumentLimitsV1(document: ChatDocumentV1): ChatDocumentV1 {
 }
 
 
+/**
+ * In-process, per-document serialization for every chat-v1.json read-modify-
+ * write cycle.
+ *
+ * Review-flagged (2026-08-23): `WorkflowFileStoreV1.replaceFileExact` checks
+ * the expected revision (an `lstat`) and performs the actual rename as two
+ * SEPARATE steps. Two concurrent in-process callers targeting the SAME
+ * document can both `await` between those steps, so both can read the same
+ * "current" revision before either has renamed — both checks pass, both
+ * writers proceed, and the second rename silently discards the first
+ * writer's content even though neither `replaceFileExact` call itself
+ * reported any failure. `persistDocument`'s optimistic-concurrency retry
+ * (see `appendChatMessageV1`) cannot close this: retrying only fires on a
+ * REPORTED conflict, and this race produces none.
+ *
+ * This module's CONCURRENCY contract (see the module header) already
+ * promises "serialized only within this extension-host window" — this queue
+ * is what actually delivers that promise for every writer in this module,
+ * not only callers that happen to share `ChatViewProvider`'s own separate
+ * per-task queue (e.g. the scheduling-intent auto-start announcement, or any
+ * other direct caller of `appendChatMessageV1`/`writeChatHistory`/the
+ * interaction functions below). By serializing every read-modify-write cycle
+ * for one document, no two in-process callers can ever observe the same
+ * revision before one of them writes, so the TOCTOU gap above cannot occur
+ * for in-process races — closing exactly the gap the real-filesystem
+ * `Promise.all` tests could not deterministically force.
+ *
+ * Cross-process races remain the pre-existing, documented weaker guarantee:
+ * a conflict from another process still surfaces as an error (or, in
+ * `appendChatMessageV1`, a retry) rather than being silently lost — this
+ * queue does not and cannot extend to another process.
+ */
+const chatDocumentQueuesV1 = new Map<string, Promise<void>>();
+
+function chatDocumentQueueKeyV1(taskFolderPath: string, canonicalId: string): string {
+  return `${taskFolderPath} ${canonicalId}`;
+}
+
+/** Run `fn` after every previously-queued operation for this exact document
+ * (task folder + canonical id) has settled, so no two in-process callers can
+ * ever interleave a read-modify-write cycle against it. A rejection from one
+ * queued operation never jams the queue for the next one. */
+async function withChatDocumentQueueV1<T>(
+  taskFolderPath: string,
+  canonicalId: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const key = chatDocumentQueueKeyV1(taskFolderPath, canonicalId);
+  const prior = chatDocumentQueuesV1.get(key) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  chatDocumentQueuesV1.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    if (chatDocumentQueuesV1.get(key) === tail) {
+      chatDocumentQueuesV1.delete(key);
+    }
+  }
+}
+
 async function persistDocument(
   taskFolderPath: string,
   document: ChatDocumentV1,
@@ -904,20 +1029,22 @@ async function persistDocument(
       ? await fileStore.replaceFileExact(locator, bytes, expectedRevision)
       : await fileStore.createFileExclusive(locator, bytes);
   if (result.kind === "ok") {
+    chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
     return;
   }
-  if (result.kind === "failed" && result.code === "targetExists" && expectedRevision === undefined) {
-    // Lost a race with a concurrent first-write (or a stale in-memory "no
-    // file yet" read): fall back to a revision-guarded replace instead of
-    // clobbering whatever just landed. This module's own concurrency stance
-    // (see header) already accepts last-writer-wins within one host, so this
-    // is a best-effort recovery for a benign race, not a stronger guarantee.
-    const stat = await fileStore.stat(locator);
-    if (stat.kind === "ok" && stat.value.kind === "file" && stat.value.revision !== undefined) {
-      const replaced = await fileStore.replaceFileExact(locator, bytes, stat.value.revision);
-      if (replaced.kind === "ok") return;
-    }
-  }
+  // A `targetExists` conflict on an exclusive create (a concurrent writer's
+  // document landed first, or this caller's "no file yet" read was stale) is
+  // surfaced as a plain conflict — never silently resolved here. This
+  // function has no way to know whether ITS caller wants "never overwrite a
+  // racing writer" (migration's commit, reset's fresh-document commit — both
+  // documented as exclusive-create-only) or "benign last-writer-wins is
+  // acceptable" (writeChatHistory's own documented concurrency stance).
+  // Review-flagged (2026-08-23): the previous version resolved every
+  // `targetExists` conflict here by blindly replacing the just-landed
+  // document with THIS caller's stale bytes, which could discard a
+  // concurrent first-writer's content — including inside `appendChatMessageV1`,
+  // whose entire contract is to never lose a racing writer's message. Callers
+  // that want a fallback implement their own, informed by their own contract.
   throw new Error(`chat-v1.json could not be written: ${describeStoreFailure(result)}`);
 }
 
@@ -942,33 +1069,164 @@ export async function writeChatHistory(
       );
     }
   }
-  const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
-  let base: ChatDocumentV1;
-  if (existing) {
-    base = existing;
-  } else {
-    const defaultBinding = resolveDefaultTaskBindingV1(taskFolderPath, canonicalId);
-    base = {
-      schemaVersion: 1,
-      documentId: newDocumentId(),
-      taskBindingId: defaultBinding.taskBindingId,
-      taskBindingSource: defaultBinding.taskBindingSource,
-      messages: [],
-      interactions: [],
-      resetEpoch: 0,
-      compaction: { compactedMessageCount: 0 },
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    let base: ChatDocumentV1;
+    if (existing) {
+      base = existing;
+    } else {
+      const defaultBinding = resolveDefaultTaskBindingV1(taskFolderPath, canonicalId);
+      base = {
+        schemaVersion: 1,
+        documentId: newDocumentId(),
+        taskBindingId: defaultBinding.taskBindingId,
+        taskBindingSource: defaultBinding.taskBindingSource,
+        messages: [],
+        interactions: [],
+        resetEpoch: 0,
+        compaction: { compactedMessageCount: 0 },
+      };
+    }
+    const compacted = compactMessages(messages, base.compaction.compactedMessageCount);
+    const next: ChatDocumentV1 = {
+      ...base,
+      messages: compacted.messages,
+      compaction: {
+        compactedMessageCount: compacted.compactedCount,
+        ...(compacted.digest !== undefined ? { lastCompactionDigest: compacted.digest } : {}),
+      },
     };
+    try {
+      await persistDocument(taskFolderPath, next, revision, canonicalId);
+    } catch (error) {
+      // This function's own documented concurrency stance (see module header)
+      // accepts last-writer-wins within one host — unlike `appendChatMessageV1`,
+      // it does not promise to preserve a racing writer's content. Only retry
+      // the ONE conflict shape that stance actually covers: this write assumed
+      // no document existed yet (`revision === undefined`) and lost that race
+      // to a concurrent first-writer OUTSIDE this queue (a document created by
+      // some future writer that does not go through `withChatDocumentQueueV1`)
+      // — every writer INSIDE this module already goes through the queue, so
+      // this retry is now only a cross-process/foreign-writer safety net, not
+      // the in-process case it used to also have to cover. Re-stat and replace
+      // with a fresh revision exactly once — a best-effort recovery for a
+      // benign race, not a stronger guarantee, and never attempted when a real
+      // prior revision was expected (that conflict must surface, not be
+      // silently clobbered).
+      if (
+        revision === undefined &&
+        error instanceof Error &&
+        error.message.includes("targetExists")
+      ) {
+        const locator = historyLocator(taskFolderPath, canonicalId);
+        const stat = await getWorkflowFileStoreV1().stat(locator);
+        if (stat.kind === "ok" && stat.value.kind === "file" && stat.value.revision !== undefined) {
+          await persistDocument(taskFolderPath, next, stat.value.revision, canonicalId);
+          return;
+        }
+      }
+      throw error;
+    }
+  });
+}
+
+/**
+ * Atomically append ONE message to a task's chat transcript.
+ *
+ * `writeChatHistory` takes a caller-computed FULL message list and writes it
+ * verbatim onto whatever revision it finds at write time — a caller that
+ * built that list from an earlier `readChatHistory()` snapshot silently
+ * discards any message a DIFFERENT writer appended in between (review-flagged
+ * 2026-08-23: exactly this race in the scheduling-intent auto-start
+ * announcement, which read once and wrote once with no queue/lock protecting
+ * it from the task's own round writing its own chat messages concurrently).
+ *
+ * This instead re-reads the CURRENT document, appends `message` onto its
+ * ACTUAL current messages (never a stale snapshot), and retries the whole
+ * read-append-write cycle on a concurrent-write conflict (`revisionMismatch`)
+ * instead of ever overwriting a newer document with stale content. Safe for
+ * any caller outside `ChatViewProvider`'s per-task queue (see the module
+ * header's CONCURRENCY note) to call without losing a racing writer's
+ * message, which `writeChatHistory` alone does not guarantee.
+ */
+export async function appendChatMessageV1(
+  taskFolderPath: string,
+  message: ChatMessage,
+  canonicalId = taskFolderPath,
+  maxAttempts = 8
+): Promise<void> {
+  if (Buffer.byteLength(JSON.stringify(message), "utf8") > CHAT_HISTORY_MAX_MESSAGE_BYTES) {
+    throw new Error(
+      `chat-v1.json message exceeds the ${CHAT_HISTORY_MAX_MESSAGE_BYTES}-byte limit and was refused`
+    );
   }
-  const compacted = compactMessages(messages, base.compaction.compactedMessageCount);
-  const next: ChatDocumentV1 = {
-    ...base,
-    messages: compacted.messages,
-    compaction: {
-      compactedMessageCount: compacted.compactedCount,
-      ...(compacted.digest !== undefined ? { lastCompactionDigest: compacted.digest } : {}),
-    },
-  };
-  await persistDocument(taskFolderPath, next, revision, canonicalId);
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
+      let base: ChatDocumentV1;
+      if (existing) {
+        base = existing;
+      } else {
+        const defaultBinding = resolveDefaultTaskBindingV1(taskFolderPath, canonicalId);
+        base = {
+          schemaVersion: 1,
+          documentId: newDocumentId(),
+          taskBindingId: defaultBinding.taskBindingId,
+          taskBindingSource: defaultBinding.taskBindingSource,
+          messages: [],
+          interactions: [],
+          resetEpoch: 0,
+          compaction: { compactedMessageCount: 0 },
+        };
+      }
+      const compacted = compactMessages([...base.messages, message], base.compaction.compactedMessageCount);
+      const next: ChatDocumentV1 = {
+        ...base,
+        messages: compacted.messages,
+        compaction: {
+          compactedMessageCount: compacted.compactedCount,
+          ...(compacted.digest !== undefined ? { lastCompactionDigest: compacted.digest } : {}),
+        },
+      };
+      try {
+        await persistDocument(taskFolderPath, next, revision, canonicalId);
+        return;
+      } catch (error) {
+        // All four codes are benign concurrent-write signals: with every
+        // IN-PROCESS writer now serialized by `withChatDocumentQueueV1`, a
+        // conflict here can only come from a writer OUTSIDE this process —
+        // `revisionMismatch` is the pre-write check catching a writer that
+        // already landed; `verificationFailed` is `replaceFileExact`'s OWN
+        // post-rename read-back finding a DIFFERENT writer's rename landed
+        // between this write and its own verification; `ioError` covers the
+        // underlying `fs.promises.rename` itself transiently failing (observed:
+        // Windows EPERM) when two near-simultaneous writers race a rename onto
+        // the SAME destination path; `targetExists` is `createFileExclusive`
+        // losing a race to create the FIRST chat-v1.json for this task against
+        // a concurrent first-writer (review-flagged 2026-08-23: `persistDocument`
+        // used to resolve this one internally by blindly replacing the winner's
+        // content with this call's stale bytes — exactly the loss this whole
+        // function exists to prevent — so it is now surfaced here instead and
+        // retried like any other conflict). None of these indicate a real,
+        // non-transient failure specific to this attempt, only that another
+        // writer won this round.
+        const conflict =
+          error instanceof Error &&
+          (error.message.includes("revisionMismatch") ||
+            error.message.includes("verificationFailed") ||
+            error.message.includes("ioError") ||
+            error.message.includes("targetExists"));
+        if (!conflict || attempt === maxAttempts) {
+          throw error;
+        }
+        // Lost a race with a concurrent writer — a short, jittered backoff
+        // before re-reading gives the OS a moment to finish the other writer's
+        // rename/verify (observed necessary for the Windows EPERM case above)
+        // rather than immediately re-attempting into the same live race.
+        await new Promise((resolve) => setTimeout(resolve, attempt * 10 + Math.floor(Math.random() * 10)));
+      }
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,41 +1502,43 @@ export async function appendChatInteraction(
     ensureWorkflowTaskFolderRootV1(taskFolderPath, { bindingId: input.binding.taskBindingId });
   }
 
-  const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
-  let base: ChatDocumentV1;
-  if (existing) {
-    base = existing;
-    if (input.binding.chatDocumentId !== existing.documentId) {
-      throw new Error("interaction binding's chatDocumentId does not match this document");
-    }
-    if (existing.taskBindingSource === "coordinatorSupplied" || existing.taskBindingSource === "ownershipDerived") {
-      if (existing.taskBindingId !== input.binding.taskBindingId) {
-        throw new Error("interaction binding conflicts with this document's authoritative task binding");
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    let base: ChatDocumentV1;
+    if (existing) {
+      base = existing;
+      if (input.binding.chatDocumentId !== existing.documentId) {
+        throw new Error("interaction binding's chatDocumentId does not match this document");
+      }
+      if (existing.taskBindingSource === "coordinatorSupplied" || existing.taskBindingSource === "ownershipDerived") {
+        if (existing.taskBindingId !== input.binding.taskBindingId) {
+          throw new Error("interaction binding conflicts with this document's authoritative task binding");
+        }
+      } else {
+        base = { ...existing, taskBindingId: input.binding.taskBindingId, taskBindingSource: "coordinatorSupplied" };
       }
     } else {
-      base = { ...existing, taskBindingId: input.binding.taskBindingId, taskBindingSource: "coordinatorSupplied" };
+      base = emptyDocumentForInteractionV1(input.binding);
     }
-  } else {
-    base = emptyDocumentForInteractionV1(input.binding);
-  }
 
-  if (base.interactions.some((i) => i.interactionId === input.interactionId)) {
-    throw new Error(`an interaction with id ${input.interactionId} already exists`);
-  }
+    if (base.interactions.some((i) => i.interactionId === input.interactionId)) {
+      throw new Error(`an interaction with id ${input.interactionId} already exists`);
+    }
 
-  const interaction: ChatDocumentInteractionV1 = {
-    interactionId: input.interactionId,
-    operationId: input.operationId,
-    actionKey: input.actionKey,
-    sourceAttemptId: input.sourceAttemptId,
-    stage: input.stage,
-    questions: input.questions,
-    state: "unresolved",
-    postedAt: input.postedAt,
-  };
+    const interaction: ChatDocumentInteractionV1 = {
+      interactionId: input.interactionId,
+      operationId: input.operationId,
+      actionKey: input.actionKey,
+      sourceAttemptId: input.sourceAttemptId,
+      stage: input.stage,
+      questions: input.questions,
+      state: "unresolved",
+      postedAt: input.postedAt,
+    };
 
-  const next: ChatDocumentV1 = { ...base, interactions: [...base.interactions, interaction] };
-  await persistDocument(taskFolderPath, next, revision, canonicalId);
+    const next: ChatDocumentV1 = { ...base, interactions: [...base.interactions, interaction] };
+    await persistDocument(taskFolderPath, next, revision, canonicalId);
+  });
 }
 
 /** Map a durable transaction's state/settlement onto the mirror's display state, or `undefined` if still unresolved. */
@@ -1325,6 +1585,16 @@ function sameAnswersV1(
  * persisted best-effort; the returned view always reflects them regardless.
  */
 export async function readChatInteractions(
+  taskFolderPath: string,
+  canonicalId: string,
+  stage?: TaskStage
+): Promise<ChatDocumentInteractionV1[]> {
+  return withChatDocumentQueueV1(taskFolderPath, canonicalId, () =>
+    readChatInteractionsLockedV1(taskFolderPath, canonicalId, stage)
+  );
+}
+
+async function readChatInteractionsLockedV1(
   taskFolderPath: string,
   canonicalId: string,
   stage?: TaskStage
@@ -1423,17 +1693,19 @@ export async function recordChatInteractionAnswers(
   interactionId: string,
   answers: readonly StructuredAnswerV1[]
 ): Promise<void> {
-  const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
-  if (!document) {
-    throw new Error(`no chat history exists to record answers for interaction ${interactionId}`);
-  }
-  const index = document.interactions.findIndex((i) => i.interactionId === interactionId);
-  if (index === -1) {
-    throw new Error(`no interaction with id ${interactionId} exists`);
-  }
-  const interactions = document.interactions.slice();
-  interactions[index] = { ...interactions[index]!, answers };
-  await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    if (!document) {
+      throw new Error(`no chat history exists to record answers for interaction ${interactionId}`);
+    }
+    const index = document.interactions.findIndex((i) => i.interactionId === interactionId);
+    if (index === -1) {
+      throw new Error(`no interaction with id ${interactionId} exists`);
+    }
+    const interactions = document.interactions.slice();
+    interactions[index] = { ...interactions[index]!, answers };
+    await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
+  });
 }
 
 /** Settle an interaction in the display mirror (plan §6.1's Cancel/Resume controls). Never invokes a provider. */
@@ -1443,17 +1715,19 @@ export async function settleChatInteraction(
   interactionId: string,
   settlement: ChatInteractionMirrorSettlementV1
 ): Promise<void> {
-  const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
-  if (!document) {
-    throw new Error(`no chat history exists to settle interaction ${interactionId}`);
-  }
-  const index = document.interactions.findIndex((i) => i.interactionId === interactionId);
-  if (index === -1) {
-    throw new Error(`no interaction with id ${interactionId} exists`);
-  }
-  const interactions = document.interactions.slice();
-  interactions[index] = { ...interactions[index]!, state: settlement };
-  await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    if (!document) {
+      throw new Error(`no chat history exists to settle interaction ${interactionId}`);
+    }
+    const index = document.interactions.findIndex((i) => i.interactionId === interactionId);
+    if (index === -1) {
+      throw new Error(`no interaction with id ${interactionId} exists`);
+    }
+    const interactions = document.interactions.slice();
+    interactions[index] = { ...interactions[index]!, state: settlement };
+    await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1501,6 +1775,15 @@ export async function resetChatHistoryV1(
   taskFolderPath: string,
   canonicalId: string
 ): Promise<ChatHistoryResetResultV1> {
+  return withChatDocumentQueueV1(taskFolderPath, canonicalId, () =>
+    resetChatHistoryLockedV1(taskFolderPath, canonicalId)
+  );
+}
+
+async function resetChatHistoryLockedV1(
+  taskFolderPath: string,
+  canonicalId: string
+): Promise<ChatHistoryResetResultV1> {
   const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
   const privateRootId = getWorkflowPrivateStorageRootIdV1();
   if (privateRootId === undefined) {
@@ -1536,8 +1819,22 @@ export async function resetChatHistoryV1(
   if (!existing) {
     // Nothing was ever committed to chat-v1.json — the verified snapshot
     // above IS the (empty) pre-reset state. Commit that same fresh document
-    // as the new chat-v1.json; there are no interactions to settle.
-    await persistDocument(taskFolderPath, document, undefined, canonicalId);
+    // as the new chat-v1.json; there are no interactions to settle. An
+    // exclusive-create conflict here (a concurrent writer committed a REAL
+    // first document between this function's read and this write) must
+    // surface as a declined reset rather than silently overwrite that
+    // writer's content (review-flagged 2026-08-23: `persistDocument` no
+    // longer resolves this internally) — this function's own contract
+    // returns a result rather than throwing, so the conflict is reported the
+    // same way every other failure in this function already is.
+    try {
+      await persistDocument(taskFolderPath, document, undefined, canonicalId);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `could not commit the fresh chat-v1.json: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     return { ok: true, resetId };
   }
 

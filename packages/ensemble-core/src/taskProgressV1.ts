@@ -178,6 +178,12 @@ export interface TaskProgress {
   implementationTypeCheckFailure?: ImplementationTypeCheckFailure;
   /** True once a round completed work the plan checklist could not record. */
   checklistProgressUnreliable?: boolean;
+  /** Plain-language reason `checklistProgressUnreliable` was set (task:
+   * "Actionable Hand-offs" PART 5) — surfaced by the reconciliation decision
+   * so the discriminating fact (why the ticks were distrusted) is available,
+   * not only the weaker unticked-item count. Absent on records written
+   * before this field existed. */
+  checklistProgressUnreliableReason?: string;
   /** Consecutive completed implementation rounds (current stage) that changed
    * zero files — durable no-progress-breaker counter; persists across
    * reloads/rounds, reset on a file-changing round or stage transition. */
@@ -291,7 +297,23 @@ export interface ReviewBlockerIdentity {
   resolver: string;
   /** File-ish token named by the blocker when one exists, else a normalized prose prefix. */
   subject: string;
+  /** Opaque stable id, carried forward across rounds via reviewer-declared
+   * lineage (absent on older entries). See the mirrored doc in
+   * src/types/taskProgress.ts. */
+  id?: string;
+  /** This round's declared lineage against its own prior blocker list,
+   * absent when unknown. See the mirrored doc in src/types/taskProgress.ts. */
+  lineage?: BlockerLineageDeclaration;
+  /** Truncated original description, for re-review prompt context only —
+   * never used for identity comparisons. */
+  description?: string;
 }
+
+/** See `ReviewBlockerIdentity.lineage`; mirrors src/types/taskProgress.ts. */
+export type BlockerLineageDeclaration =
+  | { kind: "new" }
+  | { kind: "same"; refId: string }
+  | { kind: "narrowed"; refId: string };
 
 /** One row of `TaskProgress.reviewScoreHistory`. */
 export interface ReviewScoreHistoryEntry {

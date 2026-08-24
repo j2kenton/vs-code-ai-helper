@@ -12,7 +12,8 @@ import {
   isAutomationChainActive,
   scheduleAutomationChain,
 } from "../utils/automationChain";
-import { IMPL_CONTINUATION_CHAIN_ID_V1 } from "./implementationRecoveryV1";
+import { IMPL_CONTINUATION_CHAIN_ID_V1, owedContinuationSourceV1 } from "./implementationRecoveryV1";
+import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -249,6 +250,14 @@ export class TaskActionScheduler implements vscode.Disposable {
       ) {
         continue;
       }
+      // PART 6.5 (review-flagged 2026-08-23): this claim re-arms the lease on
+      // the same `implRecovery` record the ledger tracks — push the
+      // freshly-claimed fact through right after the CAS resolves (never from
+      // inside the callback, which may re-run on a retry).
+      await syncOwedContinuationLedgerBestEffortV1(
+        task.taskFolderPath,
+        owedContinuationSourceV1(claimed.implRecovery, claimed.pendingImplReviewFiles ?? [])
+      );
       // No root operation: nothing holds the task lock (the transition's own
       // in-process chain either fired long ago or died with its window), so
       // the command dispatches immediately. The shared chainId keeps this
@@ -259,6 +268,15 @@ export class TaskActionScheduler implements vscode.Disposable {
         arg: { taskFolderPath: task.taskFolderPath, automationDispatch: true },
         taskKey: task.taskFolderPath,
         chainId: IMPL_CONTINUATION_CHAIN_ID_V1,
+        intent: {
+          trigger: "owed implementation continuation re-armed by the periodic recovery sweep",
+          settingKey: undefined,
+          expectedTiming: "immediately — this sweep pass dispatches it now",
+          willRetry: true,
+          retryNote:
+            "This sweep re-arms and retries while the continuation record stays 'pending'; once a round " +
+            "actually starts (dispatch flips to 'dispatched'), it will not retry again automatically.",
+        },
       });
     }
   }
@@ -302,13 +320,26 @@ export class TaskActionScheduler implements vscode.Disposable {
     // instead of waiting out the lease.
     for (const task of this.inventory.getTasks()) {
       if (task.progress.implRecovery?.leaseOwner !== this.owner) continue;
-      void this.store.patch(vscode.Uri.file(task.taskFolderPath), progress => {
-        if (progress.implRecovery?.leaseOwner !== this.owner) return progress;
-        return {
-          ...progress,
-          implRecovery: { ...progress.implRecovery, leaseOwner: undefined, leaseUntil: undefined },
-        };
-      });
+      const taskFolderPath = task.taskFolderPath;
+      void this.store
+        .patch(vscode.Uri.file(taskFolderPath), progress => {
+          if (progress.implRecovery?.leaseOwner !== this.owner) return progress;
+          return {
+            ...progress,
+            implRecovery: { ...progress.implRecovery, leaseOwner: undefined, leaseUntil: undefined },
+          };
+        })
+        // PART 6.5 (review-flagged 2026-08-23): dispose() cannot await, but
+        // the ledger push can still ride the same fire-and-forget chain as
+        // the lease-release write itself, closing the last of the nine
+        // `implRecovery` mutation sites.
+        .then((patched) =>
+          syncOwedContinuationLedgerBestEffortV1(
+            taskFolderPath,
+            owedContinuationSourceV1(patched?.implRecovery, patched?.pendingImplReviewFiles ?? [])
+          )
+        )
+        .catch(() => undefined);
     }
   }
 }

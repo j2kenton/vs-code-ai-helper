@@ -147,6 +147,62 @@ void describe("createWorkflowDecisionV1", () => {
     if (!result.ok) {assert.match(result.reason, /command/);}
   });
 
+  void it("accepts a well-formed 'gating' claim", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({
+        gating: {
+          holdsTaskPaused: true,
+          unblocksProgress: true,
+          detail: "Resolves the escalation this task is paused on.",
+        },
+      })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decision.gating, {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail: "Resolves the escalation this task is paused on.",
+      });
+    }
+  });
+
+  void it("accepts a decision that omits 'gating' entirely (the deferred production call site)", () => {
+    const result = createWorkflowDecisionV1(validInput());
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.decision.gating, undefined);
+    }
+  });
+
+  void it("rejects a 'gating' with a non-boolean 'holdsTaskPaused'", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({
+        gating: { holdsTaskPaused: "yes" as unknown as boolean, unblocksProgress: true, detail: "n/a" },
+      })
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {assert.match(result.reason, /holdsTaskPaused/);}
+  });
+
+  void it("rejects a 'gating' with a non-boolean 'unblocksProgress'", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({
+        gating: { holdsTaskPaused: false, unblocksProgress: "yes" as unknown as boolean, detail: "n/a" },
+      })
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {assert.match(result.reason, /unblocksProgress/);}
+  });
+
+  void it("rejects a 'gating' with an empty 'detail'", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({ gating: { holdsTaskPaused: false, unblocksProgress: false, detail: "" } })
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {assert.match(result.reason, /gating.*detail/);}
+  });
+
   void it("accepts a legitimate doNothing option", () => {
     const result = createWorkflowDecisionV1(
       validInput({

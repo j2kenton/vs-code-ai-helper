@@ -48,6 +48,10 @@ Record which commit you reviewed. End your response with this marker on its own 
 
 {{previousReview}}
 
+## Previous Round's Blockers (for lineage citation)
+
+{{priorBlockerLineageList}}
+
 ## Final Plan
 
 {{plan}}

@@ -222,6 +222,14 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           "The reviewer already verified these items against the tree; applying only records that " +
           "verification as ticks, which cannot untick or misapply anything.",
       },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: false,
+        detail:
+          "This does not resume or unblock the task by itself. It only ticks items in plan-final.md; if the " +
+          "task is currently paused, that pause comes from something else and answering this alone will not " +
+          "resume it.",
+      },
     },
     target
   );

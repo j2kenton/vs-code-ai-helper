@@ -331,6 +331,17 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     assert.match(modal, /Apply 1 Reviewer-Verified Tick/);
     assert.match(modal, /Wire the completeness gate/);
   });
+
+  // Task "Actionable Hand-offs" PART 5: every decision this task's plan asks
+  // us to populate must state whether resolving it unblocks task progress.
+  // Applying reviewer ticks never itself resumes/unblocks anything.
+  void it("states its gating metadata: applying ticks does not unblock the task", async () => {
+    const result = await run("gating", { review: REVIEW_WITH_VERIFIED_ITEMS }, { confirm: false });
+    assert.ok(result.decision, "expected a decision to be posted");
+    assert.equal(result.decision.gating?.holdsTaskPaused, false);
+    assert.equal(result.decision.gating?.unblocksProgress, false);
+    assert.ok(result.decision.gating?.detail && result.decision.gating.detail.length > 0);
+  });
 });
 
 void describe("applyReviewerVerifiedTicks — refusals that write nothing", () => {

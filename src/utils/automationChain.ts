@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
 import { taskOperations, TaskOperationHandle } from "./taskOperations";
+import {
+  announceAutoStartBestEffortV1,
+  recordRunningIntentBestEffortV1,
+  recordScheduledIntentBestEffortV1,
+  recordTerminalIntentBestEffortV1,
+  SchedulingIntentMetadataV1,
+} from "../state/schedulingIntentV1";
 
 /**
  * Lock-safe guarded dispatch for automation chains (auto-review,
@@ -49,6 +56,16 @@ export interface AutomationDispatch {
    * module and are unaffected.
    */
   stillEnabled?: () => boolean;
+  /**
+   * Hand-off metadata for the scheduling-intent ledger (task: "Actionable
+   * Hand-offs", PART 6) — what caused this dispatch, the `ensemble.*`
+   * setting (if any) that controls it, roughly when it is expected, and
+   * whether it will retry on its own. Omitted at most of the 12 call sites
+   * today; those get a generic entry derived from `command` instead (see
+   * `recordScheduledIntentBestEffortV1`), so the ledger is complete from day
+   * one and enriched per site incrementally.
+   */
+  intent?: SchedulingIntentMetadataV1;
 }
 
 /** Snapshot shape scheduleAutomationChain needs from an ended operation. */
@@ -245,22 +262,52 @@ export function scheduleAutomationChain(
   if (!release) {
     return Promise.resolve(false); // Duplicate chain for this task — dropped.
   }
+  // Best-effort scheduling-intent ledger instrumentation (PART 6). The
+  // SCHEDULED write races the caller freely (nothing below awaits it before
+  // proceeding, so a slow or failing ledger write cannot delay or break the
+  // actual dispatch). The RUNNING write and the auto-start announcement are
+  // different: review-flagged (2026-08-23) twice over — rendering a task as
+  // "scheduled" while its automatic command is already executing is exactly
+  // the invisible-auto-start defect this ledger exists to fix, and
+  // "announce before acting" is not actually true if the announcement's
+  // write is still in flight (or hasn't even started) when the command
+  // begins. Both dispatch paths below now await the announcement AND the
+  // running transition, in that order, before invoking `deps.execute` —
+  // never the reverse. Both writes are still best-effort (they swallow their
+  // own failure and never throw), so this only adds a short, bounded delay
+  // ahead of a dispatch that was already asynchronous, never a new failure
+  // mode.
+  const intentIdPromise = recordScheduledIntentBestEffortV1({
+    taskKey: dispatch.taskKey,
+    command: dispatch.command,
+    chainId: dispatch.chainId ?? dispatch.command,
+    intent: dispatch.intent,
+  });
   const rootOperationId = rootOperation?.id;
   if (!rootOperationId) {
     if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
       release();
+      void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
       return Promise.resolve(false); // Automation disabled since scheduling — dropped.
     }
-    return Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
-      () => {
-        release();
-        return true;
-      },
-      (error) => {
-        release();
-        throw error;
-      }
-    );
+    return intentIdPromise
+      .then(async (id) => {
+        await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent });
+        await recordRunningIntentBestEffortV1(id);
+      })
+      .then(() => deps.execute(dispatch.command, dispatch.arg))
+      .then(
+        () => {
+          release();
+          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+          return true;
+        },
+        (error) => {
+          release();
+          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+          throw error;
+        }
+      );
   }
   return new Promise<boolean>((resolve) => {
     const endSub = deps.onDidEnd((snapshot) => {
@@ -273,20 +320,41 @@ export function scheduleAutomationChain(
           // Automation disabled between scheduling and the root operation
           // ending — drop the chain at fire time.
           release();
+          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
           resolve(false);
           return;
         }
-        // Fire-and-forget: the root operation has already ended, so nothing
-        // is awaiting this chain — surface failures through the command's
-        // own error handling. The guard slot is held until the command
-        // settles so a duplicate cannot start while it runs.
-        Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
-          () => release(),
-          () => release()
-        );
-        resolve(true);
+        // The announcement and the running transition are both awaited
+        // BEFORE `deps.execute` is called, so the auto-start explanation is
+        // durably persisted and a reader can never observe this task as
+        // "scheduled" once its command has actually started. `resolve(true)`
+        // still fires in the same tick as the `execute` call itself (not its
+        // settlement) — the dispatch beyond that point is fire-and-forget
+        // exactly as before (the root operation has already ended, so
+        // nothing awaits this chain further; failures surface through the
+        // command's own error handling). The guard slot is held until the
+        // command settles so a duplicate cannot start while it runs.
+        void intentIdPromise
+          .then(async (id) => {
+            await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent });
+            await recordRunningIntentBestEffortV1(id);
+          })
+          .then(() => {
+            Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
+              () => {
+                release();
+                void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+              },
+              () => {
+                release();
+                void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+              }
+            );
+            resolve(true);
+          });
       } else {
         release();
+        void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
         resolve(false);
       }
     });

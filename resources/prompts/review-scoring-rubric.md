@@ -87,3 +87,21 @@ The first bracket is the blocker's category — use exactly one of: `architectur
 **When every remaining unchecked plan item is blocked on something the stage structurally cannot do** — every one of them needs a dependency install, a build/codegen step, or other command execution the edit-only implementation stage cannot run — that is a completion blocker resolved by `needs-toolchain`, not a non-blocking suggestion. Filing it as a suggestion leaves the task with nothing to escalate on: the reviewer keeps reporting a clean round with items left unbuilt, and there is no automated exit. File it as `- [completion] [needs-toolchain]` so the routing logic can act on it.
 
 Classify conservatively: default to `task-fixable` unless you have concrete evidence the blocker genuinely cannot be resolved by changing the task's code. A blocker whose actual resolution depends on something outside the task's own code — a third party's approval, a credential or account entitlement, evidence from a system the task does not control, or a decision only a human can make — is `environmental`, not `task-fixable`: it is an infrastructure/account fact unrelated to the task's code, and re-implementing the task again cannot produce that missing approval, credential, or evidence, however many times it is attempted.
+
+## Blocker Lineage (re-review only)
+
+When this prompt includes a "Previous Round's Blockers" list below (each entry showing an opaque id like `b3`), add a THIRD bracket to every line in the machine-readable blocker block, right after the resolver bracket, declaring how it relates to that list — exactly one of:
+
+- `[new]` — this issue was not present in the previous round's list.
+- `[same:<id>]` — this is the same underlying issue as prior blocker `<id>`, essentially unresolved since then.
+- `[narrowed:<id>]` — this is prior blocker `<id>`, still present but demonstrably smaller in scope than before — say how in your prose.
+
+Example:
+
+```
+- [completion] [task-fixable] [same:b3] the migration still lacks a rollback path
+```
+
+Cite the id EXACTLY as given in the list below — never invent one, and never guess at an id that isn't shown there. A blocker line with no lineage bracket, or that cites an id not present in that list, is read as lineage-unknown: it counts as neither "the same problem persisting" nor "a new one," so guessing wastes nothing but also proves nothing — cite honestly, or omit the bracket, rather than fabricate a citation. `resolved` is never declared directly by you: a previous id you do not cite anywhere in this round's block is understood by the caller as resolved, precisely because you stopped naming it.
+
+When no "Previous Round's Blockers" list is provided below (a first review round, or a review stage that doesn't track lineage), omit the third bracket entirely — there is nothing yet to cite.

@@ -27,7 +27,7 @@ import {
 import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 
-import { readChatHistory, writeChatHistory } from "../../utils/chatHistoryStore";
+import { appendChatMessageV1 } from "../../utils/chatHistoryStore";
 import {
   executeProposedAction,
   getGlobalAssistantRuntimeDepsV1,
@@ -102,9 +102,11 @@ async function appendGlobalAssistantMessageV1(
   canonicalId: string,
   text: string
 ): Promise<void> {
-  const history = await readChatHistory(taskFolderPath, canonicalId);
-  history.push({ role: "assistant", text, stage: "desc", at: new Date().toISOString() });
-  await writeChatHistory(taskFolderPath, history, canonicalId);
+  // Review-flagged (2026-08-23): a caller-computed read-then-full-write
+  // (readChatHistory + writeChatHistory) silently discards any message a
+  // concurrent writer appends in between. `appendChatMessageV1` re-reads and
+  // appends onto the CURRENT document inside the shared per-document queue.
+  await appendChatMessageV1(taskFolderPath, { role: "assistant", text, stage: "desc", at: new Date().toISOString() }, canonicalId);
 }
 
 async function promoteGlobalAssistantSendContentV1(

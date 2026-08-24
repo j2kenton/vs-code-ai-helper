@@ -8,9 +8,17 @@ import {
   IMPLEMENTATION_FILENAME,
   IMPLEMENTATION_SUMMARY_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
+  TaskStage,
 } from "../types/taskProgress";
 import { readNonEmptyText, resolveCurrentPlanUri, statIfExists } from "./fileUtils";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
+import {
+  requirementsForStageActionV1,
+  stageActionRequirementMessageV1,
+  stageActionsForPreflightV1,
+  StageActionIdV1,
+  StageArtifactRequirementV1,
+} from "./stageArtifactRequirementsV1";
 import {
   ChecklistProgressV1,
   collectChecklistItemKeysV1,
@@ -923,10 +931,73 @@ export async function materializeCanonicalIfNeeded(
     return canonicalUri;
   }
 
-  throw new Error(
-    `No ${IMPLEMENTATION_FILENAME} or ${LEGACY_IMPLEMENTATION_FILENAME} found. ` +
-      "Generate an implementation plan before running implementation."
-  );
+  throw new Error(stageActionRequirementMessageV1("runImplementation", 0));
+}
+
+/** Whether one {@link StageArtifactRequirementV1} is currently met on disk — the read half of the stage-prerequisite contract; `stageActionRequirementMessageV1` is the text half. */
+async function isStageArtifactRequirementSatisfiedV1(
+  requirement: StageArtifactRequirementV1,
+  taskFolderUri: vscode.Uri
+): Promise<boolean> {
+  switch (requirement.artifactId) {
+    case "plan": {
+      const planUri = await resolveCurrentPlanUri(taskFolderUri);
+      return (await readNonEmptyText(planUri)) !== undefined;
+    }
+    case "implementationNotes":
+      return (await readImplementationReviewContent(taskFolderUri)) !== undefined;
+    case "implementationArtifact": {
+      const canonicalContent = await readNonEmptyText(getCanonicalImplementationUri(taskFolderUri));
+      if (canonicalContent !== undefined) {
+        return true;
+      }
+      return (await readNonEmptyText(getLegacyImplementationUri(taskFolderUri))) !== undefined;
+    }
+  }
+}
+
+/**
+ * The first unmet requirement of a stage action, in the action's declared
+ * order, or `undefined` when every requirement is already satisfied.
+ * Pre-flight surfaces (task-tree tooltips, enablement checks) use this to
+ * warn BEFORE the attempt, reading the exact same requirement records the
+ * actual refusal (`stageActionRequirementMessageV1`) uses — so the two
+ * cannot say different things about the same missing file.
+ */
+export async function firstUnmetStageActionRequirementV1(
+  actionId: StageActionIdV1,
+  taskFolderUri: vscode.Uri
+): Promise<StageArtifactRequirementV1 | undefined> {
+  for (const requirement of requirementsForStageActionV1(actionId)) {
+    if (!(await isStageArtifactRequirementSatisfiedV1(requirement, taskFolderUri))) {
+      return requirement;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The first unmet requirement across every action a pre-flight surface
+ * should warn about for a given stage — e.g. an impl-review stage has both
+ * a Review action (needs plan.md + implementation notes) and an Apply
+ * Review Edit action (needs plan-final.md specifically), and the two can
+ * disagree about what's missing. Walks `stageActionsForPreflightV1`'s
+ * ordered action list and returns the first blocking requirement found, so
+ * a task-tree tooltip can warn about whichever action the stage's current
+ * artifacts would actually refuse — including "impl" (Run Implementation)
+ * and the Apply actions, not only the Review actions.
+ */
+export async function firstUnmetStagePrerequisiteV1(
+  stage: TaskStage,
+  taskFolderUri: vscode.Uri
+): Promise<StageArtifactRequirementV1 | undefined> {
+  for (const actionId of stageActionsForPreflightV1(stage)) {
+    const unmet = await firstUnmetStageActionRequirementV1(actionId, taskFolderUri);
+    if (unmet) {
+      return unmet;
+    }
+  }
+  return undefined;
 }
 
 /** Result of {@link preparePlanPromotion}. */

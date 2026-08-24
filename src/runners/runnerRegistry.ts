@@ -956,6 +956,8 @@ export async function runImplementationForModel(options: {
       onProgress: options.onProgress,
       onBusyDetail: options.onBusyDetail,
       onWaitingForUser: options.onWaitingForUser,
+      taskFolderUri: options.taskFolderUri,
+      stage: options.stage,
     });
     return { ...result, runnerId: "copilot-lm" };
   };

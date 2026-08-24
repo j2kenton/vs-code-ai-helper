@@ -17,7 +17,7 @@
  * regardless of readiness, so a low score can never render as a down arrow).
  */
 
-import { TaskStage } from "../types/taskProgress";
+import { BlockerLineageDeclaration, TaskStage } from "../types/taskProgress";
 
 /**
  * Stages from which a review can be run, mapped to the review stage it
@@ -260,6 +260,17 @@ export interface ReviewBlocker {
   category: BlockerCategory;
   resolver: BlockerResolver;
   description: string;
+  /**
+   * The reviewer's own declared lineage against the prior round's ID'd
+   * blocker list — a THIRD bracket, e.g. `[same:b3]` or `[narrowed:b3]` —
+   * parsed alongside the category/resolver brackets. Absent when the line
+   * carried no lineage bracket (no prior list was injected, an older
+   * prompt, or a non-compliant provider): that is lineage-unknown, not
+   * "new" — see resolveBlockerLineageV1 (reviewRouting.ts), which is the
+   * only place a citation is checked against the actual prior list and
+   * resolved to lineage-unknown when the cited id doesn't exist there.
+   */
+  lineage?: BlockerLineageDeclaration;
 }
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
@@ -297,7 +308,32 @@ const VERIFIED_COMPLETE_LINE_RE = /^\s*[-*]\s+(.+?)\s*$/;
  * first bracket and finds a category name there instead.
  */
 const BLOCKER_LINE_RE =
-  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(.+?)\s*$/i;
+  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(?:\[\s*(new|same\s*:\s*[\w-]+|narrowed\s*:\s*[\w-]+)\s*\]\s*)?(.+?)\s*$/i;
+
+/**
+ * Parse a blocker line's optional THIRD bracket (`[new]`, `[same:<id>]`,
+ * `[narrowed:<id>]`) into a declaration. Returns `undefined` when the
+ * bracket was absent — the caller (not this function) decides what
+ * "absent" means for lineage classification purposes.
+ */
+function parseLineageBracket(raw: string | undefined): BlockerLineageDeclaration | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "new") {
+    return { kind: "new" };
+  }
+  const sameMatch = /^same\s*:\s*([\w-]+)$/.exec(normalized);
+  if (sameMatch?.[1]) {
+    return { kind: "same", refId: sameMatch[1] };
+  }
+  const narrowedMatch = /^narrowed\s*:\s*([\w-]+)$/.exec(normalized);
+  if (narrowedMatch?.[1]) {
+    return { kind: "narrowed", refId: narrowedMatch[1] };
+  }
+  return undefined;
+}
 
 /**
  * Parse the machine-readable blocker block reviewers are asked to emit
@@ -776,7 +812,7 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       malformedLines.push(trimmed);
       continue;
     }
-    const [, category, resolver, description] = lineMatch;
+    const [, category, resolver, lineageRaw, description] = lineMatch;
     // `category` is absent when the reviewer emitted the resolver-only form;
     // that is accepted, so only resolver and description are required here.
     // Defaulting to "completion" is the conservative choice: it is the
@@ -787,10 +823,12 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       malformedLines.push(trimmed);
       continue;
     }
+    const lineage = parseLineageBracket(lineageRaw);
     blockers.push({
       category: (category ?? "completion").toLowerCase() as BlockerCategory,
       resolver: resolver.toLowerCase() as BlockerResolver,
       description,
+      ...(lineage ? { lineage } : {}),
     });
   }
   return { blockPresent: true, blockers, malformedLines };

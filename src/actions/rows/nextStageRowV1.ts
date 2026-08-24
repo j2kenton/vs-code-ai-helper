@@ -39,6 +39,7 @@ import { TaskActionOutcomeV1 } from "../../types/taskActionOutcomeV1";
 import { STAGE_ORDER, TaskStage } from "../../types/taskProgress";
 import { applyNextStagePolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
+import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
 import {
   LifecyclePolicyFailureError,
   LifecycleReviewAttemptMismatchError,
@@ -198,6 +199,14 @@ export async function executeNextStageV1(
   if (!patched) {
     return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
   }
+
+  // PART 6.5 (review-flagged 2026-08-23): `applyNextStagePolicyV1` clears
+  // `implRecovery` unconditionally on every successful transition — push that
+  // fact into the scheduling-intent ledger right after the CAS resolves
+  // (never from inside the callback, which may re-run on a retry), so a task
+  // that advances past its owed continuation this way is not left showing a
+  // stale "owed" ledger entry.
+  await syncOwedContinuationLedgerBestEffortV1(input.taskFolderPath, undefined);
 
   return {
     kind: "completed",

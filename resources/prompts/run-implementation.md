@@ -31,7 +31,21 @@ Do NOT create or edit a `plan-final.md` or `implementation.md` file at the repos
     - `item` MUST be the plan's exact item text, copied verbatim (whitespace and wording as written) — never a paraphrase, abbreviation, or your own summary of it. The tick is applied by matching this text against the plan's checklist exactly; a paraphrase matches nothing, so the item silently stays unchecked even though you reported it done. Worked example — given a plan item `- [ ] In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) and reduce its vertical padding so the combo-box input height shrinks with the text.`, write `- In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) and reduce its vertical padding so the combo-box input height shrinks with the text. — done <!-- ensemble:retroactive --> — src/views/settingsView.ts:672-675`, NOT a shortened `.model-combo-input small font + reduced padding — done <!-- ensemble:retroactive --> — ...`. This still works even when the plan item's own text contains an em dash (` — `) — copy it verbatim; the match is resolved against the plan's real item texts, not by splitting on the first dash.
     - Whole-Part claims: if an ENTIRE plan Part is done and verified, you may claim it in one line instead of enumerating every item: `Part N — done this round (X/Y), evidence: ...` (or the same shape with the retroactive marker). This ticks every item under the matching `## Part N` heading in the plan of record. Evidence is still required at the part level; a part-level claim with no evidence ticks nothing.
     - Never combine a retroactive tick with `<!-- ensemble:no-checklist-change -->` above: that marker declares nothing to tick, and a retroactive claim declares something to tick. If you have retroactive completions to report, omit the marker.
-- A `## Verification` section with a short checklist of how to confirm the implementation is correct
+- A `## Verification` section with a short checklist of how to confirm the implementation is correct. Any check in it that only a human can perform (not a command you can run and report the result of) must carry all five hand-off elements, not just a restatement of what to check: **What** to check (concrete and specific); **Why** (what it confirms, one sentence); **How** (the actual steps in the user's own project); **If it fails** (the observable symptom); **Priority** (`Priority: HIGH` when a failure here would be silent or damaging in the user's own project, `Priority: LOW` when it would be loud and recoverable — a LOW item must say skipping it is acceptable and name the trade-off). Evidence you already gathered this round goes below that guidance, never in place of it.
+
+  Worked example of the shape (the domain here is illustrative only — write each check for the actual project this task is for, never copy this example's subject matter):
+
+  > **Duplicate rows after the staging import — HIGH priority.**
+  >
+  > **What:** run the importer against staging twice and count rows in `orders`.
+  >
+  > **Why:** the dedupe key changed this round; nothing automated covers a re-run.
+  >
+  > **How:** `SELECT count(*) FROM orders;` before and after the second run — the number should not change.
+  >
+  > **If it fails:** the count grows. Rows are duplicated, not corrupted, and staging can be truncated.
+  >
+  > **Why it is high priority:** if it is wrong in production the damage is silent and compounds with every import.
 
 Output ONLY the summary document as your final text response after you are done making changes — do not narrate your intentions before acting, and do not write the summary to a file.
 

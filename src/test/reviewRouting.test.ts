@@ -1,4 +1,6 @@
 import * as assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   blockerIdentity,
@@ -1024,5 +1026,180 @@ void describe("decidePostReviewActionV1", () => {
     });
     assert.strictEqual(decision.action, "implementation");
     assert.strictEqual(decision.reviewStage, undefined);
+  });
+
+  /**
+   * Task "Actionable Hand-offs", "The worse case" / PART 9: an owed
+   * continuation outranks blocker/checklist routing, because it gates
+   * whether Apply Review (and Review, and Fast Forward) can even run.
+   * Recommending "apply-review" while a continuation is owed is always
+   * wrong — that is exactly the state those actions refuse in.
+   */
+  void it("routes to implementation, unconditionally, when a continuation is owed — even with blockers standing", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(5, { stage: "impl-low-review", taskFixableCount: 3, blockerCount: 3 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+      continuationOwed: true,
+    });
+    assert.strictEqual(decision.action, "implementation");
+    assert.match(decision.reason, /continuation/i);
+  });
+
+  void it("routes to implementation when files are quarantined behind a continuation, even with no implRecovery flag passed", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(5, { stage: "impl-low-review", taskFixableCount: 3, blockerCount: 3 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+      pendingImplReviewFilesCount: 2,
+    });
+    assert.strictEqual(decision.action, "implementation");
+    assert.match(decision.reason, /continuation/i);
+  });
+
+  void it("routes to implementation when a continuation is owed even with a clean review and complete checklist", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(10, { stage: "impl-low-review", taskFixableCount: 0, blockerCount: 0 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+      continuationOwed: true,
+    });
+    assert.strictEqual(decision.action, "implementation");
+  });
+
+  void it("does not report a continuation when both continuation inputs are absent or false/zero", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(5, { stage: "impl-low-review", taskFixableCount: 3, blockerCount: 3 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+      continuationOwed: false,
+      pendingImplReviewFilesCount: 0,
+    });
+    assert.strictEqual(decision.action, "apply-review");
+  });
+});
+
+/**
+ * Task "Actionable Hand-offs", PART 9 (remaining item): the two
+ * `decidePostReviewActionV1` consumers that used to be raw
+ * `vscode.window.showWarningMessage` dialogs (`sterileRoundRouting` and
+ * `preImplementationRouting`, both in `reviewActions.ts`) were migrated onto
+ * `postWorkflowDecisionV1` — see reviewActions.ts's comments at those two
+ * call sites and `workflowDecisionGatingInventoryV1.test.ts`, which covers
+ * their `gating` metadata. This suite covers the two properties that test
+ * doesn't: that `postWorkflowDecisionV1` (not the raw notification) is the
+ * PRIMARY path, with the raw notification appearing only as the documented
+ * fallback for a missing extension context — and that every
+ * `scheduleAutomationChain` dispatch in `reviewActions.ts` still carries the
+ * enriched `intent` metadata Part 6's ledger depends on, rather than
+ * silently regressing to the generic-from-command-name fallback Part 6
+ * reserves for not-yet-enriched sites.
+ *
+ * These read the real source text rather than executing `reviewActions.ts`
+ * (a `vscode`-importing command module) because the property under test is
+ * "which call is reached first, and under what guard" — a source-level
+ * fact — not runtime behavior already covered by `chatViewWorkflowDecision
+ * .test.ts` (decision rendering) and `workflowDecisionGatingInventoryV1
+ * .test.ts` (gating presence). Same technique as the latter file.
+ */
+void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (PART 9)", () => {
+  async function readReviewActionsSrc(): Promise<string> {
+    return readFile(path.resolve(__dirname, "../../src/commands/reviewActions.ts"), "utf8");
+  }
+
+  void it("the sterileRoundRouting dialog posts via postWorkflowDecisionV1, falling back to a raw notification only when posting fails", async () => {
+    const source = await readReviewActionsSrc();
+    const marker = 'decisionKey: "sterileRoundRouting"';
+    const index = source.indexOf(marker);
+    assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
+    const before = source.slice(Math.max(0, index - 400), index);
+    assert.match(
+      before,
+      /postWorkflowDecisionV1/,
+      "sterileRoundRouting must be posted through postWorkflowDecisionV1, not built as a raw notification"
+    );
+    const after = source.slice(index, index + 2200);
+    const fallbackOffset = after.indexOf("NotificationRouter.showWarning");
+    assert.ok(fallbackOffset >= 0, "expected a fallback notification for a missing extension context");
+    const guard = after.slice(0, fallbackOffset);
+    assert.match(
+      guard,
+      /if\s*\(!sterileDecisionPosted\)/,
+      "the fallback notification must be gated on the decision failing to post, not run unconditionally alongside it"
+    );
+  });
+
+  void it("the preImplementationRouting dialog posts via postWorkflowDecisionV1, falling back to a raw notification only when posting fails", async () => {
+    const source = await readReviewActionsSrc();
+    const marker = 'decisionKey: "preImplementationRouting"';
+    const index = source.indexOf(marker);
+    assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
+    const before = source.slice(Math.max(0, index - 400), index);
+    assert.match(
+      before,
+      /postWorkflowDecisionV1/,
+      "preImplementationRouting must be posted through postWorkflowDecisionV1, not built as a raw notification"
+    );
+    const after = source.slice(index, index + 4000);
+    const fallbackOffset = after.indexOf("NotificationRouter.showWarning");
+    assert.ok(fallbackOffset >= 0, "expected a fallback notification for a missing extension context");
+    const guard = after.slice(0, fallbackOffset);
+    assert.match(
+      guard,
+      /if\s*\(!decision\)/,
+      "the fallback notification must be gated on the decision failing to post, not run unconditionally alongside it"
+    );
+  });
+
+  void it("both migrated dialogs recommend 'Go to Review & Apply' rather than defaulting the recommendation to blindly running Implementation again", async () => {
+    const source = await readReviewActionsSrc();
+    for (const decisionKey of ["sterileRoundRouting", "preImplementationRouting"]) {
+      const marker = `decisionKey: "${decisionKey}"`;
+      const index = source.indexOf(marker);
+      assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
+      const slice = source.slice(index, index + 2200);
+      assert.match(
+        slice,
+        /optionId:\s*"goToReviewAndApply"/,
+        `${decisionKey} must offer a goToReviewAndApply option`
+      );
+      assert.match(
+        slice,
+        /recommendation:\s*\{\s*kind:\s*"option",\s*optionId:\s*"goToReviewAndApply"/,
+        `${decisionKey} must recommend goToReviewAndApply, matching the corrected routing input (an owed ` +
+          "continuation is checked before this dialog is ever reached — see decidePostReviewActionV1)"
+      );
+    }
+  });
+
+  void it("every known scheduleAutomationChain trigger in reviewActions.ts carries enriched scheduling-intent metadata", async () => {
+    const source = await readReviewActionsSrc();
+    // One entry per distinct `intent` object literal reviewActions.ts passes
+    // to `scheduleAutomationChain` (directly, or via
+    // `dispatchReviewChainAfterLockRelease`) — enumerated rather than
+    // pattern-matched across every `scheduleAutomationChain(` call, because
+    // two of the real call sites pass `intent` as a variable reference
+    // (`intent,`) rather than an inline object literal, so a single generic
+    // "the call site's next N characters contain `intent: {`" regex would
+    // false-fail on those two.
+    const knownTriggers = [
+      "auto-implement after review completes",
+      "auto-review after advancing to the next stage",
+      "Complete & Move On triggers AI: generate the plan for the next stage",
+      "Complete & Move On triggers AI: run implementation for the next stage",
+      "Complete & Move On triggers AI: run the Publish review",
+      "Complete & Move On triggers AI: review after advancing to the next stage",
+      "auto-advance review after implementation completes",
+      "auto-review after implementation completes",
+    ];
+    for (const trigger of knownTriggers) {
+      const marker = `trigger: "${trigger}"`;
+      const index = source.indexOf(marker);
+      assert.ok(index >= 0, `expected to find the enriched trigger "${trigger}" in reviewActions.ts`);
+      const slice = source.slice(Math.max(0, index - 40), index + 400);
+      assert.match(slice, /settingKey:/, `intent for trigger "${trigger}" must name a settingKey (or explicitly not-setting-driven)`);
+      assert.match(slice, /expectedTiming:/, `intent for trigger "${trigger}" must name an expectedTiming`);
+      assert.match(slice, /willRetry:/, `intent for trigger "${trigger}" must state whether it will retry`);
+    }
   });
 });

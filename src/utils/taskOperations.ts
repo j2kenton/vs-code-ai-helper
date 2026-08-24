@@ -1,9 +1,12 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TaskStage } from "../types/taskProgress";
+import { ImplRecoveryV1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
 import { normalizePath } from "./taskRoot";
 import { OperationKind } from "./operationTaxonomy";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { describeOwedContinuationRefusalV1 } from "./owedContinuationRefusalV1";
+import { writeRunLog } from "./runLog";
 
 /**
  * Lifecycle states of a tracked operation (contract C1):
@@ -669,7 +672,7 @@ export async function runTrackedOperation<T>(
 ): Promise<T | undefined> {
   const handle = taskOperations.begin(taskPath, spec);
   if (!handle) {
-    showTaskBusyWarning(taskPath);
+    await showTaskBusyWarning(taskPath);
     return undefined;
   }
   try {
@@ -765,9 +768,61 @@ export function hasActiveOperationTargetingStage(
     );
 }
 
-export function showTaskBusyWarning(taskPath: string): void {
+/**
+ * Show the busy refusal for a task whose exclusive lock is already held.
+ *
+ * When the task carries an owed implementation continuation (`implRecovery`),
+ * the generic "already in progress" line is replaced with the plain-language
+ * explainer (`describeOwedContinuationRefusalV1`) naming the blocker, the
+ * lease's wall-clock expiry, the quarantined files behind it, and what to do
+ * — see that function's doc comment for the incident this answers. A visible
+ * "declined" run-log entry is also recorded in that case, so the refusal is
+ * legible in task history rather than the silent gap a busy refusal
+ * otherwise leaves (no provider is ever invoked, so nothing else logs it).
+ * Both reads are best-effort: a task whose progress cannot be read, or that
+ * carries no `implRecovery` record, falls back to the plain busy message
+ * exactly as before.
+ */
+export async function showTaskBusyWarning(taskPath: string): Promise<void> {
   const label = taskOperations.busyLabel(taskPath) ?? "An operation";
-  NotificationRouter.showInformation(
-    `${label} is already in progress for this task. Please wait for it to finish.`
-  );
+  const genericMessage = `${label} is already in progress for this task. Please wait for it to finish.`;
+
+  let record: ImplRecoveryV1 | undefined;
+  let pendingFiles: readonly string[] = [];
+  let stage: TaskStage | undefined;
+  let continuations = 0;
+  try {
+    const folderUri = vscode.Uri.file(taskPath);
+    const strict = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: path.basename(taskPath),
+    });
+    if (strict.ok) {
+      record = strict.decoded.progress.implRecovery;
+      pendingFiles = strict.decoded.progress.pendingImplReviewFiles ?? [];
+      stage = strict.decoded.progress.currentStage;
+      continuations = strict.decoded.progress.incompleteRoundContinuations ?? 0;
+    }
+  } catch {
+    // Best-effort only — fall back to the generic message below.
+  }
+
+  if (!record) {
+    NotificationRouter.showInformation(genericMessage);
+    return;
+  }
+
+  const explained = describeOwedContinuationRefusalV1(record, pendingFiles, continuations);
+  NotificationRouter.showInformation(explained);
+  try {
+    await writeRunLog(
+      vscode.Uri.file(taskPath),
+      "declined",
+      stage ?? "impl",
+      `# Action Declined\n\nStatus: declined (owed continuation)\n\n${explained}`
+    );
+  } catch {
+    // The declined-with-reason history entry is a courtesy record — a
+    // failure to write it must never turn an already-shown refusal into an
+    // unhandled error.
+  }
 }

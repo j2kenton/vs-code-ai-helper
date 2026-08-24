@@ -79,6 +79,7 @@ import { scheduleAutomationChain } from "../utils/automationChain";
 import type { TaskOperationHandle } from "../utils/taskOperations";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import type { ChatTarget } from "../views/chatView";
+import { syncOwedContinuationLedgerBestEffortV1, OwedContinuationSourceV1 } from "../state/schedulingIntentV1";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -107,6 +108,31 @@ function ownerToken(): string {
 
 function freshToken(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** The scheduling-intent ledger's minimal, generic view of an `ImplRecoveryV1`
+ * record (task "Actionable Hand-offs", PART 6.5) — factored out once so every
+ * site across every file that pushes this fact into the ledger via
+ * `syncOwedContinuationLedgerBestEffortV1` describes the same record
+ * identically. Exported (review-flagged 2026-08-23) so the other mutation
+ * sites named in `OwedContinuationRecordV1`'s doc comment — `scheduleTaskResume.ts`,
+ * the `taskProgressFieldPolicyV1.ts` row actions, and `reviewActions.ts`'s
+ * `promotePendingImplReviewFiles` call — build the identical shape rather
+ * than each re-deriving their own. */
+export function owedContinuationSourceV1(
+  record: ImplRecoveryV1 | undefined,
+  pendingFiles: readonly string[]
+): OwedContinuationSourceV1 | undefined {
+  if (!record) {
+    return undefined;
+  }
+  return {
+    reason: record.reason,
+    at: record.at,
+    leaseUntil: record.leaseUntil,
+    quarantinedFiles: pendingFiles,
+    dispatch: record.dispatch,
+  };
 }
 
 /**
@@ -387,6 +413,14 @@ export async function beginImplementationRecoveryV1(
     };
     return { ...next, implRecovery: record, updatedAt: new Date().toISOString() };
   });
+  // PART 6.5: push the just-committed fact into the scheduling-intent
+  // ledger right after the CAS resolves (never from inside the callback,
+  // which may re-run on a retry) — see `owedContinuationSourceV1`'s doc
+  // comment for why this is one of nine mutation sites, not the only one.
+  await syncOwedContinuationLedgerBestEffortV1(
+    folderUri.fsPath,
+    owedContinuationSourceV1(persisted?.implRecovery, persisted?.pendingImplReviewFiles ?? [])
+  );
   const capReached = continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1;
 
   const finishDispatch = async (): Promise<void> => {
@@ -477,6 +511,17 @@ export async function beginImplementationRecoveryV1(
                   "A continuation round is already scheduled to produce a usable report without " +
                   "discarding this round's work.",
               },
+          gating: {
+            holdsTaskPaused: false,
+            unblocksProgress: false,
+            detail: capReached
+              ? "This does not resume the task by itself — the task is paused separately (a plateau " +
+                "escalation, asked as a question in this chat) because the continuation budget is exhausted; " +
+                "answer that question to decide how to proceed, or restore here to discard this round's work first."
+              : "This does not pause or unblock anything — the scheduled continuation round runs on its own " +
+                "regardless of your answer here. Use this only if you want to discard this round's edits before " +
+                "the continuation attempts to finish them.",
+          },
         },
         target
       );
@@ -534,6 +579,15 @@ export async function beginImplementationRecoveryV1(
         arg: { taskFolderPath: folderUri.fsPath, automationDispatch: true },
         taskKey: folderUri.fsPath,
         chainId: IMPL_CONTINUATION_CHAIN_ID_V1,
+        intent: {
+          trigger: "owed implementation continuation immediately after this round ended without a usable report",
+          settingKey: undefined,
+          expectedTiming: "once this round's operation lock releases",
+          willRetry: true,
+          retryNote:
+            "If this particular dispatch is dropped (e.g. a duplicate chain), the continuation record stays " +
+            "'pending' and the periodic recovery sweep (scheduleTaskResume.ts) will retry it later.",
+        },
       },
       input.parentOperation
     );
@@ -604,6 +658,15 @@ export async function claimImplRecoveryDispatchV1(
       updatedAt: new Date().toISOString(),
     };
   });
+  // PART 6.5: claiming flips `dispatch` from "pending" to "dispatched",
+  // which flips `willRetry` — the ledger must re-sync here or it would show
+  // "will retry" after the system has already stopped retrying. The
+  // pending-files set is unaffected by a claim, so the pre-claim snapshot is
+  // still accurate for the post-claim record.
+  await syncOwedContinuationLedgerBestEffortV1(
+    folderUri.fsPath,
+    owedContinuationSourceV1(record, priorPendingFiles)
+  );
   return { record, priorImplReviewFiles, priorPendingFiles };
 }
 
@@ -638,7 +701,9 @@ export async function escalateClaimedSummaryOnlyIfUnavailableV1(
     return claimed;
   }
   let updated: ImplRecoveryV1 | undefined = claimed;
+  let pendingFiles: readonly string[] = [];
   await patchTaskProgressStrictV1(folderUri, (current) => {
+    pendingFiles = current.pendingImplReviewFiles ?? [];
     if (
       !current.implRecovery ||
       current.implRecovery.attemptId !== claimed.attemptId ||
@@ -654,6 +719,13 @@ export async function escalateClaimedSummaryOnlyIfUnavailableV1(
     updated = escalated;
     return { ...current, implRecovery: escalated, updatedAt: new Date().toISOString() };
   });
+  // PART 6.5: `mode` is not part of `OwedContinuationSourceV1` (the ledger
+  // fact is about whether/how a continuation retries, not its edit-scope
+  // mode), so this escalation does not change the ledger's `blocker`/
+  // `willRetry` text — but re-syncing keeps the entry's `at`/`reason`
+  // aligned with whatever the CAS actually committed, rather than assuming
+  // this call site's own view was accurate.
+  await syncOwedContinuationLedgerBestEffortV1(folderUri.fsPath, owedContinuationSourceV1(updated, pendingFiles));
   return updated;
 }
 
