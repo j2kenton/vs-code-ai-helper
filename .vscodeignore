@@ -84,3 +84,14 @@ dist/meta.json
 *.log
 .tmp-*
 *.done
+
+# A compiled mirror of the whole tree that an agentic implementation round
+# emitted on 2026-08-23 with a custom `--outDir` (12.6MB, ~838 files, a
+# duplicate of `out/`). No tsconfig or npm script produces it — `dist/` is the
+# build output and `out/` the test output — so it is stray agent write-out, the
+# same class as `/implementation.md` and `/plan-final.md` in .gitignore. It was
+# added to .gitignore the same day, which does NOTHING here: vsce ignores
+# .gitignore whenever a .vscodeignore exists (see the notes above), and this
+# directory duly broke the next `npm run release` with 214 test files in the
+# package. Ignored by directory name so a re-run cannot reintroduce it.
+.test-out/**
