@@ -1091,10 +1091,78 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       );
 
       assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "publish");
+      // impl-low-review itself is entirely skipped (never becomes
+      // currentStage, so it can never receive its own dispatch) — the single
+      // dispatch observed here is landing directly on Publish, whose
+      // follow-up review is unconditional in "auto" mode too (wf10 item 14 /
+      // Part 7 step 17), not a dispatch mistakenly attributed to the skipped
+      // stage.
+      assert.equal(dispatches.length, 1, "exactly one dispatch: Publish's own follow-up review");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.equal(dispatches[0]?.chainId, "auto-review");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      settings.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("wf10 item 14 / Part 7 step 17: auto-fast-forward landing on Publish dispatches the follow-up review with dispatchEvenIfRootFails set", async () => {
+    // Publish is the terminal stage: once a review's own currentStage write
+    // lands there, the follow-up Publish review it schedules must not be
+    // gated on the SAME root operation's own eventual "succeeded" outcome —
+    // that stage transition already committed to disk before this dispatch
+    // is scheduled. Asserting `dispatchEvenIfRootFails: true` here is the
+    // regression for that specific contract, not just that a dispatch
+    // occurred at all (every sibling test above only checks the latter).
+    const settings = installModelSettingsOverride({});
+    const { folderPath } = makeTaskFolder(`ff-publish-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto-fast-forward"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl-low-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "publish");
+      const publishDispatch = dispatches.find((dispatch) => dispatch.chainId === "auto-review");
+      assert.ok(publishDispatch, "the follow-up Publish review must be scheduled under the auto-review chain");
+      assert.equal(publishDispatch?.command, "vs-code-ai-helper.fastForwardReviewWithAI");
       assert.equal(
-        dispatches.some((dispatch) => dispatch.command === "vs-code-ai-helper.runReviewWithAI"),
-        false,
-        "unconfigured impl-low-review must not receive a review dispatch"
+        publishDispatch?.dispatchEvenIfRootFails,
+        true,
+        "Publish's follow-up review must fire regardless of how the triggering root operation itself concludes"
       );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }

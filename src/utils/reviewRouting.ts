@@ -704,6 +704,108 @@ export function degenerateReviewRejectionReason(input: {
   );
 }
 
+/**
+ * wf10 item 7c / Part 6 step 16: known provider Read-tool ceilings, in bytes,
+ * below which a provider has been observed to silently truncate a prompt
+ * file read. kimi-cli's ceiling was measured at 66,192-66,715 bytes across
+ * twelve consecutive reads of the same file — a VARYING cap (token-based,
+ * not byte-based), so this constant is the lowest observed floor, used only
+ * as an advisory trigger, never a hard byte-exact cutoff.
+ */
+export const KNOWN_PROVIDER_READ_CEILING_BYTES_V1: Readonly<Record<string, number>> = {
+  "kimi-cli": 66000,
+};
+
+/**
+ * Advisory text when an assembled prompt exceeds a provider's known Read
+ * ceiling (wf10 item 7c / Part 6 step 16). Never a hard rejection — the
+ * ceiling is token-based/variable and the prompt is measured in bytes, so a
+ * prompt under the floor can still truncate and one over it can still land
+ * fine; this only names the risk and its remedy. Returns undefined when the
+ * provider has no known ceiling or the prompt is within it.
+ */
+export function promptCeilingAdvisoryV1(
+  promptLength: number | undefined,
+  providerId: string | undefined
+): string | undefined {
+  if (promptLength === undefined || providerId === undefined) {
+    return undefined;
+  }
+  const ceiling = KNOWN_PROVIDER_READ_CEILING_BYTES_V1[providerId];
+  if (ceiling === undefined || promptLength <= ceiling) {
+    return undefined;
+  }
+  return (
+    `The assembled prompt (${promptLength} bytes) exceeds ${providerId}'s known Read-tool ceiling ` +
+    `(~${ceiling} bytes observed, varies by token count) — it may be silently truncated. Shrink the prompt ` +
+    "(fewer/smaller context-pack files) or route this stage to a different provider."
+  );
+}
+
+/** Reply length above which the provider-exhaustion reply shape (below)
+ * never matches — a genuine exhaustion report is short by construction (the
+ * observed case was 151 characters); a multi-KB reply that happens to share
+ * a phrase is not this shape, whatever else it is. */
+const PROVIDER_EXHAUSTION_REPLY_MAX_LENGTH = 4000;
+
+/**
+ * Unambiguous procedural markers of the injected budget-handler mechanism
+ * itself ("Write your final response now, without any further tool calls…")
+ * or of the specific known truncation cause (kimi's Read tool). Either alone
+ * is strong enough evidence — there is no plausible genuinely-malformed
+ * review that happens to describe the harness's own tool-call cutoff or name
+ * "the read tool" alongside "truncat[ing]".
+ */
+const PROVIDER_EXHAUSTION_PROCEDURAL_PATTERNS: readonly RegExp[] = [
+  /without any further tool calls/i,
+  /read tool[\s\S]{0,60}truncat/i,
+  /truncat[\s\S]{0,60}read tool/i,
+];
+
+/**
+ * Topic words from the injected question's own two-part prompt ("Cover: the
+ * current blocker… what you need from the user to unblock progress"). Each
+ * is individually too weak on its own — "current blocker" or "to unblock
+ * progress" can plausibly appear in ordinary review prose unrelated to
+ * budget exhaustion — so `isProviderExhaustionReplyShapeV1` below requires
+ * BOTH a blocker-topic match and a needed-from-user-topic match, matching
+ * the injected question's actual two-part shape, rather than any one phrase.
+ */
+const PROVIDER_EXHAUSTION_BLOCKER_TOPIC_PATTERNS: readonly RegExp[] = [/current blocker/i];
+const PROVIDER_EXHAUSTION_NEEDED_TOPIC_PATTERNS: readonly RegExp[] = [
+  /what (?:you need|i need|is needed) from (?:the )?user/i,
+  /to unblock progress/i,
+];
+
+/**
+ * Whether a rejected (no parseable `Readiness: N/10`) reply matches the
+ * shape of a provider-side read/tool-budget EXHAUSTION REPORT rather than
+ * genuine malformed/degenerate output (wf10 item 7c / Part 6 step 16). This
+ * distinction matters because the remedy is completely different: malformed
+ * output points at the model or a transport glitch, while an exhaustion
+ * report is the model correctly answering a question Ensemble never asked,
+ * after running out of budget reading an oversized prompt — the actionable
+ * fact is prompt size, not model quality.
+ *
+ * wf10 review fix: matching on ANY single topic phrase (e.g. "current
+ * blocker" alone) over-matched ordinary replies that happen to use that
+ * phrase for an unrelated reason. Requires either an unambiguous procedural
+ * marker, or BOTH halves of the injected question's own blocker-plus-
+ * needed-from-user shape — never a lone topic word.
+ */
+export function isProviderExhaustionReplyShapeV1(content: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length === 0 || trimmed.length > PROVIDER_EXHAUSTION_REPLY_MAX_LENGTH) {
+    return false;
+  }
+  if (PROVIDER_EXHAUSTION_PROCEDURAL_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return true;
+  }
+  const hasBlockerTopic = PROVIDER_EXHAUSTION_BLOCKER_TOPIC_PATTERNS.some((pattern) => pattern.test(trimmed));
+  const hasNeededTopic = PROVIDER_EXHAUSTION_NEEDED_TOPIC_PATTERNS.some((pattern) => pattern.test(trimmed));
+  return hasBlockerTopic && hasNeededTopic;
+}
+
 export type ReviewRoute =
   | "advance"
   | "advance-with-note"
@@ -891,8 +993,21 @@ export function decideReviewRoute(input: {
  * fixable work that iteration is structurally blind to is strictly more urgent
  * than plan steps it can see, and the plan's remaining items are still there
  * on the round after the blockers clear.
+ *
+ * "Precedence" governs the RECOMMENDATION, not the truth of the alternative.
+ * `"apply-review"` is returned only when the checklist is ALSO complete, so
+ * Implementation genuinely has nothing left to do — "will most likely change
+ * nothing" is then a true statement. Whenever a task-fixable blocker AND
+ * unticked checklist items coexist, `"both"` is returned instead: two
+ * genuinely valid actions exist (Apply Review fixes what the review found;
+ * Implementation can still land real, queued checklist work Apply Review does
+ * not touch), and a caller asserting the second is futile would be asserting
+ * something false. Observed 2026-08-21 (wf9 audit item 6): a task carrying 1
+ * task-fixable blocker and 77 unticked checklist items was told Implementation
+ * "will most likely change nothing" — the newest review's own progress marker
+ * showed 76 of those steps still queued and actionable.
  */
-export type PostReviewActionV1 = "apply-review" | "implementation" | "none";
+export type PostReviewActionV1 = "apply-review" | "implementation" | "both" | "none";
 
 export interface PostReviewActionDecisionV1 {
   readonly action: PostReviewActionV1;
@@ -989,6 +1104,21 @@ export function decidePostReviewActionV1(input: {
         };
   }
   if (latest.taskFixableCount > 0) {
+    if (input.hasUntickedChecklistItems) {
+      // Two genuinely valid actions (module doc comment above): recommend
+      // Apply Review first, per the module's own precedence rule, but never
+      // claim Implementation would change nothing — real, queued checklist
+      // work is exactly what it would act on.
+      return {
+        action: "both",
+        reviewStage: latest.stage,
+        reason:
+          `The ${stageName} found ${latest.taskFixableCount} problem(s) in the code that still need ` +
+          "fixing, and the plan checklist still has unticked items. Both are valid here: Apply Review " +
+          "can fix the problems the review found (Implementation cannot see them — it only reads the " +
+          "plan checklist), and Implementation can still make progress on the unticked checklist items.",
+      };
+    }
     return {
       action: "apply-review",
       reviewStage: latest.stage,

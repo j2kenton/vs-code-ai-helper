@@ -1698,13 +1698,14 @@ export async function runCommitPushCompletionChecksV1(
       () => checkPublishPreflight(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles, { persist: true })
     ))!;
     if (preflight.lintPayload) {
-      // Both halves of publish-checks.md must come from the same run. The
-      // preflight refreshes Completion Checks (through runCompletionLint) but
-      // nothing here recomputed the Scope Check, so a pre-commit report paired
-      // fresh check results with a scope answer from whenever Run Publish
-      // Checks last ran — before the files being committed were edited. That is
-      // the two-runs-one-document failure the publish split exists to remove,
-      // reappearing inside the new artifact.
+      // Both managed sections of publish-review.md must come from the same
+      // run. The preflight refreshes Completion Checks (through
+      // runCompletionLint) but nothing here recomputed the Scope Check, so a
+      // pre-commit report paired fresh check results with a scope answer
+      // from whenever Run Publish Checks last ran — before the files being
+      // committed were edited. That is the same two-runs-one-document
+      // failure the artifact split (now reversed) once existed to remove,
+      // reappearing inside one section of the unified document instead.
       //
       // Deliberately inside this branch: an absent lintPayload means the checks
       // did not run (git-readiness race, or runCompletionLint threw), so

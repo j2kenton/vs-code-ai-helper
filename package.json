@@ -1025,7 +1025,7 @@
             "properties": {
               "match": {
                 "type": "string",
-                "description": "Substring matched against a failed check's command line."
+                "description": "Matched EXACTLY (not as a substring) against a failed check's full command line — e.g. \"npm run test\" for a root-level check, or \"[apps/server] npm run test\" for a monorepo member package. This entry never quarantines any other command or package."
               },
               "failureSignature": {
                 "type": "string",
@@ -1044,7 +1044,7 @@
           },
           "default": [],
           "scope": "resource",
-          "markdownDescription": "Completion checks whose failure is a known, pre-existing environmental issue rather than a real regression. A failure is only quarantined when both `match` and `failureSignature` are found — the raw pass/fail result is never altered, only the modulo-known-flakes signal shown to reviewers."
+          "markdownDescription": "Completion checks whose failure is a known, pre-existing environmental issue rather than a real regression. A failure is only quarantined when its command line EXACTLY matches `match` (not a substring — a monorepo member's command must include its `[packageDir]` prefix) and `failureSignature` is found in its output. The raw pass/fail result is never altered, only the modulo-known-flakes signal shown to reviewers."
         },
         "ensemble.reviewPlateauRounds": {
           "type": "integer",
@@ -1106,6 +1106,14 @@
           "maximum": 99,
           "scope": "window",
           "description": "Stop and escalate after this many consecutive implementation rounds that change zero files while the same blocker persists, instead of iterating to ensemble.fastForwardMaxIterations. 0 disables the breaker (legacy behavior). Works together with ensemble.resilience.nothingToFixRoutesToReview, which is what lets zero-change rounds continue at all."
+        },
+        "ensemble.resilience.fallbackProviderBreakerRounds": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Stop and report instead of rerunning once a stage's ACTIVE FALLBACK provider (ensemble.resilience's switch-to-backup, not the primary) produces this many consecutive zero-file implementation rounds (classified provider-failure-empty). Distinct from ensemble.resilience.noProgressBreakerRounds, which counts across the whole task regardless of which candidate ran: this breaker is keyed to the specific fallback provider path, so a known-broken backup is named and the stage model can be switched instead of being rerun into the same wall. 0 disables it."
         },
         "ensemble.resilience.quotaResetNearThresholdHours": {
           "type": "integer",

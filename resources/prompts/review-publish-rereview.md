@@ -24,8 +24,6 @@ Then structure your review as:
 - Review-confidence blockers (if any).
 - Non-blocking suggestions (if any).
 
-The Plan Item Verification section below is a mechanical, deterministic check of the plan-final.md checklist — not an AI claim. If it reports any ❌ failed item, your verdict must address that item explicitly: either list it as a shipping blocker, or state explicitly why it is not one. Your summary verdict must never state "no blockers" or "ready to publish" while a failed item there goes unaddressed — a publish verdict must never contradict a check embedded in its own artifact.
-
 If a Sibling Review Disagreement section appears below, it is also a mechanical, deterministic check, not an AI claim: the high-level and low-level implementation reviews reported contradictory facts about the identical commit. Resolve it explicitly by deriving the current state from the workspace yourself — never by silently averaging the two scores or verdicts together.
 
 Record which commit you reviewed. End your response with this marker on its own line, using the exact value shown below (copy it — do not compute or guess a SHA yourself):
@@ -39,8 +37,6 @@ Record which commit you reviewed. End your response with this marker on its own 
 {{contextPack}}
 
 {{verifiedChecks}}
-
-{{planItemVerification}}
 
 {{siblingReviewDisagreement}}
 

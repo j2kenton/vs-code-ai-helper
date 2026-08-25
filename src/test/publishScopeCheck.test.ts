@@ -25,7 +25,9 @@ import {
   readPublishChecksFreshnessStampV1,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+
+const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
 const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-publish-scope-check-test-")
@@ -240,7 +242,7 @@ void describe("mergeScopeCheckSection", () => {
 // ---------------------------------------------------------------------------
 
 void describe("upsertScopeCheckReportV1", () => {
-  void it("creates publish-checks.md with a Scope Check section when it doesn't exist", async () => {
+  void it("creates publish-review.md with a Scope Check section when it doesn't exist", async () => {
     const dir = makeDir("upsert-create");
     await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
       runAt: "2026-01-01T00:00:00.000Z",
@@ -249,10 +251,15 @@ void describe("upsertScopeCheckReportV1", () => {
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /## Scope Check/);
     assert.match(content, /Files the plan doesn't mention/);
     assert.match(content, /src\/unexpected\.ts/);
+    assert.equal(
+      nodeFs.existsSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME)),
+      false,
+      "no new publish-checks.md is ever written"
+    );
   });
 
   void it("renders the no-basis statement instead of an empty ok-looking result", async () => {
@@ -264,7 +271,7 @@ void describe("upsertScopeCheckReportV1", () => {
       basisUnavailable: true,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /No basis for this check/);
     assert.doesNotMatch(content, /No files the plan doesn't mention/);
   });
@@ -272,7 +279,7 @@ void describe("upsertScopeCheckReportV1", () => {
   void it("preserves pre-existing AI review content and updates only the managed section on rerun", async () => {
     const dir = makeDir("upsert-preserve");
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-checks.md"),
+      nodePath.join(dir, PUBLISH_REVIEW_FILENAME),
       "Readiness: 8/10\n\nSummary verdict: ready to publish.\n",
       "utf8"
     );
@@ -290,7 +297,7 @@ void describe("upsertScopeCheckReportV1", () => {
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Readiness: 8\/10/);
     assert.doesNotMatch(content, /src\/first\.ts/);
     assert.match(content, /No files the plan doesn't mention\./);
@@ -299,7 +306,7 @@ void describe("upsertScopeCheckReportV1", () => {
   void it("keeps a separate Completion Checks section intact", async () => {
     const dir = makeDir("upsert-alongside-completion-checks");
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-checks.md"),
+      nodePath.join(dir, PUBLISH_REVIEW_FILENAME),
       "<!-- completion-checks:start -->\n## Completion Checks\n\n- Status: Passed\n<!-- completion-checks:end -->\n",
       "utf8"
     );
@@ -311,7 +318,7 @@ void describe("upsertScopeCheckReportV1", () => {
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /## Completion Checks/);
     assert.match(content, /Status: Passed/);
     assert.match(content, /## Scope Check/);
@@ -376,7 +383,7 @@ void describe("upsertScopeCheckReportV1", () => {
       upsertCompletionChecksReportV1(targetUri, completionResult),
     ]);
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     for (const marker of [
       "<!-- scope-check:start -->",
       "<!-- scope-check:end -->",
@@ -391,7 +398,7 @@ void describe("upsertScopeCheckReportV1", () => {
 });
 
 void describe("the Scope Check section dates itself", () => {
-  // Both halves of publish-checks.md are refreshed by different call paths —
+  // Both halves of publish-review.md are refreshed by different call paths —
   // Commit and Push re-runs the completion lint alone — so the document can
   // legitimately hold sections computed moments apart. Completion Checks has
   // always stamped its own "Last run"; this one did not, which made the
@@ -405,7 +412,7 @@ void describe("the Scope Check section dates itself", () => {
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Last run: 2026-08-11T09:30:00\.000Z/);
   });
 
@@ -420,7 +427,7 @@ void describe("the Scope Check section dates itself", () => {
       basisUnavailable: true,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Last run: 2026-08-11T10:45:00\.000Z/);
     assert.match(content, /No basis for this check/);
   });

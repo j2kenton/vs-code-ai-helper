@@ -5,10 +5,11 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { readNonEmptyText } from "../utils/fileUtils";
 import {
+  extractCompletionChecksSectionV1,
   runCompletionLint,
   resolvePublishScopeFolder,
 } from "../utils/completionLint";
@@ -160,21 +161,33 @@ export async function runLintingFixes(
   // ever having run for this task.
   const lastReport = resolvedTask.progress.lintPayload;
   if (!lastReport) {
-    // publish-checks.md (the Publish report artifact, distinct from the
-    // AI reviewer's publish-review.md verdict) is only ever written by an
-    // actual Publish checks run — never by this preview/review path — so
-    // its presence here means checks ran and were reported at some point,
-    // but no lintPayload survived to this task's current progress (an old
-    // task from before lintPayload persistence existed, or a state file
-    // that was reset/edited by hand). Word this so it doesn't flatly claim
-    // "no report found" when there is visibly a Publish report on disk.
-    const publishChecksUri = vscode.Uri.file(
+    // A Completion Checks section on disk — in publish-review.md (the
+    // unified Publish artifact, plan item 17 step 20) or, for a task that
+    // predates that unification, the legacy publish-checks.md — is only
+    // ever written by an actual Publish checks run, never by this
+    // preview/review path. Its presence means checks ran and were reported
+    // at some point, but no lintPayload survived to this task's current
+    // progress (an old task from before lintPayload persistence existed, or
+    // a state file that was reset/edited by hand). Word this so it doesn't
+    // flatly claim "no report found" when there is visibly a Publish report
+    // on disk.
+    const publishReviewUri = vscode.Uri.file(
+      path.join(resolvedTask.taskFolderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME)
+    );
+    const publishReviewContent = await readNonEmptyText(publishReviewUri);
+    const legacyChecksUri = vscode.Uri.file(
       path.join(resolvedTask.taskFolderPath, PUBLISH_CHECKS_FILENAME)
     );
-    const publishChecksContent = await readNonEmptyText(publishChecksUri);
+    const legacyChecksContent = await readNonEmptyText(legacyChecksUri);
+    const reportFilename =
+      publishReviewContent && extractCompletionChecksSectionV1(publishReviewContent) !== undefined
+        ? (STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME)
+        : legacyChecksContent
+          ? PUBLISH_CHECKS_FILENAME
+          : undefined;
     NotificationRouter.showWarning(
-      publishChecksContent
-        ? `A ${PUBLISH_CHECKS_FILENAME} report exists on disk, but no usable Publish check result is ` +
+      reportFilename
+        ? `A ${reportFilename} report exists on disk, but no usable Publish check result is ` +
           "currently recorded for this task. Run the Publish checks again to refresh the report this action fixes."
         : "The Publish checks have not been run for this task yet. Run the Publish checks first to generate " +
           "the report this action fixes.",

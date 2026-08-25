@@ -15,12 +15,16 @@
  * (impl-low-review is itself a review stage, not the plain stage the map
  * requires), so `transition.shouldAutoReview` is always false there —
  * whether a follow-up Publish review is dispatched at all is decided
- * directly from the auto-advance mode: "auto-fast-forward" still gets a
- * follow-up Publish review dispatched (that IS a review, not a commit/push,
- * and remains in scope for automation); plain "auto" mode dispatches
- * nothing further onto Publish, only the manual nudge. Either way, nothing
- * this file exercises can ever reach `commitAndPushTask` without the user
- * clicking it.
+ * directly from the auto-advance mode. wf10 item 14 / Part 7 step 17: this
+ * dispatch is unconditional across BOTH modes now — "auto-fast-forward"
+ * dispatches the follow-up review+fix loop (`fastForwardReviewWithAI`) and
+ * plain "auto" dispatches a single review pass (`runReviewWithAI`); neither
+ * mode ever nudges the user to publish manually while a follow-up review can
+ * still be scheduled (that nudge only survives as the "could not be started
+ * automatically" drop-reason warning when the shared "auto-review" chain slot
+ * is unavailable). Either way, nothing this file exercises can ever reach
+ * `commitAndPushTask` without the user clicking it — that command is never
+ * scheduled automatically by any of these paths.
  */
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
@@ -60,7 +64,7 @@ import {
   computePublishScopeId,
   renderPublishChecksFreshnessStamp,
 } from "../utils/publishChecksFreshness";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -147,7 +151,13 @@ function stampPublishChecksFreshnessV1(folderPath: string): void {
     completedAt: "2026-01-01T00:00:00.000Z",
     scopeId: computePublishScopeId(scopeFolder),
   });
-  fs.writeFileSync(path.join(folderPath, PUBLISH_CHECKS_FILENAME), `${section}\n`, "utf8");
+  // The stamp lives in publish-review.md now (plan item 17, step 20 — the
+  // split with publish-checks.md is reversed).
+  fs.writeFileSync(
+    path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME),
+    `${section}\n`,
+    "utf8"
+  );
 }
 
 function makeTaskFolder(
@@ -613,7 +623,7 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     }
   });
 
-  void it("plain auto mode: never auto-publishes and dispatches no follow-up review either — commit/push only runs from the user's explicit click", async () => {
+  void it("plain auto mode: dispatches exactly one single-pass follow-up Publish review — commit/push only runs from the user's explicit click", async () => {
     const { folderPath } = makeTaskFolder(`auto-${Math.floor(Math.random() * 1e9)}`);
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -624,18 +634,81 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      // Isolate the ownership-dispatch decision from actual completion-lint
-      // execution (covered separately by checkPublishPreflight's own tests).
-      patch(publishPreflightModule, "checkPublishPreflight", () =>
-        Promise.resolve({ ok: true, lintPayload: { runAt: "now", passed: true, summary: "", issueCount: 0, failedChecks: [], missingScripts: [] } })),
     ];
     try {
       await runPassingReview(folderPath, dispatches);
 
+      assert.equal(dispatches.length, 1, "exactly one scheduling owner — no race between review and direct publish");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.equal(dispatches[0]?.chainId, "auto-review");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("auto-fast-forward mode: turning auto-advance off after the Publish transition commits must not cancel the already-owed review", async () => {
+    // wf10 item 14 / Part 7 step 17 (review completion blocker, 2026-08-24):
+    // the transition to Publish has already landed on disk by the time the
+    // follow-up review is scheduled — `stillEnabled` must not re-read
+    // isAutoAdvanceEnabled() at fire time and drop it if the user (or some
+    // other automation) turns the setting off afterward.
+    const { folderPath } = makeTaskFolder(`ff-toggle-${Math.floor(Math.random() * 1e9)}`);
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    let autoAdvanceEnabled = true;
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => autoAdvanceEnabled),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto-fast-forward"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+    ];
+    try {
+      await runPassingReview(folderPath, dispatches);
+
+      assert.equal(dispatches.length, 1);
+      autoAdvanceEnabled = false;
       assert.equal(
-        dispatches.length,
-        0,
-        "auto-advancing onto Publish in plain 'auto' mode never schedules the publish chain, and this mode never dispatches a follow-up review either"
+        dispatches[0]?.stillEnabled?.(),
+        true,
+        "an already-committed Publish transition must not be cancelled by turning auto-advance off afterward"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("plain auto mode: turning auto-advance off after the Publish transition commits must not cancel the already-owed review", async () => {
+    const { folderPath } = makeTaskFolder(`auto-toggle-${Math.floor(Math.random() * 1e9)}`);
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    let autoAdvanceEnabled = true;
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => autoAdvanceEnabled),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+    ];
+    try {
+      await runPassingReview(folderPath, dispatches);
+
+      assert.equal(dispatches.length, 1);
+      autoAdvanceEnabled = false;
+      assert.equal(
+        dispatches[0]?.stillEnabled?.(),
+        true,
+        "an already-committed Publish transition must not be cancelled by turning auto-advance off afterward"
       );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
@@ -1042,11 +1115,12 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
     assert.equal(isUnusableAsExistingReview(realReview), false);
   });
 
-  void it("the checks report is written to publish-checks.md and never into the reviewer's artifact", async () => {
-    // The split itself. Two authors on one document is what let a stale
-    // `Readiness: 2/10` from one commit sit above passing checks from another,
-    // with re-running the checks unable to correct the headline.
-    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-split-"));
+  void it("the checks report is spliced into publish-review.md, preserving the reviewer's own verdict", async () => {
+    // Plan item 17, step 20: the split is reversed — checks and the AI
+    // verdict now share one document (a managed, marker-delimited section),
+    // specifically so a user can never again mistake a separate
+    // checks-only file for their Publish review (2026-08-23 field report).
+    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-unified-"));
     const fsBridge = installFsBridge();
     try {
       fs.writeFileSync(
@@ -1056,15 +1130,13 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
       );
       await upsertCompletionChecksReportV1(vscode.Uri.file(folderPath), samplePassingLint);
 
-      const checks = fs.readFileSync(path.join(folderPath, "publish-checks.md"), "utf8");
-      assert.ok(checks.includes("Completion Checks"), "the report owns its own file");
-
       const review = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
       assert.ok(review.includes("Readiness: 9/10"), "the AI review body is untouched");
+      assert.ok(review.includes("Completion Checks"), "the checks section is spliced into the SAME document");
       assert.equal(
-        review.includes("Completion Checks"),
+        fs.existsSync(path.join(folderPath, "publish-checks.md")),
         false,
-        "the reviewer's artifact must never gain a checks section"
+        "no separate publish-checks.md is ever written"
       );
     } finally {
       fsBridge.restore();
@@ -1072,10 +1144,12 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
     }
   });
 
-  void it("strips a pre-split checks section out of publish-review.md on the next run", async () => {
-    // Migration: leaving the old section behind would keep the two-verdict
-    // document alive forever on exactly the tasks that hit the bug.
-    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-migrate-"));
+  void it("refreshing the Completion Checks section replaces only that section, leaving the reviewer's verdict untouched", async () => {
+    // Re-running checks must correct a stale checks section in place without
+    // disturbing the surrounding AI verdict — the two-verdict failure this
+    // guards against is a stale review next to fresh checks, not a stale
+    // checks section next to a fresh review.
+    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-refresh-"));
     const fsBridge = installFsBridge();
     try {
       fs.writeFileSync(
@@ -1100,16 +1174,15 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
 
       const review = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
       assert.equal(
-        review.includes("completion-checks:start"),
+        review.includes("Stale checks from a previous cycle."),
         false,
-        "the pre-split section must be removed"
+        "the stale section content must be replaced in place"
       );
       assert.ok(
         review.includes("Readiness: 2/10") && review.includes("Shipping blockers"),
-        "the reviewer's own verdict must survive the strip untouched"
+        "the reviewer's own verdict must survive the refresh untouched"
       );
-      const checks = fs.readFileSync(path.join(folderPath, "publish-checks.md"), "utf8");
-      assert.ok(checks.includes("All checks passed."), "the current run lands in the new file");
+      assert.ok(review.includes("All checks passed."), "the current run's results land in the same document");
     } finally {
       fsBridge.restore();
       fs.rmSync(folderPath, { recursive: true, force: true });
@@ -1684,7 +1757,7 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
     }
   });
 
-  void it("auto-advance onto Publish (plain 'auto' mode, entry-owned nudge): scopes the preflight to the task's implReviewFiles and never schedules the publish chain", async () => {
+  void it("auto-advance onto Publish (plain 'auto' mode): dispatches the follow-up review rather than computing the preflight itself", async () => {
     const { folderPath } = makeTaskFolder(`scope-autoadvance-${Math.floor(Math.random() * 1e9)}`);
     const progressPath = path.join(folderPath, "task-progress.json");
     const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
@@ -1702,17 +1775,22 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
-      // Landing on Publish in plain "auto" mode never dispatches a follow-up
-      // review or the publish chain — instead it always computes the
-      // preflight itself (reviewActions.ts's entry-owned "Publish manually"
-      // nudge, just above the auto-advance tail's return) so it can pick the
-      // right nudge wording. That preflight call must use the same
-      // implReviewFiles scope as every other entry point, complementing the
-      // sibling scope-jump/scope-nextstage tests above.
+      // wf10 item 14 / Part 7 step 17: landing on Publish in plain "auto"
+      // mode now dispatches a single-pass follow-up review
+      // (runReviewWithAI), same as every other landed-on review stage —
+      // it no longer computes checkPublishPreflight itself here to pick a
+      // "Publish manually" nudge wording (that entry-owned nudge only fires
+      // from the SEPARATE `targetStage === "publish"` branch, i.e. once a
+      // review already AT Publish completes without anywhere further to
+      // advance to — untouched by this fix and still covered by the
+      // sibling scope-jump/scope-nextstage tests above). The dispatched
+      // review itself is what will eventually decide the preflight scope,
+      // not this transition site.
       const calls = await captureRelevantFiles(() => runPassingReview(folderPath, dispatches));
-      assert.equal(calls.length, 1, "expected exactly one checkPublishPreflight call");
-      assert.deepEqual(calls[0], scopeFiles);
-      assert.equal(dispatches.length, 0, "auto-advancing onto Publish in plain 'auto' mode must never schedule the publish chain");
+      assert.equal(calls.length, 0, "this transition site no longer calls checkPublishPreflight directly — it defers to the dispatched review");
+      assert.equal(dispatches.length, 1, "auto-advancing onto Publish in plain 'auto' mode schedules exactly one follow-up review");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.equal(dispatches[0]?.chainId, "auto-review");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();

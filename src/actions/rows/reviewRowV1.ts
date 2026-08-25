@@ -20,6 +20,12 @@ import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { parseReadiness, withVisibleReviewedCommitLineV1 } from "../../utils/reviewReadiness";
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
 import { checkPublishChecksFreshnessV1 } from "../../utils/publishChecksFreshness";
+import { extractCompletionChecksSectionV1, mergeCompletionChecksSection } from "../../utils/completionLint";
+import { extractScopeCheckSectionV1, mergeScopeCheckSection } from "../../utils/publishScopeCheck";
+import {
+  extractPublishChecksFreshnessStampSectionV1,
+  mergePublishChecksFreshnessStamp,
+} from "../../utils/publishChecksFreshness";
 import { resolveHeadCommitSha } from "../../utils/gitRepoInfo";
 
 export const REVIEW_ACTION_KEY_V1 = "review.v1";
@@ -190,6 +196,50 @@ async function revalidatePublishFreshnessOrThrowV1(
   }
 }
 
+/** Generous enough for any realistic publish-review.md; a read this size
+ * failing is treated as "nothing to preserve", same as a missing file. */
+const PUBLISH_REVIEW_READ_BOUND_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Re-inject the Publish ground-truth sections (Completion Checks, Scope
+ * Check, freshness stamp) that a Publish review write would otherwise
+ * clobber (plan item 17, step 20): `promoteReviewContentV1` writes the AI's
+ * ENTIRE response as the new file content, and those sections live in
+ * `publish-review.md` too now that the split with `publish-checks.md` is
+ * reversed. Reads whatever is currently on disk at promotion time (not an
+ * earlier snapshot) and appends each managed section back onto the fresh
+ * markdown via the same merge helpers `runCompletionLint`/
+ * `runPublishScopeCheck` use, so the result is byte-identical to what a
+ * subsequent checks run would produce. A missing file, an unreadable file, or
+ * a file with no managed sections yet all degrade to "nothing to preserve" —
+ * this never blocks or fails the review write.
+ */
+async function reinjectPublishGroundTruthSectionsV1(
+  fileStore: ReturnType<typeof getWorkflowFileStoreV1>,
+  targetLocator: { readonly rootId: string; readonly relativePath: string },
+  markdown: string
+): Promise<string> {
+  const existingRead = await fileStore.readFileBounded(targetLocator, PUBLISH_REVIEW_READ_BOUND_BYTES);
+  if (existingRead.kind !== "ok") {
+    return markdown;
+  }
+  const existingContent = existingRead.value.bytes.toString("utf8");
+  let merged = markdown;
+  const completionChecks = extractCompletionChecksSectionV1(existingContent);
+  if (completionChecks) {
+    merged = mergeCompletionChecksSection(merged, completionChecks);
+  }
+  const scopeCheck = extractScopeCheckSectionV1(existingContent);
+  if (scopeCheck) {
+    merged = mergeScopeCheckSection(merged, scopeCheck);
+  }
+  const freshnessStamp = extractPublishChecksFreshnessStampSectionV1(existingContent);
+  if (freshnessStamp) {
+    merged = mergePublishChecksFreshnessStamp(merged, freshnessStamp);
+  }
+  return merged;
+}
+
 async function promoteReviewContentV1(
   content: CompletedContentV1,
   context: TaskActionExecutionContextV1
@@ -219,13 +269,21 @@ async function promoteReviewContentV1(
   // same helper and header format the legacy CliAgentRunner text path uses,
   // so a review artifact is indistinguishable regardless of which path wrote
   // it (see fileUtils.ts's withAttribution/attributionModelLabel).
-  const markdown = context.provider
+  const attributedMarkdown = context.provider
     ? withAttribution(
         freshMarkdown,
         context.provider.providerLabel,
         attributionModelLabel(context.provider.storedModelId)
       )
     : freshMarkdown;
+  // Publish-only (step 20): the ground-truth Completion Checks / Scope Check
+  // / freshness-stamp sections live in this same file now — re-splice
+  // whatever is currently on disk back in, since this write otherwise
+  // replaces the whole file with just the reviewer's prose.
+  const markdown =
+    context.stage === "publish"
+      ? await reinjectPublishGroundTruthSectionsV1(fileStore, input.targetLocator, attributedMarkdown)
+      : attributedMarkdown;
   const bytes = Buffer.from(markdown, "utf8");
   const result =
     input.baselineRevision === undefined

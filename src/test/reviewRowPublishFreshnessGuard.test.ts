@@ -28,16 +28,18 @@ import { TaskActionExecutionContextV1 } from "../actions/taskActionRegistryV1";
 import {
   configureWorkflowPrivateStorageRootV1,
   ensureWorkflowTaskFolderRootV1,
+  getWorkflowFileStoreV1,
   resetWorkflowRuntimeServicesForTestV1,
 } from "../services/workflowRuntimeServicesV1";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
-import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { STAGE_ARTIFACT_FILENAMES, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import {
   computePublishScopeId,
   renderPublishChecksFreshnessStamp,
 } from "../utils/publishChecksFreshness";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+
+const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-review-freshness-guard-"));
 cp.execSync("git init", { cwd: ROOT, stdio: "ignore" });
@@ -56,7 +58,10 @@ function writeStamp(taskFolder: string, scopeFolder: string, runId: string, comm
     completedAt: "2026-01-01T00:00:00.000Z",
     scopeId: computePublishScopeId(scopeFolder),
   });
-  fs.writeFileSync(path.join(taskFolder, PUBLISH_CHECKS_FILENAME), `${section}\n`, "utf8");
+  // The freshness stamp lives in publish-review.md now (plan item 17, step
+  // 20 — the split with publish-checks.md is reversed), the SAME file the
+  // review target below writes to.
+  fs.writeFileSync(path.join(taskFolder, PUBLISH_REVIEW_FILENAME), `${section}\n`, "utf8");
 }
 
 let privateStorageDir: string;
@@ -104,9 +109,19 @@ async function promote(
 ): Promise<void> {
   const row = createReviewRowV1();
   const rootId = ensureWorkflowTaskFolderRootV1(taskFolder);
+  const targetLocator = { rootId, relativePath };
+  // The freshness stamp now lives in the SAME file the review promotes into
+  // (plan item 17, step 20), so `writeStamp` above may have already created
+  // it — an exclusive create would then fail with `targetExists`. Mirror
+  // production (`runReviewForFolder` resolves a real baseline revision
+  // before dispatch) by supplying one whenever the target already exists.
+  const existing = await getWorkflowFileStoreV1().stat(targetLocator);
+  const baselineRevision =
+    existing.kind === "ok" && existing.value.kind === "file" ? existing.value.revision : undefined;
   const rawInput: Record<string, unknown> = {
     prompt: "review this",
-    targetLocator: { rootId, relativePath },
+    targetLocator,
+    ...(baselineRevision !== undefined ? { baselineRevision } : {}),
     ...(guard !== undefined ? { publishFreshnessGuard: guard } : {}),
   };
   const validation = validateReviewInputV1(rawInput);
@@ -162,7 +177,11 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
       () => promote(folder, guard, "publish-review.md"),
       /Publish Checks changed/
     );
-    assert.equal(fs.existsSync(path.join(folder, "publish-review.md")), false);
+    // The stamp itself (written by the test's own setup, simulating a
+    // Publish Checks run that already completed) legitimately lives in this
+    // same file now — only the review verdict must never have been added.
+    const content = fs.readFileSync(path.join(folder, "publish-review.md"), "utf8");
+    assert.doesNotMatch(content, /Readiness: 8\/10/);
   });
 
   void it("refuses promotion when the commit moved on while the review was running", async () => {
@@ -184,7 +203,7 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
     );
   });
 
-  void it("refuses promotion when publish-checks.md has no stamp at all anymore", async () => {
+  void it("refuses promotion when publish-review.md has no stamp at all anymore", async () => {
     const folder = makeTaskFolder("stamp-removed");
     const scopeFolder = path.dirname(folder);
     const guard: PublishReviewFreshnessGuardV1 = {
@@ -193,7 +212,7 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
       runId: RUN_ID,
       verifiedCommitSha: HEAD_SHA,
     };
-    // No writeStamp call: publish-checks.md is absent entirely.
+    // No writeStamp call: publish-review.md is absent entirely.
     await assert.rejects(
       () => promote(folder, guard, "publish-review.md"),
       /Publish Checks changed/

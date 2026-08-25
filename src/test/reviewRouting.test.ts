@@ -10,6 +10,8 @@ import {
   degenerateReviewRejectionReason,
   detectBlockerSetStall,
   detectPlateau,
+  isProviderExhaustionReplyShapeV1,
+  promptCeilingAdvisoryV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
   rubricCapLikelyBlockedAdvance,
@@ -921,15 +923,26 @@ void describe("decidePostReviewActionV1", () => {
     assert.strictEqual(decision.reviewStage, "impl-low-review");
   });
 
-  void it("routes to apply-review even when the checklist ALSO has unticked items", () => {
-    // Blockers take precedence: they are work iteration cannot see, and the
-    // checklist items are still there on the round after they clear.
+  /**
+   * wf10 item 6 (2026-08-24): this used to assert "apply-review" here too,
+   * reasoning that blockers take precedence. That was true for the
+   * RECOMMENDATION but false for the ALTERNATIVE: observed 2026-08-21, a task
+   * with 1 task-fixable blocker and 77 unticked checklist items was told
+   * Implementation "will most likely change nothing" — the newest review's
+   * own progress marker showed 76 of those steps still queued and
+   * actionable. Both actions are genuinely valid whenever both conditions
+   * hold; the function now says so instead of naming one and asserting the
+   * other is futile.
+   */
+  void it("returns 'both' (not 'apply-review') when a task-fixable blocker AND unticked checklist items coexist", () => {
     const decision = decidePostReviewActionV1({
       history: [entry(5, { stage: "impl-low-review", taskFixableCount: 1, blockerCount: 1 })],
       stages: IMPL_REVIEW_STAGES_V1,
       hasUntickedChecklistItems: true,
     });
-    assert.strictEqual(decision.action, "apply-review");
+    assert.strictEqual(decision.action, "both");
+    assert.strictEqual(decision.reviewStage, "impl-low-review");
+    assert.match(decision.reason, /Both are valid/);
   });
 
   void it("routes to implementation when nothing is task-fixable but the checklist is unfinished", () => {
@@ -1118,7 +1131,7 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
       /postWorkflowDecisionV1/,
       "sterileRoundRouting must be posted through postWorkflowDecisionV1, not built as a raw notification"
     );
-    const after = source.slice(index, index + 2200);
+    const after = source.slice(index, index + 3200);
     const fallbackOffset = after.indexOf("NotificationRouter.showWarning");
     assert.ok(fallbackOffset >= 0, "expected a fallback notification for a missing extension context");
     const guard = after.slice(0, fallbackOffset);
@@ -1148,6 +1161,53 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
       guard,
       /if\s*\(!decision\)/,
       "the fallback notification must be gated on the decision failing to post, not run unconditionally alongside it"
+    );
+  });
+
+  void it("the sterileRoundRouting recommendation and fallback do not call Implementation futile when sterileBothValid (a task-fixable blocker AND unticked checklist items coexist)", async () => {
+    // wf10 item 6 / this round's review finding: `decidePostReviewActionV1`
+    // returning "both" means the two actions are BOTH valid — the caller
+    // must not assert Implementation "will give the same (unchanged)
+    // result" in that case, since a two-valid-actions result is exactly the
+    // situation where that claim is false (see reviewRouting.test.ts's
+    // "both" coverage for the underlying routing contract).
+    const source = await readReviewActionsSrc();
+    const marker = 'decisionKey: "sterileRoundRouting"';
+    const index = source.indexOf(marker);
+    assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
+
+    // The recommendation.reasoning block, scoped to just before the
+    // `gating:` field that follows it.
+    const after = source.slice(index, index + 3200);
+    const gatingOffset = after.indexOf("gating: {");
+    assert.ok(gatingOffset >= 0, "expected a gating field after the recommendation block");
+    const recommendationBlock = after.slice(0, gatingOffset);
+    assert.match(
+      recommendationBlock,
+      /sterileBothValid\s*\?/,
+      "the recommendation reasoning must branch on sterileBothValid rather than unconditionally asserting futility"
+    );
+    // Whatever the false-branch (sterileBothValid === false) text is, it
+    // must not appear unguarded in the true-branch text — i.e. the futility
+    // claim must not survive into the both-valid case.
+    const trueBranchEnd = recommendationBlock.search(/:\s*"Apply Review is the only action/);
+    assert.ok(trueBranchEnd >= 0, "expected to locate the sterileBothValid===false branch text");
+    const trueBranchText = recommendationBlock.slice(0, trueBranchEnd);
+    assert.doesNotMatch(
+      trueBranchText,
+      /will give the same \(unchanged\) result/,
+      "the sterileBothValid===true branch must not claim Implementation will give the same result"
+    );
+
+    // The raw-notification fallback (missing extension context) must carry
+    // the same conditional guard.
+    const fallbackOffset = after.indexOf("NotificationRouter.showWarning");
+    assert.ok(fallbackOffset >= 0, "expected a fallback notification for a missing extension context");
+    const fallbackBlock = after.slice(fallbackOffset, fallbackOffset + 900);
+    assert.match(
+      fallbackBlock,
+      /sterileBothValid\s*\?/,
+      "the fallback notification text must also branch on sterileBothValid"
     );
   });
 
@@ -1201,5 +1261,76 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
       assert.match(slice, /expectedTiming:/, `intent for trigger "${trigger}" must name an expectedTiming`);
       assert.match(slice, /willRetry:/, `intent for trigger "${trigger}" must state whether it will retry`);
     }
+  });
+});
+
+void describe("promptCeilingAdvisoryV1 (wf10 item 7c / Part 6 step 16)", () => {
+  void it("returns undefined when the provider has no known ceiling", () => {
+    assert.equal(promptCeilingAdvisoryV1(200000, "some-unknown-provider"), undefined);
+  });
+
+  void it("returns undefined when the prompt is within the known ceiling", () => {
+    assert.equal(promptCeilingAdvisoryV1(1000, "kimi-cli"), undefined);
+  });
+
+  void it("returns undefined when either input is missing", () => {
+    assert.equal(promptCeilingAdvisoryV1(undefined, "kimi-cli"), undefined);
+    assert.equal(promptCeilingAdvisoryV1(70000, undefined), undefined);
+  });
+
+  void it("names the provider, the size, and a remedy when the ceiling is exceeded", () => {
+    const advisory = promptCeilingAdvisoryV1(70000, "kimi-cli");
+    assert.ok(advisory);
+    assert.match(advisory, /70000 bytes/);
+    assert.match(advisory, /kimi-cli/);
+    assert.match(advisory, /Shrink the prompt|route this stage/);
+  });
+});
+
+void describe("isProviderExhaustionReplyShapeV1 (wf10 item 7c / Part 6 step 16)", () => {
+  void it("recognizes the observed budget-handler exhaustion reply shape", () => {
+    const reply =
+      "The Read tool keeps truncating the full-file read. I'll page through with explicit line ranges. " +
+      "This is my current blocker and what I need from the user to unblock progress.";
+    assert.equal(isProviderExhaustionReplyShapeV1(reply), true);
+  });
+
+  void it("does not classify ordinary short malformed output as an exhaustion reply", () => {
+    assert.equal(isProviderExhaustionReplyShapeV1("garbled nonsense output with no readiness line"), false);
+  });
+
+  void it("does not classify empty output as an exhaustion reply", () => {
+    assert.equal(isProviderExhaustionReplyShapeV1("   "), false);
+  });
+
+  void it("does not classify a long reply as an exhaustion reply even if it shares a phrase", () => {
+    const longReply = "current blocker ".repeat(400);
+    assert.equal(isProviderExhaustionReplyShapeV1(longReply), false);
+  });
+
+  // wf10 review fix: a lone topic phrase must not be enough — only an
+  // unambiguous procedural marker, or BOTH halves of the injected question's
+  // blocker-plus-needed-from-user shape together, may classify as exhaustion.
+  void it("does not classify a reply naming only 'current blocker' with no needed-from-user half", () => {
+    assert.equal(
+      isProviderExhaustionReplyShapeV1("The current blocker is a missing config file."),
+      false
+    );
+  });
+
+  void it("does not classify a reply naming only the needed-from-user half with no blocker topic", () => {
+    assert.equal(
+      isProviderExhaustionReplyShapeV1("Here is what you need from the user to unblock progress."),
+      false
+    );
+  });
+
+  void it("classifies a reply that names both the blocker and needed-from-user halves together", () => {
+    assert.equal(
+      isProviderExhaustionReplyShapeV1(
+        "I could not finish. The current blocker is prompt size. What I need from the user: a smaller prompt."
+      ),
+      true
+    );
   });
 });

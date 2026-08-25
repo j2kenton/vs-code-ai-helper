@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress, type TaskStage } from "../types/taskProgress";
+import { appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -267,6 +267,47 @@ void test("appendReviewRejection caps at MAX_REVIEW_REJECTIONS, dropping the old
   assert.equal(updated.reviewRejections?.length, MAX_REVIEW_REJECTIONS);
   assert.equal(updated.reviewRejections?.[0]?.attemptId, "attempt-1", "the single oldest entry must be dropped");
   assert.equal(updated.reviewRejections?.at(-1)?.attemptId, "attempt-new");
+});
+
+// ---------------------------------------------------------------------------
+// appendRoundOutcome: durable round-outcome classification trail (wf10 item 4 / Part 4)
+// ---------------------------------------------------------------------------
+
+function roundOutcomeEntry(overrides: Partial<RoundOutcomeEntryV1> = {}): RoundOutcomeEntryV1 {
+  return {
+    stage: "impl",
+    classification: "provider-failure-empty",
+    at: "2026-07-07T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+void test("appendRoundOutcome records the classification without touching reviewRejections or reviewScoreHistory", () => {
+  const progress = { ...makeProgress(), reviewScoreHistory: [historyEntry()] };
+  const updated = appendRoundOutcome(progress, roundOutcomeEntry());
+  assert.deepEqual(updated.roundOutcomes, [roundOutcomeEntry()]);
+  assert.deepEqual(updated.reviewScoreHistory, [historyEntry()]);
+  assert.equal(updated.reviewRejections, undefined);
+});
+
+void test("appendRoundOutcome preserves prior entries in order", () => {
+  const progress = { ...makeProgress(), roundOutcomes: [roundOutcomeEntry({ classification: "genuine-no-op" })] };
+  const updated = appendRoundOutcome(progress, roundOutcomeEntry({ classification: "edits-produced" }));
+  assert.deepEqual(
+    updated.roundOutcomes?.map((e) => e.classification),
+    ["genuine-no-op", "edits-produced"]
+  );
+});
+
+void test("appendRoundOutcome caps at MAX_ROUND_OUTCOMES, dropping the oldest first", () => {
+  const existing = Array.from({ length: MAX_ROUND_OUTCOMES }, (_, i) =>
+    roundOutcomeEntry({ attemptId: `attempt-${i}` })
+  );
+  const progress = { ...makeProgress(), roundOutcomes: existing };
+  const updated = appendRoundOutcome(progress, roundOutcomeEntry({ attemptId: "attempt-new" }));
+  assert.equal(updated.roundOutcomes?.length, MAX_ROUND_OUTCOMES);
+  assert.equal(updated.roundOutcomes?.[0]?.attemptId, "attempt-1", "the single oldest entry must be dropped");
+  assert.equal(updated.roundOutcomes?.at(-1)?.attemptId, "attempt-new");
 });
 
 void test("recordEscalation sets the escalation field", () => {

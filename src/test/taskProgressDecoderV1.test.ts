@@ -106,6 +106,33 @@ void describe("taskProgressDecoderV1", () => {
     expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: { not: "an array" } }), "invalidFieldValue");
   });
 
+  void it("decodes a valid roundOutcomes trail and fails closed on malformed entries (wf10 item 4 / Part 4)", () => {
+    const valid = {
+      stage: "impl",
+      classification: "provider-failure-empty",
+      at: "2026-07-02T11:00:00.000Z",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [valid] })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.roundOutcomes, [valid]);
+    }
+    const withAttempt = { ...valid, attemptId: "attempt-1" };
+    const resultWithAttempt = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [withAttempt] })
+    );
+    assert.equal(resultWithAttempt.ok, true);
+    if (resultWithAttempt.ok) {
+      assert.deepEqual(resultWithAttempt.decoded.progress.roundOutcomes, [withAttempt]);
+    }
+    expectRecovery(doc({ ensembleProgressVersion: 1, roundOutcomes: [{ ...valid, classification: "bogus" }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, roundOutcomes: [{ ...valid, stage: "bogus" }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, roundOutcomes: [{ ...valid, extra: true }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, roundOutcomes: { not: "an array" } }), "invalidFieldValue");
+  });
+
   void it("decodes reviewScoreHistory entries with a reviewer identity and fails closed on malformed shapes (workflow-2 item 7)", () => {
     const valid = {
       stage: "impl-high-review",

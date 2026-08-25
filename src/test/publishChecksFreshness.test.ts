@@ -1,5 +1,6 @@
 /**
- * Coverage for the `publish-checks.md` freshness stamp (plan PART 2, step 6):
+ * Coverage for the `publish-review.md` freshness stamp (plan PART 2, step 6;
+ * relocated into the unified Publish artifact by plan item 17, step 20):
  * render/parse/merge/invalidate round-tripping, and the disk helpers used by
  * `runPublishChecks.ts` to prove the completion lint and Publish Scope Check
  * ran back-to-back against one unchanged commit.
@@ -28,7 +29,9 @@ import {
   writeFileAtomicV1,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+
+const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
 const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-publish-checks-freshness-test-")
@@ -149,7 +152,7 @@ void describe("publishChecksFreshness — disk helpers", () => {
 
   void it("invalidate-on-disk removes a stamp without touching other content", async () => {
     const taskFolder = makeTaskFolder("invalidate");
-    const filePath = nodePath.join(taskFolder.fsPath, PUBLISH_CHECKS_FILENAME);
+    const filePath = nodePath.join(taskFolder.fsPath, PUBLISH_REVIEW_FILENAME);
     nodeFs.writeFileSync(filePath, "## Completion Checks\nprior content\n", "utf8");
     await writePublishChecksFreshnessStampV1(taskFolder, SAMPLE_STAMP);
     assert.notEqual(await readPublishChecksFreshnessStampV1(taskFolder), undefined);
@@ -162,7 +165,7 @@ void describe("publishChecksFreshness — disk helpers", () => {
 
   void it("invalidate-on-disk is a no-op (no write) when the file has no stamp", async () => {
     const taskFolder = makeTaskFolder("invalidate-noop");
-    const filePath = nodePath.join(taskFolder.fsPath, PUBLISH_CHECKS_FILENAME);
+    const filePath = nodePath.join(taskFolder.fsPath, PUBLISH_REVIEW_FILENAME);
     nodeFs.writeFileSync(filePath, "## Completion Checks\nno stamp here\n", "utf8");
     const before = nodeFs.statSync(filePath).mtimeMs;
     await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolder);
@@ -179,7 +182,7 @@ void describe("publishChecksFreshness — disk helpers", () => {
 void describe("publishChecksFreshness — writeFileAtomicV1", () => {
   void it("leaves no temp file behind after a successful write", async () => {
     const dir = makeTaskFolder("atomic-write").fsPath;
-    const target = nodePath.join(dir, PUBLISH_CHECKS_FILENAME);
+    const target = nodePath.join(dir, PUBLISH_REVIEW_FILENAME);
     await writeFileAtomicV1(target, "hello atomic\n");
     assert.equal(nodeFs.readFileSync(target, "utf8"), "hello atomic\n");
     const leftovers = nodeFs.readdirSync(dir).filter((name) => name.includes(".tmp-"));
@@ -188,7 +191,7 @@ void describe("publishChecksFreshness — writeFileAtomicV1", () => {
 
   void it("never exposes a partially written file to a concurrent reader", async () => {
     const dir = makeTaskFolder("atomic-write-torn").fsPath;
-    const target = nodePath.join(dir, PUBLISH_CHECKS_FILENAME);
+    const target = nodePath.join(dir, PUBLISH_REVIEW_FILENAME);
     const big = "x".repeat(200_000);
     const writes = Promise.all([
       writeFileAtomicV1(target, `A:${big}`),

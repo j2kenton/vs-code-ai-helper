@@ -168,6 +168,13 @@ export interface TaskProgress {
   reviewScoreHistory?: ReviewScoreHistoryEntry[];
   /** Durable record of review rounds rejected as degenerate. */
   reviewRejections?: ReviewRejectionEntry[];
+  /** Durable, fixed-vocabulary record of what each round that reached
+   * completion accounting actually produced (mirror of
+   * `src/types/taskProgress.ts`). Persisted only at round-completion-
+   * accounting time; runner-level failures (quota, unavailable, skipped
+   * candidate) never reach that accounting and are not recorded here.
+   * Capped at MAX_ROUND_OUTCOMES (oldest dropped). */
+  roundOutcomes?: RoundOutcomeEntryV1[];
   /** Set when automated review iteration needs a human decision. */
   escalation?: TaskEscalation;
   /** Durable record of every escalation Fast Forward rode through rather than
@@ -355,6 +362,58 @@ export interface ReviewRejectionEntry {
 
 /** Cap on `TaskProgress.reviewRejections` length (oldest entries dropped first). */
 export const MAX_REVIEW_REJECTIONS = 50;
+
+/**
+ * Fixed-vocabulary outcome of a completed round (mirror of
+ * `src/types/taskProgress.ts`):
+ *  - `edits-produced`: the round changed files, or landed checklist ticks.
+ *  - `genuine-no-op`: zero files changed, justified — no work was needed.
+ *  - `provider-failure-empty`: zero files changed on a task with unticked
+ *    checklist items and a review naming live blockers — the same shape
+ *    previously recorded, indistinguishably, as a success.
+ *  - `cancelled`: the round was cancelled before producing a result.
+ *  - `rejected-degenerate`: a review round with no parseable `Readiness:
+ *    N/10` line — a failed attempt wearing a review's clothes, not a
+ *    review (see `TaskProgress.reviewRejections`).
+ */
+export type RoundOutcomeClassificationV1 =
+  | "edits-produced"
+  | "genuine-no-op"
+  | "provider-failure-empty"
+  | "cancelled"
+  | "rejected-degenerate";
+
+/** One row of `TaskProgress.roundOutcomes`. */
+export interface RoundOutcomeEntryV1 {
+  stage: TaskStage;
+  classification: RoundOutcomeClassificationV1;
+  /** ISO timestamp when the round was classified. */
+  at: string;
+  /** Correlates with the review attempt this classification describes, when known (review rounds only). */
+  attemptId?: string;
+  /**
+   * The stored model id this round actually ran with (Part 5's fallback
+   * circuit breaker and degenerate-review backup advance both need to know
+   * WHICH candidate produced a zero-file/rejected round, not just that one
+   * occurred). Absent for older entries written before this field existed;
+   * treat absence as "unknown candidate", never as a match.
+   */
+  modelId?: string;
+  /**
+   * The runner id (`runnerId`) the candidate that actually produced this
+   * round ran under — e.g. `"claude-cli"`, `"codex-cli"`, or `"copilot-lm"`
+   * for every Copilot dispatch (Copilot is routed exclusively through the
+   * sealed two-phase pipeline, so `"copilot-lm"` already IS the
+   * sealed-vs-direct distinction). Candidate identity for the breaker/
+   * health-window checks is the full provider path (provider id + model
+   * id), not `modelId` alone. Absent for entries written before this field
+   * existed; treat absence as "unknown provider", never as a match.
+   */
+  providerId?: string;
+}
+
+/** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */
+export const MAX_ROUND_OUTCOMES = 50;
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */
 export const MAX_REVIEW_BLOCKER_IDENTITIES = 32;

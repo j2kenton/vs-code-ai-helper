@@ -1443,7 +1443,16 @@ void describe("resolveRunnerForModel", () => {
 });
 
 void describe("runImplementationForModel", () => {
-  void it("reports implementation availability from a configured backup", async () => {
+  // wf10 item 3 / Part 5 step 13: a Copilot-resolved backup (here the bare
+  // legacy id "auto") must NEVER be selected by this automatic availability
+  // walk — Copilot implementation runs go through the sealed two-phase
+  // preflight pipeline, which both wf9 and jester observed landing on
+  // reliably ("available") while reliably producing zero-file rounds when
+  // reached this way. This test previously asserted the OLD behavior (the
+  // walk silently succeeding on the Copilot backup); it now asserts the
+  // opposite — the primary's own unavailability is reported honestly instead
+  // of being masked by an excluded backup.
+  void it("does not fall through to a Copilot-resolved backup — reports the primary's own unavailability instead", async () => {
     const settings = installModelSettings({
       impl: {
         primary: "kiro-cli:default",
@@ -1471,8 +1480,8 @@ void describe("runImplementationForModel", () => {
     try {
       const { availability, providerLabel } =
         await checkImplementationAvailabilityForModel("kiro-cli:default", "impl");
-      assert.equal(availability.available, true);
-      assert.equal(providerLabel, "Copilot");
+      assert.equal(availability.available, false);
+      assert.notEqual(providerLabel, "Copilot");
     } finally {
       settings.restore();
       lm.selectChatModels = originalSelectChatModels;

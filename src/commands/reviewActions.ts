@@ -29,12 +29,18 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import { ReviewScoreHistoryEntry, TaskEscalation, TaskProgress } from "../types/taskProgress";
+import {
+  ReviewScoreHistoryEntry,
+  RoundOutcomeClassificationV1,
+  TaskEscalation,
+  TaskProgress,
+} from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import {
   appendOverriddenEscalation,
   appendReviewRejection,
   appendReviewScoreHistory,
+  appendRoundOutcome,
   clearImplementationTypeCheckFailure,
   clearReviewInvalidatedByRound,
   promotePendingImplReviewFiles,
@@ -45,6 +51,13 @@ import {
   updateLintPayload,
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
+import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
+import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
+import {
+  computeDegenerateReviewEpisodeModelIdsV1,
+  decideDegenerateReviewBackupAdvanceV1,
+  DegenerateReviewBackupAdvanceDecisionV1,
+} from "../utils/degenerateReviewBackupAdvanceV1";
 import { classifyFailure, parseQuotaResetV1, isQuotaResetBeyondThresholdV1 } from "../utils/quota";
 import { QuotaParkRecordV1 } from "../types/taskProgress";
 import {
@@ -84,7 +97,6 @@ import {
 } from "../utils/fileUtils";
 import {
   ChecklistProgressV1,
-  countChecklistProgressV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
@@ -99,7 +111,9 @@ import {
 } from "../utils/taskActionOutcomeTextV1";
 import {
   checkImplementationAvailabilityForModel,
+  getConfiguredBackupModelsForStage,
   preflightStageChainAvailabilityV1,
+  recordActiveFallbackModel,
   resolveEffectiveProvider,
 } from "../runners/runnerRegistry";
 import {
@@ -112,6 +126,7 @@ import {
   describeStageSubstitutesV1,
   ResolvedStageModel,
   resolveConfiguredReviewStages,
+  resolveEffectiveStageChainV1,
   resolveFreshModelForStage,
   resolveModelForStage,
 } from "../utils/modelSelection";
@@ -207,7 +222,6 @@ import {
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { SchedulingIntentMetadataV1 } from "../state/schedulingIntentV1";
 import {
-  buildPlanItemVerificationSection,
   buildVerifiedChecksSection,
   collectCompletionLintPreview,
   CompletionLintResult,
@@ -218,6 +232,7 @@ import { checkPublishPreflight } from "../utils/publishPreflight";
 import {
   checkPublishChecksFreshnessV1,
   describePublishChecksFreshnessFailureV1,
+  ensurePublishReviewArtifactExistsV1,
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
@@ -235,7 +250,9 @@ import {
   detectBlockerSetStall,
   detectPlateau,
   formatPriorBlockerLineageListV1,
+  isProviderExhaustionReplyShapeV1,
   latestQualifyingReviewMeetsThresholdV1,
+  promptCeilingAdvisoryV1,
   resolveBlockerLineageV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
@@ -1421,11 +1438,52 @@ export async function selectReconciliationInstruction(
  * untrustworthy. Wording aligned with the task tree tooltip
  * (taskTreeProvider.ts); only `reconcilePlanChecklist` clears the latch.
  *
+ * Assumes the checklist itself still has unticked items — true whenever a
+ * round under-recorded its own progress. When it does NOT (the checklist
+ * reads N/N but the latch is still set — the exact jester-task-3 75/75
+ * shape items 6c/11 fixed for the reconcile decision's own text), telling the
+ * reader to tick "missed items" that do not exist is the same contradiction;
+ * {@link UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1} is used
+ * instead. Callers pick between the two via
+ * {@link resolveChecklistCountQualifierV1}.
+ *
  * @internal exported for testing
  */
 export const UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1 =
   " — count unverified: the plan checklist is not a complete record and needs reconciliation " +
   "(run Ensemble: Mark Plan Checklist Reconciled once the missed items are ticked)";
+
+/**
+ * Sibling to {@link UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1} for the case
+ * where the checklist has nothing unticked but the latch is still set
+ * (finding 6c/11): reconciling is still required to clear the gate, but there
+ * is nothing to go tick first.
+ *
+ * @internal exported for testing
+ */
+export const UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1 =
+  " — count unverified: the checklist itself shows nothing outstanding, but the latch still requires " +
+  "confirmation (run Ensemble: Mark Plan Checklist Reconciled to confirm and restore the gate)";
+
+/**
+ * Reads the plan of record directly (bypassing the latch-gated readers, which
+ * would return `undefined` for exactly the case this needs to distinguish)
+ * to decide which of the two qualifier constants above applies.
+ *
+ * @internal exported for testing
+ */
+export async function resolveChecklistCountQualifierV1(
+  folderUri: vscode.Uri,
+  isUnreliable: boolean
+): Promise<string> {
+  if (!isUnreliable) {
+    return "";
+  }
+  const plan = await readPlanOfRecordV1(folderUri);
+  return (plan.counts?.remaining ?? 0) > 0
+    ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1
+    : UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1;
+}
 
 /**
  * The "high score but plan incomplete" notification, factored out so the
@@ -1438,13 +1496,28 @@ export function buildStayingOnStageNoticeV1(
   score: number | null,
   progress: { complete: number; total: number },
   excludedSuffix: string,
-  countUnverified: boolean
+  countUnverified: boolean,
+  hasOutstandingChecklistItems: boolean = true
 ): string {
+  // The trailing sentence must agree with the qualifier just appended: when
+  // the checklist has nothing outstanding (only the latch is unresolved),
+  // "build the rest" contradicts the qualifier's own "shows nothing
+  // outstanding" — the exact assembled-output contradiction the review
+  // flagged (finding 9/11). Name the actual clearing action instead.
+  const stayingClause =
+    countUnverified && !hasOutstandingChecklistItems
+      ? " Staying on this stage until that is reconciled."
+      : " Staying on this stage to build the rest.";
   return (
     `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} ` +
     `plan steps are implemented${excludedSuffix}` +
-    (countUnverified ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1 : "") +
-    ". Staying on this stage to build the rest."
+    (countUnverified
+      ? hasOutstandingChecklistItems
+        ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1
+        : UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1
+      : "") +
+    "." +
+    stayingClause
   );
 }
 
@@ -1477,6 +1550,29 @@ export function describeOutstandingChecklistItemsV1(
       ? `\n…and ${unchecked.total - unchecked.items.length} more.`
       : "";
   return `\n${bullets}${more}`;
+}
+
+/**
+ * wf10 item 11: the three `NotificationRouter.showWarning` fallbacks below
+ * (only reached when `postReconcilePlanChecklistDecisionV1` cannot post —
+ * no active extension context) all used to say "Tick the missed items in
+ * plan-final.md, then run **Ensemble: Mark Plan Checklist Reconciled**"
+ * unconditionally. `describeOutstandingChecklistItemsV1` returns `""` when
+ * nothing is unticked (e.g. the latch was set by an unrecorded round on an
+ * otherwise-complete checklist — jester task 3, 75/75 with the latch still
+ * set), so that instruction sent the reader looking for missed items that do
+ * not exist — the same contradiction item 6c fixed for the reconcile
+ * decision's own "Not yet" option text, here reproduced in its notification
+ * fallback. Branches on the SAME `outstandingList` string each call site
+ * already computed, so it can never disagree with what that call site just
+ * rendered.
+ */
+function checklistReconcileGuidanceSentenceV1(outstandingList: string): string {
+  return outstandingList === ""
+    ? "Nothing is unticked to tick — run **Ensemble: Mark Plan Checklist Reconciled** to confirm and " +
+        "restore the gate."
+    : "Tick the missed items in plan-final.md, then run **Ensemble: Mark Plan Checklist Reconciled** to " +
+        "confirm and restore the gate.";
 }
 
 /**
@@ -1613,9 +1709,10 @@ export async function buildSiblingReviewDisagreementVariable(
   // claim is derived from a record known to be incomplete, and must not be
   // handed to the Publish reviewer as an authoritative count.
   const advisory = await readTaskProgressAdvisoryV1(folderUri);
-  const countQualifier = advisory?.checklistProgressUnreliable
-    ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1
-    : "";
+  const countQualifier = await resolveChecklistCountQualifierV1(
+    folderUri,
+    advisory?.checklistProgressUnreliable === true
+  );
   const blockerLines = implLowCompletionBlockers
     .map((b) => `- ${b.description}`)
     .join("\n");
@@ -1738,6 +1835,11 @@ async function requirePublishChecksFreshnessOrWarnV1(
   if (targetStage !== "publish") {
     return { ok: true };
   }
+  // Step 20(a): every Publish review entry point runs through this gate
+  // first, so this is the choke point that makes "publish-review.md has not
+  // been created yet" unreachable for a task that has actually reached
+  // Publish — a no-op once the file exists, whatever wrote it.
+  await ensurePublishReviewArtifactExistsV1(folderUri);
   const progress = await readTaskProgressAdvisoryV1(folderUri);
   const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
   const currentCommitSha = await resolveHeadCommitSha(scopeFolder);
@@ -1801,9 +1903,15 @@ async function buildVerifiedChecksVariable(
     }
     return {
       verifiedChecks: buildVerifiedChecksSection(result, reviewedCommitSha),
-      planItemVerification: includePlanItemVerification
-        ? buildPlanItemVerificationSection(result.planItems)
-        : undefined,
+      // Plan Item Verification is retired (completionLint.ts's
+      // collectAiVerifiedPlanItems doc comment) and result.planItems is
+      // therefore always undefined now — calling
+      // buildPlanItemVerificationSection(undefined) would render "No plan
+      // checklist items were found in plan-final.md (nothing to verify)",
+      // which is false whenever the plan actually has items; it is simply
+      // that nothing verifies them anymore. Omit the section entirely
+      // instead of rendering a misleading placeholder.
+      planItemVerification: undefined,
       mechanicalBlockers: synthesizeMechanicalBlockers(result),
     };
   } catch (error) {
@@ -1821,9 +1929,8 @@ async function buildVerifiedChecksVariable(
       "This means no ground-truth evidence is available for this round — treat the absence of verified checks itself as a review-confidence concern, not as neutral.";
     return {
       verifiedChecks,
-      planItemVerification: includePlanItemVerification
-        ? `## Plan Item Verification\n\nPlan item verification could not be run for this review: ${message}\n\nTreat the absence of this evidence itself as a review-confidence concern, not as neutral.`
-        : undefined,
+      // Plan Item Verification is retired — see the comment above.
+      planItemVerification: undefined,
       mechanicalBlockers: [],
     };
   }
@@ -2023,8 +2130,16 @@ export async function handleReviewRoutingOutcome(options: {
    * entry so cross-reviewer comparisons can be detected. Absent when the
    * caller has no provider attribution to offer. */
   reviewer?: { providerLabel: string; storedModelId: string };
-}): Promise<{ escalated: boolean }> {
-  const { folderUri, targetStage, reviewAttemptId, content, score, threshold, reviewer } = options;
+  /** wf10 item 7c / Part 6 step 16: the assembled prompt's length, reported
+   * in a degenerate-review rejection's run log alongside the reply's output
+   * length. Absent when the caller never assembled a fresh prompt. */
+  promptLength?: number;
+  /** wf10 item 7c / Part 6 step 16: the resolved provider id this round
+   * dispatched to, used for the known-Read-ceiling advisory. */
+  providerId?: string;
+}): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
+  const { folderUri, targetStage, reviewAttemptId, content, score, threshold, reviewer, promptLength, providerId } =
+    options;
   try {
     const resilience = getResilienceSettings();
     const blockerEvidence = parseReviewBlockersDetailed(content);
@@ -2076,23 +2191,136 @@ export async function handleReviewRoutingOutcome(options: {
       attemptId: reviewAttemptId,
     });
     if (rejectionReason !== null) {
-      await patchTaskProgressStrictV1(folderUri, (current) =>
-        appendReviewRejection(current, {
-          stage: targetStage,
-          attemptId: reviewAttemptId,
-          at: new Date().toISOString(),
-          reason: rejectionReason,
-        })
+      const degenerateModelId = reviewer?.storedModelId;
+      const persistedRejection = await patchTaskProgressStrictV1(folderUri, (current) =>
+        // wf10 item 4 / Part 4: folded into the same patch as the existing
+        // `reviewRejections` trail (not a separate write) — a degenerate
+        // review round is round-completion accounting too, and Part 5's
+        // fallback breaker reads this classification alongside
+        // `provider-failure-empty` implementation rounds.
+        appendRoundOutcome(
+          appendReviewRejection(current, {
+            stage: targetStage,
+            attemptId: reviewAttemptId,
+            at: new Date().toISOString(),
+            reason: rejectionReason,
+          }),
+          {
+            stage: targetStage,
+            classification: "rejected-degenerate",
+            attemptId: reviewAttemptId,
+            at: new Date().toISOString(),
+            ...(degenerateModelId ? { modelId: degenerateModelId } : {}),
+          }
+        )
       );
+      // wf10 item 7c / Part 6 step 16: report the diagnosable cause, not just
+      // the symptom. `Output length` alone (the old report) is exactly what
+      // read as "degenerate output" and pointed at the model when the
+      // actionable fact was prompt size — the assembled prompt size and a
+      // named-remedy advisory when a known provider Read-ceiling is
+      // exceeded turn this into something the user can act on directly.
+      // Separately, a reply matching the provider-exhaustion shape (the
+      // model correctly answering a budget-handler question Ensemble never
+      // asked, after running out of read/tool budget) is classified
+      // distinctly from genuine malformed output — same recorded outcome
+      // (`rejected-degenerate`, same backup-advance handling) but a
+      // different diagnosis in the report.
+      const isExhaustionShape = isProviderExhaustionReplyShapeV1(content);
+      const ceilingAdvisory = promptCeilingAdvisoryV1(promptLength, providerId);
+      const diagnosticLines = [
+        `Output length: ${content.length} characters.`,
+        promptLength !== undefined ? `Assembled prompt size: ${promptLength} bytes.` : undefined,
+        isExhaustionShape
+          ? "Shape: this reply matches a provider-side read/tool-budget EXHAUSTION REPORT, not malformed " +
+            "output — the model answered a budget-handler question about its blocker and what it needs, " +
+            "after exhausting its read/tool budget on this prompt. The remedy is prompt size, not model quality."
+          : undefined,
+        ceilingAdvisory,
+      ].filter((line): line is string => line !== undefined);
       await writeRunLog(
         folderUri,
         "review-guard",
         targetStage,
-        `# Rejected Review Round\n\nStatus: rejected (degenerate output)\n\n${rejectionReason}\n\n` +
-          `Output length: ${content.length} characters.`
+        `# Rejected Review Round\n\nStatus: rejected (degenerate output)\n` +
+          // wf10 item 4 / Part 4 completion-blocker fix: the fixed-vocabulary
+          // classification, not just the free-text status line, so the run
+          // log itself carries the same token persisted to `roundOutcomes`.
+          `Round outcome: rejected-degenerate\n\n${rejectionReason}\n\n${diagnosticLines.join("\n")}`
       );
-      NotificationRouter.showWarning(rejectionReason);
-      return { escalated: false };
+      // wf10 item 7d / Part 5 step 15: a completed-but-unparseable round is a
+      // candidate failure for backup-selection purposes, invisible to
+      // switch-to-backup's own runner-level failure handling (the runner
+      // succeeded; only the parser found nothing usable) — decide whether
+      // the stage's next configured backup should be tried, offered as a
+      // manual retry, or reported exhausted. The caller (routeReviewOutcomeV1)
+      // owns actually dispatching the automatic case; this function only
+      // decides and reports, matching its existing "never throws, never
+      // dispatches" contract.
+      const chain = resolveEffectiveStageChainV1(targetStage);
+      // wf10 review fix (Part 5 step 15): a successfully scored review for
+      // this stage never appends a `roundOutcomes` entry (only
+      // `rejected-degenerate` rounds do), so the episode scan below cannot
+      // rely on `roundOutcomes` alone to notice a real score happened in
+      // between — pass the newest `reviewScoreHistory` timestamp for this
+      // stage so the scan stops there instead of walking into an older
+      // episode's rejections. `progressBefore` is read before this round's
+      // own patch, so it already reflects every score published by a PRIOR
+      // round.
+      const latestScoredReviewAt = [...(progressBefore.reviewScoreHistory ?? [])]
+        .filter((entry) => entry.stage === targetStage)
+        .map((entry) => entry.at)
+        .sort()
+        .at(-1);
+      const episodeTriedModelIds = computeDegenerateReviewEpisodeModelIdsV1(
+        persistedRejection?.roundOutcomes,
+        targetStage,
+        latestScoredReviewAt
+      );
+      const degenerateBackupAdvance = decideDegenerateReviewBackupAdvanceV1({
+        chainBackups: getConfiguredBackupModelsForStage(targetStage, degenerateModelId),
+        strategy: chain.strategy,
+        currentModelId: degenerateModelId,
+        episodeTriedModelIds,
+      });
+      if (degenerateBackupAdvance.kind === "manual") {
+        NotificationRouter.showWarning(
+          `${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) has not been tried this episode.`,
+          undefined,
+          undefined,
+          undefined,
+          {
+            command: "vs-code-ai-helper.retryReviewWithBackupV1",
+            title: `Retry with ${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}`,
+            args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage, modelId: degenerateBackupAdvance.nextModelId }],
+          }
+        );
+      } else if (degenerateBackupAdvance.kind === "exhausted") {
+        // wf10 review fix (Part 5 step 15): with every configured backup
+        // already tried this episode, there is no "next model" to name — but
+        // the round may still have been a one-off flake, and the user had no
+        // one-click way to just try again. Offer a retry with the SAME model
+        // that just produced degenerate output, via the exact same manual
+        // affordance the "manual" branch above uses (recordActiveFallbackModel
+        // + preserveActiveFallback re-dispatch), rather than leaving this
+        // warning as a dead end.
+        NotificationRouter.showWarning(
+          `${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`,
+          undefined,
+          undefined,
+          undefined,
+          degenerateModelId
+            ? {
+                command: "vs-code-ai-helper.retryReviewWithBackupV1",
+                title: `Retry with ${attributionModelLabel(degenerateModelId) ?? degenerateModelId}`,
+                args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage, modelId: degenerateModelId }],
+              }
+            : undefined
+        );
+      } else {
+        NotificationRouter.showWarning(rejectionReason);
+      }
+      return { escalated: false, degenerateBackupAdvance };
     }
     // Part 10: resolve this round's blockers against the PRIOR round's ID'd
     // list for this same stage, so a reviewer's declared `[same:<id>]` /
@@ -2323,6 +2551,24 @@ export interface ReviewOutcomeContextV1 {
   reviewAttemptId: string;
   operation?: TaskOperationHandle;
   chatViewProvider?: ChatViewProvider;
+  /** wf10 item 7d / Part 5 step 15: the stored model id THIS round actually
+   * ran with — needed to decide whether a degenerate rejection should
+   * automatically advance to the stage's next configured backup. Absent
+   * only for callers that genuinely never resolved one (resumed/legacy
+   * paths), in which case the backup-advance decision degrades to
+   * "exhausted" rather than guessing. */
+  modelId?: string;
+  /** wf10 item 7c / Part 6 step 16: the assembled prompt's length (the exact
+   * string dispatched to the provider), reported alongside the reply's
+   * output length in a degenerate-review rejection's run log so the report
+   * states the diagnosable cause rather than only the symptom. Absent for
+   * callers that never assembled a fresh prompt this round (e.g. resumed
+   * paths reading back an in-flight operation's result). */
+  promptLength?: number;
+  /** wf10 item 7c / Part 6 step 16: the resolved provider id THIS round
+   * dispatched to (e.g. "kimi-cli"), used to look up a known Read-tool
+   * ceiling for the prompt-size advisory. Absent when not resolvable. */
+  providerId?: string;
 }
 
 /**
@@ -2337,7 +2583,26 @@ export interface ReviewOutcomeContextV1 {
  * escalation/follow-up logic as an initial review that completes, not a bare
  * same-stage no-op advance.
  */
-async function handleReviewOutcomeV1(
+/**
+ * Exported (in addition to its two production call sites, `runReviewForFolder`
+ * and `resumeReviewInteractionV1`) so a test can drive a REALISTIC "completed"
+ * outcome straight into the real routing/escalation/dispatch chain without
+ * hand-building any of `routeReviewOutcomeV1`'s internal decisions.
+ *
+ * wf10 Part 5 step 15 review fix: a degenerate (no parseable `Readiness:
+ * N/10`) outcome can only ever reach this function's "completed" branch via
+ * the RESUME path (`coordinator.resumeAction`, via `executeResume`) — the
+ * initial-dispatch path (`coordinator.executeAction`) rejects null-score
+ * content at the row's own `validateCompletedContent` content-contract check
+ * (reviewRowV1.ts) BEFORE it can ever settle as "completed", retrying the
+ * next candidate or returning `contentContractFailed` instead. So a test
+ * exercising the degenerate-rejection-then-automatic-backup-dispatch
+ * behavior this function's "completed" branch performs must call this
+ * function directly with a synthetic-but-realistic outcome (what Resume can
+ * legitimately produce), not attempt to walk it through the initial
+ * dispatch's coordinator loop, which structurally cannot produce this shape.
+ */
+export async function handleReviewOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
 ): Promise<void> {
@@ -2470,6 +2735,69 @@ async function notifyReviewerVerifiedTicksV1(
   }
 }
 
+/**
+ * wf10 item 7d / Part 5 step 15: dispatch (or, when dispatch genuinely
+ * cannot run, report) an automatic degenerate-review backup advance.
+ * Extracted from `routeReviewOutcomeV1`'s inline "advance" branch so this
+ * decision is unit-testable with injected dependencies — a prior round's
+ * test could only assert the call expression existed in source, never that
+ * it actually ran (review finding, Part 5 step 15).
+ *
+ * Review fix: the inline version silently did nothing when
+ * `getWorkspaceFolder` could not resolve a `vscode.WorkspaceFolder` for the
+ * task's workspace — the chain the user configured just stopped, with no
+ * warning and no retry affordance, unlike the sibling "manual"/"exhausted"
+ * branches which always offer one. This now falls back to the same
+ * one-click "Retry with <model>" notification those branches use.
+ */
+export async function dispatchDegenerateReviewBackupAdvanceV1(
+  input: {
+    folderUri: vscode.Uri;
+    workspaceUri: vscode.Uri;
+    extensionUri: vscode.Uri;
+    targetStage: TaskStage;
+    currentStage: TaskStage;
+    nextModelId: string;
+    operation?: TaskOperationHandle;
+    chatViewProvider?: ChatViewProvider;
+  },
+  deps: {
+    recordActiveFallbackModel: typeof recordActiveFallbackModel;
+    getWorkspaceFolder: (uri: vscode.Uri) => vscode.WorkspaceFolder | undefined;
+    runReviewForFolder: typeof runReviewForFolder;
+    showWarning: typeof NotificationRouter.showWarning;
+  } = {
+    recordActiveFallbackModel,
+    getWorkspaceFolder: (uri) => vscode.workspace.getWorkspaceFolder(uri),
+    runReviewForFolder,
+    showWarning: (...args) => NotificationRouter.showWarning(...args),
+  }
+): Promise<{ dispatched: boolean }> {
+  await deps.recordActiveFallbackModel(input.folderUri, input.targetStage, input.nextModelId);
+  const workspaceFolder = deps.getWorkspaceFolder(input.workspaceUri);
+  if (!workspaceFolder) {
+    deps.showWarning(
+      "A configured backup was selected to automatically retry a degenerate review, but the task's " +
+        "workspace folder could not be resolved to dispatch it.",
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.retryReviewWithBackupV1",
+        title: `Retry with ${attributionModelLabel(input.nextModelId) ?? input.nextModelId}`,
+        args: [{ taskFolderPath: input.folderUri.fsPath, stage: input.targetStage, modelId: input.nextModelId }],
+      }
+    );
+    return { dispatched: false };
+  }
+  await deps.runReviewForFolder(input.extensionUri, input.folderUri, workspaceFolder, input.currentStage, true, {
+    preserveActiveFallback: true,
+    operation: input.operation,
+    chatViewProvider: input.chatViewProvider,
+  });
+  return { dispatched: true };
+}
+
 async function routeReviewOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
@@ -2482,6 +2810,8 @@ async function routeReviewOutcomeV1(
     reviewAttemptId,
     operation,
     chatViewProvider,
+    promptLength,
+    providerId,
   } = ctx;
   if (outcome.kind === "completed") {
     let transitionToTarget: StageTransitionResult | undefined;
@@ -2562,7 +2892,7 @@ async function routeReviewOutcomeV1(
         // score), and advancing the stage right after would, via
         // updateTaskProgressStage, silently erase the escalation this same
         // call just recorded and paused the task for.
-        const { escalated } = await handleReviewRoutingOutcome({
+        const { escalated, degenerateBackupAdvance } = await handleReviewRoutingOutcome({
           folderUri,
           targetStage,
           reviewAttemptId,
@@ -2570,7 +2900,35 @@ async function routeReviewOutcomeV1(
           score,
           threshold: autoAdvanceThreshold,
           reviewer: outcome.provider,
+          promptLength,
+          providerId,
         });
+        // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
+        // is configured for switch-to-backup and an untried backup exists —
+        // dispatch it now, reusing the exact same sticky-fallback state
+        // (fallbackActive/fallbackModelId) and preserveActiveFallback flag
+        // runImplementationForModel's own cascade uses, so runReviewForFolder
+        // resolves THIS model (resolveModelForStage, not
+        // resolveFreshModelForStage's "always reset to primary") instead of
+        // re-trying the same candidate that just produced degenerate output.
+        // Returns immediately: a fresh review round is about to run and will
+        // route its OWN outcome through this exact function again once it
+        // completes; letting the rest of THIS (null-score, degenerate)
+        // outcome's routing continue past this point would race the
+        // recursive call's write to the same reviewUri for no benefit.
+        if (!escalated && degenerateBackupAdvance?.kind === "advance") {
+          await dispatchDegenerateReviewBackupAdvanceV1({
+            folderUri,
+            workspaceUri: ctx.workspaceUri,
+            extensionUri: ctx.extensionUri,
+            targetStage,
+            currentStage,
+            nextModelId: degenerateBackupAdvance.nextModelId,
+            operation,
+            chatViewProvider,
+          });
+          return;
+        }
         // Publish has no further stage to auto-advance into (see the `next`
         // block below), so this is the only notification a Publish review
         // produces. Commit and Push must only ever run from the user's own
@@ -2638,8 +2996,25 @@ async function routeReviewOutcomeV1(
           const checklistCountUnverified =
             !isPlanReviewStage(targetStage) &&
             (await readTaskProgressAdvisoryV1(folderUri))?.checklistProgressUnreliable === true;
+          // The `progress` reconciled above falls back to the review's own
+          // raw marker while the latch is set (readEffectivePlanChecklistProgressV1
+          // stands the checklist down), so `progress.complete < progress.total`
+          // here reflects the REVIEW's self-reported claim, not the checklist's
+          // actual state — the two can disagree (checklist fully ticked, review
+          // marker stale). Read the raw checklist directly so the qualifier
+          // never tells the reader to go tick items that do not exist (finding
+          // 6c/11).
+          const hasOutstandingChecklistItems = checklistCountUnverified
+            ? ((await readPlanOfRecordV1(folderUri)).counts?.remaining ?? 0) > 0
+            : true;
           NotificationRouter.showInformation(
-            buildStayingOnStageNoticeV1(score, progress, excludedSuffix, checklistCountUnverified)
+            buildStayingOnStageNoticeV1(
+              score,
+              progress,
+              excludedSuffix,
+              checklistCountUnverified,
+              hasOutstandingChecklistItems
+            )
           );
         }
         if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
@@ -2719,14 +3094,16 @@ async function routeReviewOutcomeV1(
               // qualifies — impl-low-review is itself a review stage, so
               // transition.shouldAutoReview is always false when landing on
               // Publish). Publish's follow-up-review dispatch is therefore
-              // decided separately, directly from the auto-advance mode: in
-              // "auto-fast-forward" mode every other landed-on review stage
-              // gets an immediate follow-up review via this same block, so
-              // Publish gets the same treatment for consistency. In plain
-              // "auto" mode there is no follow-up review, so the entry-owned
-              // block below nudges the user to publish manually instead.
-              const publishFollowUpReview =
-                next === "publish" && getAutoAdvanceMode() === "auto-fast-forward";
+              // decided separately, directly from the auto-advance mode.
+              // wf10 item 14 / Part 7 step 17: the Publish review dispatch is
+              // unconditional under EITHER "auto" or "auto-fast-forward" — we
+              // are only inside this branch at all when isAutoAdvanceEnabled()
+              // is true, i.e. the mode is one of those two, so this is always
+              // true once next === "publish". "auto" dispatches a single pass
+              // (runReviewWithAI below); "auto-fast-forward" dispatches the
+              // review+fix loop (fastForwardReviewWithAI), same as every other
+              // landed-on review stage gets via this same block.
+              const publishFollowUpReview = next === "publish";
               if (transition.shouldAutoReview || publishFollowUpReview) {
                 // Deferred, never inline: the caller's tracked operation still
                 // holds this task's exclusive lock, so the follow-up review is
@@ -2768,6 +3145,23 @@ async function routeReviewOutcomeV1(
                 ) {
                   releaseAutomationChain(folderUri.fsPath, "auto-review");
                 }
+                // wf10 item 14 / Part 7 step 17: `next === "publish"` marks
+                // the ONE currentStage write this branch can produce whose
+                // dispatch must not depend on how the rest of this round's
+                // root operation (e.g. a chained Fast-Forward loop still
+                // running further attempts, or its post-loop reporting)
+                // subsequently concludes — the stage transition to Publish
+                // has already landed on disk by the time we get here.
+                // `dispatchEvenIfRootFails` makes the deferred dispatch fire
+                // on ANY terminal root state, not only "succeeded", so a
+                // root that later fails/is cancelled/is interrupted can no
+                // longer silently strand Publish with its review never
+                // dispatched. Every other landed-on review stage (the
+                // `else` branch below) keeps the original "succeeded"-only
+                // gate: those really are a continuation of this round's own
+                // work, not a verification owed to an already-committed
+                // transition.
+                let dropReason: "duplicate-chain" | "automation-disabled" | "root-operation-unsuccessful" | undefined;
                 const reviewChainScheduled = scheduleAutomationChain(
                   {
                     command: reviewCommand,
@@ -2778,7 +3172,26 @@ async function routeReviewOutcomeV1(
                     chainId: "auto-review",
                     // Dropped at fire time if auto-advance was turned off
                     // while this chain waited for the root operation to end.
-                    stillEnabled: () => isAutoAdvanceEnabled(),
+                    //
+                    // wf10 item 14 / Part 7 step 17 (review completion
+                    // blocker, 2026-08-24): for `next === "publish"` this
+                    // must NOT re-read isAutoAdvanceEnabled() at fire time.
+                    // The stage transition to Publish has already committed
+                    // to disk above (`transition?.persisted`) while auto-
+                    // advance was on — the review is now an owed
+                    // verification of a landed transition, not a
+                    // continuation contingent on the setting staying on.
+                    // Toggling the setting off afterward must not cancel it,
+                    // the same way dispatchEvenIfRootFails already stops a
+                    // root-operation failure from cancelling it. A plain
+                    // review-to-review handoff (the non-publish branch) is
+                    // still a genuine continuation of this round's own work,
+                    // so it keeps the live recheck.
+                    stillEnabled: next === "publish" ? () => true : () => isAutoAdvanceEnabled(),
+                    dispatchEvenIfRootFails: next === "publish",
+                    onDropped: (reason) => {
+                      dropReason = reason;
+                    },
                     intent: {
                       trigger: "auto-review after advancing to the next stage",
                       settingKey: "ensemble.autoAdvanceEnabled",
@@ -2790,15 +3203,23 @@ async function routeReviewOutcomeV1(
                   operation
                 );
                 if (next === "publish") {
-                  // If the shared "auto-review" chainId drops this dispatch
-                  // because another review chain is already pending/running,
-                  // the task is silently stuck on Publish with nothing
-                  // running — warn with the same Publish Anyway affordance
-                  // every sibling skip path uses.
+                  // Of the three drop reasons, only "duplicate-chain" can
+                  // still occur here (wf10 item 2 / Part 7 step 17): the
+                  // `stillEnabled` override above makes "automation-disabled"
+                  // unreachable for Publish (turning auto-advance off after
+                  // the transition already committed must not cancel the
+                  // owed review), and `dispatchEvenIfRootFails` makes
+                  // "root-operation-unsuccessful" unreachable too. Both are
+                  // still handled below, defensively, in case that ever
+                  // changes.
                   void reviewChainScheduled.then((scheduled) => {
                     if (!scheduled) {
+                      const reasonText =
+                        dropReason === "automation-disabled"
+                          ? "auto-advance was turned off before the review could start"
+                          : "another review is already in progress for this task";
                       NotificationRouter.showWarning(
-                        `${folderUri.fsPath}: the follow-up Publish review could not be started automatically because another review is already in progress for this task. ` +
+                        `${folderUri.fsPath}: the follow-up Publish review could not be started automatically because ${reasonText}. ` +
                           "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.",
                         undefined,
                         undefined,
@@ -2825,42 +3246,15 @@ async function routeReviewOutcomeV1(
                   });
                 }
               }
-              if (next === "publish" && !publishFollowUpReview) {
-                // Reached only in plain "auto" mode (no follow-up review is
-                // dispatched above): nudge the user to publish manually.
-                // Commit and Push must only ever run from the user's own
-                // button click — never scheduled here.
-                const autoAdvancePublishPreflight = await checkPublishPreflight(
-                  folderUri,
-                  freshProgressForAdvance?.implReviewFiles
-                );
-                if (autoAdvancePublishPreflight.ok === false) {
-                  NotificationRouter.showWarning(
-                    `${STAGE_DISPLAY_NAMES[next]} checks failed for ${folderUri.fsPath}: ${autoAdvancePublishPreflight.reason}. ` +
-                      "Publish manually once checks pass, or use Publish Anyway from Commit and Push.",
-                    undefined,
-                    undefined,
-                    undefined,
-                    {
-                      command: "vs-code-ai-helper.commitAndPushTask",
-                      title: "Publish Anyway",
-                      args: [{ taskFolderPath: folderUri.fsPath }],
-                    }
-                  );
-                } else {
-                  NotificationRouter.showWarning(
-                    `${STAGE_DISPLAY_NAMES[next]} checks passed for ${folderUri.fsPath}. Publish manually when you're ready.`,
-                    undefined,
-                    undefined,
-                    undefined,
-                    {
-                      command: "vs-code-ai-helper.commitAndPushTask",
-                      title: "Publish",
-                      args: [{ taskFolderPath: folderUri.fsPath }],
-                    }
-                  );
-                }
-              }
+              // wf10 item 14 / Part 7 step 17: previously this branch nudged
+              // the user to publish manually whenever `next === "publish"` in
+              // plain "auto" mode (publishFollowUpReview was gated to
+              // "auto-fast-forward" only). Publish dispatch is now
+              // unconditional across both auto-advance modes (above), so that
+              // manual-nudge path is unreachable here and has been removed —
+              // if the automatic dispatch itself cannot run, the drop-reason
+              // warning with the "Publish Anyway" affordance above already
+              // covers it.
             }
           }
           // Publish has no further stage for computeNextStage to return, so
@@ -3458,6 +3852,15 @@ export async function runReviewForFolder(
     assertLegacyAiRouteAllowedV0("review.v1");
 
     const prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+    // wf10 review fix (Part 6 step 16): `promptCeilingAdvisoryV1` compares
+    // this against provider Read-tool ceilings that are themselves measured
+    // in bytes (see its own doc comment) — `prompt.length` is a JS UTF-16
+    // code-unit count, not a byte count, and silently under-reports for any
+    // prompt containing multi-byte UTF-8 content (non-ASCII plan/review
+    // text, emoji, etc.), which would let an over-ceiling prompt pass the
+    // advisory unflagged. Same convention as cliAgentRunner.ts's own
+    // `promptBytes`.
+    const promptByteLength = Buffer.byteLength(prompt, "utf8");
 
     const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
     const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
@@ -3467,10 +3870,42 @@ export async function runReviewForFolder(
     const chatIdentity = await readChatDocumentIdentityV1(folderUri.fsPath, folderUri.fsPath);
     const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
 
-    const { modelId } = await resolveFreshModelForStage(folderUri, targetStage);
+    // wf10 item 7d / Part 5 step 15: `preserveActiveFallback` (set only by
+    // the automatic degenerate-review backup-advance re-dispatch just above,
+    // and by applyImplementationReviewWithAI's own follow-up review) must
+    // resolve THIS stage's sticky fallback candidate (`resolveModelForStage`,
+    // which honors `fallbackActive`/`fallbackModelId`) rather than
+    // `resolveFreshModelForStage`'s "always reset to primary" — otherwise the
+    // model just recorded as the active fallback a moment ago would be
+    // discarded immediately and this call would simply retry the same
+    // primary the cascade is trying to get away from. Every other caller
+    // (a user-invoked fresh review) is unaffected: it never sets this flag,
+    // so it keeps retrying the primary first, exactly as before.
+    const { modelId } = options.preserveActiveFallback
+      ? await resolveModelForStage(folderUri, targetStage)
+      : await resolveFreshModelForStage(folderUri, targetStage);
     if (!modelId) {
       NotificationRouter.showWarning("No model is configured for this stage.");
       return;
+    }
+
+    // wf10 item 7c / Part 6 step 16: resolve which provider this round will
+    // actually dispatch to, so a degenerate rejection's run log can name a
+    // known Read-tool ceiling if exceeded, and so an oversized prompt gets a
+    // dispatch-time advisory before burning the round on a provider known to
+    // truncate it silently. Advisory only — never blocks dispatch, since the
+    // ceiling is token-based/variable and this prompt is measured in bytes.
+    const dispatchProviderId = (() => {
+      try {
+        const effective = resolveEffectiveProvider(modelId);
+        return effective.kind === "cli" ? effective.def.id : undefined;
+      } catch {
+        return undefined;
+      }
+    })();
+    const dispatchCeilingAdvisory = promptCeilingAdvisoryV1(promptByteLength, dispatchProviderId);
+    if (dispatchCeilingAdvisory !== undefined) {
+      NotificationRouter.showWarning(`${STAGE_DISPLAY_NAMES[targetStage]}: ${dispatchCeilingAdvisory}`);
     }
 
     // Pre-flight the stage's resolved provider chain BEFORE burning a round
@@ -3503,6 +3938,9 @@ export async function runReviewForFolder(
           reviewAttemptId,
           operation: options.operation,
           chatViewProvider: options.chatViewProvider,
+          modelId,
+          promptLength: promptByteLength,
+          providerId: dispatchProviderId,
         }
       );
       return;
@@ -3554,6 +3992,9 @@ export async function runReviewForFolder(
       reviewAttemptId,
       operation: options.operation,
       chatViewProvider: options.chatViewProvider,
+      modelId,
+      promptLength: promptByteLength,
+      providerId: dispatchProviderId,
     });
   } finally {
     if (!reviewSucceeded) {
@@ -6358,6 +6799,31 @@ export async function clearZeroChangeImplRoundCounter(taskFolderPath: string): P
   );
 }
 
+/**
+ * wf10 item 4 / Part 4 completion-blocker fix: the implementation run log is
+ * written (line ~6924, below) before this round's outcome classification is
+ * even computed, so its `Status:` line can only ever say `completed` — never
+ * the fixed-vocabulary token also persisted to `TaskProgress.roundOutcomes`.
+ * Appends that token as a distinguishing note, using the same
+ * read-then-append idiom this function already uses for every other
+ * post-hoc log annotation (the reconcile/diagnostics/unattributed-files
+ * notes further below) rather than restructuring the log write itself.
+ */
+async function appendRoundOutcomeLogNoteV1(
+  logUri: vscode.Uri,
+  classification: RoundOutcomeClassificationV1
+): Promise<void> {
+  const existingLog = await readTextIfExists(logUri);
+  if (existingLog === undefined) {
+    return;
+  }
+  await writeTextFile(
+    logUri,
+    `${existingLog}\n\n## Round Outcome\n\nClassification: \`${classification}\`\n`,
+    { skipBackup: true }
+  );
+}
+
 async function executeImplementationRun(
   _extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -6884,8 +7350,23 @@ async function executeImplementationRun(
       // zero-blocker/at-threshold signal `checklistUnderrecordingConfirmedByReview`
       // trusts below — deliberately reused, not reinvented, so this gate
       // stands down on exactly the evidence that latch stands up on.
-      const remainingChecklistProgress =
-        planChecklist !== undefined ? countChecklistProgressV1(planChecklist) : undefined;
+      //
+      // Routed through the shared latch-aware reader (`readPlanChecklistProgressV1`,
+      // which wraps `readEffectivePlanChecklistProgressV1` under the "strict"
+      // policy — see :6316) instead of a local duplicate of its stand-down
+      // condition. Review finding, wf10 item 1 (2026-08-24): a hand-rolled
+      // `!priorProgress?.checklistProgressUnreliable` guard reproduced only
+      // the latch bit, not the reader's full authority/unreadable-state
+      // contract — every OTHER completeness check in this file goes through
+      // this same wrapper, and this consumer must not be the one place that
+      // drifts from it. Deadlock this closes: a latch set by an EARLIER
+      // round, `remaining > 0` on the stale count, and
+      // `latestReviewClearsStage` false because the newest review scored
+      // below threshold WITH blockers — none of which the user can change
+      // from the implementation stage, so the gate refused forever
+      // (2026-08-21, jester task 3: latch true, "21 unticked item(s)" fired
+      // three times).
+      const remainingChecklistProgress = await readPlanChecklistProgressV1(folderUri);
       const latestReviewClearsStage = latestQualifyingReviewMeetsThresholdV1({
         history: priorProgress?.reviewScoreHistory,
         stage: priorProgress?.currentStage ?? postRunReviewStage,
@@ -6925,14 +7406,119 @@ async function executeImplementationRun(
         !priorRoundsChangedTree ||
         uncheckedItemsWithoutClearingReview
       ) {
-        NotificationRouter.showWarning(
-          uncheckedItemsWithoutClearingReview
-            ? "Implementation reported nothing to fix, but the plan checklist still has " +
-                `${remainingChecklistProgress?.remaining} unticked item(s) and no review has cleared this ` +
-                "stage yet. Review the implementation run log before treating this round as complete."
-            : "Implementation finished, but no workspace files changed. " +
-                "Review the implementation run log; the provider may have been blocked from writing files."
+        // wf10 item 4 / Part 4: this is exactly the "Status: completed" +
+        // zero files + (unticked items or no established evidence of a
+        // justified no-op) shape that was previously indistinguishable from
+        // a genuine no-op — record it durably as `provider-failure-empty`
+        // rather than only as a transient notification.
+        const gateClassification = classifyZeroFileImplRoundV1({
+          checklistAdvanced,
+          warnedAsZeroFileFailure: true,
+        });
+        // `gateStage` (the task's actual current stage — possibly a review
+        // stage such as "impl-high-review" when this round was launched from
+        // Apply Review/Fast Forward) is kept ONLY for `escalateReviewToHuman`'s
+        // stage-CAS match and for the human-facing stage name in the
+        // escalation/warning text below. It must never key implementation
+        // round-outcome bookkeeping: `runImplementationOrSealedV1` always
+        // resolves its model/quota/fallback chain from stage "impl" (see the
+        // comment on its own `stage: "impl"` argument above), and
+        // `recordActiveFallbackModel`/`candidateHasRecentZeroFileFailuresV1`
+        // (runnerRegistry.ts) read/write `fallbackActive`/`roundOutcomes`
+        // under that same literal "impl" — a round-outcome entry or
+        // `fallbackActive` read keyed to `gateStage` instead is invisible to
+        // both, so the Part 5 breaker/candidate-skip machinery can never see
+        // an implementation round dispatched while the task sits on a review
+        // stage (review fix, Part 5 steps 13-14).
+        const gateStage = priorProgress?.currentStage ?? postRunReviewStage;
+        const implBookkeepingStage: TaskStage = "impl";
+        const gateFallbackActive = priorProgress?.fallbackActive?.[implBookkeepingStage] === true;
+        // The round-outcome entry must name the candidate that ACTUALLY ran,
+        // not the stage's requested/primary model: `runImplementationOrSealedV1`
+        // can internally cascade from primary to a backup and still return
+        // `status: "completed"`, in which case `result.storedModelId` is the
+        // backup that produced this result while `modelId` (this function's
+        // parameter) remains the primary that was requested. Attributing a
+        // zero-file round to the wrong candidate would let the breaker/skip
+        // logic blame (or exonerate) the wrong provider path (review fix,
+        // Part 5 steps 13-14).
+        const gateActualModelId = result.storedModelId ?? modelId;
+        // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): candidate
+        // identity is the full provider path, not `modelId` alone —
+        // `result.runnerId` is the runner that actually produced `result`
+        // (e.g. "claude-cli", or "copilot-lm" for every Copilot dispatch,
+        // which is routed exclusively through the sealed pipeline here).
+        const gateActualProviderId = result.runnerId;
+        const persistedGateRounds = await patchTaskProgressStrictV1(folderUri, (current) =>
+          appendRoundOutcome(current, {
+            stage: implBookkeepingStage,
+            classification: gateClassification,
+            at: new Date().toISOString(),
+            ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
+            ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
+          })
         );
+        await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
+        // wf10 item 3 / item 6b / Part 5 step 13: a fallback provider that has
+        // now produced `fallbackProviderBreakerRounds` consecutive zero-file
+        // rounds is a known-broken path — stop and name it instead of letting
+        // the user rerun into the same wall (the exact wf9/jester shape: both
+        // stalled tasks kept re-dispatching to a sealed Copilot preflight
+        // fallback that produced zero edits, round after round). Takes
+        // priority over the generic warning below — item 9's "the last thing
+        // the user reads wins" rule means these two must never both show for
+        // the same round (a specific, actionable diagnosis followed by a
+        // generic "may have been blocked" reads as a downgrade, not an
+        // addition).
+        if (
+          gateClassification === "provider-failure-empty" &&
+          shouldTripFallbackProviderBreakerV1({
+            roundOutcomes: persistedGateRounds?.roundOutcomes,
+            stage: implBookkeepingStage,
+            modelId: gateActualModelId,
+            providerId: gateActualProviderId,
+            fallbackActive: gateFallbackActive,
+            breakerRounds: resilience.fallbackProviderBreakerRounds,
+          })
+        ) {
+          const fallbackLabel = gateActualModelId
+            ? (attributionModelLabel(gateActualModelId) ?? gateActualModelId)
+            : "the fallback model";
+          await escalateReviewToHuman(
+            folderUri,
+            gateStage,
+            "environmental",
+            `The active fallback provider for ${STAGE_DISPLAY_NAMES[gateStage]} (${fallbackLabel}) has now ` +
+              `produced ${resilience.fallbackProviderBreakerRounds} consecutive rounds that changed zero files ` +
+              "while the plan checklist still has unticked items — it is not producing edits. Switch this " +
+              "stage's model in AI Models rather than rerunning: the fallback is not going to start writing " +
+              "files by being tried again.",
+            priorProgress?.reviewAttemptId,
+            persistedGateRounds ?? priorProgress ?? undefined
+          );
+        } else {
+          NotificationRouter.showWarning(
+            uncheckedItemsWithoutClearingReview
+              ? "Implementation reported nothing to fix, but the plan checklist still has " +
+                  `${remainingChecklistProgress?.remaining} unticked item(s) and no review has cleared this ` +
+                  "stage yet. Run this stage's review next: if it clears (meets the auto-advance threshold " +
+                  "with zero blockers), the checklist under-recording latch engages automatically on the " +
+                  "following round and **Ensemble: Mark Plan Checklist Reconciled** becomes available; if it " +
+                  "does not clear, its blockers name the work that is actually still outstanding."
+              : "Implementation finished, but no workspace files changed. " +
+                  "Review the implementation run log; the provider may have been blocked from writing files.",
+            undefined,
+            undefined,
+            undefined,
+            uncheckedItemsWithoutClearingReview
+              ? {
+                  command: "vs-code-ai-helper.runReviewWithAI",
+                  title: "Run Review",
+                  args: [{ taskFolderPath: folderUri.fsPath }]
+                }
+              : undefined
+          );
+        }
         await safeOpenTextDocument(logUri, "implementation run log");
         return false;
       }
@@ -6973,15 +7559,90 @@ async function executeImplementationRun(
         latestReviewClearsStage;
       const newlyLatchingChecklistUnreliable =
         checklistUnderrecordingConfirmedByReview && !priorProgress?.checklistProgressUnreliable;
+      const zeroChangeClassification = classifyZeroFileImplRoundV1({
+        checklistAdvanced,
+        warnedAsZeroFileFailure: checklistClaimedButUnmergedWithoutClearingReview,
+      });
+      const zeroChangeBookkeepingStage: TaskStage = "impl";
+      const zeroChangeActualModelId = result.storedModelId ?? modelId;
+      // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): same
+      // full-provider-path identity fix as the gate block above.
+      const zeroChangeActualProviderId = result.runnerId;
       const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) => {
         const withStreak = setZeroChangeImplRounds(
           current,
           zeroChangeRounds > 0 ? zeroChangeRounds : undefined
         );
+        // wf10 item 4 / Part 4: this branch is reached only once the gate
+        // above has already ruled out the NAMED `uncheckedItemsWithoutClearingReview`
+        // shape of `provider-failure-empty` — but `checklistClaimedButUnmerged`
+        // rounds are deliberately let past that gate too (see the comment at
+        // its computation above), and when real work remains with no
+        // clearing review, this round is about to be refused below by
+        // `checklistClaimedButUnmergedWithoutClearingReview` for the exact
+        // same reason — that is a provider failure, not a justified no-op,
+        // even though it reaches this same patch.
+        // Same bookkeeping-vs-display split, and same actual-vs-requested
+        // candidate fix, as the gate block above (review fix, Part 5 steps
+        // 13-14): the round-outcome entry and the breaker read below must
+        // key on literal "impl" (where `runImplementationOrSealedV1`
+        // actually resolves its model/quota/fallback chain) and on the
+        // candidate that actually produced `result`, not on the task's
+        // current review stage or the originally-requested model.
+        const withOutcome = appendRoundOutcome(withStreak, {
+          stage: zeroChangeBookkeepingStage,
+          classification: zeroChangeClassification,
+          at: new Date().toISOString(),
+          ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
+          ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
+        });
         return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
-          ? { ...withStreak, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
-          : withStreak;
+          ? { ...withOutcome, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+          : withOutcome;
       });
+      await appendRoundOutcomeLogNoteV1(logUri, zeroChangeClassification);
+      // wf10 item 3 / Part 5 step 13: the same fallback-provider circuit
+      // breaker as the earlier gate — this branch reaches
+      // `provider-failure-empty` through a different path
+      // (`checklistClaimedButUnmergedWithoutClearingReview`), which the gate
+      // above deliberately lets past it (see the comment at that patch), so
+      // it needs its own check here rather than relying solely on the
+      // broader task-wide no-progress breaker further below to eventually
+      // catch a fallback provider stuck on this exact shape.
+      // `zeroChangeStage` (the task's actual current stage) is kept only for
+      // `escalateReviewToHuman`'s stage-CAS match and the human-facing text.
+      const zeroChangeStage = priorProgress?.currentStage ?? postRunReviewStage;
+      if (
+        zeroChangeClassification === "provider-failure-empty" &&
+        shouldTripFallbackProviderBreakerV1({
+          roundOutcomes: persistedRounds?.roundOutcomes,
+          stage: zeroChangeBookkeepingStage,
+          modelId: zeroChangeActualModelId,
+          providerId: zeroChangeActualProviderId,
+          fallbackActive: priorProgress?.fallbackActive?.[zeroChangeBookkeepingStage] === true,
+          breakerRounds: resilience.fallbackProviderBreakerRounds,
+        })
+      ) {
+        const fallbackLabel = zeroChangeActualModelId
+          ? (attributionModelLabel(zeroChangeActualModelId) ?? zeroChangeActualModelId)
+          : "the fallback model";
+        const fallbackBreakerEscalated = await escalateReviewToHuman(
+          folderUri,
+          zeroChangeStage,
+          "environmental",
+          `The active fallback provider for ${STAGE_DISPLAY_NAMES[zeroChangeStage]} (${fallbackLabel}) has now ` +
+            `produced ${resilience.fallbackProviderBreakerRounds} consecutive rounds that changed zero files ` +
+            "while real plan work remains unmerged — it is not producing edits. Switch this stage's model in " +
+            "AI Models rather than rerunning: the fallback is not going to start writing files by being tried again.",
+          priorProgress?.reviewAttemptId,
+          persistedRounds ?? priorProgress ?? undefined,
+          false,
+          (current) => setZeroChangeImplRounds(current, undefined)
+        );
+        if (fallbackBreakerEscalated) {
+          return false;
+        }
+      }
       if (newlyLatchingChecklistUnreliable) {
         const outstandingList = describeOutstandingChecklistItemsV1(planChecklist);
         const reconcileNote =
@@ -7021,7 +7682,15 @@ async function executeImplementationRun(
             "⚠️ The plan checklist still shows unfinished items, but the most recent review already scored " +
               "this stage at full marks with zero blockers — the checklist's counts are treated as " +
               "under-recording, not real unfinished work, and completeness is no longer gating advancement. " +
-              `Tick the missed items in plan-final.md, then mark the checklist reconciled.${outstandingList}`
+              `${checklistReconcileGuidanceSentenceV1(outstandingList)}${outstandingList}`,
+            undefined,
+            undefined,
+            undefined,
+            {
+              command: "vs-code-ai-helper.reconcilePlanChecklist",
+              title: "Mark Plan Checklist Reconciled",
+              args: [{ taskFolderPath: folderUri.fsPath }],
+            }
           );
         }
       }
@@ -7048,7 +7717,7 @@ async function executeImplementationRun(
         pendingImplReviewFilesCount:
           (persistedRounds ?? priorProgress)?.pendingImplReviewFiles?.length ?? 0,
       });
-      if (sterileRoundDecision.action === "apply-review") {
+      if (sterileRoundDecision.action === "apply-review" || sterileRoundDecision.action === "both") {
         // Migrated off the single-action-button `NotificationRouter.showWarning`
         // notification onto a `WorkflowDecisionV1` record (task "Actionable
         // Hand-offs", "The worse case", fix part 2) — a message with a button
@@ -7056,6 +7725,13 @@ async function executeImplementationRun(
         // and this one decides from the same routing `preImplementationRouting`
         // does (this round just ran at `impl`, where every apply command
         // refuses — see goToReviewAndApplyV1).
+        //
+        // wf10 item 6: `"both"` means a task-fixable blocker AND unticked
+        // checklist items coexist (decidePostReviewActionV1's doc comment) —
+        // included here alongside `"apply-review"` so this branch is reached
+        // whenever a blocker stands, rather than falling to the `else` below,
+        // which asserts "the current state already satisfies the plan" — false
+        // whenever the checklist is not actually complete.
         const targetReviewStage: TaskStage =
           sterileRoundDecision.reviewStage === "impl-high-review"
             ? "impl-high-review"
@@ -7067,15 +7743,21 @@ async function executeImplementationRun(
           stage: sterileStage,
           taskName: priorProgress?.displayName,
         };
+        const sterileBothValid = sterileRoundDecision.action === "both";
+        const sterileWhyUserNeeded = sterileBothValid
+          ? "This round found nothing to fix, but the plan checklist still has unticked items — only Apply " +
+            "Review can fix what the newest review still reports; running Implementation again is not " +
+            "guaranteed to touch the remaining checklist work either, since this same round already reported " +
+            "nothing to do."
+          : "Implementation only reads the plan checklist, so running it again will give the same " +
+            "result — only Apply Review can fix what the newest review still reports.";
         const sterileDecisionPosted = await postWorkflowDecisionV1(
           {
             decisionKey: "sterileRoundRouting",
             taskCanonicalId: folderUri.fsPath,
             stage: sterileStage,
             whatHappened: `Implementation changed no files. ${sterileRoundDecision.reason}`,
-            whyUserNeeded:
-              "Implementation only reads the plan checklist, so running it again will give the same " +
-              "result — only Apply Review can fix what the newest review still reports.",
+            whyUserNeeded: sterileWhyUserNeeded,
             options: [
               {
                 optionId: "goToReviewAndApply",
@@ -7100,9 +7782,12 @@ async function executeImplementationRun(
             recommendation: {
               kind: "option",
               optionId: "goToReviewAndApply",
-              reasoning:
-                "Apply Review is the only action that can fix what the newest review still reports; " +
-                "running Implementation again will give the same (unchanged) result.",
+              reasoning: sterileBothValid
+                ? "Apply Review can fix what the newest review still reports. Running Implementation again " +
+                  "is also valid — the plan checklist still has unticked items — but this same round already " +
+                  "found nothing actionable there, so Apply Review is recommended first."
+                : "Apply Review is the only action that can fix what the newest review still reports; " +
+                  "running Implementation again will give the same (unchanged) result.",
             },
             gating: {
               holdsTaskPaused: false,
@@ -7117,7 +7802,18 @@ async function executeImplementationRun(
         if (!sterileDecisionPosted) {
           NotificationRouter.showWarning(
             `Implementation changed no files. ${sterileRoundDecision.reason} ` +
-              "Running Implementation again will give the same result."
+              (sterileBothValid
+                ? "The plan checklist still has unticked items, so running Implementation again is also " +
+                  "valid — but Go to Review & Apply can fix what the newest review reports right now."
+                : "Running Implementation again will give the same result — use Go to Review & Apply instead."),
+            undefined,
+            undefined,
+            undefined,
+            {
+              command: "vs-code-ai-helper.goToReviewAndApply",
+              title: "Go to Review & Apply",
+              args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetReviewStage }]
+            }
           );
         }
       } else {
@@ -7241,8 +7937,16 @@ async function executeImplementationRun(
           NotificationRouter.showWarning(
             "Implementation reported nothing to fix, but its plan-item completions did not match the " +
               "plan of record and unticked items remain with no review clearing this stage. The checklist " +
-              "is treated as under-recording — tick the missed items in plan-final.md, then mark the " +
-              `checklist reconciled.${outstandingList}`
+              "is treated as under-recording — tick the missed items in plan-final.md, then run " +
+              `**Ensemble: Mark Plan Checklist Reconciled** to confirm and restore the gate.${outstandingList}`,
+            undefined,
+            undefined,
+            undefined,
+            {
+              command: "vs-code-ai-helper.reconcilePlanChecklist",
+              title: "Mark Plan Checklist Reconciled",
+              args: [{ taskFolderPath: folderUri.fsPath }],
+            }
           );
         }
         await safeOpenTextDocument(logUri, "implementation run log");
@@ -7254,9 +7958,52 @@ async function executeImplementationRun(
       // counter in neither direction: it skipped the increment branch above
       // (its report is unusable, so "nothing to fix" was never established),
       // and it produced no edits that would justify clearing the streak.
+      if (summaryIssue === undefined) {
+        await patchTaskProgressStrictV1(folderUri, (current) =>
+          appendRoundOutcome(setZeroChangeImplRounds(current, undefined), {
+            stage: current.currentStage,
+            classification: "edits-produced",
+            at: new Date().toISOString(),
+            ...(modelId ? { modelId } : {}),
+          })
+        );
+        await appendRoundOutcomeLogNoteV1(logUri, "edits-produced");
+      } else {
+        // wf10 item 4 / Part 4: only a genuinely clean completion earns
+        // `edits-produced` here — a round whose summary was rejected
+        // (`summaryIssue` set) is already tracked by the recovery
+        // transition (`implRecovery`), which is a distinct, richer
+        // representation this taxonomy must not duplicate (see the
+        // persistence-boundary note on `TaskProgress.roundOutcomes`).
+        await patchTaskProgressStrictV1(folderUri, (current) =>
+          setZeroChangeImplRounds(current, undefined)
+        );
+      }
+    } else if (summaryIssue === undefined) {
+      // wf10 item 4 / Part 4 completion-blocker fix: two completed-round
+      // shapes previously reached this point with NO roundOutcomes entry at
+      // all — an accepted summary-only continuation (changing zero files is
+      // its mandate, not a finding) and a completed round whose change set
+      // could not be enumerated (`filesChangedUnknown`). Both are genuine
+      // completions, not provider failures, so they earn the same
+      // classification a justified zero-file round does: `edits-produced`
+      // if this round itself landed checklist ticks, `genuine-no-op`
+      // otherwise. A rejected summary (`summaryIssue` set) stays excluded
+      // here too — already tracked by the richer `implRecovery`
+      // representation (see the comment above).
+      const noEditsClassification = classifyZeroFileImplRoundV1({
+        checklistAdvanced,
+        warnedAsZeroFileFailure: false,
+      });
       await patchTaskProgressStrictV1(folderUri, (current) =>
-        setZeroChangeImplRounds(current, undefined)
+        appendRoundOutcome(current, {
+          stage: current.currentStage,
+          classification: noEditsClassification,
+          at: new Date().toISOString(),
+          ...(modelId ? { modelId } : {}),
+        })
       );
+      await appendRoundOutcomeLogNoteV1(logUri, noEditsClassification);
     }
 
     // The run summary is written to impl-summary.md and NEVER over
@@ -7687,8 +8434,12 @@ async function executeImplementationRun(
     }
 
     // Finding 3: while `checklistProgressUnreliable` is set the loop keeps
-    // running (the completeness gate is already stood down via
-    // readPlanChecklistProgressV1), but never silently — every round that
+    // running (the completeness gate above stands itself down whenever
+    // `priorProgress.checklistProgressUnreliable` is set — see
+    // `remainingChecklistProgress`'s latch check — and every OTHER
+    // completeness check in this file stands down the same way via
+    // `readPlanChecklistProgressV1`/`readEffectivePlanChecklistProgressV1`),
+    // but never silently — every round that
     // completes under the latch records the condition in its own run file and
     // re-surfaces the ONE action that can clear it. Nothing reconciles
     // automatically: no round knows what the unrecorded round did, so the
@@ -7707,8 +8458,8 @@ async function executeImplementationRun(
           "\n\n## Checklist reconciliation needed\n\n" +
           "This task's plan checklist is not a complete record (checklistProgressUnreliable): a round " +
           "landed changes its checklist state could not record, so the plan's step counts are unverified " +
-          "and completeness is not gating advancement. Tick the missed items in plan-final.md, then run " +
-          `**Ensemble: Mark Plan Checklist Reconciled** to restore the gate.${outstandingList}`;
+          `and completeness is not gating advancement. ${checklistReconcileGuidanceSentenceV1(outstandingList)}` +
+          outstandingList;
         // skipBackup: appends to the just-written log; a `_prev` sibling in
         // runs/ would read as a second run.
         await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, {
@@ -7738,8 +8489,16 @@ async function executeImplementationRun(
       if (reconcilePosted.kind !== "posted") {
         NotificationRouter.showWarning(
           "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
-            "until reconciled, and completeness is not gating advancement. Tick the missed items in " +
-            `plan-final.md, then mark the checklist reconciled.${outstandingList}`
+            "until reconciled, and completeness is not gating advancement. " +
+            `${checklistReconcileGuidanceSentenceV1(outstandingList)}${outstandingList}`,
+          undefined,
+          undefined,
+          undefined,
+          {
+            command: "vs-code-ai-helper.reconcilePlanChecklist",
+            title: "Mark Plan Checklist Reconciled",
+            args: [{ taskFolderPath: folderUri.fsPath }],
+          }
         );
       }
     }
@@ -7943,6 +8702,21 @@ async function executeImplementationRun(
     return true;
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
+    // wf10 item 4 / Part 4: a cancelled round reaches completion accounting
+    // (it is not a runner-level failure) and must be recorded as such rather
+    // than left indistinguishable from an unreported round. `logUri` was
+    // written unconditionally above (line ~7125) before this branch, so the
+    // run log's `Status:` line reads `cancelled` with no distinguishing
+    // classification unless this note is appended too — same idiom as every
+    // other outcome branch in this function.
+    await patchTaskProgressStrictV1(folderUri, (current) =>
+      appendRoundOutcome(current, {
+        stage: current.currentStage,
+        classification: "cancelled",
+        at: new Date().toISOString(),
+      })
+    );
+    await appendRoundOutcomeLogNoteV1(logUri, "cancelled");
     return false;
   } else {
     // Part 7: an externally-terminated round (wall-clock/inactivity
@@ -8224,7 +8998,10 @@ export async function runImplementationWithAI(
     // Chat, and this round runs immediately after, exactly as an unanswered
     // dialog used to fall through. Automation dispatches skip the post
     // entirely: no human is there to act on it.
-    if (preRunDecision.action === "apply-review" && !isAutomationDispatchV1(arg)) {
+    if (
+      (preRunDecision.action === "apply-review" || preRunDecision.action === "both") &&
+      !isAutomationDispatchV1(arg)
+    ) {
       // One sentence of what is wrong, one of what to do. Explaining the
       // mechanism accurately while leaving the user with no idea which button
       // to press is the same "big red button" problem this routing exists to
@@ -8256,16 +9033,50 @@ export async function runImplementationWithAI(
         stage: resolved.progress.currentStage,
         taskName: resolved.progress.displayName,
       };
+      // wf10 item 6 (2026-08-24): `preRunDecision.action === "both"` means a
+      // task-fixable blocker AND unticked checklist items coexist
+      // (decidePostReviewActionV1's doc comment) — Implementation genuinely
+      // can still land real, queued checklist work in that case, so the
+      // "will most likely change nothing" claim below is only true when the
+      // checklist is ALSO complete (`action === "apply-review"`). Observed
+      // 2026-08-21: a task with 1 task-fixable blocker and 77 unticked
+      // checklist items was told here that Implementation would most likely
+      // change nothing; the newest review's own progress marker showed 76 of
+      // those steps still queued and actionable, and the user correctly
+      // overrode the recommendation.
+      const bothValid = preRunDecision.action === "both";
+      const whatHappenedSuffix = bothValid
+        ? " Implementation is running now anyway — it can still make progress on the unticked checklist " +
+          "items, but will not fix the problems the review found."
+        : " Implementation is running now anyway — it will most likely change nothing.";
+      const whyUserNeeded = bothValid
+        ? "Both actions are valid here: Implementation can still land real, queued checklist work, but only " +
+          "Apply Review can fix what the newest review found — this lets you choose which to prioritize " +
+          "instead of assuming one makes the other pointless."
+        : "Implementation only reads the plan checklist, so it cannot fix what the newest review still " +
+          "reports — this offers a shortcut to the review stage instead of leaving you to notice, after " +
+          "the round finishes having changed nothing, that Apply Review was the action you needed.";
+      const letItRunConsequence = bothValid
+        ? "Does nothing further. Implementation keeps running as already started, and can still make " +
+          "progress on the unticked checklist items — it just will not fix the problems the newest review found."
+        : "Does nothing further. Implementation keeps running as already started, and will most " +
+          "likely change nothing while the standing blockers remain.";
+      const recommendationReasoning = bothValid
+        ? "Apply Review can fix problems Implementation cannot see; Implementation can still make progress " +
+          "on the checklist in the meantime, so this fixes the review's findings first rather than leaving " +
+          "them to compound."
+        : "Apply Review is the only action that can fix what the newest review still reports; " +
+          "Implementation is structurally blind to it and will most likely change nothing.";
+      const fallbackNoticeSuffix = bothValid
+        ? " Implementation can still make progress on the checklist, but will not fix what the review found."
+        : " Running Implementation now will most likely change nothing.";
       const decision = await postWorkflowDecisionV1(
         {
           decisionKey: "preImplementationRouting",
           taskCanonicalId: resolved.folderUri.fsPath,
           stage: resolved.progress.currentStage,
-          whatHappened: `${preRunDecision.reason} Implementation is running now anyway — it will most likely change nothing.`,
-          whyUserNeeded:
-            "Implementation only reads the plan checklist, so it cannot fix what the newest review still " +
-            "reports — this offers a shortcut to the review stage instead of leaving you to notice, after " +
-            "the round finishes having changed nothing, that Apply Review was the action you needed.",
+          whatHappened: `${preRunDecision.reason}${whatHappenedSuffix}`,
+          whyUserNeeded,
           options: [
             {
               optionId: "goToReviewAndApply",
@@ -8284,18 +9095,14 @@ export async function runImplementationWithAI(
             {
               optionId: "letItRun",
               label: "Let Implementation Run",
-              consequence:
-                "Does nothing further. Implementation keeps running as already started, and will most " +
-                "likely change nothing while the standing blockers remain.",
+              consequence: letItRunConsequence,
               effect: { kind: "doNothing" },
             },
           ],
           recommendation: {
             kind: "option",
             optionId: "goToReviewAndApply",
-            reasoning:
-              "Apply Review is the only action that can fix what the newest review still reports; " +
-              "Implementation is structurally blind to it and will most likely change nothing.",
+            reasoning: recommendationReasoning,
           },
           gating: {
             holdsTaskPaused: false,
@@ -8312,9 +9119,7 @@ export async function runImplementationWithAI(
         // No activating extension context to post through (e.g. a unit-test
         // harness stubbing only the write path) — fall back to the direct
         // notification so the choice is not lost entirely.
-        NotificationRouter.showWarning(
-          `${preRunDecision.reason} Running Implementation now will most likely change nothing.`
-        );
+        NotificationRouter.showWarning(`${preRunDecision.reason}${fallbackNoticeSuffix}`);
       }
       // Falls through to run Implementation — see the comment above this
       // block for why this must not gate the current run.
@@ -9288,6 +10093,7 @@ export async function resumeReviewInteractionV1(
     variables: variablesResult.variables,
     reviewAttemptId,
     chatViewProvider,
+    modelId,
   });
 
   const after = await orchestrator.loadInteraction(interactionRef);

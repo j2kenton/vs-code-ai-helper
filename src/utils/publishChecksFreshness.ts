@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /**
  * Freshness stamp for `publish-checks.md` (plan PART 2, step 6): proves the
@@ -115,6 +115,23 @@ export function mergePublishChecksFreshnessStamp(existing: string, section: stri
 }
 
 /**
+ * Extract the managed freshness stamp block (markers included) from existing
+ * `publish-review.md` content, if present. Mirrors
+ * `extractCompletionChecksSectionV1`/`extractScopeCheckSectionV1` — used by
+ * `reviewRowV1.ts` to re-inject the stamp after an AI review write.
+ *
+ * @internal exported for testing and reuse by reviewRowV1.ts
+ */
+export function extractPublishChecksFreshnessStampSectionV1(content: string): string | undefined {
+  const startIdx = content.indexOf(PUBLISH_CHECKS_STAMP_START);
+  const endIdx = content.indexOf(PUBLISH_CHECKS_STAMP_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+    return undefined;
+  }
+  return content.slice(startIdx, endIdx + PUBLISH_CHECKS_STAMP_END.length);
+}
+
+/**
  * Strictly subtractive: remove a previous freshness stamp from
  * `publish-checks.md` content, if present. Used to invalidate the stamp
  * before a new Publish Checks run starts, so a reader can never observe a
@@ -135,12 +152,35 @@ export function invalidatePublishChecksFreshnessStamp(existing: string): string 
 }
 
 // ---------------------------------------------------------------------------
-// Disk I/O helpers. Uses plain node:fs against publish-checks.md, matching
-// completionLint.ts/publishScopeCheck.ts (always a plain file inside the task
-// folder, never a virtual FS scheme).
+// Disk I/O helpers. Uses plain node:fs against publish-review.md (the single
+// Publish-stage artifact — see the module doc comment on the split reversal
+// below), matching completionLint.ts/publishScopeCheck.ts (always a plain
+// file inside the task folder, never a virtual FS scheme).
 // ---------------------------------------------------------------------------
 
+/**
+ * publish-review.md — the SINGLE Publish-stage artifact. Until this round,
+ * the deterministic checks (Completion Checks, Scope Check, this freshness
+ * stamp) lived in a separate `publish-checks.md`, split off from the AI
+ * reviewer's verdict so the two writers could not clobber each other. That
+ * split is what caused a user to receive a 49 KB `publish-checks.md` with a
+ * `Status:`/pass-fail verdict shape, mistake it for their Publish review, and
+ * conclude — reasonably — that the real one had been deleted when
+ * `publish-review.md` reported "not created yet." The two artifacts are
+ * unified back into one: checks are spliced into managed, marker-delimited
+ * sections of `publish-review.md` (mergeCompletionChecksSection etc.,
+ * unchanged), and re-injected after every AI review write
+ * (`reviewRowV1.ts`'s `promoteReviewContentV1`) so the reviewer's prose can
+ * never overwrite the ground-truth section beneath it. See
+ * `importLegacyPublishChecksIfAbsentV1` below for the one-time migration path
+ * for tasks that still only have the legacy `publish-checks.md` on disk.
+ */
 function publishChecksPath(taskFolderUri: vscode.Uri): string {
+  const filename = STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME;
+  return path.join(taskFolderUri.fsPath, filename);
+}
+
+function legacyPublishChecksPath(taskFolderUri: vscode.Uri): string {
   return path.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 }
 
@@ -150,6 +190,47 @@ async function readPublishChecksFile(taskFolderUri: vscode.Uri): Promise<string>
   } catch {
     return "";
   }
+}
+
+/**
+ * One-time bounded import (plan item 17, steps 20(b)/20(c)): when
+ * `publish-review.md` does not yet carry this module's managed freshness
+ * stamp but a legacy `publish-checks.md` does, splice the legacy file's
+ * ENTIRE managed-sections content (Completion Checks, Scope Check, and this
+ * freshness stamp — whichever it has) into `existing`, preceded by a
+ * provenance note, and return the result. A no-op (returns `existing`
+ * unchanged) once `publish-review.md` already carries its own stamp — this
+ * is the "no proactive migration sweep" rule: import happens lazily, at most
+ * once, the first time something upserts into or reads the new artifact for
+ * a task that predates the unification, never as a background sweep over
+ * every task folder. The legacy file itself is never modified or deleted.
+ *
+ * @internal exported for testing
+ */
+export async function importLegacyPublishChecksIfAbsentV1(
+  taskFolderUri: vscode.Uri,
+  existing: string
+): Promise<string> {
+  if (existing.indexOf(PUBLISH_CHECKS_STAMP_START) !== -1) {
+    return existing;
+  }
+  let legacy: string;
+  try {
+    legacy = await fs.promises.readFile(legacyPublishChecksPath(taskFolderUri), "utf8");
+  } catch {
+    return existing;
+  }
+  if (legacy.indexOf(PUBLISH_CHECKS_STAMP_START) === -1 && legacy.trim().length === 0) {
+    return existing;
+  }
+  const provenance =
+    "<!-- Imported once from the legacy publish-checks.md, which predated the Publish artifact " +
+    "unification, on first access after the upgrade. publish-checks.md itself was left untouched " +
+    "on disk. Nothing below this note was authored by the current review. -->";
+  const legacyBody = legacy.trim();
+  return existing.trim().length > 0
+    ? `${existing.trimEnd()}\n\n${provenance}\n\n${legacyBody}\n`
+    : `${provenance}\n\n${legacyBody}\n`;
 }
 
 /**
@@ -254,6 +335,62 @@ export async function readPublishChecksFreshnessStampV1(
   taskFolderUri: vscode.Uri
 ): Promise<PublishChecksFreshnessStampV1 | undefined> {
   return parsePublishChecksFreshnessStamp(await readPublishChecksFile(taskFolderUri));
+}
+
+/** Placeholder body for a Publish stage that has no review yet and no legacy
+ * checks to import — makes "not created yet" unreachable (plan item 17, step
+ * 20(a)) without asserting anything about readiness. */
+function renderUnreviewedPublishStub(): string {
+  return [
+    "# Publish Review",
+    "",
+    "**Not yet reviewed.** Run Publish Checks, then request a Publish review.",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Ensure `publish-review.md` exists for a task that has reached the Publish
+ * stage (plan item 17, step 20(a)/20(b)) — call this on Publish stage entry
+ * and from any path that would otherwise report the artifact as missing.
+ * Idempotent and safe to call repeatedly: a no-op once the file exists,
+ * whatever its content.
+ *
+ * When the file must be created and a legacy `publish-checks.md` already
+ * carries this module's freshness stamp, the new file is seeded from it
+ * (import + provenance note, `importLegacyPublishChecksIfAbsentV1`) rather
+ * than created empty — a task that upgraded mid-Publish keeps its most
+ * recent check results visible instead of appearing to have lost them.
+ * Otherwise the file is created with a plain "not yet reviewed" stub.
+ *
+ * Uses `createFileExclusive`-shaped semantics via a plain exclusive-flag
+ * write so a concurrent caller racing this same check-then-create can never
+ * clobber content the other one just wrote — the loser's write fails and is
+ * silently ignored, since either outcome (stub or legacy-seeded) is a valid
+ * starting point for the same task.
+ */
+export async function ensurePublishReviewArtifactExistsV1(
+  taskFolderUri: vscode.Uri
+): Promise<void> {
+  const targetPath = publishChecksPath(taskFolderUri);
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    try {
+      await fs.promises.access(targetPath);
+      return;
+    } catch {
+      // Absent — fall through to create it.
+    }
+    const seeded = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, "");
+    const content = seeded.trim().length > 0 ? seeded : renderUnreviewedPublishStub();
+    try {
+      await fs.promises.writeFile(targetPath, content, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      // Another caller created it first — its content stands.
+    }
+  });
 }
 
 /**

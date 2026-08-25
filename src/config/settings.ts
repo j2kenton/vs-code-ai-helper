@@ -446,6 +446,12 @@ export interface ResilienceSettings {
   /** 2c: escalate after this many consecutive implementation rounds that
    * change zero files while the same blocker persists (0 = off). */
   noProgressBreakerRounds: number;
+  /** wf10 item 3 / Part 5 step 13: stop and report after this many
+   * consecutive `provider-failure-empty` implementation rounds on a stage's
+   * ACTIVE FALLBACK provider specifically (keyed to that candidate, not the
+   * whole task) — distinct from noProgressBreakerRounds, which counts across
+   * any candidate (0 = off). */
+  fallbackProviderBreakerRounds: number;
   /** Part 5 step 3: a quota/entitlement failure's provider-reported reset
    * time within this many hours is "near" (remedy text says to rerun after
    * it); beyond it, or unknown, remedy text advises switching models
@@ -464,6 +470,7 @@ const RESILIENCE_BLOCKER_SET_PLATEAU_KEY = "resilience.blockerSetPlateau";
 const RESILIENCE_CHURN_CEILING_ROUNDS_KEY = "resilience.churnCeilingRounds";
 const RESILIENCE_NOTHING_TO_FIX_KEY = "resilience.nothingToFixRoutesToReview";
 const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerRounds";
+const RESILIENCE_FALLBACK_PROVIDER_BREAKER_ROUNDS_KEY = "resilience.fallbackProviderBreakerRounds";
 const RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY = "resilience.quotaResetNearThresholdHours";
 const RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY = "resilience.inactivityTimeoutMinutes";
 
@@ -503,6 +510,12 @@ export const RESILIENCE_DEFAULTS = {
   churnCeilingRounds: 4,
   nothingToFixRoutesToReview: true,
   noProgressBreakerRounds: 3,
+  // Deliberately lower than noProgressBreakerRounds: a fallback provider is
+  // ALREADY a degraded path (the primary already failed once to reach it),
+  // so a narrower, faster-tripping breaker on that specific candidate is
+  // appropriate — waiting for the broader task-wide breaker to also trip
+  // means rerunning into the same known-broken candidate one extra round.
+  fallbackProviderBreakerRounds: 2,
   quotaResetNearThresholdHours: 24,
   // 0 = off. Shipped enabled at 15 on 2026-08-16 and disabled the same day:
   // it fired 6 times in one afternoon, every one killing a healthy round that
@@ -590,6 +603,10 @@ export function getResilienceSettings(): ResilienceSettings {
     noProgressBreakerRounds: readResilienceRounds(
       RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY,
       RESILIENCE_DEFAULTS.noProgressBreakerRounds
+    ),
+    fallbackProviderBreakerRounds: readResilienceRounds(
+      RESILIENCE_FALLBACK_PROVIDER_BREAKER_ROUNDS_KEY,
+      RESILIENCE_DEFAULTS.fallbackProviderBreakerRounds
     ),
     quotaResetNearThresholdHours: readQuotaResetThresholdHours(
       RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY,

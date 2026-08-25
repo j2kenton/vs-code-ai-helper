@@ -57,6 +57,38 @@ export interface AutomationDispatch {
    */
   stillEnabled?: () => boolean;
   /**
+   * wf10 item 14 / Part 7 step 17: when true, the DEFERRED dispatch path
+   * fires once the root operation ends in ANY terminal state — succeeded,
+   * failed, cancelled, or interrupted — instead of only "succeeded".
+   *
+   * Most chains are a genuine CONTINUATION of the root operation's own work
+   * (e.g. "generate the plan, then review it") and correctly must not fire
+   * after a failed/cancelled root — there is nothing finished to continue
+   * from. A Publish-review dispatch is different: by the time it is
+   * scheduled, `currentStage` has already been durably persisted to
+   * "publish" (the write already landed on disk). That transition is a
+   * committed fact regardless of how the triggering root operation's own
+   * REMAINING work (a chained Fast-Forward loop, its post-loop reporting,
+   * etc.) subsequently concludes. Requiring the whole root operation to
+   * additionally end "succeeded" ties an already-committed stage's owed
+   * verification to an unrelated operation's outcome — exactly the
+   * "stage moves and its work does not" defect described in wf10 item 14.
+   * Leave false for every other chain, whose semantics correctly depend on
+   * the root actually succeeding.
+   */
+  dispatchEvenIfRootFails?: boolean;
+  /**
+   * Fires synchronously, once, immediately before the schedule promise
+   * resolves `false` — i.e. whenever the chain is dropped rather than
+   * dispatched. Lets a caller report the SPECIFIC reason a drop happened
+   * (duplicate chain vs. automation disabled meanwhile vs. the root
+   * operation ending unsuccessfully) instead of a single hardcoded message
+   * that is only accurate for one of those causes (wf10 item 2: a refusal
+   * must name its real condition, not a generic fallback that happens to
+   * fit the most common case).
+   */
+  onDropped?: (reason: "duplicate-chain" | "automation-disabled" | "root-operation-unsuccessful") => void;
+  /**
    * Hand-off metadata for the scheduling-intent ledger (task: "Actionable
    * Hand-offs", PART 6) — what caused this dispatch, the `ensemble.*`
    * setting (if any) that controls it, roughly when it is expected, and
@@ -247,11 +279,17 @@ function claimChainGuard(
  * - Without a `rootOperation`, the command runs immediately and the returned
  *   promise settles with its completion.
  * - With a `rootOperation`, dispatch is deferred until that operation ends;
- *   the command runs only when the root ended in `succeeded`.
+ *   the command runs only when the root ended in `succeeded` — unless
+ *   `dispatch.dispatchEvenIfRootFails` is set, in which case it runs
+ *   whatever the root's terminal state (see that field's doc comment).
  *
  * Resolves `true` when the command was dispatched, `false` when the chain
- * was dropped — because the root operation failed/was cancelled, or because
- * an identical (taskKey, command) chain was already pending or running.
+ * was dropped — because the root operation failed/was cancelled (and
+ * `dispatchEvenIfRootFails` was not set), because an identical
+ * (taskKey, command) chain was already pending or running, or because
+ * `stillEnabled` returned false. `dispatch.onDropped`, when provided, is
+ * called synchronously with the specific reason before the promise resolves
+ * false.
  */
 export function scheduleAutomationChain(
   dispatch: AutomationDispatch,
@@ -260,6 +298,7 @@ export function scheduleAutomationChain(
 ): Promise<boolean> {
   const release = claimChainGuard(dispatch.taskKey, dispatch.chainId ?? dispatch.command);
   if (!release) {
+    dispatch.onDropped?.("duplicate-chain");
     return Promise.resolve(false); // Duplicate chain for this task — dropped.
   }
   // Best-effort scheduling-intent ledger instrumentation (PART 6). The
@@ -288,6 +327,7 @@ export function scheduleAutomationChain(
     if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
       release();
       void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+      dispatch.onDropped?.("automation-disabled");
       return Promise.resolve(false); // Automation disabled since scheduling — dropped.
     }
     return intentIdPromise
@@ -315,12 +355,20 @@ export function scheduleAutomationChain(
         return;
       }
       endSub.dispose();
-      if (snapshot.state === "succeeded") {
+      // dispatchEvenIfRootFails (wf10 item 14): a Publish-review dispatch
+      // fires here regardless of how the root ended, because the stage
+      // transition it verifies was already durably committed before this
+      // chain was scheduled — an unrelated failure/cancellation/interruption
+      // in the root's OWN remaining work must not silently strand that
+      // already-committed transition with nothing running. Every other
+      // chain keeps the original "succeeded" gate.
+      if (snapshot.state === "succeeded" || dispatch.dispatchEvenIfRootFails === true) {
         if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
           // Automation disabled between scheduling and the root operation
           // ending — drop the chain at fire time.
           release();
           void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+          dispatch.onDropped?.("automation-disabled");
           resolve(false);
           return;
         }
@@ -355,6 +403,7 @@ export function scheduleAutomationChain(
       } else {
         release();
         void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+        dispatch.onDropped?.("root-operation-unsuccessful");
         resolve(false);
       }
     });

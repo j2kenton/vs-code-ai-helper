@@ -94,6 +94,10 @@ void describe("ensemble.resilience.* defaults", () => {
       RESILIENCE_DEFAULTS.noProgressBreakerRounds > 0,
       "noProgressBreakerRounds of 0 disables the breaker"
     );
+    assert.ok(
+      RESILIENCE_DEFAULTS.fallbackProviderBreakerRounds > 0,
+      "fallbackProviderBreakerRounds of 0 disables the breaker"
+    );
   });
 
   void it("keeps both breakers below the default fast-forward iteration budget", () => {
@@ -111,6 +115,10 @@ void describe("ensemble.resilience.* defaults", () => {
     assert.ok(
       RESILIENCE_DEFAULTS.noProgressBreakerRounds < (maxIterations as number),
       `noProgressBreakerRounds (${RESILIENCE_DEFAULTS.noProgressBreakerRounds}) must be below fastForwardMaxIterations (${String(maxIterations)})`
+    );
+    assert.ok(
+      RESILIENCE_DEFAULTS.fallbackProviderBreakerRounds < (maxIterations as number),
+      `fallbackProviderBreakerRounds (${RESILIENCE_DEFAULTS.fallbackProviderBreakerRounds}) must be below fastForwardMaxIterations (${String(maxIterations)})`
     );
   });
 });

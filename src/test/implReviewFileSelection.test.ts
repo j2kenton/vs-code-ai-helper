@@ -252,7 +252,20 @@ void test("total embed cap stays anchored under the chat-transaction input snaps
   // JSON-escape overhead. This guard fails if someone raises the cap back
   // above what that composition can absorb — see the constant's doc comment
   // before touching either side of the inequality.
-  const WORST_OBSERVED_NON_CONTENT_BYTES = 115_000;
+  // Raised 115_000 -> 155_000 (2026-08-25). The old figure was measured on the
+  // 2026-08-06 task that first hit this wall, and this guard then PASSED while
+  // workflow 10's review was rejected twice for exceeding the same limit — the
+  // assumption, not the inequality, was what went stale.
+  //
+  // Derived from that rejection rather than re-measured by hand: the
+  // transaction exceeded the cap with IMPL_REVIEW_MAX_TOTAL_CHARS=100000 in
+  // force, so
+  //   non_content x ESCAPE_OVERHEAD > MAX - (100000 x ESCAPE_OVERHEAD)
+  //   non_content                   > 150,855
+  // 155_000 is the nearest round figure above that floor. Raise it again if a
+  // rejection ever proves it low — a guard whose constant is optimistic is
+  // worse than no guard, because it reports safety it has not checked.
+  const WORST_OBSERVED_NON_CONTENT_BYTES = 155_000;
   const ESCAPE_OVERHEAD = 1.045;
   assert.ok(
     (IMPL_REVIEW_MAX_TOTAL_CHARS + WORST_OBSERVED_NON_CONTENT_BYTES) * ESCAPE_OVERHEAD <

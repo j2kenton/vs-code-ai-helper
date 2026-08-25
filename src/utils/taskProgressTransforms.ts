@@ -15,9 +15,11 @@ import {
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  MAX_ROUND_OUTCOMES,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
+  RoundOutcomeEntryV1,
   TaskEscalation,
   STAGE_ORDER,
   TaskProgress,
@@ -502,6 +504,28 @@ export function appendReviewRejection(
   return {
     ...progress,
     reviewRejections: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append one round-outcome classification (wf10 item 4 / Part 4, see
+ * `TaskProgress.roundOutcomes`) to the durable trail. Trims from the front
+ * once the cap is exceeded — same shape as `appendReviewRejection` and
+ * `appendReviewScoreHistory`, which this sits beside in every call site that
+ * records round-completion accounting.
+ */
+export function appendRoundOutcome(
+  progress: TaskProgress,
+  entry: RoundOutcomeEntryV1
+): TaskProgress {
+  const outcomes = [...(progress.roundOutcomes ?? []), entry];
+  const trimmed = outcomes.length > MAX_ROUND_OUTCOMES
+    ? outcomes.slice(outcomes.length - MAX_ROUND_OUTCOMES)
+    : outcomes;
+  return {
+    ...progress,
+    roundOutcomes: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

@@ -36,10 +36,13 @@ import {
   ProviderId,
 } from "./providers";
 import {
+  getResilienceSettings,
   isModelProviderEnabled,
   isProviderSelectionConfigured,
   resolveQuotaAccountKeyV1,
 } from "../config/settings";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { candidateHasRecentZeroFileFailuresV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   describeStageSubstitutesV1,
   resolveEffectiveStageChainV1,
@@ -64,7 +67,7 @@ import {
 } from "../utils/taskProgressTransforms";
 import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
-import { TaskStage } from "../types/taskProgress";
+import { RoundOutcomeEntryV1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
   ProviderChainCandidateStatusV1,
@@ -753,7 +756,18 @@ export function resolveRunnerForModel(
  */
 export async function checkImplementationAvailabilityForModel(
   modelId: string | undefined,
-  stage?: TaskStage
+  stage?: TaskStage,
+  /**
+   * wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): when supplied
+   * (only `runImplementationOrSealedV1`'s own pre-dispatch resolution does),
+   * the backup walk below also skips a CLI backup with a recent record of
+   * zero-file rounds — the same health window `runImplementationForModel`'s
+   * own internal cascade already reads, just applied one step earlier, since
+   * THIS walk is what actually decides which candidate an implementation
+   * round dispatches to. Every other caller (informational availability
+   * checks, gate probes) omits it and keeps the prior behavior unchanged.
+   */
+  taskFolderUri?: vscode.Uri
 ): Promise<RunnerAvailability> {
   const check = async (
     storedModelId: string | undefined,
@@ -792,8 +806,57 @@ export async function checkImplementationAvailabilityForModel(
     return primary;
   }
 
+  // Read once, outside the loop — a per-candidate read would re-fetch the
+  // identical file once per backup for no benefit. Best-effort: an
+  // unreadable progress file must never block a fallback walk that would
+  // otherwise work. Mirrors `runImplementationForModel`'s own internal
+  // cascade (runnerRegistry.ts, further below in this file).
+  const breakerRounds = getResilienceSettings().fallbackProviderBreakerRounds;
+  let roundOutcomesForHealthCheck: RoundOutcomeEntryV1[] | undefined;
+  if (taskFolderUri && stage && breakerRounds > 0) {
+    try {
+      const progressRead = await readTaskProgressStrictV1(taskFolderUri);
+      roundOutcomesForHealthCheck = progressRead.ok ? progressRead.decoded.progress.roundOutcomes : undefined;
+    } catch {
+      roundOutcomesForHealthCheck = undefined;
+    }
+  }
+
   for (const backupModel of backupModelsForStage(stage, modelId)) {
-    const fallback = await check(backupModel, resolveEffectiveProvider(backupModel));
+    const backupEffective = resolveEffectiveProvider(backupModel);
+    // wf10 item 3 / Part 5 step 13: never let AUTOMATIC edit-capable backup
+    // selection land on Copilot's sealed two-phase preflight pipeline
+    // (runSealedImplementationV1/runTwoPhaseEditActionV1) — observed on both
+    // wf9 and jester walking exactly this chain (a live CLI primary quota-
+    // exhausted, its CLI backup ALSO quota-dead, landing on a bare/legacy
+    // model id that resolves to Copilot) onto a path that reliably reported
+    // "available" while reliably producing zero-file rounds. A user who
+    // deliberately CONFIGURES Copilot as the stage's PRIMARY is unaffected —
+    // this only excludes it from the unattended backup walk; `primary`
+    // above is checked before this loop runs and never goes through it.
+    if (backupEffective.kind === "copilot") {
+      continue;
+    }
+    // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1/2): this walk
+    // is what actually resolves the candidate `runImplementationOrSealedV1`
+    // dispatches to — a candidate that "reports available" but has a recent
+    // record of zero-file rounds must not be walked back onto here, exactly
+    // the same health window the runtime cascade further below already
+    // applies to ITS OWN backup loop.
+    if (
+      breakerRounds > 0 &&
+      stage !== undefined &&
+      candidateHasRecentZeroFileFailuresV1(
+        roundOutcomesForHealthCheck,
+        stage,
+        backupModel,
+        breakerRounds,
+        backupEffective.def.id
+      )
+    ) {
+      continue;
+    }
+    const fallback = await check(backupModel, backupEffective);
     if (
       fallback.availability.available ||
       isAuthenticationFailure(fallback.availability.reason)
@@ -857,21 +920,17 @@ export async function runImplementationForModel(options: {
    */
   allowCrossProviderBackups: boolean;
   /**
-   * Optional safe cross-provider handoff (Codex review finding: a CLI
-   * primary that passes its pre-run availability probe but then fails at
-   * RUNTIME with a quota/temporarily-unavailable error had no way to reach a
-   * configured Copilot backup — `allowCrossProviderBackups: false` correctly
-   * blocks this cascade's own unsealed `run` dispatch from crossing to it,
-   * but the caller never got a chance to route that backup through the
-   * sealed pipeline instead, so `switch-to-backup` silently did nothing for
-   * a runtime failure even though it already worked for a pre-run
-   * unavailable-primary failure via runImplementationOrSealedV1's own
-   * top-level resolution). When set, a backup whose kind differs from the
-   * primary's is no longer skipped outright: this callback is invoked with
-   * its modelId INSTEAD of the unsafe `run` dispatch, and its result flows
-   * through the exact same quota-observation/sticky-fallback/dirty-tree-gate
-   * bookkeeping as any same-kind backup. An unresolvable backup modelId is
-   * still always skipped, regardless of this callback, exactly as before.
+   * Safe cross-provider handoff to the sealed two-phase Copilot pipeline
+   * (originally added per a Codex review finding: a CLI primary that passes
+   * its pre-run availability probe but then fails at RUNTIME with a quota/
+   * temporarily-unavailable error had no way to reach a configured Copilot
+   * backup). wf10 item 3 / Part 5 step 13: this cascade's automatic backup
+   * loop no longer calls this callback at all — every cross-kind (Copilot)
+   * backup is excluded from automatic selection entirely, since that path
+   * reliably reports "available" while reliably producing zero-file rounds
+   * (observed on wf9 and jester). The option and its plumbing at the
+   * `runImplementationOrSealedV1` call site are left in place, unused by
+   * this cascade, so the exclusion stays reversible without an API change.
    */
   runCrossProviderBackup?: (modelId: string) => Promise<ImplementationRunResult & { runnerId: string }>;
   /**
@@ -1069,36 +1128,81 @@ export async function runImplementationForModel(options: {
     }
     const releaseReservation = (): Promise<void> =>
       releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
+    // wf10 item 3 / item 6b / Part 5 step 14: a candidate with a recent
+    // record of zero-file rounds (the same `provider-failure-empty` health
+    // window step 13's breaker reads) must not be automatically re-selected
+    // here — this is exactly how both wf9 and jester walked their backup
+    // chain onto a known-broken sealed Copilot preflight path repeatedly:
+    // that candidate reports "available" (it IS reachable), so nothing
+    // before this point had a reason to skip it. Read once, outside the
+    // loop — a per-candidate read would re-fetch the identical file once per
+    // backup for no benefit. Best-effort: an unreadable progress file must
+    // never block a fallback cascade that would otherwise work.
+    const breakerRounds = getResilienceSettings().fallbackProviderBreakerRounds;
+    let roundOutcomesForHealthCheck: RoundOutcomeEntryV1[] | undefined;
+    if (breakerRounds > 0) {
+      try {
+        const progressRead = await readTaskProgressStrictV1(options.taskFolderUri);
+        roundOutcomesForHealthCheck = progressRead.ok ? progressRead.decoded.progress.roundOutcomes : undefined;
+      } catch {
+        roundOutcomesForHealthCheck = undefined;
+      }
+    }
     for (const backupModel of filterEnabledBackupModels(chain.backups)) {
       if (backupModel === options.modelId) {
+        continue;
+      }
+      // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): resolved
+      // BEFORE the health check below so that check can match on the full
+      // provider path (provider id + model id), not `modelId` alone — the
+      // same identity `runnerId: selected.def.id`/`"copilot-lm"` records at
+      // this candidate's own eventual return point further down.
+      let backupKind: "cli" | "copilot" | undefined;
+      let backupProviderId: string | undefined;
+      try {
+        const backupEffective = resolveEffectiveProvider(backupModel);
+        backupKind = backupEffective.kind;
+        backupProviderId = backupEffective.kind === "cli" ? backupEffective.def.id : "copilot-lm";
+      } catch {
+        // Unresolvable — the availability check just below rejects it too;
+        // treat as skip either way rather than crossing provider kinds.
+      }
+      if (
+        breakerRounds > 0 &&
+        candidateHasRecentZeroFileFailuresV1(
+          roundOutcomesForHealthCheck,
+          options.stage,
+          backupModel,
+          breakerRounds,
+          backupProviderId
+        )
+      ) {
         continue;
       }
       // Captured before this backup's availability check/dispatch — same
       // rationale as `primaryAccountKey` above.
       const backupAccountKey = resolveQuotaAccountKeyV1(backupModel);
-      let useCrossProviderBackup = false;
       if (!options.allowCrossProviderBackups) {
-        let backupKind: "cli" | "copilot" | undefined;
-        try {
-          backupKind = resolveEffectiveProvider(backupModel).kind;
-        } catch {
-          // Unresolvable — the availability check just below rejects it too;
-          // treat as skip either way rather than crossing provider kinds.
-        }
         if (backupKind !== effective.kind) {
-          // Codex review finding: previously always skipped here, so a
-          // primary that passed its pre-run probe but then failed at RUNTIME
-          // (quota/temporarily-unavailable) could never reach a
-          // cross-provider-kind backup even with switch-to-backup configured
-          // — runCrossProviderBackup (when the caller supplied one) is the
-          // sanctioned way to still reach it, through that caller's own safe
-          // dispatch instead of this cascade's unsealed `run` below. An
-          // unresolvable backupKind (undefined) still always skips,
-          // regardless, matching the pre-existing comment above.
-          if (!options.runCrossProviderBackup || backupKind === undefined) {
-            continue;
-          }
-          useCrossProviderBackup = true;
+          // wf10 item 3 / Part 5 step 13: the sealed two-phase Copilot
+          // pipeline (runSealedImplementationV1, reached below via
+          // runCrossProviderBackup) is excluded from automatic backup
+          // selection entirely — the same reasoning as the preflight
+          // availability walk's exclusion above (~line 810). The earlier
+          // "Codex review finding" reasoning that justified reaching it here
+          // (a CLI primary's RUNTIME quota failure otherwise had no way to
+          // reach a configured Copilot backup) is superseded by the observed
+          // wf9/jester failure: that path reliably reports "available" while
+          // reliably producing zero-file rounds, which is worse than never
+          // reaching it. Since this cascade is only ever entered for a CLI
+          // winning candidate (a Copilot winning candidate routes through
+          // runSealedImplementationV1 directly, never through here), the
+          // only cross-kind backup this loop could ever reach is Copilot —
+          // so excluding backupKind === "copilot" here removes Copilot from
+          // automatic implementation fallback selection entirely, while an
+          // unresolvable backupKind (undefined) still always skips too,
+          // matching the pre-existing comment above.
+          continue;
         }
       }
       const fallbackAvailability =
@@ -1119,9 +1223,13 @@ export async function runImplementationForModel(options: {
         }
         continue;
       }
-      const fallbackResult = useCrossProviderBackup
-        ? await options.runCrossProviderBackup!(backupModel)
-        : await run(resolveEffectiveProvider(backupModel));
+      // wf10 item 3 / Part 5 step 13: `options.runCrossProviderBackup` is
+      // never invoked here — the `continue` above already excludes every
+      // cross-kind (i.e. Copilot) backup this loop could otherwise reach.
+      // The option stays on the type (see its header) so the exclusion
+      // remains reversible without an API change, but this cascade no
+      // longer calls it.
+      const fallbackResult = await run(resolveEffectiveProvider(backupModel));
       await recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage, getExtensionContextV1(), undefined, backupAccountKey);
       if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(

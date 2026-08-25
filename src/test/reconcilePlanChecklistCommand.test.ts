@@ -39,11 +39,13 @@ import {
   reconcilePlanChecklistConfirmedV1,
 } from "../commands/reconcilePlanChecklist";
 import {
+  UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1,
   UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1,
   buildSiblingReviewDisagreementVariable,
   buildStayingOnStageNoticeV1,
   describeOutstandingChecklistItemsV1,
   readPlanChecklistProgressV1,
+  resolveChecklistCountQualifierV1,
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -79,6 +81,16 @@ const CHECKLIST_PLAN = [
 ].join("\n");
 
 const PLAN_WITHOUT_CHECKLIST = ["# Final Plan", "", "Prose only, no checklist.", ""].join("\n");
+
+const FULLY_CHECKED_PLAN = [
+  "# Final Plan",
+  "",
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "- [x] Split the artifacts",
+  "- [x] Wire the completeness gate",
+  "",
+].join("\n");
 
 const BASE_UPDATED_AT = "2026-08-11T00:00:00.000Z";
 
@@ -479,8 +491,13 @@ void describe("reconcilePlanChecklist — confirmation", () => {
     assert.match(modal, /1 outstanding/);
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, undefined);
     assert.equal(result.refreshes, 1);
+    // The last "info" entry, not the first: posting the reconcile decision
+    // itself now also notifies at "info" level (its gating is non-blocking —
+    // item 13, headline/severity must reflect `gating`), so the first "info"
+    // entry can be that announcement rather than this command's own
+    // completion message.
     assert.match(
-      result.captured.find((m) => m.method === "info")?.message ?? "",
+      result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
       /completeness now gates advancement again/
     );
   });
@@ -744,6 +761,84 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         .find((d) => d.decisionKey === "reconcilePlanChecklist");
       assert.ok(decision, "a decision must be posted");
       assert.equal(decision.recommendation.kind, "none");
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // wf10 item 6c: `coveredItemsCount === 0` is two unrelated situations — no
+  // review vouches for an outstanding item (tested above), or there is no
+  // outstanding item AT ALL. Observed live 2026-08-21 on jester task 3: the
+  // panel simultaneously said "0 outstanding" and "at least one unticked
+  // item is not named as verified complete" — self-contradictory. This is
+  // exactly the case where "Mark reconciled" is unambiguously safe (nothing
+  // outstanding to accidentally advance), and it must be recommended instead
+  // of "no basis".
+  void it("recommends Mark reconciled, not 'no basis', when zero checklist items are unticked", async () => {
+    const name = "evidence-fully-ticked";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Split the artifacts",
+        "- [x] Wire the completeness gate",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+    // No review artifacts — irrelevant here, since nothing is outstanding
+    // for a review to vouch for in the first place.
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.match(decision.recommendation.reasoning, /0 outstanding/);
+        assert.doesNotMatch(decision.recommendation.reasoning, /no basis/);
+      }
+      // The "Not yet" option must never instruct ticking items that do not
+      // exist (the second half of the same jester defect).
+      const notYet = decision.options.find((o) => o.optionId === "notYet");
+      assert.ok(notYet, "a Not yet option must still be offered");
+      assert.doesNotMatch(
+        notYet.consequence,
+        /tick the missed items in plan-final\.md/,
+        "there are no missed items to tick when the checklist already reads 0 outstanding"
+      );
     } finally {
       win.restore();
       fs.restore();
@@ -1020,6 +1115,79 @@ void describe("checklistProgressUnreliable — gating and reporting surfaces", (
     );
   });
 
+  void it("the staying-on-stage notice uses the nothing-outstanding qualifier when the checklist has nothing left to tick", () => {
+    // wf10 item 11 continued: latched but the checklist itself is fully
+    // ticked (jester task 3's 75/75 shape) — the reader must not be told to
+    // go tick "missed items" that do not exist.
+    const nothingOutstanding = buildStayingOnStageNoticeV1(
+      8,
+      { complete: 3, total: 5 },
+      "",
+      true,
+      false
+    );
+    assert.ok(
+      nothingOutstanding.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1),
+      "nothing-outstanding must use the nothing-outstanding qualifier text"
+    );
+    assert.equal(
+      nothingOutstanding.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1) &&
+        !nothingOutstanding.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1),
+      false,
+      "must not render the 'tick the missed items' qualifier when nothing is outstanding"
+    );
+    assert.doesNotMatch(
+      nothingOutstanding,
+      /once the missed items are ticked/,
+      "must never instruct ticking items that do not exist"
+    );
+    // The trailing sentence must agree with the qualifier just rendered —
+    // this is the exact assembled-output contradiction the review flagged:
+    // "shows nothing outstanding" followed by "Staying on this stage to
+    // build the rest" tells the reader two incompatible things in one notice.
+    assert.doesNotMatch(
+      nothingOutstanding,
+      /build the rest/,
+      "must not tell the reader there is more to build when nothing is outstanding"
+    );
+    assert.match(
+      nothingOutstanding,
+      /Staying on this stage until that is reconciled/,
+      "the closing instruction must point at reconciliation, not at unbuilt work"
+    );
+
+    // The default (outstanding items present) case must be unchanged.
+    const stillOutstanding = buildStayingOnStageNoticeV1(8, { complete: 3, total: 5 }, "", true, true);
+    assert.match(
+      stillOutstanding,
+      /Staying on this stage to build the rest/,
+      "when items are genuinely outstanding the original closing instruction still applies"
+    );
+  });
+
+  void it("resolveChecklistCountQualifierV1 picks the qualifier from the raw checklist, not the latch alone", async () => {
+    const { folder: unticked } = makeTask("qualifier-resolve-unticked", { latched: true });
+    const { folder: fullyTicked } = makeTask("qualifier-resolve-fully-ticked", {
+      latched: true,
+      plan: FULLY_CHECKED_PLAN,
+    });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const unreliable = await resolveChecklistCountQualifierV1(vscode.Uri.file(unticked), true);
+      assert.equal(unreliable, UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1);
+
+      const nothingLeft = await resolveChecklistCountQualifierV1(vscode.Uri.file(fullyTicked), true);
+      assert.equal(nothingLeft, UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1);
+
+      const notLatched = await resolveChecklistCountQualifierV1(vscode.Uri.file(unticked), false);
+      assert.equal(notLatched, "");
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
   void it("the sibling-disagreement block qualifies the ordered-steps count only while latched", async () => {
     const { folder } = makeTask("sibling-qualifier", { latched: true });
     const sha = "abcdef1";
@@ -1070,6 +1238,63 @@ void describe("checklistProgressUnreliable — gating and reporting surfaces", (
         cleared.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
         false,
         "once reconciled the count renders unqualified again"
+      );
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("the sibling-disagreement block uses the nothing-outstanding qualifier when the checklist is fully ticked but still latched", async () => {
+    // wf10 item 11 continued: same 75/75-but-latched shape as item 6c, this
+    // time for the Publish-facing sibling-disagreement variable rather than
+    // the reconcile decision's own text.
+    const { folder } = makeTask("sibling-qualifier-fully-ticked", {
+      latched: true,
+      plan: FULLY_CHECKED_PLAN,
+    });
+    const sha = "abcdef2";
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      [
+        "# Implementation Review",
+        "",
+        `<!-- reviewed-commit: ${sha} -->`,
+        "<!-- progress: 4/4 -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-low-review.md"),
+      [
+        "# Implementation Review",
+        "",
+        `<!-- reviewed-commit: ${sha} -->`,
+        "<!-- blockers:start -->",
+        "- [completion] [task-fixable] the resolver from plan step 2 does not exist",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      const folderUri = vscode.Uri.file(folder);
+      const rendered = await buildSiblingReviewDisagreementVariable(folderUri, sha);
+      assert.match(rendered, /4 of 4 ordered steps/);
+      assert.ok(
+        rendered.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_NOTHING_OUTSTANDING_V1),
+        "a fully-ticked-but-latched checklist must use the nothing-outstanding qualifier"
+      );
+      assert.doesNotMatch(
+        rendered,
+        /once the missed items are ticked/,
+        "must never instruct ticking items that do not exist"
       );
     } finally {
       win.restore();

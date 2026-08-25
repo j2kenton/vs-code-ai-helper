@@ -32,7 +32,29 @@
  * 100000 (~25k tokens) keeps the worst observed composition ≈ 20K+ under
  * the limit while still embedding a dozen files' capped contents. */
 export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
-export const IMPL_REVIEW_MAX_TOTAL_CHARS = 100000;
+/**
+ * Lowered 100000 -> 60000 (2026-08-25, second live rejection). The 100000
+ * figure was anchored to a *measured* non-content composition of ~115K
+ * (template + rubric + plan + implementation + previous review + the pack's
+ * non-content sections). That measurement has been outgrown: workflow 10's
+ * `task.md` alone reached 59,473 bytes, and its review was rejected twice with
+ * `inputSnapshot exceeds the 262144-byte canonical limit`.
+ *
+ * The real figure is derivable from the rejection itself — the transaction
+ * exceeded 262,144 with a 100000 content cap in force, so
+ *   non_content x 1.045 > 262144 - (100000 x 1.045)
+ *   non_content          > 150,855
+ * against the 115,000 assumed. 60000 restores a real margin at the observed
+ * composition rather than a nominal one.
+ *
+ * This is a STOPGAP, not the fix. A hardcoded content cap cannot stay correct
+ * while the non-content side grows independently — that is exactly the defect
+ * recorded as item 9 of workflow 11 (`.ensemble/2026-08-24_task_1`): the
+ * assembled input must be measured against the canonical limit before dispatch
+ * and reduced until it fits, so this constant becomes a computed remainder
+ * instead of a periodically re-guessed number.
+ */
+export const IMPL_REVIEW_MAX_TOTAL_CHARS = 60000;
 
 /**
  * Workflow findings round 8, item 1 (fixes 1 and 5): the flat 8 KB

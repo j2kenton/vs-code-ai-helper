@@ -323,8 +323,13 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     assert.match(plan, /- \[x\] Wire the completeness gate/, "the verified item is now ticked");
     assert.match(plan, /- \[ \] Add the retry button/, "an item never named by the review stays unticked");
     assert.equal(result.refreshes, 1);
+    // The last "info" entry, not the first: posting the decision itself now
+    // also notifies at "info" level when its gating is non-blocking (item 13
+    // — the headline/severity must reflect `gating`, not always be a
+    // warning), so the first "info" entry can be that announcement rather
+    // than this command's own completion message.
     assert.match(
-      result.captured.find((m) => m.method === "info")?.message ?? "",
+      result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
       /Applied 1 reviewer-verified tick/
     );
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
@@ -421,8 +426,10 @@ void describe("applyReviewerVerifiedTicks — items that do not resolve", () => 
     const result = await run("partial-resolve", { review }, { confirm: true });
     const plan = readPlan(result.folder);
     assert.match(plan, /- \[x\] Wire the completeness gate/);
+    // Last "info" entry — see the comment on the identical pattern in the
+    // "happy path" test above.
     assert.match(
-      result.captured.find((m) => m.method === "info")?.message ?? "",
+      result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
       /Applied 1 reviewer-verified tick/,
       "only the one resolvable item should be counted/applied"
     );
@@ -497,8 +504,10 @@ void describe("applyReviewerVerifiedTicks — cancellation and races", () => {
     const plan = readPlan(result.folder);
     assert.match(plan, /- \[x\] Wire the completeness gate/, "the reviewer's tick still applies");
     assert.match(plan, /- \[x\] Add the retry button/, "the concurrent edit is preserved, not clobbered");
+    // Last "info" entry — see the comment on the identical pattern in the
+    // "happy path" test above.
     assert.match(
-      result.captured.find((m) => m.method === "info")?.message ?? "",
+      result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
       /Applied 1 reviewer-verified tick/
     );
   });

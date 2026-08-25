@@ -32,9 +32,11 @@ import {
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  MAX_ROUND_OUTCOMES,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
+  RoundOutcomeEntryV1,
   STAGE_ORDER,
   TaskEscalation,
   TaskProgress,
@@ -132,6 +134,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewAttemptId",
   "reviewScoreHistory",
   "reviewRejections",
+  "roundOutcomes",
   "escalation",
   "overriddenEscalations",
   "implementationTypeCheckFailure",
@@ -195,6 +198,13 @@ const ESCALATION_KINDS: ReadonlySet<string> = new Set([
   "environmental",
   "unverifiable",
   "reviewer-disagreement",
+]);
+const ROUND_OUTCOME_CLASSIFICATIONS: ReadonlySet<string> = new Set([
+  "edits-produced",
+  "genuine-no-op",
+  "provider-failure-empty",
+  "cancelled",
+  "rejected-degenerate",
 ]);
 
 /** Bounded-representation limits for strict field validation. */
@@ -782,6 +792,66 @@ function validateReviewRejections(
       entry["reason"].length > MAX_ESCALATION_REASON_LENGTH
     ) {
       return "reviewRejections entry reason must be a bounded non-empty string";
+    }
+  }
+  return undefined;
+}
+
+function validateRoundOutcomes(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_ROUND_OUTCOMES) {
+    return "roundOutcomes must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "roundOutcomes entries must be objects";
+    }
+    const allowed = new Set(["stage", "classification", "at", "attemptId", "modelId", "providerId"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `roundOutcomes entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "roundOutcomes entry stage must be a recognized stage";
+    }
+    if (
+      typeof entry["classification"] !== "string" ||
+      !ROUND_OUTCOME_CLASSIFICATIONS.has(entry["classification"])
+    ) {
+      return "roundOutcomes entry classification must be a recognized round-outcome classification";
+    }
+    if (!isIsoTimestamp(entry["at"])) {
+      return "roundOutcomes entry at must be an ISO timestamp";
+    }
+    if (entry["attemptId"] !== undefined) {
+      if (
+        typeof entry["attemptId"] !== "string" ||
+        entry["attemptId"].length === 0 ||
+        entry["attemptId"].length > MAX_ID_LENGTH
+      ) {
+        return "roundOutcomes entry attemptId must be a bounded non-empty string";
+      }
+    }
+    if (entry["modelId"] !== undefined) {
+      if (
+        typeof entry["modelId"] !== "string" ||
+        entry["modelId"].length === 0 ||
+        entry["modelId"].length > MAX_NAME_LENGTH
+      ) {
+        return "roundOutcomes entry modelId must be a bounded non-empty string";
+      }
+    }
+    if (entry["providerId"] !== undefined) {
+      if (
+        typeof entry["providerId"] !== "string" ||
+        entry["providerId"].length === 0 ||
+        entry["providerId"].length > MAX_NAME_LENGTH
+      ) {
+        return "roundOutcomes entry providerId must be a bounded non-empty string";
+      }
     }
   }
   return undefined;
@@ -1522,6 +1592,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.reviewRejections = value as ReviewRejectionEntry[];
+        break;
+      }
+      case "roundOutcomes": {
+        const error = validateRoundOutcomes(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.roundOutcomes = value as RoundOutcomeEntryV1[];
         break;
       }
       case "escalation": {

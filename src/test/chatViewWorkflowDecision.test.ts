@@ -49,6 +49,7 @@
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { describe, it } from "node:test";
+import * as vm from "node:vm";
 import * as vscode from "vscode";
 
 import {
@@ -116,6 +117,27 @@ function installExecuteCommandCapture(resolveValue: unknown = undefined): {
     calls,
     restore: (): void => {
       commandsObj._executeCommandOverride = orig;
+    },
+  };
+}
+
+/**
+ * The test stub's `workspace.fs.readFile` is unimplemented by default (every
+ * read fails closed, harmlessly, for suites that don't need real content).
+ * The staleness-reconciliation tests below need `deriveApplicableVerifiedTicksV1`
+ * (called from `chatView.ts`'s render path) to actually read plan-final.md and
+ * the review artifact off real disk, so they can distinguish "still
+ * applicable" from "already ticked" — without this, every read would fail and
+ * every decision would look indistinguishable from "cannot tell".
+ */
+function installRealFs(): { restore: () => void } {
+  const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const original = fsRecord.readFile;
+  fsRecord.readFile = async (uri: vscode.Uri): Promise<Uint8Array> =>
+    new TextEncoder().encode(await fs.promises.readFile(uri.fsPath, "utf8"));
+  return {
+    restore: (): void => {
+      fsRecord.readFile = original;
     },
   };
 }
@@ -547,6 +569,126 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       assert.deepEqual(entry.actionCommand.args, [target]);
     } finally {
       notify.restore();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("a non-gating decision (holdsTaskPaused:false, unblocksProgress:false) is not announced as 'Decision needed' and does not post a warning", () => {
+    const folder = makeFolder();
+    const notify = installNotificationRouterCapture();
+    try {
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl", taskName: "My Task" };
+      const decision: WorkflowDecisionV1 = {
+        decisionId: "decision-1",
+        decisionKey: "exampleDecision",
+        taskCanonicalId: folder,
+        stage: "impl",
+        whatHappened: "The scheduled round finished and the summary was rejected.",
+        whyUserNeeded: "The system cannot tell whether to retry or restore the prior round.",
+        options: [
+          {
+            optionId: "doIt",
+            label: "Do it",
+            consequence: "Applies the change immediately.",
+            effect: { kind: "command", command: "ensemble.doIt" },
+          },
+        ],
+        recommendation: { kind: "option", optionId: "doIt", reasoning: "It is safe and reversible." },
+        gating: { holdsTaskPaused: false, unblocksProgress: false, detail: "This does not resume the task." },
+        createdAt: new Date().toISOString(),
+        state: "pending",
+      };
+
+      notifyPendingWorkflowDecision(decision, target);
+
+      assert.equal(notify.entries.length, 1);
+      const entry = notify.entries[0]!;
+      assert.equal(entry.level, "info", "a non-gating decision must not be posted as a warning");
+      assert.doesNotMatch(entry.message, /Decision needed/);
+      // The reported fact is still `whatHappened` — only the headline/severity
+      // change with gating, never the content itself (see the module comment
+      // on notifyPendingWorkflowDecision).
+      assert.match(entry.message, /The scheduled round finished and the summary was rejected\./);
+      // Review-flagged (2026-08-24): the non-blocking path must ALSO carry
+      // `gating.detail` (why it does not need urgent attention), not only
+      // `whatHappened` — dropping it left the notification with no basis for
+      // its own "Optional" claim.
+      assert.match(entry.message, /This does not resume the task\./);
+    } finally {
+      notify.restore();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("render() marks a non-gating decision so the panel does not headline it 'Decision needed'", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      const posted = await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          gating: { holdsTaskPaused: false, unblocksProgress: false, detail: "This does not resume the task." },
+        })
+      );
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      const decisions = lastDecisions(fake) as ReadonlyArray<WorkflowDecisionV1 & { isBlockingDecision?: boolean }>;
+      assert.equal(decisions.length, 1);
+      assert.equal(decisions[0]!.isBlockingDecision, false);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  // Review-flagged (2026-08-24): the previous coverage only asserted the
+  // host-side `isBlockingDecision` field posted into "state" — it never
+  // executed the webview's own script, so a regression that re-hardcoded
+  // `title.textContent='Decision needed'` inside the webview (the surface
+  // the plan item actually targets) would leave every existing test green.
+  // This extracts and evaluates the ACTUAL production expression from the
+  // HTML `resolveWebviewView` assigns to `webview.html` — the same string
+  // VS Code would hand to the real webview — rather than re-deriving the
+  // predicate independently, so a hardcoded headline fails this test either
+  // by no longer matching the expected expression shape at all, or by
+  // computing the wrong string once evaluated.
+  void it("the webview's own title expression computes 'Decision needed' vs 'Optional' from isBlockingDecision, not a hardcoded string", () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const html = fake.view.webview.html;
+      const match = html.match(
+        /title\.textContent=(\(dcs\.isBlockingDecision!==false\)\?'Decision needed':'Optional');/
+      );
+      assert.ok(
+        match,
+        "expected the decision card title in the webview script to be computed from dcs.isBlockingDecision, not hardcoded"
+      );
+      const expression = match[1]!;
+      const computeTitle = (isBlockingDecision: boolean | undefined): unknown =>
+        vm.runInNewContext(expression, { dcs: { isBlockingDecision } });
+      assert.equal(computeTitle(true), "Decision needed");
+      assert.equal(computeTitle(false), "Optional");
+      // Absence (a decision predating the gating field) must default to
+      // blocking, matching the host-side predicate's own "absence is never
+      // positive evidence" rule.
+      assert.equal(computeTitle(undefined), "Decision needed");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
       fs.rmSync(folder, { recursive: true, force: true });
     }
   });
@@ -1606,6 +1748,144 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         "expected the resume outcome to be acknowledged once resume() actually completes"
       );
     } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * wf10 item 6d / step 7: "Apply N Reviewer-Verified Ticks" is posted from a
+ * snapshot of plan-final.md and the review taken at post time. If the named
+ * item(s) get ticked some other way before the user answers (a later round's
+ * own echo, a hand edit, a differently-sourced reconcile), the stored record
+ * still reads "pending" — `listPending`'s fresh store read (PART 4, above)
+ * only re-checks `state`, not whether the underlying claim is still true.
+ * `withdrawStaleApplyReviewerVerifiedTicksDecisionsV1` (chatView.ts) re-derives
+ * applicability against the CURRENT plan-final.md on every render and
+ * withdraws (dismisses) a decision whose target items are already ticked,
+ * rather than leaving a stale, now-no-op control in the panel.
+ */
+void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision is re-checked against disk on render (wf10 item 6d)", () => {
+  const REVIEW_WITH_VERIFIED_ITEM = [
+    "Readiness: 9/10",
+    "",
+    "<!-- verified-complete:start -->",
+    "- Wire the completeness gate",
+    "<!-- verified-complete:end -->",
+    "",
+    "<!-- blockers:start -->",
+    "<!-- blockers:end -->",
+  ].join("\n");
+
+  function applyTicksDecisionInput(folder: string): CreateWorkflowDecisionInputV1 {
+    return decisionInput(folder, {
+      decisionKey: "applyReviewerVerifiedTicks",
+      stage: "impl-high-review",
+      whatHappened:
+        "impl-high-review.md named 1 plan item(s) as verified complete that are still unticked in plan-final.md.",
+      options: [
+        {
+          optionId: "apply",
+          label: "Apply 1 Reviewer-Verified Tick",
+          consequence: "Ticks 1 item(s) in plan-final.md, sourced from impl-high-review.md:\n- Wire the completeness gate",
+          effect: {
+            kind: "command",
+            command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
+            args: [{ taskFolderPath: folder, canonicalId: folder, reviewStage: "impl-high-review" }],
+          },
+        },
+        {
+          optionId: "skip",
+          label: "Not yet",
+          consequence: "Does nothing. The items stay unticked until you apply this or tick them yourself.",
+          effect: { kind: "doNothing" },
+        },
+      ],
+      recommendation: {
+        kind: "option",
+        optionId: "apply",
+        reasoning: "The reviewer already verified this item against the tree.",
+      },
+    });
+  }
+
+  void it("stays pending when the named item is still unticked in plan-final.md", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [ ] Wire the completeness gate", ""].join("\n")
+      );
+      fs.writeFileSync(`${folder}/impl-high-review.md`, REVIEW_WITH_VERIFIED_ITEM);
+      const posted = await provider.workflowDecisionStore.post(applyTicksDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      const decisions = lastDecisions(fake);
+      assert.ok(
+        decisions.some((d) => d.decisionId === "decision-1"),
+        "the decision must still render — its named item is genuinely still unticked"
+      );
+      assert.equal(
+        provider.workflowDecisionStore.get("decision-1")?.state,
+        "pending",
+        "the store record must not be dismissed while the item is still unticked"
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("is withdrawn (dismissed) on render once the named item is already ticked in plan-final.md", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      // Ticked from the start — simulates the item having been ticked by
+      // some OTHER path (a later round's own echo, a hand edit, a
+      // differently-sourced reconcile) after this decision was posted.
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [x] Wire the completeness gate", ""].join("\n")
+      );
+      fs.writeFileSync(`${folder}/impl-high-review.md`, REVIEW_WITH_VERIFIED_ITEM);
+      const posted = await provider.workflowDecisionStore.post(applyTicksDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      const decisions = lastDecisions(fake);
+      assert.ok(
+        !decisions.some((d) => d.decisionId === "decision-1"),
+        "a decision whose target item is already ticked must not render as an actionable pending card"
+      );
+      assert.equal(
+        provider.workflowDecisionStore.get("decision-1")?.state,
+        "dismissed",
+        "the stale decision must be withdrawn in the store, not just hidden from this one render"
+      );
+    } finally {
+      realFs.restore();
       notify.restore();
       cmds.restore();
       provider.dispose();

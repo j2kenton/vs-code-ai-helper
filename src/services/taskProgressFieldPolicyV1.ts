@@ -237,6 +237,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve (durable degenerate-round rejection trail).",
     reopen: "Preserve (durable degenerate-round rejection trail).",
   },
+  roundOutcomes: {
+    migration: "Validate bounded exact-shape entry array; preserve.",
+    nextStage: "Preserve (durable round-outcome classification trail).",
+    markTaskDone: "Preserve (durable round-outcome classification trail).",
+    reopen: "Preserve (durable round-outcome classification trail).",
+  },
   escalation: {
     migration: "Validate exact shape; preserve.",
     nextStage:
@@ -412,6 +418,7 @@ export function applyNextStagePolicyV1(
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
+    roundOutcomes: progress.roundOutcomes,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
@@ -469,6 +476,7 @@ export function applyMarkTaskDonePolicyV1(
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
+    roundOutcomes: progress.roundOutcomes,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
@@ -565,6 +573,7 @@ export function applyReopenPolicyV1(
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
+    roundOutcomes: progress.roundOutcomes,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,

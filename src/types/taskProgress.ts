@@ -283,6 +283,24 @@ export interface TaskProgress {
    */
   reviewRejections?: ReviewRejectionEntry[];
   /**
+   * Durable, fixed-vocabulary record of what each round that reached
+   * completion accounting actually produced (wf10 item 4 / Part 4). Exists
+   * because "Status: completed" with zero files recorded was previously
+   * indistinguishable from a genuine no-op: an empty preflight plan on a
+   * task with unticked checklist items and a review naming live blockers is
+   * a PROVIDER FAILURE ("provider-failure-empty"), not a finding that no
+   * work was needed ("genuine-no-op") — see `RoundOutcomeClassificationV1`.
+   * Persisted only at round-completion-accounting time, in the same patch as
+   * the other round-accounting fields it sits beside (`zeroChangeImplRounds`,
+   * `reviewRejections`) — runner-level failures (quota, unavailable, skipped
+   * candidate) never reach that accounting and are NOT recorded here; they
+   * keep their existing representation (`fallbackActive`,
+   * `TaskActionOutcomeV1` kinds) untouched, so this taxonomy neither
+   * duplicates nor replaces it. Capped at MAX_ROUND_OUTCOMES (oldest
+   * dropped).
+   */
+  roundOutcomes?: RoundOutcomeEntryV1[];
+  /**
    * Set when automated review iteration determined it cannot make further
    * progress on its own and needs a human decision. Cleared on the next
    * stage transition and whenever the user explicitly resumes iteration.
@@ -642,6 +660,68 @@ export interface ReviewRejectionEntry {
 
 /** Cap on `TaskProgress.reviewRejections` length (oldest entries dropped first). */
 export const MAX_REVIEW_REJECTIONS = 50;
+
+/**
+ * Fixed classification of what a round that reached completion accounting
+ * actually produced (wf10 item 4 / Part 4):
+ *  - `edits-produced`: real workspace edits landed, or the plan checklist
+ *    itself advanced (durable progress either way).
+ *  - `genuine-no-op`: zero files changed, but this is a JUSTIFIED no-work
+ *    finding — a correct implementer declining to fabricate work when prior
+ *    rounds already changed the tree and no unticked/unclearing evidence
+ *    says otherwise.
+ *  - `provider-failure-empty`: zero files changed on a task that still has
+ *    unticked checklist items and no review has cleared the stage — the
+ *    same shape previously recorded, indistinguishably, as a success.
+ *  - `cancelled`: the round was cancelled before producing a result.
+ *  - `rejected-degenerate`: a review round with no parseable `Readiness:
+ *    N/10` line — a failed attempt wearing a review's clothes, not a
+ *    review (see `TaskProgress.reviewRejections`).
+ */
+export type RoundOutcomeClassificationV1 =
+  | "edits-produced"
+  | "genuine-no-op"
+  | "provider-failure-empty"
+  | "cancelled"
+  | "rejected-degenerate";
+
+/** One row of `TaskProgress.roundOutcomes`. */
+export interface RoundOutcomeEntryV1 {
+  stage: TaskStage;
+  classification: RoundOutcomeClassificationV1;
+  /** ISO timestamp when the round was classified. */
+  at: string;
+  /** Correlates with the review attempt this classification describes, when known (review rounds only). */
+  attemptId?: string;
+  /**
+   * The stored model id this round actually ran with (Part 5's fallback
+   * circuit breaker and degenerate-review backup advance both need to know
+   * WHICH candidate produced a zero-file/rejected round, not just that one
+   * occurred — a breaker keyed on the task+stage alone would trip on a
+   * healthy primary's occasional no-op mixed with a genuinely broken
+   * fallback's rounds). Absent for older entries written before this field
+   * existed; treat absence as "unknown candidate", never as a match.
+   */
+  modelId?: string;
+  /**
+   * The runner id (`runnerId`) the candidate that actually produced this
+   * round ran under — e.g. `"claude-cli"`, `"codex-cli"`, or `"copilot-lm"`
+   * for every Copilot dispatch (Copilot is routed exclusively through the
+   * sealed two-phase pipeline in `runImplementationOrSealedV1`, so
+   * `"copilot-lm"` already IS the sealed-vs-direct distinction — there is no
+   * separate invocation-mode value it could take). wf10 review fix (Part 5
+   * steps 13-14, narrowed blocker 1): candidate identity for the breaker/
+   * health-window checks is the full provider path (provider id + model id),
+   * not `modelId` alone — two different provider paths could in principle
+   * share a model id string. Absent for entries written before this field
+   * existed; treat absence as "unknown provider", never as a match, exactly
+   * like an absent `modelId`.
+   */
+  providerId?: string;
+}
+
+/** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */
+export const MAX_ROUND_OUTCOMES = 50;
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */
 export const MAX_REVIEW_BLOCKER_IDENTITIES = 32;

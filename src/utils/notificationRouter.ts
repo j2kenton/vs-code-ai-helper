@@ -57,9 +57,15 @@ export const NotificationRouter = {
    * Route routine informational message.
    * NOTE: Routine notices must never raise an OS toast (desktop notification).
    */
-  showInformation(message: string, filePath?: string, resultTargetUri?: string, sourceOperationId?: string): void {
+  showInformation(
+    message: string,
+    filePath?: string,
+    resultTargetUri?: string,
+    sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info", filePath, resultTargetUri, sourceOperationId);
+    surface.addEntry(message, "info", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**

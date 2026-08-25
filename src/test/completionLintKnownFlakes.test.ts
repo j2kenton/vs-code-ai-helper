@@ -66,6 +66,45 @@ void describe("classifyKnownFlakeFailures", () => {
     assert.strictEqual(result.length, 1);
     assert.strictEqual(result[0]?.command, "npm run test");
   });
+
+  // The jester task 5 over-matching bug this fixes: an entry meant for one
+  // monorepo member package's cron suite (`match: "npm run test"`, no
+  // package prefix) previously quarantined every other package's
+  // `[packageDir] npm run test` command too, because the old check was
+  // `command.includes(match)` and "npm run test" is a substring of all of
+  // them. Exact equality means the entry can only ever quarantine the exact
+  // command line (and, for a monorepo member, the exact package) it names.
+  void it("does not quarantine a differently-scoped monorepo command sharing a substring", () => {
+    const cronFlake: KnownFlakyCheck = {
+      match: "[apps/amplify/functions] npm run test",
+      failureSignature: "Cannot read properties of undefined (reading 'config')",
+      reason: "amplify/functions cron suite — pre-existing collection issue",
+    };
+    const failures = [
+      { command: "[apps/amplify/functions] npm run test", code: 1, output: "Cannot read properties of undefined (reading 'config')" },
+      { command: "[apps/server] npm run test", code: 1, output: "Cannot read properties of undefined (reading 'config')" },
+      { command: "[apps/web] npm run test", code: 1, output: "Cannot read properties of undefined (reading 'config')" },
+      { command: "npm run test", code: 1, output: "Cannot read properties of undefined (reading 'config')" },
+    ];
+    const result = classifyKnownFlakeFailures(failures, [cronFlake]);
+    assert.strictEqual(result.length, 1, "only the exact named package+command may be quarantined");
+    assert.strictEqual(result[0]?.command, "[apps/amplify/functions] npm run test");
+  });
+
+  void it("a package-agnostic entry (no bracket prefix) only matches the root-level command, never a bracketed member command", () => {
+    const rootOnlyFlake: KnownFlakyCheck = {
+      match: "npm run test",
+      failureSignature: "EPERM",
+      reason: "root-level cleanup race",
+    };
+    const failures = [
+      { command: "npm run test", code: 1, output: "EPERM: cleanup race" },
+      { command: "[apps/server] npm run test", code: 1, output: "EPERM: cleanup race" },
+    ];
+    const result = classifyKnownFlakeFailures(failures, [rootOnlyFlake]);
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0]?.command, "npm run test");
+  });
 });
 
 // ---------------------------------------------------------------------------

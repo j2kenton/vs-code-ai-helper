@@ -296,13 +296,24 @@ void describe("runEditActionV1 — §7.5 availability", () => {
   // winning candidate turned out to be Copilot. This proves the gate now
   // resolves the WINNING candidate (via checkImplementationAvailabilityForModel,
   // same as runImplementationOrSealedV1 itself) and host-checks THAT one.
-  void it("host-checks the winning Copilot backup when the configured CLI primary is not installed", async () => {
+  // wf10 item 3 / Part 5 step 13: `checkImplementationAvailabilityForModel`'s
+  // automatic backup walk now deliberately excludes a Copilot-resolved
+  // candidate — the sealed two-phase preflight path both wf9 and jester
+  // observed being selected this way while reliably producing zero-file
+  // rounds. This test previously proved the gate host-checked the winning
+  // Copilot backup (the OLD behavior); it now proves the opposite — the gate
+  // reports the CLI primary's own unavailability and never silently crosses
+  // into the excluded Copilot backup. `checkEditActionProviderPathGateV1`'s
+  // "resolve the winning candidate, not just the primary's kind" fix (the
+  // property this test file protects) is still covered for the still-
+  // supported direction by the sibling test just below (an explicit Copilot
+  // PRIMARY falling back to a CLI backup remains fully automatic).
+  void it("does not fall through to a Copilot-resolved backup — reports the CLI primary's own unavailability", async () => {
     const originalSpawn = childProcess.spawn;
     childProcess.spawn = (() => {
       const child = new EventEmitter() as import("node:child_process").ChildProcess;
       // Every CLI existence probe (where.exe/which) reports "not installed" —
-      // the configured CLI primary must be unavailable so the gate is forced
-      // to fall through to the configured Copilot backup.
+      // the configured CLI primary must be unavailable.
       process.nextTick(() => child.emit("close", 1));
       return child;
     }) as typeof childProcess.spawn;
@@ -314,29 +325,12 @@ void describe("runEditActionV1 — §7.5 availability", () => {
       impl: { primary: "opencode-cli:default", backup: "auto", strategy: "switch-to-backup" },
     });
     try {
-      const ok = await checkEditActionProviderPathGateV1("impl");
-      assert.equal(ok.ok, true, "the Copilot backup is live and the host supports it, so the gate must pass");
-
-      // Removing the tool-calling constructor makes the winning Copilot
-      // backup itself unavailable (checkImplementationAvailabilityForModel's
-      // own Copilot branch probes the same capability) — either way, the
-      // gate must reject BEFORE any task/source read, which is the actual
-      // AC-HOST-03 property this fix protects; which of the two internal
-      // layers supplies the rejection code is not itself the contract.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-      const raw = require("vscode") as Record<string, unknown>;
-      const original = raw.LanguageModelToolResultPart;
-      delete raw.LanguageModelToolResultPart;
-      try {
-        const failed = await checkEditActionProviderPathGateV1("impl");
-        assert.equal(
-          failed.ok,
-          false,
-          "the CLI primary being down must not mask the winning Copilot backup's own host incapability"
-        );
-      } finally {
-        raw.LanguageModelToolResultPart = original;
-      }
+      const result = await checkEditActionProviderPathGateV1("impl");
+      assert.equal(
+        result.ok,
+        false,
+        "a down CLI primary with only a Copilot backup configured must fail the gate, not silently cross into the excluded backup"
+      );
     } finally {
       settings.restore();
       childProcess.spawn = originalSpawn;

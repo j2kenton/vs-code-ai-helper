@@ -92,6 +92,125 @@ void test("drops the chain when the root operation failed or was cancelled", asy
   }
 });
 
+void test("dispatchEvenIfRootFails: true dispatches even when the root operation failed or was cancelled", async () => {
+  // wf10 item 14 / Part 7 step 17: a Publish-review dispatch must not be
+  // silently dropped just because the root operation that scheduled it
+  // later ends unsuccessfully — the stage transition it verifies already
+  // committed before this chain was scheduled.
+  for (const state of ["failed", "cancelled", "interrupted"]) {
+    const chain = makeFakeChain();
+    const pending = scheduleAutomationChain(
+      { command: "x.publishReview", dispatchEvenIfRootFails: true },
+      { id: "root-1" },
+      chain.deps
+    );
+    chain.end({ id: "root-1", state });
+    assert.equal(await pending, true, state);
+    assert.equal(chain.executed.length, 1, state);
+  }
+});
+
+void test("dispatchEvenIfRootFails: true still dispatches on a succeeded root (unchanged happy path)", async () => {
+  const chain = makeFakeChain();
+  const pending = scheduleAutomationChain(
+    { command: "x.publishReview", dispatchEvenIfRootFails: true },
+    { id: "root-1" },
+    chain.deps
+  );
+  chain.end({ id: "root-1", state: "succeeded" });
+  assert.equal(await pending, true);
+  assert.equal(chain.executed.length, 1);
+});
+
+void test("dispatchEvenIfRootFails: true still honors stillEnabled at fire time on a failed root", async () => {
+  const chain = makeFakeChain();
+  const pending = scheduleAutomationChain(
+    { command: "x.publishReview", dispatchEvenIfRootFails: true, stillEnabled: () => false },
+    { id: "root-1" },
+    chain.deps
+  );
+  chain.end({ id: "root-1", state: "failed" });
+  assert.equal(await pending, false, "disabled automation must still drop the chain even with dispatchEvenIfRootFails");
+  assert.equal(chain.executed.length, 0);
+});
+
+void test("dispatchEvenIfRootFails omitted (default false) keeps dropping on a failed/cancelled root", async () => {
+  for (const state of ["failed", "cancelled"]) {
+    const chain = makeFakeChain();
+    const pending = scheduleAutomationChain(
+      { command: "x.review" },
+      { id: "root-1" },
+      chain.deps
+    );
+    chain.end({ id: "root-1", state });
+    assert.equal(await pending, false, state);
+    assert.equal(chain.executed.length, 0, state);
+  }
+});
+
+void test("onDropped reports the specific reason for each drop cause", async () => {
+  // Duplicate chain (immediate).
+  {
+    resetAutomationChainGuards();
+    const chain = makeFakeChain();
+    const reasons: string[] = [];
+    const first = scheduleAutomationChain(
+      { command: "x.review", taskKey: "/task-a" },
+      undefined,
+      chain.deps
+    );
+    void first;
+    const dup = await scheduleAutomationChain(
+      { command: "x.review", taskKey: "/task-a", onDropped: (r) => reasons.push(r) },
+      undefined,
+      chain.deps
+    );
+    assert.equal(dup, false);
+    assert.deepEqual(reasons, ["duplicate-chain"]);
+  }
+  // Automation disabled (immediate).
+  {
+    resetAutomationChainGuards();
+    const chain = makeFakeChain();
+    const reasons: string[] = [];
+    const result = await scheduleAutomationChain(
+      { command: "x.review", stillEnabled: () => false, onDropped: (r) => reasons.push(r) },
+      undefined,
+      chain.deps
+    );
+    assert.equal(result, false);
+    assert.deepEqual(reasons, ["automation-disabled"]);
+  }
+  // Automation disabled (deferred, at fire time).
+  {
+    resetAutomationChainGuards();
+    const chain = makeFakeChain();
+    const reasons: string[] = [];
+    const pending = scheduleAutomationChain(
+      { command: "x.review", stillEnabled: () => false, onDropped: (r) => reasons.push(r) },
+      { id: "root-1" },
+      chain.deps
+    );
+    chain.end({ id: "root-1", state: "succeeded" });
+    assert.equal(await pending, false);
+    assert.deepEqual(reasons, ["automation-disabled"]);
+  }
+  // Root operation ended unsuccessfully (deferred, dispatchEvenIfRootFails unset).
+  {
+    resetAutomationChainGuards();
+    const chain = makeFakeChain();
+    const reasons: string[] = [];
+    const pending = scheduleAutomationChain(
+      { command: "x.review", onDropped: (r) => reasons.push(r) },
+      { id: "root-1" },
+      chain.deps
+    );
+    chain.end({ id: "root-1", state: "failed" });
+    assert.equal(await pending, false);
+    assert.deepEqual(reasons, ["root-operation-unsuccessful"]);
+  }
+});
+
 void test("duplicate (taskKey, command) chain is dropped while the first is pending", async () => {
   resetAutomationChainGuards();
   const chain = makeFakeChain();

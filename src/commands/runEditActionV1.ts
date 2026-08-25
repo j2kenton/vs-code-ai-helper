@@ -1094,7 +1094,19 @@ export async function runImplementationOrSealedV1(
   // primary isn't installed/available is too late — a configured, available
   // backup would never be attempted despite passing this exact availability
   // check moments earlier.
-  const availability = await checkImplementationAvailabilityForModel(options.modelId, stage);
+  // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1/2): this is the
+  // walk that actually resolves the candidate dispatch below runs against —
+  // passing `taskFolderUri` lets it skip a backup with a recent record of
+  // zero-file rounds, the same health window `runImplementationForModel`'s
+  // own internal cascade already applies one step later for its own backup
+  // loop (this pre-dispatch walk previously had no task-health input at
+  // all, so a known-broken backup could still be selected here before that
+  // later cascade ever ran).
+  const availability = await checkImplementationAvailabilityForModel(
+    options.modelId,
+    stage,
+    options.taskFolderUri
+  );
   if (!availability.availability.available) {
     return {
       status: "failed",

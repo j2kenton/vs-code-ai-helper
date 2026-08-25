@@ -1013,6 +1013,20 @@ export async function postReconcilePlanChecklistDecisionV1(
     pendingOperationEvidence
   );
 
+  // wf10 item 6c: `coveredItemsCount === 0` is TWO unrelated situations —
+  // (a) unticked items exist but no review vouches for them (the "no basis
+  // to recommend" message below is true), or (b) there are no unticked items
+  // AT ALL, so there is nothing for any review to vouch for in the first
+  // place and the message is false. Observed live 2026-08-21 on jester task
+  // 3: the panel printed "plan-final.md currently reads 75/75 items
+  // complete, with 0 outstanding" directly above "At least one unticked item
+  // is not named as verified complete" — self-contradictory two lines apart.
+  // Case (b) is exactly where "Mark reconciled" is unambiguously safe:
+  // nothing is outstanding, so re-arming the gate cannot let unfinished work
+  // advance. Split the branch so that case is recommended instead of
+  // silently falling into the "no basis" wording meant for case (a).
+  const noUncheckedItemsRemain = counted.remaining === 0;
+
   // NINTH review round: tier-1 (review-verified) evidence is a candidate for
   // explicit selection, never an automatic tick (see
   // `runAutomaticChecklistReconciliationV1`'s doc comment) — so whenever any
@@ -1033,12 +1047,21 @@ export async function postReconcilePlanChecklistDecisionV1(
               ? " This covers every currently outstanding item, so reconciling afterward is safe too."
               : ""),
         }
-      : {
-          kind: "none",
-          reasoning:
-            "At least one unticked item is not named as verified complete by any implementation review " +
-            "on file — the system has no basis to recommend reconciling until you have checked it yourself.",
-        };
+      : noUncheckedItemsRemain
+        ? {
+            kind: "option",
+            optionId: "reconcile",
+            reasoning:
+              `plan-final.md currently reads ${counted.checked}/${counted.total} items complete, with 0 ` +
+              "outstanding — the checklist is fully accounted for, so there is nothing left for any review " +
+              "to vouch for. Marking reconciled simply confirms that and restores completeness gating.",
+          }
+        : {
+            kind: "none",
+            reasoning:
+              "At least one unticked item is not named as verified complete by any implementation review " +
+              "on file — the system has no basis to recommend reconciling until you have checked it yourself.",
+          };
 
   const target: ChatTarget = {
     canonicalId,
@@ -1123,9 +1146,16 @@ export async function postReconcilePlanChecklistDecisionV1(
         {
           optionId: "notYet",
           label: "Not yet — keep the gate down",
-          consequence:
-            "Does nothing. Completeness stays stood down until you tick the missed items in plan-final.md " +
-            "and run this again, or a candidate above is applied.",
+          consequence: noUncheckedItemsRemain
+            ? // No unticked items exist at all (case b above) — instructing
+              // the user to "tick the missed items" would send them looking
+              // for something that is not there (jester task 3: the 7
+              // remaining boxes at the time all carried `ensemble:excluded`
+              // and were deliberately outside the count).
+              "Does nothing. Completeness stays stood down until you mark reconciled — there is nothing " +
+              "unticked left to tick; every remaining box (if any) is deliberately excluded from the count."
+            : "Does nothing. Completeness stays stood down until you tick the missed items in plan-final.md " +
+              "and run this again, or a candidate above is applied.",
           effect: { kind: "doNothing" },
         },
       ],

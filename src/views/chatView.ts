@@ -31,6 +31,7 @@ import {
 } from "../types/structuredQuestionV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
 import {
   deriveOwedContinuationRecordV1,
@@ -324,13 +325,49 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
   if (!getNotificationRouterStatus()) return;
   const label = target.taskName ?? target.taskFolderPath;
   const stageName = STAGE_DISPLAY_NAMES[target.stage];
-  NotificationRouter.showWarning(
-    `Decision needed — ${label} (${stageName}): ${decision.whatHappened}`,
-    undefined,
-    undefined,
-    undefined,
-    { command: "vs-code-ai-helper.openWorkflowDecision", title: "Review decision in Chat", args: [target] }
-  );
+  // A record predating the `gating` field (or one from a call site that
+  // regresses and omits it) is treated as blocking — absence is never
+  // positive evidence, so an unknown gating state must not downgrade a
+  // notification that might genuinely be holding the task paused.
+  const isBlocking =
+    decision.gating === undefined ||
+    decision.gating.holdsTaskPaused === true ||
+    decision.gating.unblocksProgress === true;
+  const actionCommand = {
+    command: "vs-code-ai-helper.openWorkflowDecision",
+    title: "Review decision in Chat",
+    args: [target],
+  };
+  // The fact reported is always `whatHappened` — `gating.detail` says
+  // whether answering moves anything forward, which is a claim ABOUT the
+  // decision, not a substitute for the decision's own content. Swapping the
+  // body for `gating.detail` on the non-blocking path would silently drop
+  // the actual fact (e.g. which continuation was scheduled) behind a generic
+  // "this doesn't block anything" line — the same "absence is never positive
+  // evidence" failure this contract exists to prevent, just relocated to the
+  // headline instead of the gating field itself. So the non-blocking path
+  // states BOTH: `whatHappened` for the fact, then `gating.detail` for why
+  // it does not need urgent attention — the plan's explicit contract for
+  // this surface.
+  if (isBlocking) {
+    NotificationRouter.showWarning(
+      `Decision needed — ${label} (${stageName}): ${decision.whatHappened}`,
+      undefined,
+      undefined,
+      undefined,
+      actionCommand
+    );
+  } else {
+    const detail = decision.gating?.detail;
+    const body = detail ? `${decision.whatHappened} ${detail}` : decision.whatHappened;
+    NotificationRouter.showInformation(
+      `Optional — ${label} (${stageName}): ${body}`,
+      undefined,
+      undefined,
+      undefined,
+      actionCommand
+    );
+  }
 }
 
 /** Memento key the last-open chat target is persisted under, so the panel
@@ -1111,6 +1148,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * Item 6d (wf10 step 7): the "Apply N Reviewer-Verified Ticks" card's claim
+   * is a snapshot taken when it was posted — if every item it names gets
+   * ticked some other way before the user answers (a later round's own echo,
+   * a hand edit, a differently-sourced reconcile), the card is a silent no-op
+   * that still reads as pending and actionable. `listPending` above already
+   * re-reads the STORE fresh on every render (so a decision resolved
+   * elsewhere disappears), but that only re-checks the record's `state`, not
+   * whether its underlying claim is still true — a `"pending"` record stays
+   * `"pending"` even after its target items are ticked out from under it.
+   *
+   * Re-derives applicability fresh against the CURRENT plan-final.md on every
+   * render, via the exact same `deriveApplicableVerifiedTicksV1` the "Apply"
+   * command itself re-runs at accept-time (module doc comment there) — so
+   * this can never disagree with what actually happens if the user clicks
+   * Apply. Any decision whose derivation is no longer `"ok"` (every item
+   * already ticked, the review file is gone, the stage changed) is withdrawn
+   * (`dismiss`ed) rather than left presenting as an open question.
+   *
+   * Scoped to this one `decisionKey` for now, per the task's worked example;
+   * other decision kinds have no equivalent cheap, side-effect-free
+   * "is this still true?" re-derivation to call here. A derivation failure
+   * (I/O error) fails closed — the card stays pending rather than being
+   * withdrawn on inconclusive evidence.
+   */
+  private async withdrawStaleApplyReviewerVerifiedTicksDecisionsV1(
+    target: ChatTarget,
+    decisions: readonly WorkflowDecisionV1[]
+  ): Promise<readonly WorkflowDecisionV1[]> {
+    const fresh: WorkflowDecisionV1[] = [];
+    const stale: WorkflowDecisionV1[] = [];
+    for (const decision of decisions) {
+      if (decision.decisionKey !== "applyReviewerVerifiedTicks") {
+        fresh.push(decision);
+        continue;
+      }
+      const derived = await deriveApplicableVerifiedTicksV1(
+        vscode.Uri.file(target.taskFolderPath),
+        decision.stage
+      ).catch(() => undefined);
+      if (derived === undefined || derived.kind === "ok") {
+        fresh.push(decision);
+      } else {
+        stale.push(decision);
+      }
+    }
+    for (const decision of stale) {
+      await this.workflowDecisionStore.dismiss(decision.decisionId).catch(() => undefined);
+    }
+    return fresh;
+  }
+
+  /**
    * The webview's single commit path for a `WorkflowDecisionV1` card:
    * resolve the record in the store FIRST (single-flight — a second press of
    * an already-resolved control reports `alreadySettled` instead of
@@ -1368,7 +1457,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // control lingering in the panel.
     const pendingDecisions: readonly WorkflowDecisionV1[] =
       target && target.kind !== "global"
-        ? this.workflowDecisionStore.listPending(target.canonicalId).filter((d) => d.stage === target.stage)
+        ? await this.withdrawStaleApplyReviewerVerifiedTicksDecisionsV1(
+            target,
+            this.workflowDecisionStore.listPending(target.canonicalId).filter((d) => d.stage === target.stage)
+          )
         : [];
     // Distinguish genuinely-running work from an operation that is merely
     // parked waiting on the user's answer (round-limit pause, a pending
@@ -1512,6 +1604,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         "unknown"
       ).text,
       isGating: decision.gating?.holdsTaskPaused === true,
+      // Headline/severity predicate — distinct from `isGating` above (which
+      // deliberately tracks `holdsTaskPaused` alone for the border
+      // highlight). This is "is the user's answer actually awaited by
+      // something", so it also considers `unblocksProgress`: a decision that
+      // does not hold the task paused but whose resolution does move it
+      // forward still deserves the blocking "Decision needed" headline.
+      // Unknown gating (undefined, predates the field) defaults to blocking —
+      // absence is never positive evidence.
+      isBlockingDecision:
+        decision.gating === undefined ||
+        decision.gating.holdsTaskPaused === true ||
+        decision.gating.unblocksProgress === true,
     }));
     // "What happens next" — the chat panel's half of the always-present
     // scheduling posture (task "Actionable Hand-offs", PART 6; the task-tree
@@ -2006,7 +2110,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const err=document.createElement('div'); err.className='interaction-error';
           card.appendChild(err);
           const title=document.createElement('div'); title.className='interaction-title';
-          title.textContent='Decision needed';
+          title.textContent=(dcs.isBlockingDecision!==false)?'Decision needed':'Optional';
           card.appendChild(title);
           const what=document.createElement('div'); what.className='interaction-prompt';
           what.textContent=dcs.whatHappened;

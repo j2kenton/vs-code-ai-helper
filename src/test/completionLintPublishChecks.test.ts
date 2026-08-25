@@ -20,6 +20,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import {
+  collectAiVerifiedPlanItems,
   collectCompletionLint,
   readPackageScripts,
   mergeCompletionChecksSection,
@@ -28,10 +29,14 @@ import {
   CompletionLintResult,
 } from "../utils/completionLint";
 import {
+  ensurePublishReviewArtifactExistsV1,
   readPublishChecksFreshnessStampV1,
+  renderPublishChecksFreshnessStamp,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+
+const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
 const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-completion-lint-test-")
@@ -183,7 +188,8 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
 });
 
 // ---------------------------------------------------------------------------
-// C3: writing completion-check results into publish-checks.md
+// C3: writing completion-check results into publish-review.md (unified
+// Publish artifact — plan item 17, step 20)
 // ---------------------------------------------------------------------------
 
 function fakeResult(overrides: Partial<CompletionLintResult> = {}): CompletionLintResult {
@@ -233,20 +239,25 @@ void describe("mergeCompletionChecksSection", () => {
 });
 
 void describe("upsertCompletionChecksReportV1", () => {
-  void it("creates publish-checks.md with a Completion Checks section when it doesn't exist", async () => {
+  void it("creates publish-review.md with a Completion Checks section when it doesn't exist", async () => {
     const dir = makeWorkspace("publish-review-create", { name: "x" });
     await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /## Completion Checks/);
     assert.match(content, /Status: Failed/);
     assert.match(content, /npm run lint/);
+    assert.equal(
+      nodeFs.existsSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME)),
+      false,
+      "no new publish-checks.md is ever written"
+    );
   });
 
   void it("preserves pre-existing AI review content and updates only the managed section on rerun", async () => {
     const dir = makeWorkspace("publish-review-preserve", { name: "x" });
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-checks.md"),
+      nodePath.join(dir, PUBLISH_REVIEW_FILENAME),
       "Readiness: 8/10\n\nSummary verdict: ready to publish.\n",
       "utf8"
     );
@@ -257,10 +268,126 @@ void describe("upsertCompletionChecksReportV1", () => {
       fakeResult({ passed: true, summary: "No linting issues found.", failedChecks: [] })
     );
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Readiness: 8\/10/);
     assert.match(content, /Status: Passed/);
     assert.doesNotMatch(content, /Status: Failed/);
+  });
+
+  void it("ensurePublishReviewArtifactExistsV1 imports a legacy publish-checks.md's sections, with its original stamp, when publish-review.md doesn't exist yet", async () => {
+    // Plan item 17, step 20(b): a task that upgraded mid-Publish still has
+    // its most recent Scope Check and freshness stamp available under the
+    // unified artifact, imported once with a provenance note, rather than
+    // silently losing them because the new file starts empty — and, unlike
+    // a fresh checks run, mere creation must not invalidate that stamp.
+    const dir = makeWorkspace("publish-review-legacy-import", { name: "x" });
+    const originalStamp = {
+      formatVersion: 1 as const,
+      runId: "22222222-2222-4222-8222-222222222222",
+      verifiedCommitSha: "b".repeat(40),
+      completedAt: "2026-08-20T00:00:00.000Z",
+      scopeId: "fedcba9876543210",
+    };
+    const legacyContent = [
+      "<!-- completion-checks:start -->",
+      "## Completion Checks",
+      "",
+      "- Status: Passed",
+      "<!-- completion-checks:end -->",
+      "",
+      "<!-- scope-check:start -->",
+      "## Scope Check",
+      "",
+      "No files the plan doesn't mention.",
+      "<!-- scope-check:end -->",
+      "",
+      renderPublishChecksFreshnessStamp(originalStamp),
+      "",
+    ].join("\n");
+    nodeFs.writeFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), legacyContent, "utf8");
+    assert.equal(nodeFs.existsSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME)), false);
+
+    await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+    // Both legacy sections survived the import.
+    assert.match(content, /Status: Passed/);
+    assert.match(content, /No files the plan doesn't mention\./);
+    // The legacy freshness stamp's fields survived the import verbatim —
+    // creation alone (no fresh check run) must not invalidate it.
+    assert.match(content, new RegExp(originalStamp.runId));
+    assert.match(content, new RegExp(originalStamp.verifiedCommitSha));
+    assert.notEqual(await readPublishChecksFreshnessStampV1(vscode.Uri.file(dir)), undefined);
+    // Imported content is explicitly attributed, not silently merged in.
+    assert.match(content, /Imported once from the legacy publish-checks\.md/);
+    // The legacy file itself is untouched.
+    assert.equal(
+      nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8"),
+      legacyContent
+    );
+
+    // Idempotent: calling again once the file exists never re-imports or
+    // duplicates the section.
+    await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+    const contentAfterSecondCall = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+    assert.equal(contentAfterSecondCall, content);
+  });
+
+  void it("ensurePublishReviewArtifactExistsV1 creates a plain stub when no legacy publish-checks.md exists", async () => {
+    const dir = makeWorkspace("publish-review-stub", { name: "x" });
+    await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+    assert.match(content, /Not yet reviewed/);
+  });
+
+  void it("renders Status: Passed when every failure is a quarantined known flake, not Status: Failed", async () => {
+    // The jester task 5 observation this fixes: passed=false (raw verdict,
+    // never adjusted) but passedModuloKnownFlakes=true (every failure
+    // quarantined) previously still rendered "Status: Failed" because the
+    // headline read result.passed instead of the modulo-known-flakes field.
+    const dir = makeWorkspace("publish-review-known-flake-headline", { name: "x" });
+    await upsertCompletionChecksReportV1(
+      vscode.Uri.file(dir),
+      fakeResult({
+        passed: false,
+        passedModuloKnownFlakes: true,
+        issueCount: 1,
+        failedChecks: [{ command: "npm run test", exitCode: 1, output: "EPERM: rmdir race" }],
+        knownFlakeFailures: [{ command: "npm run test", exitCode: 1, reason: "pre-existing cleanup race" }],
+      })
+    );
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+    assert.match(content, /Status: Passed/);
+    assert.doesNotMatch(content, /Status: Failed/);
+    // The quarantined failure stays fully visible in the body.
+    assert.match(content, /known flake: pre-existing cleanup race/);
+  });
+
+  void it("never renders a Plan Item Verification section — the AI-assisted pass is retired and gated off", async () => {
+    // jester task 5, 2026-08-23: "0 passed, 3 failed, 44 inconclusive" plus a
+    // blocking-sounding instruction demanding justification for items that
+    // were already declared out of scope. With no working AI verification
+    // path, collectAiVerifiedPlanItems always returns undefined and this
+    // section must never appear in the artifact at all.
+    const dir = makeWorkspace("publish-review-no-plan-item-verification", { name: "x" });
+    nodeFs.writeFileSync(
+      nodePath.join(dir, "plan-final.md"),
+      "# Plan\n\n- [x] Done step\n- [ ] Not done step\n- [ ] Deferred step <!-- ensemble:excluded -->\n",
+      "utf8"
+    );
+
+    assert.equal(
+      collectAiVerifiedPlanItems(vscode.Uri.file(dir), dir),
+      undefined,
+      "the AI-assisted pass is gated off entirely — it must never re-derive a verdict from the checklist"
+    );
+
+    await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+    assert.doesNotMatch(content, /Plan Item Verification/);
+    assert.doesNotMatch(content, /failed verification/);
   });
 
   void it("records the override reason when a user publishes anyway", async () => {
@@ -269,7 +396,7 @@ void describe("upsertCompletionChecksReportV1", () => {
       reason: "user chose Publish Anyway",
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Published anyway despite failing checks — user chose Publish Anyway\./);
   });
 
@@ -297,7 +424,7 @@ void describe("upsertCompletionChecksReportV1", () => {
     const dir = makeWorkspace("publish-review-concurrent", { name: "x" });
     const targetUri = vscode.Uri.file(dir);
 
-    // Two closely triggered refreshes racing on the same publish-checks.md
+    // Two closely triggered refreshes racing on the same publish-review.md
     // (plan PART 2, step 6's concurrency requirement) must each land a
     // complete, well-formed Completion Checks section — never an
     // interleaved half-write from one call clobbering the other's.
@@ -306,7 +433,7 @@ void describe("upsertCompletionChecksReportV1", () => {
       upsertCompletionChecksReportV1(targetUri, fakeResult({ summary: "run B" })),
     ]);
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     const starts = content.split("<!-- completion-checks:start -->").length - 1;
     const ends = content.split("<!-- completion-checks:end -->").length - 1;
     assert.equal(starts, 1, "exactly one Completion Checks section, no duplicated/torn section markers");

@@ -14,6 +14,7 @@ import {
   snapshotStageResponseState,
 } from "./stageResponseScope";
 import {
+  importLegacyPublishChecksIfAbsentV1,
   invalidatePublishChecksFreshnessStamp,
   withPublishChecksReportLockV1,
   writeFileAtomicV1,
@@ -324,43 +325,25 @@ export function mergeScopeCheckSection(existing: string, section: string): strin
 }
 
 /**
- * Remove this module's managed section from `publish-review.md`, where it used
- * to live before the split. Mirrors
- * `stripCompletionChecksFromReviewArtifactV1` exactly — subtractive only, and
- * only over the markers this module owns. See PUBLISH_CHECKS_FILENAME for why
- * the reviewer's verdict and these checks must not share a document.
+ * Extract this module's managed Scope Check section (markers included) from
+ * existing `publish-review.md` content, if present. Mirrors
+ * `extractCompletionChecksSectionV1` — used by `reviewRowV1.ts` to re-inject
+ * the section after an AI review write.
+ *
+ * @internal exported for testing and reuse by reviewRowV1.ts
  */
-async function stripScopeCheckFromReviewArtifactV1(
-  taskFolderUri: vscode.Uri
-): Promise<void> {
-  const legacyName = STAGE_ARTIFACT_FILENAMES.publish;
-  if (!legacyName) {
-    return;
-  }
-  const legacyPath = nodePath.join(taskFolderUri.fsPath, legacyName);
-
-  let existing: string;
-  try {
-    existing = await nodeFs.promises.readFile(legacyPath, "utf8");
-  } catch {
-    return;
-  }
-
-  const startIdx = existing.indexOf(SCOPE_CHECK_SECTION_START);
-  const endIdx = existing.indexOf(SCOPE_CHECK_SECTION_END);
+export function extractScopeCheckSectionV1(content: string): string | undefined {
+  const startIdx = content.indexOf(SCOPE_CHECK_SECTION_START);
+  const endIdx = content.indexOf(SCOPE_CHECK_SECTION_END);
   if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-    return;
+    return undefined;
   }
-
-  const stripped =
-    existing.slice(0, startIdx).trimEnd() +
-    "\n" +
-    existing.slice(endIdx + SCOPE_CHECK_SECTION_END.length).trimStart();
-  await nodeFs.promises.writeFile(legacyPath, `${stripped.trimEnd()}\n`, "utf8");
+  return content.slice(startIdx, endIdx + SCOPE_CHECK_SECTION_END.length);
 }
 
 /**
- * Upsert a "Scope Check" section into publish-checks.md, alongside (and
+ * Upsert a "Scope Check" section into `publish-review.md` — the single
+ * Publish-stage artifact (plan item 17, step 20) — alongside (and
  * independent of) the "Completion Checks" section `completionLint.ts`
  * manages. Uses plain `node:fs` for the same reason
  * `upsertCompletionChecksReportV1` does — always a plain file inside
@@ -370,7 +353,7 @@ export async function upsertScopeCheckReportV1(
   taskFolderUri: vscode.Uri,
   result: PublishScopeCheckResult
 ): Promise<void> {
-  const targetPath = nodePath.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
+  const targetPath = nodePath.join(taskFolderUri.fsPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
 
   // See the matching comment in completionLint.ts's upsertCompletionChecksReportV1:
   // one locked read-modify-write, merging the section and invalidating any
@@ -384,12 +367,14 @@ export async function upsertScopeCheckReportV1(
     } catch {
       existing = "";
     }
+    // One-time bounded import (step 20(c)) — see the matching comment in
+    // upsertCompletionChecksReportV1.
+    existing = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
 
     const section = renderScopeCheckSection(result);
     const merged = mergeScopeCheckSection(existing, section);
     await writeFileAtomicV1(targetPath, invalidatePublishChecksFreshnessStamp(merged));
   });
-  await stripScopeCheckFromReviewArtifactV1(taskFolderUri);
 }
 
 /**

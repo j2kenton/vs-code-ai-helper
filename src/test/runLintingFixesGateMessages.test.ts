@@ -143,7 +143,10 @@ void describe("runLintingFixes gate and fallback messages", () => {
     }
   });
 
-  void it("does not flatly claim 'no report found' when publish-checks.md is present but lintPayload is missing", async () => {
+  void it("does not flatly claim 'no report found' when a legacy publish-checks.md is present but lintPayload is missing", async () => {
+    // Legacy shape (pre-unification, plan item 17 step 20): an old task may
+    // still carry a checks report ONLY in the separate publish-checks.md,
+    // never written to fresh by any current code path.
     const taskFolderPath = makeTaskFolder("stale-report-on-disk");
     writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, "publish"));
     fs.writeFileSync(
@@ -165,6 +168,42 @@ void describe("runLintingFixes gate and fallback messages", () => {
       assert.equal(surface.entries[0]?.level, "warning");
       const message = surface.entries[0]?.message ?? "";
       assert.match(message, /publish-checks\.md/i);
+      assert.doesNotMatch(
+        message,
+        /^No Publish report found/i,
+        "must not flatly assert no report exists when a Publish report is visibly present on disk"
+      );
+    } finally {
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("does not flatly claim 'no report found' when publish-review.md carries a Completion Checks section but lintPayload is missing", async () => {
+    // Unified shape (plan item 17 step 20): the report now lives inside
+    // publish-review.md itself, spliced in as a managed section.
+    const taskFolderPath = makeTaskFolder("stale-report-unified");
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, "publish"));
+    fs.writeFileSync(
+      path.join(taskFolderPath, "publish-review.md"),
+      "<!-- completion-checks:start -->\n## Completion Checks\n\n- Overall: All checks passed.\n<!-- completion-checks:end -->\n",
+      "utf8"
+    );
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+
+    try {
+      const inventory = makeInventory(taskFolderPath, fixtureProgress(taskFolderPath, "publish"));
+      await runLintingFixes(inventory, vscode.Uri.file(REAL_ROOT), { taskFolderPath });
+
+      assert.equal(surface.entries.length, 1);
+      assert.equal(surface.entries[0]?.level, "warning");
+      const message = surface.entries[0]?.message ?? "";
+      assert.match(message, /publish-review\.md/i);
       assert.doesNotMatch(
         message,
         /^No Publish report found/i,

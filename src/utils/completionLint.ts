@@ -16,6 +16,7 @@ import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1
 import { ReviewBlocker } from "./reviewReadiness";
 import { scopeToLatestChecklistV1, unescapeChecklistItemTextV1 } from "./implementationChecklist";
 import {
+  importLegacyPublishChecksIfAbsentV1,
   invalidatePublishChecksFreshnessStamp,
   withPublishChecksReportLockV1,
   writeFileAtomicV1,
@@ -346,19 +347,6 @@ function appendNote(existing: string | undefined, addition: string): string {
   return existing ? `${existing}; ${addition}` : addition;
 }
 
-/** Deferred items keep their deterministic failure; everything else records
- * why the AI pass could not corroborate it. */
-function markAiVerificationUnavailable(
-  items: readonly PlanItemVerification[],
-  reason: string
-): PlanItemVerification[] {
-  return items.map((item) =>
-    item.status === "failed"
-      ? { ...item }
-      : { ...item, note: appendNote(item.note, `AI verification unavailable: ${reason}`) }
-  );
-}
-
 /**
  * Extract per-item verdicts from an AI response: a fenced ```json block, a
  * bare JSON array/object, or JSON-object lines — any mix is accepted, and
@@ -447,86 +435,38 @@ export function mergeAiPlanVerdicts(
   });
 }
 
-interface PlanVerificationCacheEntry {
-  /** Scope + plan content — a changed plan or scope invalidates the entry. */
-  contentKey: string;
-  at: number;
-  items: PlanItemVerification[];
-}
-
-/** One AI verification per task per plan revision within this window — the
- * publish fix loop re-runs runCompletionLint several times back-to-back and
- * must not spend an AI call (and minutes of latency) on each pass. */
-const PLAN_VERIFICATION_CACHE_TTL_MS = 5 * 60 * 1000;
-const planVerificationCache = new Map<string, PlanVerificationCacheEntry>();
-
-/** @internal exported for testing */
-export function clearPlanVerificationCache(): void {
-  planVerificationCache.clear();
-}
-
-/**
- * The AI-assisted verdict pass over the deterministic plan-item baseline.
- *
- * Retired during the Cleanup cohort's disposition of the three supplementary
- * legacy AI routes discovered outside the plan's baseline route table (plan
- * §8, legacyAiActionSafetyGateV0.ts's file header): this pass had no V1
- * coordinator replacement, and its only invocation path — the legacy
- * `resolveRunnerForModel`/`AgentRunner.run()` boundary — is now permanently
- * and unconditionally rejected for every uncorrelated caller
- * (`LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0`), so the dead
- * model-resolution/prompt/runner code that used to live here has been
- * removed rather than left unreachable. `collectAiVerifiedPlanItems`'s only
- * caller already treats this as a legitimate "AI verification unavailable"
- * outcome and degrades to the deterministic baseline.
- */
-function runAiPlanVerification(
-  baseline: readonly PlanItemVerification[]
-): PlanItemVerification[] {
-  return markAiVerificationUnavailable(
-    baseline,
-    "AI-assisted plan verification was retired and has no replacement pending a new implementation decision; status below reflects the deterministic checklist baseline only"
-  );
-}
-
 /**
  * The full Publish plan-item verification: deterministic checklist baseline,
- * then the AI-assisted pass against the verification scope, with per-task
- * caching keyed on the plan content so back-to-back Publish checks don't
- * repeat the AI call. Absent/empty plan → undefined (no section rendered).
+ * then (previously) an AI-assisted pass against the verification scope.
+ *
+ * Gated off entirely (always returns undefined). The AI-assisted pass was
+ * retired during the Cleanup cohort's disposition of the three supplementary
+ * legacy AI routes discovered outside the plan's baseline route table (plan
+ * §8, legacyAiActionSafetyGateV0.ts's file header) — its only invocation
+ * path, the legacy `resolveRunnerForModel`/`AgentRunner.run()` boundary, is
+ * now permanently and unconditionally rejected for every uncorrelated caller
+ * (`LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0`) — and has no V1
+ * coordinator replacement. With no AI pass, this can never produce a
+ * `passed` verdict: every non-deferred item would stay permanently
+ * `inconclusive` and every deferred/`ensemble:excluded` item would be
+ * reported as `failed`, which in turn made buildPlanItemVerificationSection
+ * emit a blocking-sounding instruction ("N plan item(s) failed
+ * verification... your verdict must never state 'no blockers'") demanding
+ * justification for items the rest of the workflow already treats as
+ * deliberately out of scope (observed 2026-08-23: "0 passed, 3 failed, 44
+ * inconclusive" on a task with no real outstanding work). Restoring this
+ * requires a new implementation decision for a working AI verification path
+ * (see `parseAiPlanVerdicts`/`mergeAiPlanVerdicts` below, kept and still
+ * independently tested as the reusable building blocks for that path) —
+ * until then this returns undefined so neither the Publish checks artifact
+ * nor the Publish review prompt renders the dead section at all, rather than
+ * rendering it in a state that can never resolve.
  */
 export function collectAiVerifiedPlanItems(
-  taskFolderUri: vscode.Uri,
-  scopeFolder: string
+  _taskFolderUri: vscode.Uri,
+  _scopeFolder: string
 ): PlanItemVerification[] | undefined {
-  let planContent: string;
-  try {
-    planContent = fs.readFileSync(
-      path.join(taskFolderUri.fsPath, "plan-final.md"),
-      "utf8"
-    );
-  } catch {
-    return undefined;
-  }
-  const baseline = verifyPlanItems(planContent);
-  if (baseline.length === 0) {
-    return undefined;
-  }
-
-  const cacheKey = taskFolderUri.fsPath;
-  const contentKey = `${scopeFolder}\n${planContent}`;
-  const cached = planVerificationCache.get(cacheKey);
-  if (
-    cached &&
-    cached.contentKey === contentKey &&
-    Date.now() - cached.at < PLAN_VERIFICATION_CACHE_TTL_MS
-  ) {
-    return cached.items.map((item) => ({ ...item }));
-  }
-
-  const items = runAiPlanVerification(baseline);
-  planVerificationCache.set(cacheKey, { contentKey, at: Date.now(), items });
-  return items.map((item) => ({ ...item }));
+  return undefined;
 }
 
 /**
@@ -1340,6 +1280,16 @@ export async function collectCompletionLint(
  * narrow so the allowlist can't accidentally swallow an unrelated real
  * failure that happens to share a command name.
  *
+ * `match` is compared for EXACT equality against the failed command's line,
+ * not a substring `includes` — a monorepo's per-package commands are already
+ * disambiguated by their `[packageDir]` prefix (see the recursive pass
+ * above), so a broad entry like `match: "npm run test"` (intended for one
+ * package's cron suite) previously also swallowed every other package's
+ * `[apps/server] npm run test`, `[apps/web] npm run test`, etc. — anything
+ * whose command line merely contained that substring. Exact equality means
+ * an entry can only ever quarantine the single command (and, for a monorepo
+ * member, the single package) it actually names.
+ *
  * @internal exported for testing
  */
 export function classifyKnownFlakeFailures(
@@ -1349,7 +1299,7 @@ export function classifyKnownFlakeFailures(
   const quarantined: Array<{ command: string; exitCode: number; reason: string }> = [];
   for (const failure of failures) {
     const flake = knownFlakes.find(
-      (entry) => failure.command.includes(entry.match) && failure.output.includes(entry.failureSignature)
+      (entry) => failure.command.trim() === entry.match.trim() && failure.output.includes(entry.failureSignature)
     );
     if (flake) {
       quarantined.push({ command: failure.command, exitCode: failure.code, reason: flake.reason });
@@ -1524,8 +1474,20 @@ function renderCompletionChecksSection(
   override?: { reason: string }
 ): string {
   const lines: string[] = [PUBLISH_CHECKS_SECTION_START, "## Completion Checks", ""];
-  const status = result.passed
-    ? "Passed"
+  // The headline is derived from passedModuloKnownFlakes, NOT result.passed —
+  // its own doc comment states it, not `passed`, is the readiness-relevant
+  // verdict shown to reviewers. Falls back to `passed` for an older/mocked
+  // result that predates the field (see the "degrades gracefully" test).
+  // A run where every failure is a quarantined known flake must read
+  // "Passed" here; the quarantined failures stay fully visible in the
+  // "Failed checks" section below, each labelled with its flake reason, so
+  // nothing is hidden — only the headline stops over-claiming a real failure.
+  const effectivePassed = result.passedModuloKnownFlakes ?? result.passed;
+  const knownFlakeCount = result.knownFlakeFailures?.length ?? 0;
+  const status = effectivePassed
+    ? knownFlakeCount > 0
+      ? `Passed (${knownFlakeCount} quarantined known flake(s) — see Failed checks below)`
+      : "Passed"
     : result.issueCount > 0
       ? "Failed"
       : "Inconclusive (required checks could not run)";
@@ -1552,7 +1514,13 @@ function renderCompletionChecksSection(
     for (const check of result.failedChecks) {
       const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
       const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
-      const retryNote = check.retryCount ? ` — failed consistently across ${check.retryCount + 1} attempts (${check.retryCount} cache-bypassed retries)` : "";
+      // Omitted once the failure is a known, quarantined flake: for those the
+      // retry count is not diagnostic evidence, it is noise that can actively
+      // contradict the recorded flake reason (e.g. "reproduces only in the
+      // extension host, a cache-bypassed retry proves nothing" — the retry
+      // ran anyway and "failed consistently" then reads as counter-evidence
+      // to the very reason quarantining it).
+      const retryNote = check.retryCount && !flake ? ` — failed consistently across ${check.retryCount + 1} attempts (${check.retryCount} cache-bypassed retries)` : "";
       lines.push(
         "",
         `**${check.command}** (exit ${check.exitCode})${retryNote}${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
@@ -1696,17 +1664,21 @@ export function buildVerifiedChecksSection(
     const flake = knownFlakeFailures.find(
       (f) => f.command === check.command && f.exitCode === check.exitCode
     );
-    const retryNote = check.retryCount
-      ? ` (failed consistently across ${check.retryCount + 1} attempts, ${check.retryCount} with the cache disabled)`
-      : "";
     if (flake) {
+      // No retry-count note here (see the sibling omission in
+      // renderCompletionChecksSection above) — for a quarantined flake the
+      // retry count is not diagnostic evidence, and can read as
+      // counter-evidence to the recorded flake reason.
       lines.push(
         "",
-        `- **${check.command}** — exit ${check.exitCode}${retryNote}, **quarantined known flake**: ${flake.reason}. ` +
+        `- **${check.command}** — exit ${check.exitCode}, **quarantined known flake**: ${flake.reason}. ` +
           "This failure is excluded from the overall verdict above — do not treat it as an outstanding blocker."
       );
       continue;
     }
+    const retryNote = check.retryCount
+      ? ` (failed consistently across ${check.retryCount + 1} attempts, ${check.retryCount} with the cache disabled)`
+      : "";
     const output = truncateCheckOutput(check.output, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS);
     lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)${retryNote}`, "```", output, "```");
   }
@@ -1766,67 +1738,45 @@ export function mergeCompletionChecksSection(existing: string, section: string):
 }
 
 /**
- * Remove this module's managed section from `publish-review.md`, where it used
- * to live before the split (see PUBLISH_CHECKS_FILENAME).
+ * Extract this module's managed Completion Checks section (markers included)
+ * from existing `publish-review.md` content, if present. Used by
+ * `reviewRowV1.ts`'s `promoteReviewContentV1` to re-inject the section after
+ * an AI review write, which replaces the whole file — ground truth must
+ * survive a reviewer's prose the same way it survives a `runCompletionLint`
+ * refresh.
  *
- * Leaving it there is not cosmetic. The reviewer's verdict and these checks
- * advance on different schedules, so a task carrying both ends up asserting two
- * readiness answers from two different commits in one document — the exact
- * failure the split exists to remove. Re-running the checks would refresh the
- * lower half and leave the stale headline in place, which is how a passing run
- * came to be read as a 2/10.
- *
- * Strictly subtractive, and only over markers this module owns: it never adds
- * content to the reviewer's artifact, so the two writers cannot start
- * disagreeing again through this path.
+ * @internal exported for testing and reuse by reviewRowV1.ts
  */
-async function stripCompletionChecksFromReviewArtifactV1(
-  taskFolderUri: vscode.Uri
-): Promise<void> {
-  const legacyName = STAGE_ARTIFACT_FILENAMES.publish;
-  if (!legacyName) {
-    return;
-  }
-  const legacyPath = path.join(taskFolderUri.fsPath, legacyName);
-
-  let existing: string;
-  try {
-    existing = await fs.promises.readFile(legacyPath, "utf8");
-  } catch {
-    return;
-  }
-
-  const startIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_START);
-  const endIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_END);
+export function extractCompletionChecksSectionV1(content: string): string | undefined {
+  const startIdx = content.indexOf(PUBLISH_CHECKS_SECTION_START);
+  const endIdx = content.indexOf(PUBLISH_CHECKS_SECTION_END);
   if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-    return;
+    return undefined;
   }
-
-  const stripped =
-    existing.slice(0, startIdx).trimEnd() +
-    "\n" +
-    existing.slice(endIdx + PUBLISH_CHECKS_SECTION_END.length).trimStart();
-  await fs.promises.writeFile(legacyPath, `${stripped.trimEnd()}\n`, "utf8");
+  return content.slice(startIdx, endIdx + PUBLISH_CHECKS_SECTION_END.length);
 }
 
 /**
- * Upsert a "Completion Checks" section into publish-checks.md. Every
- * completion lint run at the Publish stage calls this, so both the "check"
- * and "fix" paths keep this artifact current. Uses plain `node:fs` (like
- * `readPackageScripts` above) rather than `vscode.workspace.fs` — this is
- * always a plain file on disk inside the task folder, never a virtual FS
- * scheme, so there's nothing the VS Code FS abstraction adds here.
+ * Upsert a "Completion Checks" section into `publish-review.md` — the single
+ * Publish-stage artifact (plan item 17, step 20; see the module doc comment
+ * on `publishChecksFreshness.ts`'s `publishChecksPath` for why this used to
+ * be a separate `publish-checks.md`). Every completion lint run at the
+ * Publish stage calls this, so both the "check" and "fix" paths keep this
+ * artifact current. Uses plain `node:fs` (like `readPackageScripts` above)
+ * rather than `vscode.workspace.fs` — this is always a plain file on disk
+ * inside the task folder, never a virtual FS scheme, so there's nothing the
+ * VS Code FS abstraction adds here.
  */
 export async function upsertCompletionChecksReportV1(
   taskFolderUri: vscode.Uri,
   result: CompletionLintResult,
   override?: { reason: string }
 ): Promise<void> {
-  const targetPath = path.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
+  const targetPath = path.join(taskFolderUri.fsPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
 
   // Single locked read-modify-write: merging the section and invalidating
   // any freshness stamp happen against the same in-memory snapshot and land
-  // in one atomic write, so a concurrent reader of publish-checks.md can
+  // in one atomic write, so a concurrent reader of publish-review.md can
   // never observe this section updated with a stamp that still looks
   // current (or a half-written file). See withPublishChecksReportLockV1's
   // doc comment for why this is a per-report lock rather than nesting calls
@@ -1838,6 +1788,11 @@ export async function upsertCompletionChecksReportV1(
     } catch {
       existing = "";
     }
+    // One-time bounded import (step 20(c)): pulls in a legacy
+    // publish-checks.md's sections when this file doesn't have its own yet,
+    // so a task that upgraded mid-Publish doesn't lose its most recent
+    // Scope Check (or other section this call doesn't itself produce).
+    existing = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
 
     const section = renderCompletionChecksSection(result, override);
     const merged = mergeCompletionChecksSection(existing, section);
@@ -1850,7 +1805,6 @@ export async function upsertCompletionChecksReportV1(
     // Publish Checks runs again.
     await writeFileAtomicV1(targetPath, invalidatePublishChecksFreshnessStamp(merged));
   });
-  await stripCompletionChecksFromReviewArtifactV1(taskFolderUri);
 }
 
 /**
