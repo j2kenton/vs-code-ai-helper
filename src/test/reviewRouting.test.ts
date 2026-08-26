@@ -4,8 +4,10 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   blockerIdentity,
+  chooseAutomaticImplementationDispatchV1,
   decidePostReviewActionV1,
   decideReviewRoute,
+  describeTaskFixableBlockersV1,
   IMPL_REVIEW_STAGES_V1,
   degenerateReviewRejectionReason,
   detectBlockerSetStall,
@@ -198,6 +200,46 @@ void describe("blockerIdentity", () => {
     const a = blocker({ description: "src/a.ts fails", resolver: "task-fixable" });
     const b = blocker({ description: "src/a.ts fails", resolver: "environmental" });
     assert.notDeepStrictEqual(blockerIdentity(a), blockerIdentity(b));
+  });
+
+  void it("carries origin through from the source blocker", () => {
+    const mechanical = blocker({ description: "`npm run lint` failed", origin: "mechanical" });
+    assert.strictEqual(blockerIdentity(mechanical).origin, "mechanical");
+  });
+
+  void it("leaves origin absent when the source blocker doesn't carry one", () => {
+    assert.strictEqual(blockerIdentity(blocker({ description: "src/a.ts fails" })).origin, undefined);
+  });
+});
+
+void describe("describeTaskFixableBlockersV1", () => {
+  void it("splits reviewer-reported from mechanical when every task-fixable blocker carries an origin", () => {
+    const blockers = [
+      identity({ resolver: "task-fixable", origin: "reviewer" }),
+      identity({ resolver: "task-fixable", origin: "mechanical" }),
+      identity({ resolver: "task-fixable", origin: "mechanical" }),
+    ];
+    assert.strictEqual(
+      describeTaskFixableBlockersV1(3, blockers),
+      "3 problem(s) (1 reviewer-reported, 2 mechanical)"
+    );
+  });
+
+  void it("still shows the split when there are no mechanical blockers, so 0 mechanical is stated rather than hidden", () => {
+    const blockers = [identity({ resolver: "task-fixable", origin: "reviewer" })];
+    assert.strictEqual(
+      describeTaskFixableBlockersV1(1, blockers),
+      "1 problem(s) (1 reviewer-reported, 0 mechanical)"
+    );
+  });
+
+  void it("falls back to a bare count when origin is missing on any task-fixable blocker (older entries)", () => {
+    const blockers = [identity({ resolver: "task-fixable" })];
+    assert.strictEqual(describeTaskFixableBlockersV1(1, blockers), "1 problem(s)");
+  });
+
+  void it("falls back to a bare count when blockers is absent entirely", () => {
+    assert.strictEqual(describeTaskFixableBlockersV1(2, undefined), "2 problem(s)");
   });
 });
 
@@ -1089,6 +1131,75 @@ void describe("decidePostReviewActionV1", () => {
       pendingImplReviewFilesCount: 0,
     });
     assert.strictEqual(decision.action, "apply-review");
+  });
+});
+
+/**
+ * wf10 continuation item 17: the automatic loop used to compute
+ * `decidePostReviewActionV1` on every dispatch — manual and automatic alike
+ * — but only ever ACTED on it for the manual path (posting a decision card).
+ * An automation dispatch fell through to Implementation regardless of what
+ * the decision said, which is exactly how ten consecutive automatic
+ * `# Implementation Run` rounds ran against a blocker frozen at score 6:
+ * Implementation only reads the plan checklist and was never told about it.
+ */
+void describe("chooseAutomaticImplementationDispatchV1", () => {
+  void it("redirects to Apply Review when the decision is apply-review and the dispatch is automatic", () => {
+    const dispatch = chooseAutomaticImplementationDispatchV1({
+      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
+      isAutomationDispatch: true,
+      continuationOwed: false,
+    });
+    assert.strictEqual(dispatch.kind, "redirect-apply-review");
+    assert.strictEqual(dispatch.kind === "redirect-apply-review" && dispatch.reviewStage, "impl-high-review");
+  });
+
+  void it("redirects to Apply Review when the decision is 'both' and the dispatch is automatic", () => {
+    const dispatch = chooseAutomaticImplementationDispatchV1({
+      decision: { action: "both", reviewStage: "impl-low-review", reason: "both are valid" },
+      isAutomationDispatch: true,
+      continuationOwed: false,
+    });
+    assert.strictEqual(dispatch.kind, "redirect-apply-review");
+    assert.strictEqual(dispatch.kind === "redirect-apply-review" && dispatch.reviewStage, "impl-low-review");
+  });
+
+  void it("runs Implementation when the dispatch is manual, even for an apply-review decision", () => {
+    const dispatch = chooseAutomaticImplementationDispatchV1({
+      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
+      isAutomationDispatch: false,
+      continuationOwed: false,
+    });
+    assert.strictEqual(dispatch.kind, "run-implementation");
+  });
+
+  void it("runs Implementation when a continuation is owed, even for an apply-review decision", () => {
+    const dispatch = chooseAutomaticImplementationDispatchV1({
+      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
+      isAutomationDispatch: true,
+      continuationOwed: true,
+    });
+    assert.strictEqual(dispatch.kind, "run-implementation");
+  });
+
+  void it("runs Implementation for 'implementation' and 'none' decisions regardless of dispatch mode", () => {
+    for (const action of ["implementation", "none"] as const) {
+      const dispatch = chooseAutomaticImplementationDispatchV1({
+        decision: { action, reviewStage: "impl-high-review", reason: "n/a" },
+        isAutomationDispatch: true,
+        continuationOwed: false,
+      });
+      assert.strictEqual(dispatch.kind, "run-implementation");
+    }
+  });
+
+  void it("runs Implementation when the decision carries no reviewStage to redirect to", () => {
+    const dispatch = chooseAutomaticImplementationDispatchV1({
+      decision: { action: "apply-review", reason: "no review yet" },
+      isAutomationDispatch: true,
+      continuationOwed: false,
+    });
+    assert.strictEqual(dispatch.kind, "run-implementation");
   });
 });
 

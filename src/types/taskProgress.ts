@@ -125,7 +125,17 @@ export interface LintPayload {
   /** Number of editor diagnostics plus failed checks. */
   issueCount?: number;
   /** Commands that failed, including their exit codes and output. */
-  failedChecks?: Array<{ command: string; exitCode: number; output: string }>;
+  failedChecks?: Array<{
+    command: string;
+    exitCode: number;
+    output: string;
+    retryCount?: number;
+    /** The known-flake quarantine decision for this failure, computed once
+     * in `collectCompletionLint` (see completionLint.ts's `QuarantineStampV1`
+     * and `isQuarantinedCheckV1`) and persisted verbatim so a re-read never
+     * has to re-derive it. */
+    quarantine?: { reason: string; ruleMatch: string };
+  }>;
   /**
    * Where this payload came from. `"publish"` (the default when absent, for
    * backward compatibility) means a real Publish attempt ran the checks via
@@ -584,6 +594,18 @@ export type ImplRecoveryModeV1 =
 /** Dispatch state of the owed recovery continuation. */
 export type ImplRecoveryDispatchStateV1 = "pending" | "dispatched";
 
+/**
+ * What an implementation round was actually working from, distinguishing a
+ * checklist-driven Implementation round from a review-driven Apply Review
+ * round from a recovery continuation of either — the three currently share
+ * one `# Implementation Run` run-log header with no way to tell them apart
+ * after the fact (wf task "make the stage chat a record of work", item 17a).
+ */
+export type ImplementationDispatchModeV1 =
+  | "implementation"
+  | "apply-review"
+  | "continuation";
+
 /** `TaskProgress.implRecovery` — one owed recovery continuation. */
 export interface ImplRecoveryV1 {
   /** Stable token identifying the triggering round, quoted in its run log. */
@@ -612,6 +634,22 @@ export interface ImplRecoveryV1 {
   /** Same lease semantics as `scheduledRun`: one window arms the dispatch. */
   leaseOwner?: string;
   leaseUntil?: string;
+  /**
+   * Dispatch mode of the round that triggered this recovery. When it was
+   * `"apply-review"`, the claimed continuation must render from
+   * `apply-impl-review-code.md` with the original review content rather than
+   * silently reverting to a checklist-driven `run-implementation.md`
+   * continuation (the defect item 17b's risk note warns against). Absent for
+   * recoveries recorded before this field existed; treat absence as
+   * `"implementation"`.
+   */
+  sourceDispatchMode?: ImplementationDispatchModeV1;
+  /**
+   * The review stage whose blockers the source `"apply-review"` round was
+   * applying, so its continuation can re-read the same review artifact.
+   * Only meaningful when `sourceDispatchMode === "apply-review"`.
+   */
+  sourceReviewStage?: TaskStage;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -679,6 +717,35 @@ export interface ReviewBlockerIdentity {
    * deciding whether to cite it. Never used for identity comparisons.
    */
   description?: string;
+  /**
+   * Carried forward from `ReviewBlocker.origin` (reviewReadiness.ts):
+   * `"reviewer"` for a blocker the AI reviewer itself raised in prose,
+   * `"mechanical"` for one synthesized directly from a failed Verified
+   * Check. Absent on entries written before this field existed, and for any
+   * blocker whose origin was not recorded at parse time — never assume
+   * `"reviewer"` for an absent value. Lets a reader distinguish "the
+   * reviewer found 3 problems" from "0 reviewer-found, 3 generated
+   * mechanically from failing checks" instead of reading both as one
+   * undifferentiated count (wf10 continuation item 12).
+   */
+  origin?: "reviewer" | "mechanical";
+}
+
+/**
+ * One blocker this round re-raised that matches a `plan-final.md`
+ * `## Accepted Non-Goals` entry (wf10 continuation item 18) — recorded so
+ * the disagreement is visible ("either the reviewer has a reason the
+ * decision missed, or it is not reading the decision") rather than silent.
+ * The review's own timestamp (`ReviewScoreHistoryEntry.at`) IS the "review
+ * mtime" this was observed at — no separate timestamp is carried here.
+ */
+export interface ReviewerChallengedNonGoalV1 {
+  /** The stable blocker lineage id (`ReviewBlockerIdentity.id`) of the
+   * re-raised blocker, when one could be resolved. */
+  readonly blockerId?: string;
+  /** The `## Accepted Non-Goals` sub-heading (or the section heading itself,
+   * for a plan with no sub-headings) the blocker matched. */
+  readonly nonGoalHeading: string;
 }
 
 /**
@@ -720,6 +787,26 @@ export interface ReviewScoreHistoryEntry {
    * plausible between-reviewer offset (2026-08-14 finding: workflow-2 item 7).
    */
   reviewer?: ReviewerIdentityV1;
+  /**
+   * Stable identities of blockers this round reported that were EXCLUDED
+   * from `blockerCount`/`taskFixableCount`/`blockers` because they matched a
+   * `plan-final.md` `## Accepted Non-Goals` entry (wf10 continuation item
+   * 18, `derivePlanNonGoalSupersessionsV1`). Absent when nothing was
+   * superseded this round. Kept separate from `blockers` (which lists only
+   * what still counts as outstanding) so a reader can see both what this
+   * round measured AND what was set aside, rather than the plan's decision
+   * silently shrinking the reported numbers with no trace.
+   */
+  supersededBlockers?: ReviewBlockerIdentity[];
+  /**
+   * Every blocker this round re-raised that matches an Accepted Non-Goals
+   * entry — see `ReviewerChallengedNonGoalV1`'s doc comment. Absent when
+   * nothing matched. A NON-EMPTY value here does not mean the reviewer was
+   * wrong to raise it (see that type's doc comment on match confidence) —
+   * only that the disagreement between this round and the plan of record is
+   * now visible instead of silent.
+   */
+  reviewerChallengedNonGoal?: ReviewerChallengedNonGoalV1[];
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */
@@ -766,6 +853,24 @@ export interface BlockerSupersessionRecordV1 {
    * `commands/chatWithStage.ts`) carries it.
    */
   confirmingMessageAt?: string;
+  /**
+   * Where this supersession came from. Absent decodes as `"chat-confirmed"`
+   * — every record written before this field existed came from the stage-chat
+   * resolution path (`dispatchProposedBlockerSupersessionEditV1`), the only
+   * one that existed then.
+   *
+   *  - `"chat-confirmed"`: a human resolved this specific blocker via this
+   *    task's own stage chat and a confirmable `plan.md` edit landed. Only
+   *    suppresses STALE content (`filterSupersededBlockersV1`'s doc comment)
+   *    — a fresh review's own live output is never masked by it.
+   *  - `"plan-non-goal"` (wf10 continuation item 18): derived automatically
+   *    by matching a blocker's description against `plan-final.md`'s
+   *    `## Accepted Non-Goals` section (`derivePlanNonGoalSupersessionsV1`,
+   *    `reviewEvidenceNormalizerV1.ts`) — a standing decision about the
+   *    blocker's SUBJECT, not a statement about one stale artifact, so it
+   *    applies even to content produced the same round it was derived from.
+   */
+  source?: "chat-confirmed" | "plan-non-goal";
 }
 
 /** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
@@ -828,6 +933,14 @@ export interface RoundOutcomeEntryV1 {
    * like an absent `modelId`.
    */
   providerId?: string;
+  /**
+   * What the round was dispatched to work from — checklist-driven
+   * Implementation, review-driven Apply Review, or a recovery continuation
+   * of either. Absent for entries written before this field existed; treat
+   * absence as unknown, never as `"implementation"` by default, since older
+   * rows predate the distinction entirely.
+   */
+  dispatchMode?: ImplementationDispatchModeV1;
 }
 
 /** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */

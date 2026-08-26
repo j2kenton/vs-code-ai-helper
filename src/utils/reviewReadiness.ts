@@ -271,6 +271,18 @@ export interface ReviewBlocker {
    * resolved to lineage-unknown when the cited id doesn't exist there.
    */
   lineage?: BlockerLineageDeclaration;
+  /**
+   * Who/what raised this blocker: `"reviewer"` for one parsed from the
+   * AI reviewer's own `<!-- blockers:start -->` block (set by
+   * {@link parseReviewBlockersDetailed}), `"mechanical"` for one
+   * synthesized directly from a failed Verified Check, bypassing the model
+   * entirely (`synthesizeMechanicalBlockers`, completionLint.ts). Optional
+   * so older callers/fixtures that construct a `ReviewBlocker` by hand
+   * remain valid; a mechanically generated blocker must always carry it so
+   * it stays distinguishable from a reviewer's own finding in the durable
+   * record (wf10 continuation item 12).
+   */
+  origin?: "reviewer" | "mechanical";
 }
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
@@ -828,6 +840,7 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       category: (category ?? "completion").toLowerCase() as BlockerCategory,
       resolver: resolver.toLowerCase() as BlockerResolver,
       description,
+      origin: "reviewer",
       ...(lineage ? { lineage } : {}),
     });
   }

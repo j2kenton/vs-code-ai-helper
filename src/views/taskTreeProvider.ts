@@ -28,6 +28,7 @@ import {
   REVIEWED_COMMIT_STAGES,
   REVIEW_TARGETS,
 } from "../utils/reviewReadiness";
+import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
@@ -764,6 +765,21 @@ export class StageNode extends vscode.TreeItem {
       tooltipStr +=
         `\n\nReview score: ${readiness.label}\n\n---\n\n` +
         `${readiness.progress.complete} of ${readiness.progress.total} steps completed`;
+    }
+    if (readiness && isReviewStage(stage)) {
+      // Reviewer/mechanical split (wf10 continuation item 12): the newest
+      // recorded history entry for this stage carries `taskFixableCount` plus
+      // per-blocker `origin`, so a count that includes a mechanically
+      // generated blocker (synthesized from a failed Verified Check, not
+      // raised by the reviewer) reads as such here too, everywhere else the
+      // count is shown.
+      const latestHistoryEntry = (task.progress.reviewScoreHistory ?? [])
+        .filter((entry) => entry.stage === stage)
+        .at(-1);
+      if (latestHistoryEntry && latestHistoryEntry.taskFixableCount > 0) {
+        tooltipStr +=
+          `\n\n${describeTaskFixableBlockersV1(latestHistoryEntry.taskFixableCount, latestHistoryEntry.blockers)} outstanding`;
+      }
     }
     if (readiness?.staleReviewedSha) {
       // Display-time computation (Part 2, review status messaging): a stale

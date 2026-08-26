@@ -2606,6 +2606,26 @@ void describe("describeIncompleteImplementationRoundV1", () => {
     assert.ok(detected?.reason.includes("follow-up turn"));
   });
 
+  /**
+   * wf10 continuation item 17, run 122's actual deferral: "I'll pause here
+   * and wait for the background test run to complete before producing the
+   * final summary — the completion notification will resume this task
+   * automatically." Present-tense "wait" (not "waiting") and a third-person
+   * "the completion notification will resume" both slipped past the
+   * original phrase list — nothing resumed the round, and its review-driven
+   * mandate was lost when the recovery that followed reverted to a
+   * checklist-driven continuation instead.
+   */
+  void it("classifies the run-122 'completion notification will resume' deferral as roundDeferred", () => {
+    const detected = describeIncompleteImplementationRoundV1(
+      "I'll pause here and wait for the background test run to complete " +
+        "before producing the final summary — the completion notification " +
+        "will resume this task automatically.",
+      { planChecklist: CHECKLIST_PLAN_OF_RECORD }
+    );
+    assert.equal(detected?.kind, "roundDeferred");
+  });
+
   void it("classifies the 2026-08-10 live status message as roundDeferred", () => {
     const detected = describeIncompleteImplementationRoundV1(
       STATUS_MESSAGE_NOT_A_SUMMARY,

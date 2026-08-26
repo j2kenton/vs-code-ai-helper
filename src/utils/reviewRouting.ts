@@ -99,6 +99,22 @@ function restrictToTrailingSameReviewerRun<T extends ReviewScoreHistoryEntry>(
   return scored.slice(startIndex);
 }
 
+/**
+ * wf10 continuation items 17 / 18: this function measures whether the
+ * SCORE has stopped improving — it has no way to see WHY. A frozen
+ * `taskFixableCount` (see `roundsWithoutTaskFixableDecrease`,
+ * `shouldEscalateChurnCeiling`) across rounds whose `RoundOutcomeEntryV1
+ * .dispatchMode` was `"implementation"` the whole time is not evidence the
+ * work is genuinely stuck — Implementation only ever reads the plan
+ * checklist, so it structurally cannot move a task-fixable blocker count no
+ * matter how many rounds run. That is a DISPATCH plateau (the loop kept
+ * choosing an action that cannot help), not a WORK plateau (the problem
+ * resists every action tried) — `chooseAutomaticImplementationDispatchV1`
+ * (this file) exists to prevent the dispatch plateau at the source; a caller
+ * diagnosing a churn-ceiling escalation should still check the dispatch mode
+ * of the stagnant window's rounds before concluding the problem itself is
+ * hard.
+ */
 export function detectPlateau(
   history: readonly ReviewScoreHistoryEntry[],
   stage: TaskStage,
@@ -153,6 +169,7 @@ export function blockerIdentity(blocker: ReviewBlocker): ReviewBlockerIdentity {
     category: blocker.category,
     resolver: blocker.resolver,
     subject: subject || "unspecified",
+    ...(blocker.origin ? { origin: blocker.origin } : {}),
   };
 }
 
@@ -1007,6 +1024,32 @@ export function decideReviewRoute(input: {
  * "will most likely change nothing" — the newest review's own progress marker
  * showed 76 of those steps still queued and actionable.
  */
+/**
+ * Human-readable rendering of a task-fixable blocker count that splits out
+ * how many were raised by the reviewer itself versus generated mechanically
+ * from a failed Verified Check (`ReviewBlockerIdentity.origin`), e.g.
+ * `"3 problem(s) (2 reviewer-reported, 1 mechanical)"`. Falls back to a bare
+ * count when origin isn't recorded for every task-fixable blocker (older
+ * entries predating the field, or a caller that never threaded it through)
+ * — the split is only ever shown when it can be stated with certainty,
+ * never guessed at. Used everywhere a blocker count reaches the user, so a
+ * mechanically generated blocker (wf10 continuation item 12) is never
+ * silently indistinguishable from one the reviewer actually found.
+ */
+export function describeTaskFixableBlockersV1(
+  count: number,
+  blockers: readonly ReviewBlockerIdentity[] | undefined
+): string {
+  const label = `${count} problem(s)`;
+  const taskFixable = (blockers ?? []).filter((b) => b.resolver === "task-fixable");
+  if (taskFixable.length !== count || taskFixable.some((b) => b.origin === undefined)) {
+    return label;
+  }
+  const mechanicalCount = taskFixable.filter((b) => b.origin === "mechanical").length;
+  const reviewerCount = taskFixable.filter((b) => b.origin === "reviewer").length;
+  return `${label} (${reviewerCount} reviewer-reported, ${mechanicalCount} mechanical)`;
+}
+
 export type PostReviewActionV1 = "apply-review" | "implementation" | "both" | "none";
 
 export interface PostReviewActionDecisionV1 {
@@ -1113,10 +1156,11 @@ export function decidePostReviewActionV1(input: {
         action: "both",
         reviewStage: latest.stage,
         reason:
-          `The ${stageName} found ${latest.taskFixableCount} problem(s) in the code that still need ` +
-          "fixing, and the plan checklist still has unticked items. Both are valid here: Apply Review " +
-          "can fix the problems the review found (Implementation cannot see them — it only reads the " +
-          "plan checklist), and Implementation can still make progress on the unticked checklist items.",
+          `The ${stageName} found ${describeTaskFixableBlockersV1(latest.taskFixableCount, latest.blockers)} ` +
+          "in the code that still need fixing, and the plan checklist still has unticked items. Both are " +
+          "valid here: Apply Review can fix the problems the review found (Implementation cannot see them " +
+          "— it only reads the plan checklist), and Implementation can still make progress on the unticked " +
+          "checklist items.",
       };
     }
     return {
@@ -1127,9 +1171,9 @@ export function decidePostReviewActionV1(input: {
       // rendered into the implementation prompt" is a sentence that describes
       // the mechanism perfectly and tells nobody what to click.
       reason:
-        `The ${stageName} found ${latest.taskFixableCount} problem(s) in the code that ` +
-        "still need fixing. Implementation works only from the plan checklist, so it cannot fix " +
-        "them — Apply Review can.",
+        `The ${stageName} found ${describeTaskFixableBlockersV1(latest.taskFixableCount, latest.blockers)} ` +
+        "in the code that still need fixing. Implementation works only from the plan checklist, so it " +
+        "cannot fix them — Apply Review can.",
     };
   }
   if (input.hasUntickedChecklistItems) {
@@ -1143,6 +1187,64 @@ export function decidePostReviewActionV1(input: {
     action: "none",
     reviewStage: latest.stage,
     reason: `The newest ${stageName} reports no task-fixable blockers and the plan checklist is complete.`,
+  };
+}
+
+/** What an automatic (unattended) Implementation dispatch should actually do,
+ * given `decidePostReviewActionV1`'s verdict. */
+export type AutomaticImplementationDispatchV1 =
+  | { readonly kind: "run-implementation" }
+  | {
+      /**
+       * Redirect to Apply Review instead of running a checklist-driven
+       * Implementation round — `decision.action` is `"apply-review"` or
+       * `"both"`, so Implementation is either structurally unable to fix
+       * what the review found, or is one of two valid actions where Apply
+       * Review takes precedence (module doc comment above `decidePostReviewActionV1`).
+       */
+      readonly kind: "redirect-apply-review";
+      readonly reviewStage: TaskStage;
+      readonly reason: string;
+    };
+
+/**
+ * wf10 continuation item 17: the manual pre-run routing check
+ * (`decidePostReviewActionV1` above) has always been computed on the
+ * automatic path too, but automation dispatches only ever POSTED it as a
+ * decision card for a human to read — the human path is not there, so the
+ * card is skipped, and the round fell through to run Implementation
+ * regardless of what the decision said. Observed: ten consecutive automatic
+ * `# Implementation Run` rounds against a `[same:…]` blocker frozen at
+ * score 6, none of them able to touch it, because Implementation only reads
+ * the plan checklist.
+ *
+ * This is the missing other half: what the AUTOMATIC path should do with the
+ * same verdict, with no human to ask. `isAutomationDispatch: false` (a
+ * manual run) always runs Implementation here — the decision card handles
+ * manual routing on its own, this function must not second-guess a human who
+ * already chose to press "Implementation". `continuationOwed: true` also
+ * always runs Implementation — draining an owed continuation outranks
+ * everything (see `continuationOwed` on `decidePostReviewActionV1`'s input;
+ * Review/Apply Review both refuse while a continuation is owed, so a
+ * redirect here would just fail).
+ */
+export function chooseAutomaticImplementationDispatchV1(input: {
+  readonly decision: PostReviewActionDecisionV1;
+  readonly isAutomationDispatch: boolean;
+  readonly continuationOwed: boolean;
+}): AutomaticImplementationDispatchV1 {
+  if (
+    !input.isAutomationDispatch ||
+    input.continuationOwed ||
+    input.decision.reviewStage === undefined ||
+    (input.decision.action !== "apply-review" && input.decision.action !== "both")
+  ) {
+    return { kind: "run-implementation" };
+  }
+  return {
+    kind: "redirect-apply-review",
+    reviewStage: input.decision.reviewStage,
+    reason: input.decision.reason,
   };
 }
 

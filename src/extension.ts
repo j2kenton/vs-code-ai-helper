@@ -21,6 +21,7 @@ import {
 } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
+import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -627,6 +628,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")
   ));
   registerViewArtifactCommands(context);
+  registerOpenRetainedPromptCommand(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerGoToReviewAndApplyCommandV1(context);

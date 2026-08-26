@@ -265,7 +265,23 @@ void test("total embed cap stays anchored under the chat-transaction input snaps
   // 155_000 is the nearest round figure above that floor. Raise it again if a
   // rejection ever proves it low — a guard whose constant is optimistic is
   // worse than no guard, because it reports safety it has not checked.
-  const WORST_OBSERVED_NON_CONTENT_BYTES = 155_000;
+  //
+  // Raised 155_000 -> 195_000 (2026-08-26). A rejection did prove it low: this
+  // guard passed while workflow 11's own impl-high review (run 027) was
+  // rejected for exceeding the same limit — the third time this has happened
+  // and the second time this constant was the stale part. Derived the same
+  // way, from a rejection with IMPL_REVIEW_MAX_TOTAL_CHARS=60000 in force:
+  //   non_content x ESCAPE_OVERHEAD > MAX - (60000 x ESCAPE_OVERHEAD)
+  //   non_content                   > 190,855
+  //
+  // Read this as a floor that keeps rising, not as a measurement that keeps
+  // being refined. Each raise has been inferred from a failure rather than
+  // observed, because the assembled prompt is not retained anywhere — so the
+  // true worst case has never been known, only bounded from below. That is the
+  // argument for item 9 of workflow 11 replacing both sides of this inequality
+  // with a pre-dispatch measurement; when it does, delete this test with the
+  // constant it guards.
+  const WORST_OBSERVED_NON_CONTENT_BYTES = 195_000;
   const ESCAPE_OVERHEAD = 1.045;
   assert.ok(
     (IMPL_REVIEW_MAX_TOTAL_CHARS + WORST_OBSERVED_NON_CONTENT_BYTES) * ESCAPE_OVERHEAD <

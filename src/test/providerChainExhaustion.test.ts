@@ -41,6 +41,17 @@ import { TaskProgress } from "../types/taskProgress";
 import { ProviderChainExhaustionV1 } from "../types/taskActionOutcomeV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
+
+function fakeCompletedCorrelation(): ActionCorrelationV1 {
+  return {
+    taskBindingId: allocateHex128IdV1(),
+    chatDocumentId: allocateHex128IdV1(),
+    actionKey: "review.v1",
+    operationId: allocateHex128IdV1(),
+    attemptId: allocateHex128IdV1(),
+  };
+}
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-chain-exhaustion-"));
 
@@ -374,6 +385,104 @@ void describe("provider chain exhaustion (stage owner)", () => {
     );
     assert.equal(logs.length, 1);
     assert.doesNotMatch(logs[0]!, /## Provider chain exhausted/);
+  });
+
+  // wf10 continuation item 12, Part 1 step 4: the run log is the durable,
+  // per-round record of a review's outcome — it must carry the same
+  // reviewer/mechanical blocker split every other blocker-count surface
+  // (Fast Forward's closing notice, decidePostReviewActionV1's reason text,
+  // the tree tooltip) already shows, via the same describeTaskFixableBlockersV1
+  // helper, or this is the one place left where a mechanically-synthesized
+  // blocker stays indistinguishable from one the reviewer actually raised.
+  void it("a completed review's run log states the reviewer/mechanical blocker split", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("completed_runlog_blocker_split");
+    fs.writeFileSync(
+      path.join(folderPath, "task-progress.json"),
+      JSON.stringify(
+        {
+          taskFolder: "completed_runlog_blocker_split",
+          currentStage: "impl-high-review",
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          ownership: {
+            metaRoot: path.join(REAL_ROOT, "plans"),
+            projectRoot: REAL_ROOT,
+            workspaceRoot: REAL_ROOT,
+            boundAt: "2026-01-01T00:00:00.000Z",
+          },
+          reviewScoreHistory: [
+            {
+              stage: "impl-high-review",
+              score: 9,
+              attemptId: "attempt-published",
+              at: "2026-08-26T10:00:00.000Z",
+              blockerCount: 3,
+              taskFixableCount: 3,
+              blockers: [
+                { subject: "a", resolver: "task-fixable", category: "completion", origin: "reviewer" },
+                { subject: "b", resolver: "task-fixable", category: "completion", origin: "mechanical" },
+                { subject: "c", resolver: "task-fixable", category: "completion", origin: "mechanical" },
+              ],
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    await withHarness(async () => {
+      await writeReviewRunLogV1(
+        { kind: "completed", code: "completed", correlation: fakeCompletedCorrelation() },
+        {
+          extensionUri: vscode.Uri.file(REAL_ROOT),
+          folderUri,
+          workspaceUri: vscode.Uri.file(REAL_ROOT),
+          currentStage: "impl",
+          targetStage: "impl-high-review",
+          reviewUri: vscode.Uri.file(path.join(folderPath, "impl-high-review.md")),
+          variables: {},
+          reviewAttemptId: "attempt-published",
+        }
+      );
+    });
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs
+      .readdirSync(runsDir)
+      .sort()
+      .map((name) => fs.readFileSync(path.join(runsDir, name), "utf8"));
+    assert.equal(logs.length, 1);
+    assert.match(logs[0]!, /Status: completed \(completed\)/);
+    assert.match(logs[0]!, /Blockers: 3 problem\(s\) \(1 reviewer-reported, 2 mechanical\)/);
+  });
+
+  void it("a completed review's run log with no matching history entry omits the Blockers line", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("completed_runlog_no_history");
+    await withHarness(async () => {
+      await writeReviewRunLogV1(
+        { kind: "completed", code: "completed", correlation: fakeCompletedCorrelation() },
+        {
+          extensionUri: vscode.Uri.file(REAL_ROOT),
+          folderUri,
+          workspaceUri: vscode.Uri.file(REAL_ROOT),
+          currentStage: "impl",
+          targetStage: "impl-high-review",
+          reviewUri: vscode.Uri.file(path.join(folderPath, "impl-high-review.md")),
+          variables: {},
+          reviewAttemptId: "attempt-unmatched",
+        }
+      );
+    });
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs.readdirSync(runsDir).map((name) =>
+      fs.readFileSync(path.join(runsDir, name), "utf8")
+    );
+    assert.equal(logs.length, 1);
+    assert.doesNotMatch(logs[0]!, /Blockers:/);
   });
 
   // workflow 3 continuation (third item): `candidatesExhausted` (every

@@ -1,5 +1,6 @@
 import { BlockerSupersessionRecordV1, TaskStage } from "../types/taskProgress";
 import { ReviewBlocker, ReviewProgress, parseReviewProgress } from "./reviewReadiness";
+import { headingsV1, walkLinesV1 } from "./markdownStructure";
 
 /**
  * Shared evidence-normalization layer (wf10 items 18 / 7b) — the single place
@@ -96,16 +97,291 @@ export function filterSupersededBlockersV1(
   supersessions: readonly BlockerSupersessionRecordV1[] | undefined,
   reviewAsOfMs?: number
 ): ReviewBlocker[] {
-  if (!supersessions || supersessions.length === 0 || reviewAsOfMs === undefined) {
+  if (!supersessions || supersessions.length === 0) {
     return [...blockers];
   }
   const superseded = new Set(
     supersessions
-      .filter((entry) => entry.stage === stage && new Date(entry.supersededAt).getTime() > reviewAsOfMs)
+      .filter((entry) => {
+        if (entry.stage !== stage) {
+          return false;
+        }
+        // wf10 continuation item 18: a `"plan-non-goal"` record is a
+        // standing decision about the blocker's SUBJECT (the plan of record
+        // declares it out of scope), not a statement about one now-stale
+        // review artifact — unlike `"chat-confirmed"` below, it applies even
+        // to content produced THIS invocation (`reviewAsOfMs === undefined`).
+        // Safe to do unconditionally: the ONLY production caller that derives
+        // a plan-non-goal record (`derivePlanNonGoalSupersessionsV1`) does so
+        // from a match against THIS SAME round's blockers, so a record never
+        // exists here before the round it would suppress.
+        if ((entry.source ?? "chat-confirmed") === "plan-non-goal") {
+          return true;
+        }
+        // `"chat-confirmed"` (the default/absent case): only suppresses
+        // content that demonstrably PREDATES the resolution — see the
+        // doc comment above for why fresh review content must never be
+        // filtered by it.
+        return reviewAsOfMs !== undefined && new Date(entry.supersededAt).getTime() > reviewAsOfMs;
+      })
       .map((entry) => entry.blockerDescription.trim())
   );
   if (superseded.size === 0) {
     return [...blockers];
   }
   return blockers.filter((blocker) => !superseded.has(blocker.description.trim()));
+}
+
+/** One entry parsed from `plan-final.md`'s `## Accepted Non-Goals` section —
+ * see `parseAcceptedNonGoalsV1`. */
+export interface PlanNonGoalEntryV1 {
+  /** The entry's own sub-heading, or the `## Accepted Non-Goals` heading
+   * itself when the section has no sub-headings (a single flat write-up). */
+  readonly heading: string;
+  /** The entry's body text, used only for matching — never rendered. */
+  readonly bodyText: string;
+}
+
+/**
+ * Parse `plan-final.md`'s `## Accepted Non-Goals` section (wf10 continuation
+ * item 18) into one entry per sub-heading, or one entry for the whole section
+ * when it has none. Returns `[]` when the section is absent or empty — most
+ * plans, and every plan predating this feature.
+ */
+export function parseAcceptedNonGoalsV1(planContent: string): PlanNonGoalEntryV1[] {
+  const all = headingsV1(planContent);
+  const topIndex = all.findIndex((h) => h.title.trim().toLowerCase() === "accepted non-goals");
+  if (topIndex === -1) {
+    return [];
+  }
+  const top = all[topIndex]!;
+  const lines = walkLinesV1(planContent);
+  let sectionEnd = lines.length;
+  for (let i = topIndex + 1; i < all.length; i++) {
+    if (all[i]!.level <= top.level) {
+      sectionEnd = all[i]!.line;
+      break;
+    }
+  }
+  const subHeadings = all
+    .map((h, idx) => ({ h, idx }))
+    .filter(({ h, idx }) => idx > topIndex && h.line < sectionEnd && h.level > top.level);
+  const bodyBetween = (startLine: number, endLine: number): string =>
+    lines
+      .slice(startLine, endLine)
+      .map((l) => l.text)
+      .join("\n")
+      .trim();
+  if (subHeadings.length === 0) {
+    const bodyText = bodyBetween(top.line + 1, sectionEnd);
+    return bodyText ? [{ heading: top.title, bodyText }] : [];
+  }
+  const entries: PlanNonGoalEntryV1[] = [];
+  for (let i = 0; i < subHeadings.length; i++) {
+    const current = subHeadings[i]!;
+    let end = sectionEnd;
+    for (let j = current.idx + 1; j < all.length; j++) {
+      if (all[j]!.level <= current.h.level) {
+        end = all[j]!.line;
+        break;
+      }
+    }
+    const bodyText = bodyBetween(current.h.line + 1, end);
+    if (bodyText) {
+      entries.push({ heading: current.h.title, bodyText });
+    }
+  }
+  return entries;
+}
+
+const NON_GOAL_STOPWORDS_V1 = new Set([
+  "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "were",
+  "this", "that", "these", "those", "it", "its", "as", "by", "with", "at", "be", "been", "being",
+  "not", "never", "no", "which", "who", "what", "when", "where", "how", "will", "would", "can",
+  "could", "should", "still", "into", "than", "then", "so", "but", "if", "any", "all", "from",
+]);
+
+function nonGoalSignificantWordsV1(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]+/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 2 && !NON_GOAL_STOPWORDS_V1.has(word))
+  );
+}
+
+/** Fraction of `subject`'s significant words also present in `reference`.
+ * Asymmetric on purpose: a blocker's own description is short and specific,
+ * and should be near-fully covered by the (typically longer) non-goal
+ * write-up describing the same residual — the reverse is not required, since
+ * the write-up may add API citations, dates, and reasoning the blocker text
+ * never mentions. */
+function nonGoalCoverageV1(subject: string, reference: string): number {
+  const subjectWords = nonGoalSignificantWordsV1(subject);
+  if (subjectWords.size === 0) {
+    return 0;
+  }
+  const referenceWords = nonGoalSignificantWordsV1(reference);
+  let shared = 0;
+  for (const word of subjectWords) {
+    if (referenceWords.has(word)) {
+      shared++;
+    }
+  }
+  return shared / subjectWords.size;
+}
+
+/** How much of a blocker's own distinctive vocabulary must appear in a
+ * non-goal entry's body for the two to be treated as the same subject. */
+export const NON_GOAL_MATCH_THRESHOLD_V1 = 0.6;
+
+/** One blocker matched against an Accepted Non-Goals entry describing the
+ * same subject. */
+export interface PlanNonGoalMatchV1 {
+  readonly blocker: ReviewBlocker;
+  readonly nonGoalHeading: string;
+}
+
+/** Match each of `blockers` against `nonGoals`, keeping each blocker's
+ * best-scoring entry when it clears {@link NON_GOAL_MATCH_THRESHOLD_V1}. Pure
+ * and best-effort: a threshold-based match can miss a genuine match with
+ * unusually little shared vocabulary, or (much less likely, given the
+ * asymmetric coverage direction) fire on an unrelated blocker that happens to
+ * share enough generic terms — callers that persist a match
+ * (`derivePlanNonGoalSupersessionsV1`) always also record it as a visible
+ * `reviewerChallengedNonGoal` fact rather than silently trusting it forever.
+ */
+export function matchBlockersAgainstNonGoalsV1(
+  blockers: readonly ReviewBlocker[],
+  nonGoals: readonly PlanNonGoalEntryV1[]
+): PlanNonGoalMatchV1[] {
+  if (nonGoals.length === 0) {
+    return [];
+  }
+  const matches: PlanNonGoalMatchV1[] = [];
+  for (const blocker of blockers) {
+    let best: { heading: string; score: number } | undefined;
+    for (const entry of nonGoals) {
+      const score = nonGoalCoverageV1(blocker.description, entry.bodyText);
+      if (!best || score > best.score) {
+        best = { heading: entry.heading, score };
+      }
+    }
+    if (best && best.score >= NON_GOAL_MATCH_THRESHOLD_V1) {
+      matches.push({ blocker, nonGoalHeading: best.heading });
+    }
+  }
+  return matches;
+}
+
+/** Result of matching one round's blockers against the plan of record's
+ * Accepted Non-Goals section and reconciling against previously-derived
+ * supersession records — see `derivePlanNonGoalSupersessionsV1`. */
+export interface PlanNonGoalSupersessionResultV1 {
+  /** `blockers` with every matched blocker removed — the set every
+   * downstream consumer of this round (history, escalation, notices) should
+   * treat as this round's actual outstanding blockers. */
+  readonly effectiveBlockers: ReviewBlocker[];
+  /** Supersession records not already present in `existingSupersessions`,
+   * for the caller to persist alongside this round's other writes. */
+  readonly newSupersessions: readonly BlockerSupersessionRecordV1[];
+  /** Every match found this round, whether or not it was already known —
+   * a review re-raising a blocker the plan already declared out of scope is
+   * worth recording every time it happens, not only the first time
+   * (`ReviewScoreHistoryEntry.reviewerChallengedNonGoal`). */
+  readonly challenged: readonly PlanNonGoalMatchV1[];
+}
+
+/**
+ * wf10 continuation item 18: "when a review re-raises a blocker the plan
+ * declares out of scope, say so" — instead of the blocker silently vanishing
+ * (masking a possibly-still-live issue) or silently persisting forever
+ * (leaving the plan's decision unenforced). Matches this round's `blockers`
+ * against `planContent`'s `## Accepted Non-Goals` section
+ * ({@link parseAcceptedNonGoalsV1}, {@link matchBlockersAgainstNonGoalsV1}),
+ * derives any supersession records not already in `existingSupersessions`
+ * (deduped by exact blocker description within THIS stage), and returns the
+ * blocker set with every match removed alongside the full list of matches so
+ * the caller can record the disagreement even when it already knew about it.
+ *
+ * Pure — the caller persists `newSupersessions` and decides what to do with
+ * `challenged`.
+ */
+export function derivePlanNonGoalSupersessionsV1(
+  stage: TaskStage,
+  blockers: readonly ReviewBlocker[],
+  planContent: string,
+  existingSupersessions: readonly BlockerSupersessionRecordV1[] | undefined,
+  nowIso: string,
+  planRelPath = "plan-final.md"
+): PlanNonGoalSupersessionResultV1 {
+  const nonGoals = parseAcceptedNonGoalsV1(planContent);
+  const matches = matchBlockersAgainstNonGoalsV1(blockers, nonGoals);
+  if (matches.length === 0) {
+    return { effectiveBlockers: [...blockers], newSupersessions: [], challenged: [] };
+  }
+  const existingDescriptions = new Set(
+    (existingSupersessions ?? [])
+      .filter((entry) => entry.stage === stage && (entry.source ?? "chat-confirmed") === "plan-non-goal")
+      .map((entry) => entry.blockerDescription.trim())
+  );
+  const newSupersessions: BlockerSupersessionRecordV1[] = [];
+  const seenThisRound = new Set<string>();
+  for (const match of matches) {
+    const description = match.blocker.description.trim();
+    if (seenThisRound.has(description)) {
+      continue;
+    }
+    seenThisRound.add(description);
+    if (!existingDescriptions.has(description)) {
+      newSupersessions.push({
+        stage,
+        blockerDescription: description,
+        supersededAt: nowIso,
+        planRelPath,
+        source: "plan-non-goal",
+      });
+    }
+  }
+  const matchedDescriptions = new Set(matches.map((match) => match.blocker.description.trim()));
+  const effectiveBlockers = blockers.filter((blocker) => !matchedDescriptions.has(blocker.description.trim()));
+  return { effectiveBlockers, newSupersessions, challenged: matches };
+}
+
+/**
+ * Render `plan-final.md`'s parsed Accepted Non-Goals entries as the
+ * `{{acceptedNonGoals}}` review-prompt variable (wf10 continuation item 18).
+ * Always returns non-empty text — an absent section is stated explicitly
+ * rather than left as a silently-empty section in the rendered prompt.
+ */
+export function formatAcceptedNonGoalsVariableV1(nonGoals: readonly PlanNonGoalEntryV1[]): string {
+  if (nonGoals.length === 0) {
+    return "_No `## Accepted Non-Goals` section is recorded in the plan of record — nothing is declared out of scope for this review._";
+  }
+  return nonGoals.map((entry) => `### ${entry.heading}\n\n${entry.bodyText}`).join("\n\n");
+}
+
+/**
+ * Render this stage's standing `blockerSupersessions` (both
+ * `"chat-confirmed"` and `"plan-non-goal"`) as the `{{ownerDecisions}}`
+ * review-prompt variable (wf10 continuation item 18) — an explicit list of
+ * blockers the task owner (or the plan of record) has already resolved,
+ * given the same binding weight as the Accepted Non-Goals section. Always
+ * returns non-empty text.
+ */
+export function formatOwnerDecisionsVariableV1(
+  stage: TaskStage,
+  supersessions: readonly BlockerSupersessionRecordV1[] | undefined
+): string {
+  const relevant = (supersessions ?? []).filter((entry) => entry.stage === stage);
+  if (relevant.length === 0) {
+    return "_No standing owner decisions are recorded for this stage._";
+  }
+  return relevant
+    .map((entry) => {
+      const kind = (entry.source ?? "chat-confirmed") === "plan-non-goal" ? "plan non-goal" : "chat-confirmed";
+      return `- "${entry.blockerDescription}" — resolved (${kind}) on ${entry.supersededAt}`;
+    })
+    .join("\n");
 }

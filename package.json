@@ -361,6 +361,12 @@
         "icon": "$(eye)"
       },
       {
+        "command": "vs-code-ai-helper.openRetainedPrompt",
+        "title": "Open Retained Prompt",
+        "category": "Ensemble",
+        "icon": "$(file-code)"
+      },
+      {
         "command": "vs-code-ai-helper.markTaskDone",
         "title": "Complete Task",
         "category": "Ensemble",
@@ -1025,7 +1031,7 @@
             "properties": {
               "match": {
                 "type": "string",
-                "description": "Matched EXACTLY (not as a substring) against a failed check's full command line — e.g. \"npm run test\" for a root-level check, or \"[apps/server] npm run test\" for a monorepo member package. This entry never quarantines any other command or package."
+                "description": "Matched EXACTLY (not as a substring) against a failed check's full command line — e.g. \"npm run test\" for a root-level check, or \"[apps/server] npm run test\" for a monorepo member package. With scope \"exact\" (the default), this entry never quarantines any other command or package. With scope \"any-package\", it also matches every monorepo member's bracketed command sharing the same unprefixed text."
               },
               "failureSignature": {
                 "type": "string",
@@ -1034,6 +1040,15 @@
               "reason": {
                 "type": "string",
                 "description": "Shown next to the quarantined failure so it stays explainable."
+              },
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "exact",
+                  "any-package"
+                ],
+                "default": "exact",
+                "description": "\"exact\" (default): match must equal the full command line exactly. \"any-package\": match is compared with any leading \"[packageDir] \" monorepo prefix stripped, so one entry quarantines the same failure signature across every member package (and the root command)."
               }
             },
             "required": [
@@ -1044,7 +1059,7 @@
           },
           "default": [],
           "scope": "resource",
-          "markdownDescription": "Completion checks whose failure is a known, pre-existing environmental issue rather than a real regression. A failure is only quarantined when its command line EXACTLY matches `match` (not a substring — a monorepo member's command must include its `[packageDir]` prefix) and `failureSignature` is found in its output. The raw pass/fail result is never altered, only the modulo-known-flakes signal shown to reviewers."
+          "markdownDescription": "Completion checks whose failure is a known, pre-existing environmental issue rather than a real regression. A failure is only quarantined when its command line matches `match` (per `scope` — exactly by default, or with a monorepo `[packageDir]` prefix ignored when `scope` is `any-package`) and `failureSignature` is found in its output. The raw pass/fail result is never altered, only the modulo-known-flakes signal shown to reviewers."
         },
         "ensemble.reviewPlateauRounds": {
           "type": "integer",

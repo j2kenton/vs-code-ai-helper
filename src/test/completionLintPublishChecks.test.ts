@@ -37,6 +37,27 @@ import {
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { KnownFlakyCheck } from "../config/settings";
+
+/** Mirrors completionLintKnownFlakes.test.ts's helper of the same purpose —
+ * stubs the `ensemble.knownFlakyChecks` setting so renderCompletionChecksSection's
+ * (via upsertCompletionChecksReportV1) own `getKnownFlakyChecks()` read for the
+ * exact-scope-mismatch annotation is deterministic. */
+function stubKnownFlakyChecks(checks: KnownFlakyCheck[]): () => void {
+  const wsRecord = vscode.workspace as unknown as Record<string, unknown>;
+  const original = wsRecord.getConfiguration;
+  wsRecord.getConfiguration = (): {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    inspect: () => undefined;
+  } => ({
+    get: (key: string, defaultValue?: unknown): unknown =>
+      key === "knownFlakyChecks" ? checks : defaultValue,
+    inspect: (): undefined => undefined,
+  });
+  return () => {
+    wsRecord.getConfiguration = original;
+  };
+}
 
 const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
@@ -391,7 +412,14 @@ void describe("upsertCompletionChecksReportV1", () => {
         passed: false,
         passedModuloKnownFlakes: true,
         issueCount: 1,
-        failedChecks: [{ command: "npm run test", exitCode: 1, output: "EPERM: rmdir race" }],
+        failedChecks: [
+          {
+            command: "npm run test",
+            exitCode: 1,
+            output: "EPERM: rmdir race",
+            quarantine: { reason: "pre-existing cleanup race", ruleMatch: "npm run test" },
+          },
+        ],
         knownFlakeFailures: [{ command: "npm run test", exitCode: 1, reason: "pre-existing cleanup race" }],
       })
     );
@@ -401,6 +429,39 @@ void describe("upsertCompletionChecksReportV1", () => {
     assert.doesNotMatch(content, /Status: Failed/);
     // The quarantined failure stays fully visible in the body.
     assert.match(content, /known flake: pre-existing cleanup race/);
+  });
+
+  // Plan item 12, step 3: renderCompletionChecksSection (this file's
+  // persisted publish-review.md renderer) must give the same exact-scope
+  // guidance buildVerifiedChecksSection gives — the two must never disagree
+  // about why a monorepo-scoped failure sharing a signature with an
+  // exact-scope rule wasn't quarantined.
+  void it("annotates an unquarantined monorepo-scoped failure with the exact-scope mismatch reason", async () => {
+    const dir = makeWorkspace("publish-review-scope-mismatch", { name: "x" });
+    const restore = stubKnownFlakyChecks([
+      { match: "npm run test", failureSignature: "Vite optimizer collection race", reason: "Vite optimizer collection race" },
+    ]);
+    try {
+      await upsertCompletionChecksReportV1(
+        vscode.Uri.file(dir),
+        fakeResult({
+          passed: false,
+          passedModuloKnownFlakes: false,
+          issueCount: 1,
+          failedChecks: [
+            { command: "[apps/server] npm run test", exitCode: 1, output: "Vite optimizer collection race" },
+          ],
+          knownFlakeFailures: [],
+        })
+      );
+      const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+      assert.match(
+        content,
+        /not quarantined — rule `npm run test` is scope: exact; set scope: "any-package" or add `\[pkg\] npm run test`/
+      );
+    } finally {
+      restore();
+    }
   });
 
   void it("never renders a Plan Item Verification section — the AI-assisted pass is retired and gated off", async () => {

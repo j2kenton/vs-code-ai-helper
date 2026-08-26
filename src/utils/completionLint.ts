@@ -54,12 +54,97 @@ export interface PlanItemVerification {
   note?: string;
 }
 
+/**
+ * The known-flake quarantine decision for one failed check, computed exactly
+ * once (in `collectCompletionLint`, via `classifyKnownFlakeFailures`) and
+ * stamped directly onto that check's `failedChecks` entry. Every consumer
+ * that needs to know "was this quarantined?" — the two Verified/Completion
+ * Checks renderers and `synthesizeMechanicalBlockers` — reads this stamp via
+ * {@link isQuarantinedCheckV1} instead of independently re-deriving the
+ * answer by cross-referencing `knownFlakeFailures` against `command`/
+ * `exitCode`. A single stamped decision is what makes it structurally
+ * impossible for the display and the mechanical-blocker generator to
+ * disagree about the same failure (wf10 continuation item 12).
+ */
+export interface QuarantineStampV1 {
+  /** The `reason` of the known-flaky-check allowlist entry that matched. */
+  reason: string;
+  /** The `match` value of the allowlist entry that matched, for evidence. */
+  ruleMatch: string;
+}
+
+/** True when a failed check carries a quarantine stamp — the single source
+ * of truth every quarantine-aware renderer/generator must consult instead of
+ * re-deriving the decision. See {@link QuarantineStampV1}.
+ *
+ * Falls back to matching `check` against `result.knownFlakeFailures` by
+ * command+exitCode when no stamp is present — a persisted `lintPayload`
+ * written before the per-check stamp existed only carries the legacy flat
+ * `knownFlakeFailures` list, and without this fallback a strict re-read of
+ * that older payload would treat its known flakes as unquarantined again,
+ * reintroducing the exact phantom-blocker defect this stamp exists to fix
+ * (wf10 continuation item 12). */
+export function isQuarantinedCheckV1(
+  result: { knownFlakeFailures?: readonly { command: string; exitCode: number }[] },
+  check: { command: string; exitCode: number; quarantine?: QuarantineStampV1 }
+): boolean {
+  if (check.quarantine !== undefined) {
+    return true;
+  }
+  return (result.knownFlakeFailures ?? []).some(
+    (flake) => flake.command === check.command && flake.exitCode === check.exitCode
+  );
+}
+
+/** Resolve the quarantine reason text for a failed check, preferring its own
+ * stamp and falling back to the legacy `knownFlakeFailures` list by
+ * command+exitCode — same precedence as {@link isQuarantinedCheckV1}, so a
+ * check quarantined only via a pre-stamp persisted payload still renders
+ * with its reason instead of silently reading as an unexplained failure. */
+function resolveQuarantineReasonV1(
+  result: { knownFlakeFailures?: readonly { command: string; exitCode: number; reason: string }[] },
+  check: { command: string; exitCode: number; quarantine?: QuarantineStampV1 }
+): string | undefined {
+  if (check.quarantine) {
+    return check.quarantine.reason;
+  }
+  return (result.knownFlakeFailures ?? []).find(
+    (flake) => flake.command === check.command && flake.exitCode === check.exitCode
+  )?.reason;
+}
+
+/**
+ * Annotation shown next to an unquarantined failure that would have been
+ * quarantined under `scope: "any-package"` — computed fresh from the current
+ * known-flaky-check allowlist (never persisted; both renderers call this
+ * directly so they can never disagree). See {@link findExactScopeMismatchV1}
+ * and plan item 12, step 3.
+ */
+function describeScopeMismatchAnnotationV1(
+  check: { command: string; output: string },
+  knownFlakes: readonly KnownFlakyCheck[]
+): string | undefined {
+  const mismatch = findExactScopeMismatchV1(check, knownFlakes);
+  return mismatch
+    ? `not quarantined — rule \`${mismatch.match}\` is scope: exact; set scope: "any-package" or add \`[pkg] ${mismatch.match}\``
+    : undefined;
+}
+
 export interface CompletionLintResult {
   runAt: string;
   passed: boolean;
   summary: string;
   issueCount: number;
-  failedChecks: Array<{ command: string; exitCode: number; output: string; retryCount?: number }>;
+  failedChecks: Array<{
+    command: string;
+    exitCode: number;
+    output: string;
+    retryCount?: number;
+    /** Set once, at collection time, when this failure matched a configured
+     * known-flaky-check allowlist entry. See {@link QuarantineStampV1} and
+     * {@link isQuarantinedCheckV1}. */
+    quarantine?: QuarantineStampV1;
+  }>;
   /** Entries of `failedChecks` that also matched a configured known-flaky-
    * check allowlist entry (see settings.ts's `getKnownFlakyChecks`). `passed`
    * above is never adjusted for these — this is a separate, additive signal
@@ -1232,7 +1317,21 @@ export async function collectCompletionLint(
       `"scripts" to enable publish checks for them. Checks are inconclusive, not passed.)${retriedNote}`
     : `${baseSummary}${retriedNote}`;
   const knownFlakes = getKnownFlakyChecks();
-  const knownFlakeFailures = classifyKnownFlakeFailures(commandFailures, knownFlakes);
+  // Computed exactly once per failure, right here — `findQuarantineMatchV1`
+  // is called a single time per entry of `commandFailures`, and both
+  // `knownFlakeFailures` below and each `failedChecks` entry's `quarantine`
+  // stamp are derived from that same array of matches. A previous revision
+  // called `findQuarantineMatchV1` again, separately, while building
+  // `failedChecks` — functionally consistent (the function is deterministic)
+  // but two call sites computing "the same" decision is exactly the shape
+  // wf10 continuation item 12 exists to eliminate.
+  const quarantineMatches = commandFailures.map((failure) => ({
+    failure,
+    match: findQuarantineMatchV1(failure, knownFlakes),
+  }));
+  const knownFlakeFailures = quarantineMatches
+    .filter((entry) => entry.match !== undefined)
+    .map(({ failure, match }) => ({ command: failure.command, exitCode: failure.code, reason: match!.reason }));
   const unquarantinedFailureCount = commandFailures.length - knownFlakeFailures.length;
   return {
     runAt: new Date().toISOString(),
@@ -1244,22 +1343,25 @@ export async function collectCompletionLint(
       issues.length === 0 && unquarantinedFailureCount === 0 && missingScripts.length === 0,
     issueCount,
     summary,
-    failedChecks: commandFailures.map(({ command, code, output, retryCount }) => ({
-      command,
-      exitCode: code,
-      // Truncated at the PERSIST boundary, not just the display ones. This
-      // payload is written into task-progress.json, which is re-read and
-      // rewritten on every stage transition, so an untruncated failure makes
-      // a hot ~2.5 KB file enormous: one `pnpm run verify` failure carrying
-      // all 422 eslint warnings produced a 384 KB progress file
-      // (.ensemble/2026-07-24_task_1, 2026-08-08). truncateCheckOutput was
-      // already applied where output feeds prompts (PUBLISH_CHECKS_ and
-      // VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS) but never where it feeds
-      // storage. Head+tail is kept, so the fail-fast opening and the
-      // summarizing end both survive for runLintingFixes.
-      output: truncateCheckOutput(output, PERSISTED_CHECK_OUTPUT_MAX_CHARS),
-      ...(retryCount > 0 ? { retryCount } : {}),
-    })),
+    failedChecks: quarantineMatches.map(({ failure: { command, code, output, retryCount }, match: flake }) => {
+      return {
+        command,
+        exitCode: code,
+        // Truncated at the PERSIST boundary, not just the display ones. This
+        // payload is written into task-progress.json, which is re-read and
+        // rewritten on every stage transition, so an untruncated failure makes
+        // a hot ~2.5 KB file enormous: one `pnpm run verify` failure carrying
+        // all 422 eslint warnings produced a 384 KB progress file
+        // (.ensemble/2026-07-24_task_1, 2026-08-08). truncateCheckOutput was
+        // already applied where output feeds prompts (PUBLISH_CHECKS_ and
+        // VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS) but never where it feeds
+        // storage. Head+tail is kept, so the fail-fast opening and the
+        // summarizing end both survive for runLintingFixes.
+        output: truncateCheckOutput(output, PERSISTED_CHECK_OUTPUT_MAX_CHARS),
+        ...(retryCount > 0 ? { retryCount } : {}),
+        ...(flake ? { quarantine: { reason: flake.reason, ruleMatch: flake.match } } : {}),
+      };
+    }),
     knownFlakeFailures,
     retriedPasses,
     missingScripts,
@@ -1274,36 +1376,120 @@ export async function collectCompletionLint(
   };
 }
 
+/** The `[packageDir] ` prefix the monorepo recursive pass (above) prepends
+ * to a member package's command line, e.g. `[apps/server] npm run test`. */
+const MONOREPO_PACKAGE_PREFIX_RE = /^\[[^\]]+\]\s*/;
+
+/** Strip a monorepo member's `[packageDir] ` prefix, if present, so an
+ * `any-package`-scoped allowlist entry can match the bare command underneath
+ * regardless of which package produced it. A root-level command (no prefix)
+ * passes through unchanged. */
+function stripMonorepoPackagePrefixV1(command: string): string {
+  return command.replace(MONOREPO_PACKAGE_PREFIX_RE, "").trim();
+}
+
 /**
- * Match failed checks against the known-flaky-check allowlist. A failure is
- * quarantined only when BOTH `match` (against the command line) and
- * `failureSignature` (against the combined output) are found — deliberately
- * narrow so the allowlist can't accidentally swallow an unrelated real
- * failure that happens to share a command name.
+ * Find the known-flaky-check allowlist entry that quarantines one failed
+ * check, or `undefined` if none matches. A failure is quarantined only when
+ * BOTH `match` and `failureSignature` are found — deliberately narrow so the
+ * allowlist can't accidentally swallow an unrelated real failure that
+ * happens to share a command name.
  *
- * `match` is compared for EXACT equality against the failed command's line,
- * not a substring `includes` — a monorepo's per-package commands are already
- * disambiguated by their `[packageDir]` prefix (see the recursive pass
- * above), so a broad entry like `match: "npm run test"` (intended for one
- * package's cron suite) previously also swallowed every other package's
- * `[apps/server] npm run test`, `[apps/web] npm run test`, etc. — anything
- * whose command line merely contained that substring. Exact equality means
- * an entry can only ever quarantine the single command (and, for a monorepo
- * member, the single package) it actually names.
+ * `match` is compared against the failed command's line according to the
+ * entry's `scope` (default `"exact"`):
+ *  - `"exact"`: the command line must equal `match` exactly, not a substring
+ *    `includes` — a monorepo's per-package commands are already
+ *    disambiguated by their `[packageDir]` prefix (see the recursive pass
+ *    above), so a broad entry like `match: "npm run test"` (intended for one
+ *    package's cron suite) previously also swallowed every other package's
+ *    `[apps/server] npm run test`, `[apps/web] npm run test`, etc. — anything
+ *    whose command line merely contained that substring.
+ *  - `"any-package"`: `match` is compared against the command line with any
+ *    leading `[packageDir] ` prefix stripped, so one entry can deliberately
+ *    quarantine the same failure signature across every monorepo member
+ *    package (and the root command) without needing one entry per package.
+ *
+ * Private to this module — {@link classifyKnownFlakeFailures} and
+ * `collectCompletionLint`'s `failedChecks` stamping both call this exact
+ * function, which is what keeps their quarantine decisions in sync.
+ */
+function findQuarantineMatchV1(
+  failure: { command: string; output: string },
+  knownFlakes: readonly KnownFlakyCheck[]
+): KnownFlakyCheck | undefined {
+  const trimmedCommand = failure.command.trim();
+  const unscopedCommand = stripMonorepoPackagePrefixV1(failure.command);
+  return knownFlakes.find((entry) => {
+    if (!failure.output.includes(entry.failureSignature)) {
+      return false;
+    }
+    const trimmedMatch = entry.match.trim();
+    return entry.scope === "any-package"
+      ? unscopedCommand === trimmedMatch
+      : trimmedCommand === trimmedMatch;
+  });
+}
+
+/**
+ * Find the `scope: "exact"` (default) allowlist entry that would have
+ * quarantined this failure had it been `scope: "any-package"` instead — i.e.
+ * the failure's `[packageDir] `-prefixed command strips down to exactly
+ * `entry.match` and the failure signature matches, but the entry's exact
+ * scope requires the full, unstripped command line to equal `match`, which
+ * it does not. Returns `undefined` for a command with no monorepo prefix,
+ * or when {@link findQuarantineMatchV1} already quarantined the failure.
+ *
+ * Exists so both display renderers can tell a user WHY a failure that looks
+ * like a known flake was not quarantined, instead of leaving them to
+ * discover the exact/any-package distinction by reading source (plan item
+ * 12, step 3: "not quarantined — rule `X` is scope: exact; set scope:
+ * any-package or add `[pkg] X`").
+ */
+function findExactScopeMismatchV1(
+  failure: { command: string; output: string },
+  knownFlakes: readonly KnownFlakyCheck[]
+): KnownFlakyCheck | undefined {
+  const unscopedCommand = stripMonorepoPackagePrefixV1(failure.command);
+  if (unscopedCommand === failure.command.trim()) {
+    // No monorepo prefix on this command at all — an exact-scope entry
+    // either already matched it (handled by findQuarantineMatchV1) or is
+    // genuinely unrelated, not merely scope-mismatched.
+    return undefined;
+  }
+  return knownFlakes.find((entry) => {
+    if (entry.scope === "any-package") {
+      return false;
+    }
+    if (!failure.output.includes(entry.failureSignature)) {
+      return false;
+    }
+    return unscopedCommand === entry.match.trim();
+  });
+}
+
+/**
+ * Match failed checks against the known-flaky-check allowlist, returning one
+ * entry per quarantined failure with both the legacy flat shape
+ * (`command`/`exitCode`/`reason`) and the stamp {@link collectCompletionLint}
+ * attaches to that failure's `failedChecks` entry — the two are always in
+ * sync because both are derived from the same match, computed once here.
  *
  * @internal exported for testing
  */
 export function classifyKnownFlakeFailures(
   failures: readonly { command: string; code: number; output: string }[],
   knownFlakes: readonly KnownFlakyCheck[]
-): Array<{ command: string; exitCode: number; reason: string }> {
-  const quarantined: Array<{ command: string; exitCode: number; reason: string }> = [];
+): Array<{ command: string; exitCode: number; reason: string; quarantine: QuarantineStampV1 }> {
+  const quarantined: Array<{ command: string; exitCode: number; reason: string; quarantine: QuarantineStampV1 }> = [];
   for (const failure of failures) {
-    const flake = knownFlakes.find(
-      (entry) => failure.command.trim() === entry.match.trim() && failure.output.includes(entry.failureSignature)
-    );
+    const flake = findQuarantineMatchV1(failure, knownFlakes);
     if (flake) {
-      quarantined.push({ command: failure.command, exitCode: failure.code, reason: flake.reason });
+      quarantined.push({
+        command: failure.command,
+        exitCode: failure.code,
+        reason: flake.reason,
+        quarantine: { reason: flake.reason, ruleMatch: flake.match },
+      });
     }
   }
   return quarantined;
@@ -1515,9 +1701,10 @@ function renderCompletionChecksSection(
     }
   }
   if (result.failedChecks.length > 0) {
+    const knownFlakesForMismatch = getKnownFlakyChecks();
     lines.push("", "#### Failed checks");
     for (const check of result.failedChecks) {
-      const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
+      const flakeReason = resolveQuarantineReasonV1(result, check);
       const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
       // Omitted once the failure is a known, quarantined flake: for those the
       // retry count is not diagnostic evidence, it is noise that can actively
@@ -1525,10 +1712,15 @@ function renderCompletionChecksSection(
       // extension host, a cache-bypassed retry proves nothing" — the retry
       // ran anyway and "failed consistently" then reads as counter-evidence
       // to the very reason quarantining it).
-      const retryNote = check.retryCount && !flake ? ` — failed consistently across ${check.retryCount + 1} attempts (${check.retryCount} cache-bypassed retries)` : "";
+      const retryNote = check.retryCount && !flakeReason ? ` — failed consistently across ${check.retryCount + 1} attempts (${check.retryCount} cache-bypassed retries)` : "";
+      const scopeMismatchNote = !flakeReason
+        ? describeScopeMismatchAnnotationV1(check, knownFlakesForMismatch)
+        : undefined;
       lines.push(
         "",
-        `**${check.command}** (exit ${check.exitCode})${retryNote}${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
+        `**${check.command}** (exit ${check.exitCode})${retryNote}` +
+          `${flakeReason ? ` — _known flake: ${flakeReason}_` : ""}` +
+          `${scopeMismatchNote ? ` — _${scopeMismatchNote}_` : ""}`,
         "```",
         output,
         "```"
@@ -1597,9 +1789,12 @@ export function buildVerifiedChecksSection(
   // produce "Overall: One or more checks failed." immediately followed by
   // "No command failures." with nothing named — an unfalsifiable failure
   // signal, exactly what this block exists to eliminate.
-  const unquarantinedFailures = result.failedChecks.filter(
-    (check) => !knownFlakeFailures.some((f) => f.command === check.command && f.exitCode === check.exitCode)
-  );
+  //
+  // Filtered via the per-check `quarantine` stamp (isQuarantinedCheckV1),
+  // not by cross-referencing `knownFlakeFailures` by command/exitCode — the
+  // stamp is the single quarantine decision every consumer reads, so this
+  // list can never disagree with synthesizeMechanicalBlockers's.
+  const unquarantinedFailures = result.failedChecks.filter((check) => !isQuarantinedCheckV1(result, check));
   const retriedPasses = result.retriedPasses ?? [];
   const overall = unquarantinedFailures.length > 0
     ? "One or more checks failed."
@@ -1665,18 +1860,17 @@ export function buildVerifiedChecksSection(
     return lines.join("\n");
   }
   lines.push("", "### Command results");
+  const knownFlakesForMismatch = getKnownFlakyChecks();
   for (const check of result.failedChecks) {
-    const flake = knownFlakeFailures.find(
-      (f) => f.command === check.command && f.exitCode === check.exitCode
-    );
-    if (flake) {
+    const flakeReason = resolveQuarantineReasonV1(result, check);
+    if (flakeReason) {
       // No retry-count note here (see the sibling omission in
       // renderCompletionChecksSection above) — for a quarantined flake the
       // retry count is not diagnostic evidence, and can read as
       // counter-evidence to the recorded flake reason.
       lines.push(
         "",
-        `- **${check.command}** — exit ${check.exitCode}, **quarantined known flake**: ${flake.reason}. ` +
+        `- **${check.command}** — exit ${check.exitCode}, **quarantined known flake**: ${flakeReason}. ` +
           "This failure is excluded from the overall verdict above — do not treat it as an outstanding blocker."
       );
       continue;
@@ -1684,8 +1878,16 @@ export function buildVerifiedChecksSection(
     const retryNote = check.retryCount
       ? ` (failed consistently across ${check.retryCount + 1} attempts, ${check.retryCount} with the cache disabled)`
       : "";
+    const scopeMismatchNote = describeScopeMismatchAnnotationV1(check, knownFlakesForMismatch);
     const output = truncateCheckOutput(check.output, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS);
-    lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)${retryNote}`, "```", output, "```");
+    lines.push(
+      "",
+      `- **${check.command}** — exit ${check.exitCode} (FAILED)${retryNote}` +
+        `${scopeMismatchNote ? ` — _${scopeMismatchNote}_` : ""}`,
+      "```",
+      output,
+      "```"
+    );
   }
   return lines.join("\n");
 }
@@ -1702,25 +1904,30 @@ export function buildVerifiedChecksSection(
  * independent of whether the reviewer's free-text summary of it happens to
  * parse.
  *
- * Quarantined known-flake failures (`knownFlakeFailures`) are excluded,
- * mirroring `buildVerifiedChecksSection`'s own "excluded from the overall
- * verdict" treatment above — a quarantined flake must not synthesize a
- * blocker any more than it counts toward `passed`.
+ * Quarantined known-flake failures are excluded via the same
+ * {@link isQuarantinedCheckV1} stamp `buildVerifiedChecksSection` and
+ * `renderCompletionChecksSection` read — a quarantined flake must not
+ * synthesize a blocker any more than it counts toward `passed`, and it can
+ * never disagree with those renderers about which failures are quarantined
+ * (wf10 continuation item 12: a review that reported zero blockers
+ * previously still had three mechanical `task-fixable` blockers land in
+ * `reviewScoreHistory` because a monorepo-scoped failure quarantined for
+ * DISPLAY was not recognized as quarantined here).
  *
  * category/resolver are fixed at "completion"/"task-fixable": a failing repo
  * check is, by construction, something an implementation round can address
  * (fix what the command reports, then it passes), the same bucket a human
- * reviewer would file it under.
+ * reviewer would file it under. `origin: "mechanical"` distinguishes this
+ * from a blocker a reviewer actually raised in prose, in the durable record
+ * (`ReviewBlockerIdentity.origin`).
  */
 export function synthesizeMechanicalBlockers(result: CompletionLintResult): ReviewBlocker[] {
-  const knownFlakeFailures = result.knownFlakeFailures ?? [];
-  const unquarantinedFailures = result.failedChecks.filter(
-    (check) => !knownFlakeFailures.some((f) => f.command === check.command && f.exitCode === check.exitCode)
-  );
+  const unquarantinedFailures = result.failedChecks.filter((check) => !isQuarantinedCheckV1(result, check));
   return unquarantinedFailures.map((check) => ({
     category: "completion",
     resolver: "task-fixable",
     description: `\`${check.command}\` failed (exit ${check.exitCode}) — generated mechanically from Verified Checks`,
+    origin: "mechanical",
   }));
 }
 

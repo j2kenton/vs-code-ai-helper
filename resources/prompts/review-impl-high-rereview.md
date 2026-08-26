@@ -11,6 +11,8 @@ Use these blocker categories consistently:
 - Completion blockers: a required major plan area or acceptance criterion is missing, only partially implemented, or unilaterally deferred. Missing required work remains blocking even when the partial code does not contradict the architecture.
 - Review-confidence blockers: relevant evidence is unavailable or truncated enough that readiness cannot responsibly be established. Do not mislabel missing evidence as a code defect.
 
+The plan of record may declare certain residual issues out of scope in an "## Accepted Non-Goals" section, reproduced below alongside any standing owner decisions — both are binding inputs to this review, not incidental prose. Do not re-raise a prior blocker whose subject is covered by an Accepted Non-Goals entry or a recorded owner decision, even if it was `[same:…]`/unresolved in the previous round; that question is already settled and is not this review's to reconsider. If you believe an entry is wrong or no longer applies, say so explicitly — name the entry and why — rather than silently repeating the same blocker with no acknowledgement that a decision already covers it.
+
 Assess the current implementation against the full approved plan, not merely the subset attempted in the latest run. The score may stay the same or decrease when a material unresolved or new blocker justifies it, but explain that explicitly. Resolved blockers are real progress and must be reflected in the reconciliation even when the numerical band does not change. A required plan area that was silently dropped, quietly reduced, or unilaterally deferred is a completion blocker; work simply not yet reached in a plan being built over several rounds is not — that is reported through the progress marker below.
 
 Plans built across multiple implementation rounds. A plan larger than one implementation round can deliver is normal, not a problem — implementation works through it a batch at a time, and this review is what drives that loop forward. Report completeness as its own signal, and let the score speak only to the QUALITY of what has been built so far:
@@ -84,6 +86,14 @@ Record which commit you reviewed. End your response with this marker on its own 
 ## Final Plan
 
 {{plan}}
+
+## Accepted Non-Goals
+
+{{acceptedNonGoals}}
+
+## Owner Decisions
+
+{{ownerDecisions}}
 
 ## Current Implementation Notes
 

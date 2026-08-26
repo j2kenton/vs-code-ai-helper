@@ -55,6 +55,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import {
+  ImplementationDispatchModeV1,
   ImplRecoveryModeV1,
   ImplRecoveryTriggerV1,
   ImplRecoveryV1,
@@ -292,6 +293,20 @@ export interface ImplementationRecoveryInputV1 {
   /** Displayable reason the round's report was unusable. */
   readonly reason: string;
   /**
+   * What the triggering round was dispatched to work from. When
+   * `"apply-review"`, the claimed continuation must re-render from
+   * `apply-impl-review-code.md` with the original review content rather than
+   * reverting to a checklist-driven continuation (item 17b). Absent triggers
+   * treat the source as `"implementation"`.
+   */
+  readonly sourceDispatchMode?: ImplementationDispatchModeV1;
+  /**
+   * The review stage the triggering `"apply-review"` round was applying.
+   * Required alongside `sourceDispatchMode: "apply-review"` so the
+   * continuation can re-read the same review artifact.
+   */
+  readonly sourceReviewStage?: TaskStage;
+  /**
    * True when the triggering round was killed from outside (timeout,
    * inactivity kill, crash) instead of returning a final response — see
    * `ImplRecoveryModeEvidenceV1.terminatedExternally`. Part 7's timeout
@@ -401,6 +416,10 @@ export async function beginImplementationRecoveryV1(
       dispatch: "pending",
       at: new Date().toISOString(),
       ...(input.filesChangedUnknown ? { filesChangedUnknown: true } : {}),
+      ...(input.sourceDispatchMode ? { sourceDispatchMode: input.sourceDispatchMode } : {}),
+      ...(input.sourceDispatchMode === "apply-review" && input.sourceReviewStage
+        ? { sourceReviewStage: input.sourceReviewStage }
+        : {}),
       // The lease covers only the in-process hand-off to the continuation
       // chain; a cap-reached record gets none — nothing will ever fire it,
       // and a lease would just delay the sweep noticing it is parked.

@@ -47,14 +47,33 @@ export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
  * against the 115,000 assumed. 60000 restores a real margin at the observed
  * composition rather than a nominal one.
  *
- * This is a STOPGAP, not the fix. A hardcoded content cap cannot stay correct
- * while the non-content side grows independently — that is exactly the defect
- * recorded as item 9 of workflow 11 (`.ensemble/2026-08-24_task_1`): the
- * assembled input must be measured against the canonical limit before dispatch
- * and reduced until it fits, so this constant becomes a computed remainder
- * instead of a periodically re-guessed number.
+ * Lowered 60000 -> 30000 (2026-08-26, third live rejection — workflow 11's own
+ * impl-high review, run 027). Same shape as the previous two: the constant did
+ * not drift, the non-content side grew past it again. What moved this time was
+ * `impl-summary.md`, from 1,320 bytes to 44,140 in a single round, on top of a
+ * 73,859-byte `plan.md` and a 109,493-byte context pack. Nothing measures that
+ * sum, so nothing noticed.
+ *
+ * Derived from the rejection, as before — a 60000 cap was in force, so
+ *   non_content x 1.045 > 262144 - (60000 x 1.045)
+ *   non_content         > 190,855
+ * against the 150,855 floor the previous lowering was anchored to. Note this
+ * is a LOWER bound, not a measurement: the true figure is whatever the failed
+ * prompt actually weighed, which nothing retains. 30000 is chosen to leave
+ * margin for that uncertainty, not because 55000 would fail the arithmetic.
+ *
+ * TEMPORARY — delete this constant, do not re-tune it. It is the third guess
+ * at a number that is not knowable in advance, and each guess has held for
+ * about three weeks. The fix is item 9 of workflow 11
+ * (`.ensemble/2026-08-24_task_1`): measure the assembled input against the
+ * canonical limit BEFORE dispatch and shed content until it fits. When that
+ * lands, the budget for embedded file contents is a computed remainder and
+ * this constant has no reason to exist — remove it and its guard test rather
+ * than leaving a second, weaker limit in the path. Until then it is the only
+ * thing standing between a growing task and an undiagnosable
+ * `chatTransaction.chatTransactionRejected`.
  */
-export const IMPL_REVIEW_MAX_TOTAL_CHARS = 60000;
+export const IMPL_REVIEW_MAX_TOTAL_CHARS = 30000;
 
 /**
  * Workflow findings round 8, item 1 (fixes 1 and 5): the flat 8 KB

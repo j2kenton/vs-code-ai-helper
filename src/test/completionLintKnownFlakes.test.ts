@@ -14,7 +14,14 @@ import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
-import { buildVerifiedChecksSection, classifyKnownFlakeFailures, collectCompletionLint, CompletionLintResult } from "../utils/completionLint";
+import {
+  buildVerifiedChecksSection,
+  classifyKnownFlakeFailures,
+  collectCompletionLint,
+  CompletionLintResult,
+  isQuarantinedCheckV1,
+  synthesizeMechanicalBlockers,
+} from "../utils/completionLint";
 import { KnownFlakyCheck } from "../config/settings";
 
 const EPERM_FLAKE: KnownFlakyCheck = {
@@ -39,7 +46,14 @@ void describe("classifyKnownFlakeFailures", () => {
   void it("quarantines a failure matching both command and failure-signature substrings", () => {
     const failures = [{ command: "npm run test", code: 1, output: "Error: EPERM: operation not permitted, rmdir 'C:\\tmp\\x'" }];
     const result = classifyKnownFlakeFailures(failures, [EPERM_FLAKE]);
-    assert.deepStrictEqual(result, [{ command: "npm run test", exitCode: 1, reason: EPERM_FLAKE.reason }]);
+    assert.deepStrictEqual(result, [
+      {
+        command: "npm run test",
+        exitCode: 1,
+        reason: EPERM_FLAKE.reason,
+        quarantine: { reason: EPERM_FLAKE.reason, ruleMatch: EPERM_FLAKE.match },
+      },
+    ]);
   });
 
   void it("does not quarantine a failure that matches the command but not the failure signature", () => {
@@ -102,6 +116,59 @@ void describe("classifyKnownFlakeFailures", () => {
       { command: "[apps/server] npm run test", code: 1, output: "EPERM: cleanup race" },
     ];
     const result = classifyKnownFlakeFailures(failures, [rootOnlyFlake]);
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0]?.command, "npm run test");
+  });
+
+  // wf10 continuation item 12: the jester "trivial test-only task" incident —
+  // a single Vite optimizer collection race reproduced identically in the
+  // root command and all three monorepo member packages, but the workspace's
+  // `match: "npm run test"` rule (default scope "exact") quarantined only the
+  // root one, so the three scoped failures became phantom task-fixable
+  // blockers despite the review saying "None". scope: "any-package" is the
+  // opt-in fix: one entry covers the same signature across every package.
+  void it("scope 'any-package' quarantines the root command and every bracketed member command sharing the same signature", () => {
+    const anyPackageFlake: KnownFlakyCheck = {
+      match: "npm run test",
+      failureSignature: "Vite optimizer",
+      reason: "Vite optimizer collection race",
+      scope: "any-package",
+    };
+    const failures = [
+      { command: "npm run test", code: 1, output: "Vite optimizer collection race" },
+      { command: "[apps/dashboard] npm run test", code: 1, output: "Vite optimizer collection race" },
+      { command: "[apps/server] npm run test", code: 1, output: "Vite optimizer collection race" },
+      { command: "[apps/web] npm run test", code: 1, output: "Vite optimizer collection race" },
+    ];
+    const result = classifyKnownFlakeFailures(failures, [anyPackageFlake]);
+    assert.strictEqual(result.length, 4, "every package-scoped command sharing the signature must be quarantined");
+    assert.deepStrictEqual(
+      result.map((r) => r.command),
+      failures.map((f) => f.command)
+    );
+  });
+
+  void it("scope 'any-package' still requires the failure signature to match — a differing signature is not quarantined", () => {
+    const anyPackageFlake: KnownFlakyCheck = {
+      match: "npm run test",
+      failureSignature: "Vite optimizer",
+      reason: "Vite optimizer collection race",
+      scope: "any-package",
+    };
+    const failures = [
+      { command: "[apps/server] npm run test", code: 1, output: "AssertionError: expected 1 to equal 2" },
+    ];
+    assert.deepStrictEqual(classifyKnownFlakeFailures(failures, [anyPackageFlake]), []);
+  });
+
+  void it("scope 'exact' (the default) still passes with an unrelated monorepo command left unquarantined", () => {
+    // Regression guard: adding `scope` support must not change the default
+    // behavior for entries that don't set it.
+    const failures = [
+      { command: "npm run test", code: 1, output: "EPERM: cleanup race" },
+      { command: "[apps/server] npm run test", code: 1, output: "EPERM: cleanup race" },
+    ];
+    const result = classifyKnownFlakeFailures(failures, [EPERM_FLAKE]);
     assert.strictEqual(result.length, 1);
     assert.strictEqual(result[0]?.command, "npm run test");
   });
@@ -192,6 +259,34 @@ void describe("collectCompletionLint — passedModuloKnownFlakes (real command e
     }
   });
 
+  // wf10 continuation item 12's regression: the stamp collectCompletionLint
+  // attaches must be what every quarantine-aware consumer reads, so a fully
+  // quarantined real run can never disagree between the display and
+  // synthesizeMechanicalBlockers (both must report zero outstanding
+  // blockers, and the stamp itself must be present for the annotation).
+  void it("stamps the quarantined failedChecks entry, and synthesizeMechanicalBlockers agrees it produced zero blockers", async () => {
+    const dir = makeWorkspace(
+      "all-quarantined-stamped",
+      'node -e "console.error(\'Error: EPERM: operation not permitted, rmdir\'); process.exit(1)"'
+    );
+    const restore = stubKnownFlakyChecks([
+      { match: "npm run test", failureSignature: "EPERM", reason: "known cleanup race" },
+    ]);
+    try {
+      const result = await collectCompletionLint(dir, []);
+      assert.strictEqual(result.failedChecks.length, 1);
+      assert.strictEqual(isQuarantinedCheckV1(result, result.failedChecks[0]!), true, "the check itself must carry the stamp");
+      assert.strictEqual(result.failedChecks[0]?.quarantine?.reason, "known cleanup race");
+      assert.deepStrictEqual(
+        synthesizeMechanicalBlockers(result),
+        [],
+        "a stamped quarantine must never synthesize a mechanical blocker"
+      );
+    } finally {
+      restore();
+    }
+  });
+
   void it("is false when a real failure does NOT match the allowlist", async () => {
     const dir = makeWorkspace(
       "not-quarantined",
@@ -249,7 +344,14 @@ void describe("buildVerifiedChecksSection", () => {
       passed: false,
       passedModuloKnownFlakes: true,
       issueCount: 1,
-      failedChecks: [{ command: "npm run test", exitCode: 1, output: "EPERM: rmdir race" }],
+      failedChecks: [
+        {
+          command: "npm run test",
+          exitCode: 1,
+          output: "EPERM: rmdir race",
+          quarantine: { reason: EPERM_FLAKE.reason, ruleMatch: EPERM_FLAKE.match },
+        },
+      ],
       knownFlakeFailures: [{ command: "npm run test", exitCode: 1, reason: EPERM_FLAKE.reason }],
     });
     const section = buildVerifiedChecksSection(result);
@@ -259,6 +361,58 @@ void describe("buildVerifiedChecksSection", () => {
     // The raw failure's full command-result code block must not also render
     // for a quarantined failure — it's summarized inline instead.
     assert.doesNotMatch(section, /exit 1 \(FAILED\)/);
+  });
+
+  // Plan item 12, step 3: an unquarantined monorepo-scoped failure whose
+  // command would match under `scope: "any-package"` must tell the reviewer
+  // WHY it wasn't quarantined instead of rendering as an unexplained failure
+  // indistinguishable from a real regression.
+  void it("annotates an unquarantined monorepo-scoped failure with the exact-scope mismatch reason", () => {
+    const exactScopeFlake: KnownFlakyCheck = {
+      match: "npm run test",
+      failureSignature: "Vite optimizer collection race",
+      reason: "Vite optimizer collection race",
+    };
+    const restore = stubKnownFlakyChecks([exactScopeFlake]);
+    try {
+      const result = baseResult({
+        passed: false,
+        passedModuloKnownFlakes: false,
+        issueCount: 1,
+        failedChecks: [
+          { command: "[apps/server] npm run test", exitCode: 1, output: "Vite optimizer collection race" },
+        ],
+        knownFlakeFailures: [],
+      });
+      const section = buildVerifiedChecksSection(result);
+      assert.match(
+        section,
+        /not quarantined — rule `npm run test` is scope: exact; set scope: "any-package" or add `\[pkg\] npm run test`/
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  void it("does not annotate a failure that matches no allowlist entry at all, even with a scope mismatch check", () => {
+    const restore = stubKnownFlakyChecks([
+      { match: "npm run test", failureSignature: "Vite optimizer collection race", reason: "flake" },
+    ]);
+    try {
+      const result = baseResult({
+        passed: false,
+        passedModuloKnownFlakes: false,
+        issueCount: 1,
+        failedChecks: [
+          { command: "[apps/server] npm run lint", exitCode: 1, output: "AssertionError: expected 1 to equal 2" },
+        ],
+        knownFlakeFailures: [],
+      });
+      const section = buildVerifiedChecksSection(result);
+      assert.doesNotMatch(section, /not quarantined — rule/);
+    } finally {
+      restore();
+    }
   });
 
   void it("degrades gracefully when knownFlakeFailures/passedModuloKnownFlakes are absent (older/mocked result)", () => {

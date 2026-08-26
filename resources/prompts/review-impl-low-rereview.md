@@ -21,6 +21,8 @@ acceptance criterion, report the required behavior and actual behavior as a
 completion blocker unless the task records user approval. Implementation notes
 do not constitute that approval.
 
+The plan of record may declare certain residual issues out of scope in an "## Accepted Non-Goals" section, reproduced below alongside any standing owner decisions — both are binding inputs to this review, not incidental prose. Do not re-raise a prior blocker whose subject is covered by an Accepted Non-Goals entry or a recorded owner decision, even if it was `[same:…]`/unresolved in the previous round; that question is already settled and is not this review's to reconsider. If you believe an entry is wrong or no longer applies, say so explicitly — name the entry and why — rather than silently repeating the same blocker with no acknowledgement that a decision already covers it.
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
@@ -61,6 +63,14 @@ Record which commit you reviewed. End your response with this marker on its own 
 ## Final Plan
 
 {{plan}}
+
+## Accepted Non-Goals
+
+{{acceptedNonGoals}}
+
+## Owner Decisions
+
+{{ownerDecisions}}
 
 ## Current Implementation Notes
 

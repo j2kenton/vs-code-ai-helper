@@ -358,12 +358,32 @@ export function getPublishVerificationCommands(): string[] {
 
 /** One quarantined known-flaky-check entry — see getKnownFlakyChecks(). */
 export interface KnownFlakyCheck {
-  /** Substring matched against a failed check's command line. */
+  /**
+   * Matched against a failed check's command line — EXACTLY, not as a
+   * substring (see `scope` below for the one exception). A monorepo
+   * member's command carries a `[packageDir] ` prefix (e.g.
+   * `[apps/server] npm run test`); with the default `scope: "exact"`, an
+   * entry with `match: "npm run test"` matches ONLY the unprefixed
+   * root-level command, never any bracketed member command.
+   */
   match: string;
   /** Substring matched against that failed check's combined stdout/stderr. */
   failureSignature: string;
   /** Shown next to the quarantined failure so it stays explainable, not silent. */
   reason: string;
+  /**
+   * How `match` is compared against a failed command's line:
+   *  - `"exact"` (default): the command line must equal `match` exactly.
+   *  - `"any-package"`: `match` is compared with any leading
+   *    `[packageDir] ` monorepo prefix stripped from the command line first
+   *    — so one entry quarantines the same failure signature across every
+   *    member package (and the root command) instead of needing one entry
+   *    per package. Use this only when the SAME underlying flake genuinely
+   *    reproduces the same way in every package; a signature specific to
+   *    one package's suite should stay `"exact"` with the full
+   *    `[packageDir] ...` command as `match`.
+   */
+  scope?: "exact" | "any-package";
 }
 
 /**
@@ -388,8 +408,9 @@ export function getKnownFlakyChecks(): KnownFlakyCheck[] {
     const match = typeof entry.match === "string" ? entry.match.trim() : "";
     const failureSignature = typeof entry.failureSignature === "string" ? entry.failureSignature.trim() : "";
     const reason = typeof entry.reason === "string" ? entry.reason.trim() : "";
+    const scope = entry.scope === "any-package" ? "any-package" : "exact";
     if (match && failureSignature && reason) {
-      entries.push({ match, failureSignature, reason });
+      entries.push({ match, failureSignature, reason, ...(scope === "any-package" ? { scope } : {}) });
     }
   }
   return entries;

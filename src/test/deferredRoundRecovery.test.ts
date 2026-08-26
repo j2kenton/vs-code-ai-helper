@@ -700,8 +700,12 @@ function readRunLogs(folderPath: string): string[] {
   if (!fs.existsSync(runsDir)) {
     return [];
   }
+  // Run logs are ".md" files under runs/; item 17a's prompt manifest
+  // (".prompt-manifest.json") and retained prompt text (".prompt.txt") are
+  // written as siblings and are not run logs themselves.
   return fs
     .readdirSync(runsDir)
+    .filter((name) => name.endsWith(".md"))
     .sort()
     .map((name) => fs.readFileSync(path.join(runsDir, name), "utf8"));
 }
@@ -869,6 +873,67 @@ void describe("deferred/incomplete round recovery (end to end)", () => {
     assert.equal(
       run.dispatches.some((d) => d.chainId === "impl-continuation"),
       false
+    );
+  });
+});
+
+/**
+ * Item 17b / review blocker (2026-08-26, fail-closed correction):
+ * `deriveNextRecoverySourceV1` and the run-log `Mode:` line were already
+ * fixed to report a fallback honestly rather than falsely claiming
+ * apply-review ancestry — but honest reporting of a mode LOSS is not the
+ * same as preventing the loss. This end-to-end test drives the real
+ * `runImplementationWithAI` continuation branch (`reviewActions.ts`, the
+ * `applyReviewContinuationStage` block) against an `implRecovery` record
+ * whose `sourceDispatchMode` is `"apply-review"` but whose source review
+ * artifact is missing, and asserts the round refuses to run at all rather
+ * than silently downgrading to a checklist-driven Implementation round.
+ */
+void describe("Apply Review continuation reconstruction (item 17b, fail-closed)", () => {
+  void it("refuses to run under a lost apply-review mandate rather than silently downgrading to checklist-driven Implementation", async () => {
+    const { folderPath, progress } = makeTaskFolder("apply_review_continuation_lost", {
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-lost-review",
+        reason: "the provider's final response was cut short",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+        sourceDispatchMode: "apply-review",
+        sourceReviewStage: "impl-high-review",
+      },
+    });
+    // The source review artifact this continuation would need to re-render
+    // from is missing — the exact reconstruction failure the fail-closed fix
+    // must refuse under, rather than falling through to run-implementation.md.
+    fs.rmSync(path.join(folderPath, "impl-high-review.md"), { force: true });
+
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/should-not-run.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // The round must never have been dispatched under the wrong mandate.
+    assert.equal(run.prompts.length, 0, "the checklist-driven prompt must never be assembled");
+    assert.equal(readRunLogs(folderPath).length, 0, "no run log — the round never ran");
+
+    // The continuation stays owed, exactly as it was, for a retry once the
+    // review artifact is restored.
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.dispatch, "pending");
+    assert.equal(persisted?.implRecovery?.sourceDispatchMode, "apply-review");
+    assert.deepEqual(persisted?.pendingImplReviewFiles, ["src/newfile.ts"]);
+
+    // A warning names the reconstruction failure.
+    assert.ok(
+      run.notifications.some((n) => /could not be reconstructed/.test(n.message)),
+      `expected a reconstruction-failure warning; got: ${JSON.stringify(run.notifications)}`
     );
   });
 });

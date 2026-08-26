@@ -210,6 +210,11 @@ const ROUND_OUTCOME_CLASSIFICATIONS: ReadonlySet<string> = new Set([
   "cancelled",
   "rejected-degenerate",
 ]);
+const IMPLEMENTATION_DISPATCH_MODES: ReadonlySet<string> = new Set([
+  "implementation",
+  "apply-review",
+  "continuation",
+]);
 
 /** Bounded-representation limits for strict field validation. */
 const MAX_NAME_LENGTH = 4096;
@@ -565,7 +570,17 @@ function validateLintPayload(value: unknown): string | undefined {
       // wrote a progress file its own strict decoder then refused —
       // "unknown property \"retryCount\"" — leaving the task stuck needing
       // recovery. Observed 2026-08-08 on .ensemble/2026-07-24_task_1.
-      const checkAllowed = new Set(["command", "exitCode", "output", "retryCount"]);
+      //
+      // `quarantine` is completionLint.ts's per-check known-flake stamp
+      // (QuarantineStampV1, computed once in `collectCompletionLint`) and is
+      // persisted verbatim by `runCompletionLint`/`updateLintPayload`. It was
+      // missing here too, reproducing the exact same defect: a task whose
+      // publish checks include a quarantined known flake wrote a progress
+      // file its own strict decoder then refused to re-read (wf10
+      // continuation item 12, blocker: "quarantined failed-check stamps are
+      // persisted... even though the strict decoder rejects the
+      // `quarantine` property").
+      const checkAllowed = new Set(["command", "exitCode", "output", "retryCount", "quarantine"]);
       for (const key of Object.keys(check)) {
         if (!checkAllowed.has(key)) {
           return `lintPayload.failedChecks entry has an unknown property ${JSON.stringify(key)}`;
@@ -582,6 +597,24 @@ function validateLintPayload(value: unknown): string | undefined {
       }
       if (!boundedString(check["output"], MAX_CHECK_OUTPUT_LENGTH)) {
         return "lintPayload.failedChecks entry output must be a bounded string";
+      }
+      const quarantine = check["quarantine"];
+      if (quarantine !== undefined) {
+        if (!isPlainObject(quarantine)) {
+          return "lintPayload.failedChecks entry quarantine must be an object when present";
+        }
+        const quarantineAllowed = new Set(["reason", "ruleMatch"]);
+        for (const key of Object.keys(quarantine)) {
+          if (!quarantineAllowed.has(key)) {
+            return `lintPayload.failedChecks entry quarantine has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+        if (!boundedString(quarantine["reason"], MAX_SUMMARY_LENGTH)) {
+          return "lintPayload.failedChecks entry quarantine.reason must be a bounded string";
+        }
+        if (!boundedString(quarantine["ruleMatch"], MAX_SUMMARY_LENGTH)) {
+          return "lintPayload.failedChecks entry quarantine.ruleMatch must be a bounded string";
+        }
       }
     }
   }
@@ -620,6 +653,123 @@ function validateScheduledRun(
   return undefined;
 }
 
+/**
+ * Shared shape validation for a `ReviewBlockerIdentity[]` field, factored out
+ * so `reviewScoreHistory` entries' `blockers` and `supersededBlockers`
+ * (wf10 continuation item 18) validate identically instead of risking two
+ * independently-maintained copies of the same rules drifting apart.
+ * `fieldLabel` names the field in every returned message (e.g.
+ * `"reviewScoreHistory entry blocker"`).
+ */
+function validateBlockerIdentityListV1(value: unknown, fieldLabel: string): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
+    return `${fieldLabel}s must be a bounded array`;
+  }
+  for (const blocker of value as unknown[]) {
+    if (!isPlainObject(blocker)) {
+      return `${fieldLabel} entries must be objects`;
+    }
+    const allowedBlockerKeys = new Set([
+      "category",
+      "resolver",
+      "subject",
+      "id",
+      "lineage",
+      "description",
+      "origin",
+    ]);
+    for (const key of Object.keys(blocker)) {
+      if (!allowedBlockerKeys.has(key)) {
+        return `${fieldLabel} has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    for (const key of ["category", "resolver", "subject"] as const) {
+      const field = blocker[key];
+      if (typeof field !== "string" || field.length === 0 || field.length > 200) {
+        return `${fieldLabel} ${key} must be a bounded non-empty string`;
+      }
+    }
+    const id = blocker["id"];
+    if (id !== undefined && (typeof id !== "string" || id.length === 0 || id.length > MAX_ID_LENGTH)) {
+      return `${fieldLabel} id must be a bounded non-empty string`;
+    }
+    const description = blocker["description"];
+    if (
+      description !== undefined &&
+      (typeof description !== "string" || description.length === 0 || description.length > 500)
+    ) {
+      return `${fieldLabel} description must be a bounded non-empty string`;
+    }
+    const origin = blocker["origin"];
+    if (origin !== undefined && origin !== "reviewer" && origin !== "mechanical") {
+      return `${fieldLabel} origin must be reviewer or mechanical`;
+    }
+    const lineage = blocker["lineage"];
+    if (lineage !== undefined) {
+      if (!isPlainObject(lineage)) {
+        return `${fieldLabel} lineage must be an object`;
+      }
+      const kind = lineage["kind"];
+      if (kind === "new") {
+        const allowedLineageKeys = new Set(["kind"]);
+        for (const key of Object.keys(lineage)) {
+          if (!allowedLineageKeys.has(key)) {
+            return `${fieldLabel} lineage has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+      } else if (kind === "same" || kind === "narrowed") {
+        const allowedLineageKeys = new Set(["kind", "refId"]);
+        for (const key of Object.keys(lineage)) {
+          if (!allowedLineageKeys.has(key)) {
+            return `${fieldLabel} lineage has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+        const refId = lineage["refId"];
+        if (typeof refId !== "string" || refId.length === 0 || refId.length > MAX_ID_LENGTH) {
+          return `${fieldLabel} lineage refId must be a bounded non-empty string`;
+        }
+      } else {
+        return `${fieldLabel} lineage kind must be new, same, or narrowed`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Shape validation for `ReviewScoreHistoryEntry.reviewerChallengedNonGoal`
+ * (wf10 continuation item 18). */
+function validateReviewerChallengedNonGoalV1(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
+    return "reviewScoreHistory entry reviewerChallengedNonGoal must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entries must be objects";
+    }
+    const allowed = new Set(["blockerId", "nonGoalHeading"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `reviewScoreHistory entry reviewerChallengedNonGoal entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    const blockerId = entry["blockerId"];
+    if (
+      blockerId !== undefined &&
+      (typeof blockerId !== "string" || blockerId.length === 0 || blockerId.length > MAX_ID_LENGTH)
+    ) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entry blockerId must be a bounded non-empty string";
+    }
+    if (
+      typeof entry["nonGoalHeading"] !== "string" ||
+      entry["nonGoalHeading"].length === 0 ||
+      entry["nonGoalHeading"].length > 200
+    ) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entry nonGoalHeading must be a bounded non-empty string";
+    }
+  }
+  return undefined;
+}
+
 function validateReviewScoreHistory(
   value: unknown,
   family: TaskProgressFamilyV1
@@ -640,6 +790,8 @@ function validateReviewScoreHistory(
       "taskFixableCount",
       "blockers",
       "reviewer",
+      "supersededBlockers",
+      "reviewerChallengedNonGoal",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -671,71 +823,26 @@ function validateReviewScoreHistory(
     }
     const blockers = entry["blockers"];
     if (blockers !== undefined) {
-      if (!Array.isArray(blockers) || blockers.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
-        return "reviewScoreHistory entry blockers must be a bounded array";
+      const blockersError = validateBlockerIdentityListV1(blockers, "reviewScoreHistory entry blocker");
+      if (blockersError) {
+        return blockersError;
       }
-      for (const blocker of blockers as unknown[]) {
-        if (!isPlainObject(blocker)) {
-          return "reviewScoreHistory entry blockers entries must be objects";
-        }
-        const allowedBlockerKeys = new Set([
-          "category",
-          "resolver",
-          "subject",
-          "id",
-          "lineage",
-          "description",
-        ]);
-        for (const key of Object.keys(blocker)) {
-          if (!allowedBlockerKeys.has(key)) {
-            return `reviewScoreHistory entry blocker has an unknown property ${JSON.stringify(key)}`;
-          }
-        }
-        for (const key of ["category", "resolver", "subject"] as const) {
-          const field = blocker[key];
-          if (typeof field !== "string" || field.length === 0 || field.length > 200) {
-            return `reviewScoreHistory entry blocker ${key} must be a bounded non-empty string`;
-          }
-        }
-        const id = blocker["id"];
-        if (id !== undefined && (typeof id !== "string" || id.length === 0 || id.length > MAX_ID_LENGTH)) {
-          return "reviewScoreHistory entry blocker id must be a bounded non-empty string";
-        }
-        const description = blocker["description"];
-        if (
-          description !== undefined &&
-          (typeof description !== "string" || description.length === 0 || description.length > 500)
-        ) {
-          return "reviewScoreHistory entry blocker description must be a bounded non-empty string";
-        }
-        const lineage = blocker["lineage"];
-        if (lineage !== undefined) {
-          if (!isPlainObject(lineage)) {
-            return "reviewScoreHistory entry blocker lineage must be an object";
-          }
-          const kind = lineage["kind"];
-          if (kind === "new") {
-            const allowedLineageKeys = new Set(["kind"]);
-            for (const key of Object.keys(lineage)) {
-              if (!allowedLineageKeys.has(key)) {
-                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
-              }
-            }
-          } else if (kind === "same" || kind === "narrowed") {
-            const allowedLineageKeys = new Set(["kind", "refId"]);
-            for (const key of Object.keys(lineage)) {
-              if (!allowedLineageKeys.has(key)) {
-                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
-              }
-            }
-            const refId = lineage["refId"];
-            if (typeof refId !== "string" || refId.length === 0 || refId.length > MAX_ID_LENGTH) {
-              return "reviewScoreHistory entry blocker lineage refId must be a bounded non-empty string";
-            }
-          } else {
-            return "reviewScoreHistory entry blocker lineage kind must be new, same, or narrowed";
-          }
-        }
+    }
+    const supersededBlockers = entry["supersededBlockers"];
+    if (supersededBlockers !== undefined) {
+      const supersededBlockersError = validateBlockerIdentityListV1(
+        supersededBlockers,
+        "reviewScoreHistory entry supersededBlocker"
+      );
+      if (supersededBlockersError) {
+        return supersededBlockersError;
+      }
+    }
+    const reviewerChallengedNonGoal = entry["reviewerChallengedNonGoal"];
+    if (reviewerChallengedNonGoal !== undefined) {
+      const challengedError = validateReviewerChallengedNonGoalV1(reviewerChallengedNonGoal);
+      if (challengedError) {
+        return challengedError;
       }
     }
     const reviewer = entry["reviewer"];
@@ -812,7 +919,14 @@ function validateBlockerSupersessions(
     if (!isPlainObject(entry)) {
       return "blockerSupersessions entries must be objects";
     }
-    const allowed = new Set(["stage", "blockerDescription", "supersededAt", "planRelPath", "confirmingMessageAt"]);
+    const allowed = new Set([
+      "stage",
+      "blockerDescription",
+      "supersededAt",
+      "planRelPath",
+      "confirmingMessageAt",
+      "source",
+    ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
         return `blockerSupersessions entry has an unknown property ${JSON.stringify(key)}`;
@@ -841,6 +955,10 @@ function validateBlockerSupersessions(
     if (entry["confirmingMessageAt"] !== undefined && !isIsoTimestamp(entry["confirmingMessageAt"])) {
       return "blockerSupersessions entry confirmingMessageAt must be an ISO timestamp";
     }
+    const source = entry["source"];
+    if (source !== undefined && source !== "chat-confirmed" && source !== "plan-non-goal") {
+      return "blockerSupersessions entry source must be chat-confirmed or plan-non-goal";
+    }
   }
   return undefined;
 }
@@ -856,7 +974,15 @@ function validateRoundOutcomes(
     if (!isPlainObject(entry)) {
       return "roundOutcomes entries must be objects";
     }
-    const allowed = new Set(["stage", "classification", "at", "attemptId", "modelId", "providerId"]);
+    const allowed = new Set([
+      "stage",
+      "classification",
+      "at",
+      "attemptId",
+      "modelId",
+      "providerId",
+      "dispatchMode",
+    ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
         return `roundOutcomes entry has an unknown property ${JSON.stringify(key)}`;
@@ -900,6 +1026,13 @@ function validateRoundOutcomes(
       ) {
         return "roundOutcomes entry providerId must be a bounded non-empty string";
       }
+    }
+    if (
+      entry["dispatchMode"] !== undefined &&
+      (typeof entry["dispatchMode"] !== "string" ||
+        !IMPLEMENTATION_DISPATCH_MODES.has(entry["dispatchMode"]))
+    ) {
+      return "roundOutcomes entry dispatchMode must be a recognized dispatch mode";
     }
   }
   return undefined;
@@ -971,7 +1104,10 @@ const IMPL_RECOVERY_DISPATCH_STATES: ReadonlySet<string> = new Set([
   "dispatched",
 ]);
 
-function validateImplRecovery(value: unknown): string | undefined {
+function validateImplRecovery(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
   if (!isPlainObject(value)) {
     return "implRecovery must be an object";
   }
@@ -986,6 +1122,8 @@ function validateImplRecovery(value: unknown): string | undefined {
     "attemptId",
     "leaseOwner",
     "leaseUntil",
+    "sourceDispatchMode",
+    "sourceReviewStage",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1045,6 +1183,20 @@ function validateImplRecovery(value: unknown): string | undefined {
   }
   if (value["leaseUntil"] !== undefined && !isIsoTimestamp(value["leaseUntil"])) {
     return "implRecovery.leaseUntil must be an ISO timestamp when present";
+  }
+  if (
+    value["sourceDispatchMode"] !== undefined &&
+    (typeof value["sourceDispatchMode"] !== "string" ||
+      !IMPLEMENTATION_DISPATCH_MODES.has(value["sourceDispatchMode"]))
+  ) {
+    return "implRecovery.sourceDispatchMode must be a recognized dispatch mode when present";
+  }
+  if (
+    value["sourceReviewStage"] !== undefined &&
+    (typeof value["sourceReviewStage"] !== "string" ||
+      resolveStage(value["sourceReviewStage"], family) === undefined)
+  ) {
+    return "implRecovery.sourceReviewStage must be a recognized stage when present";
   }
   return undefined;
 }
@@ -1690,7 +1842,7 @@ export function decodeTaskProgressTextV1(
         break;
       }
       case "implRecovery": {
-        const error = validateImplRecovery(value);
+        const error = validateImplRecovery(value, family);
         if (error !== undefined) {
           return recovery("invalidFieldValue", error);
         }

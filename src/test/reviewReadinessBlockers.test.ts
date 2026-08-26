@@ -30,8 +30,8 @@ void describe("parseReviewBlockers", () => {
     ].join("\n");
     const blockers = parseReviewBlockers(content);
     assert.deepStrictEqual(blockers, [
-      { category: "completion", resolver: "task-fixable", description: "missing redo command-level tests" },
-      { category: "review-confidence", resolver: "environmental", description: "Windows EPERM temp-dir cleanup race" },
+      { category: "completion", resolver: "task-fixable", description: "missing redo command-level tests", origin: "reviewer" },
+      { category: "review-confidence", resolver: "environmental", description: "Windows EPERM temp-dir cleanup race", origin: "reviewer" },
     ]);
   });
 
@@ -42,7 +42,7 @@ void describe("parseReviewBlockers", () => {
       "<!-- blockers:end -->",
     ].join("\n");
     assert.deepStrictEqual(parseReviewBlockers(content), [
-      { category: "completion", resolver: "task-fixable", description: "example" },
+      { category: "completion", resolver: "task-fixable", description: "example", origin: "reviewer" },
     ]);
   });
 
@@ -56,7 +56,7 @@ void describe("parseReviewBlockers", () => {
       "<!-- blockers:end -->",
     ].join("\n");
     assert.deepStrictEqual(parseReviewBlockers(content), [
-      { category: "completion", resolver: "task-fixable", description: "the one valid line" },
+      { category: "completion", resolver: "task-fixable", description: "the one valid line", origin: "reviewer" },
     ]);
   });
 
@@ -75,7 +75,7 @@ void describe("parseReviewBlockers", () => {
       "<!-- blockers:end -->",
     ].join("\n");
     assert.deepStrictEqual(parseReviewBlockers(content), [
-      { category: "shipping", resolver: "task-fixable", description: "leftover debug console.log in commitAndPushTask.ts" },
+      { category: "shipping", resolver: "task-fixable", description: "leftover debug console.log in commitAndPushTask.ts", origin: "reviewer" },
     ]);
   });
 
@@ -228,7 +228,7 @@ void describe("parseReviewBlockersDetailed.malformedLines (fail-closed)", () => 
     ].join("\n");
     const evidence = parseReviewBlockersDetailed(content);
     assert.deepStrictEqual(evidence.blockers, [
-      { category: "completion", resolver: "task-fixable", description: "the one valid line" },
+      { category: "completion", resolver: "task-fixable", description: "the one valid line", origin: "reviewer" },
     ]);
     assert.deepStrictEqual(evidence.malformedLines, ["- this is not a blocker line at all"]);
     assert.strictEqual(hasZeroTaskFixableEvidence(content), false);

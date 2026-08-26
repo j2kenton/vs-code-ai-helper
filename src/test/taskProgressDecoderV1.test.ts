@@ -133,6 +133,81 @@ void describe("taskProgressDecoderV1", () => {
     expectRecovery(doc({ ensembleProgressVersion: 1, roundOutcomes: { not: "an array" } }), "invalidFieldValue");
   });
 
+  void it("decodes a roundOutcomes entry's optional dispatchMode and fails closed on an unrecognized value (item 17a — Part 2 step 6)", () => {
+    const valid = {
+      stage: "impl",
+      classification: "edits-produced",
+      at: "2026-07-02T11:00:00.000Z",
+      dispatchMode: "apply-review",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [valid] })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.roundOutcomes, [valid]);
+    }
+    // Entries written before this field existed decode fine without it.
+    const withoutField = { ...valid };
+    delete (withoutField as Record<string, unknown>)["dispatchMode"];
+    const resultWithout = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [withoutField] })
+    );
+    assert.equal(resultWithout.ok, true);
+    if (resultWithout.ok) {
+      assert.deepEqual(resultWithout.decoded.progress.roundOutcomes, [withoutField]);
+    }
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [{ ...valid, dispatchMode: "bogus" }] }),
+      "invalidFieldValue"
+    );
+  });
+
+  void it("decodes implRecovery's optional sourceDispatchMode/sourceReviewStage and fails closed on unrecognized values (item 17b — Part 2 step 6)", () => {
+    const base = {
+      sourceAttemptId: "impl-recovery-1",
+      reason: "the provider returned no usable summary",
+      trigger: "summaryRejected",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-07-02T11:00:00.000Z",
+    };
+    const withApplyReviewSource = {
+      ...base,
+      sourceDispatchMode: "apply-review",
+      sourceReviewStage: "impl-high-review",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, implRecovery: withApplyReviewSource })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.implRecovery, withApplyReviewSource);
+    }
+    // A record written before this field existed decodes fine without it.
+    const resultWithout = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, implRecovery: base })
+    );
+    assert.equal(resultWithout.ok, true);
+    if (resultWithout.ok) {
+      assert.deepEqual(resultWithout.decoded.progress.implRecovery, base);
+    }
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        implRecovery: { ...base, sourceDispatchMode: "bogus" },
+      }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        implRecovery: { ...base, sourceDispatchMode: "apply-review", sourceReviewStage: "bogus" },
+      }),
+      "invalidFieldValue"
+    );
+  });
+
   void it("decodes reviewScoreHistory entries with a reviewer identity and fails closed on malformed shapes (workflow-2 item 7)", () => {
     const valid = {
       stage: "impl-high-review",
@@ -172,6 +247,40 @@ void describe("taskProgressDecoderV1", () => {
     );
     expectRecovery(
       doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...valid, reviewer: "not-an-object" }] }),
+      "invalidFieldValue"
+    );
+  });
+
+  void it("decodes a reviewScoreHistory blocker's origin (reviewer/mechanical) and fails closed on a bogus value (wf10 continuation item 12)", () => {
+    const withOrigin = {
+      stage: "impl-high-review",
+      score: 6,
+      attemptId: "attempt-1",
+      at: "2026-08-26T11:00:00.000Z",
+      blockerCount: 1,
+      taskFixableCount: 1,
+      blockers: [
+        { category: "completion", resolver: "task-fixable", subject: "npm run test", origin: "mechanical" },
+      ],
+    };
+    const result = decodeTaskProgressTextV1(doc({ ensembleProgressVersion: 1, reviewScoreHistory: [withOrigin] }));
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.reviewScoreHistory, [withOrigin]);
+    }
+    // Legacy blockers with no origin still decode cleanly.
+    const legacyBlockers = [{ category: "completion", resolver: "task-fixable", subject: "npm run test" }];
+    const legacyResult = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...withOrigin, blockers: legacyBlockers }] })
+    );
+    assert.equal(legacyResult.ok, true);
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        reviewScoreHistory: [
+          { ...withOrigin, blockers: [{ ...withOrigin.blockers[0], origin: "ai" }] },
+        ],
+      }),
       "invalidFieldValue"
     );
   });

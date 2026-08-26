@@ -42,6 +42,8 @@ Distinguish:
 - Completion blockers: required major work or acceptance criteria remain incomplete.
 - Review-confidence blockers: relevant evidence is unavailable or truncated enough that readiness cannot responsibly be established.
 
+The plan of record may declare certain residual issues out of scope in an "## Accepted Non-Goals" section, reproduced below alongside any standing owner decisions — both are binding inputs to this review, not incidental prose. Do not report a blocker whose subject is covered by an Accepted Non-Goals entry or a recorded owner decision; those questions are already settled and are not this review's to reconsider. If you believe an entry is wrong or no longer applies, say so explicitly in your verdict — name the entry and why — rather than silently re-raising the same blocker with no acknowledgement that a decision already covers it.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:
@@ -72,6 +74,14 @@ Record which commit you reviewed. End your response with this marker on its own 
 ## Final Plan
 
 {{plan}}
+
+## Accepted Non-Goals
+
+{{acceptedNonGoals}}
+
+## Owner Decisions
+
+{{ownerDecisions}}
 
 ## Implementation Notes
 

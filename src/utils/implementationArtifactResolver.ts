@@ -359,7 +359,17 @@ const DEFERRAL_PHRASES_V1: readonly RegExp[] = [
   // No leading "still": round 010's "is running in the background" carried
   // the identical meaning and slipped past the stricter form.
   /\brunning in the background\b/i,
-  /\bwaiting (?:for|on) the background\b/i,
+  // `wait(?:ing)?`, not just `waiting`: wf10 continuation item 17's run 122
+  // wrote "I'll pause here and wait for the background test run to
+  // complete" — present tense, not the gerund the original pattern required
+  // — and slipped past this exact list.
+  /\bwait(?:ing)? (?:for|on) the background\b/i,
+  // Same round: "the completion notification will resume this task
+  // automatically" — a third-person promise of a follow-up turn, distinct
+  // from the first-person "I'll resume/continue/…" phrasing above, and the
+  // one the model actually used when deferring to a notification it
+  // (wrongly) believed would fire.
+  /\bcompletion notification will resume\b/i,
 ];
 
 /**

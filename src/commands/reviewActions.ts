@@ -21,6 +21,7 @@ import {
   isPlanReviewStage,
   isReviewStage,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  MAX_REVIEW_BLOCKER_IDENTITIES,
   PLAN_FILENAME,
   PLAN_REVIEW_STAGES,
   REVIEW_STAGES,
@@ -31,6 +32,8 @@ import {
 } from "../types/taskProgress";
 import {
   BlockerSupersessionRecordV1,
+  ImplementationDispatchModeV1,
+  ReviewBlockerIdentity,
   ReviewScoreHistoryEntry,
   RoundOutcomeClassificationV1,
   TaskEscalation,
@@ -38,6 +41,7 @@ import {
 } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import {
+  appendBlockerSupersession,
   appendOverriddenEscalation,
   appendReviewRejection,
   appendReviewScoreHistory,
@@ -53,6 +57,13 @@ import {
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
 import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
+import {
+  deriveCurrentDispatchModeV1,
+  deriveNextRecoverySourceV1,
+  formatRunLogModeHeaderV1,
+  shouldContinueAsApplyReviewV1,
+} from "../utils/implementationDispatchModeV1";
+import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
 import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   computeDegenerateReviewEpisodeModelIdsV1,
@@ -165,7 +176,8 @@ import {
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
-import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { appendChatMessageV1, readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
   createProductionTaskActionCoordinatorV1,
@@ -231,7 +243,14 @@ import {
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
-import { filterSupersededBlockersV1 } from "../utils/reviewEvidenceNormalizerV1";
+import {
+  derivePlanNonGoalSupersessionsV1,
+  filterSupersededBlockersV1,
+  formatAcceptedNonGoalsVariableV1,
+  formatOwnerDecisionsVariableV1,
+  parseAcceptedNonGoalsV1,
+  PlanNonGoalSupersessionResultV1,
+} from "../utils/reviewEvidenceNormalizerV1";
 import {
   checkPublishChecksFreshnessV1,
   describePublishChecksFreshnessFailureV1,
@@ -245,11 +264,14 @@ import {
   recordTaskImplementationBaselineShaIfAbsentV1,
 } from "../utils/taskImplementationBaselineV1";
 import {
+  blockerIdentity,
   buildChurnEscalationReasonV1,
+  chooseAutomaticImplementationDispatchV1,
   classifyChurnLineageV1,
   decidePostReviewActionV1,
   decideReviewRoute,
   degenerateReviewRejectionReason,
+  describeTaskFixableBlockersV1,
   IMPL_REVIEW_STAGES_V1,
   detectBlockerSetStall,
   detectPlateau,
@@ -625,6 +647,25 @@ interface ExecuteImplementationRunOptions {
    * lifecycle (plan §5.5 / AC-PREFLIGHT-04).
    */
   chatViewProvider?: ChatViewProvider;
+  /**
+   * Prompt template name and the raw variables it was rendered from (item
+   * 17a's prompt manifest — Part 2 step 7), so the manifest written beside
+   * the run log records real per-variable sizes/hashes instead of a single
+   * opaque prompt blob. Absent for any caller that has not been updated to
+   * supply it; the manifest then falls back to one pseudo-variable
+   * covering the whole dispatched prompt.
+   */
+  templateName?: string;
+  templateVariables?: Record<string, string>;
+  /**
+   * The stable identities of the blockers this round is being dispatched to
+   * address — set only for an apply-review dispatch (fresh or a continuation
+   * that re-rendered from the review), never for a checklist-driven round
+   * (Part 2 step 5: "list the blocker ids handed to it"). Recorded in the run
+   * log's `Mode:` header so the automatic loop's dispatch choices stay
+   * auditable against what the reviewer actually reported.
+   */
+  dispatchedBlockerIds?: readonly ReviewBlockerIdentity[];
 }
 
 /**
@@ -1265,6 +1306,30 @@ async function readStandingImplBlockersV1(
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The stable identities (with `id`, when assigned) of the newest review's
+ * blockers for ONE specific stage — the blocker ids an Apply Review round is
+ * actually being handed, for the run-log record (Part 2 step 5's still-open
+ * requirement: "list the blocker ids handed to it"). Unlike
+ * `readStandingImplBlockersV1`, this does not search across every impl-review
+ * stage for the newest entry — the caller already knows which review this
+ * round is applying, so it asks for that stage precisely. Best-effort: a
+ * failure to read history must never block or alter the round itself, only
+ * leave the run log's blocker list empty.
+ */
+async function blockerIdentitiesHandedToApplyReviewV1(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<ReviewBlockerIdentity[]> {
+  try {
+    const history = (await readTaskProgressAdvisoryV1(taskFolderUri))?.reviewScoreHistory ?? [];
+    const latest = history.filter((entry) => entry.stage === stage).at(-1);
+    return latest?.blockers ?? [];
+  } catch {
+    return [];
   }
 }
 
@@ -2050,6 +2115,29 @@ function getMechanicalBlockersForStage(folderUri: vscode.Uri, targetStage: TaskS
 }
 
 /**
+ * The shared "clean round" veto: a mechanically-synthesized task-fixable
+ * blocker (an unquarantined failed Verified Check — see
+ * `synthesizeMechanicalBlockers`) always overrides the reviewer's own
+ * zero-fixable evidence to `false`, regardless of what the reviewer's prose
+ * says. Used identically for the pre-loop baseline (the review that already
+ * produced `baselineScore`) and every in-loop round in
+ * `fastForwardReviewWithAI`, so both share one definition of "zero-fixable"
+ * — a failing check quarantined via `isQuarantinedCheckV1` never reaches
+ * here (`synthesizeMechanicalBlockers` already filters it out), so a fully
+ * quarantined run leaves this veto untouched and defers to the reviewer's
+ * own evidence.
+ *
+ * @internal exported for testing
+ */
+export function resolveZeroFixableEvidenceV1(
+  mechanicalBlockers: readonly ReviewBlocker[],
+  reviewContent: string
+): boolean {
+  const hasMechanicalTaskFixable = mechanicalBlockers.some((b) => b.resolver === "task-fixable");
+  return hasMechanicalTaskFixable ? false : hasZeroTaskFixableEvidence(reviewContent);
+}
+
+/**
  * Reconcile a plateaued primary review against one second-opinion round.
  * Deliberately never lets the second opinion advance the task on its own —
  * a friendlier fallback model unilaterally clearing work its primary
@@ -2223,7 +2311,34 @@ export async function handleReviewRoutingOutcome(options: {
     // A supersession can only ever suppress a STALE, previously-persisted
     // review artifact a decision surface reads later (`reconcilePlanChecklist.ts`),
     // never this round's own live output.
-    const blockers = parsedBlockers;
+    //
+    // wf10 continuation item 18: a `"plan-non-goal"` supersession is exactly
+    // the opposite kind of fact — a standing decision about the blocker's
+    // SUBJECT (the plan of record declares it out of scope), not a statement
+    // about a stale artifact — so it is correct, and required, to apply it to
+    // THIS round's own fresh blockers below. Scoped to the impl review
+    // stages: `plan-final.md`'s `## Accepted Non-Goals` section is the impl
+    // plan of record, with no equivalent for a plan review (which reviews
+    // `plan.md`, before promotion to `plan-final.md`).
+    let planNonGoalResult: PlanNonGoalSupersessionResultV1 | undefined;
+    if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      try {
+        const planFinalContent = (await readPlanOfRecordV1(folderUri)).text;
+        if (planFinalContent) {
+          planNonGoalResult = derivePlanNonGoalSupersessionsV1(
+            targetStage,
+            parsedBlockers,
+            planFinalContent,
+            progressBefore.blockerSupersessions,
+            new Date().toISOString()
+          );
+        }
+      } catch {
+        // Best-effort only — a read failure here must never block the round
+        // from recording its review normally with the unfiltered blockers.
+      }
+    }
+    const blockers = planNonGoalResult?.effectiveBlockers ?? parsedBlockers;
     // 2d: a round with no parseable `Readiness: N/10` line is a failure
     // wearing a review's clothes — a provider error, truncation, or
     // degenerate output. It must NOT be appended to reviewScoreHistory:
@@ -2379,6 +2494,21 @@ export async function handleReviewRoutingOutcome(options: {
     const priorEntryForStage = [...(progressBefore.reviewScoreHistory ?? [])]
       .reverse()
       .find((entry) => entry.stage === targetStage);
+    // wf10 continuation item 18: identities for blockers this round EXCLUDED
+    // for matching an Accepted Non-Goals entry — never fed through
+    // `resolveBlockerLineageV1` (they are not in `blockers`, so they have no
+    // place in next round's prior-list citation), given a distinct id
+    // namespace (`-ng-`) so it can never collide with a same-round citable id.
+    // Capped identically to `resolveBlockerLineageV1`'s own slice so a
+    // pathological match count can never fail the strict decoder's bound on
+    // write — sliced once so `supersededBlockers` and
+    // `reviewerChallengedNonGoal` below stay index-aligned.
+    const challengedMatches = (planNonGoalResult?.challenged ?? []).slice(0, MAX_REVIEW_BLOCKER_IDENTITIES);
+    const challengedIdentities = challengedMatches.map((match, index) => ({
+      ...blockerIdentity(match.blocker),
+      id: `${reviewAttemptId}-ng-${index}`,
+      description: match.blocker.description.slice(0, 200),
+    }));
     const historyEntry = {
       stage: targetStage,
       score,
@@ -2388,9 +2518,26 @@ export async function handleReviewRoutingOutcome(options: {
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
       blockers: resolveBlockerLineageV1(blockers, priorEntryForStage?.blockers, reviewAttemptId),
       ...(reviewer ? { reviewer } : {}),
+      ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
+      ...(challengedMatches.length > 0
+        ? {
+            reviewerChallengedNonGoal: challengedMatches.map((match, index) => ({
+              blockerId: challengedIdentities[index]!.id,
+              nonGoalHeading: match.nonGoalHeading,
+            })),
+          }
+        : {}),
     };
     const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
-      const withHistory = appendReviewScoreHistory(current, historyEntry);
+      let withHistory = appendReviewScoreHistory(current, historyEntry);
+      // wf10 continuation item 18: persist every newly-derived plan-non-goal
+      // supersession alongside the history entry it was derived for, so a
+      // later reconciliation/reconcile read sees the SAME decision this
+      // round already applied — never a round that filtered blockers from
+      // its own history entry while leaving no durable trace of why.
+      for (const supersession of planNonGoalResult?.newSupersessions ?? []) {
+        withHistory = appendBlockerSupersession(withHistory, supersession);
+      }
       // A real (non-degenerate) review round just published for this stage —
       // that is replacement review-tracking state, so an incomplete-round
       // invalidation marker for the same stage is now redundant and may be
@@ -2404,6 +2551,26 @@ export async function handleReviewRoutingOutcome(options: {
     });
     if (!updated) {
       return { escalated: false };
+    }
+    // wf10 continuation item 18: "when a review re-raises a blocker the plan
+    // declares out of scope, say so" — the run log above already records it,
+    // but a run log is not somewhere the user is looking. A chat line makes
+    // the disagreement visible where the round's other outcomes are read.
+    if (historyEntry.reviewerChallengedNonGoal?.length) {
+      try {
+        await appendChatMessageV1(folderUri.fsPath, {
+          role: "assistant",
+          text:
+            `_${STAGE_DISPLAY_NAMES[targetStage]} re-raised ${historyEntry.reviewerChallengedNonGoal.length} ` +
+            `blocker(s) the plan's Accepted Non-Goals section already declares out of scope: ` +
+            historyEntry.reviewerChallengedNonGoal.map((c) => `"${c.nonGoalHeading}"`).join(", ") +
+            `. Excluded from this round's blocker count — see the run log for detail._`,
+          stage: targetStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort — the run log and history entry already carry this.
+      }
     }
 
     // Churn ceiling: an unconditional stop after N configurable rounds
@@ -2733,6 +2900,45 @@ export async function writeReviewRunLogV1(
           : "_no candidates are configured for this stage_") +
         "\n\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
       : "";
+    // wf10 continuation item 12, Part 1 step 4: the durable per-review record
+    // (this run log) must show the same reviewer/mechanical split every other
+    // blocker-count surface shows — otherwise this is the one place left
+    // where a mechanically-synthesized blocker is indistinguishable from one
+    // the reviewer actually raised. Read back the historyEntry THIS outcome
+    // just published (matched by attemptId, not "the newest for this stage")
+    // so a resumed/rerun review can never attribute a stale round's blockers
+    // to this one.
+    let blockerSection = "";
+    if (outcome.kind === "completed") {
+      try {
+        const progressForLog = await readTaskProgressAdvisoryV1(ctx.folderUri);
+        const publishedEntry = [...(progressForLog?.reviewScoreHistory ?? [])]
+          .reverse()
+          .find((entry) => entry.stage === ctx.targetStage && entry.attemptId === ctx.reviewAttemptId);
+        if (publishedEntry) {
+          blockerSection = `\nBlockers: ${describeTaskFixableBlockersV1(
+            publishedEntry.taskFixableCount,
+            publishedEntry.blockers
+          )}\n`;
+          // wf10 continuation item 18: the run log is the durable ledger
+          // surface today (Part 4's roundLedger does not exist yet) — record
+          // every blocker this round re-raised despite a matching Accepted
+          // Non-Goals entry, so "did the reviewer see the decision?" has an
+          // answer in the artifact even when it disagreed with it.
+          if (publishedEntry.reviewerChallengedNonGoal?.length) {
+            blockerSection +=
+              `\nReviewer challenged ${publishedEntry.reviewerChallengedNonGoal.length} plan non-goal(s):\n` +
+              publishedEntry.reviewerChallengedNonGoal
+                .map((c) => `- re-raised despite "${c.nonGoalHeading}"`)
+                .join("\n") +
+              "\n";
+          }
+        }
+      } catch {
+        // Best-effort enrichment only — the bare outcome line above already
+        // makes this run log a usable record without it.
+      }
+    }
     const logUri = await writeRunLog(
       ctx.folderUri,
       "review-v1",
@@ -2740,7 +2946,7 @@ export async function writeReviewRunLogV1(
       `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
         outcome,
         STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
-      )}\n${exhaustionSection}`
+      )}\n${blockerSection}${exhaustionSection}`
     );
     taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
   } catch {
@@ -3821,6 +4027,32 @@ export async function runReviewForFolder(
 
     variables.plan = planContent;
     variables.implementation = implementationContent;
+    // wf10 continuation item 18: `{{plan}}` above is `plan.md`, not
+    // `plan-final.md` (see the comment block above this branch) — a plan's
+    // `## Accepted Non-Goals` section, added to `plan-final.md` AFTER
+    // promotion, never reaches the reviewer through `{{plan}}` or (unless
+    // `impl-summary.md` is absent) `{{implementation}}`. These two variables
+    // are the explicit channel: read `plan-final.md` directly rather than
+    // relying on either fallback chain to happen to carry it.
+    if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      try {
+        const planFinalContent = (await readPlanOfRecordV1(folderUri)).text;
+        variables.acceptedNonGoals = formatAcceptedNonGoalsVariableV1(
+          planFinalContent ? parseAcceptedNonGoalsV1(planFinalContent) : []
+        );
+      } catch {
+        variables.acceptedNonGoals = formatAcceptedNonGoalsVariableV1([]);
+      }
+      try {
+        const currentProgress = await readTaskProgressAdvisoryV1(folderUri);
+        variables.ownerDecisions = formatOwnerDecisionsVariableV1(
+          targetStage,
+          currentProgress?.blockerSupersessions
+        );
+      } catch {
+        variables.ownerDecisions = formatOwnerDecisionsVariableV1(targetStage, undefined);
+      }
+    }
     const checks = await buildVerifiedChecksVariable(
       folderUri,
       undefined,
@@ -5093,9 +5325,6 @@ export async function fastForwardReviewWithAI(
   // computes it for each in-loop round, so the pre-loop and in-loop
   // evidence share one definition of "zero-fixable" and "plan incomplete".
   const initialMechanicalBlockers = getMechanicalBlockersForStage(resolved.folderUri, targetStage);
-  const initialHasMechanicalTaskFixable = initialMechanicalBlockers.some(
-    (b) => b.resolver === "task-fixable"
-  );
   const initialProgress = isPlanReviewStage(targetStage)
     ? parseReviewProgress(initialContent)
     : reconcileProgressWithChecklistV1(
@@ -5103,9 +5332,7 @@ export async function fastForwardReviewWithAI(
         await readPlanChecklistProgressV1(resolved.folderUri)
       );
   const preLoopEvidence = {
-    zeroFixableEvidence: initialHasMechanicalTaskFixable
-      ? false
-      : hasZeroTaskFixableEvidence(initialContent),
+    zeroFixableEvidence: resolveZeroFixableEvidenceV1(initialMechanicalBlockers, initialContent),
     planIncomplete: isPlanIncomplete(initialProgress),
   };
   // Reviewer identity + task-fixable count already on record for this stage's
@@ -5392,7 +5619,6 @@ export async function fastForwardReviewWithAI(
             // that happens to fail to parse must never be the ONLY thing
             // standing between "checks are failing" and "clean round".
             const mechanicalBlockers = getMechanicalBlockersForStage(resolved.folderUri, targetStage);
-            const hasMechanicalTaskFixable = mechanicalBlockers.some((b) => b.resolver === "task-fixable");
             return {
               score: parseReadiness(newContent).score,
               taskFixableCount: detailed.blockPresent
@@ -5407,7 +5633,7 @@ export async function fastForwardReviewWithAI(
               // to false regardless of what the reviewer's own block says —
               // a Verified Check that is still failing is never a clean
               // round, no matter how the reviewer described it.
-              zeroFixableEvidence: hasMechanicalTaskFixable ? false : hasZeroTaskFixableEvidence(newContent),
+              zeroFixableEvidence: resolveZeroFixableEvidenceV1(mechanicalBlockers, newContent),
               // "Clean so far" vs "clean and finished" — null when the review
               // emitted no marker, which preserves the pre-marker behavior.
               // Reconciled against the plan of record's checklist for the same
@@ -5541,19 +5767,21 @@ export async function fastForwardReviewWithAI(
           expectedTaskFolder: path.basename(resolved.folderUri.fsPath),
         })
       : undefined;
-    const siblingBlockers =
+    const siblingHistoryEntry =
       siblingRead?.ok === true
         ? (siblingRead.decoded.progress.reviewScoreHistory ?? [])
             .filter((entry) => entry.stage === siblingImplStage)
-            .at(-1)?.taskFixableCount ?? 0
-        : 0;
+            .at(-1)
+        : undefined;
+    const siblingBlockers = siblingHistoryEntry?.taskFixableCount ?? 0;
     const stageName = STAGE_DISPLAY_NAMES[targetStage];
     if (siblingImplStage && siblingBlockers > 0) {
       NotificationRouter.showWarning(
         `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
           `${stageName} rounds found nothing left to fix (last score ${outcome.score}/10). ` +
-          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} ` +
-          `still lists ${siblingBlockers} problem(s). Use Apply Review to fix those.`,
+          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} still lists ` +
+          `${describeTaskFixableBlockersV1(siblingBlockers, siblingHistoryEntry?.blockers)}. ` +
+          "Use Apply Review to fix those.",
         undefined,
         undefined,
         undefined,
@@ -5678,6 +5906,72 @@ export async function fastForwardReviewWithAI(
  * plan-final.md before reading the canonical content. This mirrors the same
  * migration path used by generateImplementationWithAI and runImplementationWithAI.
  */
+/**
+ * Assemble the apply-review prompt (context pack + approved plan +
+ * implementation notes + review content) rendered from
+ * `apply-impl-review-code.md`. Extracted from `applyImplementationReviewWithAI`
+ * so a recovery continuation whose SOURCE round was dispatched as Apply
+ * Review (item 17b) can render from the identical template and review
+ * content instead of silently reverting to a checklist-driven
+ * `run-implementation.md` continuation — the exact regression the plan
+ * warns "a bug to fix, not a toggle to offer" in a different context, but
+ * the same class of silent mode loss.
+ */
+async function buildApplyReviewPromptPartsV1(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  contextPackContent: string,
+  reviewContent: string
+): Promise<{ prompt: string; templateVariables: Record<string, string> } | { error: string }> {
+  let canonicalUri: vscode.Uri;
+  try {
+    canonicalUri = await materializeCanonicalIfNeeded(folderUri);
+  } catch {
+    return { error: stageActionRequirementMessageV1("applyReviewImplementation", 0) };
+  }
+
+  const planOfRecordNotes = await readNonEmptyText(canonicalUri);
+  if (!planOfRecordNotes) {
+    return { error: stageActionRequirementMessageV1("applyReviewImplementation", 0) };
+  }
+
+  const latestSummary = await readNonEmptyText(getImplementationSummaryUri(folderUri));
+  const implementationNotes =
+    latestSummary && !isUnusableImplementationSummaryV1(latestSummary)
+      ? `${planOfRecordNotes}\n\n---\n\n## Latest implementation round summary\n\n${latestSummary}`
+      : planOfRecordNotes;
+
+  let approvedPlan: string | undefined;
+  let planName = "plan.md";
+  try {
+    const approvedPlanUri = await resolveCurrentPlanUri(folderUri);
+    planName = path.basename(approvedPlanUri.fsPath);
+    approvedPlan = await readNonEmptyText(approvedPlanUri);
+  } catch {
+    // Handled by !approvedPlan guard below
+  }
+
+  if (!approvedPlan) {
+    return {
+      error: `No approved plan found (or it is empty). Generate or restore ${planName} before applying an implementation review.`,
+    };
+  }
+
+  const templateVariables = {
+    contextPack: contextPackContent,
+    approvedPlan,
+    implementation: implementationNotes,
+    review: reviewContent,
+  };
+  const prompt = await renderPromptTemplate(
+    extensionUri,
+    "apply-impl-review-code.md",
+    templateVariables
+  );
+
+  return { prompt, templateVariables };
+}
+
 async function applyImplementationReviewWithAI(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -5719,68 +6013,6 @@ async function applyImplementationReviewWithAI(
       return false;
     }
   }
-  // Materialize canonical plan-final.md from legacy implementation.md if needed.
-  let canonicalUri: vscode.Uri;
-  try {
-    canonicalUri = await materializeCanonicalIfNeeded(folderUri);
-  } catch {
-    NotificationRouter.showWarning(
-      stageActionRequirementMessageV1("applyReviewImplementation", 0)
-    );
-    return false;
-  }
-
-  const planOfRecordNotes = await readNonEmptyText(canonicalUri);
-  if (!planOfRecordNotes) {
-    NotificationRouter.showWarning(
-      stageActionRequirementMessageV1("applyReviewImplementation", 0)
-    );
-    return false;
-  }
-
-  // {{implementation}} here carries BOTH artifacts, because this prompt needs
-  // both and they now live in different files. apply-impl-review-code.md tells
-  // the round to echo the plan's checklist back (so plan progress keeps
-  // accumulating), which requires the plan of record — but before the split,
-  // plan-final.md also held the last round's summary, so the round could see
-  // its Files Changed / Verification / remaining blockers. Swapping wholesale
-  // to impl-summary.md would restore that evidence and lose the checklist;
-  // appending keeps both, checklist first so the echo instruction reads
-  // naturally. A summary stamped unusable is omitted rather than presented as
-  // notes — there is nothing reviewable in a rejection stamp.
-  //
-  // The separator deliberately does NOT name impl-summary.md. Both runners
-  // reserve only the artifact filenames a prompt actually mentions, on the
-  // reasoning that a model can misread a mention as an instruction to write
-  // the file; naming this one here would have put it in front of an
-  // edit-capable agent while it sits outside those reserved sets, so a
-  // misdirected repo-root write would be recorded as a real source change.
-  const latestSummary = await readNonEmptyText(getImplementationSummaryUri(folderUri));
-  const implementationNotes =
-    latestSummary && !isUnusableImplementationSummaryV1(latestSummary)
-      ? `${planOfRecordNotes}\n\n---\n\n## Latest implementation round summary\n\n${latestSummary}`
-      : planOfRecordNotes;
-
-  // Do not make the implementation model infer the approved contract from a
-  // review or from its own prior summary. Review generation already uses the
-  // current plan artifact; review application must receive that same source.
-  let approvedPlan: string | undefined;
-  let planName = "plan.md";
-  try {
-    const approvedPlanUri = await resolveCurrentPlanUri(folderUri);
-    planName = path.basename(approvedPlanUri.fsPath);
-    approvedPlan = await readNonEmptyText(approvedPlanUri);
-  } catch {
-    // Handled by !approvedPlan guard below
-  }
-
-  if (!approvedPlan) {
-    NotificationRouter.showWarning(
-      `No approved plan found (or it is empty). Generate or restore ${planName} before applying an implementation review.`
-    );
-    return false;
-  }
-
   // The `implementation` stage's model was already resolved by the caller
   // (before its full §7.5 gate) — re-check liveness only, since availability
   // can change while the reads above ran.
@@ -5795,22 +6027,36 @@ async function applyImplementationReviewWithAI(
 
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
 
-  const prompt = await renderPromptTemplate(
+  // {{implementation}} carries BOTH the plan of record and the latest
+  // implementation summary, because this prompt needs both and they now live
+  // in different files. apply-impl-review-code.md tells the round to echo the
+  // plan's checklist back (so plan progress keeps accumulating), which
+  // requires the plan of record — but before the split, plan-final.md also
+  // held the last round's summary, so the round could see its Files Changed /
+  // Verification / remaining blockers. Swapping wholesale to impl-summary.md
+  // would restore that evidence and lose the checklist; appending keeps both,
+  // checklist first so the echo instruction reads naturally. A summary
+  // stamped unusable is omitted rather than presented as notes — there is
+  // nothing reviewable in a rejection stamp.
+  const parts = await buildApplyReviewPromptPartsV1(
     extensionUri,
-    "apply-impl-review-code.md",
-    {
-      contextPack: contextPackContent,
-      approvedPlan,
-      implementation: implementationNotes,
-      review: reviewContent,
-    }
+    folderUri,
+    contextPackContent,
+    reviewContent
   );
+  if ("error" in parts) {
+    NotificationRouter.showWarning(parts.error);
+    return false;
+  }
+  const prompt = parts.prompt;
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
+
+  const dispatchedBlockerIds = await blockerIdentitiesHandedToApplyReviewV1(folderUri, stage);
 
   // suppressAutoReviewDispatch: the caller (applyReviewWithAI) re-reviews
   // inline under the lock it already holds — see that option's doc comment
@@ -5831,6 +6077,9 @@ async function applyImplementationReviewWithAI(
       onWaitingForUser: options.parentOperation
         ? (w) => options.parentOperation!.setWaitingForUser(w)
         : undefined,
+      templateName: "apply-impl-review-code.md",
+      templateVariables: parts.templateVariables,
+      dispatchedBlockerIds,
     }
   );
 }
@@ -6987,6 +7236,12 @@ async function executeImplementationRun(
   options: ExecuteImplementationRunOptions
 ): Promise<boolean> {
   const cwd = workspaceRoot.uri.fsPath;
+  // Allocated once, before dispatch, so the run log and the prompt manifest
+  // (Part 2 step 7) can be correlated by this id rather than by parsing the
+  // run log's incrementing-counter filename. Not a coordinator
+  // attemptId/operationId — this dispatch path never reaches the coordinator
+  // — see promptManifestV1.ts's doc comment (review blocker, 2026-08-26).
+  const promptRoundId = allocateHex128IdV1();
 
   // Snapshot HEAD as this task's implementation baseline, first round only
   // (workflow findings round 8, item 1: a task's first implementation review
@@ -7068,6 +7323,33 @@ async function executeImplementationRun(
     modelId
   );
   const claimedRecovery: ClaimedImplRecoveryV1 = { ...claimedAtStart, record: escalatedRecord };
+  // What THIS round is running as (item 17a) — a checklist-driven
+  // Implementation round, a review-driven Apply Review round, or a recovery
+  // continuation of either. Recorded in the run log and on the round-outcome
+  // entry so the automatic loop's dispatch choices become auditable after the
+  // fact (previously indistinguishable: both wrote the same
+  // `# Implementation Run` header).
+  const currentDispatchMode: ImplementationDispatchModeV1 = deriveCurrentDispatchModeV1(
+    claimedRecovery.record !== undefined,
+    options.editActionKey
+  );
+  // What a NEW recovery (if this round needs one) should record as ITS
+  // source — propagated from a continuation's own source so a continuation
+  // of a continuation of an apply-review round still resolves to
+  // "apply-review", never collapsing to "continuation" (which describes only
+  // the round that just ran, not what a further continuation should render
+  // from). Keyed on `options.editActionKey` alone (see that function's doc
+  // comment) rather than the claimed record's own `sourceDispatchMode`, so a
+  // continuation whose apply-review re-render failed and fell through to
+  // run-implementation.md is correctly recorded as checklist-driven, never
+  // as apply-review ancestry it did not actually run under this round.
+  const nextRecoverySource = deriveNextRecoverySourceV1(
+    options.editActionKey,
+    postRunReviewStage,
+    claimedRecovery.record?.sourceReviewStage
+  );
+  const nextRecoverySourceDispatchMode = nextRecoverySource.sourceDispatchMode;
+  const nextRecoverySourceReviewStage = nextRecoverySource.sourceReviewStage;
   const wasEscalatedFromSummaryOnly =
     claimedAtStart.record?.mode === "summary-only" && escalatedRecord?.mode !== "summary-only";
   const dispatchPrompt = wasEscalatedFromSummaryOnly
@@ -7341,6 +7623,8 @@ async function executeImplementationRun(
       postRunReviewStage,
       parentOperation: options.parentOperation,
       ...(incompleteRound === undefined ? { offerRestoreOption: true } : {}),
+      sourceDispatchMode: nextRecoverySourceDispatchMode,
+      ...(nextRecoverySourceReviewStage ? { sourceReviewStage: nextRecoverySourceReviewStage } : {}),
     });
   }
   const quarantinedPaths = recovery?.quarantinedPaths ?? [];
@@ -7364,7 +7648,23 @@ async function executeImplementationRun(
         )
       : [];
 
-  const logContent = `# Implementation Run\n\nStatus: ${
+  // Keyed on `nextRecoverySourceDispatchMode`/`nextRecoverySourceReviewStage`
+  // — themselves derived from `options.editActionKey` alone, never from the
+  // claimed record's stale `sourceDispatchMode` — so a continuation whose
+  // apply-review re-render failed and fell through to the checklist-driven
+  // template is recorded honestly as `continuation` here, not misreported as
+  // apply-review ancestry it did not actually run under (review blocker,
+  // 2026-08-26). `formatRunLogModeHeaderV1` also carries the blocker ids this
+  // apply-review round was actually handed (Part 2 step 5), empty for a
+  // checklist-driven round.
+  const modeAndBlockerHeader = formatRunLogModeHeaderV1(
+    currentDispatchMode,
+    nextRecoverySourceDispatchMode,
+    nextRecoverySourceReviewStage,
+    options.dispatchedBlockerIds
+  );
+
+  const logContent = `# Implementation Run\n\nRound ID: ${promptRoundId}\n\n${modeAndBlockerHeader}Status: ${
     incompleteRound ? `incomplete (${incompleteRound.kind})` : result.status
   }\n\n${implProviderLine}Files changed:\n${
     result.filesChanged.length > 0
@@ -7431,6 +7731,44 @@ async function executeImplementationRun(
   const logUri = await writeRunLog(folderUri, result.runnerId, "impl", logContent);
   // No handle in scope here either — resolve the task's live root operation.
   taskOperations.setResultTargetUriForTask(folderUri.fsPath, logUri);
+
+  // Prompt manifest (item 17a/18, Part 2 step 7) — written beside the run
+  // log, best-effort: an observability artifact failing to write must never
+  // be mistaken for the round itself failing. A write failure is no longer
+  // silently swallowed (review blocker, 2026-08-26): it is appended to the
+  // ALREADY-WRITTEN run log as its own durable note, so a reader who goes
+  // looking for the manifest and finds it missing can tell "it was never
+  // attempted" apart from "it was attempted and failed", instead of the
+  // absence being unexplained.
+  try {
+    // See PromptManifestV1.promptCaptureComplete: only a direct CLI dispatch
+    // (runnerId !== "copilot-lm") sends dispatchPrompt verbatim; a
+    // Copilot-resolved round runs through the sealed pipeline, which
+    // prepends/appends content this dispatch path never sees.
+    const promptCaptureComplete = result.runnerId !== "copilot-lm";
+    const manifest = buildPromptManifestV1(
+      options.templateName ?? "run-implementation.md",
+      options.templateVariables ?? { prompt: dispatchPrompt },
+      dispatchPrompt,
+      promptCaptureComplete,
+      promptRoundId
+    );
+    await writePromptManifestV1(logUri, manifest, dispatchPrompt);
+  } catch (manifestError) {
+    try {
+      const note = `\n\n## Prompt manifest\n\nFailed to write the prompt observability manifest for this round: ${
+        manifestError instanceof Error ? manifestError.message : String(manifestError)
+      }\n`;
+      await vscode.workspace.fs.writeFile(
+        logUri,
+        new TextEncoder().encode(logContent + note)
+      );
+    } catch {
+      // Even the durable failure note could not be written (e.g. the
+      // filesystem itself is unavailable) — the round's own bookkeeping
+      // above already succeeded and must not be blocked by this.
+    }
+  }
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
@@ -7608,6 +7946,7 @@ async function executeImplementationRun(
             at: new Date().toISOString(),
             ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
             ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
+            dispatchMode: currentDispatchMode,
           })
         );
         await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
@@ -7747,6 +8086,7 @@ async function executeImplementationRun(
           at: new Date().toISOString(),
           ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
           ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
+          dispatchMode: currentDispatchMode,
         });
         return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
           ? { ...withOutcome, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
@@ -8117,6 +8457,7 @@ async function executeImplementationRun(
             classification: "edits-produced",
             at: new Date().toISOString(),
             ...(modelId ? { modelId } : {}),
+            dispatchMode: currentDispatchMode,
           })
         );
         await appendRoundOutcomeLogNoteV1(logUri, "edits-produced");
@@ -8153,6 +8494,7 @@ async function executeImplementationRun(
           classification: noEditsClassification,
           at: new Date().toISOString(),
           ...(modelId ? { modelId } : {}),
+          dispatchMode: currentDispatchMode,
         })
       );
       await appendRoundOutcomeLogNoteV1(logUri, noEditsClassification);
@@ -8890,6 +9232,7 @@ async function executeImplementationRun(
         stage: current.currentStage,
         classification: "cancelled",
         at: new Date().toISOString(),
+        dispatchMode: currentDispatchMode,
       })
     );
     await appendRoundOutcomeLogNoteV1(logUri, "cancelled");
@@ -9301,32 +9644,48 @@ export async function runImplementationWithAI(
       // block for why this must not gate the current run.
     }
 
+    // wf10 continuation item 17: on the AUTOMATIC path there is no human to
+    // read the decision card above, so — unlike the manual branch, which
+    // always falls through to Implementation once the card is posted — an
+    // automation dispatch that `chooseAutomaticImplementationDispatchV1`
+    // says should redirect must actually redirect, not run Implementation
+    // and change nothing. This is what closes the loop observed on wf10: ten
+    // consecutive automatic Implementation rounds against a blocker frozen
+    // at score 6 because Implementation only reads the plan checklist and
+    // was never told about the review's blockers.
+    if (isAutomationDispatchV1(arg)) {
+      const autoDispatch = chooseAutomaticImplementationDispatchV1({
+        decision: preRunDecision,
+        isAutomationDispatch: true,
+        continuationOwed: resolved.progress.implRecovery !== undefined,
+      });
+      if (autoDispatch.kind === "redirect-apply-review") {
+        try {
+          await appendChatMessageV1(resolved.folderUri.fsPath, {
+            role: "assistant",
+            text:
+              `_Automation redirected: an unattended Implementation dispatch was routed to ` +
+              `${STAGE_DISPLAY_NAMES[autoDispatch.reviewStage]} → Apply Review instead, since ` +
+              `Implementation cannot fix what that review found. ${autoDispatch.reason}_`,
+            stage: resolved.progress.currentStage,
+            at: new Date().toISOString(),
+          });
+        } catch {
+          // Best-effort record only — the redirect itself must still happen
+          // even when the chat write fails.
+        }
+        await goToReviewAndApplyV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          reviewStage: autoDispatch.reviewStage,
+        });
+        return;
+      }
+    }
+
     const contextPackContent = await generateContextPack(
       resolved.folderUri,
       workspaceRoot.uri
     );
-
-    const templatePrompt = await renderPromptTemplate(
-      extensionUri,
-      "run-implementation.md",
-      { contextPack: contextPackContent, plan: planFinalContent }
-    );
-
-    // The hedge behind decidePostReviewActionV1's routing (see
-    // standingBlockersNoticeV1). `run-implementation.md` is rendered with the
-    // plan and NOT the review, so a round that reaches here with blockers
-    // outstanding — a directly-invoked command, a chain predating the routing,
-    // a recovery continuation — would otherwise spend itself on a checklist
-    // with nothing actionable left and report "nothing to do", while the
-    // reviewer keeps reporting the same defects. Reads the newest impl review
-    // artifact of either kind, matching the routing's own stage selection.
-    const standingBlockers = await readStandingImplBlockersV1(resolved.folderUri);
-    const basePrompt = standingBlockers
-      ? buildStandingBlockersNoticeV1(templatePrompt, {
-          blockers: standingBlockers.blockers,
-          reviewStageName: STAGE_DISPLAY_NAMES[standingBlockers.stage],
-        })
-      : templatePrompt;
 
     // Continuation of a failed/unreported round: a prior round changed the
     // quarantined files but ended without a usable report (deferred, cut
@@ -9336,7 +9695,11 @@ export async function runImplementationWithAI(
     // entry. The record's persisted MODE (Part 2) selects the mandate:
     // `summary-only` (report the combined diff, no edits),
     // `inspect-and-complete` (verify/finish the quarantined files inside the
-    // reviewed boundary), or the unconstrained notice.
+    // reviewed boundary), or the unconstrained notice. Read here, BEFORE the
+    // template is chosen: a continuation whose SOURCE round was dispatched as
+    // Apply Review (item 17b) must re-render from apply-impl-review-code.md
+    // with the original review content — never silently revert to a
+    // checklist-driven run-implementation.md continuation.
     const freshForContinuation = await readTaskProgressAdvisoryV1(resolved.folderUri);
     const pendingFiles =
       freshForContinuation?.pendingImplReviewFiles ??
@@ -9344,13 +9707,98 @@ export async function runImplementationWithAI(
       [];
     const recoveryRecord =
       freshForContinuation?.implRecovery ?? resolved.progress.implRecovery;
+    const reviewedFiles =
+      freshForContinuation?.implReviewFiles ?? resolved.progress.implReviewFiles ?? [];
+
+    let sourceReviewPrompt: string | undefined;
+    let sourceReviewStageForRun: TaskStage | undefined;
+    let dispatchedTemplateName = "run-implementation.md";
+    let dispatchedTemplateVariables: Record<string, string> = {
+      contextPack: contextPackContent,
+      plan: planFinalContent,
+    };
+    let dispatchedBlockerIds: readonly ReviewBlockerIdentity[] | undefined;
+    const applyReviewContinuationStage = shouldContinueAsApplyReviewV1(recoveryRecord);
+    if (applyReviewContinuationStage) {
+      const sourceReviewUri = artifactUri(resolved.folderUri, applyReviewContinuationStage);
+      const sourceReviewContent = sourceReviewUri && (await readNonEmptyText(sourceReviewUri));
+      let reconstructionError: string | undefined;
+      if (sourceReviewContent) {
+        const parts = await buildApplyReviewPromptPartsV1(
+          extensionUri,
+          resolved.folderUri,
+          contextPackContent,
+          sourceReviewContent
+        );
+        if ("prompt" in parts) {
+          sourceReviewPrompt = parts.prompt;
+          sourceReviewStageForRun = applyReviewContinuationStage;
+          dispatchedTemplateName = "apply-impl-review-code.md";
+          dispatchedTemplateVariables = parts.templateVariables;
+          dispatchedBlockerIds = await blockerIdentitiesHandedToApplyReviewV1(
+            resolved.folderUri,
+            applyReviewContinuationStage
+          );
+        } else {
+          reconstructionError = parts.error;
+        }
+      } else {
+        reconstructionError =
+          `The ${STAGE_DISPLAY_NAMES[applyReviewContinuationStage]} review artifact is missing or ` +
+          "empty, so this continuation cannot be re-rendered as Apply Review.";
+      }
+      if (!sourceReviewPrompt) {
+        // Review blocker 2026-08-26 (fail-closed correction): a continuation
+        // whose source round was Apply Review must never silently downgrade
+        // to checklist-driven Implementation, honest run-log reporting
+        // notwithstanding — that IS the mode loss the plan forbids, not a
+        // narrower version of it. Refuse the round instead of running it
+        // under the wrong mandate. Nothing has been claimed or mutated yet
+        // (this runs before any `patchTaskProgressStrictV1` call in this
+        // function), so `implRecovery` and `pendingImplReviewFiles` are left
+        // exactly as they were — the continuation stays owed, and a retry
+        // once the missing artifact is restored can still complete it as
+        // Apply Review.
+        NotificationRouter.showWarning(
+          `Apply Review continuation could not be reconstructed: ${reconstructionError ?? "unknown reason"} ` +
+            "The pending changes remain quarantined; restore the missing artifact and retry."
+        );
+        return;
+      }
+    }
+
+    const basePrompt = await (async () => {
+      if (sourceReviewPrompt !== undefined) {
+        return sourceReviewPrompt;
+      }
+      const templatePrompt = await renderPromptTemplate(
+        extensionUri,
+        "run-implementation.md",
+        { contextPack: contextPackContent, plan: planFinalContent }
+      );
+
+      // The hedge behind decidePostReviewActionV1's routing (see
+      // standingBlockersNoticeV1). `run-implementation.md` is rendered with the
+      // plan and NOT the review, so a round that reaches here with blockers
+      // outstanding — a directly-invoked command, a chain predating the routing,
+      // a recovery continuation whose source was not apply-review — would
+      // otherwise spend itself on a checklist with nothing actionable left and
+      // report "nothing to do", while the reviewer keeps reporting the same
+      // defects. Reads the newest impl review artifact of either kind, matching
+      // the routing's own stage selection.
+      const standingBlockers = await readStandingImplBlockersV1(resolved.folderUri);
+      return standingBlockers
+        ? buildStandingBlockersNoticeV1(templatePrompt, {
+            blockers: standingBlockers.blockers,
+            reviewStageName: STAGE_DISPLAY_NAMES[standingBlockers.stage],
+          })
+        : templatePrompt;
+    })();
+
     const prompt = buildImplementationContinuationPromptV1(basePrompt, {
       mode: recoveryRecord?.mode,
       pendingFiles,
-      reviewedFiles:
-        freshForContinuation?.implReviewFiles ??
-        resolved.progress.implReviewFiles ??
-        [],
+      reviewedFiles,
     });
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
@@ -9377,6 +9825,10 @@ export async function runImplementationWithAI(
         parentOperation: op,
         followUpReviewMode,
         chatViewProvider,
+        templateName: dispatchedTemplateName,
+        templateVariables: dispatchedTemplateVariables,
+        ...(sourceReviewStageForRun ? { editActionKey: "applyReviewEdit.v1" } : {}),
+        ...(dispatchedBlockerIds ? { dispatchedBlockerIds } : {}),
       }
     );
     }

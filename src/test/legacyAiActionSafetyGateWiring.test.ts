@@ -99,7 +99,12 @@ const CASES: readonly WiringCase[] = [
     file: "src/commands/reviewActions.ts",
     functionSignature: "async function applyImplementationReviewWithAI(",
     routeId: "applyReviewEdit.v1",
-    laterMarker: "materializeCanonicalIfNeeded(folderUri)",
+    // The plan-final/plan reads (previously inline here, including
+    // materializeCanonicalIfNeeded(folderUri)) were extracted into
+    // buildApplyReviewPromptPartsV1 (item 17b — shared with a review-driven
+    // continuation's re-render) so this route's first read is now performed
+    // by calling that helper, not by an inline read of its own.
+    laterMarker: "buildApplyReviewPromptPartsV1(",
   },
   {
     // A prior "bootstrap" exemption let this route skip the throwing gate
