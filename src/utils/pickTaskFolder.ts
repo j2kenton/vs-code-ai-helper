@@ -51,8 +51,10 @@ export async function pickTaskFolder(
   }
 
   const items = tasks.map((task) => ({
-    label: task.folderName,
-    description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+    label: task.progress.displayName ?? task.folderName,
+    // wf10 item 21: folder id as description alongside stage, rather than
+    // rendering only the unrecognizable folder id as the whole label.
+    description: `${task.folderName} · Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
     folderUri: task.folderUri,
   }));
 

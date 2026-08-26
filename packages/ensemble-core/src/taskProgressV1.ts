@@ -145,6 +145,13 @@ export interface TaskProgress {
   createdAt: string;
   /** ISO timestamp when the progress was last updated */
   updatedAt: string;
+  /**
+   * Monotonic optimistic-concurrency token, owned entirely by the extension's
+   * `patchTaskProgressStrictV1` (wf10 item 8). Mirrors `src/types/taskProgress.ts`
+   * exactly; see that definition for the full rationale. Absent on any record
+   * that predates this field or on brand-new tasks before their first patch.
+   */
+  progressVersion?: number;
   /** Workspace-relative paths changed across all AI implementation runs. */
   implReviewFiles?: string[];
   /** Persisted lint state for this task. */
@@ -168,6 +175,10 @@ export interface TaskProgress {
   reviewScoreHistory?: ReviewScoreHistoryEntry[];
   /** Durable record of review rounds rejected as degenerate. */
   reviewRejections?: ReviewRejectionEntry[];
+  /** Durable record of blockers a human resolved via this task's own stage
+   * chat (mirror of `src/types/taskProgress.ts`). Capped at
+   * MAX_BLOCKER_SUPERSESSIONS (oldest dropped). */
+  blockerSupersessions?: BlockerSupersessionRecordV1[];
   /** Durable, fixed-vocabulary record of what each round that reached
    * completion accounting actually produced (mirror of
    * `src/types/taskProgress.ts`). Persisted only at round-completion-
@@ -362,6 +373,29 @@ export interface ReviewRejectionEntry {
 
 /** Cap on `TaskProgress.reviewRejections` length (oldest entries dropped first). */
 export const MAX_REVIEW_REJECTIONS = 50;
+
+/** One row of `TaskProgress.blockerSupersessions` (mirror of
+ * `src/types/taskProgress.ts`) — a blocker a human resolved via this task's
+ * own stage chat, recorded the moment the confirmable `plan.md` edit lands. */
+export interface BlockerSupersessionRecordV1 {
+  /** The plan-review stage the superseded blocker was recorded against. */
+  stage: TaskStage;
+  /** The blocker's own description text, exactly as parsed from the review
+   * artifact at the moment it was declared resolved. */
+  blockerDescription: string;
+  /** ISO timestamp the confirmable plan.md edit was actually applied. */
+  supersededAt: string;
+  /** Task-folder-relative path of the file the resolving decision was
+   * written to (currently always `plan.md`). */
+  planRelPath: string;
+  /** ISO timestamp of the assistant chat message that proposed the confirmed
+   * edit — the pointer to the confirming chat exchange. Optional only so a
+   * record from before this field existed remains decodable. */
+  confirmingMessageAt?: string;
+}
+
+/** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
+export const MAX_BLOCKER_SUPERSESSIONS = 50;
 
 /**
  * Fixed-vocabulary outcome of a completed round (mirror of

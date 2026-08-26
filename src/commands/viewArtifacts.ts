@@ -51,7 +51,9 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
   // Prepare picker using artifactPicker helper (no filtering for viewTask)
   const hasPlanMap = new Map<string, boolean>();
   const pickerOptions: ArtifactPickerOptions<vscode.Uri> = {
-    tasks,
+    // wf10 item 21: carry displayName through so the picker label is never
+    // just the unrecognizable folder id.
+    tasks: tasks.map((task) => ({ ...task, displayName: task.progress.displayName })),
     hasPlanMap,
     mode: 'viewTask',
   };
@@ -134,7 +136,9 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
   }
 
   const pickerOptions: ArtifactPickerOptions<vscode.Uri> = {
-    tasks,
+    // wf10 item 21: carry displayName through so the picker label is never
+    // just the unrecognizable folder id.
+    tasks: tasks.map((task) => ({ ...task, displayName: task.progress.displayName })),
     hasPlanMap,
     mode: 'viewPlan',
   };

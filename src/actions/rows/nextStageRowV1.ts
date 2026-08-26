@@ -40,6 +40,7 @@ import { STAGE_ORDER, TaskStage } from "../../types/taskProgress";
 import { applyNextStagePolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
+import { ensurePublishReviewArtifactExistsV1 } from "../../utils/publishChecksFreshness";
 import {
   LifecyclePolicyFailureError,
   LifecycleReviewAttemptMismatchError,
@@ -198,6 +199,15 @@ export async function executeNextStageV1(
 
   if (!patched) {
     return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
+  }
+
+  // Every route that can land currentStage on "publish" must guarantee the
+  // stage's document exists (plan item 17, step 20a) — this is the primary
+  // manual/review-driven transition writer (legacy `advanceStageLocked` in
+  // `stageTransition.ts` covers the other transition kinds), so it must not
+  // be the one gap that leaves "not created yet" reachable.
+  if (patched.currentStage === "publish") {
+    await ensurePublishReviewArtifactExistsV1(taskFolderUri);
   }
 
   // PART 6.5 (review-flagged 2026-08-23): `applyNextStagePolicyV1` clears

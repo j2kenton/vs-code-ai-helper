@@ -4,7 +4,6 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   GENERAL_MODEL_STAGE,
-  buildResolvedModelSnapshotV1,
   resolveEffectiveStageChainV1,
   resolveModelForStage,
 } from "../utils/modelSelection";
@@ -396,46 +395,6 @@ void describe("getModelSettings / setModelSettings — extended shape round trip
         written.impl && typeof written.impl === "object",
         "the cleared stage's key must be written so the legacy-defaults import stays suppressed"
       );
-    } finally {
-      stub.restore();
-    }
-  });
-});
-
-void describe("buildResolvedModelSnapshotV1 — provenance", () => {
-  void it("records general provenance (source/originStage) for a blank stage", () => {
-    const stub = installConfig({
-      modelSettings: {
-        desc: {
-          primary: "gemini-cli:default",
-          backups: ["claude-cli:sonnet"],
-          strategy: "switch-to-backup",
-        },
-      },
-    });
-    try {
-      const snapshot = buildResolvedModelSnapshotV1();
-      assert.equal(snapshot.schemaVersion, 1);
-      const impl = snapshot.stages.impl;
-      assert.equal(impl?.source, "general");
-      assert.equal(impl?.originStage, GENERAL_MODEL_STAGE);
-      assert.equal(impl?.primary, "gemini-cli:default");
-      assert.deepEqual(impl?.backups, ["claude-cli:sonnet"]);
-      assert.equal(impl?.strategy, "switch-to-backup");
-      const desc = snapshot.stages.desc;
-      assert.equal(desc?.source, "workspace");
-      assert.equal(desc?.originStage, GENERAL_MODEL_STAGE);
-    } finally {
-      stub.restore();
-    }
-  });
-
-  void it("records source none with an empty chain when nothing is configured anywhere", () => {
-    const stub = installConfig({ modelSettings: {} });
-    try {
-      const snapshot = buildResolvedModelSnapshotV1();
-      assert.equal(snapshot.stages.impl?.source, "none");
-      assert.deepEqual(snapshot.stages.impl?.backups, []);
     } finally {
       stub.restore();
     }

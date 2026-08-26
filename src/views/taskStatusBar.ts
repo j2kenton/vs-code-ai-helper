@@ -3,6 +3,7 @@ import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
+import { describeOwedContinuationRowIndicatorV1 } from "./taskTreeProvider";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -87,14 +88,44 @@ export class TaskStatusBar implements vscode.Disposable {
     const isPaused = taskToShow.progress.status === "paused";
     const statusLabel = isPaused ? "paused" : "active";
 
+    // Passive-case standing indicator (wf10 item 11's passive complement):
+    // when the shown task carries an owed continuation and nothing is
+    // running for it, the bar otherwise reads identically to a task with
+    // nothing owed for the length of the lease. Checked against THIS task's
+    // own operations specifically (not the global `isRunning`, which is true
+    // whenever ANY task has a live operation) — a running continuation
+    // already reads as "in progress" via the spinner icon above.
+    const thisTaskHasLiveOperation =
+      taskOperations.getTaskOperations(taskToShow.canonicalId ?? taskToShow.folderUri.fsPath).length > 0;
+    const owedIndicator =
+      !isPaused && !thisTaskHasLiveOperation
+        ? describeOwedContinuationRowIndicatorV1(
+            taskToShow.progress.implRecovery,
+            taskToShow.progress.incompleteRoundContinuations ?? 0
+          )
+        : undefined;
+
+    // Quarantined files behind the owed continuation, if any — mirrors the
+    // tree tooltip's "What happens next" line (`describeSchedulingPostureV1`'s
+    // `owedWillNotRetry` case), which already names these via the scheduling
+    // posture ledger. The status bar has no ledger access, so this reads
+    // `pendingImplReviewFiles` directly rather than pulling in that mechanism.
+    const quarantinedFiles = taskToShow.progress.pendingImplReviewFiles ?? [];
+    const quarantinedFilesLine =
+      owedIndicator && quarantinedFiles.length > 0
+        ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${quarantinedFiles.join(", ")}`
+        : undefined;
+
     // Text: Checklist, folderName, stage display name, status
-    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}`;
+    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}${owedIndicator ? ` — ${owedIndicator.description}` : ""}`;
     this.item.tooltip = new vscode.MarkdownString(
       [
         `**Ensemble — ${statusLabel} task**`,
         "",
         `Task: \`${taskToShow.folderName}\``,
         `Stage: **${STAGE_DISPLAY_NAMES[stage]}**`,
+        ...(owedIndicator ? [`$(watch) ${owedIndicator.description}`] : []),
+        ...(quarantinedFilesLine ? [quarantinedFilesLine] : []),
         `Last updated: ${new Date(
           taskToShow.progress.updatedAt
         ).toLocaleString()}`,

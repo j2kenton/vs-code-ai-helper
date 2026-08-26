@@ -24,7 +24,7 @@ import {
 import { RUNS_DIRNAME, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { REVERT_JOURNAL_SUFFIX } from "../utils/artifactRevertJournal";
 import { REDO_SIDECAR_SUFFIX } from "../utils/redoSidecar";
-import { TASK_MODEL_CONFIG_FILENAME, RESOLVED_MODEL_SNAPSHOT_FILENAME } from "../utils/modelSelection";
+import { TASK_MODEL_CONFIG_FILENAME } from "../utils/modelSelection";
 import { MIGRATION_JOURNAL_FILENAME } from "../utils/metaResourcesMigration";
 import { formatAtomicTempBasename } from "../state/writeAtomic";
 
@@ -89,7 +89,6 @@ void describe("workflowPrivacyClassifierV1", () => {
     assert.equal(classifyWorkflowPathV1("finalization-journal.json"), "workflowControl");
     assert.equal(classifyWorkflowPathV1(".ensemble-activation-checkpoint.json"), "workflowControl");
     assert.equal(classifyWorkflowPathV1(TASK_MODEL_CONFIG_FILENAME), "workflowControl");
-    assert.equal(classifyWorkflowPathV1(RESOLVED_MODEL_SNAPSHOT_FILENAME), "workflowControl");
     assert.equal(classifyWorkflowPathV1(".ensemble-session.lock"), "workflowControl");
     assert.equal(classifyWorkflowPathV1(".ensemble-meta.lock"), "workflowControl");
     assert.equal(classifyWorkflowPathV1("plans/t/.ensemble-task.lock"), "workflowControl");

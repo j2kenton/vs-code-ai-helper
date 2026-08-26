@@ -11,13 +11,17 @@
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 import * as vscode from "vscode";
 import {
   buildStageActionPayload,
   buildStageResponsePrompt,
+  dispatchProposedBlockerSupersessionEditV1,
   dispatchProposedStageActionV1,
   getStageChatAction,
+  readStageArtifactsForChat,
   splitStageActionEnvelopes,
   STAGE_CHAT_ACTIONS,
 } from "../commands/chatWithStage";
@@ -25,7 +29,7 @@ import { planStageAction } from "../utils/chatStageActionEnvelope";
 import { getGlobalAssistantOperation } from "../utils/globalAssistantActions";
 import { ChatViewProvider } from "../views/chatView";
 import { readChatHistory } from "../utils/chatHistoryStore";
-import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { makeOwnedTaskFolder, readTaskProgressForTest } from "./taskFolderFixture";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { createChatSendRowV1 } from "../actions/rows/chatSendRowV1";
@@ -184,6 +188,82 @@ void test("stage prompt advertises the shared ACTION envelope and every action i
   for (const action of STAGE_CHAT_ACTIONS) {
     assert.ok(prompt.includes(action.id), `prompt must list ${action.id}`);
   }
+});
+
+// wf10 item 19 / plan Step 28 (prompt-side prerequisite only — the full
+// confirmable-edit + durable supersession + stage-gate recognition flow
+// remains unbuilt, see the round summary): a jester task 4 live transcript
+// showed stage chat declaring a recorded blocker resolved and advising the
+// user to "complete this stage and advance" while plan.md stayed byte-for-
+// byte unchanged, because the model only said so in prose instead of
+// drafting the already-existing [[UPDATE_FILE:...]] envelope. The prompt
+// must instruct the model to draft the update as part of declaring a
+// blocker resolved, and to use the "shall I write it to plan.md?" phrasing
+// (never advice to advance) until it has.
+void test("stage prompt instructs drafting the plan update, not just advice, when declaring a recorded blocker resolved", () => {
+  const prompt = buildStageResponsePrompt("Plan", "my-task", "", "ctx", "msg");
+  assert.match(
+    prompt,
+    /draft that decision into the relevant file with `\[\[UPDATE_FILE:\.\.\.\]\]`/,
+    "prompt must instruct drafting the UPDATE_FILE envelope as part of declaring a blocker resolved, not only stating it"
+  );
+  assert.match(
+    prompt,
+    /this resolves it once recorded — shall I write it to plan\.md\?/,
+    "prompt must carry the exact required phrasing before the write is drafted"
+  );
+  assert.match(
+    prompt,
+    /do not advise completing this stage or advancing/,
+    "prompt must forbid advancing advice while the recorded blocker is still unaddressed in the artifacts"
+  );
+});
+
+// wf10 review fix (2026-08-25, new completion blocker): the prior wording
+// only forbade advancing advice "until you have actually drafted that
+// update" — since drafting happens synchronously in the same response, that
+// left the model free to draft the UPDATE_FILE envelope AND advise advancing
+// in that same reply, before the user has confirmed anything and before any
+// write has landed. A declined or failed confirmation could then leave chat
+// advising advancement while plan.md was never actually touched. The prompt
+// must instead require seeing this conversation's own confirmed-write
+// message before advising advancing at all.
+void test("stage prompt forbids advancing advice even in the same response that drafts the update, until a confirmed write is visible in history", () => {
+  const prompt = buildStageResponsePrompt("Plan", "my-task", "", "ctx", "msg");
+  assert.match(
+    prompt,
+    /that restriction still applies in the very same response where you draft the update/,
+    "prompt must forbid advancing advice within the same response that drafts the UPDATE_FILE envelope, not only before drafting it"
+  );
+  assert.match(
+    prompt,
+    /once this conversation's own history shows a message beginning "_Updated `<file>`\._" for that exact update/,
+    "prompt must require the confirmed-write outcome message before advising advancing"
+  );
+  assert.match(
+    prompt,
+    /A declined confirmation instead reports "_\.\.\.was not confirmed; nothing was written\._"/,
+    "prompt must tell the model to recognize a declined confirmation and keep treating the blocker as outstanding"
+  );
+});
+
+// Review-flagged (2026-08-25, third narrowing of task-fixable blocker
+// fc82d17d-…-3): the prompt must instruct the model to emit the explicit
+// `[[RESOLVES_BLOCKER]]` marker as part of declaring a blocker resolved — the
+// signal `detectBlockerSupersessionCandidateV1` (chatSendRowV1.ts) now relies
+// on instead of inferring resolution from the edit's own vocabulary.
+void test("stage prompt instructs the [[RESOLVES_BLOCKER]] marker when declaring a recorded blocker resolved", () => {
+  const prompt = buildStageResponsePrompt("Plan", "my-task", "", "ctx", "msg");
+  assert.match(
+    prompt,
+    /also end your response with `\[\[RESOLVES_BLOCKER\]\]` on its own line/,
+    "prompt must instruct emitting the explicit marker alongside the UPDATE_FILE draft"
+  );
+  assert.match(
+    prompt,
+    /never for an edit that merely discusses, restates, or promises to resolve the blocker later/,
+    "prompt must warn against marking an edit that does not actually resolve the blocker"
+  );
 });
 
 void test("accepts the shared typed [[ACTION:...]] protocol alongside the legacy form", () => {
@@ -570,5 +650,665 @@ void test("dispatchProposedStageActionV1 refuses an unrecognized action id witho
   } finally {
     bridge.restore();
     fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// wf10 item 19 / plan Step 28: a chat-drafted `plan.md` edit sent while the
+// chat's own stage is a plan-review stage with exactly ONE recorded blocker,
+// AND accompanied by the model's own explicit `[[RESOLVES_BLOCKER]]` marker,
+// is a candidate blocker-supersession edit — the write must NOT be
+// auto-applied (unlike an ordinary chat markdown edit); it must be proposed
+// on the message instead, for a confirmation dialog to gate it, so the same
+// class of defect that let stage chat advise "this resolves it, advance"
+// while plan.md stayed unchanged cannot recur behind a silent auto-write.
+void test("a plan.md edit marked [[RESOLVES_BLOCKER]] during a sole-blocker plan-review chat is proposed, not auto-applied", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-candidate-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-candidate",
+      attemptId: "attempt-supersession-candidate",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Recorded your decision. [[UPDATE_FILE:plan.md]]# Plan\n\nOwner-approved tie policy: ...\n[[/UPDATE_FILE]]" +
+        "\n[[RESOLVES_BLOCKER]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.ok(!last.text.includes("UPDATE_FILE"), "the envelope must never survive into the displayed text");
+    assert.ok(!last.text.includes("RESOLVES_BLOCKER"), "the marker must never survive into the displayed text");
+    assert.match(last.text, /confirm to apply/i);
+    assert.ok(last.proposedBlockerSupersessionEdit, "must carry a proposed edit awaiting confirmation");
+    assert.equal(last.proposedBlockerSupersessionEdit?.relPath, "plan.md");
+    assert.equal(
+      last.proposedBlockerSupersessionEdit?.blockerDescription,
+      "the owner must approve a complete tie policy"
+    );
+    assert.equal(last.proposedBlockerSupersessionEdit?.reviewStage, "plan-high-review");
+
+    // Not auto-applied: plan.md must not exist on disk yet.
+    assert.ok(!fs.existsSync(`${folder}/plan.md`), "plan.md must not be written until the user confirms");
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Review-flagged (2026-08-25, third narrowing of task-fixable blocker
+// fc82d17d-…-3): the marker replaces lexical correlation as the SOLE
+// resolution signal — an edit sharing plenty of the blocker's vocabulary is
+// never treated as a candidate without the model's own explicit marker,
+// exactly like a model that never intended to draft a resolution.
+void test("a plan.md edit that shares the blocker's vocabulary but omits [[RESOLVES_BLOCKER]] still auto-applies", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-no-marker-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-no-marker",
+      attemptId: "attempt-supersession-no-marker",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Noted. [[UPDATE_FILE:plan.md]]# Plan\n\n## Open decisions\n\nThe tie policy remains pending — the owner " +
+        "has not yet approved it.\n[[/UPDATE_FILE]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "vocabulary overlap alone, with no explicit marker, must never be treated as resolving the blocker"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Review-flagged (2026-08-25): a sole recorded blocker is not, by itself,
+// evidence that a given plan.md edit resolves it — confirming an UNRELATED
+// wording fix elsewhere in the document must not be misread as "this
+// resolves the blocker" and silently suppress a genuinely unresolved one.
+// With the explicit-marker design, this is trivially true: no marker means
+// no candidate, whatever the edit's content — this fixture also has no
+// marker, matching a model that never intended to declare a resolution.
+void test("an unrelated plan.md edit during a sole-blocker plan-review chat still auto-applies (no unsafe supersession guess)", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-unrelated-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan.md`,
+      ["# Plan", "", "## Part 1", "", "Some existing unrelated content.", ""].join("\n"),
+      "utf8"
+    );
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-unrelated",
+      attemptId: "attempt-supersession-unrelated",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Fixed a typo. [[UPDATE_FILE:plan.md]]# Plan\n\n## Part 1\n\nSome existing unrelated content, now with a " +
+        "typo fixed.\n[[/UPDATE_FILE]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "an edit sharing none of the blocker's vocabulary must not be treated as resolving it"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+    const written = fs.readFileSync(`${folder}/plan.md`, "utf8");
+    assert.match(written, /typo fixed/, "the unrelated edit must still auto-apply, exactly like any ordinary chat edit");
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Review-flagged (2026-08-25, blocker fc82d17d-…-3, now resolved by the
+// explicit `[[RESOLVES_BLOCKER]]` marker rather than lexical detection — see
+// `detectBlockerSupersessionCandidateV1`'s doc comment): the review's own
+// worked example — an edit that shares significant vocabulary with the
+// blocker while explicitly saying the matter is STILL pending — is a
+// realistic case where a well-behaved model would never emit the marker in
+// the first place. This proves the fixture's realistic (marker-less) shape
+// still auto-applies, not any text analysis of "remains pending".
+void test("an edit restating the blocker as still pending (with no marker) still auto-applies", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-still-pending-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan.md`,
+      ["# Plan", "", "## Part 1", "", "Some existing unrelated content.", ""].join("\n"),
+      "utf8"
+    );
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-still-pending",
+      attemptId: "attempt-supersession-still-pending",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Noted. [[UPDATE_FILE:plan.md]]# Plan\n\n## Part 1\n\nSome existing unrelated content.\n\n" +
+        "## Open decisions\n\nThe tie policy remains pending — the owner has not yet approved it.\n[[/UPDATE_FILE]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "an edit with no [[RESOLVES_BLOCKER]] marker must never be treated as resolving the blocker, regardless of vocabulary"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Review-flagged (2026-08-25, blocker fc82d17d-…-3, now resolved by the
+// explicit marker — see the "still pending" test above for why this fixture
+// stays marker-less): "the tie policy will be presented for approval
+// tomorrow" shares plenty of vocabulary with the blocker while describing a
+// FUTURE promise, not a decision already made — another realistic case a
+// well-behaved model would never mark `[[RESOLVES_BLOCKER]]`.
+void test("an edit merely promising future approval (with no marker) still auto-applies", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-future-promise-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan.md`,
+      ["# Plan", "", "## Part 1", "", "Some existing unrelated content.", ""].join("\n"),
+      "utf8"
+    );
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-future-promise",
+      attemptId: "attempt-supersession-future-promise",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Noted. [[UPDATE_FILE:plan.md]]# Plan\n\n## Part 1\n\nSome existing unrelated content.\n\n" +
+        "## Open decisions\n\nThe tie policy will be presented for approval tomorrow.\n[[/UPDATE_FILE]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "an edit with no [[RESOLVES_BLOCKER]] marker must never be treated as resolving the blocker, regardless of vocabulary"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Review-flagged (2026-08-25, blocker fc82d17d-…-3, now resolved by the
+// explicit marker): "owner sign-off is outstanding" shares plenty of
+// vocabulary with the blocker while asserting the matter is unresolved — a
+// phrasing that defeated two rounds of denylist narrowing before the marker
+// replaced lexical inference entirely. A well-behaved model would never mark
+// `[[RESOLVES_BLOCKER]]` on this text, and its absence is now the only thing
+// that matters.
+void test("an edit describing sign-off as outstanding (with no marker) still auto-applies", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-outstanding-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan.md`,
+      ["# Plan", "", "## Part 1", "", "Some existing unrelated content.", ""].join("\n"),
+      "utf8"
+    );
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 7/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-outstanding",
+      attemptId: "attempt-supersession-outstanding",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text:
+        "Noted. [[UPDATE_FILE:plan.md]]# Plan\n\n## Part 1\n\nSome existing unrelated content.\n\n" +
+        "## Open decisions\n\nTie-policy alternatives include equal final-entry timestamps and guarantees for " +
+        "the promised outcome; owner sign-off is outstanding.\n[[/UPDATE_FILE]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "an edit with no [[RESOLVES_BLOCKER]] marker must never be treated as resolving the blocker, regardless of vocabulary"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// The same shape but with TWO recorded blockers, and the model DOES include
+// the marker: cardinality still refuses to guess which blocker the write
+// addresses, so the explicit marker alone does not bypass this guard — this
+// stays an ordinary chat file update and auto-applies exactly as before.
+void test("a plan.md edit marked [[RESOLVES_BLOCKER]] during a multi-blocker plan-review chat still auto-applies (no ambiguous supersession guess)", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("blocker-supersession-multi-");
+  const canonicalId = folder;
+  try {
+    fs.writeFileSync(
+      `${folder}/plan-high-review.md`,
+      [
+        "Readiness: 5/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a tie policy",
+        "- [completion] [task-fixable] the retry loop still swallows errors",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const row = createChatSendRowV1();
+    const correlation: ActionCorrelationV1 = {
+      actionKey: "chatSend.v1",
+      operationId: "op-supersession-multi",
+      attemptId: "attempt-supersession-multi",
+      taskBindingId: "binding-1",
+      chatDocumentId: "doc-1",
+    };
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage: "plan-high-review",
+      validatedInput: { prompt: "irrelevant", taskFolderPath: folder, canonicalId },
+    };
+    const content: CompletedContentV1 = {
+      contentType: "chat-message.v1",
+      schemaVersion: 1,
+      text: "Updating the plan. [[UPDATE_FILE:plan.md]]# Plan\n\nSome update.\n[[/UPDATE_FILE]]\n[[RESOLVES_BLOCKER]]",
+    };
+    const code = await row.promoteCompletedContent(content, context);
+    assert.equal(code, "completed");
+
+    const history = await readChatHistory(folder, canonicalId);
+    const last = history[history.length - 1];
+    assert.ok(last);
+    assert.ok(!last.text.includes("RESOLVES_BLOCKER"), "the marker must never survive into the displayed text");
+    assert.equal(
+      last.proposedBlockerSupersessionEdit,
+      undefined,
+      "the explicit marker must not override the multi-blocker ambiguity guard"
+    );
+    assert.match(last.text, /_Updated `plan\.md`\._/);
+    assert.ok(fs.existsSync(`${folder}/plan.md`), "an ordinary chat edit with no candidate must still auto-apply");
+  } finally {
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// Dispatch-path coverage for the confirm/apply half, mirroring
+// dispatchProposedStageActionV1's own applied/declined pair above.
+void test("dispatchProposedBlockerSupersessionEditV1 applies the write only on confirmation (applied)", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("supersession-dispatch-applied-");
+  const win = vscode.window as unknown as Record<string, unknown>;
+  const originalWarning = win.showWarningMessage;
+  try {
+    win.showWarningMessage = (): Promise<string | undefined> => Promise.resolve("Apply Update");
+    const provider = new ChatViewProvider(makeMemento());
+
+    await dispatchProposedBlockerSupersessionEditV1(provider, folder, folder, "plan-high-review", {
+      relPath: "plan.md",
+      content: "# Plan\n\nOwner-approved tie policy.",
+      blockerDescription: "the owner must approve a complete tie policy",
+      reviewStage: "plan-high-review",
+    });
+
+    const history = await readChatHistory(folder, folder);
+    assert.equal(history.length, 1);
+    assert.match(history[0]!.text, /_Updated `plan\.md`\._/);
+    assert.equal(fs.readFileSync(`${folder}/plan.md`, "utf8"), "# Plan\n\nOwner-approved tie policy.");
+
+    // wf10 item 19: the write must ALSO record a durable supersession entry
+    // — this is what lets readStageArtifactsForChat (the production consumer,
+    // see TaskProgress.blockerSupersessions's doc comment) recognize the
+    // blocker as no longer outstanding without requiring a fresh review round.
+    const progress = await readTaskProgressForTest(vscode.Uri.file(folder));
+    assert.equal(progress?.blockerSupersessions?.length, 1);
+    assert.equal(progress?.blockerSupersessions?.[0]?.stage, "plan-high-review");
+    assert.equal(
+      progress?.blockerSupersessions?.[0]?.blockerDescription,
+      "the owner must approve a complete tie policy"
+    );
+    assert.equal(progress?.blockerSupersessions?.[0]?.planRelPath, "plan.md");
+  } finally {
+    win.showWarningMessage = originalWarning;
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+void test("dispatchProposedBlockerSupersessionEditV1 writes nothing when the confirmation is declined (declined)", async () => {
+  const bridge = installReadFileBridge();
+  const { folder } = makeOwnedTaskFolder("supersession-dispatch-declined-");
+  const win = vscode.window as unknown as Record<string, unknown>;
+  const originalWarning = win.showWarningMessage;
+  try {
+    win.showWarningMessage = (): Promise<string | undefined> => Promise.resolve(undefined);
+    const provider = new ChatViewProvider(makeMemento());
+
+    await dispatchProposedBlockerSupersessionEditV1(provider, folder, folder, "plan-high-review", {
+      relPath: "plan.md",
+      content: "# Plan\n\nOwner-approved tie policy.",
+      blockerDescription: "the owner must approve a complete tie policy",
+      reviewStage: "plan-high-review",
+    });
+
+    const history = await readChatHistory(folder, folder);
+    assert.equal(history.length, 1);
+    assert.match(history[0]!.text, /not confirmed; nothing was written/);
+    assert.ok(!fs.existsSync(`${folder}/plan.md`), "declining the confirmation must never write the file");
+
+    // wf10 item 19: a declined write must never record a supersession —
+    // nothing was actually resolved on disk, so a stage gate must keep
+    // reading the blocker as outstanding.
+    const progress = await readTaskProgressForTest(vscode.Uri.file(folder));
+    assert.equal(progress?.blockerSupersessions, undefined);
+  } finally {
+    win.showWarningMessage = originalWarning;
+    bridge.restore();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+// wf10 review fix (2026-08-25, new completion blocker): `readStageArtifactsForChat`
+// is the real production consumer of `TaskProgress.blockerSupersessions` for a
+// plan-review stage — see its own doc comment and TaskProgress.blockerSupersessions's
+// for why the two consumers a prior comment named here never actually applied.
+void test("readStageArtifactsForChat annotates a blocker superseded via chat, without hiding the raw review text", async () => {
+  const bridge = installReadFileBridge();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-stage-artifact-supersession-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "plan-high-review.md"),
+      [
+        "Readiness: 5/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    // supersededAt must be unambiguously AFTER the review artifact's own
+    // mtime — the artifact above was just written via fs.writeFileSync, so
+    // its mtime is real wall-clock "now"; a same-day midnight timestamp here
+    // would (almost always) read as BEFORE that mtime and be treated as a
+    // stale supersession (see the sibling "stale supersession" test below),
+    // not the fresh one this test exercises.
+    const context = await readStageArtifactsForChat(vscode.Uri.file(dir), "plan-high-review", [
+      {
+        stage: "plan-high-review",
+        blockerDescription: "the owner must approve a complete tie policy",
+        supersededAt: "2099-01-01T00:00:00.000Z",
+        planRelPath: "plan.md",
+        confirmingMessageAt: "2098-12-31T23:59:00.000Z",
+      },
+    ]);
+
+    assert.match(context, /the owner must approve a complete tie policy/, "raw review text must survive unchanged");
+    assert.match(context, /Superseded: the blocker "the owner must approve a complete tie policy"/);
+    assert.match(context, /2099-01-01T00:00:00\.000Z/);
+    assert.match(context, /`plan\.md`/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test("readStageArtifactsForChat never masks a blocker a fresher review re-asserts (stale supersession)", async () => {
+  const bridge = installReadFileBridge();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-stage-artifact-stale-supersession-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "plan-high-review.md"),
+      [
+        "Readiness: 5/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    // Supersession recorded long before this artifact's own mtime — a later,
+    // still-current review round independently re-found the identically
+    // worded blocker, so it must read as outstanding, not superseded.
+    const context = await readStageArtifactsForChat(vscode.Uri.file(dir), "plan-high-review", [
+      {
+        stage: "plan-high-review",
+        blockerDescription: "the owner must approve a complete tie policy",
+        supersededAt: "2000-01-01T00:00:00.000Z",
+        planRelPath: "plan.md",
+      },
+    ]);
+
+    assert.match(context, /the owner must approve a complete tie policy/);
+    assert.doesNotMatch(context, /Superseded: the blocker/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test("readStageArtifactsForChat ignores a supersession recorded against a different stage", async () => {
+  const bridge = installReadFileBridge();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-stage-artifact-wrong-stage-supersession-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "plan-high-review.md"),
+      [
+        "Readiness: 5/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [architectural] [environmental] the owner must approve a complete tie policy",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const context = await readStageArtifactsForChat(vscode.Uri.file(dir), "plan-high-review", [
+      {
+        stage: "plan-low-review",
+        blockerDescription: "the owner must approve a complete tie policy",
+        supersededAt: "2026-08-26T00:00:00.000Z",
+        planRelPath: "plan.md",
+      },
+    ]);
+
+    assert.doesNotMatch(context, /Superseded: the blocker/);
+  } finally {
+    bridge.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

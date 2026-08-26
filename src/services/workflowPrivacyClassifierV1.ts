@@ -77,8 +77,8 @@ export const CREATION_SENTINEL_FILENAME_V1 = ".ensemble-creation-sentinel-v1.jso
  * Workflow-control basenames the product persists today. Owners:
  * task-progress.json (types/taskProgress.ts), finalization-journal.json
  * (state/finalizationJournal.ts), .ensemble-activation-checkpoint.json
- * (state/taskActivationCheckpoint.ts), task-models.json and
- * task-models.resolved.json (utils/modelSelection.ts), .ensemble-migration.json
+ * (state/taskActivationCheckpoint.ts), task-models.json
+ * (utils/modelSelection.ts), .ensemble-migration.json
  * — the crash-surviving meta-root move provenance journal
  * (utils/metaResourcesMigration.ts MIGRATION_JOURNAL_FILENAME). The classifier
  * unit test pins each literal against its owning module's export where one
@@ -89,7 +89,6 @@ const WORKFLOW_CONTROL_BASENAMES = new Set<string>([
   "finalization-journal.json",
   ".ensemble-activation-checkpoint.json",
   "task-models.json",
-  "task-models.resolved.json",
   ".ensemble-migration.json",
   CREATION_SENTINEL_FILENAME_V1.toLowerCase(),
 ]);

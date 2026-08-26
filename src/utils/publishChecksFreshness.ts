@@ -5,11 +5,13 @@ import * as crypto from "node:crypto";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /**
- * Freshness stamp for `publish-checks.md` (plan PART 2, step 6): proves the
- * completion lint and Publish Scope Check that produced the rest of the
- * document ran back-to-back against one unchanged commit. The stamp does
- * NOT assert the checks passed — a completed run with red results still
- * gets a valid stamp — only that they ran, together, against `verifiedCommitSha`.
+ * Freshness stamp for `publish-review.md` (plan PART 2, step 6; plan item 17,
+ * step 20 for the artifact-unification rename from the legacy
+ * `publish-checks.md`): proves the completion lint and Publish Scope Check
+ * that produced the rest of the document ran back-to-back against one
+ * unchanged commit. The stamp does NOT assert the checks passed — a
+ * completed run with red results still gets a valid stamp — only that they
+ * ran, together, against `verifiedCommitSha`.
  *
  * `scopeId` is a hash of the absolute verification-scope folder rather than
  * the raw path itself, so the stamp never embeds a private absolute
@@ -53,13 +55,79 @@ export function renderPublishChecksFreshnessStamp(stamp: PublishChecksFreshnessS
   ].join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// "## Verification (ground truth)" wrapper heading. The Completion Checks
+// and Scope Check sections each render their own `###` heading (`### Completion
+// Checks`, `### Scope Check`) — one level below this wrapper so they nest as
+// its children in the rendered document, rather than reading as two more
+// top-level sections indistinguishable from the AI reviewer's own prose,
+// which is exactly the "mistaken for the review" failure the artifact
+// unification exists to fix. This heading is inserted once, ahead of both,
+// framing everything beneath it as deterministic input rather than verdict.
+// ---------------------------------------------------------------------------
+
+export const VERIFICATION_HEADING_START = "<!-- verification-heading:start -->";
+export const VERIFICATION_HEADING_END = "<!-- verification-heading:end -->";
+
+/** @internal exported for testing */
+export function renderVerificationHeading(): string {
+  return [
+    VERIFICATION_HEADING_START,
+    "## Verification (ground truth)",
+    "",
+    "Deterministic results from actually running this project's checks — input to your review, " +
+      "not a verdict on its own.",
+    VERIFICATION_HEADING_END,
+  ].join("\n");
+}
+
+function extractMarkedSection(content: string, start: string, end: string): string | undefined {
+  const startIdx = content.indexOf(start);
+  const endIdx = content.indexOf(end);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+    return undefined;
+  }
+  return content.slice(startIdx, endIdx + end.length);
+}
+
+/** @internal exported for testing and reuse by reviewRowV1.ts */
+export function extractVerificationHeadingSectionV1(content: string): string | undefined {
+  return extractMarkedSection(content, VERIFICATION_HEADING_START, VERIFICATION_HEADING_END);
+}
+
+/** @internal exported for testing and reuse by reviewRowV1.ts */
+export function mergeVerificationHeadingSection(existing: string, section: string): string {
+  const startIdx = existing.indexOf(VERIFICATION_HEADING_START);
+  const endIdx = existing.indexOf(VERIFICATION_HEADING_END);
+  return startIdx !== -1 && endIdx !== -1 && endIdx > startIdx
+    ? existing.slice(0, startIdx) + section + existing.slice(endIdx + VERIFICATION_HEADING_END.length)
+    : existing.trim().length > 0
+      ? `${existing.trimEnd()}\n\n${section}\n`
+      : `${section}\n`;
+}
+
+/**
+ * Ensure `existing` carries the "## Verification (ground truth)" wrapper
+ * heading, inserting the default rendering (appended at the end, ahead of
+ * whatever managed section is about to be merged in next) when absent.
+ * Idempotent — a no-op once the heading is present, whatever its content.
+ *
+ * @internal exported for testing and reuse by reviewRowV1.ts
+ */
+export function ensureVerificationHeadingV1(existing: string): string {
+  if (existing.indexOf(VERIFICATION_HEADING_START) !== -1) {
+    return existing;
+  }
+  return mergeVerificationHeadingSection(existing, renderVerificationHeading());
+}
+
 function readStampField(block: string, name: string): string | undefined {
   const match = block.match(new RegExp(`<!--\\s*${name}:\\s*([^>]*?)\\s*-->`));
   return match?.[1]?.trim() || undefined;
 }
 
 /**
- * Parse the managed freshness block out of `publish-checks.md` content.
+ * Parse the managed freshness block out of `publish-review.md` content.
  * Returns undefined when the block is absent, truncated, or missing any
  * required field — callers must treat that identically to "no stamp".
  *
@@ -98,7 +166,7 @@ export function parsePublishChecksFreshnessStamp(
 }
 
 /**
- * Merge a rendered freshness block into existing `publish-checks.md`
+ * Merge a rendered freshness block into existing `publish-review.md`
  * content, replacing a previous stamp in place. Mirrors
  * `mergeCompletionChecksSection`/`mergeScopeCheckSection`'s upsert pattern.
  *
@@ -133,7 +201,7 @@ export function extractPublishChecksFreshnessStampSectionV1(content: string): st
 
 /**
  * Strictly subtractive: remove a previous freshness stamp from
- * `publish-checks.md` content, if present. Used to invalidate the stamp
+ * `publish-review.md` content, if present. Used to invalidate the stamp
  * before a new Publish Checks run starts, so a reader can never observe a
  * stamp whose commit predates in-flight check output.
  *
@@ -192,18 +260,106 @@ async function readPublishChecksFile(taskFolderUri: vscode.Uri): Promise<string>
   }
 }
 
+/** The bounded set of managed sections a legacy `publish-checks.md` can carry
+ * — the only content `importLegacyPublishChecksIfAbsentV1` is permitted to
+ * bring across. Anything else in the legacy file (its own headings, stray
+ * prose, an obsolete instruction block) is deliberately left behind. */
+const LEGACY_MANAGED_SECTION_MARKERS: ReadonlyArray<{ start: string; end: string }> = [
+  { start: "<!-- completion-checks:start -->", end: "<!-- completion-checks:end -->" },
+  { start: "<!-- scope-check:start -->", end: "<!-- scope-check:end -->" },
+  { start: PUBLISH_CHECKS_STAMP_START, end: PUBLISH_CHECKS_STAMP_END },
+];
+
+/**
+ * Durable "already imported from legacy" sentinel — deliberately NOT the
+ * freshness stamp. `upsertCompletionChecksReportV1` invalidates (removes)
+ * the freshness stamp on every run that doesn't also run the Scope Check
+ * (see its own doc comment), so using the stamp's presence as the import
+ * sentinel made the import fire again on the very next upsert call once the
+ * stamp it had just imported was stripped — duplicating the provenance note,
+ * the verification heading, and every managed section it had just written.
+ *
+ * Embedded inside the "## Verification (ground truth)" heading block itself
+ * (`renderVerificationHeadingWithLegacyImportMarkerV1` below), not appended
+ * as bare text alongside it: `reviewRowV1.ts`'s `reinjectPublishGroundTruthSectionsV1`
+ * re-splices a review write by extracting and re-merging only the known
+ * marker-delimited sections (heading, completion checks, scope check,
+ * freshness stamp) — anything written outside those markers is dropped from
+ * the file a review write produces. A marker living outside all of them
+ * would silently vanish on the very next review write, making the "done"
+ * sentinel disappear and the import fire again on every subsequent review.
+ * Riding inside the heading section, which every re-splice path already
+ * preserves, makes the marker survive for the lifetime of the file.
+ */
+const LEGACY_IMPORT_DONE_MARKER = "<!-- publish-checks-legacy-import:v1 -->";
+
+/**
+ * Same rendering as `renderVerificationHeading`, with the durable
+ * legacy-import-done marker AND the human-readable provenance note both
+ * folded into the same marker-delimited block, so both survive every future
+ * re-splice (see `LEGACY_IMPORT_DONE_MARKER`'s doc comment). This matters
+ * because `reviewRowV1.ts`'s `reinjectPublishGroundTruthSectionsV1` re-injects
+ * a review write by extracting and re-merging only the known marker-delimited
+ * sections (this heading, completion checks, scope check, freshness stamp) —
+ * plain text living between those markers, as the provenance note used to,
+ * is dropped on the very next AI review write. Used only by the import
+ * path — the heading `ensureVerificationHeadingV1` inserts for a task with no
+ * legacy content to import stays provenance-free.
+ */
+function renderVerificationHeadingWithLegacyImportMarkerV1(): string {
+  return [
+    VERIFICATION_HEADING_START,
+    "## Verification (ground truth)",
+    "",
+    LEGACY_IMPORT_DONE_MARKER,
+    "Deterministic results from actually running this project's checks — input to your review, " +
+      "not a verdict on its own.",
+    "",
+    "_Imported once from the legacy `publish-checks.md`, which predated the Publish artifact " +
+      "unification, on first access after the upgrade. Only its managed checks sections were " +
+      "imported (not its heading or prose) — `publish-checks.md` itself was left untouched on disk._",
+    VERIFICATION_HEADING_END,
+  ].join("\n");
+}
+
+/**
+ * Legacy `publish-checks.md` rendered its own two section headings one level
+ * shallower (`## Completion Checks`, `## Scope Check`) than the current
+ * build does, because it was a standalone top-level document rather than
+ * content nested under this file's `## Verification (ground truth)` wrapper.
+ * Imported verbatim, those headings would read as siblings of the wrapper
+ * instead of children of it — the same "mistaken for the review" shape the
+ * artifact unification exists to fix (see the module doc comment above).
+ * Bounded to exactly the two known legacy heading strings; nothing else in
+ * an imported section is rewritten. A section whose heading is already at
+ * the current (already-demoted) level is left untouched.
+ *
+ * @internal exported for testing
+ */
+export function normalizeLegacyHeadingLevelV1(section: string): string {
+  return section
+    .replace(/^## Completion Checks$/m, "### Completion Checks")
+    .replace(/^## Scope Check$/m, "### Scope Check");
+}
+
 /**
  * One-time bounded import (plan item 17, steps 20(b)/20(c)): when
- * `publish-review.md` does not yet carry this module's managed freshness
- * stamp but a legacy `publish-checks.md` does, splice the legacy file's
- * ENTIRE managed-sections content (Completion Checks, Scope Check, and this
- * freshness stamp — whichever it has) into `existing`, preceded by a
- * provenance note, and return the result. A no-op (returns `existing`
- * unchanged) once `publish-review.md` already carries its own stamp — this
- * is the "no proactive migration sweep" rule: import happens lazily, at most
- * once, the first time something upserts into or reads the new artifact for
- * a task that predates the unification, never as a background sweep over
- * every task folder. The legacy file itself is never modified or deleted.
+ * `publish-review.md` does not yet carry the durable `LEGACY_IMPORT_DONE_MARKER`
+ * sentinel but a legacy `publish-checks.md` does have known sections, extract
+ * ONLY the legacy file's known delimited sections (Completion Checks, Scope
+ * Check, freshness stamp — whichever it has; never its heading, prose, or
+ * any other content) and splice them into `existing`, under the
+ * "## Verification (ground truth)" wrapper heading and preceded by a
+ * provenance note. A no-op (returns `existing` unchanged) once the marker is
+ * already present, or when the legacy file has none of the three known
+ * sections — this is the "no proactive migration sweep" rule: import happens
+ * lazily, at most once, the first time something upserts into or reads the
+ * new artifact for a task that predates the unification (a checks run via
+ * `completionLint.ts`/`publishScopeCheck.ts`, artifact creation via
+ * `ensurePublishReviewArtifactExistsV1`, or a review write via
+ * `reviewRowV1.ts`'s `reinjectPublishGroundTruthSectionsV1`), never as a
+ * background sweep over every task folder. The legacy file itself is never
+ * modified or deleted.
  *
  * @internal exported for testing
  */
@@ -211,7 +367,7 @@ export async function importLegacyPublishChecksIfAbsentV1(
   taskFolderUri: vscode.Uri,
   existing: string
 ): Promise<string> {
-  if (existing.indexOf(PUBLISH_CHECKS_STAMP_START) !== -1) {
+  if (existing.indexOf(LEGACY_IMPORT_DONE_MARKER) !== -1) {
     return existing;
   }
   let legacy: string;
@@ -220,17 +376,54 @@ export async function importLegacyPublishChecksIfAbsentV1(
   } catch {
     return existing;
   }
-  if (legacy.indexOf(PUBLISH_CHECKS_STAMP_START) === -1 && legacy.trim().length === 0) {
+  const importedSections = LEGACY_MANAGED_SECTION_MARKERS.map(({ start, end }) =>
+    extractMarkedSection(legacy, start, end)
+  )
+    .filter((section): section is string => section !== undefined)
+    .map(normalizeLegacyHeadingLevelV1);
+  if (importedSections.length === 0) {
     return existing;
   }
-  const provenance =
-    "<!-- Imported once from the legacy publish-checks.md, which predated the Publish artifact " +
-    "unification, on first access after the upgrade. publish-checks.md itself was left untouched " +
-    "on disk. Nothing below this note was authored by the current review. -->";
-  const legacyBody = legacy.trim();
-  return existing.trim().length > 0
-    ? `${existing.trimEnd()}\n\n${provenance}\n\n${legacyBody}\n`
-    : `${provenance}\n\n${legacyBody}\n`;
+  // The marker-carrying heading is merged via mergeVerificationHeadingSection
+  // (replace-in-place if a heading is already there, append if not) rather
+  // than blindly appended — guards against ever producing two
+  // `verification-heading` marker pairs in the same file, which would make
+  // extraction (first-start/first-end) silently drop the second one. The
+  // provenance note now lives INSIDE that heading block (see
+  // renderVerificationHeadingWithLegacyImportMarkerV1's doc comment) rather
+  // than as plain text alongside the imported sections, so it survives a
+  // subsequent AI review write's re-splice.
+  const withHeading = mergeVerificationHeadingSection(existing, renderVerificationHeadingWithLegacyImportMarkerV1());
+  const body = importedSections.join("\n\n");
+  return withHeading.trim().length > 0
+    ? `${withHeading.trimEnd()}\n\n${body}\n`
+    : `${body}\n`;
+}
+
+/**
+ * Entry-gate variant of the lazy import (plan item 17, step 20(c) — "next
+ * touch of either surface"): when `publish-review.md` already exists but has
+ * not yet had legacy sections imported into it (e.g. an older build's stub,
+ * or a task where only `publish-checks.md` ever carried a valid stamp), pull
+ * them in and persist the result to disk BEFORE any freshness check reads
+ * the file. Without this, `requirePublishChecksFreshnessOrWarnV1` (plan PART
+ * 2, step 7) reads `publish-review.md`'s (absent) stamp, classifies it
+ * `"missing"`, and refuses the review before `reviewRowV1.ts`'s
+ * promotion-time import — reachable only on an actual review write — ever
+ * runs. A no-op once the durable import marker is present, or when there is
+ * no legacy `publish-checks.md` to import from.
+ */
+export async function ensurePublishReviewLegacySectionsImportedV1(
+  taskFolderUri: vscode.Uri
+): Promise<void> {
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    const existing = await readPublishChecksFile(taskFolderUri);
+    const imported = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
+    if (imported === existing) {
+      return;
+    }
+    await writeFileAtomicV1(publishChecksPath(taskFolderUri), imported);
+  });
 }
 
 /**
@@ -271,7 +464,7 @@ export async function writeFileAtomicV1(targetPath: string, content: string): Pr
 
 /**
  * Per-report async mutex (plan PART 2, step 6): serializes every
- * read-modify-write cycle against a given `publish-checks.md` so two calls
+ * read-modify-write cycle against a given `publish-review.md` so two calls
  * that resolve to the same file — from any call site, present or future —
  * can never interleave their read and write, which is what would otherwise
  * let one call's write clobber a section the other just wrote. Task-level
@@ -296,7 +489,7 @@ export function withPublishChecksReportLockV1<T>(
 }
 
 /**
- * Remove any previous freshness stamp from `publish-checks.md` on disk. A
+ * Remove any previous freshness stamp from `publish-review.md` on disk. A
  * no-op (no write) when no stamp is present, so calling this on every
  * Publish Checks run never touches the file's mtime unnecessarily.
  */
@@ -315,7 +508,7 @@ export async function invalidatePublishChecksFreshnessStampOnDiskV1(
   });
 }
 
-/** Write a valid freshness stamp into `publish-checks.md` on disk. */
+/** Write a valid freshness stamp into `publish-review.md` on disk. */
 export async function writePublishChecksFreshnessStampV1(
   taskFolderUri: vscode.Uri,
   stamp: PublishChecksFreshnessStampV1

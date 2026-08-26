@@ -5,6 +5,10 @@ node_modules/
 dist/
 out/
 out-test/
+# Sanctioned scratch compile output (wf10 item 10): a one-off `tsc --outDir`
+# during an implementation round belongs here, never in a made-up path like
+# .test-out/ — see resources/prompts/run-implementation.md.
+.scratch/
 # Not a project output path — no tsconfig or npm script emits here. An
 # agentic run compiled the tree with a custom --outDir on 2026-08-23 and left
 # 12.6MB behind, untracked and unignored, where a `git add -A` would have

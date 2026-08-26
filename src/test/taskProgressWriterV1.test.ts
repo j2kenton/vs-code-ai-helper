@@ -243,6 +243,96 @@ void describe("taskProgressWriterV1 — patchTaskProgressStrictV1 parity", () =>
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // progressVersion (wf10 item 8 / plan step 23): a monotonic CAS token owned
+  // entirely by patchTaskProgressStrictV1, decoupled from the display-facing
+  // updatedAt it used to double as. A record written before this field
+  // existed has no `progressVersion` at all — the fixture above (no
+  // `progressVersion` key) stands in for exactly that legacy shape.
+  // ---------------------------------------------------------------------------
+
+  void it("stamps progressVersion to 1 on the first real write to a record that predates the field", async () => {
+    const h = installHarness();
+    try {
+      const before = decodeTaskProgressTextV1(fs.readFileSync(h.progressPath, "utf8"), {
+        expectedTaskFolder: TASK_FOLDER_NAME,
+      });
+      assert.equal(before.ok, true);
+      if (before.ok) {
+        assert.equal(before.decoded.progress.progressVersion, undefined);
+      }
+      const patched = await patchTaskProgressStrictV1(h.folderUri, (current) => ({
+        ...current,
+        currentStage: "plan",
+      }));
+      assert.equal(patched?.progressVersion, 1);
+      const onDisk = decodeTaskProgressTextV1(fs.readFileSync(h.progressPath, "utf8"), {
+        expectedTaskFolder: TASK_FOLDER_NAME,
+      });
+      assert.equal(onDisk.ok, true);
+      if (onDisk.ok) {
+        assert.equal(onDisk.decoded.progress.progressVersion, 1);
+      }
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("increments progressVersion by exactly 1 on each subsequent real write", async () => {
+    const h = installHarness();
+    try {
+      const first = await patchTaskProgressStrictV1(h.folderUri, (current) => ({
+        ...current,
+        currentStage: "plan",
+      }));
+      assert.equal(first?.progressVersion, 1);
+      const second = await patchTaskProgressStrictV1(h.folderUri, (current) => ({
+        ...current,
+        currentStage: "impl",
+      }));
+      assert.equal(second?.progressVersion, 2);
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("never bumps progressVersion for a byte-identical no-op patch", async () => {
+    const h = installHarness();
+    try {
+      const first = await patchTaskProgressStrictV1(h.folderUri, (current) => ({
+        ...current,
+        currentStage: "plan",
+      }));
+      assert.equal(first?.progressVersion, 1);
+      // A patch that changes nothing else must decline (byte-identical
+      // encoding), and MUST NOT advance the token — the token itself is
+      // never allowed to be what makes an otherwise-identical patch look
+      // like a change.
+      const noop = await patchTaskProgressStrictV1(h.folderUri, (current) => ({ ...current }));
+      assert.equal(noop?.progressVersion, 1);
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("ignores an update callback's own progressVersion value — the token is patchTaskProgressStrictV1's alone", async () => {
+    const h = installHarness();
+    try {
+      const patched = await patchTaskProgressStrictV1(h.folderUri, (current) => ({
+        ...current,
+        currentStage: "plan",
+        // A caller has no legitimate reason to set this, and per the field's
+        // policy row no transition builder does — but if one ever tried,
+        // patchTaskProgressStrictV1 must still own the final value rather
+        // than trust it.
+        progressVersion: 999,
+      }));
+      assert.equal(patched?.progressVersion, 1);
+    } finally {
+      h.restore();
+    }
+  });
+
   void it("skips the write entirely for a byte-identical patch, but still runs beforeWrite (CAS-decline parity)", async () => {
     const h = installHarness();
     try {
@@ -342,5 +432,105 @@ void describe("taskProgressWriterV1 — patchTaskProgressStrictV1 parity", () =>
     if (decoded.ok) {
       assert.equal(decoded.decoded.progress.status, "creating");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// progressVersion migration compatibility against this repository's own live
+// `.ensemble/` task history (wf10 item 8 / plan step 23: "test the migration
+// and CAS behavior against existing task folders in .ensemble/"). `.ensemble/`
+// is gitignored dogfood state — present on a developer machine that has run
+// real tasks, absent on a fresh clone or CI checkout — so this sweep skips
+// itself entirely rather than failing when the directory is not there; when it
+// IS there, it is the strongest available evidence that the new field does not
+// break decoding of records that predate it OR records this task's own writer
+// has since stamped, and that the encoder can carry the token forward for
+// real (not just curated-fixture) documents — the population is a mix of
+// both by the time this test runs against a live checkout, so it must accept
+// both rather than assuming every record still lacks the field.
+// ---------------------------------------------------------------------------
+
+void describe("progressVersion — compatibility with live .ensemble/ task folders", () => {
+  const liveRoot = path.resolve(__dirname, "..", "..", ".ensemble");
+
+  function listLiveProgressFiles(): { folder: string; file: string }[] {
+    if (!fs.existsSync(liveRoot)) {
+      return [];
+    }
+    const results: { folder: string; file: string }[] = [];
+    for (const entry of fs.readdirSync(liveRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const file = path.join(liveRoot, entry.name, "task-progress.json");
+      if (fs.existsSync(file)) {
+        results.push({ folder: entry.name, file });
+      }
+    }
+    return results;
+  }
+
+  void it("every live record — whether it predates progressVersion or was already stamped by the shipped writer — decodes cleanly, and the encoder can advance the token forward without disturbing anything else", () => {
+    const files = listLiveProgressFiles();
+    if (files.length === 0) {
+      // No local .ensemble/ history on this machine/checkout — nothing to
+      // sweep. Not a failure: this test only strengthens the guarantee when
+      // real dogfood state happens to be present.
+      return;
+    }
+    let decodedCount = 0;
+    let legacyCount = 0;
+    let migratedCount = 0;
+    for (const { folder, file } of files) {
+      const text = fs.readFileSync(file, "utf8");
+      const result = decodeTaskProgressTextV1(text, { expectedTaskFolder: folder });
+      if (!result.ok) {
+        // A folder whose task-progress.json cannot strictly decode is exercised
+        // by other, dedicated recovery-path tests; it is out of scope for a
+        // migration-compatibility sweep and is silently skipped here rather
+        // than asserted on.
+        continue;
+      }
+      decodedCount++;
+      const { progress, entries } = result.decoded;
+      // The population is mixed by design: most records still predate this
+      // field, but any task this feature's own writer has since touched
+      // (including this task's own folder) already carries a stamped token.
+      // Both are valid on-disk states and must both decode cleanly.
+      if (progress.progressVersion === undefined) {
+        legacyCount++;
+      } else {
+        migratedCount++;
+        assert.ok(
+          Number.isInteger(progress.progressVersion) && progress.progressVersion >= 1,
+          `${folder}: an already-migrated progressVersion must be a positive integer, got ${progress.progressVersion}`
+        );
+      }
+      // Simulate patchTaskProgressStrictV1's increment formula directly (no
+      // disk write): `(current.progressVersion ?? 0) + 1` — 1 for a legacy
+      // record lacking the field, one higher than the existing token for an
+      // already-migrated one — and re-encoding with it set must still
+      // round-trip through a fresh strict decode with every other field
+      // byte-for-byte unaffected.
+      const nextVersion = (progress.progressVersion ?? 0) + 1;
+      const stamped = { ...progress, progressVersion: nextVersion };
+      const reencoded = encodeTaskProgressV1(stamped, entries);
+      const redecoded = decodeTaskProgressTextV1(reencoded, { expectedTaskFolder: folder });
+      assert.equal(redecoded.ok, true, `${folder}: re-encoded record with progressVersion must re-decode`);
+      if (redecoded.ok) {
+        assert.equal(redecoded.decoded.progress.progressVersion, nextVersion);
+        assert.deepEqual(
+          { ...redecoded.decoded.progress, progressVersion: undefined },
+          { ...progress, progressVersion: undefined },
+          `${folder}: advancing progressVersion must not alter any other field`
+        );
+      }
+    }
+    assert.ok(decodedCount > 0, "expected at least one live task-progress.json to strictly decode");
+    assert.equal(
+      legacyCount + migratedCount,
+      decodedCount,
+      "every decoded record must be classified as either legacy (field absent) or migrated (field present)"
+    );
   });
 });

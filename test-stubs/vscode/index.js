@@ -304,6 +304,29 @@ class RelativePattern {
   }
 }
 
+// Minimal Range/WorkspaceEdit + workspace.applyEdit below: just enough for
+// writeTextFile's open-editor branch (fileUtils.ts) to run under plain
+// `node --test` — it constructs a full-document Range, builds a WorkspaceEdit
+// that replaces it, applies it, then saves. Positions are opaque here (only
+// ever round-tripped through Range, never inspected), and applyEdit ignores
+// the range and replaces the whole tracked document content, since that's
+// the only shape writeTextFile ever produces.
+class Range {
+  constructor(start, end) {
+    this.start = start;
+    this.end = end;
+  }
+}
+
+class WorkspaceEdit {
+  constructor() {
+    this._replacements = [];
+  }
+  replace(uri, range, newText) {
+    this._replacements.push({ uri, newText });
+  }
+}
+
 const workspace = {
   fs: {
     readFile: notImplemented("workspace.fs.readFile"),
@@ -371,6 +394,26 @@ const workspace = {
     return { uri: uriOrOptions, getText: () => "", isDirty: false };
   },
   _untitledCounter: 0,
+  // Applies a WorkspaceEdit built via `new vscode.WorkspaceEdit()` +
+  // `.replace(uri, range, newText)` to whichever tracked document in
+  // `textDocuments` matches by uri, via that document's `_setContent` (a
+  // test-only mutator; real documents don't expose one). Ignores the range,
+  // since every caller in this codebase replaces the full document. Bumps
+  // the doc's `.version` by 1 (starting from 1 if unset) on every applied
+  // edit, mirroring real vscode.TextDocument.version semantics closely
+  // enough for fileUtils.ts's `guardVersion` race guard to be exercised
+  // under plain `node --test` — a test can also bump `.version` directly
+  // (without going through applyEdit) to simulate a concurrent edit landing.
+  applyEdit: async (edit) => {
+    for (const { uri, newText } of edit._replacements) {
+      const doc = workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
+      if (doc && typeof doc._setContent === "function") {
+        doc._setContent(newText);
+        doc.version = (typeof doc.version === "number" ? doc.version : 1) + 1;
+      }
+    }
+    return true;
+  },
   _documentCloses: new EventEmitter(),
   onDidCloseTextDocument: (listener) => workspace._documentCloses.event(listener),
   _closeTextDocument: (doc) => {
@@ -402,6 +445,30 @@ const workspace = {
   _configurationChanges: new EventEmitter(),
   onDidChangeWorkspaceFolders: (listener) => workspace._workspaceFolderChanges.event(listener),
   _workspaceFolderChanges: new EventEmitter(),
+  // Minimal onWillSaveTextDocument: real VS Code lets a listener call
+  // event.waitUntil(thenable) to delay the save until the thenable settles.
+  // _fireWillSave below drives that for tests: it invokes every registered
+  // listener, collects anything passed to waitUntil, and awaits them all
+  // before resolving — so a test can assert the save was genuinely deferred
+  // (e.g. it did not resolve until some other in-flight promise did).
+  onWillSaveTextDocument: (listener) => workspace._willSaveListeners.event(listener),
+  _willSaveListeners: new EventEmitter(),
+  _fireWillSave: async (document, reason) => {
+    const waited = [];
+    const event = {
+      document,
+      reason: reason ?? 1,
+      waitUntil: (thenable) => { waited.push(Promise.resolve(thenable)); },
+    };
+    workspace._willSaveListeners.fire(event);
+    await Promise.all(waited);
+  },
+};
+
+const TextDocumentSaveReason = {
+  Manual: 1,
+  AfterDelay: 2,
+  FocusOut: 3,
 };
 
 class TreeView {
@@ -512,7 +579,10 @@ module.exports = {
   Uri,
   FileType,
   RelativePattern,
+  Range,
+  WorkspaceEdit,
   StatusBarAlignment,
+  TextDocumentSaveReason,
   ConfigurationTarget,
   ProgressLocation,
   StatusBarItem,

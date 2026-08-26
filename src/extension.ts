@@ -48,6 +48,7 @@ import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHigh
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import { recoverRevertJournals } from "./utils/artifactRevertJournal";
+import { registerConditionalWriteSaveGuardV1 } from "./utils/fileUtils";
 import {
   ensureAutomaticMetaGitIgnore,
 } from "./commands/toggleMetaResourcesGitIgnore";
@@ -486,6 +487,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   context.subscriptions.push(modelsConfiguredListener);
+
+  // Closes the "editor save lands mid-write" vector on
+  // writeTextFileIfUnchangedV1 (fileUtils.ts) — review-flagged 2026-08-25,
+  // task-fixable blocker `739cfbbb-…-1`. While a conditional write is
+  // in-flight for a uri, a concurrent editor save for the SAME uri now
+  // defers until the write resolves instead of racing it. A no-op for every
+  // document without an in-flight conditional write.
+  context.subscriptions.push(registerConditionalWriteSaveGuardV1());
 
   // Scope migration must resolve before the provider migration, which
   // inspects enabledProviders' post-migration state to decide whether it

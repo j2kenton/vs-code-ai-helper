@@ -32,7 +32,7 @@ import {
   resetWorkflowRuntimeServicesForTestV1,
 } from "../services/workflowRuntimeServicesV1";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
-import { STAGE_ARTIFACT_FILENAMES, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import {
   computePublishScopeId,
   renderPublishChecksFreshnessStamp,
@@ -242,6 +242,63 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
       targetLocator: { rootId, relativePath: "plan-high-review.md" },
     });
     assert.equal(validation.ok, true);
+  });
+});
+
+void describe("review.v1 promotion lazily imports legacy publish-checks.md sections (plan item 17, step 20c)", () => {
+  void it("imports legacy sections on a review write when publish-review.md exists but lacks them, and stays idempotent on a second write", async () => {
+    const folder = makeTaskFolder("both-files-lazy-import");
+    const scopeFolder = path.dirname(folder);
+    // A legacy publish-checks.md, as a pre-upgrade task would still have on
+    // disk (never modified — only its known managed sections are read).
+    const legacyContent = [
+      "<!-- completion-checks:start -->",
+      "### Completion Checks",
+      "",
+      "- Status: Passed",
+      "<!-- completion-checks:end -->",
+      "",
+      "<!-- scope-check:start -->",
+      "### Scope Check",
+      "",
+      "No files the plan doesn't mention.",
+      "<!-- scope-check:end -->",
+      "",
+    ].join("\n");
+    fs.writeFileSync(path.join(folder, PUBLISH_CHECKS_FILENAME), legacyContent, "utf8");
+    // publish-review.md exists (e.g. seeded as a stub by
+    // ensurePublishReviewArtifactExistsV1 on an older build) and carries its
+    // OWN valid freshness stamp — matching the guard — but none of the
+    // embedded verification sections a fresh checks run would have merged in.
+    writeStamp(folder, scopeFolder, RUN_ID, HEAD_SHA);
+    const guard: PublishReviewFreshnessGuardV1 = {
+      taskFolderPath: folder,
+      scopeFolderPath: scopeFolder,
+      runId: RUN_ID,
+      verifiedCommitSha: HEAD_SHA,
+    };
+
+    await promote(folder, guard, "publish-review.md");
+    const afterFirst = fs.readFileSync(path.join(folder, "publish-review.md"), "utf8");
+    assert.match(afterFirst, /Readiness: 8\/10/, "the reviewer's verdict is written");
+    assert.match(afterFirst, /### Completion Checks/, "the legacy Completion Checks section was imported");
+    assert.match(afterFirst, /### Scope Check/, "the legacy Scope Check section was imported");
+    assert.match(afterFirst, /publish-checks-legacy-import:v1/, "the durable import-done marker is written");
+    // The legacy file itself is never touched.
+    assert.equal(
+      fs.readFileSync(path.join(folder, PUBLISH_CHECKS_FILENAME), "utf8"),
+      legacyContent
+    );
+
+    // A second review write (e.g. a re-review) must not import a second
+    // time — the durable marker, not the freshness stamp (which every
+    // review write re-merges from whatever was already on disk), gates it.
+    await promote(folder, guard, "publish-review.md");
+    const afterSecond = fs.readFileSync(path.join(folder, "publish-review.md"), "utf8");
+    const occurrences = afterSecond.split("publish-checks-legacy-import:v1").length - 1;
+    assert.equal(occurrences, 1, "the legacy import must run at most once, not once per review write");
+    const completionHeadingOccurrences = afterSecond.split("### Completion Checks").length - 1;
+    assert.equal(completionHeadingOccurrences, 1, "the imported section must not be duplicated on a second write");
   });
 });
 

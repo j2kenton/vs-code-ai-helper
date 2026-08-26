@@ -194,6 +194,31 @@ export interface TaskProgress {
   /** ISO timestamp when the progress was last updated */
   updatedAt: string;
   /**
+   * Monotonic optimistic-concurrency token, owned entirely by
+   * `patchTaskProgressStrictV1` (wf10 item 8): incremented by exactly 1 on
+   * every write that actually changes the document, and left untouched by
+   * every caller — no `nextStage`/`markTaskDone`/`reopen` transition, and no
+   * individual patch callback, sets this itself. This exists because
+   * `updatedAt` was previously asked to serve two incompatible roles at
+   * once: a CAS token that must stay stable across a write for a closed-over
+   * comparison to make sense, and a human-facing "when did this last change"
+   * timestamp that every display site (Tasks-tree sort/tooltip, discovery
+   * sort, status bar) expects to move on every change. Resolving that in
+   * `updatedAt`'s favor as a token meant a display bump (e.g. Mark Plan
+   * Checklist Reconciled) had nowhere safe to land, so it was silently
+   * skipped — the one action the UI insists only a human can perform was the
+   * one it did not record. With its own field, `updatedAt` is free to become
+   * purely display-value again.
+   *
+   * Absent on any record that predates this field (every task that existed
+   * before this version) and on brand-new tasks before their first patch;
+   * `patchTaskProgressStrictV1` treats absence as generation 0 and stamps 1
+   * on that first versioned write. A CAS guard comparing this field must
+   * therefore fall back to comparing `updatedAt` when either side lacks it,
+   * and may treat it as authoritative once both sides carry it.
+   */
+  progressVersion?: number;
+  /**
    * Workspace-relative paths changed across all AI implementation runs for
    * this task, accumulated (unioned, not replaced) as each run completes —
    * see `updateImplReviewFiles`. Ordered most-recently-changed first so the
@@ -282,6 +307,62 @@ export interface TaskProgress {
    * plateau detection. Capped at MAX_REVIEW_REJECTIONS (oldest dropped).
    */
   reviewRejections?: ReviewRejectionEntry[];
+  /**
+   * Durable record of review blockers a human has stated, in this task's own
+   * stage chat, are resolved by something they just said — wf10 item 19.
+   *
+   * The chat's confirmable-edit flow (`chatSendRowV1.ts`'s
+   * `detectBlockerSupersessionCandidateV1`, `chatWithStage.ts`'s
+   * `dispatchProposedBlockerSupersessionEditV1`) writes one entry here the
+   * moment the user confirms the drafted `plan.md` update that resolves a
+   * stage's sole recorded blocker. Without this record, the write to
+   * `plan.md` and the review file's own unchanged blocker text disagree
+   * forever until a fresh review round runs — which item 19 explicitly does
+   * NOT require (a full re-review remains an offered stronger option, never
+   * a precondition). Two production consumers read a plan-review stage's
+   * blocker list and treat a matching entry here as no longer outstanding,
+   * both via `filterSupersededBlockersV1` (`reviewEvidenceNormalizerV1.ts`),
+   * bound to the on-disk review artifact's own mtime so a fresher, still-live
+   * re-finding of the same blocker text is never masked:
+   * `readStageArtifactsForChat` (`chatWithStage.ts`), which feeds the chat
+   * model's own prompt context, and (added 2026-08-25, review blocker
+   * `a96160ec-…-2`) `computePlanReviewBlockerSupersessionEvidenceV1`
+   * (`reconcilePlanChecklist.ts`), which surfaces the same filtered result as
+   * a durable evidence entry in the reconcile decision panel — a real,
+   * on-screen surface a human reads directly, not only a hint injected into a
+   * model's prompt.
+   *
+   * `postReviewPlateauDecisionV1` (`reviewEscalation.ts`) deliberately never
+   * filters at all, since the evidence it reads is always THIS round's own
+   * just-published, still-fresh finding — see `filterSupersededBlockersV1`'s
+   * own doc comment on why fresh review content must never be suppressed by
+   * an older supersession. `buildSoleBlockerReconcileGuidanceV1`
+   * (`reconcilePlanChecklist.ts`) also does not apply this record: it only
+   * ever iterates `IMPL_REVIEW_STAGES` for an unrelated purpose (Step 26,
+   * checklist-tick corroboration), and this field is only ever recorded
+   * against a plan-review stage, so its filter call there could never match
+   * regardless.
+   *
+   * Neither `reviewScoreHistory` nor `advanceStage` (`stageTransition.ts`)
+   * consult this field: auto-advance for a plan-review stage is
+   * score-threshold-only, and manual "Next Stage" is unconditional for every
+   * stage — there is no live "blockers must be zero" transition gate for a
+   * plan-review stage to wire supersession-awareness into. What this field
+   * changes is what evidence is available to a human deciding, not whether a
+   * transition is technically permitted.
+   *
+   * Matched on exact (trimmed) blocker description text for the same stage —
+   * deliberately simple: a later review round that re-states the SAME
+   * blocker text after the plan edit was supposed to resolve it is a real
+   * disagreement worth surfacing again, not something this record should
+   * keep suppressing, but because reviewers virtually always alter wording
+   * between rounds even when re-finding the same underlying issue, an exact
+   * match naturally stops applying to the next round's blocker list — which
+   * is the intended lifecycle, not a bug to work around. Unbounded growth is
+   * prevented the same way `reviewRejections` is
+   * (`MAX_BLOCKER_SUPERSESSIONS`, oldest dropped first).
+   */
+  blockerSupersessions?: BlockerSupersessionRecordV1[];
   /**
    * Durable, fixed-vocabulary record of what each round that reached
    * completion accounting actually produced (wf10 item 4 / Part 4). Exists
@@ -660,6 +741,35 @@ export interface ReviewRejectionEntry {
 
 /** Cap on `TaskProgress.reviewRejections` length (oldest entries dropped first). */
 export const MAX_REVIEW_REJECTIONS = 50;
+
+/** One row of `TaskProgress.blockerSupersessions` (wf10 item 19). */
+export interface BlockerSupersessionRecordV1 {
+  /** The plan-review stage the superseded blocker was recorded against. */
+  stage: TaskStage;
+  /** The blocker's own description text, exactly as parsed from the review
+   * artifact at the moment it was declared resolved — matched verbatim
+   * (after trimming) against a stage's current blocker list. */
+  blockerDescription: string;
+  /** ISO timestamp the confirmable plan.md edit was actually applied. */
+  supersededAt: string;
+  /** Task-folder-relative path of the file the resolving decision was
+   * written to (currently always `plan.md`). */
+  planRelPath: string;
+  /**
+   * ISO timestamp of the assistant chat message (`ChatMessage.at`,
+   * `chatHistoryStore.ts`) that proposed the confirmed edit — the durable
+   * pointer to the confirming chat exchange a review flagged as missing
+   * (2026-08-25): without it, a supersession record asserted a resolution
+   * happened in chat with no way to find that exchange again. Optional only
+   * so a record from before this field existed remains decodable; every NEW
+   * record (`dispatchProposedBlockerSupersessionEditV1`,
+   * `commands/chatWithStage.ts`) carries it.
+   */
+  confirmingMessageAt?: string;
+}
+
+/** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
+export const MAX_BLOCKER_SUPERSESSIONS = 50;
 
 /**
  * Fixed classification of what a round that reached completion accounting

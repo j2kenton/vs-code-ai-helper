@@ -3,20 +3,23 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, TaskNode, TaskTreeProvider, tryReadReadiness } from "../views/taskTreeProvider";
+import { describeOwedContinuationRowIndicatorV1, firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, TaskNode, TaskTreeProvider, tryReadReadiness } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../types/incompleteTask";
 import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,
+  MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_ORDER,
   migrateStage,
+  type ImplRecoveryV1,
   type TaskStage,
 } from "../types/taskProgress";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { parseTaskDocument, buildTaskDocument } from "../utils/taskDescriptionDocument";
 import { shortcutHint } from "../utils/shortcutHints";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { taskOperations } from "../utils/taskOperations";
 import type { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
 
 // Mock dependencies before importing the module under test
@@ -1623,6 +1626,123 @@ void describe("TaskTreeProvider — scheduling posture reads back from the ledge
       );
     } finally {
       provider.dispose();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wf10 item 11's passive complement: a task carrying an owed implementation
+// continuation with nothing currently running against it must show a
+// standing indicator (tree row + status bar, both sourced from this one
+// helper) instead of looking identical to a task with nothing owed for the
+// full length of the lease.
+// ---------------------------------------------------------------------------
+void describe("describeOwedContinuationRowIndicatorV1", () => {
+  function makeRecord(overrides: Partial<ImplRecoveryV1> = {}): ImplRecoveryV1 {
+    return {
+      sourceAttemptId: "impl-recovery-row-1",
+      reason: "the provider's final response was cut short",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-08-25T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  void it("is undefined when there is no implRecovery record", () => {
+    assert.equal(describeOwedContinuationRowIndicatorV1(undefined, 0), undefined);
+  });
+
+  void it("is undefined once the continuation has been claimed (dispatch !== \"pending\")", () => {
+    assert.equal(
+      describeOwedContinuationRowIndicatorV1(makeRecord({ dispatch: "dispatched" }), 0),
+      undefined
+    );
+  });
+
+  void it("names the next-attempt wall-clock time derived from leaseUntil, under budget", () => {
+    const indicator = describeOwedContinuationRowIndicatorV1(
+      makeRecord({ leaseUntil: "2026-08-25T00:10:00.000Z" }),
+      0
+    );
+    assert.ok(indicator);
+    assert.match(indicator.description, /Continuation owed — next attempt \d{1,2}:\d{2}/);
+  });
+
+  void it("reports budget-exhausted distinctly, with no fabricated next-attempt time", () => {
+    const indicator = describeOwedContinuationRowIndicatorV1(
+      makeRecord({ leaseUntil: undefined }),
+      MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1
+    );
+    assert.ok(indicator);
+    assert.match(indicator.description, /budget exhausted, needs your input/);
+    assert.doesNotMatch(indicator.description, /next attempt/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review-flagged (2026-08-25): TaskNode's row only checked the task-level
+// operation (`taskLevelOp`, commit/push/Complete-and-move-on/Release) before
+// rendering the owed-continuation indicator, so a STAGE-scoped operation
+// (e.g. an implementation round already running) could coexist with
+// "Continuation owed — next attempt…", contrary to the indicator's own
+// "nothing currently running against it" contract. Mirrors
+// `taskStatusBar.ts`'s `thisTaskHasLiveOperation`, which already checked all
+// operations correctly.
+// ---------------------------------------------------------------------------
+void describe("TaskNode — owed-continuation indicator suppression under a live operation", () => {
+  function owedTask(): IncompleteTask {
+    return {
+      folderUri: vscode.Uri.file("/workspace/tasks/owed-row-task"),
+      folderName: "owed-row-task",
+      canonicalId: "/workspace/tasks/owed-row-task",
+      progress: {
+        currentStage: "impl-high-review",
+        status: "active",
+        taskFolder: "owed-row-task",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+        implRecovery: {
+          sourceAttemptId: "impl-recovery-row-2",
+          reason: "the provider's final response was cut short",
+          trigger: "roundIncomplete",
+          mode: "unconstrained",
+          dispatch: "pending",
+          at: "2026-08-25T00:00:00.000Z",
+          leaseUntil: "2026-08-25T00:10:00.000Z",
+        },
+      },
+    } as unknown as IncompleteTask;
+  }
+
+  void it("shows the owed indicator when nothing is running for the task", () => {
+    const node = new TaskNode(owedTask(), false);
+    assert.match(node.description as string, /Continuation owed/);
+  });
+
+  void it("suppresses the owed indicator while a STAGE-scoped operation is running for the same task", () => {
+    const task = owedTask();
+    const handle = taskOperations.begin(task.folderUri.fsPath, {
+      label: "Running Implementation",
+      stage: "impl-high-review",
+      exclusive: true,
+    });
+    assert.ok(handle);
+    try {
+      // A stage-scoped operation spins its own StageNode, not this task row
+      // (see the comment above `taskLevelOp`), so the row itself carries no
+      // description once the owed indicator is correctly suppressed — the
+      // defect under test is specifically that it kept the *wrong*
+      // description ("Continuation owed…") rather than none.
+      const node = new TaskNode(task, false);
+      assert.doesNotMatch(
+        String(node.description ?? ""),
+        /Continuation owed/,
+        "must not show 'Continuation owed' while a stage-scoped round is actively running"
+      );
+    } finally {
+      taskOperations.end(handle);
     }
   });
 });

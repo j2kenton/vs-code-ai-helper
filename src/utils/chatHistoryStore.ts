@@ -236,6 +236,26 @@ export interface ChatMessage {
    * so an action is never executed twice.
    */
   proposedStageAction?: { id: string; payload?: unknown };
+  /**
+   * wf10 item 19: a chat-drafted `[[UPDATE_FILE:...]]` edit that would
+   * resolve this task's plan review's sole recorded blocker is NOT
+   * auto-applied like an ordinary chat file update — a review found the old
+   * silent-apply path let chat advise "this resolves it, advance" while the
+   * write was still only implied. Instead the write is proposed here
+   * (`promoteChatSendContentV1`, `actions/rows/chatSendRowV1.ts`), and
+   * `chatWithStage.ts` reads it back once the message is persisted, shows a
+   * confirmation dialog naming the exact blocker text it would resolve
+   * (execution needs `vscode.window`, unavailable inside that pure promotion
+   * path — same reason `proposedStageAction` exists), and applies it only on
+   * confirmation. Never read a second time for the same message, so a write
+   * is never applied twice.
+   */
+  proposedBlockerSupersessionEdit?: {
+    relPath: string;
+    content: string;
+    blockerDescription: string;
+    reviewStage: TaskStage;
+  };
 }
 
 /** The display-mirror states a structured-question interaction can be in (plan §5.1/§5.5). */
@@ -601,6 +621,22 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
         return undefined;
       }
     }
+    if (e.proposedBlockerSupersessionEdit !== undefined) {
+      const edit = e.proposedBlockerSupersessionEdit as Record<string, unknown>;
+      if (
+        typeof edit !== "object" ||
+        edit === null ||
+        typeof edit.relPath !== "string" ||
+        edit.relPath.length === 0 ||
+        typeof edit.content !== "string" ||
+        typeof edit.blockerDescription !== "string" ||
+        edit.blockerDescription.length === 0 ||
+        typeof edit.reviewStage !== "string" ||
+        !VALID_STAGES.has(edit.reviewStage)
+      ) {
+        return undefined;
+      }
+    }
     if (e.stage === null || e.stage === undefined) {
       // A null stage snapshot is legal only on a migrated legacy recovery
       // record (plan §5.2's "Missing stage → snapshot null").
@@ -619,6 +655,16 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
         : {}),
       ...(e.proposedStageAction !== undefined
         ? { proposedStageAction: e.proposedStageAction as { id: string; payload?: unknown } }
+        : {}),
+      ...(e.proposedBlockerSupersessionEdit !== undefined
+        ? {
+            proposedBlockerSupersessionEdit: e.proposedBlockerSupersessionEdit as {
+              relPath: string;
+              content: string;
+              blockerDescription: string;
+              reviewStage: TaskStage;
+            },
+          }
         : {}),
     });
   }

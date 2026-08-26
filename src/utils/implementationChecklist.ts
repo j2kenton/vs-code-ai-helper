@@ -95,8 +95,11 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
 /**
  * True when `content` both declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing
  * to tick") and ALSO reports at least one {@link RETROACTIVE_TICK_MARKER_V1}
- * claim in its own `## Plan Item Checklist` section — a round that wants
- * checklist state to change while explicitly declaring it does not.
+ * claim, in its own `## Plan Item Checklist` section, that does NOT name a
+ * plan item already ticked in the plan of record — a round that wants
+ * checklist state to change while explicitly declaring it does not. A claim
+ * that genuinely names an already-ticked item is a status note, not a
+ * contradiction — see the `alreadyCheckedPlanItemKeys` paragraph below.
  *
  * Confirmed live (round 013, task "1.9", 2026-08-14): the round declared the
  * marker, then listed dozens of retroactive completions for Parts 1-3 with
@@ -121,23 +124,65 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
  *
  * `planItemKeys` (optional) is forwarded to `collectRetroactiveTickClaimsV1`
  * so an item whose own text contains ` — ` is still recognized as a claim;
- * omitting it falls back to the naive split, which is still sufficient here
- * since only the PRESENCE of at least one claim matters, not which item it
- * names.
+ * omitting it falls back to the naive split, which still finds a claim to
+ * check against `alreadyCheckedPlanItemKeys` below, just with a coarser split
+ * on any embedded dash.
+ *
+ * `alreadyCheckedPlanItemKeys` (optional, normalized via
+ * `normalizeChecklistItemTextV1`) is what turns "any claim at all" into "a
+ * claim that does not already hold" (wf10 item 12): a round may legitimately
+ * report the status of items it touched without ticking anything NEW, using
+ * this exact marker plus per-item "already ticked in a prior round" notes —
+ * three independent providers converged on that shape unprompted (run 064
+ * and two sibling occurrences). Omitting this parameter (the default empty
+ * set) reproduces the original all-claims-are-contradictory behavior, so
+ * every existing caller that has not been updated to pass it keeps its prior
+ * semantics unchanged.
+ *
+ * A claim is genuinely contradictory — this marker cannot be used — in
+ * exactly three cases, all still caught: (1) the claimed item text matches NO
+ * real plan item at all (the round-013 reproduction: a paraphrase that the
+ * merge could never have matched either); (2) the claimed item text matches a
+ * real plan item that is NOT yet ticked (a claim trying to advance state
+ * while declaring none changed); and (3) the claimed item text matches an
+ * already-ticked plan item, but the entry itself never says so — no
+ * {@link RETROACTIVE_TICK_MARKER_V1} and no "already ticked"/"already
+ * checked"/"already complete" phrasing in its own `status`/`evidence` fields
+ * (review-flagged, 2026-08-25: matching an already-checked plan item is a
+ * fact about the PLAN, not about what the entry claims — a bare
+ * `"— done — <anything>"` naming an item that merely happens to already be
+ * ticked read as a legitimate status note regardless of what the entry
+ * actually said, which would also have accepted an entry that (wrongly)
+ * claimed FRESH completion of an already-ticked item. A second, narrower form
+ * of the same bug — also fixed 2026-08-25 — scanned the entry's WHOLE raw
+ * bullet, including the immutable `itemText`, so an item whose own wording
+ * happens to contain the marker or "already ticked"-style phrasing could
+ * satisfy the self-declaration requirement with no self-declaration at all;
+ * the check is now scoped to `status`/`evidence` only). Case (3) also
+ * requires non-empty evidence, matching the marker's own documented
+ * requirement. Part-level claims
+ * (`collectPartLevelTickClaimsV1`) are always treated as contradictory here —
+ * this marker's accepted exception is per-item status notes only, never a
+ * whole-Part claim.
  */
 export function hasContradictoryNoChecklistChangeClaimV1(
   content: string,
-  planItemKeys: ReadonlySet<string> = new Set()
+  planItemKeys: ReadonlySet<string> = new Set(),
+  alreadyCheckedPlanItemKeys: ReadonlySet<string> = new Set()
 ): boolean {
   const trimmed = content.trim();
   if (!declaresNoChecklistChangeV1(trimmed)) {
     return false;
   }
   const { own } = splitSummaryAtEchoV1(trimmed);
-  return (
-    collectRetroactiveTickClaimsV1(own, planItemKeys).length > 0 ||
-    collectPartLevelTickClaimsV1(own).length > 0
-  );
+  const itemClaims = collectRetroactiveTickClaimsInternalV1(own, planItemKeys);
+  const hasGenuinelyContradictoryItemClaim = itemClaims.some((claim) => {
+    if (!alreadyCheckedPlanItemKeys.has(normalizeChecklistItemTextV1(claim.itemText))) {
+      return true;
+    }
+    return !claim.alreadyAnnotated || claim.evidence.length === 0;
+  });
+  return hasGenuinelyContradictoryItemClaim || collectPartLevelTickClaimsV1(own).length > 0;
 }
 
 /**
@@ -327,7 +372,48 @@ export function collectRetroactiveTickClaimsV1(
   ownSummary: string,
   planItemKeys: ReadonlySet<string> = new Set()
 ): RetroactiveTickClaimV1[] {
-  const claims: RetroactiveTickClaimV1[] = [];
+  return collectRetroactiveTickClaimsInternalV1(ownSummary, planItemKeys).map(
+    ({ itemText, evidence }) => ({ itemText, evidence })
+  );
+}
+
+/**
+ * Matches either {@link RETROACTIVE_TICK_MARKER_V1} or the bare-prose
+ * "already ticked"/"already checked"/"already complete" phrasing the
+ * shape-issue message documents as the marker's plain-language equivalent
+ * ("a plain \"— done — already ticked...\" note"). Used only to compute
+ * {@link RetroactiveTickClaimInternalV1.alreadyAnnotated} — a claim whose
+ * `status`/`evidence` fields match neither is a bare "done" note with no
+ * self-declaration that the item was already ticked, which is what makes it
+ * a genuinely contradictory claim under a `no-checklist-change` declaration
+ * (see {@link hasContradictoryNoChecklistChangeClaimV1}'s case 3).
+ *
+ * Deliberately checked against `status`/`evidence` only, never `itemText`
+ * (review-flagged, 2026-08-25): a plan item's own wording can legitimately
+ * contain "already ticked"-like phrasing or literally quote
+ * {@link RETROACTIVE_TICK_MARKER_V1} — this file's own step 21 checklist
+ * text does — and testing the whole raw bullet let that item-text substring
+ * alone satisfy the annotation requirement for a claim that never actually
+ * self-declared anything, reopening the exact bypass case 3 exists to close.
+ */
+const ALREADY_TICKED_ANNOTATION_PATTERN = /already[ \t]+(?:ticked|checked|complete)/i;
+
+/** {@link RetroactiveTickClaimV1} plus whether the entry's own `status`/
+ * `evidence` fields self-declare as an already-ticked status note — see
+ * {@link ALREADY_TICKED_ANNOTATION_PATTERN}. Kept internal (not exported)
+ * because every existing caller of {@link collectRetroactiveTickClaimsV1}
+ * pattern-matches the narrower public shape with `assert.deepEqual`; adding
+ * a field there would break those fixtures for callers that have no use for
+ * it. Only {@link hasContradictoryNoChecklistChangeClaimV1} needs this. */
+interface RetroactiveTickClaimInternalV1 extends RetroactiveTickClaimV1 {
+  readonly alreadyAnnotated: boolean;
+}
+
+function collectRetroactiveTickClaimsInternalV1(
+  ownSummary: string,
+  planItemKeys: ReadonlySet<string> = new Set()
+): RetroactiveTickClaimInternalV1[] {
+  const claims: RetroactiveTickClaimInternalV1[] = [];
   const all = headingsV1(ownSummary);
   const at = findLastHeadingV1(all, "Plan Item Checklist");
   if (at === -1) {
@@ -358,7 +444,14 @@ export function collectRetroactiveTickClaimsV1(
     if (!parsed.status.toLowerCase().startsWith("done")) {
       continue;
     }
-    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
+    const statusAndEvidence = `${parsed.status} ${parsed.evidence}`;
+    claims.push({
+      itemText: parsed.itemText,
+      evidence: parsed.evidence,
+      alreadyAnnotated:
+        ALREADY_TICKED_ANNOTATION_PATTERN.test(statusAndEvidence) ||
+        statusAndEvidence.includes(RETROACTIVE_TICK_MARKER_V1),
+    });
   }
   return claims;
 }
@@ -849,6 +942,60 @@ export function parseChecklistItemPriorityV1(itemText: string): ChecklistItemPri
   return match?.[1] ? (match[1].toLowerCase() as ChecklistItemPriorityV1) : undefined;
 }
 
+/**
+ * Parses the leading `N.` step number an ordinary (non-hand-off) checklist
+ * item's own text declares — e.g. `"26. Build a shared evidence-…"` -> `26`,
+ * matching how this codebase's plans number their own steps (see
+ * `create-plan.md`'s "Numbered implementation steps"). `undefined` for a
+ * hand-off item (which numbers itself `"H1."`, `"H2."`, …, never a bare
+ * digit) or an older plan whose items carry no number at all.
+ */
+export function parseChecklistItemStepNumberV1(itemText: string): number | undefined {
+  const match = /^(\d+)\.\s/.exec(itemText.trim());
+  return match?.[1] ? Number(match[1]) : undefined;
+}
+
+/**
+ * Review-flagged (2026-08-25, third narrowing of task-fixable blocker
+ * `57e9485f-…-0`): the plan format carries no structural link between a
+ * checklist item and the specific manual-verification hand-off item(s) that
+ * cover it — both live under one shared "## Manual verification"-style
+ * heading, so `buildSoleBlockerReconcileGuidanceV1`
+ * (`reconcilePlanChecklist.ts`) could only ever confirm a per-item
+ * association in the trivial case (exactly one outstanding manual item in
+ * the whole plan), and had to pool the entire outstanding set otherwise —
+ * which the review correctly rejected as "a plan-wide list accompanied by
+ * 'do whichever apply'" rather than the relevant item's own checks. A
+ * lexical-overlap filter cannot close this gap either (the function's own
+ * prior doc comment records a case where a HIGH check shares no vocabulary
+ * at all with its blocker's description), so no amount of TEXT ANALYSIS of
+ * the two independently-authored items can establish the link.
+ *
+ * `Covers: Step N[, Step M, …]` is the structural fix: an OPTIONAL,
+ * author-written cross-reference on a hand-off item's own line, naming the
+ * numbered checklist step(s) (see {@link parseChecklistItemStepNumberV1}) it
+ * specifically verifies. Purely additive — a plan authored before this
+ * convention existed (every plan on disk as of this fix, including the one
+ * that produced this fix) has zero matches and falls back to the existing
+ * pooled/pigeonhole behavior unchanged; only a plan whose hand-off items
+ * declare it gets a real, sound, non-lexical association. `create-plan.md`
+ * instructs future plans to include it when a hand-off item maps to exactly
+ * one specific step.
+ */
+const CHECKLIST_ITEM_COVERS_PATTERN = /covers:\s*steps?\s*((?:\d+\s*(?:,\s*(?:step\s*)?\d+\s*)*))/i;
+
+/** Parses the checklist step number(s) a manual-verification item's own text
+ * declares it covers (via `Covers: Step N[, Step M, …]`), or `undefined` when
+ * it declares none — see the doc comment above. */
+export function parseChecklistItemCoversV1(itemText: string): readonly number[] | undefined {
+  const match = CHECKLIST_ITEM_COVERS_PATTERN.exec(itemText);
+  if (!match?.[1]) {
+    return undefined;
+  }
+  const numbers = match[1].match(/\d+/g)?.map(Number) ?? [];
+  return numbers.length > 0 ? numbers : undefined;
+}
+
 /** Stable sort rank for {@link listOutstandingManualVerificationItemsV1}: HIGH
  * first, then items with no declared priority, then LOW last. Kept as one
  * rank per item (not a HIGH/LOW-only partition) specifically so a list with
@@ -905,6 +1052,77 @@ export function listOutstandingManualVerificationItemsV1(
     items: sorted.slice(0, limit).map((item) => unescapeChecklistItemTextV1(item.text)),
     total: sorted.length,
   };
+}
+
+/** Result of {@link appendCoversAnnotationV1}. */
+export interface AppendCoversAnnotationResultV1 {
+  /** The updated plan text — unchanged (`=== planOfRecord`) when `appliedCount === 0`. */
+  readonly content: string;
+  /** How many of `targetItemTexts` actually received a new `Covers:` annotation. */
+  readonly appliedCount: number;
+}
+
+/**
+ * Review-flagged (2026-08-25, FOURTH round on task-fixable blocker
+ * `57e9485f-…-0`): every purely textual signal for linking a pooled manual
+ * item to a specific blocker has now been tried and independently disproven —
+ * stated-count matching (coincidental vocabulary), per-item lexical overlap
+ * (the function's own doc comment records a HIGH check sharing no word with
+ * its blocker's description), and cardinality-alone (the review's original
+ * counterexample). No further heuristic is added here; inventing a fifth
+ * would only repeat the pattern the last three rounds already disproved.
+ *
+ * What this function does instead: turn the ALREADY-SOUND `Covers: Step N`
+ * mechanism ({@link parseChecklistItemCoversV1}) from something a human must
+ * hand-edit into plan-final.md into a one-click, auditable action — the same
+ * "prefer a confirmable edit over an implied one" principle this codebase
+ * already applies to reviewer-verified ticks and stage-chat blocker
+ * supersessions. It never infers which items apply; the caller supplies
+ * `targetItemTexts` (the human's own confirmed selection, driven from a
+ * decision panel that showed the exact items), and this only records that
+ * confirmed link durably. An item whose line already carries a `Covers:`
+ * annotation is left untouched (this only ever ADDS one, never overwrites or
+ * duplicates), and an item text with no matching plan line is silently
+ * skipped — `appliedCount` tells the caller how many actually landed.
+ *
+ * Byte-preserving and scoped to the latest checklist rendering only, exactly
+ * like {@link mergeChecklistProgressV1} (see that function's own doc comment
+ * for why): only the matched line's captured text grows an annotation: every
+ * other byte — indentation, bullet style, surrounding prose, older duplicate
+ * renderings — is left exactly as it was.
+ */
+export function appendCoversAnnotationV1(
+  planOfRecord: string,
+  targetItemTexts: readonly string[],
+  stepNumber: number
+): AppendCoversAnnotationResultV1 {
+  const targetKeys = new Set(targetItemTexts.map(normalizeChecklistItemTextV1));
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  let appliedCount = 0;
+  const mergedRegion = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          const key = normalizeChecklistItemTextV1(text);
+          if (!targetKeys.has(key) || parseChecklistItemCoversV1(text) !== undefined) {
+            return whole;
+          }
+          appliedCount += 1;
+          const markerIndex = text.lastIndexOf(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+          const annotated =
+            markerIndex >= 0
+              ? `${text.slice(0, markerIndex).trimEnd()} — Covers: Step ${stepNumber}. ${text.slice(markerIndex)}`
+              : `${text} — Covers: Step ${stepNumber}.`;
+          return `${open}${state}${close}${annotated}${trailing}`;
+        }
+      );
+    })
+    .join("");
+  return { content: `${prefix}${mergedRegion}`, appliedCount };
 }
 
 /**

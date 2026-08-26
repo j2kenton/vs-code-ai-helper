@@ -16,21 +16,27 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 
 import { appendChatMessageV1, describeWorkflowStoreFailureV1 } from "../../utils/chatHistoryStore";
-import { TaskStage } from "../../types/taskProgress";
+import { PLAN_FILENAME, PLAN_REVIEW_STAGES, STAGE_ARTIFACT_FILENAMES, TaskStage } from "../../types/taskProgress";
 import {
   FileUpdateEnvelope,
   planFileUpdate,
   splitFileUpdateEnvelopes,
+  splitResolvesBlockerMarkerV1,
 } from "../../utils/chatFileUpdateEnvelope";
 import {
   planStageAction,
   splitStageActionEnvelopes,
 } from "../../utils/chatStageActionEnvelope";
+import { parseReviewBlockers } from "../../utils/reviewReadiness";
 import {
   ensureWorkflowTaskFolderRootV1,
   getWorkflowFileStoreV1,
 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileLocatorV1 } from "../../services/workflowFileStoreV1";
+
+/** Generous bound for reading a review artifact just to count its recorded
+ * blockers — reviews are prose documents, never anywhere near this size. */
+const MAX_REVIEW_READ_BYTES_V1 = 4 * 1024 * 1024;
 
 export const CHAT_SEND_ACTION_KEY_V1 = "chatSend.v1";
 
@@ -93,6 +99,41 @@ class ChatSendPromotionErrorV1 extends Error {
   }
 }
 
+/** Actually writes a validated markdown update to disk — split out of
+ * {@link applyChatFileUpdateEnvelopesV1} so the blocker-supersession path
+ * can plan the same write without performing it (it defers to a user
+ * confirmation instead — see {@link detectBlockerSupersessionCandidateV1}).
+ * Exported so `chatWithStage.ts` can perform the SAME write, with the SAME
+ * revision-checked semantics, once the user confirms a proposed edit. */
+export async function writeMarkdownUpdateV1(
+  taskFolderPath: string,
+  relPath: string,
+  targetPath: string,
+  content: string
+): Promise<string> {
+  const rootId = ensureWorkflowTaskFolderRootV1(taskFolderPath);
+  const relativePath = path.relative(taskFolderPath, targetPath).split(path.sep).join("/");
+  const locator: WorkflowFileLocatorV1 = { rootId, relativePath };
+  const fileStore = getWorkflowFileStoreV1();
+  const bytes = Buffer.from(content, "utf8");
+
+  const stat = await fileStore.stat(locator);
+  if (stat.kind !== "ok") {
+    return `_Could not update \`${relPath}\`: ${describeWorkflowStoreFailureV1(stat)}._`;
+  }
+  if (stat.value.kind === "directory") {
+    return `_Could not update \`${relPath}\`: the target is a directory, not a file._`;
+  }
+  const result =
+    stat.value.kind === "file" && stat.value.revision !== undefined
+      ? await fileStore.replaceFileExact(locator, bytes, stat.value.revision)
+      : await fileStore.createFileExclusive(locator, bytes);
+  if (result.kind !== "ok") {
+    return `_Could not update \`${relPath}\`: ${describeWorkflowStoreFailureV1(result)}._`;
+  }
+  return `_Updated \`${relPath}\`._`;
+}
+
 /**
  * Applies the C4 chat-edit envelope (item 21, 2026-08-17..19 workflow-defects
  * batch): a response may propose the full replacement content of exactly one
@@ -102,36 +143,114 @@ class ChatSendPromotionErrorV1 extends Error {
  * Never throws: a write failure is a soft, chat-visible refusal, not a
  * promotion error, since the assistant's own text answer is still valid on
  * its own regardless of whether the file update landed.
+ *
+ * wf10 item 19: when {@link detectBlockerSupersessionCandidateV1} recognizes
+ * this as a candidate blocker-resolving edit, the write is NOT performed here
+ * — the `proposedEdit` field is returned instead, for the caller to persist
+ * on the message and defer to a user confirmation, mirroring how a
+ * `proposedStageAction` defers execution needing `vscode.window`.
  */
 async function applyChatFileUpdateEnvelopesV1(
   taskFolderPath: string,
-  updates: readonly FileUpdateEnvelope[]
-): Promise<string | undefined> {
+  stage: TaskStage,
+  updates: readonly FileUpdateEnvelope[],
+  resolvesBlocker: boolean
+): Promise<{
+  note: string | undefined;
+  proposedEdit?: { relPath: string; content: string; blockerDescription: string; reviewStage: TaskStage };
+}> {
   const plan = planFileUpdate(taskFolderPath, updates);
-  if (plan.action === "none") return undefined;
-  if (plan.action === "reject") return plan.note;
+  if (plan.action === "none") return { note: undefined };
+  if (plan.action === "reject") return { note: plan.note };
 
+  const blockerDescription = await detectBlockerSupersessionCandidateV1(
+    taskFolderPath,
+    stage,
+    { relPath: plan.relPath, content: plan.content },
+    resolvesBlocker
+  );
+  if (blockerDescription !== undefined) {
+    return {
+      note: `_Drafted an update to \`${plan.relPath}\` that would resolve the blocker below — confirm to apply it._`,
+      proposedEdit: { relPath: plan.relPath, content: plan.content, blockerDescription, reviewStage: stage },
+    };
+  }
+
+  return { note: await writeMarkdownUpdateV1(taskFolderPath, plan.relPath, plan.targetPath, plan.content) };
+}
+
+/**
+ * wf10 item 19: a chat edit to `plan.md` drafted while the chat's own stage
+ * is a plan-review stage with exactly one recorded blocker, AND accompanied
+ * by an explicit `[[RESOLVES_BLOCKER]]` marker from the model, is treated as
+ * a candidate blocker-supersession edit rather than an ordinary chat file
+ * update — see `ChatMessage.proposedBlockerSupersessionEdit`'s doc comment
+ * for why this must be proposed and confirmed rather than auto-applied.
+ *
+ * The single-blocker cardinality guard stays: with two or more blockers on
+ * record, "this resolves it" is genuinely ambiguous about which one, so this
+ * returns `undefined` (ordinary auto-apply) even when the marker is present.
+ * Only plan-review stages are covered — impl-review's plan-of-record is the
+ * checklist file, ticked by a different, already-guarded mechanism
+ * (applyReviewerVerifiedTicks.ts), not a free-text rewrite.
+ *
+ * Review-narrowed three times (2026-08-25, blocker `fc82d17d-…-3`): earlier
+ * revisions tried to infer "does this edit resolve the blocker" from the
+ * edit's own text — keyword overlap with the blocker's description, gated by
+ * an ever-growing denylist of "still open" / "future promise" / single-word
+ * negative-state phrasings. Each review round produced a new counterexample
+ * sharing the blocker's vocabulary while describing it as unresolved, because
+ * no fixed phrase list can enumerate every way natural language says "not
+ * yet" — the review's own verdict was that this is unsound resolution
+ * inference, not stage chat semantically concluding the blocker is resolved.
+ *
+ * The marker (`splitResolvesBlockerMarkerV1`,
+ * `utils/chatFileUpdateEnvelope.ts`) replaces all of that with the one signal
+ * that is actually reliable: the model's own judgement, made explicit instead
+ * of re-derived from its prose. The model is instructed
+ * (`buildStageResponsePrompt`, `chatWithStage.ts`) to include the marker
+ * exactly when it has concluded, in the same turn, that the draft resolves
+ * the stage's recorded blocker — the same judgement it already demonstrated
+ * correctly in the original bug report. Its absence falls through to the
+ * ordinary auto-apply path, exactly as an edit that failed the old lexical
+ * check did — an unrelated wording fix or a typo, with no marker, is never
+ * misread as a resolution. Nothing is written to `plan.md` for a candidate
+ * edit until the user explicitly confirms it in a dialog naming the blocker
+ * text (`ChatMessage.proposedBlockerSupersessionEdit`), which is the real
+ * safety net either way and, unlike a heuristic, cannot be defeated by
+ * phrasing.
+ */
+async function detectBlockerSupersessionCandidateV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  update: FileUpdateEnvelope,
+  resolvesBlocker: boolean
+): Promise<string | undefined> {
+  if (!resolvesBlocker) {
+    return undefined;
+  }
+  if (!PLAN_REVIEW_STAGES.includes(stage)) {
+    return undefined;
+  }
+  const normalizedRelPath = update.relPath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (normalizedRelPath.toLowerCase() !== PLAN_FILENAME.toLowerCase()) {
+    return undefined;
+  }
+  const reviewFilename = STAGE_ARTIFACT_FILENAMES[stage];
+  if (!reviewFilename) {
+    return undefined;
+  }
   const rootId = ensureWorkflowTaskFolderRootV1(taskFolderPath);
-  const relativePath = path.relative(taskFolderPath, plan.targetPath).split(path.sep).join("/");
-  const locator: WorkflowFileLocatorV1 = { rootId, relativePath };
   const fileStore = getWorkflowFileStoreV1();
-  const bytes = Buffer.from(plan.content, "utf8");
-
-  const stat = await fileStore.stat(locator);
-  if (stat.kind !== "ok") {
-    return `_Could not update \`${plan.relPath}\`: ${describeWorkflowStoreFailureV1(stat)}._`;
+  const read = await fileStore.readFileBounded({ rootId, relativePath: reviewFilename }, MAX_REVIEW_READ_BYTES_V1);
+  if (read.kind !== "ok") {
+    return undefined;
   }
-  if (stat.value.kind === "directory") {
-    return `_Could not update \`${plan.relPath}\`: the target is a directory, not a file._`;
+  const blockers = parseReviewBlockers(read.value.bytes.toString("utf8"));
+  if (blockers.length !== 1) {
+    return undefined;
   }
-  const result =
-    stat.value.kind === "file" && stat.value.revision !== undefined
-      ? await fileStore.replaceFileExact(locator, bytes, stat.value.revision)
-      : await fileStore.createFileExclusive(locator, bytes);
-  if (result.kind !== "ok") {
-    return `_Could not update \`${plan.relPath}\`: ${describeWorkflowStoreFailureV1(result)}._`;
-  }
-  return `_Updated \`${plan.relPath}\`._`;
+  return blockers[0]!.description;
 }
 
 async function promoteChatSendContentV1(
@@ -142,11 +261,12 @@ async function promoteChatSendContentV1(
     throw new ChatSendPromotionErrorV1("chatSend.v1 received a non-chat-message completed content");
   }
   const input = context.validatedInput as ChatSendActionInputV1;
-  // Neither envelope kind may survive into the displayed/persisted text,
-  // whether or not it is applied — strip both unconditionally before
-  // anything else touches content.text.
+  // None of the three bracket markers may survive into the displayed/
+  // persisted text, whether or not each is acted on — strip all of them
+  // unconditionally before anything else touches content.text.
   const { text: fileStrippedText, updates } = splitFileUpdateEnvelopes(content.text);
-  const { text: strippedText, actions } = splitStageActionEnvelopes(fileStrippedText);
+  const { text: markerStrippedText, resolvesBlocker } = splitResolvesBlockerMarkerV1(fileStrippedText);
+  const { text: strippedText, actions } = splitStageActionEnvelopes(markerStrippedText);
   // Execution needs vscode.window (a confirmation dialog), unavailable
   // inside this pure promotion path, so a single recognized proposal is
   // carried on the persisted message for chatWithStage.ts to execute once
@@ -157,8 +277,9 @@ async function promoteChatSendContentV1(
   const actionOutcomeNote = stagePlan.action === "reject" ? stagePlan.note : undefined;
   if (input.taskFolderPath) {
     let finalText = strippedText;
-    const fileOutcomeNote = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, updates);
-    for (const note of [fileOutcomeNote, actionOutcomeNote]) {
+    const stage = (context.stage as TaskStage) ?? "desc";
+    const fileOutcome = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, stage, updates, resolvesBlocker);
+    for (const note of [fileOutcome.note, actionOutcomeNote]) {
       if (note) {
         finalText = finalText.length > 0 ? `${finalText}\n\n${note}` : note;
       }
@@ -172,9 +293,10 @@ async function promoteChatSendContentV1(
     await appendChatMessageV1(input.taskFolderPath, {
       role: "assistant",
       text: finalText,
-      stage: (context.stage as TaskStage) ?? "desc",
+      stage,
       at: new Date().toISOString(),
       ...(proposedStageAction ? { proposedStageAction } : {}),
+      ...(fileOutcome.proposedEdit ? { proposedBlockerSupersessionEdit: fileOutcome.proposedEdit } : {}),
     }, canonicalId);
   }
   return "completed";

@@ -18,6 +18,7 @@ import {
 } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateTaskProgressStage } from "./taskProgressTransforms";
+import { ensurePublishReviewArtifactExistsV1 } from "./publishChecksFreshness";
 
 // The disk-level CAS below protects multiple windows. This in-memory queue
 // additionally serializes transition dispatch within this extension host, so
@@ -201,6 +202,9 @@ async function advanceStageLocked(
     } else if (publishArtifact) {
       await publishArtifact();
     }
+    if (newStage === "publish") {
+      await ensurePublishReviewArtifactExistsV1(taskFolderUri);
+    }
     return {
       persisted: true,
       newStage,
@@ -227,6 +231,16 @@ async function advanceStageLocked(
 
   if (!patched) {
     return undefined;
+  }
+
+  // The stage always has a document to open (plan item 17, step 20(a)):
+  // create publish-review.md the moment ANY transition lands on Publish, not
+  // only when a review is later requested — "not created yet" must be
+  // unreachable once a task has actually reached the stage. Idempotent and
+  // cheap; every route that can set currentStage to "publish" goes through
+  // this one helper.
+  if (newStage === "publish") {
+    await ensurePublishReviewArtifactExistsV1(taskFolderUri);
   }
 
   // Compute exactly-once auto-review eligibility.

@@ -40,6 +40,54 @@ export function splitFileUpdateEnvelopes(
   return { text: remaining, updates };
 }
 
+/**
+ * `[[RESOLVES_BLOCKER]]`: an explicit, model-authored declaration that the
+ * `[[UPDATE_FILE:...]]` draft in the SAME response is intended to resolve the
+ * current plan-review stage's recorded blocker — see
+ * `buildStageResponsePrompt`'s own instruction for when the model is told to
+ * emit it.
+ *
+ * Review-flagged (2026-08-25, third narrowing of task-fixable blocker
+ * `fc82d17d-…-3`): `detectBlockerSupersessionCandidateV1`
+ * (`actions/rows/chatSendRowV1.ts`) used to infer "does this edit resolve the
+ * blocker" from the edit's own text — keyword overlap with the blocker's
+ * description, gated by a denylist of "still open" / "future promise" /
+ * single-word negative-state phrasings. Three successive review rounds each
+ * produced a new counterexample sharing the blocker's vocabulary while
+ * describing it as unresolved ("remains pending", "will be presented
+ * tomorrow", "sign-off is outstanding"), because natural language has
+ * unboundedly many ways to say "not yet" and no fixed phrase list can
+ * enumerate them all — enumerating more is provably whack-a-mole, not a
+ * narrowing that converges.
+ *
+ * This marker replaces that inference with the one signal that is actually
+ * reliable: the model's OWN semantic judgement, made machine-readable instead
+ * of re-derived from its prose after the fact — the same judgement that, in
+ * the original bug report, correctly recognized a resolved blocker and
+ * correctly restated the approved rule in full. `detectBlockerSupersessionCandidateV1`
+ * now treats an edit as a blocker-supersession CANDIDATE only when this
+ * marker is present (plus the existing single-blocker cardinality guard);
+ * its absence falls through to the ordinary auto-apply path, exactly as an
+ * edit that failed the old lexical check did. The user-facing safety net is
+ * unchanged and, unlike a heuristic, cannot be defeated by phrasing: nothing
+ * is written to `plan.md` for a candidate edit until the user explicitly
+ * confirms it in a dialog naming the blocker text, per
+ * `ChatMessage.proposedBlockerSupersessionEdit`.
+ */
+const RESOLVES_BLOCKER_MARKER_PATTERN = /\[\[RESOLVES_BLOCKER\]\]/gi;
+
+/** Extracts the `[[RESOLVES_BLOCKER]]` marker, if present, and returns the
+ * remaining text with every occurrence removed — like every other bracket
+ * envelope, it must never survive into the displayed/persisted response. */
+export function splitResolvesBlockerMarkerV1(
+  text: string
+): { text: string; resolvesBlocker: boolean } {
+  const resolvesBlocker = RESOLVES_BLOCKER_MARKER_PATTERN.test(text);
+  RESOLVES_BLOCKER_MARKER_PATTERN.lastIndex = 0;
+  const remaining = text.replace(RESOLVES_BLOCKER_MARKER_PATTERN, "").trim();
+  return { text: remaining, resolvesBlocker };
+}
+
 export type ChatFileUpdatePlan =
   | { action: "none" }
   | { action: "reject"; note: string }

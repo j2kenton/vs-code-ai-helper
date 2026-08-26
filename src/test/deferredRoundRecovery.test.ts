@@ -1433,7 +1433,7 @@ void describe("contradictory no-checklist-change + retroactive claims (Part 3, e
 
     const logs = readRunLogs(folderPath);
     assert.match(logs[0]!, /no-checklist-change/);
-    assert.match(logs[0]!, /retroactive plan-item completions/);
+    assert.match(logs[0]!, /already ticked in the plan of record/);
 
     assert.equal(
       run.dispatches.some((d) => d.chainId === "impl-continuation"),

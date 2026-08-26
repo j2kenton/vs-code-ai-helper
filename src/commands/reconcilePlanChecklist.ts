@@ -10,7 +10,7 @@ import {
   getCanonicalImplementationUri,
   readPlanOfRecordV1,
 } from "../utils/implementationArtifactResolver";
-import { readTextIfExists, statIfExists, writeTextFile } from "../utils/fileUtils";
+import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
   listUncheckedChecklistItemTextsV1,
   filterUncheckedPlanItemsV1,
@@ -18,14 +18,34 @@ import {
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
 } from "../utils/implementationChecklist";
-import { parseReviewVerifiedCompleteV1, parseReadiness } from "../utils/reviewReadiness";
-import { IMPL_REVIEW_STAGES, STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { parseReviewVerifiedCompleteV1, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
+import {
+  BlockerSupersessionRecordV1,
+  IMPL_REVIEW_STAGES,
+  PLAN_REVIEW_STAGES,
+  STAGE_ARTIFACT_FILENAMES,
+  STAGE_DISPLAY_NAMES,
+  TaskStage,
+} from "../types/taskProgress";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { WorkflowDecisionEvidenceItemV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { ChatTarget } from "../views/chatView";
 import { buildSyntheticVerifiedCompleteSummaryV1 } from "./applyReviewerVerifiedTicks";
+import {
+  filterSupersededBlockersV1,
+  normalizeReviewEvidenceV1,
+  NormalizedReviewEvidenceV1,
+} from "../utils/reviewEvidenceNormalizerV1";
+import {
+  appendCoversAnnotationV1,
+  listOutstandingManualVerificationItemsV1,
+  parseChecklistItemCoversV1,
+  parseChecklistItemPriorityV1,
+  parseChecklistItemStepNumberV1,
+} from "../utils/implementationChecklist";
+import { ReviewBlocker } from "../utils/reviewReadiness";
 
 type ReconcileArg =
   | { task?: IncompleteTask }
@@ -122,18 +142,46 @@ function describeRoundSummaryChecklistClaimV1(
  */
 async function computeReviewVerifiedCoverageV1(
   folderUri: vscode.Uri,
-  planOfRecord: string
+  planOfRecord: string,
+  /** wf10 item 19: human-resolved-via-chat blockers to drop before any
+   * consumer of the returned `evidence.blockers` treats them as outstanding
+   * (see `filterSupersededBlockersV1`'s doc comment). Omitted callers get the
+   * review's blockers unfiltered, same as before this field existed. */
+  blockerSupersessions?: readonly BlockerSupersessionRecordV1[]
 ): Promise<{
   coveredItems: string[];
-  perStage: { stage: TaskStage; readiness?: string; matches: string[]; hasArtifact: boolean }[];
+  perStage: {
+    stage: TaskStage;
+    readiness?: string;
+    matches: string[];
+    hasArtifact: boolean;
+    /** Item 18: this stage's blocker set, resolver classes, and lineage —
+     * `undefined` when the stage has no artifact (never re-read separately;
+     * see {@link normalizeReviewEvidenceV1}'s doc comment on why this is the
+     * one shared reader, not a second pass over the same file). */
+    evidence?: NormalizedReviewEvidenceV1;
+    /** Artifact mtime in ms, so a caller comparing multiple review stages can
+     * pick the actually-newest one instead of falling back to
+     * `IMPL_REVIEW_STAGES`' fixed declaration order (which is not a recency
+     * signal — see `buildSoleBlockerReconcileGuidanceV1`'s prior defect). */
+    mtimeMs?: number;
+  }[];
 }> {
   const coveredKeys = new Set<string>();
   const coveredItems: string[] = [];
-  const perStage: { stage: TaskStage; readiness?: string; matches: string[]; hasArtifact: boolean }[] = [];
+  const perStage: {
+    stage: TaskStage;
+    readiness?: string;
+    matches: string[];
+    hasArtifact: boolean;
+    evidence?: NormalizedReviewEvidenceV1;
+    mtimeMs?: number;
+  }[] = [];
   for (const stage of IMPL_REVIEW_STAGES) {
     const filename = STAGE_ARTIFACT_FILENAMES[stage];
     if (!filename) continue;
-    const content = await readTextIfExists(vscode.Uri.joinPath(folderUri, filename));
+    const fileUri = vscode.Uri.joinPath(folderUri, filename);
+    const content = await readTextIfExists(fileUri);
     if (content === undefined) {
       perStage.push({ stage, matches: [], hasArtifact: false });
       continue;
@@ -148,9 +196,96 @@ async function computeReviewVerifiedCoverageV1(
         coveredItems.push(item);
       }
     }
-    perStage.push({ stage, readiness: readiness.label, matches, hasArtifact: true });
+    // Review-flagged (2026-08-25, new architectural blocker): a supersession
+    // only suppresses a blocker recorded against THIS specific, on-disk
+    // artifact — bind the filter to the artifact's own mtime (`reviewAsOfMs`)
+    // so a supersession recorded BEFORE this artifact was last written (i.e.
+    // a fresher review already ran and independently re-asserted the same
+    // text) never applies. See `filterSupersededBlockersV1`'s doc comment.
+    const stat = await statIfExists(fileUri);
+    const evidence = normalizeReviewEvidenceV1(
+      content,
+      filterSupersededBlockersV1(stage, parseReviewBlockers(content), blockerSupersessions, stat?.mtime)
+    );
+    perStage.push({ stage, readiness: readiness.label, matches, hasArtifact: true, evidence, mtimeMs: stat?.mtime });
   }
   return { coveredItems, perStage };
+}
+
+/**
+ * Review-flagged (2026-08-25, task-fixable blocker `a96160ec-…-2`): the only
+ * production consumer of `TaskProgress.blockerSupersessions` was
+ * `readStageArtifactsForChat` (`chatWithStage.ts`), which feeds an assistant
+ * chat model's transient prompt context only — nothing a human reads directly
+ * ever changes as a result. `computeReviewVerifiedCoverageV1` above already
+ * reads a PERSISTED review artifact's own mtime from disk and applies
+ * `filterSupersededBlockersV1` correctly, but it only iterates
+ * `IMPL_REVIEW_STAGES` — and `blockerSupersessions` are only ever recorded
+ * against a `PLAN_REVIEW_STAGES` entry (`detectBlockerSupersessionCandidateV1`,
+ * `chatSendRowV1.ts`), so that call can structurally never match anything.
+ *
+ * This mirrors the exact same disk-read/mtime-bound pattern for the stage
+ * family supersessions are actually recorded against, and surfaces the result
+ * as a durable evidence entry in the reconcile decision panel — a real,
+ * on-screen, non-chat surface a human reads directly (`gatherReconcileEvidenceV1`
+ * below), rather than a hint only ever injected into a model's prompt. Every
+ * safety property of the original mechanism is preserved unchanged: this
+ * calls the SAME `filterSupersededBlockersV1`, bound to the SAME on-disk
+ * artifact mtime, so a supersession recorded before a fresher review
+ * independently re-asserted the same blocker text still never applies (see
+ * that function's doc comment).
+ *
+ * Deliberately does not touch `reviewScoreHistory`, `currentStage`, or the
+ * review artifact itself — those are the plateau escalation's and
+ * `advanceStage`'s (`stageTransition.ts`) own territory, and neither actually
+ * gates a plan-review-stage transition on blocker count (auto-advance for
+ * these stages is score-threshold-only; manual "Next Stage" is unconditional
+ * for every stage) — there is no live "blockers must be zero" gate for a
+ * plan-review stage to wire this into. What WAS missing, and is fixed here,
+ * is that the supersession record was invisible outside chat; this makes it
+ * visible in the one production surface that already assembles evidence for a
+ * human to read before deciding.
+ */
+async function computePlanReviewBlockerSupersessionEvidenceV1(
+  folderUri: vscode.Uri,
+  blockerSupersessions: readonly BlockerSupersessionRecordV1[] | undefined
+): Promise<WorkflowDecisionEvidenceItemV1[]> {
+  if (!blockerSupersessions || blockerSupersessions.length === 0) {
+    return [];
+  }
+  const items: WorkflowDecisionEvidenceItemV1[] = [];
+  for (const stage of PLAN_REVIEW_STAGES) {
+    const filename = STAGE_ARTIFACT_FILENAMES[stage];
+    if (!filename) {
+      continue;
+    }
+    const fileUri = vscode.Uri.joinPath(folderUri, filename);
+    const content = await readTextIfExists(fileUri);
+    if (content === undefined) {
+      continue;
+    }
+    const stat = await statIfExists(fileUri);
+    const rawBlockers = parseReviewBlockers(content);
+    const remaining = filterSupersededBlockersV1(stage, rawBlockers, blockerSupersessions, stat?.mtime);
+    const supersededCount = rawBlockers.length - remaining.length;
+    if (supersededCount === 0) {
+      continue;
+    }
+    items.push({
+      label: `${STAGE_DISPLAY_NAMES[stage]} blocker status`,
+      detail:
+        `${supersededCount} of ${rawBlockers.length} recorded blocker(s) on this stage's review artifact ` +
+        `${supersededCount === 1 ? "was" : "were"} marked resolved via this task's own stage chat, with a ` +
+        "confirmed plan.md write — see the chat for the exchange. " +
+        (remaining.length > 0
+          ? `${remaining.length} blocker(s) still remain outstanding on this artifact:\n${remaining
+              .map((b) => `- ${b.description}`)
+              .join("\n")}`
+          : "0 blocker(s) remain outstanding on this artifact — a fresh review is the stronger confirmation but " +
+            "is not required to advance."),
+    });
+  }
+  return items;
 }
 
 async function gatherReconcileEvidenceV1(
@@ -158,8 +293,17 @@ async function gatherReconcileEvidenceV1(
   planOfRecord: string,
   pendingImplReviewFiles: readonly string[] | undefined,
   roundSummaryChecklistClaim: MergeChecklistProgressResultV1 | undefined,
-  pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[]
-): Promise<{ evidence: WorkflowDecisionEvidenceItemV1[]; allUncheckedCovered: boolean; coveredItemsCount: number }> {
+  pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[],
+  blockerSupersessions?: readonly BlockerSupersessionRecordV1[]
+): Promise<{
+  evidence: WorkflowDecisionEvidenceItemV1[];
+  allUncheckedCovered: boolean;
+  coveredItemsCount: number;
+  /** Item 18: newest-per-stage blocker/progress evidence, so the caller can
+   * decide whether the sole outstanding item coincides with the review's
+   * sole remaining (environmental) blocker without a second file read. */
+  perStage: { stage: TaskStage; hasArtifact: boolean; evidence?: NormalizedReviewEvidenceV1; mtimeMs?: number }[];
+}> {
   const evidence: WorkflowDecisionEvidenceItemV1[] = [];
   const unchecked = listUncheckedChecklistItemTextsV1(planOfRecord, Number.MAX_SAFE_INTEGER);
   evidence.push({
@@ -199,7 +343,11 @@ async function gatherReconcileEvidenceV1(
     });
   }
 
-  const { coveredItems, perStage } = await computeReviewVerifiedCoverageV1(folderUri, planOfRecord);
+  const { coveredItems, perStage } = await computeReviewVerifiedCoverageV1(
+    folderUri,
+    planOfRecord,
+    blockerSupersessions
+  );
   const coveredKeys = new Set(coveredItems.map((item) => normalizeChecklistItemTextV1(item)));
   // Tier-1 candidates, aggregated across every review stage and deduplicated
   // (`coveredItems`) — surfaced the same way tier 2's evidence is above, so a
@@ -230,8 +378,229 @@ async function gatherReconcileEvidenceV1(
     });
   }
 
+  // wf10 item 19 (blocker `a96160ec-…-2`): surface any plan-review blocker
+  // superseded via stage chat — see computePlanReviewBlockerSupersessionEvidenceV1's
+  // doc comment for why this belongs here rather than the checklist-coverage
+  // loop above (which is IMPL_REVIEW_STAGES-scoped by design).
+  const planReviewSupersessionEvidence = await computePlanReviewBlockerSupersessionEvidenceV1(
+    folderUri,
+    blockerSupersessions
+  );
+  evidence.push(...planReviewSupersessionEvidence);
+
   const allUncheckedCovered = unchecked.total > 0 && unchecked.items.every((item) => coveredKeys.has(normalizeChecklistItemTextV1(item)));
-  return { evidence, allUncheckedCovered, coveredItemsCount: coveredItems.length };
+  return {
+    evidence,
+    allUncheckedCovered,
+    coveredItemsCount: coveredItems.length,
+    perStage: perStage.map(({ stage, hasArtifact, evidence: stageEvidence, mtimeMs }) => ({
+      stage,
+      hasArtifact,
+      evidence: stageEvidence,
+      mtimeMs,
+    })),
+  };
+}
+
+/**
+ * Common English words stripped before the overlap check in
+ * {@link sharesSignificantOverlapV1} — without this, generic connective
+ * words ("with", "that", "must", "including") would count as "shared
+ * subject matter" between any two unrelated sentences and defeat the whole
+ * point of the check.
+ */
+const OVERLAP_STOPWORDS_V1 = new Set([
+  "this", "that", "these", "those", "with", "from", "into", "have", "has",
+  "must", "will", "shall", "would", "could", "should", "does", "done",
+  "the", "and", "for", "are", "was", "were", "been", "being", "not", "but",
+  "including", "including", "item", "items", "check", "checks", "verify",
+  "verified", "verification", "complete", "outstanding", "remaining",
+  "review", "reviewed", "task", "stage", "plan", "record", "recorded",
+  "before", "after", "when", "while", "each", "every", "some", "any",
+  "manual", "manually", "human", "automated", "automation", "action",
+]);
+
+/** Lower-cased, punctuation-stripped, stopword-filtered word set of `text`,
+ * for the coarse "do these two sentences share a subject" test below. Words
+ * of length <= 3 are dropped along with stopwords — short function words
+ * ("the", "for", "and") carry no topical signal. */
+function significantWordsV1(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[`*_#>[\]().,:;!?"']/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 3 && !OVERLAP_STOPWORDS_V1.has(word))
+  );
+}
+
+/**
+ * True when `a` and `b` share at least `minShared` significant words — a
+ * deliberately coarse identity check, not semantic understanding. It exists
+ * to stop {@link buildSoleBlockerReconcileGuidanceV1} from treating "exactly
+ * one unticked item plus exactly one environmental blocker" as proof the two
+ * are about the same thing (a defect a review confirmed: cardinality alone
+ * is not identity). Two sentences about genuinely unrelated subjects will
+ * essentially never share two non-trivial words; two sentences about the
+ * same subject (e.g. "live-AWS acceptance checks" appearing in both a
+ * checklist item and its blocker's description) reliably will.
+ */
+function sharesSignificantOverlapV1(a: string, b: string, minShared = 2): boolean {
+  const wordsA = significantWordsV1(a);
+  if (wordsA.size === 0) {
+    return false;
+  }
+  const wordsB = significantWordsV1(b);
+  let shared = 0;
+  for (const word of wordsA) {
+    if (wordsB.has(word)) {
+      shared += 1;
+      if (shared >= minShared) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Item 18: when the checklist has no review-verified tick candidate
+ * (`coveredItemsCount === 0`) but genuinely has outstanding items (case (a)
+ * — the message "no basis to recommend" is otherwise true), check whether
+ * the evidence already on disk narrows that down to a specific, actionable
+ * recommendation rather than a blanket decline. The one case this covers:
+ * exactly one item is unticked, the NEWEST review artifact on file (by
+ * mtime, across every review stage — not the fixed `IMPL_REVIEW_STAGES`
+ * declaration order, which is not a recency signal) reports exactly one
+ * blocker classified `environmental` (an outside-automation's-control
+ * blocker is the shape that always resolves to "a human goes and does
+ * something", never to more automated iteration), AND that blocker's own
+ * description actually names the same subject as the sole unticked item
+ * (`sharesSignificantOverlapV1` — a prior revision skipped this and treated
+ * cardinality alone, "exactly one of each", as proof the two coincide, which
+ * a review confirmed was unsound) — the jester task 6 shape (task item 18)
+ * this was built from. Any other shape (more than one outstanding item, more
+ * than one blocker, a non-environmental resolver, no textual overlap, or no
+ * review artifact at all) returns `undefined`, and the caller keeps the
+ * general "no basis to recommend" wording — this function's whole point is
+ * to narrow the decline, not to force a recommendation the evidence does not
+ * actually support.
+ */
+/**
+ * Review-flagged (2026-08-25, task-fixable blocker `57e9485f-…-0`, narrowed
+ * for a THIRD time): the previous revision accepted a stated count in the
+ * blocker's own text ("the five live-AWS acceptance checks remain
+ * unexecuted") as corroboration that pooling every outstanding manual item is
+ * sound for that blocker, whenever the count matched the number of manual
+ * items outstanding ANYWHERE in the plan. The review's counterexample: a
+ * blocker can genuinely overlap with the sole unticked item in one clause
+ * while separately naming an unrelated count in another ("…owner sign-off
+ * still needed; five unrelated regression tests also remain flaky") — if the
+ * plan happens to have exactly five outstanding manual items for entirely
+ * unrelated reasons, the prior code pooled and labelled all five as this
+ * blocker's checks anyway. A stated count is a coincidence of vocabulary, not
+ * evidence the count is ABOUT the same set — nothing in the blocker's own
+ * text ties the number to "the manual-verification section" specifically,
+ * so no amount of narrowing the count-noun list (already tried twice: first
+ * restricting to a nearby count noun, then dropping the dangerously generic
+ * `steps` from that noun list) closes the gap; the shape itself is unsound.
+ *
+ * Stated-count matching is removed entirely.
+ * `manualItemsScopeConfirmed` is now true in exactly one shape — see below —
+ * which is not a heuristic at all: when precisely ONE manual-verification
+ * item remains outstanding in the whole plan, "every outstanding manual item"
+ * and "the item(s) behind this blocker" are provably the same one-element
+ * set, independent of wording or any coincidental number in the blocker's
+ * text. Any other count falls back to the weaker, honest phrasing the caller
+ * already has for the unconfirmed case ("The plan cannot confirm which
+ * recorded manual checks specifically cover this blocker…").
+ */
+function buildSoleBlockerReconcileGuidanceV1(
+  soleUncheckedItemText: string,
+  perStage: { stage: TaskStage; hasArtifact: boolean; evidence?: NormalizedReviewEvidenceV1; mtimeMs?: number }[],
+  planOfRecord: string
+): {
+  blocker: ReviewBlocker;
+  stage: TaskStage;
+  highPriorityItems: string[];
+  lowPriorityItems: string[];
+  /** False whenever these items are pooled from the whole plan rather than
+   * confirmed specific to this blocker — see the pooling comment above. The
+   * caller's reasoning text must phrase the recommendation accordingly. */
+  manualItemsScopeConfirmed: boolean;
+} | undefined {
+  // Newest artifact by mtime wins, not the fixed stage-declaration order —
+  // ties (equal or unknown mtimes) resolve to the last entry in
+  // IMPL_REVIEW_STAGES order, which is the only remaining use of that order
+  // here and only as a deterministic tiebreak, not a recency claim.
+  const candidateStages = perStage.filter((entry) => entry.hasArtifact && entry.evidence);
+  let target: (typeof candidateStages)[number] | undefined;
+  for (const entry of candidateStages) {
+    if (
+      !target ||
+      (entry.mtimeMs ?? 0) >= (target.mtimeMs ?? 0)
+    ) {
+      target = entry;
+    }
+  }
+  if (!target?.evidence) {
+    return undefined;
+  }
+  const { blockers } = target.evidence;
+  if (blockers.length !== 1 || blockers[0]!.resolver !== "environmental") {
+    return undefined;
+  }
+  const blocker = blockers[0]!;
+  // Identity, not cardinality: the sole item and the sole blocker must
+  // actually be about the same thing before this recommends acting as if
+  // they are.
+  if (!sharesSignificantOverlapV1(soleUncheckedItemText, blocker.description)) {
+    return undefined;
+  }
+  // The plan's own text carries no structural link between a checklist item
+  // and the specific manual-verification checks that stand behind it (both
+  // live under one shared "## Manual verification" heading, so there is no
+  // "item N's checks" grouping to key off), and a lexical-overlap filter
+  // fails on the very case this was built from — a HIGH-priority check named
+  // "Bastion stops after the linger window expires with no borrowers" shares
+  // no significant word with a blocker described as "the five live-AWS
+  // acceptance checks remain unexecuted", yet is exactly one of those five
+  // checks. So every outstanding manual item is pooled here by default — but
+  // `manualItemsScopeConfirmed` tells the caller whether that pooling is
+  // actually an established one-to-one relationship (true) or not (false),
+  // so the caller's wording can say which is the case rather than always
+  // implying the weaker one.
+  const manualItems = listOutstandingManualVerificationItemsV1(planOfRecord, Number.MAX_SAFE_INTEGER);
+  // Review-flagged (2026-08-25, THIRD narrowing of task-fixable blocker
+  // `57e9485f-…-0`): a real structural link, when the plan's own hand-off
+  // items declare one — see `parseChecklistItemCoversV1`'s doc comment. Takes
+  // priority over the pigeonhole fallback below whenever it applies, because
+  // it is sound for ANY count of outstanding manual items, not only exactly
+  // one. Every plan on disk as of this fix predates the convention, so this
+  // is forward-looking: it applies to nothing yet, and the pigeonhole/pooled
+  // fallback is unchanged for every existing plan.
+  const soleItemStepNumber = parseChecklistItemStepNumberV1(soleUncheckedItemText);
+  const coveringItems =
+    soleItemStepNumber !== undefined
+      ? manualItems.items.filter((item) => parseChecklistItemCoversV1(item)?.includes(soleItemStepNumber))
+      : [];
+  const scopedItems = coveringItems.length > 0 ? coveringItems : manualItems.items;
+  const highPriorityItems = scopedItems.filter((item) => parseChecklistItemPriorityV1(item) === "high");
+  const lowPriorityItems = scopedItems.filter((item) => parseChecklistItemPriorityV1(item) === "low");
+  if (highPriorityItems.length === 0 && lowPriorityItems.length === 0) {
+    // Nothing concrete to tell the human to go and do — stay a decline
+    // rather than recommending an empty action list.
+    return undefined;
+  }
+  // Confirmed either by an explicit "Covers: Step N" declaration (sound for
+  // any count), or — review-narrowed a third time (2026-08-25) — by the
+  // pigeonhole case: the only sound corroboration available from PLAN TEXT
+  // ALONE, with no explicit declaration, is that exactly one outstanding
+  // manual item cannot be confused with any other. See this function's own
+  // doc comment for why a stated-count match was removed rather than
+  // narrowed again.
+  const manualItemsScopeConfirmed = coveringItems.length > 0 || manualItems.items.length === 1;
+  return { blocker, stage: target.stage, highPriorityItems, lowPriorityItems, manualItemsScopeConfirmed };
 }
 
 /**
@@ -988,6 +1357,10 @@ export async function postReconcilePlanChecklistDecisionV1(
      * explicit "not recorded" statement below rather than silence.
      */
     checklistProgressUnreliableReason?: string;
+    /** wf10 item 19: blockers a human has resolved via this task's own stage
+     * chat — see `TaskProgress.blockerSupersessions`'s doc comment. Same
+     * optionality rationale as `checklistProgressUnreliableReason` above. */
+    blockerSupersessions?: readonly BlockerSupersessionRecordV1[];
   },
   roundSummaryChecklistClaim?: MergeChecklistProgressResultV1,
   pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[]
@@ -1005,12 +1378,13 @@ export async function postReconcilePlanChecklistDecisionV1(
     return { kind: "noChecklist" };
   }
 
-  const { evidence, allUncheckedCovered, coveredItemsCount } = await gatherReconcileEvidenceV1(
+  const { evidence, allUncheckedCovered, coveredItemsCount, perStage } = await gatherReconcileEvidenceV1(
     folderUri,
     plan.text,
     progress.pendingImplReviewFiles,
     roundSummaryChecklistClaim,
-    pendingOperationEvidence
+    pendingOperationEvidence,
+    progress.blockerSupersessions
   );
 
   // wf10 item 6c: `coveredItemsCount === 0` is TWO unrelated situations —
@@ -1026,6 +1400,40 @@ export async function postReconcilePlanChecklistDecisionV1(
   // advance. Split the branch so that case is recommended instead of
   // silently falling into the "no basis" wording meant for case (a).
   const noUncheckedItemsRemain = counted.remaining === 0;
+
+  // Item 18: when case (a) — unticked items exist and none are review-
+  // verified — narrow the decline to a specific recommendation whenever the
+  // sole outstanding item coincides with the sole remaining blocker on the
+  // relevant review, and that blocker is `environmental` (see
+  // buildSoleBlockerReconcileGuidanceV1's doc comment). `undefined` in every
+  // other shape, in which case the general "no basis to recommend" wording
+  // below is unchanged.
+  const soleUncheckedItemText =
+    counted.remaining === 1 ? listUncheckedChecklistItemTextsV1(plan.text, 1).items[0] : undefined;
+  const soleBlockerGuidance =
+    coveredItemsCount === 0 && !noUncheckedItemsRemain && soleUncheckedItemText !== undefined
+      ? buildSoleBlockerReconcileGuidanceV1(soleUncheckedItemText, perStage, plan.text)
+      : undefined;
+
+  // Review-flagged (2026-08-25, task-fixable blocker `57e9485f-…-0`, fourth
+  // round): every purely textual signal for confirming which pooled manual
+  // items belong to this blocker has been tried and disproven (see
+  // `buildSoleBlockerReconcileGuidanceV1`'s and `appendCoversAnnotationV1`'s
+  // doc comments) — inventing a fifth would repeat that pattern. What IS
+  // available is the sound, already-built `Covers: Step N` mechanism, which
+  // an existing plan simply has not had recorded yet. Offer recording it as
+  // a one-click, auditable action rather than requiring the human to hand-
+  // edit plan-final.md: only reachable when the pooled recommendation is
+  // still unconfirmed and the sole outstanding item has a parseable step
+  // number to link to.
+  const soleItemStepNumberForLink =
+    soleBlockerGuidance && !soleBlockerGuidance.manualItemsScopeConfirmed
+      ? parseChecklistItemStepNumberV1(soleUncheckedItemText ?? "")
+      : undefined;
+  const linkableManualItems: string[] =
+    soleBlockerGuidance && soleItemStepNumberForLink !== undefined
+      ? [...soleBlockerGuidance.highPriorityItems, ...soleBlockerGuidance.lowPriorityItems]
+      : [];
 
   // NINTH review round: tier-1 (review-verified) evidence is a candidate for
   // explicit selection, never an automatic tick (see
@@ -1056,12 +1464,94 @@ export async function postReconcilePlanChecklistDecisionV1(
               "outstanding — the checklist is fully accounted for, so there is nothing left for any review " +
               "to vouch for. Marking reconciled simply confirms that and restores completeness gating.",
           }
-        : {
-            kind: "none",
-            reasoning:
-              "At least one unticked item is not named as verified complete by any implementation review " +
-              "on file — the system has no basis to recommend reconciling until you have checked it yourself.",
-          };
+        : soleBlockerGuidance
+          ? {
+              // Review-narrowed blocker 57e9485f-…-0: this recommendation
+              // used to point at "reconcile" itself — an immediately
+              // executable button that clears the latch — while the
+              // reasoning text below says the human must first do the
+              // manual checks and tick the item. Recommending an
+              // already-clickable action AS the prerequisite step means
+              // clicking the recommended button skips the prerequisite
+              // entirely. "notYet" is the correct recommendation here: it
+              // performs no action, so the reasoning's "do this, then tick,
+              // then click Mark reconciled" sequence cannot be shortcut by
+              // following the recommendation. "Mark reconciled" stays
+              // available as a non-recommended option for once those steps
+              // are actually done.
+              kind: "option",
+              optionId: "notYet",
+              reasoning:
+                `This is the checklist's sole outstanding item, and its wording overlaps with ${STAGE_DISPLAY_NAMES[soleBlockerGuidance.stage]}'s ` +
+                `sole remaining blocker: "${soleBlockerGuidance.blocker.description}" — classified environmental, so no further ` +
+                "automated round can clear it; only a human action can. Do that action first — clicking \"Mark reconciled\" " +
+                "now would assert this item is verified complete before it actually has been. " +
+                // buildSoleBlockerReconcileGuidanceV1's doc comment: the plan
+                // format has no structural link between a checklist item and
+                // the specific manual checks behind it (both live under one
+                // shared heading), so pooling "every outstanding manual item"
+                // and pooling "the item(s) behind this blocker" are only
+                // provably the SAME set when exactly one manual item remains
+                // (manualItemsScopeConfirmed) — a stated-count match was tried
+                // and removed after a review showed it unsound (see that
+                // function's doc comment). Review-flagged a FIFTH time
+                // (2026-08-25): the unconfirmed branch used to close with an
+                // unconditional "tick the item ... and re-run the review",
+                // justified by "doing every pooled check as a safe superset
+                // ... can never lead to a wrong tick". That claim is false —
+                // performing checks unrelated to this blocker does not
+                // establish that the blocker's OWN checks were among them, so
+                // the pooled list is not evidence the tick is warranted. The
+                // fix keeps the honest scope disclosure and still lists the
+                // concrete pooled checks as reasonable due diligence, but the
+                // tick is no longer the pooled branch's own next step: it is
+                // reached only after the human separately confirms scope
+                // (via "Link" below, when a step number is linkable, or by
+                // checking the blocker's own wording directly otherwise) —
+                // exactly the same evidentiary bar the confirmed branch
+                // already clears before recommending a tick.
+                (soleBlockerGuidance.manualItemsScopeConfirmed
+                  ? "The plan's outstanding manual-verification check(s) are confirmed to be the ones this " +
+                    "blocker names. "
+                  : "The plan cannot confirm which recorded manual checks specifically cover this blocker — it " +
+                    "predates the `Covers: Step N` hand-off annotation that would make that link explicit (see " +
+                    "resources/prompts/create-plan.md), and more than one manual-verification item remains " +
+                    "outstanding, so pooling every outstanding item and pooling this blocker's own item(s) are " +
+                    "not provably the same set. The list below is every outstanding manual check in the plan, not " +
+                    "a confirmed subset for this blocker specifically — performing it is reasonable due " +
+                    "diligence, but by itself it does not establish that THIS blocker's own checks were among " +
+                    "them, so it does not by itself justify ticking the item. ") +
+                (soleBlockerGuidance.highPriorityItems.length > 0
+                  ? `The plan records ${soleBlockerGuidance.highPriorityItems.length} outstanding HIGH-priority check(s), which are required:\n` +
+                    soleBlockerGuidance.highPriorityItems.map((item) => `- ${item}`).join("\n") +
+                    (soleBlockerGuidance.lowPriorityItems.length > 0
+                      ? `\nThe ${soleBlockerGuidance.lowPriorityItems.length} outstanding LOW-priority check(s) may be skipped per the plan's own recorded trade-off if they do not apply.`
+                      : "")
+                  : `The plan records ${soleBlockerGuidance.lowPriorityItems.length} outstanding LOW-priority check(s) and no HIGH-priority ones — they may be skipped per the plan's own recorded trade-off if they do not apply, otherwise do them:\n` +
+                    soleBlockerGuidance.lowPriorityItems.map((item) => `- ${item}`).join("\n")) +
+                (soleBlockerGuidance.manualItemsScopeConfirmed
+                  ? " Then: tick the item in plan-final.md, click Mark reconciled, and re-run the review."
+                  : linkableManualItems.length > 0
+                    ? " If, from your own knowledge of what this blocker covers, the check(s) above are in fact " +
+                      "the ones it names, use \"Link Outstanding Check(s) To This Blocker\" below to record that " +
+                      "confirmation — this decision will then show the confirmed recommendation, including the " +
+                      "tick/reconcile/re-review sequence. Ticking the item without that confirmation would " +
+                      "assert a verification this evidence does not establish."
+                    : " Confirm directly against the blocker's own wording above — not merely by having " +
+                      "performed the checks — before ticking the item in plan-final.md; this evidence alone " +
+                      "does not establish that THIS blocker's checks were among them."),
+            }
+          : {
+              kind: "none",
+              reasoning:
+                "At least one unticked item is not named as verified complete by any implementation review " +
+                "on file — the system has no basis to recommend reconciling until you have checked it yourself." +
+                (counted.remaining === 1
+                  ? " (The sole outstanding item does not cleanly coincide with a single environmental blocker on " +
+                    "the relevant review, so no more specific recommendation is available — check what the " +
+                    "review actually says before deciding.)"
+                  : ""),
+            };
 
   const target: ChatTarget = {
     canonicalId,
@@ -1126,6 +1616,37 @@ export async function postReconcilePlanChecklistDecisionV1(
                   kind: "command" as const,
                   command: "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
                   args: [{ taskFolderPath, canonicalId }],
+                },
+              },
+            ]
+          : []),
+        ...(linkableManualItems.length > 0 && soleBlockerGuidance && soleItemStepNumberForLink !== undefined
+          ? [
+              {
+                optionId: "linkManualChecks",
+                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} To This Blocker`,
+                consequence:
+                  `Records a durable "Covers: Step ${soleItemStepNumberForLink}" note on each of the ` +
+                  `${linkableManualItems.length} outstanding manual-verification item(s) listed above, in ` +
+                  "plan-final.md — your explicit confirmation that these are the checks this blocker names " +
+                  "(the plan's own text carries no such link yet, and no automated signal can establish one " +
+                  "soundly). Does not tick or complete anything by itself — do the checks, then tick the item " +
+                  "and mark reconciled. Once recorded, this same decision will show the confirmed recommendation " +
+                  "instead of the pooled one, for this plan and any future round.",
+                effect: {
+                  kind: "command" as const,
+                  command: "vs-code-ai-helper.linkManualChecksToBlockerConfirmed",
+                  args: [
+                    {
+                      taskFolderPath,
+                      canonicalId,
+                      decisionId,
+                      stepNumber: soleItemStepNumberForLink,
+                      itemTexts: linkableManualItems,
+                      blockerStage: soleBlockerGuidance.stage,
+                      blockerDescription: soleBlockerGuidance.blocker.description,
+                    },
+                  ],
                 },
               },
             ]
@@ -1282,12 +1803,32 @@ export async function reconcilePlanChecklistConfirmedV1(
   }
 
   let raced = false;
+  const expectedVersion = resolved.progress.progressVersion;
   await patchTaskProgressStrictV1(folderUri, (current) => {
-    if (current.updatedAt !== resolved.progress.updatedAt) {
+    // `progressVersion` (wf10 item 8) is authoritative once both sides carry
+    // it — `updatedAt` alone could not tell "the task changed" apart from
+    // "nothing changed, but this same reconciliation bumps it too" once this
+    // write itself started setting `updatedAt`. A record from before the
+    // field existed (either side absent) falls back to the original
+    // `updatedAt` comparison.
+    const raceDetected =
+      expectedVersion !== undefined && current.progressVersion !== undefined
+        ? current.progressVersion !== expectedVersion
+        : current.updatedAt !== resolved.progress.updatedAt;
+    if (raceDetected) {
       raced = true;
       return current;
     }
-    return { ...current, checklistProgressUnreliable: undefined };
+    // Bumping `updatedAt` here (wf10 item 8) is what makes this action
+    // visible in the Tasks tree sort/tooltip and the status bar: clearing
+    // the latch used to touch nothing but `checklistProgressUnreliable`, so
+    // the one action the UI insists only a human can perform left no
+    // display trace that anything had happened.
+    return {
+      ...current,
+      checklistProgressUnreliable: undefined,
+      updatedAt: new Date().toISOString(),
+    };
   });
   if (raced) {
     NotificationRouter.showWarning(
@@ -1305,7 +1846,8 @@ export async function reconcilePlanChecklistConfirmedV1(
 export type ApplyReconciliationTicksResultV1 =
   | { readonly kind: "applied"; readonly count: number }
   | { readonly kind: "noCandidates" }
-  | { readonly kind: "noChecklist" };
+  | { readonly kind: "noChecklist" }
+  | { readonly kind: "changedUnderneath" };
 
 /**
  * Applies every currently-unticked plan item an implementation review
@@ -1333,6 +1875,16 @@ export type ApplyReconciliationTicksResultV1 =
  * explicit acts (plan Part 4: "the explicit human confirmation is deliberate
  * and correct"), so a partial or rejected selection here leaves the latch
  * exactly where it was.
+ *
+ * Narrowing (sixth review pass, 2026-08-25, task-fixable blocker
+ * `739cfbbb-…-1`): this was the second of two remaining in-process writers of
+ * `plan-final.md` still bypassing {@link writeTextFileIfUnchangedV1} (the
+ * first, `applyReviewerVerifiedTicksConfirmedV1`, was closed the prior pass).
+ * The write now routes through that primitive using `plan.text` — the same
+ * content the merge was computed against — as the expected content, so a
+ * concurrent writer or editor save landing between the read above and this
+ * write is detected and refused rather than silently overwritten, exactly
+ * like `linkManualChecksToBlockerConfirmedV1`'s Guard 3.
  */
 export async function applyReconciliationReviewVerifiedTicksV1(
   folderUri: vscode.Uri
@@ -1353,7 +1905,14 @@ export async function applyReconciliationReviewVerifiedTicksV1(
   if (merged.kind !== "merged") {
     return { kind: "noCandidates" };
   }
-  await writeTextFile(getCanonicalImplementationUri(folderUri), merged.content);
+  const written = await writeTextFileIfUnchangedV1(
+    getCanonicalImplementationUri(folderUri),
+    plan.text,
+    merged.content
+  );
+  if (!written) {
+    return { kind: "changedUnderneath" };
+  }
   return { kind: "applied", count: coveredItems.length };
 }
 
@@ -1398,9 +1957,254 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     );
     return;
   }
+  if (result.kind === "changedUnderneath") {
+    NotificationRouter.showWarning(
+      "plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision " +
+        "and try again."
+    );
+    return;
+  }
   await inventory.refresh();
   NotificationRouter.showInformation(
     `Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
+  );
+}
+
+/** Argument shape for the "Link N Outstanding Check(s) To This Blocker" option
+ * (`postReconcilePlanChecklistDecisionV1`'s `linkManualChecks` option) — the
+ * task ids plus the human-confirmed step number and item texts to annotate.
+ * Not folded into {@link ReconcileArg}/`normalizeArg`, which deliberately
+ * carry only task-identity fields. */
+interface LinkManualChecksArg {
+  readonly canonicalId?: string;
+  readonly taskFolderPath?: string;
+  /** Present on the normal dispatch path — see the freshness guard in
+   * {@link linkManualChecksToBlockerConfirmedV1} for why it is checked. */
+  readonly decisionId?: string;
+  readonly stepNumber?: number;
+  readonly itemTexts?: readonly string[];
+  /** The stage and exact description of the environmental blocker this link
+   * asserts these checks cover, captured when the decision was built — see
+   * Guard 2b in {@link linkManualChecksToBlockerConfirmedV1} for why this is
+   * re-checked against a fresh read of the review artifact at write time. */
+  readonly blockerStage?: TaskStage;
+  readonly blockerDescription?: string;
+}
+
+/**
+ * Executes the "Link N Outstanding Check(s) To This Blocker" option
+ * (`postReconcilePlanChecklistDecisionV1`). Records the human's own confirmed
+ * selection as `Covers: Step N` annotations via
+ * {@link appendCoversAnnotationV1} — see that function's doc comment for why
+ * this is the sound alternative to a fifth text-matching heuristic.
+ *
+ * Review-flagged (2026-08-25, task-fixable blocker `739cfbbb-…-1`, narrowed
+ * TWICE): the operation being additive/idempotent at the LINE level (an
+ * already-annotated item is never re-annotated) is not the same guarantee as
+ * the DECISION being current, the BLOCKER it names still being active, nor
+ * the WRITE being race-free — earlier revisions' doc comments conflated
+ * these. Four independent guards close the actual gaps named by the review:
+ *
+ *  1. **Stale decision data.** When the option carries a `decisionId` (the
+ *     normal dispatch path), this looks the decision back up and refuses if
+ *     `plan-final.md`'s on-disk mtime is newer than the decision's own
+ *     `createdAt` — the exact freshness contract
+ *     `reconcilePlanChecklistConfirmedV1` already applies to "Mark
+ *     reconciled", reused here rather than inventing a second one.
+ *  2. **A blocker/step association that no longer holds.** Independent of
+ *     `decisionId` (which may be absent for an older in-flight decision, or
+ *     evicted from the store), the plan's CURRENT sole outstanding step is
+ *     re-derived fresh from the just-read text and compared against the
+ *     confirmed `stepNumber`: the annotation asserts these checks cover THAT
+ *     step, so if the plan has changed enough that it no longer is the sole
+ *     outstanding step, applying it now would record a false association.
+ *  2b. **The blocker itself may have changed or cleared.** Guard 2 only
+ *     confirms the STEP is unchanged, not that the review's blocker driving
+ *     the recommendation is still there — a newer review round can replace or
+ *     resolve it while the plan and step stay textually identical. This
+ *     re-reads the recorded stage's review artifact fresh (never the value
+ *     baked into the decision's args) and refuses unless a blocker with the
+ *     exact confirmed description is still present AND not superseded via
+ *     stage chat since (`filterSupersededBlockersV1`, the same check
+ *     `gatherReconcileEvidenceV1` applies when building the original
+ *     recommendation).
+ *  3. **An intervening write.** The final write goes through
+ *     {@link writeTextFileIfUnchangedV1} (review-flagged 2026-08-25,
+ *     task-fixable blocker `739cfbbb-…-1`, narrowed a SIXTH time). The
+ *     primitive performs backup, an initial compare-read, a second re-read,
+ *     and one final re-read positioned as the very last thing before the
+ *     write call — no other awaited work runs between that final read and
+ *     the write. Concurrent callers against this same file, and any writer
+ *     whose edit lands before that final read, are detected and this call is
+ *     refused rather than silently overwriting them. The fifth review pass
+ *     named a vector no amount of extra reads could close: a manual editor
+ *     save for the same file landing after that final read, which never goes
+ *     through this primitive's reads at all. That vector is now closed
+ *     separately — `registerConditionalWriteSaveGuardV1` (fileUtils.ts,
+ *     registered once at extension activation) defers any editor save for a
+ *     uri while a conditional write is in flight for it, via
+ *     `vscode.workspace.onWillSaveTextDocument`'s `event.waitUntil`, so the
+ *     save lands strictly after this write resolves instead of racing it.
+ *     The on-disk mutation itself (when no editor has the file open) is now
+ *     also an atomic same-directory temp-write-then-rename rather than a
+ *     single non-atomic `vscode.workspace.fs.writeFile` call, matching
+ *     `WorkflowFileStoreV1.replaceFileExact` elsewhere in this codebase.
+ *     None of this extends to an edit landing in the instant between the
+ *     final read and the write itself from a process outside this extension
+ *     host, since no cross-process file lock exists for this file anywhere
+ *     in the codebase and no in-process mechanism can close that specific
+ *     gap — only an OS-level atomic compare-and-swap could, which VS Code's
+ *     fs API does not expose; that residual gap is unchanged and shared with
+ *     every sibling writer. The sixth review pass also flagged the one
+ *     writer of `plan-final.md` it had found that still bypassed this
+ *     primitive at the time — `applyReviewerVerifiedTicksConfirmedV1`'s
+ *     unconditional write — and a self-deadlock in the save guard itself
+ *     (its own `document.save()` call would look itself up in the
+ *     pending-writes map and `waitUntil()` its own promise). Both were fixed
+ *     that pass: that call site routed through `writeTextFileIfUnchangedV1`
+ *     like this one, and the guard distinguished a write's own save from a
+ *     genuinely separate one via `conditionalWriteOwnSaveInFlight`.
+ *     Seventh review pass (2026-08-25, same blocker, narrowed further): two
+ *     MORE production writers of this artifact were still bypassing this
+ *     primitive — `applyReconciliationReviewVerifiedTicksV1`
+ *     (`reconcilePlanChecklist.ts`) and the implementation-round checklist
+ *     merge (`reviewActions.ts`) — now both route through it too. The same
+ *     pass also found the sixth pass's self-deadlock fix was URI-wide rather
+ *     than event-specific — any will-save for the uri during the whole
+ *     `applyEdit`+`save()` window was exempted, not just the write's own
+ *     nested save — and narrowed `conditionalWriteOwnSaveInFlight`'s window
+ *     to start only immediately before `.save()`; see that set's doc comment
+ *     in `fileUtils.ts` for the fix and its residual.
+ */
+export async function linkManualChecksToBlockerConfirmedV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: LinkManualChecksArg
+): Promise<void> {
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
+  const resolved = await resolveTaskContext(
+    inventory,
+    explicitArg ? { canonicalId: explicitArg.canonicalId, taskFolderPath: explicitArg.taskFolderPath } : undefined,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!resolved) {
+    NotificationRouter.showError(
+      "The task could not be found. Refresh the Tasks panel and try again."
+    );
+    return;
+  }
+
+  const stepNumber = explicitArg?.stepNumber;
+  const itemTexts = explicitArg?.itemTexts ?? [];
+  if (stepNumber === undefined || itemTexts.length === 0) {
+    NotificationRouter.showWarning(
+      "Nothing to link — no outstanding checks or target step were supplied."
+    );
+    return;
+  }
+
+  const folderUri = vscode.Uri.file(resolved.taskFolderPath);
+  const planUri = getCanonicalImplementationUri(folderUri);
+
+  const initialStat = await statIfExists(planUri);
+
+  // Guard 1: stale decision data (see doc comment above).
+  if (explicitArg?.decisionId) {
+    const context = getExtensionContextV1();
+    const decision = context && new WorkflowDecisionStoreV1(context.workspaceState).get(explicitArg.decisionId);
+    if (decision && initialStat && initialStat.mtime > Date.parse(decision.createdAt)) {
+      NotificationRouter.showWarning(
+        "plan-final.md changed since this decision was posted, so the confirmed link may no longer apply. " +
+          "Re-open the reconcile decision and try again."
+      );
+      return;
+    }
+  }
+
+  const plan = await readTextIfExists(planUri);
+  if (plan === undefined) {
+    NotificationRouter.showWarning(
+      "plan-final.md could not be read, so there is nothing to link."
+    );
+    return;
+  }
+
+  // Guard 2: the blocker/step association must still hold (see doc comment
+  // above) — re-derive the plan's CURRENT sole outstanding step rather than
+  // trusting the one baked into the decision's args.
+  const currentUnchecked = listUncheckedChecklistItemTextsV1(plan, 1);
+  const currentSoleStep =
+    currentUnchecked.total === 1 ? parseChecklistItemStepNumberV1(currentUnchecked.items[0] ?? "") : undefined;
+  if (currentSoleStep !== stepNumber) {
+    NotificationRouter.showWarning(
+      "plan-final.md no longer has Step " + stepNumber + " as its sole outstanding item, so linking now could " +
+        "record a false association. Re-open the reconcile decision to see the current state and try again."
+    );
+    return;
+  }
+
+  // Guard 2b (review-flagged 2026-08-25, narrowed blocker `739cfbbb-…-1`):
+  // this link asserts "these checks cover THIS blocker", not just "this step
+  // is still sole outstanding" — a newer review can change or clear the
+  // blocker while the plan and step remain unchanged, and Guard 2 alone
+  // cannot see that. Independent of `decisionId`, re-read the recorded
+  // stage's review artifact fresh (never the value cached in args) and
+  // confirm the same environmental blocker is still active — present in the
+  // artifact's raw text AND not superseded via stage chat since — before
+  // writing.
+  if (explicitArg?.blockerStage && explicitArg?.blockerDescription) {
+    const stageFilename = STAGE_ARTIFACT_FILENAMES[explicitArg.blockerStage];
+    const stageUri = stageFilename ? vscode.Uri.joinPath(folderUri, stageFilename) : undefined;
+    const stageContent = stageUri ? await readTextIfExists(stageUri) : undefined;
+    const stageStat = stageUri ? await statIfExists(stageUri) : undefined;
+    const activeBlockers =
+      stageContent !== undefined
+        ? filterSupersededBlockersV1(
+            explicitArg.blockerStage,
+            parseReviewBlockers(stageContent),
+            resolved.progress.blockerSupersessions,
+            stageStat?.mtime
+          )
+        : [];
+    const stillActive = activeBlockers.some(
+      (b) => b.resolver === "environmental" && b.description === explicitArg.blockerDescription
+    );
+    if (!stillActive) {
+      NotificationRouter.showWarning(
+        `The ${STAGE_DISPLAY_NAMES[explicitArg.blockerStage]} review no longer names the blocker this link was ` +
+          "confirmed against as an active environmental blocker, so linking now could record a false " +
+          "association. Re-open the reconcile decision to see the current state and try again."
+      );
+      return;
+    }
+  }
+
+  const { content, appliedCount } = appendCoversAnnotationV1(plan, itemTexts, stepNumber);
+  if (appliedCount === 0) {
+    NotificationRouter.showInformation(
+      "Every listed check already carries a Covers: annotation, or plan-final.md has changed since — nothing " +
+        "to link."
+    );
+    return;
+  }
+
+  // Guard 3: an intervening write (see doc comment above) — revision-
+  // conditional via writeTextFileIfUnchangedV1, which serializes against any
+  // other in-process caller for this uri and refuses unless the file's
+  // content still matches `plan` at the moment of the write.
+  const written = await writeTextFileIfUnchangedV1(planUri, plan, content);
+  if (!written) {
+    NotificationRouter.showWarning(
+      "plan-final.md changed while this link was being applied — nothing was written. Re-open the reconcile " +
+        "decision and try again."
+    );
+    return;
+  }
+
+  await inventory.refresh();
+  NotificationRouter.showInformation(
+    `Linked ${appliedCount} outstanding check(s) to Step ${stepNumber} in plan-final.md via a Covers: annotation.`
   );
 }
 
@@ -1421,6 +2225,10 @@ export function registerReconcilePlanChecklistCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
       (arg?: ReconcileArg) => applyReconciliationReviewVerifiedTicksConfirmedV1(inventory, currentTaskStore, arg)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.linkManualChecksToBlockerConfirmed",
+      (arg?: LinkManualChecksArg) => linkManualChecksToBlockerConfirmedV1(inventory, currentTaskStore, arg)
     )
   );
 }

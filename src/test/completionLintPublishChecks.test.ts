@@ -30,6 +30,8 @@ import {
 } from "../utils/completionLint";
 import {
   ensurePublishReviewArtifactExistsV1,
+  extractVerificationHeadingSectionV1,
+  normalizeLegacyHeadingLevelV1,
   readPublishChecksFreshnessStampV1,
   renderPublishChecksFreshnessStamp,
   writePublishChecksFreshnessStampV1,
@@ -313,13 +315,28 @@ void describe("upsertCompletionChecksReportV1", () => {
     // Both legacy sections survived the import.
     assert.match(content, /Status: Passed/);
     assert.match(content, /No files the plan doesn't mention\./);
+    // The legacy sections' own `##`-level headings (one level shallower than
+    // the current build's `###`, since the legacy file was a standalone
+    // top-level document) were normalized to nest under
+    // "## Verification (ground truth)" instead of reading as its siblings.
+    assert.match(content, /### Completion Checks/);
+    assert.match(content, /### Scope Check/);
+    assert.doesNotMatch(content, /^## Completion Checks$/m);
+    assert.doesNotMatch(content, /^## Scope Check$/m);
     // The legacy freshness stamp's fields survived the import verbatim —
     // creation alone (no fresh check run) must not invalidate it.
     assert.match(content, new RegExp(originalStamp.runId));
     assert.match(content, new RegExp(originalStamp.verifiedCommitSha));
     assert.notEqual(await readPublishChecksFreshnessStampV1(vscode.Uri.file(dir)), undefined);
-    // Imported content is explicitly attributed, not silently merged in.
-    assert.match(content, /Imported once from the legacy publish-checks\.md/);
+    // Imported content is explicitly attributed, not silently merged in —
+    // and, critically, that provenance note lives INSIDE the extractable
+    // "## Verification (ground truth)" heading marker, not as bare text
+    // beside it, so a later AI review write's re-splice (which extracts and
+    // re-merges only marker-delimited sections) cannot silently drop it.
+    assert.match(content, /Imported once from the legacy `publish-checks\.md`/);
+    const headingSection = extractVerificationHeadingSectionV1(content);
+    assert.ok(headingSection, "expected the verification heading marker to be present");
+    assert.match(headingSection, /Imported once from the legacy `publish-checks\.md`/);
     // The legacy file itself is untouched.
     assert.equal(
       nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8"),
@@ -339,6 +356,27 @@ void describe("upsertCompletionChecksReportV1", () => {
 
     const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Not yet reviewed/);
+  });
+
+  void it("normalizeLegacyHeadingLevelV1 demotes exactly the two known legacy headings and leaves everything else alone", () => {
+    const section = [
+      "<!-- completion-checks:start -->",
+      "## Completion Checks",
+      "",
+      "- Status: Passed",
+      "## Not a managed heading",
+      "<!-- completion-checks:end -->",
+    ].join("\n");
+    const normalized = normalizeLegacyHeadingLevelV1(section);
+    assert.match(normalized, /^### Completion Checks$/m);
+    assert.doesNotMatch(normalized, /^## Completion Checks$/m);
+    // Only the two known legacy headings are rewritten — unrelated `##`
+    // text in the body is left untouched.
+    assert.match(normalized, /^## Not a managed heading$/m);
+
+    // Content already at the current (already-demoted) level is a no-op.
+    const alreadyCurrent = "### Scope Check\n\nNo files the plan doesn't mention.";
+    assert.equal(normalizeLegacyHeadingLevelV1(alreadyCurrent), alreadyCurrent);
   });
 
   void it("renders Status: Passed when every failure is a quarantined known flake, not Status: Failed", async () => {

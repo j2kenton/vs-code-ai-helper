@@ -14,7 +14,7 @@ import {
   mergeChecklistProgressV1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
-import { writeTextFile } from "../utils/fileUtils";
+import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
@@ -305,6 +305,16 @@ export async function applyReviewerVerifiedTicks(
  * and safer than an abort-on-race check because ticking is monotonic and
  * text-matched (module doc comment above): recomputing against whatever is on
  * disk right now can never lose a tick or apply the wrong one.
+ *
+ * The final write goes through {@link writeTextFileIfUnchangedV1} rather than
+ * an unconditional `writeTextFile` (review-flagged 2026-08-25, task-fixable
+ * blocker `739cfbbb-…-1`: this was the one remaining in-process writer of
+ * `plan-final.md` that bypassed that primitive's FIFO queue and revision
+ * check, named explicitly in `reconcilePlanChecklist.ts`'s Guard 3 comment as
+ * the known gap). `freshPlan.text`, already read immediately above as the
+ * basis for the merge, is passed as the expected content, so this call now
+ * queues behind any other in-process writer of the same uri and is refused —
+ * rather than silently overwriting — if the file changed underneath it.
  */
 export async function applyReviewerVerifiedTicksConfirmedV1(
   inventory: TaskInventory,
@@ -353,7 +363,18 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
     return;
   }
 
-  await writeTextFile(getCanonicalImplementationUri(folderUri), merged.content);
+  const written = await writeTextFileIfUnchangedV1(
+    getCanonicalImplementationUri(folderUri),
+    freshPlan.text,
+    merged.content
+  );
+  if (!written) {
+    NotificationRouter.showWarning(
+      "plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision " +
+        "and try again."
+    );
+    return;
+  }
   await inventory.refresh();
   NotificationRouter.showInformation(
     `Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`

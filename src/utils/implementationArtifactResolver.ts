@@ -10,7 +10,7 @@ import {
   LEGACY_IMPLEMENTATION_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
-import { readNonEmptyText, resolveCurrentPlanUri, statIfExists } from "./fileUtils";
+import { readNonEmptyText, resolveCurrentPlanUri, statIfExists, withPlanFileWriteLockV1 } from "./fileUtils";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
 import {
   requirementsForStageActionV1,
@@ -21,6 +21,7 @@ import {
 } from "./stageArtifactRequirementsV1";
 import {
   ChecklistProgressV1,
+  collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
   countChecklistProgressV1,
   declaresNoChecklistChangeV1,
@@ -243,19 +244,35 @@ export function describeImplementationSummaryShapeIssue(
   // Checked before the section presence gates below: a response that
   // declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing to tick") while also
   // reporting retroactive completions in `## Plan Item Checklist` wants
-  // checklist state to change while explicitly declaring it does not. Both
-  // halves individually satisfy the shape gate (the marker alone stands in
-  // for the echo), so this round would otherwise complete with its claimed
-  // progress recorded nowhere durable — see
-  // `hasContradictoryNoChecklistChangeClaimV1`'s doc comment for the
-  // round-013 reproduction that made this visible.
-  if (expectations.planChecklist !== undefined && hasContradictoryNoChecklistChangeClaimV1(trimmed)) {
+  // checklist state to change while explicitly declaring it does not — UNLESS
+  // every one of those completions names a plan item that is ALREADY ticked
+  // in the plan of record, in which case it is a genuine per-item status note
+  // ("already ticked in a prior round; this round only extended it" — the
+  // shape three independent providers converged on for a round that fixed a
+  // review blocker in already-complete work without ticking anything new;
+  // wf10 item 12) rather than a claim trying to advance state under a marker
+  // that says nothing changed. `hasContradictoryNoChecklistChangeClaimV1`
+  // draws that distinction against `alreadyCheckedPlanItemKeys` below; see its
+  // doc comment for both the round-013 reproduction (a claim naming NO real
+  // plan item at all — a paraphrase) and the run-064 reproduction (claims
+  // naming real, already-ticked items) that this now tells apart.
+  if (
+    expectations.planChecklist !== undefined &&
+    hasContradictoryNoChecklistChangeClaimV1(
+      trimmed,
+      collectChecklistItemKeysV1(expectations.planChecklist),
+      new Set(collectCheckedChecklistCountsV1(expectations.planChecklist).keys())
+    )
+  ) {
     return (
       "the final response declares `<!-- ensemble:no-checklist-change -->` (nothing to tick) but " +
-      "also reports retroactive plan-item completions in `## Plan Item Checklist` — use exactly one: " +
-      "either omit the marker and echo the plan's checklist with the completed items ticked (quoting " +
-      "each item's exact text from the plan, not a paraphrase), or drop the marker declaration and the " +
-      "retroactive claims both if truly nothing changed this round"
+      "also reports a plan-item completion in `## Plan Item Checklist` that does not name an item " +
+      "already ticked in the plan of record — use exactly one: either omit the marker and echo the " +
+      "plan's checklist with the completed items ticked (quoting each item's exact text from the plan, " +
+      "not a paraphrase), or, if every claimed item really is already ticked, mark it accordingly " +
+      "(`<!-- ensemble:retroactive -->` with evidence, or a plain \"— done — already ticked...\" note); " +
+      "a claim about an item that is not yet ticked, or a whole-Part claim, cannot travel under this " +
+      "marker at all — drop the marker and echo the checklist, or drop the claim if truly nothing changed"
     );
   }
 
@@ -922,16 +939,25 @@ export async function materializeCanonicalIfNeeded(
     return canonicalUri;
   }
 
-  const legacyStat = await statIfExists(legacyUri);
-  if (legacyStat) {
-    // Copy legacy -> canonical
-    const content = await vscode.workspace.fs.readFile(legacyUri);
-    await backupArtifactBeforeWrite(canonicalUri);
-    await vscode.workspace.fs.writeFile(canonicalUri, content);
-    return canonicalUri;
-  }
-
-  throw new Error(stageActionRequirementMessageV1("runImplementation", 0));
+  // Serialized against every other writer of canonicalUri (concurrent calls
+  // to this function, and preparePlanPromotion's publish below) via
+  // withPlanFileWriteLockV1, with a fresh existence re-check taken inside the
+  // lock — not the stale check above — so a queued call that lost a race to
+  // create the file does not still overwrite it once its turn comes.
+  return withPlanFileWriteLockV1(canonicalUri, async () => {
+    if (await statIfExists(canonicalUri)) {
+      return canonicalUri;
+    }
+    const legacyStat = await statIfExists(legacyUri);
+    if (legacyStat) {
+      // Copy legacy -> canonical
+      const content = await vscode.workspace.fs.readFile(legacyUri);
+      await backupArtifactBeforeWrite(canonicalUri);
+      await vscode.workspace.fs.writeFile(canonicalUri, content);
+      return canonicalUri;
+    }
+    throw new Error(stageActionRequirementMessageV1("runImplementation", 0));
+  });
 }
 
 /** Whether one {@link StageArtifactRequirementV1} is currently met on disk — the read half of the stage-prerequisite contract; `stageActionRequirementMessageV1` is the text half. */
@@ -1046,11 +1072,20 @@ export async function preparePlanPromotion(
     ready: true,
     publish: async () => {
       const canonicalUri = getCanonicalImplementationUri(taskFolderUri);
-      await backupArtifactBeforeWrite(canonicalUri);
-      await vscode.workspace.fs.writeFile(
-        canonicalUri,
-        new TextEncoder().encode(planContent)
-      );
+      // Same per-uri lock and in-lock existence re-check as
+      // materializeCanonicalIfNeeded above: a concurrent publish() or
+      // materialize call for this uri may have already created the file
+      // while this call was queued, and must not be silently overwritten.
+      await withPlanFileWriteLockV1(canonicalUri, async () => {
+        if (await statIfExists(canonicalUri)) {
+          return;
+        }
+        await backupArtifactBeforeWrite(canonicalUri);
+        await vscode.workspace.fs.writeFile(
+          canonicalUri,
+          new TextEncoder().encode(planContent)
+        );
+      });
     },
   };
 }

@@ -197,16 +197,31 @@ export async function patchTaskProgressStrictV1(
     if (options?.beforeWrite) {
       await options.beforeWrite(patched);
     }
-    const encoded = encodeTaskProgressV1({ ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
-    if (encoded === encodeTaskProgressV1(current, strict.decoded.entries)) {
+    // `progressVersion` (wf10 item 8) is incremented HERE and nowhere else —
+    // no caller's own comparison can race the bump, because no caller ever
+    // sets this field itself. Determine whether the patch is a real change
+    // with the token held at its CURRENT value on both sides first, so the
+    // token itself can never be what makes an otherwise byte-identical patch
+    // look like a change.
+    const currentEncoded = encodeTaskProgressV1(current, strict.decoded.entries);
+    const unversionedEncoded = encodeTaskProgressV1(
+      { ...patched, ensembleProgressVersion: 1, progressVersion: current.progressVersion },
+      strict.decoded.entries
+    );
+    if (unversionedEncoded === currentEncoded) {
       return current;
     }
+    const versioned: TaskProgress = {
+      ...patched,
+      progressVersion: (current.progressVersion ?? 0) + 1,
+    };
+    const encoded = encodeTaskProgressV1({ ...versioned, ensembleProgressVersion: 1 }, strict.decoded.entries);
     await beginFinalization(taskFolderUri.fsPath, taskFolderUri.fsPath, "task-progress mutation");
     // Keep the intent journal on failure. Startup recovery needs the record
     // to reconcile an interrupted mutation instead of losing the evidence.
     await writeAtomic(vscode.Uri.joinPath(taskFolderUri, TASK_PROGRESS_FILENAME), encoded);
     await finishFinalization(taskFolderUri.fsPath);
-    return patched;
+    return versioned;
   };
   return options?.skipLock ? operation() : withTaskLock(taskFolderUri.fsPath, operation);
 }

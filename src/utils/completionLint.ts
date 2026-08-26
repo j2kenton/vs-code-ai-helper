@@ -16,6 +16,7 @@ import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1
 import { ReviewBlocker } from "./reviewReadiness";
 import { scopeToLatestChecklistV1, unescapeChecklistItemTextV1 } from "./implementationChecklist";
 import {
+  ensureVerificationHeadingV1,
   importLegacyPublishChecksIfAbsentV1,
   invalidatePublishChecksFreshnessStamp,
   withPublishChecksReportLockV1,
@@ -1473,7 +1474,11 @@ function renderCompletionChecksSection(
   result: CompletionLintResult,
   override?: { reason: string }
 ): string {
-  const lines: string[] = [PUBLISH_CHECKS_SECTION_START, "## Completion Checks", ""];
+  // "###", not "##": this section is spliced under the "## Verification
+  // (ground truth)" wrapper heading (publishChecksFreshness.ts) and must
+  // nest as its child, not read as a sibling top-level section (plan item
+  // 17, step 20 — the review flagged the two headings as false siblings).
+  const lines: string[] = [PUBLISH_CHECKS_SECTION_START, "### Completion Checks", ""];
   // The headline is derived from passedModuloKnownFlakes, NOT result.passed —
   // its own doc comment states it, not `passed`, is the readiness-relevant
   // verdict shown to reviewers. Falls back to `passed` for an older/mocked
@@ -1498,11 +1503,11 @@ function renderCompletionChecksSection(
   }
   lines.push(`- Summary: ${result.summary}`);
   if (result.verificationEnvironment) {
-    lines.push("", "### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
+    lines.push("", "#### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
   }
   lines.push(...renderCommandsRunLines(result));
   if (result.missingScripts.length > 0) {
-    lines.push("", "### Inconclusive checks");
+    lines.push("", "#### Inconclusive checks");
     for (const script of result.missingScripts) {
       lines.push(
         `- \`${script}\`: **inconclusive** — no \`${script}\` script is configured in the verified package.json, so this check could not run (an undetected toolchain is never a pass).`
@@ -1510,7 +1515,7 @@ function renderCompletionChecksSection(
     }
   }
   if (result.failedChecks.length > 0) {
-    lines.push("", "### Failed checks");
+    lines.push("", "#### Failed checks");
     for (const check of result.failedChecks) {
       const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
       const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
@@ -1531,7 +1536,7 @@ function renderCompletionChecksSection(
     }
   }
   if (result.retriedPasses && result.retriedPasses.length > 0) {
-    lines.push("", "### Checks that required a retry to pass");
+    lines.push("", "#### Checks that required a retry to pass");
     for (const retried of result.retriedPasses) {
       lines.push(
         `- \`${retried.command}\`: failed on the first attempt, passed on retry ${retried.retryCount} (cache disabled) — flaky, not clean.`
@@ -1539,7 +1544,7 @@ function renderCompletionChecksSection(
     }
   }
   if (result.planItems && result.planItems.length > 0) {
-    lines.push("", buildPlanItemVerificationSection(result.planItems, { heading: "###" }));
+    lines.push("", buildPlanItemVerificationSection(result.planItems, { heading: "####" }));
   }
   if (override) {
     lines.push("", `_Published anyway despite failing checks — ${override.reason}._`);
@@ -1793,6 +1798,7 @@ export async function upsertCompletionChecksReportV1(
     // so a task that upgraded mid-Publish doesn't lose its most recent
     // Scope Check (or other section this call doesn't itself produce).
     existing = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
+    existing = ensureVerificationHeadingV1(existing);
 
     const section = renderCompletionChecksSection(result, override);
     const merged = mergeCompletionChecksSection(existing, section);

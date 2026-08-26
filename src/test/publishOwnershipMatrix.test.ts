@@ -1491,6 +1491,127 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
     }
   });
 
+  void it("both-files case: a stub publish-review.md with no stamp, alongside a legacy publish-checks.md that DOES have one, still lets the review proceed (wf10 item 17, step 20c)", async () => {
+    // Reproduces the review-confidence blocker on the previous round: the
+    // entry gate (requirePublishChecksFreshnessOrWarnV1) used to read
+    // publish-review.md's own (absent) stamp and refuse with "Publish Checks
+    // have not been run yet" — never reaching reviewRowV1.ts's promotion-time
+    // import, which only runs AFTER this gate accepts. A task that upgraded
+    // mid-Publish, where an older build had already stubbed publish-review.md
+    // before the legacy-import path existed, could never get its most recent
+    // Scope Check/Completion Checks/stamp imported by requesting a review.
+    const folderName = `both-files-${Math.floor(Math.random() * 1e9)}`;
+    const folderPath = path.join(REAL_ROOT, "plans", folderName);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const progress: TaskProgress = {
+      taskFolder: folderName,
+      currentStage: "publish",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+
+    // Stub publish-review.md — no embedded verification sections, no stamp —
+    // exactly the shape an older intermediate build's
+    // ensurePublishReviewArtifactExistsV1 would have left behind.
+    fs.writeFileSync(
+      path.join(folderPath, "publish-review.md"),
+      "# Publish Review\n\n**Not yet reviewed.**\n",
+      "utf8"
+    );
+    // Legacy publish-checks.md — the REAL pre-unification shape: its own
+    // top-level `##` headings (one level shallower than the current build's
+    // `###`), never `###` — and the only place the valid freshness stamp
+    // lives.
+    const scopeFolder = path.dirname(folderPath);
+    const legacyStamp = renderPublishChecksFreshnessStamp({
+      formatVersion: 1,
+      runId: "11111111-1111-4111-8111-111111111111",
+      verifiedCommitSha: REAL_ROOT_HEAD_SHA,
+      completedAt: "2026-01-01T00:00:00.000Z",
+      scopeId: computePublishScopeId(scopeFolder),
+    });
+    const legacyContent = [
+      "<!-- completion-checks:start -->",
+      "## Completion Checks",
+      "",
+      "- Status: Passed",
+      "<!-- completion-checks:end -->",
+      "",
+      "<!-- scope-check:start -->",
+      "## Scope Check",
+      "",
+      "No files the plan doesn't mention.",
+      "<!-- scope-check:end -->",
+      "",
+      legacyStamp,
+      "",
+    ].join("\n");
+    fs.writeFileSync(path.join(folderPath, PUBLISH_CHECKS_FILENAME), legacyContent, "utf8");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+    ];
+    try {
+      await runPassingReview(
+        folderPath,
+        dispatches,
+        "Readiness: 9/10\n\n- Ready.\n",
+        "publish"
+      );
+
+      // The gate must not have refused the review as missing evidence — the
+      // freshness-failure warning names "Run Publish Checks" and must not
+      // appear alongside the expected manual-publish nudge.
+      const refusal = provider
+        .getEntries()
+        .find((entry) => /Publish Checks have not been run yet/.test(entry.message));
+      assert.equal(refusal, undefined, "expected the legacy stamp to satisfy the freshness gate, not a refusal");
+
+      const finalContent = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
+      assert.match(finalContent, /Readiness: 9\/10/, "the reviewer's verdict was actually written");
+      // Legacy sections were imported and their headings normalized to nest
+      // under "## Verification (ground truth)" instead of reading as
+      // top-level siblings of it.
+      assert.match(finalContent, /### Completion Checks/);
+      assert.match(finalContent, /### Scope Check/);
+      assert.doesNotMatch(finalContent, /^## Completion Checks$/m);
+      assert.doesNotMatch(finalContent, /^## Scope Check$/m);
+      // The provenance note survived the review write's re-splice — it used
+      // to live as plain text outside every extractable marker and get
+      // silently dropped by reinjectPublishGroundTruthSectionsV1.
+      assert.match(finalContent, /Imported once from the legacy `publish-checks\.md`/);
+      // The legacy file itself is never modified.
+      assert.equal(
+        fs.readFileSync(path.join(folderPath, PUBLISH_CHECKS_FILENAME), "utf8"),
+        legacyContent
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("completeCommitAndPushTask (the composite command): never dispatches a separate auto-publish chain — it commits inline instead", async () => {
     const folderName = `composite-${Math.floor(Math.random() * 1e9)}`;
     const folderPath = path.join(REAL_ROOT, "plans", folderName);

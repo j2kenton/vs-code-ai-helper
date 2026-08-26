@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
+import { appendBlockerSupersession, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { BlockerSupersessionRecordV1, MAX_BLOCKER_SUPERSESSIONS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -267,6 +267,48 @@ void test("appendReviewRejection caps at MAX_REVIEW_REJECTIONS, dropping the old
   assert.equal(updated.reviewRejections?.length, MAX_REVIEW_REJECTIONS);
   assert.equal(updated.reviewRejections?.[0]?.attemptId, "attempt-1", "the single oldest entry must be dropped");
   assert.equal(updated.reviewRejections?.at(-1)?.attemptId, "attempt-new");
+});
+
+// ---------------------------------------------------------------------------
+// appendBlockerSupersession: durable chat-resolved-blocker trail (wf10 item 19)
+// ---------------------------------------------------------------------------
+
+function supersessionEntry(overrides: Partial<BlockerSupersessionRecordV1> = {}): BlockerSupersessionRecordV1 {
+  return {
+    stage: "plan-high-review",
+    blockerDescription: "the owner must approve a complete tie policy",
+    supersededAt: "2026-07-07T00:00:00.000Z",
+    planRelPath: "plan.md",
+    ...overrides,
+  };
+}
+
+void test("appendBlockerSupersession records the resolved blocker without touching reviewRejections or reviewScoreHistory", () => {
+  const progress = { ...makeProgress(), reviewScoreHistory: [historyEntry()] };
+  const updated = appendBlockerSupersession(progress, supersessionEntry());
+  assert.deepEqual(updated.blockerSupersessions, [supersessionEntry()]);
+  assert.deepEqual(updated.reviewScoreHistory, [historyEntry()]);
+  assert.equal(updated.reviewRejections, undefined);
+});
+
+void test("appendBlockerSupersession preserves prior entries in order", () => {
+  const progress = { ...makeProgress(), blockerSupersessions: [supersessionEntry({ planRelPath: "plan-old.md" })] };
+  const updated = appendBlockerSupersession(progress, supersessionEntry({ planRelPath: "plan.md" }));
+  assert.deepEqual(
+    updated.blockerSupersessions?.map((e) => e.planRelPath),
+    ["plan-old.md", "plan.md"]
+  );
+});
+
+void test("appendBlockerSupersession caps at MAX_BLOCKER_SUPERSESSIONS, dropping the oldest first", () => {
+  const existing = Array.from({ length: MAX_BLOCKER_SUPERSESSIONS }, (_, i) =>
+    supersessionEntry({ blockerDescription: `blocker-${i}` })
+  );
+  const progress = { ...makeProgress(), blockerSupersessions: existing };
+  const updated = appendBlockerSupersession(progress, supersessionEntry({ blockerDescription: "blocker-new" }));
+  assert.equal(updated.blockerSupersessions?.length, MAX_BLOCKER_SUPERSESSIONS);
+  assert.equal(updated.blockerSupersessions?.[0]?.blockerDescription, "blocker-1", "the single oldest entry must be dropped");
+  assert.equal(updated.blockerSupersessions?.at(-1)?.blockerDescription, "blocker-new");
 });
 
 // ---------------------------------------------------------------------------

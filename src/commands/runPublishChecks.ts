@@ -9,7 +9,7 @@ import { runCompletionLint, resolvePublishScopeFolder } from "../utils/completio
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
-import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   runTrackedOperation,
   taskOperations,
@@ -94,8 +94,9 @@ export function normalizeRunPublishChecksArg(node: RunPublishChecksArg | undefin
 /**
  * First Publish action: run the completion checks (lint/type/test against the
  * task's Publish verification scope, plus the AI-assisted plan-item
- * verification) and record the result as the Publish-stage report in
- * publish-checks.md. This command only checks and reports — fixing what the
+ * verification) and record the result as the Publish-stage report, spliced
+ * into publish-review.md (the single unified Publish-stage artifact — plan
+ * item 17, step 20). This command only checks and reports — fixing what the
  * report found is the separate second action (runLintingFixes).
  */
 export async function runPublishChecks(
@@ -213,22 +214,26 @@ export async function runPublishChecks(
               // Keep the tree aligned with the persisted lint payload.
               await inventory.refresh();
 
-              // Opens the report these checks just wrote, not the reviewer's
-              // artifact. This used to open publish-review.md and announce
-              // "Report saved" — but the checks only ever upserted a section
-              // partway down that file, so what surfaced was the AI verdict at
-              // the top, from whichever commit the last review ran against.
-              // Observed live 2026-08-11: a fully passing run opened a
-              // "Readiness: 2/10" document listing three blockers that had all
-              // been fixed, and re-running the checks could not change it.
+              // Opens publish-review.md — the single Publish-stage artifact
+              // (plan item 17, step 20). Before the split reversal this used
+              // to open publish-review.md too and announce "Report saved" —
+              // then the checks were moved to a separate publish-checks.md so
+              // the two writers could not clobber each other, which caused a
+              // different failure: a user mistook a 49 KB publish-checks.md
+              // for their real review (observed 2026-08-23). The split is now
+              // reversed — checks upsert their sections directly into
+              // publish-review.md under "## Verification (ground truth)" and
+              // are re-injected after every AI review write, so this can open
+              // the one artifact again without either failure mode returning.
+              const publishReviewFilename = STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME;
               await safeOpenTextDocument(
-                vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME),
-                "Publish checks report"
+                vscode.Uri.joinPath(taskFolderUri, publishReviewFilename),
+                "Publish review"
               );
 
               if (result.passed) {
                 NotificationRouter.showInformation(
-                  `Publish checks passed. Report saved to ${PUBLISH_CHECKS_FILENAME}.`
+                  `Publish checks passed. Report saved to ${publishReviewFilename}.`
                 );
               } else {
                 NotificationRouter.showWarning(

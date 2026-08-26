@@ -109,6 +109,14 @@ const DELIBERATELY_NOT_IN_CHAT_CONTEXT: ReadonlyMap<string, string> = new Map([
     LOW_LEVEL_PLAN_FILENAME,
     "folded into plan-final.md at the implementation stage",
   ],
+  [
+    PUBLISH_CHECKS_FILENAME,
+    "legacy pre-unification artifact, frozen on disk once written: its Completion Checks/Scope " +
+      "Check sections are now spliced directly into publish-review.md (STAGE_ARTIFACT_FILENAMES.publish) " +
+      "and re-read live from there, so this file is never opened directly (plan item 17, step 20) — " +
+      "re-reading it here would surface content stuck at the moment of the artifact-unification " +
+      "upgrade as if it were current",
+  ],
 ]);
 
 function seedFolder(name: string): { folder: string; sentinelFor: (file: string) => string } {
@@ -216,20 +224,23 @@ void describe("chat artifact coverage — every answerable artifact reaches chat
     );
   });
 
-  void it("surfaces the Publish checks report at the Publish stage", async () => {
-    // The regression this file was written for. Before the fix, chat at Publish
-    // saw only publish-review.md — the reviewer's verdict, from whichever commit
-    // it last ran against — and answered questions about the current checks from
-    // it.
+  void it("surfaces the unified publish-review.md, and never the legacy publish-checks.md, at the Publish stage", async () => {
+    // The regression this file was originally written for (chat at Publish
+    // seeing only the reviewer's verdict, stale relative to the checks) was
+    // fixed by moving the checks INTO publish-review.md rather than reading a
+    // second file (plan item 17, step 20's artifact-unification reversal).
+    // publish-checks.md is now frozen legacy — asserting its absence here
+    // guards the opposite regression: re-reading it would surface content
+    // stuck at the moment of the upgrade as if it were the current report.
     const { perStage } = await observeCoverage();
     const publishContext = perStage.get("publish") ?? "";
     assert.ok(
-      publishContext.includes(PUBLISH_CHECKS_FILENAME),
-      "the Publish checks report must be part of Publish-stage chat context"
+      !publishContext.includes(PUBLISH_CHECKS_FILENAME),
+      "the legacy publish-checks.md must not be read directly any more"
     );
     assert.ok(
       publishContext.includes(STAGE_ARTIFACT_FILENAMES.publish ?? "publish-review.md"),
-      "the reviewer's own artifact must still be there too"
+      "the unified publish-review.md artifact — now carrying the checks sections too — must still be there"
     );
   });
 

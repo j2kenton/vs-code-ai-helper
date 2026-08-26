@@ -11,7 +11,9 @@
  * are not part of this boundary").
  */
 import {
+  BlockerSupersessionRecordV1,
   ImplementationTypeCheckFailure,
+  MAX_BLOCKER_SUPERSESSIONS,
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
@@ -504,6 +506,28 @@ export function appendReviewRejection(
   return {
     ...progress,
     reviewRejections: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append one blocker-supersession record (wf10 item 19, see
+ * `TaskProgress.blockerSupersessions`'s doc comment) — the durable trail a
+ * stage gate consults so a blocker a human resolved via stage chat stops
+ * reading as outstanding without requiring a fresh review round. Same
+ * append-and-cap shape as `appendReviewRejection`.
+ */
+export function appendBlockerSupersession(
+  progress: TaskProgress,
+  entry: BlockerSupersessionRecordV1
+): TaskProgress {
+  const supersessions = [...(progress.blockerSupersessions ?? []), entry];
+  const trimmed = supersessions.length > MAX_BLOCKER_SUPERSESSIONS
+    ? supersessions.slice(supersessions.length - MAX_BLOCKER_SUPERSESSIONS)
+    : supersessions;
+  return {
+    ...progress,
+    blockerSupersessions: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

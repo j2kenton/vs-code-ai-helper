@@ -42,6 +42,7 @@ import {
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
 import {
+  collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
   collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
@@ -2361,11 +2362,225 @@ void describe("hasContradictoryNoChecklistChangeClaimV1", () => {
     });
     assert.ok(issue, "a contradictory response must be rejected");
     assert.match(issue, /no-checklist-change/);
-    assert.match(issue, /retroactive plan-item completions/);
+    assert.match(issue, /already ticked in the plan of record/);
   });
 
   void it("does not flag a response with neither marker nor claims", () => {
     assert.equal(describeImplementationSummaryShapeIssue(WELL_FORMED_SUMMARY), undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // wf10 item 12 / plan step 21: three independent providers (jester
+  // 2026-08-22, wf9 runs 062 and 064) converged unprompted on the SAME shape —
+  // the no-checklist-change marker plus per-item "already ticked in a prior
+  // round" notes for items the round only re-verified or extended, never
+  // ticking anything new. That shape is a genuine, accurate report and must
+  // be accepted, not quarantined as if it were round-013's paraphrase-driven
+  // contradiction.
+  // -------------------------------------------------------------------------
+  const CHECKED_PLAN_ITEM = "Fix `getStageStatus` so the current-stage comparison wins";
+  const PLAN_WITH_CHECKED_ITEM = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "# Implementation Checklist",
+    "",
+    `- [x] ${CHECKED_PLAN_ITEM}`,
+    "- [ ] Some other unbuilt step",
+  ].join("\n");
+  /** The actual shape from run 064: marker plus a per-item already-ticked note, no marker on the item itself. */
+  const RUN_064_SHAPED_RESPONSE = [
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "This round fixed a defect the review raised in already-completed work — it did not tick any " +
+      "previously-unbuilt checklist item, so no checkbox state changes.",
+    "",
+    "## Files Changed",
+    "",
+    "- `src/foo.ts` — fixed the defect",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- ${CHECKED_PLAN_ITEM} — done — already ticked in a prior round; this round only extended it`,
+    "",
+    "## Verification",
+    "",
+    "- pnpm run test:unit — pass",
+  ].join("\n");
+
+  void it("is false when every retroactive claim names a plan item already ticked in the plan of record", () => {
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RUN_064_SHAPED_RESPONSE,
+        collectChecklistItemKeysV1(PLAN_WITH_CHECKED_ITEM),
+        new Set(collectCheckedChecklistCountsV1(PLAN_WITH_CHECKED_ITEM).keys())
+      ),
+      false
+    );
+  });
+
+  void it("is still true when a claim names a real plan item that is NOT yet ticked", () => {
+    const planStillUnchecked = PLAN_WITH_CHECKED_ITEM.replace("[x]", "[ ]");
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RUN_064_SHAPED_RESPONSE,
+        collectChecklistItemKeysV1(planStillUnchecked),
+        new Set(collectCheckedChecklistCountsV1(planStillUnchecked).keys())
+      ),
+      true
+    );
+  });
+
+  void it("describeImplementationSummaryShapeIssue accepts the run-064 shape: marker plus per-item already-ticked notes", () => {
+    const issue = describeImplementationSummaryShapeIssue(RUN_064_SHAPED_RESPONSE, {
+      planChecklist: PLAN_WITH_CHECKED_ITEM,
+    });
+    assert.equal(issue, undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // Review-flagged (2026-08-25): matching an already-checked plan item is a
+  // fact about the PLAN, not about what the claim itself says. A bare "done"
+  // note naming an already-ticked item must still self-declare as a status
+  // note (the marker, or "already ticked"/"already checked"/"already
+  // complete" phrasing) WITH evidence — otherwise it is indistinguishable
+  // from an entry wrongly claiming fresh completion of an item that merely
+  // happens to already be ticked.
+  // -------------------------------------------------------------------------
+  const RESPONSE_WITH_UNANNOTATED_DONE_CLAIM = [
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "Nothing new was ticked this round.",
+    "",
+    "## Files Changed",
+    "",
+    "- `src/foo.ts` — fixed the defect",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- ${CHECKED_PLAN_ITEM} — done — completed this round`,
+  ].join("\n");
+
+  void it("is true for a done claim on an already-ticked item that never says the item was already ticked", () => {
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RESPONSE_WITH_UNANNOTATED_DONE_CLAIM,
+        collectChecklistItemKeysV1(PLAN_WITH_CHECKED_ITEM),
+        new Set(collectCheckedChecklistCountsV1(PLAN_WITH_CHECKED_ITEM).keys())
+      ),
+      true
+    );
+  });
+
+  void it("describeImplementationSummaryShapeIssue rejects the unannotated-done shape", () => {
+    const issue = describeImplementationSummaryShapeIssue(RESPONSE_WITH_UNANNOTATED_DONE_CLAIM, {
+      planChecklist: PLAN_WITH_CHECKED_ITEM,
+    });
+    assert.match(issue ?? "", /no-checklist-change/);
+  });
+
+  const RESPONSE_WITH_ANNOTATED_BUT_EMPTY_EVIDENCE = [
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "Nothing new was ticked this round.",
+    "",
+    "## Files Changed",
+    "",
+    "- `src/foo.ts` — fixed the defect",
+    "",
+    "## Plan Item Checklist",
+    "",
+    // Single em-dash: "already ticked" lands inside the STATUS segment
+    // itself (satisfying the annotation check), leaving nothing after a
+    // second em-dash to parse as evidence — the case the marker's own
+    // documented requirement ("with evidence") exists to catch.
+    `- ${CHECKED_PLAN_ITEM} — done, already ticked in a prior round`,
+  ].join("\n");
+
+  void it("is true for an already-ticked annotation with no evidence after it", () => {
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RESPONSE_WITH_ANNOTATED_BUT_EMPTY_EVIDENCE,
+        collectChecklistItemKeysV1(PLAN_WITH_CHECKED_ITEM),
+        new Set(collectCheckedChecklistCountsV1(PLAN_WITH_CHECKED_ITEM).keys())
+      ),
+      true
+    );
+  });
+
+  const RESPONSE_WITH_EXPLICIT_MARKER = [
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "Nothing new was ticked this round.",
+    "",
+    "## Files Changed",
+    "",
+    "- `src/foo.ts` — fixed the defect",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- ${CHECKED_PLAN_ITEM} — done ${RETROACTIVE_TICK_MARKER_V1} — re-verified against app.ts:194`,
+  ].join("\n");
+
+  void it("is false when the explicit retroactive marker is used instead of 'already ticked' prose", () => {
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RESPONSE_WITH_EXPLICIT_MARKER,
+        collectChecklistItemKeysV1(PLAN_WITH_CHECKED_ITEM),
+        new Set(collectCheckedChecklistCountsV1(PLAN_WITH_CHECKED_ITEM).keys())
+      ),
+      false
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Review-flagged (2026-08-25), narrowed bypass: the annotation check used
+  // to scan the ENTIRE raw bullet, including the immutable item text pulled
+  // straight from the plan. A plan item whose own wording happens to quote
+  // RETROACTIVE_TICK_MARKER_V1 or "already ticked"-style phrasing — exactly
+  // what this task's own step 21 checklist item does — let ANY "done" claim
+  // against it read as self-annotated, even with no self-declaration at all
+  // in the claim's own status/evidence fields. Reproduced with the real step
+  // 21 item text below.
+  // -------------------------------------------------------------------------
+  const STEP_21_ITEM_TEXT =
+    "Extend the summary contract to accept `<!-- ensemble:no-checklist-change -->` together with " +
+    "per-item status notes when every referenced checklist item carries an explicit already-ticked " +
+    `\`${RETROACTIVE_TICK_MARKER_V1}\` annotation; a summary declaring no-checklist-change while ` +
+    'claiming a new tick still rejects. Add a contract test using run 064\'s exact shape (marker plus ' +
+    'per-item "already ticked in a prior round" notes) asserting it passes rather than being quarantined.';
+  const PLAN_WITH_STEP_21_ITEM = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "# Implementation Checklist",
+    "",
+    `- [x] ${STEP_21_ITEM_TEXT}`,
+    "- [ ] Some other unbuilt step",
+  ].join("\n");
+  const RESPONSE_CLAIMING_STEP_21_ITEM_UNANNOTATED = [
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "Nothing new was ticked this round.",
+    "",
+    "## Files Changed",
+    "",
+    "- `src/foo.ts` — fixed the defect",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- ${STEP_21_ITEM_TEXT} — done — completed this round`,
+  ].join("\n");
+
+  void it("is true for a done claim on an already-ticked item whose OWN TEXT quotes the annotation marker/phrasing, when the claim's status/evidence self-declare nothing", () => {
+    assert.equal(
+      hasContradictoryNoChecklistChangeClaimV1(
+        RESPONSE_CLAIMING_STEP_21_ITEM_UNANNOTATED,
+        collectChecklistItemKeysV1(PLAN_WITH_STEP_21_ITEM),
+        new Set(collectCheckedChecklistCountsV1(PLAN_WITH_STEP_21_ITEM).keys())
+      ),
+      true
+    );
+  });
+
+  void it("describeImplementationSummaryShapeIssue rejects the item-text-quotes-the-marker bypass shape", () => {
+    const issue = describeImplementationSummaryShapeIssue(RESPONSE_CLAIMING_STEP_21_ITEM_UNANNOTATED, {
+      planChecklist: PLAN_WITH_STEP_21_ITEM,
+    });
+    assert.match(issue ?? "", /no-checklist-change/);
   });
 });
 

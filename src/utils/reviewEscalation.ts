@@ -1,9 +1,22 @@
 import * as vscode from "vscode";
-import { EscalationKind, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
+import {
+  EscalationKind,
+  PLAN_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
+  STAGE_DISPLAY_NAMES,
+  STAGE_ORDER,
+  TaskProgress,
+  TaskStage,
+} from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
 import { normalizePath } from "./taskRoot";
+import { readTextIfExists } from "./fileUtils";
+import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
+import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
+import { postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
+import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
@@ -17,6 +30,438 @@ export interface EscalationChatTarget {
 }
 
 let chatTarget: EscalationChatTarget | undefined;
+
+/**
+ * Item 7b — the data a "plateau" (review-stuck) escalation needs to build a
+ * `WorkflowDecisionV1` instead of a plain chat question naming only the
+ * taxonomy of reasons automation can be stuck (environmental, unverifiable,
+ * spec-defect, needs-toolchain) rather than the actual blocker. Supplied only
+ * by review-stage plateau call sites that have this in hand from the round
+ * that just published (`reviewActions.ts`'s `handleReviewRoutingOutcome`) —
+ * the implementation-side no-progress breaker (a different phenomenon: zero
+ * file changes across rounds, not a review's blocker list) does not have this
+ * shape and keeps using the plain chat-question path below.
+ */
+export interface ReviewPlateauEvidenceV1 {
+  /** The just-published review's raw markdown — consulted only for its
+   * `<!-- progress: N/M -->` marker (see `normalizeReviewEvidenceV1`). */
+  readonly content: string;
+  readonly blockers: readonly ReviewBlocker[];
+  readonly taskFixableCount: number;
+}
+
+function nextStageInOrderV1(stage: TaskStage): TaskStage | undefined {
+  const index = STAGE_ORDER.indexOf(stage);
+  return index === -1 || index === STAGE_ORDER.length - 1 ? undefined : STAGE_ORDER[index + 1];
+}
+
+/**
+ * A backtick-quoted span inside a blocker's own description that looks like a
+ * runnable command (starts with a recognized CLI verb) — e.g. a reviewer
+ * writing `` `npm run check-competition-template-status` `` as part of the
+ * blocker text. When present, naming it is strictly more useful than the
+ * generic "no command in this product can run it" line, and — per the
+ * review-narrowed blocker this exists to fix — that generic line is not even
+ * true for a blocker that names its own remedy command.
+ */
+const COMMAND_LIKE_PREFIX_RE =
+  /^(npm|npx|yarn|pnpm|node|git|python|python3|bash|sh|make|cargo|go|curl|vs-code-ai-helper\.)\b/i;
+
+function extractNamedCommandV1(description: string): string | undefined {
+  const spanRe = /`([^`]+)`/g;
+  let match: RegExpExecArray | null;
+  while ((match = spanRe.exec(description)) !== null) {
+    const candidate = match[1]?.trim();
+    if (candidate && COMMAND_LIKE_PREFIX_RE.test(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+const CLEARING_COMMAND_STOPWORDS_V1 = new Set([
+  "about", "after", "again", "against", "always", "before", "being", "between",
+  "cannot", "could", "every", "having", "however", "never", "other", "record",
+  "recorded", "should", "still", "their", "there", "these", "those", "through",
+  "under", "unless", "until", "which", "while", "with", "would",
+]);
+
+function significantWordsV1(text: string): Set<string> {
+  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return new Set(words.filter((w) => w.length >= 5 && !CLEARING_COMMAND_STOPWORDS_V1.has(w)));
+}
+
+/**
+ * Item 7b review fix (Step 27, 2026-08-25): `extractNamedCommandV1` alone
+ * only sees a command the reviewer happened to quote INSIDE the blocker's
+ * own one-line description. The task's richer evidence — the rest of the
+ * SAME review round's markdown (a "Verified Checks" / "How to verify"
+ * section, a named poll command, etc.) — may name the actual clearing
+ * command for this blocker even when the blocker line itself does not quote
+ * one. Falls back to scanning `reviewContent` line by line for a
+ * command-like backtick span, keeping the one whose own line shares the most
+ * significant vocabulary with the blocker description (at least one
+ * five-plus-letter word in common) — a coarse correlation, not proof, but the
+ * same standard `sharesSignificantOverlapV1` (reconcilePlanChecklist.ts) uses
+ * elsewhere in this codebase for "these two are about the same thing".
+ * Returns `undefined`, exactly as before, when nothing correlates.
+ *
+ * Review-narrowed (2026-08-25): scanning only the current round's review
+ * markdown missed a command the APPROVED PLAN itself names — e.g. a plan's
+ * own "How to verify" step quoting the exact poll command for an external
+ * status this blocker is about. `additionalSources` lets a caller thread in
+ * further markdown documents (currently: `plan.md`, the plan of record) to
+ * search the same way, in the order given, without duplicating this scoring
+ * logic per source. No task/project action-metadata registry exists
+ * elsewhere in this codebase to search beyond these two document sources —
+ * the four stage-chat actions (`STAGE_CHAT_ACTIONS`) are lifecycle
+ * operations (complete stage, set stage, …), not clearing commands for an
+ * external-status or infra blocker, so there is nothing further to add here
+ * without inventing a metadata source that does not exist.
+ */
+function extractCorrelatedCommandV1(
+  description: string,
+  reviewContent: string | undefined,
+  additionalSources: readonly (string | undefined)[] = []
+): string | undefined {
+  const direct = extractNamedCommandV1(description);
+  if (direct) {
+    return direct;
+  }
+  const blockerWords = significantWordsV1(description);
+  if (blockerWords.size === 0) {
+    return undefined;
+  }
+  let best: { command: string; score: number } | undefined;
+  for (const source of [reviewContent, ...additionalSources]) {
+    if (!source) {
+      continue;
+    }
+    for (const line of source.split(/\r?\n/)) {
+      const command = extractNamedCommandV1(line);
+      if (!command) {
+        continue;
+      }
+      const lineWords = significantWordsV1(line);
+      let score = 0;
+      for (const word of blockerWords) {
+        if (lineWords.has(word)) {
+          score += 1;
+        }
+      }
+      if (score > 0 && (!best || score > best.score)) {
+        best = { command, score };
+      }
+    }
+  }
+  return best?.command;
+}
+
+/**
+ * Sub-classifies an `environmental` blocker's actual clearing action from its
+ * OWN description text, instead of assuming every environmental blocker is
+ * an infra/sandbox/OS fix. Review-narrowed blocker `57e9485f-…-1`: that
+ * blanket assumption is false for the plan's own observed cases — an owner
+ * approving a policy (`[architectural] [environmental] the owner must
+ * approve a complete tie policy…`) and a third-party status still pending
+ * (`"Both submitted v3 templates remain PENDING at Meta"`) are both
+ * classified `environmental` (no further automated round can move either
+ * one) but neither is an infrastructure/sandbox/OS defect, and both DO have
+ * a concrete human action, just not a code fix.
+ */
+function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" | "generic" {
+  const OWNER_RE = /\bowners?\b/i;
+  const APPROVAL_WORD_RE = /\b(approv\w*|decid\w*|decision|sign[- ]?off\w*)\b/i;
+  if (OWNER_RE.test(description) && APPROVAL_WORD_RE.test(description)) {
+    return "owner-decision";
+  }
+  const EXTERNAL_STATUS_RE = /\b(pending|awaiting|third[- ]?party|external (service|system|review|api))\b/i;
+  if (EXTERNAL_STATUS_RE.test(description)) {
+    return "external-status";
+  }
+  return "generic";
+}
+
+/**
+ * Item 7b, review-narrowed blocker `-1`: the plateau escalation's "what
+ * clears this" line used to name the union of every reason a blocker can be
+ * non-task-fixable ("a human decision, an external system, or a toolchain
+ * step") regardless of which one actually applies. `BlockerResolver`
+ * (reviewReadiness.ts) already classifies each blocker into exactly one of
+ * these — this derives the concrete clearing action from THAT classification
+ * AND the blocker's own description text (not the resolver class alone,
+ * which the review found conflates an owner-approval or third-party-status
+ * case with a generic infra/sandbox/OS fix), naming an inline command when
+ * the blocker itself quotes one, or (Step 27) elsewhere in the same round's
+ * review markdown when it does not.
+ */
+function describeResolverClearingActionV1(
+  resolver: BlockerResolver,
+  description: string,
+  stageName: string,
+  reviewContent?: string,
+  /** Review-narrowed (Step 27, 2026-08-25): the approved plan (`plan.md`),
+   * searched the same way as `reviewContent` when the blocker itself and the
+   * current review round's markdown name no command — see
+   * `extractCorrelatedCommandV1`'s doc comment. */
+  planContent?: string
+): string {
+  const namedCommand = extractCorrelatedCommandV1(description, reviewContent, [planContent]);
+  switch (resolver) {
+    case "environmental": {
+      const kind = classifyEnvironmentalBlockerV1(description);
+      if (kind === "owner-decision") {
+        return (
+          "an owner decision on the point described above — state it in this task's stage chat (it can record " +
+          `the decision into the plan for you), then use "Keep iterating" to have ${stageName} re-verify.`
+        );
+      }
+      if (kind === "external-status") {
+        return (
+          "a status change at an external system this task does not control — " +
+          (namedCommand
+            ? `run \`${namedCommand}\` to check current status, then `
+            : "check its current status yourself, then ") +
+          `use "Keep iterating" to have ${stageName} re-verify once it changes.`
+        );
+      }
+      return (
+        "an infrastructure, sandbox, or OS-level fix outside this task's code" +
+        (namedCommand ? ` — run \`${namedCommand}\`, then ` : " — no command in this product can run it; address the underlying environment directly, then ") +
+        `use "Keep iterating" to have ${stageName} re-verify.`
+      );
+    }
+    case "unverifiable":
+      return (
+        "evidence the reviewer could not confirm within its own limits — supply what it says it could not see " +
+        (namedCommand ? `(run \`${namedCommand}\`, gather the missing log, etc.) ` : "(run the missing check, gather the missing log, etc.) ") +
+        `yourself, then use "Keep iterating" to have ${stageName} re-verify.`
+      );
+    case "spec-defect":
+      return (
+        'a change to the requirement itself, not the implementation — see "Reconsider the requirement itself" ' +
+        "below; the acceptance criterion as written may not be satisfiable."
+      );
+    case "needs-toolchain":
+      return (
+        "running the project's own build/codegen/toolchain step from outside this task " +
+        (namedCommand ? `(run \`${namedCommand}\`)` : "(e.g. a build or generator command)") +
+        ` — the implementation stage cannot run it; do that yourself, then use "Keep iterating" to have ` +
+        `${stageName} re-verify.`
+      );
+    case "task-fixable":
+      return `another implementation round — use "Keep iterating" below.`;
+  }
+}
+
+/**
+ * Build and post the `reviewPlateauEscalation` decision (item 7b's target
+ * shape): quote the blocker verbatim rather than its category taxonomy, show
+ * the evidence automation is done (taskFixableCount, the progress marker),
+ * recommend exactly one option with the reason it wins here, explain why each
+ * rejected option is wrong in THIS instance, name what would clear the
+ * blocker, and cite any `[narrowed:…]` lineage instead of implying no
+ * iteration has made progress. Modeled on jester's
+ * `check-competition-template-status.ts`, per the task's own worked example.
+ *
+ * Returns whether the decision was actually posted (no extension context
+ * available is the one expected failure mode, mirroring every other
+ * `postWorkflowDecisionV1` call site) — the caller falls back to the plain
+ * chat-question path when this returns false, so an escalation is never
+ * silently dropped just because this richer surface could not be posted.
+ */
+async function postReviewPlateauDecisionV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  reason: string,
+  evidence: ReviewPlateauEvidenceV1,
+  target: { canonicalId: string; taskFolderPath: string; stage: TaskStage; taskName?: string }
+): Promise<boolean> {
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  // Review-flagged (2026-08-25, new architectural blocker): `evidence.blockers`
+  // is always THIS round's own just-published finding (see
+  // `ReviewPlateauEvidenceV1`'s doc comment) — the newest evidence that
+  // exists for this stage. An OLDER `TaskProgress.blockerSupersessions` entry
+  // records that some earlier, now-stale review artifact was resolved via
+  // chat; it must never suppress a fresh round independently re-finding the
+  // identically-worded blocker, since doing so previously let a genuinely
+  // still-live blocker vanish from both this decision and
+  // `reviewScoreHistory` permanently (the caller never persists a blocker
+  // this function filtered out). `filterSupersededBlockersV1` is therefore
+  // not called here — see its doc comment on why fresh review content is
+  // never filtered by a supersession.
+  const normalized = normalizeReviewEvidenceV1(evidence.content, evidence.blockers);
+  const primaryBlocker = normalized.blockers[0];
+  const narrowedRef =
+    normalized.narrowedBlockers.length > 0 && normalized.narrowedBlockers[0]!.lineage?.kind === "narrowed"
+      ? normalized.narrowedBlockers[0]!.lineage.refId
+      : undefined;
+  const narrowedNote =
+    narrowedRef !== undefined
+      ? ` This blocker has narrowed across rounds (declared \`[narrowed:${narrowedRef}]\`) — iteration IS making ` +
+        "progress on it, it has simply not cleared yet."
+      : "";
+  const progressNote =
+    normalized.progress !== null
+      ? `${normalized.progress.complete} of ${normalized.progress.total} plan steps verified.`
+      : "No plan-progress marker was reported for this round.";
+
+  const nextStage = nextStageInOrderV1(stage);
+  const nextStageName = nextStage ? STAGE_DISPLAY_NAMES[nextStage] : undefined;
+  let nextStageHasRun = false;
+  if (nextStage) {
+    const filename = STAGE_ARTIFACT_FILENAMES[nextStage];
+    if (filename) {
+      const nextContent = await readTextIfExists(vscode.Uri.joinPath(folderUri, filename));
+      nextStageHasRun = nextContent !== undefined && nextContent.trim().length > 0;
+    }
+  }
+  const hasSpecDefect = normalized.blockers.some((b) => b.resolver === "spec-defect");
+  const blockerCountLabel = `${normalized.blockers.length} of the remaining ${normalized.blockers.length === 1 ? "blocker" : "blockers"}`;
+  // Review-narrowed (Step 27, 2026-08-25): read the approved plan alongside
+  // the review markdown so `describeResolverClearingActionV1` can also find
+  // a clearing command the PLAN itself names (e.g. a "How to verify" step)
+  // when neither the blocker line nor this round's review content quotes
+  // one — see `extractCorrelatedCommandV1`'s doc comment.
+  const planContentForClearingNote = await readTextIfExists(vscode.Uri.joinPath(folderUri, PLAN_FILENAME));
+  // Item 7b rule 5, "name what would clear the blocker, with the command if
+  // one exists": when something is task-fixable, the clearing action IS
+  // re-running the review (which "Keep iterating" now genuinely does — see
+  // resumeAndRerunReviewV1's doc comment); when nothing is, no command in
+  // this product can clear it, only an action outside the task.
+  const clearingNote =
+    evidence.taskFixableCount > 0
+      ? `Clears via: choose "Keep iterating" below — it resumes the task and re-runs ${stageName} against the ` +
+        `${evidence.taskFixableCount} task-fixable ${evidence.taskFixableCount === 1 ? "blocker" : "blockers"}.`
+      : primaryBlocker
+        ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName, evidence.content, planContentForClearingNote)}`
+        : "Clears via: an action outside this task — no command in this product can resolve it. Once done, " +
+          `"Keep iterating" resumes the task and re-runs ${stageName} to confirm.`;
+
+  const options: WorkflowDecisionOptionV1[] = [
+    ...(nextStage
+      ? [
+          {
+            optionId: "advance",
+            label: `Advance to ${nextStageName}`,
+            consequence: nextStageHasRun
+              ? `Moves the task to ${nextStageName}, which has already run once for this task — this accepts the ` +
+                "current state as good enough to proceed rather than re-reviewing it here."
+              : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
+                `not necessarily re-find this same blocker the way another ${stageName} round would.`,
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.setTaskStage",
+              args: [{ taskFolderPath: folderUri.fsPath, stage: nextStage }],
+            },
+          },
+        ]
+      : []),
+    {
+      optionId: "keepIterating",
+      label: "Keep iterating",
+      consequence:
+        evidence.taskFixableCount > 0
+          ? `Resumes the task and reruns ${stageName} — ${evidence.taskFixableCount} of the ${normalized.blockers.length} ` +
+            "remaining blocker(s) are task-fixable, so another round has real work to act on."
+          : `Resumes the task and reruns ${stageName} — nothing to act on: 0 of the ${normalized.blockers.length} ` +
+            "remaining blocker(s) are task-fixable.",
+      // resumeAndRerunReviewV1, not plain resumeTask: a prior revision
+      // dispatched resumeTask alone (which only clears the pause) while this
+      // consequence text claimed it "reruns" the stage — a review flagged
+      // the button as not doing what it said. This command actually resumes
+      // AND re-dispatches the review, matching the text above.
+      effect: {
+        kind: "command" as const,
+        command: "vs-code-ai-helper.resumeAndRerunReview",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      },
+    },
+    {
+      optionId: "handleMyself",
+      label: "I'll handle it myself",
+      consequence:
+        "Leaves the task paused, exactly like \"Reconsider the requirement itself\" below — nothing is dispatched. " +
+        "Choose this if you disagree the blocker is outside automation's control, or want to make a fix (or a " +
+        "decision only you can make) yourself before resuming.",
+      effect: { kind: "doNothing" },
+    },
+    {
+      optionId: "reconsiderRequirement",
+      label: "Reconsider the requirement itself",
+      consequence: hasSpecDefect
+        ? "Leaves the task paused, exactly like \"I'll handle it myself\" above — nothing is dispatched. At least " +
+          "one remaining blocker here is classified spec-defect — check the plan's non-goals and prior decisions; " +
+          "it may be asking for something no implementation can satisfy as written."
+        : "Leaves the task paused, exactly like \"I'll handle it myself\" above — nothing is dispatched. No " +
+          "remaining blocker this round is classified spec-defect, so there is no specific evidence the " +
+          "requirement itself is unsound in this instance — pick this only if you have reason to believe " +
+          "otherwise despite that.",
+      effect: { kind: "doNothing" },
+    },
+  ];
+
+  const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
+    ? {
+        kind: "option",
+        optionId: "reconsiderRequirement",
+        reasoning:
+          "A remaining blocker this round is classified spec-defect — that is exactly the shape where the " +
+          "requirement, not the implementation, is what needs to change.",
+      }
+    : evidence.taskFixableCount > 0
+      ? {
+          kind: "option",
+          optionId: "keepIterating",
+          reasoning: `${blockerCountLabel} are still task-fixable, so another round has real work to do.`,
+        }
+      : nextStage && !nextStageHasRun
+        ? {
+            kind: "option",
+            optionId: "advance",
+            reasoning:
+              `Every remaining blocker is non-task-fixable and ${nextStageName} hasn't run yet — further ` +
+              `${stageName} rounds will most likely re-find this same blocker, while ${nextStageName} covers ` +
+              "different ground.",
+          }
+        : {
+            kind: "option",
+            optionId: "handleMyself",
+            reasoning:
+              `Every remaining blocker is non-task-fixable${nextStage ? ` and ${nextStageName} has already run` : ""}` +
+              ", so this needs a human decision or action, not more automated iteration.",
+          };
+
+  const decision = await postWorkflowDecisionV1(
+    {
+      decisionKey: "reviewPlateauEscalation",
+      taskCanonicalId: target.canonicalId,
+      stage,
+      whatHappened:
+        `${stageName} can't progress on its own. ` +
+        (primaryBlocker
+          ? `${normalized.blockers.length === 1 ? "One blocker remains" : `${normalized.blockers.length} blockers remain`}` +
+            `, and here is the first one, verbatim:\n\n"${primaryBlocker.description}"${narrowedNote}`
+          : reason),
+      whyUserNeeded:
+        `Automation has done what it can here — ${progressNote} ${evidence.taskFixableCount} of the ` +
+        `${normalized.blockers.length} remaining blocker(s) are task-fixable.`,
+      options,
+      recommendation,
+      evidence: [{ label: "What clears this", detail: clearingNote }],
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail:
+          "This decision is what is holding the task paused — resolving it with \"Advance\" or \"Keep iterating\" " +
+          "resumes or advances the task immediately; \"I'll handle it myself\" and \"Reconsider the requirement " +
+          "itself\" both leave it paused and dispatch nothing.",
+      },
+    },
+    target
+  );
+  return decision !== undefined;
+}
 
 /** Wire the Chat With AI provider so escalations can post a real question
  * there, not just a notification. Call once from extension.ts, mirroring
@@ -64,7 +509,19 @@ export async function escalateReviewToHuman(
   reviewAttemptId: string | undefined,
   progressHint?: Pick<TaskProgress, "displayName">,
   secondOpinionAttempted = false,
-  extraMutation?: (current: TaskProgress) => TaskProgress
+  extraMutation?: (current: TaskProgress) => TaskProgress,
+  /**
+   * Item 7b: when `kind === "plateau"` and the caller has this in hand (a
+   * review-stage plateau, not the implementation-side no-progress breaker —
+   * see {@link ReviewPlateauEvidenceV1}'s doc comment), post the
+   * `reviewPlateauEscalation` `WorkflowDecisionV1` instead of the plain chat
+   * question below. Falls through to the plain question when omitted (every
+   * non-plateau kind, and any plateau call site not yet supplying it) or when
+   * posting the decision itself fails (no extension context available) — an
+   * escalation must never go silent just because the richer surface could
+   * not be posted.
+   */
+  reviewPlateauEvidence?: ReviewPlateauEvidenceV1
 ): Promise<boolean> {
   try {
     let applied = false;
@@ -120,6 +577,29 @@ export async function escalateReviewToHuman(
     });
     if (!applied) {
       return false;
+    }
+
+    // Item 7b: a review-stage plateau with real evidence in hand gets the
+    // WorkflowDecisionV1 rebuild (quoted blocker, taskFixableCount, progress
+    // marker, a single ranked recommendation) instead of the plain chat
+    // question below. Falls through on posting failure (no extension
+    // context) rather than doubling up or going silent.
+    if (kind === "plateau" && reviewPlateauEvidence) {
+      const posted = await postReviewPlateauDecisionV1(
+        folderUri,
+        stage,
+        reason,
+        reviewPlateauEvidence,
+        {
+          canonicalId: normalizePath(folderUri.fsPath),
+          taskFolderPath: folderUri.fsPath,
+          stage,
+          taskName: progressHint?.displayName,
+        }
+      );
+      if (posted) {
+        return true;
+      }
     }
 
     const stageName = STAGE_DISPLAY_NAMES[stage];

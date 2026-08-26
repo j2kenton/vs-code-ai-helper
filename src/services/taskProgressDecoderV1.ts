@@ -25,9 +25,11 @@
  * tables cannot silently drift while the permissive reader still exists.
  */
 import {
+  BlockerSupersessionRecordV1,
   ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
+  MAX_BLOCKER_SUPERSESSIONS,
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
@@ -125,6 +127,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "ownership",
   "createdAt",
   "updatedAt",
+  "progressVersion",
   "implReviewFiles",
   "lintPayload",
   "scheduledRun",
@@ -135,6 +138,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewScoreHistory",
   "reviewRejections",
   "roundOutcomes",
+  "blockerSupersessions",
   "escalation",
   "overriddenEscalations",
   "implementationTypeCheckFailure",
@@ -797,6 +801,50 @@ function validateReviewRejections(
   return undefined;
 }
 
+function validateBlockerSupersessions(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_BLOCKER_SUPERSESSIONS) {
+    return "blockerSupersessions must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "blockerSupersessions entries must be objects";
+    }
+    const allowed = new Set(["stage", "blockerDescription", "supersededAt", "planRelPath", "confirmingMessageAt"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `blockerSupersessions entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "blockerSupersessions entry stage must be a recognized stage";
+    }
+    if (
+      typeof entry["blockerDescription"] !== "string" ||
+      entry["blockerDescription"].length === 0 ||
+      entry["blockerDescription"].length > MAX_ESCALATION_REASON_LENGTH
+    ) {
+      return "blockerSupersessions entry blockerDescription must be a bounded non-empty string";
+    }
+    if (!isIsoTimestamp(entry["supersededAt"])) {
+      return "blockerSupersessions entry supersededAt must be an ISO timestamp";
+    }
+    if (
+      typeof entry["planRelPath"] !== "string" ||
+      entry["planRelPath"].length === 0 ||
+      entry["planRelPath"].length > MAX_PATH_LENGTH
+    ) {
+      return "blockerSupersessions entry planRelPath must be a bounded non-empty string";
+    }
+    if (entry["confirmingMessageAt"] !== undefined && !isIsoTimestamp(entry["confirmingMessageAt"])) {
+      return "blockerSupersessions entry confirmingMessageAt must be an ISO timestamp";
+    }
+  }
+  return undefined;
+}
+
 function validateRoundOutcomes(
   value: unknown,
   family: TaskProgressFamilyV1
@@ -1418,6 +1466,13 @@ export function decodeTaskProgressTextV1(
         draft.updatedAt = value;
         break;
       }
+      case "progressVersion": {
+        if (!isNonNegativeInteger(value)) {
+          return recovery("invalidFieldValue", "progressVersion must be a non-negative integer");
+        }
+        draft.progressVersion = value;
+        break;
+      }
       case "implReviewFiles": {
         if (!Array.isArray(value) || value.length > MAX_IMPL_REVIEW_FILES) {
           return recovery("invalidFieldValue", "implReviewFiles must be a bounded array");
@@ -1600,6 +1655,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.roundOutcomes = value as RoundOutcomeEntryV1[];
+        break;
+      }
+      case "blockerSupersessions": {
+        const error = validateBlockerSupersessions(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.blockerSupersessions = value as BlockerSupersessionRecordV1[];
         break;
       }
       case "escalation": {

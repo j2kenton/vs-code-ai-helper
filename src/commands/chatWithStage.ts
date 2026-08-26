@@ -4,7 +4,6 @@ import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskCon
 import {
   IMPLEMENTATION_SUMMARY_FILENAME,
   PLAN_FILENAME,
-  PUBLISH_CHECKS_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   TaskStage,
@@ -22,13 +21,17 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
 import {
   readTextIfExists,
+  statIfExists,
 } from "../utils/fileUtils";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import {
   computeReviewFreshness,
+  parseReviewBlockers,
   parseReviewedCommitSha,
   REVIEWED_COMMIT_STAGES,
 } from "../utils/reviewReadiness";
+import { filterSupersededBlockersV1 } from "../utils/reviewEvidenceNormalizerV1";
+import { BlockerSupersessionRecordV1, PLAN_REVIEW_STAGES } from "../types/taskProgress";
 import { executeProposedAction } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -44,8 +47,16 @@ import {
   createProductionTaskActionCoordinatorV1,
   getProductionActionConversationOrchestratorV1,
 } from "../actions/productionTaskActionRuntimeV1";
-import { CHAT_SEND_ACTION_KEY_V1, ChatSendActionInputV1, validateChatSendInputV1 } from "../actions/rows/chatSendRowV1";
+import {
+  CHAT_SEND_ACTION_KEY_V1,
+  ChatSendActionInputV1,
+  validateChatSendInputV1,
+  writeMarkdownUpdateV1,
+} from "../actions/rows/chatSendRowV1";
+import { resolveMarkdownUpdateTarget as resolveMarkdownUpdateTargetV1 } from "../utils/chatFileUpdateEnvelope";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -177,7 +188,7 @@ export function buildStageResponsePrompt(
   const artifactsSection = taskArtifacts.trim().length > 0
     ? `\n\nTask's plan and current stage artifact (always included, regardless of open editor tabs):\n${taskArtifacts}`
     : "";
-  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action.\n\nConversation so far:\n${conversation.slice(-12000)}${artifactsSection}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. If you conclude in this conversation that a blocker recorded in this task's current review or plan is resolved by something the user just told you, draft that decision into the relevant file with \`[[UPDATE_FILE:...]]\` as part of saying so, rather than only stating it in your reply, and also end your response with \`[[RESOLVES_BLOCKER]]\` on its own line — this is how the extension knows YOU concluded this specific draft resolves the recorded blocker, rather than guessing from the wording of your edit; include it only when that is genuinely your conclusion, and never for an edit that merely discusses, restates, or promises to resolve the blocker later. Drafting the update is NOT the same as it taking effect: the user must still confirm it in a dialog after this response, outside this conversation turn, so you cannot know here whether it will be accepted, declined, or fail to apply. Until you have actually drafted that update, say "this resolves it once recorded — shall I write it to plan.md?" and do not advise completing this stage or advancing to the next one, since the artifacts on record still show the blocker outstanding — and that restriction still applies in the very same response where you draft the update, since nothing has been written yet at that point either. Only treat the blocker as resolved, and it becomes safe to advise advancing, on a LATER turn once this conversation's own history shows a message beginning "_Updated \`<file>\`._" for that exact update — the sole confirmation the write actually landed. A declined confirmation instead reports "_...was not confirmed; nothing was written._" in this same conversation; if you see that, the blocker is still outstanding, so say so plainly, do not advise advancing, and offer to draft the update again if the user still wants it applied. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action.\n\nConversation so far:\n${conversation.slice(-12000)}${artifactsSection}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
 }
 
 /**
@@ -197,7 +208,23 @@ export function buildStageResponsePrompt(
  */
 export async function readStageArtifactsForChat(
   taskFolderUri: vscode.Uri,
-  targetStage: TaskStage
+  targetStage: TaskStage,
+  /**
+   * wf10 item 19 (review-flagged 2026-08-25, new completion blocker): the
+   * ONLY production consumer of `TaskProgress.blockerSupersessions` for a
+   * plan-review stage — the two consumers that field's own doc comment
+   * claimed (`buildSoleBlockerReconcileGuidanceV1`,
+   * `postReviewPlateauDecisionV1`) never actually match a plan-review-scoped
+   * record: the former only ever iterates `IMPL_REVIEW_STAGES`, and the
+   * latter is deliberately never called with a supersession filter (fresh
+   * round evidence must never be masked — see `filterSupersededBlockersV1`'s
+   * doc comment). Without a real consumer, a human reopening this stage's
+   * chat after confirming a resolving edit would still be shown the review
+   * artifact's raw, unannotated blocker text as if nothing had happened.
+   * Optional so every other caller (and the coverage test) keeps working
+   * unchanged; omit to get the artifact with no annotation.
+   */
+  blockerSupersessions?: readonly BlockerSupersessionRecordV1[]
 ): Promise<string> {
   const sections: string[] = [];
 
@@ -231,6 +258,39 @@ export async function readStageArtifactsForChat(
             "its verdicts describe that commit, not the current workspace.";
         }
       }
+      // wf10 item 19: this artifact's own blocker text is never rewritten
+      // when a human resolves it via chat (item 19 explicitly does not
+      // require a fresh review round) — so, for a plan-review stage with
+      // recorded supersessions, note beneath the raw text which listed
+      // blocker(s) a confirmed `plan.md` edit already resolved. Bound to
+      // THIS artifact's own mtime (`filterSupersededBlockersV1`'s
+      // `reviewAsOfMs`), so a supersession recorded against an OLDER version
+      // of this same file never suppresses a blocker a later, still-current
+      // review round re-asserted.
+      if (PLAN_REVIEW_STAGES.includes(targetStage) && blockerSupersessions?.length) {
+        const stat = await statIfExists(vscode.Uri.joinPath(taskFolderUri, stageFilename));
+        const allBlockers = parseReviewBlockers(stageContent);
+        const stillOutstanding = new Set(
+          filterSupersededBlockersV1(targetStage, allBlockers, blockerSupersessions, stat?.mtime).map(
+            (blocker) => blocker.description.trim()
+          )
+        );
+        const supersededBlockers = allBlockers.filter(
+          (blocker) => !stillOutstanding.has(blocker.description.trim())
+        );
+        for (const blocker of supersededBlockers) {
+          const record = blockerSupersessions.find(
+            (entry) =>
+              entry.stage === targetStage &&
+              entry.blockerDescription.trim() === blocker.description.trim()
+          );
+          section +=
+            `\n\n> ✅ Superseded: the blocker "${blocker.description}" was marked resolved on ` +
+            `${record?.supersededAt ?? "an earlier date"} by a confirmed edit to \`${record?.planRelPath ?? PLAN_FILENAME}\`` +
+            (record?.confirmingMessageAt ? ` (confirmed in the chat exchange at ${record.confirmingMessageAt})` : "") +
+            " — treat it as no longer outstanding unless this file has since been re-reviewed and re-asserts it.";
+        }
+      }
       sections.push(section);
     }
   }
@@ -248,24 +308,15 @@ export async function readStageArtifactsForChat(
     );
   }
 
-  // The Publish checks report, and it regressed exactly the way the paragraph
-  // above describes: before the publish split these sections arrived here
-  // inside publish-review.md, so "why did the checks fail?" was answerable at
-  // the Publish stage. Afterwards chat could only see the review's verdict —
-  // which may be several commits old — and would answer a question about the
-  // current run from a stale one.
-  //
-  // Read unconditionally rather than gated on `targetStage === "publish"`:
-  // readTextIfExists already yields undefined when the file is absent, and a
-  // stage conditional is one more place for the next artifact to be forgotten.
-  const publishChecksContent = await readTextIfExists(
-    vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME)
-  );
-  if (publishChecksContent?.trim()) {
-    sections.push(
-      `### ${PUBLISH_CHECKS_FILENAME} (latest Publish checks report)\n\n${publishChecksContent}`
-    );
-  }
+  // The Publish checks sections used to live in a separate publish-checks.md,
+  // read here as its own block — but that file is now frozen legacy (plan
+  // item 17, step 20): the checks are spliced directly into publish-review.md
+  // under "## Verification (ground truth)", so the `stageFilename` block
+  // above already carries them, current as of this task's latest run, for
+  // `targetStage === "publish"`. Re-reading the legacy file here would only
+  // ever surface content frozen at the moment of the artifact-unification
+  // upgrade, presented as if it were the latest report — the exact stale-
+  // evidence failure this unification exists to eliminate.
 
   return sections.join("\n\n");
 }
@@ -336,6 +387,11 @@ export async function chatWithStage(
 
   const lockKey = task.taskFolderPath;
   let proposedAction: StageChatActionProposal | undefined;
+  let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
+  // The proposing assistant message's own timestamp — the durable pointer to
+  // the confirming chat exchange a supersession record carries (see
+  // `BlockerSupersessionRecordV1.confirmingMessageAt`'s doc comment).
+  let proposedBlockerSupersessionEditAt: string | undefined;
   // Tracks whether the user's message has actually been written to
   // chat-v1.json yet. Persisted only after every deterministic
   // precondition below has passed (plan §5.4/AC-CHAT-TX-02) — a failure
@@ -394,7 +450,11 @@ export async function chatWithStage(
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");
-    const taskArtifacts = await readStageArtifactsForChat(taskFolderUri, targetStage);
+    const taskArtifacts = await readStageArtifactsForChat(
+      taskFolderUri,
+      targetStage,
+      task.progress.blockerSupersessions
+    );
     const prompt = buildStageResponsePrompt(STAGE_DISPLAY_NAMES[targetStage], task.folderName, taskArtifacts,
       await generateContextPack(taskFolderUri, workspaceFolder.uri), message, conversation);
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
@@ -453,7 +513,10 @@ export async function chatWithStage(
       // executing it itself — execution needs vscode.window (a confirmation
       // dialog), unavailable inside that pure promotion path.
       const history = await readChatHistory(task.taskFolderPath, task.canonicalId);
-      proposedAction = [...history].reverse().find((m) => m.role === "assistant")?.proposedStageAction;
+      const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
+      proposedAction = lastAssistant?.proposedStageAction;
+      proposedBlockerSupersessionEdit = lastAssistant?.proposedBlockerSupersessionEdit;
+      proposedBlockerSupersessionEditAt = lastAssistant?.at;
       // Now trigger transcript refresh in chat view.
       await chatViewProvider.open({
         canonicalId: task.canonicalId,
@@ -520,6 +583,16 @@ export async function chatWithStage(
       task.canonicalId,
       targetStage,
       proposedAction
+    );
+  }
+  if (proposedBlockerSupersessionEdit) {
+    await dispatchProposedBlockerSupersessionEditV1(
+      chatViewProvider,
+      task.taskFolderPath,
+      task.canonicalId,
+      targetStage,
+      proposedBlockerSupersessionEdit,
+      proposedBlockerSupersessionEditAt
     );
   }
 }
@@ -590,6 +663,86 @@ export async function dispatchProposedStageActionV1(
 }
 
 /**
+ * wf10 item 19: confirms and applies a chat-drafted plan edit recognized
+ * (`detectBlockerSupersessionCandidateV1`, `actions/rows/chatSendRowV1.ts`)
+ * as resolving this stage's sole recorded review blocker. Mirrors
+ * `dispatchProposedStageActionV1`'s shape — the write is proposed rather
+ * than auto-applied specifically because it needs a `vscode.window`
+ * confirmation dialog naming the exact blocker text it would resolve, which
+ * the pure promotion path that recognized it cannot show.
+ *
+ * @internal exported for testing
+ */
+export async function dispatchProposedBlockerSupersessionEditV1(
+  chatViewProvider: ChatViewProvider,
+  taskFolderPath: string,
+  canonicalId: string,
+  targetStage: TaskStage,
+  proposedEdit: NonNullable<ChatMessage["proposedBlockerSupersessionEdit"]>,
+  /** The proposing assistant message's own `at` timestamp — recorded on the
+   * supersession entry as the durable pointer to the confirming chat
+   * exchange (`BlockerSupersessionRecordV1.confirmingMessageAt`). Absent only
+   * when the caller could not find the proposing message (defense in depth;
+   * should not happen in practice since the proposal is always read back
+   * from the message that just carried it). */
+  confirmingMessageAt?: string
+): Promise<void> {
+  const chatTarget = { canonicalId, taskFolderPath };
+  const targetPath = resolveMarkdownUpdateTargetV1(taskFolderPath, proposedEdit.relPath);
+  if (!targetPath) {
+    await chatViewProvider.append(
+      "assistant",
+      `_Could not apply the drafted update to \`${proposedEdit.relPath}\`: the target is no longer a valid file inside this task's folder._`,
+      targetStage,
+      chatTarget
+    );
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `Apply the drafted update to "${proposedEdit.relPath}"?\n\nThis would resolve the blocker:\n"${proposedEdit.blockerDescription}"\n\n` +
+      "A fresh review is the stronger confirmation, but is not required for this write to land.",
+    { modal: true },
+    "Apply Update"
+  );
+  if (choice !== "Apply Update") {
+    await chatViewProvider.append(
+      "assistant",
+      `_The drafted update to \`${proposedEdit.relPath}\` was not confirmed; nothing was written._`,
+      targetStage,
+      chatTarget
+    );
+    return;
+  }
+  const outcome = await writeMarkdownUpdateV1(taskFolderPath, proposedEdit.relPath, targetPath, proposedEdit.content);
+  if (/^_Updated /.test(outcome)) {
+    // wf10 item 19: record the durable supersession the moment the write
+    // actually lands, not just the confirmation — a declined or failed write
+    // (checked above) must never suppress a stage gate from reading the
+    // blocker as outstanding, since nothing was actually resolved on disk.
+    // See `TaskProgress.blockerSupersessions`'s doc comment for how this
+    // record is read back. Two production consumers as of 2026-08-25:
+    // `readStageArtifactsForChat` (this same module, feeds the chat model's
+    // prompt context) and `computePlanReviewBlockerSupersessionEvidenceV1`
+    // (`reconcilePlanChecklist.ts`, surfaces it as durable evidence in the
+    // reconcile decision panel — a real on-screen surface, not just chat
+    // context). `postReviewPlateauDecisionV1` (`reviewEscalation.ts`)
+    // deliberately never filters, since the evidence it reads is always THIS
+    // round's own just-published, still-fresh finding — see
+    // `filterSupersededBlockersV1`'s doc comment.
+    await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (current) =>
+      appendBlockerSupersession(current, {
+        stage: proposedEdit.reviewStage,
+        blockerDescription: proposedEdit.blockerDescription,
+        supersededAt: new Date().toISOString(),
+        planRelPath: proposedEdit.relPath,
+        ...(confirmingMessageAt ? { confirmingMessageAt } : {}),
+      })
+    );
+  }
+  await chatViewProvider.append("assistant", outcome, targetStage, chatTarget);
+}
+
+/**
  * Drive an explicit Chat Resume of a `chatSend.v1` structured-question interaction.
  */
 export async function resumeChatSendInteractionV1(
@@ -650,9 +803,17 @@ export async function resumeChatSendInteractionV1(
   });
 
   let proposedAction: StageChatActionProposal | undefined;
+  let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
+  // The proposing assistant message's own timestamp — the durable pointer to
+  // the confirming chat exchange a supersession record carries (see
+  // `BlockerSupersessionRecordV1.confirmingMessageAt`'s doc comment).
+  let proposedBlockerSupersessionEditAt: string | undefined;
   if (outcome.kind === "completed") {
     const history = await readChatHistory(ownedTask.taskFolderPath, ownedTask.canonicalId ?? ownedTask.taskFolderPath);
-    proposedAction = [...history].reverse().find((m) => m.role === "assistant")?.proposedStageAction;
+    const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
+    proposedAction = lastAssistant?.proposedStageAction;
+    proposedBlockerSupersessionEdit = lastAssistant?.proposedBlockerSupersessionEdit;
+    proposedBlockerSupersessionEditAt = lastAssistant?.at;
     await chatViewProvider.open({
       canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
       taskFolderPath: ownedTask.taskFolderPath,
@@ -702,6 +863,16 @@ export async function resumeChatSendInteractionV1(
       ownedTask.canonicalId ?? ownedTask.taskFolderPath,
       ownedTask.progress.currentStage,
       proposedAction
+    );
+  }
+  if (proposedBlockerSupersessionEdit) {
+    await dispatchProposedBlockerSupersessionEditV1(
+      chatViewProvider,
+      ownedTask.taskFolderPath,
+      ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+      ownedTask.progress.currentStage,
+      proposedBlockerSupersessionEdit,
+      proposedBlockerSupersessionEditAt
     );
   }
   return { ok: true, settlement };

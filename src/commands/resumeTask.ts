@@ -12,6 +12,7 @@ import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -226,6 +227,57 @@ async function resumeCompletedTask(
 }
 
 /**
+ * Resume a paused task and immediately re-dispatch its stage review — the
+ * `WorkflowDecisionOptionEffectV1` shape only carries one command, and
+ * `runReviewWithAI` itself refuses on a paused task (`reviewActions.ts`'s
+ * `runReviewWithAI`: "This task is paused. Resume it before running a
+ * review."), so a single-command "keep iterating" option cannot resume AND
+ * rerun without a small combined command like this one. Internal-only
+ * (registered here, not exposed in `package.json` contributions) — its sole
+ * caller is `reviewEscalation.ts`'s `postReviewPlateauDecisionV1`, item 7b:
+ * a prior revision of that decision dispatched plain `resumeTask` while
+ * telling the user it "reruns" the stage, which it never did.
+ *
+ * `resumePausedTask` handles (and reports) its own failure modes via
+ * `NotificationRouter`; this only proceeds to the review dispatch when the
+ * task actually reached "active", so a failed/declined resume does not also
+ * throw a confusing "task is paused" review-side message on top of whatever
+ * resumePausedTask already told the user.
+ */
+export async function resumeAndRerunReviewV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: ResumeTaskArg
+): Promise<void> {
+  // Resolved BEFORE the resume, from the same (possibly-cached) `inventory`
+  // resumePausedTask itself resolves against — this is the target folder,
+  // not a status check, so cache staleness here is irrelevant.
+  const resolverArg = normalizeResumeTaskArg(explicitArg);
+  const target = await resolveTaskContext(
+    inventory,
+    resolverArg,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!target) {
+    return;
+  }
+  await resumePausedTask(inventory, currentTaskStore, explicitArg);
+  // Re-read `task-progress.json` straight off disk rather than asking
+  // `inventory`/`resolveTaskContext` again: `inventory` is an in-memory cache
+  // that is not guaranteed to reflect the write `resumePausedTask` (via
+  // `activateTask`) just made, and reading it a second time risks seeing the
+  // pre-resume "paused" snapshot and silently skipping the review dispatch.
+  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  if (!reread.ok || reread.decoded.progress.status === "paused") {
+    return;
+  }
+  await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+    taskFolderPath: target.taskFolderPath,
+  });
+}
+
+/**
  * Register the resumeTask command
  */
 export function registerResumeTaskCommand(
@@ -239,4 +291,11 @@ export function registerResumeTaskCommand(
       resumePausedTask(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(disposable);
+
+  const resumeAndRerunReview = vscode.commands.registerCommand(
+    "vs-code-ai-helper.resumeAndRerunReview",
+    (arg?: ResumeTaskArg) =>
+      resumeAndRerunReviewV1(inventory, currentTaskStore, arg)
+  );
+  context.subscriptions.push(resumeAndRerunReview);
 }

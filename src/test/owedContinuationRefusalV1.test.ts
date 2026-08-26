@@ -14,6 +14,7 @@
 import * as assert from "node:assert/strict";
 import { afterEach, before, after, describe, it } from "node:test";
 import * as vscode from "vscode";
+import * as path from "path";
 
 import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
 import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 } from "../types/taskProgress";
@@ -363,5 +364,287 @@ void describe("showTaskBusyWarning — reads a real implRecovery record and surf
     } finally {
       taskOperations.end(handle);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wf10 item 11's release-triggered retry: a busy refusal for an owed
+// continuation still `"pending"` (not yet claimed by a running round) must
+// re-dispatch the continuation the moment the blocking operation
+// deregisters, instead of leaving it to sit until the 10-minute
+// RECOVERY_TRANSITION_LEASE_MS sweep reclaims it. Live incident (2026-08-21,
+// wf9): the in-process hand-off lost a race against a still-finishing
+// sibling operation (Fast Forward Review) on the same task, which
+// deregistered a fraction of a second later with nothing listening for it.
+// ---------------------------------------------------------------------------
+void describe("showTaskBusyWarning — release-triggered retry for an owed continuation (wf10 item 11)", () => {
+  const workspace = vscode.workspace as unknown as {
+    fs: {
+      readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+      createDirectory: (uri: vscode.Uri) => Promise<void>;
+      readDirectory: (uri: vscode.Uri) => Promise<[string, number][]>;
+      writeFile: (uri: vscode.Uri, content: Uint8Array) => Promise<void>;
+    };
+  };
+  let originalReadFile: typeof workspace.fs.readFile;
+  let originalCreateDirectory: typeof workspace.fs.createDirectory;
+  let originalReadDirectory: typeof workspace.fs.readDirectory;
+  let originalWriteFile: typeof workspace.fs.writeFile;
+  let originalExecuteCommand: typeof vscode.commands.executeCommand;
+
+  before(() => {
+    originalReadFile = workspace.fs.readFile;
+    originalCreateDirectory = workspace.fs.createDirectory;
+    originalReadDirectory = workspace.fs.readDirectory;
+    originalWriteFile = workspace.fs.writeFile;
+    originalExecuteCommand = vscode.commands.executeCommand;
+  });
+
+  after(() => {
+    workspace.fs.readFile = originalReadFile;
+    workspace.fs.createDirectory = originalCreateDirectory;
+    workspace.fs.readDirectory = originalReadDirectory;
+    workspace.fs.writeFile = originalWriteFile;
+    vscode.commands.executeCommand = originalExecuteCommand;
+  });
+
+  afterEach(() => {
+    deactivateNotificationRouter();
+    workspace.fs.readFile = originalReadFile;
+    workspace.fs.createDirectory = originalCreateDirectory;
+    workspace.fs.readDirectory = originalReadDirectory;
+    workspace.fs.writeFile = originalWriteFile;
+    vscode.commands.executeCommand = originalExecuteCommand;
+  });
+
+  function uniqueFolder(label: string): vscode.Uri {
+    return vscode.Uri.file(`/tasks/${label}-${Math.random().toString(36).slice(2)}`);
+  }
+
+  function stubProgressFor(folder: vscode.Uri, progress: Record<string, unknown>): void {
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+      if (uri.fsPath === vscode.Uri.joinPath(folder, "task-progress.json").fsPath) {
+        return Promise.resolve(new TextEncoder().encode(JSON.stringify(progress)));
+      }
+      return Promise.reject(new Error(`ENOENT: ${uri.fsPath}`));
+    };
+    workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+    workspace.fs.readDirectory = (): Promise<[string, number][]> => Promise.reject(new Error("ENOENT"));
+    workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+  }
+
+  function stubExecuteCommand(): { commandId: string; args: unknown[] }[] {
+    const executed: { commandId: string; args: unknown[] }[] = [];
+    vscode.commands.executeCommand = ((commandId: string, ...args: unknown[]) => {
+      executed.push({ commandId, args });
+      return Promise.resolve(undefined);
+    }) as unknown as typeof vscode.commands.executeCommand;
+    return executed;
+  }
+
+  /** onDidEnd fires synchronously, but the retry's own re-check read is
+   * async — flush a couple of microtask/macrotask turns before asserting. */
+  async function flush(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  void it("re-dispatches the continuation once the blocking operation deregisters, instead of waiting for the lease sweep", async () => {
+    const folder = uniqueFolder("owed-retry-fires");
+    stubProgressFor(folder, {
+      taskFolder: path.basename(folder.fsPath),
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-08-25T00:00:00.000Z",
+      updatedAt: "2026-08-25T00:00:00.000Z",
+      pendingImplReviewFiles: ["src/foo.ts"],
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-retry-1",
+        reason: "the provider's final response was cut short",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-08-25T00:00:00.000Z",
+        leaseUntil: "2026-08-25T00:10:00.000Z",
+      },
+    });
+    initNotificationRouter(new RecordingSurface());
+    const executed = stubExecuteCommand();
+
+    // A sibling operation (e.g. Fast Forward Review) still holds the task's
+    // exclusive lock at the moment the continuation's own dispatch refuses.
+    const blocker = taskOperations.begin(folder.fsPath, { label: "Fast Forward Review" });
+    assert.ok(blocker);
+
+    await showTaskBusyWarning(folder.fsPath);
+    assert.equal(executed.length, 0, "must not re-dispatch while the blocker is still held");
+
+    taskOperations.end(blocker); // The sibling operation finishes a moment later.
+    await flush();
+
+    assert.equal(executed.length, 1, `expected exactly one re-dispatch; got: ${JSON.stringify(executed)}`);
+    assert.equal(executed[0]?.commandId, "vs-code-ai-helper.runImplementationWithAI");
+    assert.deepEqual(executed[0]?.args, [{ taskFolderPath: folder.fsPath, automationDispatch: true }]);
+  });
+
+  void it("does not arm a retry when the continuation is already \"dispatched\" (a round is already running it)", async () => {
+    const folder = uniqueFolder("owed-retry-skips-dispatched");
+    stubProgressFor(folder, {
+      taskFolder: path.basename(folder.fsPath),
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-08-25T00:00:00.000Z",
+      updatedAt: "2026-08-25T00:00:00.000Z",
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-retry-2",
+        reason: "the provider's final response was cut short",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "dispatched",
+        at: "2026-08-25T00:00:00.000Z",
+        leaseUntil: "2026-08-25T00:10:00.000Z",
+      },
+    });
+    initNotificationRouter(new RecordingSurface());
+    const executed = stubExecuteCommand();
+
+    const blocker = taskOperations.begin(folder.fsPath, { label: "Fast Forward Review" });
+    assert.ok(blocker);
+    await showTaskBusyWarning(folder.fsPath);
+    taskOperations.end(blocker);
+    await flush();
+
+    assert.equal(executed.length, 0, "a dispatched (already-running) continuation must not be re-fired");
+  });
+
+  void it("does not arm a retry once the continuation budget is exhausted", async () => {
+    const folder = uniqueFolder("owed-retry-skips-budget-exhausted");
+    stubProgressFor(folder, {
+      taskFolder: path.basename(folder.fsPath),
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-08-25T00:00:00.000Z",
+      updatedAt: "2026-08-25T00:00:00.000Z",
+      incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-retry-3",
+        reason: "the provider's final response was cut short",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-08-25T00:00:00.000Z",
+      },
+    });
+    initNotificationRouter(new RecordingSurface());
+    const executed = stubExecuteCommand();
+
+    const blocker = taskOperations.begin(folder.fsPath, { label: "Fast Forward Review" });
+    assert.ok(blocker);
+    await showTaskBusyWarning(folder.fsPath);
+    taskOperations.end(blocker);
+    await flush();
+
+    assert.equal(executed.length, 0, "an exhausted-budget continuation needs a human decision, not an automatic retry");
+  });
+
+  void it("re-dispatches even when the blocking operation deregisters DURING the progress read, before arming (no lost wakeup)", async () => {
+    // Reproduces the actual 2026-08-21 race precisely: every other test in
+    // this block holds the blocker until AFTER showTaskBusyWarning returns,
+    // which never exercises the gap between the busy check's async progress
+    // read starting and armReleaseTriggeredContinuationRetryV1 subscribing.
+    // Here the blocking operation ends INSIDE the readFile stub — i.e. while
+    // showTaskBusyWarning is still awaiting the read that happens before
+    // arming — so by the time arming runs, the release already happened and
+    // no future onDidEnd for it will ever fire.
+    const folder = uniqueFolder("owed-retry-lost-wakeup");
+    const blocker = taskOperations.begin(folder.fsPath, { label: "Fast Forward Review" });
+    assert.ok(blocker);
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+      if (uri.fsPath === vscode.Uri.joinPath(folder, "task-progress.json").fsPath) {
+        taskOperations.end(blocker);
+        return Promise.resolve(
+          new TextEncoder().encode(
+            JSON.stringify({
+              taskFolder: path.basename(folder.fsPath),
+              currentStage: "impl-high-review",
+              status: "active",
+              createdAt: "2026-08-25T00:00:00.000Z",
+              updatedAt: "2026-08-25T00:00:00.000Z",
+              implRecovery: {
+                sourceAttemptId: "impl-recovery-retry-6",
+                reason: "the provider's final response was cut short",
+                trigger: "roundIncomplete",
+                mode: "unconstrained",
+                dispatch: "pending",
+                at: "2026-08-25T00:00:00.000Z",
+                leaseUntil: "2026-08-25T00:10:00.000Z",
+              },
+            })
+          )
+        );
+      }
+      return Promise.reject(new Error(`ENOENT: ${uri.fsPath}`));
+    };
+    workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+    workspace.fs.readDirectory = (): Promise<[string, number][]> => Promise.reject(new Error("ENOENT"));
+    workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+    initNotificationRouter(new RecordingSurface());
+    const executed = stubExecuteCommand();
+
+    await showTaskBusyWarning(folder.fsPath);
+    await flush();
+
+    assert.equal(
+      executed.length,
+      1,
+      `expected exactly one re-dispatch even though the release preceded arming; got: ${JSON.stringify(executed)}`
+    );
+    assert.equal(executed[0]?.commandId, "vs-code-ai-helper.runImplementationWithAI");
+  });
+
+  void it("re-checks at fire time and skips the re-dispatch if the continuation was claimed in the meantime", async () => {
+    const folder = uniqueFolder("owed-retry-rechecks-at-fire-time");
+    let dispatchState: "pending" | "dispatched" = "pending";
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+      if (uri.fsPath === vscode.Uri.joinPath(folder, "task-progress.json").fsPath) {
+        return Promise.resolve(
+          new TextEncoder().encode(
+            JSON.stringify({
+              taskFolder: path.basename(folder.fsPath),
+              currentStage: "impl-high-review",
+              status: "active",
+              createdAt: "2026-08-25T00:00:00.000Z",
+              updatedAt: "2026-08-25T00:00:00.000Z",
+              implRecovery: {
+                sourceAttemptId: "impl-recovery-retry-4",
+                reason: "the provider's final response was cut short",
+                trigger: "roundIncomplete",
+                mode: "unconstrained",
+                dispatch: dispatchState,
+                at: "2026-08-25T00:00:00.000Z",
+                leaseUntil: "2026-08-25T00:10:00.000Z",
+              },
+            })
+          )
+        );
+      }
+      return Promise.reject(new Error(`ENOENT: ${uri.fsPath}`));
+    };
+    workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+    workspace.fs.readDirectory = (): Promise<[string, number][]> => Promise.reject(new Error("ENOENT"));
+    workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+    initNotificationRouter(new RecordingSurface());
+    const executed = stubExecuteCommand();
+
+    const blocker = taskOperations.begin(folder.fsPath, { label: "Fast Forward Review" });
+    assert.ok(blocker);
+    await showTaskBusyWarning(folder.fsPath);
+    // Something else (e.g. the lease sweep) claims the continuation before
+    // this listener's blocker actually releases.
+    dispatchState = "dispatched";
+    taskOperations.end(blocker);
+    await flush();
+
+    assert.equal(executed.length, 0, "a continuation claimed before the retry fires must not be redundantly re-run");
   });
 });

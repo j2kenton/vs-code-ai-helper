@@ -123,6 +123,7 @@ export async function renameTask(
         ...current,
         displayName: name.trim(),
         nameIsDefault: false,
+        updatedAt: new Date().toISOString(),
       }));
       await inventory.refresh();
       op.report(`renamed to "${name.trim()}"`);
@@ -455,6 +456,7 @@ export async function renameTaskWithAI(
           displayName: finalName,
           // The explicit Rename Task with AI click confirms the name.
           nameIsDefault: false,
+          updatedAt: new Date().toISOString(),
         }));
         await inventory.refresh();
         op.report(`renamed to "${finalName}"`);

@@ -14,6 +14,7 @@ import {
   snapshotStageResponseState,
 } from "./stageResponseScope";
 import {
+  ensureVerificationHeadingV1,
   importLegacyPublishChecksIfAbsentV1,
   invalidatePublishChecksFreshnessStamp,
   withPublishChecksReportLockV1,
@@ -265,7 +266,10 @@ const SCOPE_CHECK_SECTION_END = "<!-- scope-check:end -->";
  * @internal exported for testing
  */
 export function renderScopeCheckSection(result: PublishScopeCheckResult): string {
-  const lines: string[] = [SCOPE_CHECK_SECTION_START, "## Scope Check", ""];
+  // "###", not "##": nests as a child of the "## Verification (ground
+  // truth)" wrapper heading (publishChecksFreshness.ts), matching Completion
+  // Checks (plan item 17, step 20).
+  const lines: string[] = [SCOPE_CHECK_SECTION_START, "### Scope Check", ""];
   lines.push(`- Last run: ${result.runAt}`, "");
   lines.push(
     "_Report-only — this never blocks Publish, the same as a failing check elsewhere on this " +
@@ -289,7 +293,7 @@ export function renderScopeCheckSection(result: PublishScopeCheckResult): string
   if (result.unplannedFiles.length === 0) {
     lines.push("", "No files the plan doesn't mention.");
   } else {
-    lines.push("", "### Files the plan doesn't mention", "");
+    lines.push("", "#### Files the plan doesn't mention", "");
     for (const file of result.unplannedFiles) {
       lines.push(`- \`${file}\``);
     }
@@ -370,6 +374,7 @@ export async function upsertScopeCheckReportV1(
     // One-time bounded import (step 20(c)) — see the matching comment in
     // upsertCompletionChecksReportV1.
     existing = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
+    existing = ensureVerificationHeadingV1(existing);
 
     const section = renderScopeCheckSection(result);
     const merged = mergeScopeCheckSection(existing, section);

@@ -69,6 +69,7 @@ export async function pinTask(
       await patchTaskProgressStrictV1(vscode.Uri.file(oldest.taskFolderPath), (current) => ({
         ...current,
         pinnedAt: undefined,
+        updatedAt: new Date().toISOString(),
       }));
       NotificationRouter.showInformation(
         `Pin limit of ${MAX_PINNED_TASKS} reached — unpinned "${oldest.progress.displayName ?? oldest.folderName}".`
@@ -79,6 +80,7 @@ export async function pinTask(
   await patchTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
     ...current,
     pinnedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   }));
   await inventory.refresh();
 }
@@ -106,6 +108,7 @@ export async function unpinTask(
   await patchTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
     ...current,
     pinnedAt: undefined,
+    updatedAt: new Date().toISOString(),
   }));
   await inventory.refresh();
 }

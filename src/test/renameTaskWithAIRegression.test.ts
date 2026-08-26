@@ -379,6 +379,11 @@ void describe("renameTaskWithAI (command-level, real coordinator + fake transpor
         const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
         assert.strictEqual(persisted?.displayName, "Add background export queue for large datasets");
         assert.strictEqual(transportCallCount(), 1);
+        assert.notStrictEqual(
+          persisted?.updatedAt,
+          "2026-01-01T00:00:00.000Z",
+          "an AI rename is a user-visible change and must bump updatedAt (wf10 item 8)"
+        );
       }
     );
   });

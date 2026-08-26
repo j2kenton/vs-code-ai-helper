@@ -24,7 +24,10 @@ import { extractCompletionChecksSectionV1, mergeCompletionChecksSection } from "
 import { extractScopeCheckSectionV1, mergeScopeCheckSection } from "../../utils/publishScopeCheck";
 import {
   extractPublishChecksFreshnessStampSectionV1,
+  extractVerificationHeadingSectionV1,
+  importLegacyPublishChecksIfAbsentV1,
   mergePublishChecksFreshnessStamp,
+  mergeVerificationHeadingSection,
 } from "../../utils/publishChecksFreshness";
 import { resolveHeadCommitSha } from "../../utils/gitRepoInfo";
 
@@ -217,14 +220,32 @@ const PUBLISH_REVIEW_READ_BOUND_BYTES = 4 * 1024 * 1024;
 async function reinjectPublishGroundTruthSectionsV1(
   fileStore: ReturnType<typeof getWorkflowFileStoreV1>,
   targetLocator: { readonly rootId: string; readonly relativePath: string },
-  markdown: string
+  markdown: string,
+  taskFolderUri: vscode.Uri
 ): Promise<string> {
   const existingRead = await fileStore.readFileBounded(targetLocator, PUBLISH_REVIEW_READ_BOUND_BYTES);
   if (existingRead.kind !== "ok") {
     return markdown;
   }
-  const existingContent = existingRead.value.bytes.toString("utf8");
+  let existingContent = existingRead.value.bytes.toString("utf8");
+  // Both-files migration, review-touch case (plan item 17, step 20(c)): a
+  // task that already has publish-review.md but never got the embedded
+  // verification sections (e.g. it was created by an older build before this
+  // import path existed) gets the same bounded, one-time legacy import here,
+  // lazily, on the next review write — rather than only on a checks run.
+  // Idempotent via importLegacyPublishChecksIfAbsentV1's own durable marker;
+  // a no-op when there is no legacy publish-checks.md, or it was already
+  // imported.
+  existingContent = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existingContent);
   let merged = markdown;
+  // Heading first: mergeVerificationHeadingSection appends at the end when
+  // its marker is absent from `merged` (which, at this point, is just the
+  // fresh AI markdown), so it lands ahead of the sections merged below —
+  // matching the order a checks run itself produces.
+  const verificationHeading = extractVerificationHeadingSectionV1(existingContent);
+  if (verificationHeading) {
+    merged = mergeVerificationHeadingSection(merged, verificationHeading);
+  }
   const completionChecks = extractCompletionChecksSectionV1(existingContent);
   if (completionChecks) {
     merged = mergeCompletionChecksSection(merged, completionChecks);
@@ -248,6 +269,7 @@ async function promoteReviewContentV1(
     throw new ReviewPromotionErrorV1("review.v1 received a non-markdown-artifact completed content");
   }
   const input = context.validatedInput as ReviewActionInputV1;
+  let publishTaskFolderUri: vscode.Uri | undefined;
   if (context.stage === "publish") {
     if (!input.publishFreshnessGuard) {
       throw new ReviewPromotionErrorV1(
@@ -255,6 +277,7 @@ async function promoteReviewContentV1(
       );
     }
     await revalidatePublishFreshnessOrThrowV1(input.publishFreshnessGuard);
+    publishTaskFolderUri = vscode.Uri.file(input.publishFreshnessGuard.taskFolderPath);
   }
   const fileStore = getWorkflowFileStoreV1();
   // Review freshness, write time: a review carrying a reviewed-commit marker
@@ -281,8 +304,13 @@ async function promoteReviewContentV1(
   // whatever is currently on disk back in, since this write otherwise
   // replaces the whole file with just the reviewer's prose.
   const markdown =
-    context.stage === "publish"
-      ? await reinjectPublishGroundTruthSectionsV1(fileStore, input.targetLocator, attributedMarkdown)
+    context.stage === "publish" && publishTaskFolderUri
+      ? await reinjectPublishGroundTruthSectionsV1(
+          fileStore,
+          input.targetLocator,
+          attributedMarkdown,
+          publishTaskFolderUri
+        )
       : attributedMarkdown;
   const bytes = Buffer.from(markdown, "utf8");
   const result =

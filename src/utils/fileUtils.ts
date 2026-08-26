@@ -1,4 +1,7 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
+import { randomBytes } from "crypto";
 import { PLAN_FILENAME } from "../types/taskProgress";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
 import { NotificationRouter } from "./notificationRouter";
@@ -58,6 +61,27 @@ function findOpenDocument(fileUri: vscode.Uri): vscode.TextDocument | undefined 
 }
 
 /**
+ * Thrown by {@link writeTextFile} when `options.guardVersion` was supplied
+ * and, immediately after `applyEdit` resolved, the open document's version
+ * had advanced by more than this write's own edit accounts for — i.e. a
+ * concurrent edit (a keystroke, another extension, etc.) landed during the
+ * `applyEdit` IPC round-trip. `writeTextFileIfUnchangedV1` catches this and
+ * refuses the write (returns `false`) instead of calling `document.save()`,
+ * so the race is detected and the write is refused rather than the
+ * already-applied full-buffer replace being silently persisted over
+ * whatever the concurrent edit contributed. See {@link
+ * conditionalWriteOwnSaveInFlight}'s doc comment for the residual this does
+ * NOT close: VS Code's public API has no version-conditional `applyEdit`, so
+ * this cannot prevent the buffer mutation itself, only stop it reaching disk.
+ */
+export class ConcurrentEditDuringApplyError extends Error {
+  constructor(fileUri: vscode.Uri) {
+    super(`A concurrent edit landed in ${fileUri.fsPath} while this write was applying.`);
+    this.name = "ConcurrentEditDuringApplyError";
+  }
+}
+
+/**
  * Read a text file's content, preferring an open editor buffer so unsaved
  * changes are included.
  */
@@ -110,11 +134,29 @@ export async function statIfExists(
  * backup decision for this write (e.g. conditionally, or not at all) —
  * otherwise this unconditional backup runs regardless and can clobber one
  * that decision intentionally skipped.
+ *
+ * `onBeforeSave` is an internal seam for {@link writeTextFileIfUnchangedV1}:
+ * called synchronously after the edit has landed in the open buffer but
+ * immediately before `document.save()` — i.e. bracketing only the one call
+ * that can actually trigger `onWillSaveTextDocument`, not the preceding
+ * `applyEdit` await. Never pass this from other call sites.
+ *
+ * `guardVersion` is another internal seam for {@link
+ * writeTextFileIfUnchangedV1}: the open document's `.version` at the moment
+ * its content was last validated against `expectedContent`. If, immediately
+ * after `applyEdit` resolves, the document's version has advanced by more
+ * than this write's own edit accounts for, a concurrent edit landed during
+ * the `applyEdit` await and {@link ConcurrentEditDuringApplyError} is thrown
+ * instead of calling `document.save()` — converting a silently-persisted
+ * lost update into a detected, refused write, the same "detect and refuse"
+ * idiom used everywhere else in this file. Never pass this from other call
+ * sites; there is nothing to validate a version against outside a
+ * conditional write.
  */
 export async function writeTextFile(
   fileUri: vscode.Uri,
   content: string,
-  options: { skipBackup?: boolean } = {}
+  options: { skipBackup?: boolean; onBeforeSave?: () => void; guardVersion?: number } = {}
 ): Promise<void> {
   if (!options.skipBackup) {
     await backupArtifactBeforeWrite(fileUri);
@@ -141,10 +183,434 @@ export async function writeTextFile(
   }
 
   const updatedDoc = findOpenDocument(fileUri) ?? openDoc;
+  if (options.guardVersion !== undefined && typeof updatedDoc.version === "number") {
+    // A clean single edit from this call advances the version by exactly 1.
+    // Anything more means a concurrent edit's own version bump landed in the
+    // applyEdit window too — refuse before this write can persist over it.
+    if (updatedDoc.version > options.guardVersion + 1) {
+      throw new ConcurrentEditDuringApplyError(fileUri);
+    }
+  }
+  options.onBeforeSave?.();
   const saved = await updatedDoc.save();
   if (!saved) {
     throw new Error(`Failed to save ${fileUri.fsPath}.`);
   }
+}
+
+/**
+ * Per-uri FIFO chain backing {@link writeTextFileIfUnchangedV1}: each new
+ * call attaches after whatever the previous call for the same uri was doing,
+ * so two overlapping callers can never interleave their own
+ * read-compare-write — the second one's read always happens after the
+ * first's write has already landed (or been refused).
+ *
+ * Also consulted by {@link registerConditionalWriteSaveGuardV1}: while an
+ * entry is present for a uri, that uri has an in-flight conditional write,
+ * and an editor save for the same uri is deferred until it resolves rather
+ * than being allowed to race it.
+ */
+const pendingConditionalWrites = new Map<string, Promise<unknown>>();
+
+/**
+ * Uris whose in-flight conditional write is, right now, between its own
+ * `applyEdit` landing and its own `document.save()` resolving, for the
+ * open-editor branch below. Consulted by
+ * {@link registerConditionalWriteSaveGuardV1} to tell that save apart from a
+ * genuinely separate editor save landing at the same moment: without this,
+ * the guard would look up the uri in `pendingConditionalWrites`, find the
+ * very write whose own `save()` is what triggered the `onWillSaveTextDocument`
+ * event, and `event.waitUntil()` that write's promise — which cannot resolve
+ * until this same `save()` call resolves, an immediate, permanent deadlock
+ * (review-flagged 2026-08-25, architectural blocker on the fifth pass). A
+ * save for this uri while it is a member of this set is the conditional
+ * write landing, not a race with it, so the guard lets it proceed untouched.
+ *
+ * Narrowing (sixth review pass, 2026-08-25, same blocker, "new architectural
+ * blocker" — the exemption was URI-wide for the entire `writeTextFile` call,
+ * including the `applyEdit` await, so a will-save this write's own code never
+ * triggers could still be waved through during that window instead of being
+ * correctly deferred). The marker is now set via `writeTextFile`'s
+ * `onBeforeSave` hook — only once `applyEdit` has already landed and
+ * `.save()` is the very next call — not for the whole open-editor branch, so
+ * `applyEdit`'s async gap is no longer inside the exemption window at all.
+ *
+ * This is still a presence check keyed by uri, not by the specific event
+ * that triggered it — VS Code's public API gives no way to correlate a
+ * `TextDocumentWillSaveEvent` back to the exact `.save()` call that raised
+ * it, and no version-based cross-check can safely replace the presence check
+ * here: doing so would risk the corresponding `false` branch falling through
+ * to `event.waitUntil()` on THIS write's own still-pending promise whenever a
+ * version mismatch occurred, reopening the exact deadlock this set exists to
+ * close. Because both landings persist the same already-applied buffer
+ * content, a save for this uri while it's in this set is never a lost
+ * update, even in the residual case of a second, genuinely separate save
+ * request arriving in the same narrow `.save()` window. What this narrowing
+ * does NOT close — and no in-process mechanism can, without VS Code exposing
+ * a version-conditional edit/save API — is a keystroke landing during the
+ * `applyEdit` await itself: `writeTextFile` replaces the full buffer range
+ * captured before that await, so a concurrent edit in that specific gap
+ * cannot be made to survive in the buffer. That gap is unrelated to and
+ * unaffected by this set; for the {@link writeTextFileIfUnchangedV1} caller
+ * specifically it is now DETECTED (via `writeTextFile`'s `guardVersion`
+ * option, seventh review pass) and the write refused before `.save()`
+ * persists it, rather than the buffer state silently reaching disk — see
+ * {@link ConcurrentEditDuringApplyError}. A caller of `writeTextFile`
+ * directly, without `guardVersion`, does not get that detection; it is the
+ * same category of residual as the cross-process gap documented on {@link
+ * writeTextFileIfUnchangedV1}.
+ */
+const conditionalWriteOwnSaveInFlight = new Set<string>();
+
+/**
+ * Same-directory temp-write-then-rename, so the on-disk replacement is one
+ * atomic filesystem operation (no reader, in this process or another, can
+ * ever observe a partially-written file) instead of the single unconditional
+ * `vscode.workspace.fs.writeFile` call `writeTextFile` uses for the
+ * no-open-editor case. Mirrors `WorkflowFileStoreV1.replaceFileExact`
+ * (`services/workflowFileStoreV1.ts`) — the "exact-revision file-store
+ * pattern elsewhere in the tree" the fourth review pass pointed at as a
+ * genuinely different architectural direction from adding more reads.
+ * Bypasses `vscode.workspace.fs` (routes through Node's `fs` directly, like
+ * that sibling primitive) since this only ever runs against a file with no
+ * open editor buffer to keep in sync.
+ */
+async function replaceOnDiskAtomicV1(fileUri: vscode.Uri, content: string): Promise<void> {
+  const targetPath = fileUri.fsPath;
+  const tempPath = path.join(
+    path.dirname(targetPath),
+    `.ensemble-write-${randomBytes(8).toString("hex")}.tmp`
+  );
+  const bytes = Buffer.from(content, "utf8");
+  try {
+    await fs.promises.writeFile(tempPath, bytes, { flag: "wx" });
+    await fs.promises.rename(tempPath, targetPath);
+  } catch (error) {
+    try {
+      await fs.promises.unlink(tempPath);
+    } catch {
+      // Temp cleanup is best-effort; the original file is untouched either way.
+    }
+    throw error;
+  }
+}
+
+/**
+ * Revision-conditional write: succeeds only if the file's content still
+ * matches `expectedContent` at the moment of the write. Closes the
+ * stat-then-write TOCTOU window a plain read-check-`writeTextFile` sequence
+ * leaves open (review-flagged 2026-08-25, task-fixable blocker
+ * `739cfbbb-…-1` on `linkManualChecksToBlockerConfirmedV1`) for any caller
+ * that routes its write through this primitive: concurrent calls against the
+ * SAME uri queue behind each other via {@link pendingConditionalWrites}, so
+ * the fresh read below and the write are a true critical section for those
+ * callers — a losing caller's read observes the winner's write and is
+ * refused rather than silently clobbering it.
+ *
+ * Narrowing (second review pass, 2026-08-25): the prior version ran the
+ * unconditional backup (an awaited I/O op) *between* the compare-read and
+ * the write, which is exactly the window an editor save or a writer outside
+ * this queue could land in and still get silently overwritten. Backup now
+ * runs first, then the compare-read.
+ *
+ * Narrowing (third review pass, 2026-08-25, blocker `739cfbbb-…-1`): a
+ * second, unconditional re-read (`revalidated`) was added after the first
+ * compare, but `testOnlyBeforeWrite` fired *before* it — so the reviewer's
+ * injected race was still caught by a check positioned after the injection,
+ * proving nothing about the window that actually matters. The hook now fires
+ * *after* both prior reads, immediately before one final read (`final`) with
+ * no other awaited work between that read and the write call — the latest
+ * possible point at which an in-process race can still be observed and
+ * refused, and the position the test now actually exercises.
+ *
+ * Narrowing (fourth review pass, 2026-08-25, same blocker): the fifth read
+ * still only closed the ordering gap for callers that themselves go through
+ * this primitive. The review named a DIFFERENT, concrete vector this never
+ * touched — a manual editor save for the same uri, landing after the final
+ * read — and pointed out that the fix required is a different mechanism, not
+ * another read ("repeated reads are not the only available architectural
+ * direction"). Two changes close that specific vector:
+ *
+ *  1. {@link registerConditionalWriteSaveGuardV1} registers
+ *     `vscode.workspace.onWillSaveTextDocument` once at activation. While
+ *     this uri has an entry in {@link pendingConditionalWrites}, any editor
+ *     save for it is deferred (`event.waitUntil`) until that entry resolves
+ *     — so a save that would otherwise land inside this critical section now
+ *     lands strictly after it, and is never lost.
+ *  2. The actual disk mutation for the no-open-editor case now goes through
+ *     {@link replaceOnDiskAtomicV1} (temp file + atomic rename) instead of
+ *     `vscode.workspace.fs.writeFile`'s single non-atomic write call — the
+ *     same pattern `WorkflowFileStoreV1.replaceFileExact` already uses
+ *     elsewhere in this codebase, so no reader can observe a torn write.
+ *
+ * Narrowing (fifth review pass, 2026-08-25, task-fixable blocker
+ * `739cfbbb-…-1`, and a new architectural blocker on the same pass):
+ *
+ *  1. The one remaining in-process writer of `plan-final.md` that bypassed
+ *     this primitive — `applyReviewerVerifiedTicksConfirmedV1`'s
+ *     unconditional `writeTextFile` call — now routes through this function
+ *     instead, so it queues behind {@link pendingConditionalWrites} and is
+ *     refused (not silently overwritten) if the file changed underneath it,
+ *     the same as every other writer of this artifact.
+ *  2. The save guard added in the fourth pass introduced a self-deadlock:
+ *     for the open-editor branch, this function awaits `writeTextFile`,
+ *     which awaits `document.save()`; that save synchronously fires
+ *     `onWillSaveTextDocument`, whose handler looked this same uri up in
+ *     {@link pendingConditionalWrites}, found the very write it was nested
+ *     inside of, and `event.waitUntil()`'d that write's own promise — a
+ *     promise that cannot resolve until this `save()` call resolves. Fixed
+ *     by {@link conditionalWriteOwnSaveInFlight}: this function marks a uri
+ *     as "own save in flight" for the duration of its own `writeTextFile`
+ *     call, and the guard checks that marker first, letting the write's own
+ *     save proceed untouched while still deferring any genuinely separate
+ *     editor save for the same uri.
+ *
+ * Narrowing (sixth review pass, 2026-08-25, task-fixable blocker
+ * `739cfbbb-…-1` narrowed further, and the fifth pass's new architectural
+ * blocker):
+ *
+ *  1. The two remaining production writers of `plan-final.md` that still
+ *     bypassed this primitive are now routed through it:
+ *     `applyReconciliationReviewVerifiedTicksV1` (`reconcilePlanChecklist.ts`)
+ *     and the implementation-round checklist merge
+ *     (`reviewActions.ts`, the `mergeResult.kind === "merged"` branch) both
+ *     now call this function with the plan text their merge was computed
+ *     against as `expectedContent`, so a concurrent change is detected and
+ *     refused rather than silently overwritten, the same as every other
+ *     writer of this artifact. (The round-completion writer cannot simply
+ *     re-read and recompute its merge immediately before writing, unlike the
+ *     two decision-confirmation writers — several routing decisions earlier
+ *     in that same function already depend on the merge result computed
+ *     against the original read, so re-deriving fresh would risk those
+ *     decisions disagreeing with what is actually written. Using the
+ *     original read as the expected content still correctly detects and
+ *     refuses a genuine concurrent change; it does not weaken the guarantee,
+ *     it only means the write can be refused by a change that happened
+ *     earlier in the function's own execution, which is the correct,
+ *     conservative behavior.)
+ *  2. {@link conditionalWriteOwnSaveInFlight}'s exemption was URI-wide for
+ *     the whole `writeTextFile` call, including the `applyEdit` await, so a
+ *     will-save event this write's own code never triggers could still be
+ *     waved through untouched during that window rather than correctly
+ *     deferred. The marker is now set via `writeTextFile`'s `onBeforeSave`
+ *     hook, which fires only once `applyEdit` has already landed and
+ *     `.save()` is the very next call — see that set's own doc comment for
+ *     the full narrowing and its residual.
+ *
+ * Narrowing (seventh review pass, 2026-08-26, blocker `739cfbbb-…-1`
+ * narrowed further as a completion blocker): the residual named below —
+ * "a keystroke landing in the open-editor branch's own `applyEdit` await
+ * … can still be lost" — was previously silent: the full-buffer replace
+ * would land and `.save()` would persist it regardless of whether a
+ * concurrent edit had interleaved. `writeTextFile`'s `guardVersion` option
+ * (see its own doc comment) now compares the document's version immediately
+ * after `applyEdit` resolves against the version captured at this
+ * function's own last validated read; a bigger jump than this write's own
+ * edit accounts for throws {@link ConcurrentEditDuringApplyError}, which
+ * this function catches and turns into a refusal (`false`), the same
+ * "detected, not silently lost" contract every other race window in this
+ * function already has — BEFORE `.save()` is ever called, so nothing bad
+ * reaches disk. This does not and cannot make the concurrent keystroke
+ * survive in the buffer (no version-conditional `applyEdit` exists to
+ * rebase against it), only stop this write from silently persisting over
+ * it; the caller is expected to retry from a fresh read on `false`, the same
+ * as every other refusal this function can return.
+ *
+ * This closes the in-process races this codebase can actually produce, for
+ * every known writer of a shared artifact routed through this primitive:
+ * concurrent calls through it (queued), and a concurrent editor save for the
+ * same uri (deferred, without self-deadlocking on the write's own save). It
+ * does NOT extend to a write from a process outside this extension host — no
+ * cross-process file lock exists for this file anywhere in the codebase, and
+ * none of the above (nor any further in-process re-read) can close that
+ * specific gap; only an OS-level atomic compare-and-swap could, which VS
+ * Code's fs API does not expose. That residual gap is the same limitation
+ * every writer in this codebase already has, and is unchanged by this pass.
+ * A future writer of this same artifact that is added without going through
+ * this primitive would reopen the bypass gap closed in point 1 above — there
+ * is no compile-time enforcement that every writer uses it. Narrowed by the
+ * seventh pass above: a keystroke landing in the open-editor branch's own
+ * `applyEdit` await (before this write's full-buffer replace lands) is now
+ * DETECTED via `guardVersion` and the write is refused rather than silently
+ * persisted — but the keystroke itself still cannot be made to survive in
+ * the buffer, since no version-conditional edit/save API is exposed by VS
+ * Code to rebase against it; see {@link conditionalWriteOwnSaveInFlight}'s
+ * doc comment and {@link ConcurrentEditDuringApplyError}.
+ */
+export async function writeTextFileIfUnchangedV1(
+  fileUri: vscode.Uri,
+  expectedContent: string,
+  newContent: string,
+  options: {
+    skipBackup?: boolean;
+    /** Test-only seam: fires after the write is validated as safe to
+     * proceed but before it lands, so a test can inject a race
+     * deterministically. Never pass this from production code. */
+    testOnlyBeforeWrite?: () => Promise<void> | void;
+  } = {}
+): Promise<boolean> {
+  const key = fileUri.toString();
+  const prior = pendingConditionalWrites.get(key) ?? Promise.resolve();
+  const task = prior.catch(() => undefined).then(async (): Promise<boolean> => {
+    if (!options.skipBackup) {
+      await backupArtifactBeforeWrite(fileUri);
+    }
+    const current = await readTextIfExists(fileUri);
+    if (current !== expectedContent) {
+      return false;
+    }
+    const revalidated = await readTextIfExists(fileUri);
+    if (revalidated !== expectedContent) {
+      return false;
+    }
+    if (options.testOnlyBeforeWrite) {
+      await options.testOnlyBeforeWrite();
+    }
+    // This is the primitive's true last read: nothing awaited runs between
+    // it and the write call below, so it is the latest possible point an
+    // in-process race can be observed and refused.
+    const final = await readTextIfExists(fileUri);
+    if (final !== expectedContent) {
+      return false;
+    }
+    const openDoc = findOpenDocument(fileUri);
+    if (openDoc) {
+      // An open editor buffer needs `writeTextFile`'s applyEdit+save path to
+      // stay in sync; the onWillSave guard above is what protects this case
+      // from a SEPARATE editor save racing it. The marker is set via
+      // `onBeforeSave` — i.e. only once the edit has already landed and
+      // `writeTextFile` is about to call `.save()` — rather than for this
+      // whole try block, so a will-save event that fires DURING the
+      // preceding `applyEdit` await (which this write's own code never
+      // triggers) is not exempted and is correctly deferred instead. See
+      // conditionalWriteOwnSaveInFlight's doc comment for why the exemption
+      // itself must still cover the `.save()` call specifically.
+      //
+      // guardVersion is the document's version as of the "final" read just
+      // above (no awaited work runs between that read and this line, so it
+      // reflects the same instant) — see writeTextFile's doc comment and
+      // ConcurrentEditDuringApplyError for what this closes.
+      const guardVersion = typeof openDoc.version === "number" ? openDoc.version : undefined;
+      try {
+        await writeTextFile(fileUri, newContent, {
+          skipBackup: true,
+          onBeforeSave: () => conditionalWriteOwnSaveInFlight.add(key),
+          guardVersion,
+        });
+      } catch (error) {
+        if (error instanceof ConcurrentEditDuringApplyError) {
+          return false;
+        }
+        throw error;
+      } finally {
+        conditionalWriteOwnSaveInFlight.delete(key);
+      }
+    } else {
+      await replaceOnDiskAtomicV1(fileUri, newContent);
+    }
+    return true;
+  });
+  pendingConditionalWrites.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (pendingConditionalWrites.get(key) === task) {
+      pendingConditionalWrites.delete(key);
+    }
+  }
+}
+
+/**
+ * Registers the editor-save guard that closes the "editor save lands mid-
+ * write" vector documented on {@link writeTextFileIfUnchangedV1} above. Call
+ * once at activation and add the returned disposable to
+ * `context.subscriptions`. Cheap for every other document: it only ever
+ * looks up the uri in {@link pendingConditionalWrites} and returns
+ * immediately when there is no in-flight conditional write for it.
+ */
+/**
+ * Serializes an arbitrary write operation against the SAME per-uri queue
+ * {@link writeTextFileIfUnchangedV1} uses, so a writer with its own mutation
+ * strategy and its own safety checks (e.g. the stage Revert/Redo swap's
+ * version/dirty recheck, or a create-if-missing materialization) still
+ * cannot interleave with a conditional write for the same uri (review-
+ * flagged 2026-08-26, narrowed task-fixable blocker `739cfbbb-…-1`: "not
+ * every production mutation of plan-final.md participates in the new
+ * per-URI coordinator" — the Revert/Redo surface and the
+ * `implementationArtifactResolver.ts` create/promotion paths were named as
+ * the concrete gaps).
+ *
+ * This does NOT itself enforce a content precondition — `operation` keeps
+ * whatever precondition it already has (a fresh existence re-check, a
+ * version recheck, etc.), ideally performed *inside* `operation` so it
+ * observes state as of its actual turn in the queue rather than whatever was
+ * true when the caller decided to enqueue.
+ *
+ * If `operation` performs its own `document.save()` call(s), each one must
+ * be bracketed with {@link markOwnSaveInFlightV1} / {@link
+ * clearOwnSaveInFlightV1} (mirroring `writeTextFile`'s `onBeforeSave` seam)
+ * — otherwise the will-save guard registered by
+ * {@link registerConditionalWriteSaveGuardV1} will see this uri already
+ * queued here, treat the save as a genuinely separate racing save, and
+ * `event.waitUntil()` this very operation's own promise: a permanent
+ * deadlock, the same failure mode {@link conditionalWriteOwnSaveInFlight}'s
+ * doc comment describes for `writeTextFileIfUnchangedV1` itself.
+ */
+export async function withPlanFileWriteLockV1<T>(
+  fileUri: vscode.Uri,
+  operation: () => Promise<T>
+): Promise<T> {
+  const key = fileUri.toString();
+  const prior = pendingConditionalWrites.get(key) ?? Promise.resolve();
+  const task = prior.catch(() => undefined).then(operation);
+  pendingConditionalWrites.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (pendingConditionalWrites.get(key) === task) {
+      pendingConditionalWrites.delete(key);
+    }
+  }
+}
+
+/**
+ * Marks `fileUri` as having its own conditional-write save in flight, for a
+ * caller inside {@link withPlanFileWriteLockV1} that performs its own
+ * `document.save()` call outside of `writeTextFile`. Call immediately before
+ * the save (never earlier — the exemption must not cover any awaited work
+ * preceding it, per the sixth review pass's narrowing) and pair with
+ * {@link clearOwnSaveInFlightV1} in a `finally` once the save settles.
+ */
+export function markOwnSaveInFlightV1(fileUri: vscode.Uri): void {
+  conditionalWriteOwnSaveInFlight.add(fileUri.toString());
+}
+
+/** Pairs with {@link markOwnSaveInFlightV1}. */
+export function clearOwnSaveInFlightV1(fileUri: vscode.Uri): void {
+  conditionalWriteOwnSaveInFlight.delete(fileUri.toString());
+}
+
+export function registerConditionalWriteSaveGuardV1(): vscode.Disposable {
+  return vscode.workspace.onWillSaveTextDocument((event) => {
+    const key = event.document.uri.toString();
+    if (conditionalWriteOwnSaveInFlight.has(key)) {
+      // This save IS the conditional write landing (triggered by its own
+      // applyEdit+save call), not a separate save racing it. Awaiting the
+      // write's promise here would deadlock, since that promise cannot
+      // resolve until this very save resolves. Let it proceed untouched.
+      return;
+    }
+    const inFlight = pendingConditionalWrites.get(key);
+    if (!inFlight) {
+      return;
+    }
+    event.waitUntil(
+      inFlight.then(
+        (): vscode.TextEdit[] => [],
+        (): vscode.TextEdit[] => []
+      )
+    );
+  });
 }
 
 export async function safeOpenTextDocument(

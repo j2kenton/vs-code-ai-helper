@@ -361,6 +361,23 @@ void describe("nextStage.v1 registry row", () => {
     assert.deepEqual(calls, ["beforeWrite"]);
   });
 
+  void it("creates publish-review.md when landing on Publish (plan item 17, step 20a) — the primary review-driven/manual transition writer, not just the legacy advanceStage path", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-publish-artifact-");
+    setProgress(fixture.folder, { status: "active", currentStage: "impl-low-review" });
+    const artifactPath = path.join(fixture.folder, "publish-review.md");
+    assert.equal(fs.existsSync(artifactPath), false);
+
+    const outcome = await executeNextStageV1(contextFor(fixture.folder, "impl-low-review"));
+    assert.equal(outcome.kind, "completed");
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "publish");
+    }
+    assert.equal(fs.existsSync(artifactPath), true, "publish-review.md must exist the moment this row lands the task on Publish");
+  });
+
   void it("never runs beforeWrite when the CAS is rejected", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-beforewrite-rejected-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan-high-review" });

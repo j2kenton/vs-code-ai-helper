@@ -34,6 +34,8 @@ Worked example of the shape (the domain here is illustrative only — write each
 
 A LOW-priority criterion follows the same shape but ends by naming what is being traded off, e.g. "Priority: LOW — a failure here surfaces as an error dialog immediately; skipping this check only costs a rerun, never bad data."
 
+When a hand-off criterion verifies the work of exactly one specific numbered implementation step elsewhere in this plan (not several steps, and not the plan in general), add a `Covers: Step N` note naming that step's number, e.g. "Priority: HIGH — the outage is silent. Covers: Step 12." This is the only structural link between a numbered step and the hand-off check(s) that verify it, so a later reconciliation decision can point at the specific check(s) behind a specific outstanding step instead of the whole hand-off list. Omit it entirely when a criterion does not map to one specific step (most will not) — never guess a step number, and never name more than one step per criterion (split it into separate criteria instead if it genuinely verifies two).
+
 One plan is one task. A plan too large for a single round is delivered as ordered PARTS that this one task implements across several rounds — never divided across separate or follow-up tasks. Nothing here has authority to hand part of a plan to another task, and a division made at plan time happens before the implementation checklist exists, so the removed work would never be tracked as outstanding at all. If the plan genuinely cannot be delivered that way, say so plainly as a blocking issue needing a human scope decision rather than inventing a division.
 
 Do not invent requirements that are not implied by the context. If the request is unclear, say so explicitly instead of guessing.

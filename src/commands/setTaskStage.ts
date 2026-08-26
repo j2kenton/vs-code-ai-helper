@@ -143,9 +143,12 @@ export async function setTaskStage(
     }
 
     const taskItems = allTasks.map((task) => ({
-      label: task.folderName,
+      label: task.progress.displayName ?? task.folderName,
       description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
-      detail: `Last updated: ${new Date(
+      // wf10 item 21: the folder id (never shown elsewhere once displayName
+      // exists) stays visible here alongside the recency hint, rather than
+      // rendering only an unrecognizable folder id as the whole label.
+      detail: `${task.folderName} · Last updated: ${new Date(
         task.progress.updatedAt
       ).toLocaleString()}`,
       task,

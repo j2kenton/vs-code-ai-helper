@@ -30,6 +30,7 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import {
+  BlockerSupersessionRecordV1,
   ReviewScoreHistoryEntry,
   RoundOutcomeClassificationV1,
   TaskEscalation,
@@ -94,6 +95,7 @@ import {
   statIfExists,
   withAttribution,
   writeTextFile,
+  writeTextFileIfUnchangedV1,
 } from "../utils/fileUtils";
 import {
   ChecklistProgressV1,
@@ -229,10 +231,12 @@ import {
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
+import { filterSupersededBlockersV1 } from "../utils/reviewEvidenceNormalizerV1";
 import {
   checkPublishChecksFreshnessV1,
   describePublishChecksFreshnessFailureV1,
   ensurePublishReviewArtifactExistsV1,
+  ensurePublishReviewLegacySectionsImportedV1,
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
@@ -1037,21 +1041,41 @@ async function resolveTask(
 
   const soleEligible = eligible.length === 1 ? eligible[0] : undefined;
   const currentTaskId = new CurrentTaskStore(context.workspaceState).get();
+  const taskId = (task: DiscoveredTaskItem): string =>
+    task.canonicalId ?? normalizePath(task.folderUri.fsPath);
   const autoPickable =
-    soleEligible !== undefined &&
-    (!currentTaskId ||
-      currentTaskId === (soleEligible.canonicalId ?? normalizePath(soleEligible.folderUri.fsPath)));
+    soleEligible !== undefined && (!currentTaskId || currentTaskId === taskId(soleEligible));
+  // wf10 item 20: a caller with no explicit tree node (e.g. a task-scoped
+  // stage chat, or a keybinding fired while a task is selected) still has a
+  // clear implied task via CurrentTaskStore — it should never fall through
+  // to a "Select a task" picker over every task in the workspace just
+  // because it isn't the SOLE eligible one. Only genuinely ambiguous
+  // invocations (bare command palette with no current task, or a current
+  // task that isn't eligible for this action) reach the picker below.
+  const currentTaskMatch = currentTaskId
+    ? eligible.find((task) => taskId(task) === currentTaskId)
+    : undefined;
 
   let picked: DiscoveredTaskItem | undefined;
-  if (autoPickable) {
+  if (currentTaskMatch) {
+    picked = currentTaskMatch;
+  } else if (autoPickable) {
     picked = soleEligible;
   } else {
-    const items = eligible.map((task) => ({
-      label: task.folderName,
+    // Genuinely ambiguous: list the current task first (if it exists but
+    // wasn't eligible, it won't be in `eligible` at all and this is a no-op)
+    // so it is pre-focused — showQuickPick focuses the first item by default
+    // (same trick as reopenTask.ts's pickReopenStage).
+    const ordered = currentTaskId
+      ? [...eligible].sort((a, b) => Number(taskId(a) !== currentTaskId) - Number(taskId(b) !== currentTaskId))
+      : eligible;
+    const items = ordered.map((task) => ({
+      label: "corrupt" in task ? task.folderName : task.progress.displayName ?? task.folderName,
       description:
         "corrupt" in task
           ? `[Recovery Required] ${task.reason}`
           : `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+      detail: task.folderName,
       task,
     }));
     const selected = await vscode.window.showQuickPick(items, {
@@ -1810,8 +1834,11 @@ async function readPreviousReviewForRereview(
  */
 /**
  * Publish review freshness gate (plan PART 2, step 7): refuse to build a
- * Publish review prompt unless `publish-checks.md` carries a valid stamp for
- * the CURRENT verification scope and commit. Every entry point that can
+ * Publish review prompt unless `publish-review.md` (the single unified
+ * Publish-stage artifact — plan item 17, step 20; see the module doc comment
+ * on `publishChecksFreshness.ts`'s `publishChecksPath` for why this used to
+ * be a separate `publish-checks.md`) carries a valid stamp for the CURRENT
+ * verification scope and commit. Every entry point that can
  * start a Publish review — direct review, Fast Forward, automatic review,
  * and resumed review — must call this before it reads/derives any other
  * review content, so a stale or absent Publish Checks run can never be
@@ -1840,6 +1867,15 @@ async function requirePublishChecksFreshnessOrWarnV1(
   // been created yet" unreachable for a task that has actually reached
   // Publish — a no-op once the file exists, whatever wrote it.
   await ensurePublishReviewArtifactExistsV1(folderUri);
+  // Step 20(c), both-files case: a task whose publish-review.md already
+  // exists (e.g. an older build's stub) but never had legacy
+  // publish-checks.md sections imported into it must get that import HERE,
+  // before the freshness check below reads publish-review.md's stamp —
+  // otherwise a legacy-only stamp can never be reached, because the review
+  // write's own lazy import (reviewRowV1.ts's
+  // reinjectPublishGroundTruthSectionsV1) only runs AFTER this gate accepts.
+  // A no-op once imported, or when there is nothing legacy to import.
+  await ensurePublishReviewLegacySectionsImportedV1(folderUri);
   const progress = await readTaskProgressAdvisoryV1(folderUri);
   const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
   const currentCommitSha = await resolveHeadCommitSha(scopeFolder);
@@ -2149,7 +2185,7 @@ export async function handleReviewRoutingOutcome(options: {
     // this review's content was even generated, so a mechanical failure
     // feeds history/routing even if the reviewer's own prose description of
     // it never round-trips through BLOCKER_LINE_RE at all.
-    const blockers = [...blockerEvidence.blockers, ...getMechanicalBlockersForStage(folderUri, targetStage)];
+    const parsedBlockers = [...blockerEvidence.blockers, ...getMechanicalBlockersForStage(folderUri, targetStage)];
     if (blockerEvidence.malformedLines.length > 0) {
       // A malformed line is UNKNOWN, not clean — never let it look identical
       // to a round that stalled for any other reason. Record what could not
@@ -2161,12 +2197,12 @@ export async function handleReviewRoutingOutcome(options: {
         folderUri,
         "review-guard",
         targetStage,
-        `# Unparseable Blocker Lines\n\nStatus: ${blockers.length} blocker(s) parsed; ` +
+        `# Unparseable Blocker Lines\n\nStatus: ${parsedBlockers.length} blocker(s) parsed; ` +
           `${blockerEvidence.malformedLines.length} line(s) could not be parsed.\n\n` +
           `## Malformed lines\n\n${blockerEvidence.malformedLines.map((l) => `- ${l}`).join("\n")}`
       );
       NotificationRouter.showWarning(
-        `${STAGE_DISPLAY_NAMES[targetStage]} review parsed ${blockers.length} blocker(s), but ` +
+        `${STAGE_DISPLAY_NAMES[targetStage]} review parsed ${parsedBlockers.length} blocker(s), but ` +
           `${blockerEvidence.malformedLines.length} blocker line(s) could not be read and were not counted. ` +
           "Check the review-guard run log."
       );
@@ -2175,6 +2211,19 @@ export async function handleReviewRoutingOutcome(options: {
     if (!progressBefore) {
       return { escalated: false };
     }
+    // Review-flagged (2026-08-25, new architectural blocker): `parsedBlockers`
+    // is THIS round's own fresh finding — the newest evidence that exists for
+    // this stage. A prior `TaskProgress.blockerSupersessions` entry recorded
+    // against an older, stale review artifact must never suppress it: doing
+    // so here previously hid a genuinely-still-live blocker from
+    // `reviewScoreHistory` and every downstream router permanently, since a
+    // filtered blocker was never even persisted for a later round to notice
+    // had reappeared. `filterSupersededBlockersV1` is deliberately NOT called
+    // here — see its doc comment (`reviewAsOfMs` undefined = never filter).
+    // A supersession can only ever suppress a STALE, previously-persisted
+    // review artifact a decision surface reads later (`reconcilePlanChecklist.ts`),
+    // never this round's own live output.
+    const blockers = parsedBlockers;
     // 2d: a round with no parseable `Readiness: N/10` line is a failure
     // wearing a review's clothes — a provider error, truncation, or
     // degenerate output. It must NOT be appended to reviewScoreHistory:
@@ -2425,7 +2474,9 @@ export async function handleReviewRoutingOutcome(options: {
         reason,
         reviewAttemptId,
         updated,
-        false
+        false,
+        undefined,
+        { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
       );
       return { escalated };
     }
@@ -2481,12 +2532,24 @@ export async function handleReviewRoutingOutcome(options: {
         `${STAGE_DISPLAY_NAMES[targetStage]} review has plateaued at ${score}/10. Independent second-opinion review is not available in this build, so this escalates directly.`,
         reviewAttemptId,
         updated,
-        true
+        true,
+        undefined,
+        { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
       );
       return { escalated };
     }
     // decision.route === "escalate"
-    const escalated = await escalateReviewToHuman(folderUri, targetStage, "plateau", decision.reason, reviewAttemptId, updated, false);
+    const escalated = await escalateReviewToHuman(
+      folderUri,
+      targetStage,
+      "plateau",
+      decision.reason,
+      reviewAttemptId,
+      updated,
+      false,
+      undefined,
+      { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
+    );
     return { escalated };
   } catch (error) {
     NotificationRouter.showWarning(
@@ -5969,10 +6032,62 @@ async function advanceStageViaNextStageRowV1(
   return { persisted: true, newStage: next, shouldAutoReview };
 }
 
+/**
+ * wf10 item 19 / Step 28 (review blocker a96160ec-…-2, third narrowing,
+ * resolved 2026-08-25): the two pre-existing consumers of
+ * `blockerSupersessions` — `readStageArtifactsForChat` (chatWithStage.ts) and
+ * `computePlanReviewBlockerSupersessionEvidenceV1` (reconcilePlanChecklist.ts)
+ * — are both informational; neither is consulted by the transition itself,
+ * so a manual "Complete Stage & Move On" could silently advance past a
+ * blocker the artifacts still list as outstanding. This reads the CURRENT
+ * plan-review stage's own review artifact fresh and returns whatever
+ * blockers `filterSupersededBlockersV1` says remain outstanding — the same
+ * set a human reading the review would see as unresolved. Scoped to
+ * `PLAN_REVIEW_STAGES` only, matching `blockerSupersessions`'s own
+ * documented scope (it is never recorded against any other stage kind).
+ */
+async function getOutstandingPlanReviewBlockersForAdvanceV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  blockerSupersessions: readonly BlockerSupersessionRecordV1[] | undefined
+): Promise<ReviewBlocker[]> {
+  if (!PLAN_REVIEW_STAGES.includes(stage)) {
+    return [];
+  }
+  const filename = STAGE_ARTIFACT_FILENAMES[stage];
+  if (!filename) {
+    return [];
+  }
+  const reviewUri = vscode.Uri.joinPath(folderUri, filename);
+  const content = await readTextIfExists(reviewUri);
+  if (!content?.trim()) {
+    return [];
+  }
+  const blockers = parseReviewBlockers(content);
+  if (blockers.length === 0) {
+    return [];
+  }
+  let mtimeMs: number | undefined;
+  try {
+    mtimeMs = (await vscode.workspace.fs.stat(reviewUri)).mtime;
+  } catch {
+    mtimeMs = undefined;
+  }
+  return filterSupersededBlockersV1(stage, blockers, blockerSupersessions, mtimeMs);
+}
+
 export async function nextStage(
   _extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  node?: TaskNodeArg
+  node?: TaskNodeArg,
+  /**
+   * Set only by the "Complete Anyway" notification action
+   * (`vs-code-ai-helper.completeStageAnywayV1`) dispatched from the warning
+   * below. Never a requirement to advance (plan Part 14's own wording: "a
+   * full re-review remains an offered stronger option, never a
+   * requirement") — this is the one-click override, not a hard block.
+   */
+  bypassBlockerGate = false
 ): Promise<void> {
   // Publish is the final executable stage: its review is generated here and
   // completion/release remain explicit actions. There is no stage after it.
@@ -6024,6 +6139,43 @@ export async function nextStage(
         `Write or generate it before advancing.`
     );
     return;
+  }
+
+  // wf10 item 19 / Step 28: a plan-review stage whose latest review still
+  // lists a blocker no confirmed plan.md edit has superseded gets a warning
+  // rather than a silent advance — the whole point of a recorded
+  // supersession is that the artifacts agree before advice to advance is
+  // acted on (see readStageArtifactsForChat's and
+  // buildSoleBlockerReconcileGuidanceV1's doc comments, and this file's own
+  // `getOutstandingPlanReviewBlockersForAdvanceV1`). This is a warn-and-
+  // confirm, not a hard refusal: "Complete Anyway" is one click away, so a
+  // human who verified the blocker some other way (or disagrees with it) is
+  // never stranded — matching the "Publish Anyway" affordance already used
+  // for every sibling skip path in this same command.
+  if (!bypassBlockerGate) {
+    const outstandingBlockers = await getOutstandingPlanReviewBlockersForAdvanceV1(
+      resolved.folderUri,
+      resolved.progress.currentStage,
+      resolved.progress.blockerSupersessions
+    );
+    if (outstandingBlockers.length > 0) {
+      const blockerList = outstandingBlockers.map((b) => `- ${b.description}`).join("\n");
+      NotificationRouter.showWarning(
+        `${resolved.progress.taskFolder}: ${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]}'s review still ` +
+          `lists ${outstandingBlockers.length} blocker(s) not recorded as resolved:\n${blockerList}\n\n` +
+          "If you resolved this in stage chat, confirm the plan.md edit there so it's recorded. Otherwise, " +
+          "advance anyway if you've verified it some other way — a full re-review is a stronger option but not required.",
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.completeStageAnywayV1",
+          title: "Complete Anyway",
+          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+        }
+      );
+      return;
+    }
   }
 
   // Special handling for advancing into "implementation" stage:
@@ -8101,24 +8253,48 @@ async function executeImplementationRun(
         // round reported.
         const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
         if (mergeResult.kind === "merged") {
-          await writeTextFile(planOfRecordUri, mergeResult.content);
-          effectivePlanChecklist = mergeResult.content;
-          // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
-          // round verified as already complete rather than built itself —
-          // recorded in the run log, next to the rest of the round's
-          // evidence, so the claim is auditable rather than indistinguishable
-          // from an ordinary this-round tick.
-          if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
-            const existingLog = await readTextIfExists(logUri);
-            if (existingLog !== undefined) {
-              const retroSection =
-                "\n\n## Retroactive plan ticks\n\n" +
-                "Items ticked this round via a retroactive claim (verified complete from an " +
-                "earlier round, not built this round):\n\n" +
-                mergeResult.retroactiveTicks
-                  .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
-                  .join("\n");
-              await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
+          // Revision-conditional (review-flagged 2026-08-25, task-fixable
+          // blocker `739cfbbb-…-1`, narrowed a seventh time): this was the
+          // third remaining in-process writer of `plan-final.md` that
+          // bypassed `writeTextFileIfUnchangedV1`. Unlike the two decision-
+          // confirmation writers (`applyReviewerVerifiedTicksConfirmedV1`,
+          // `applyReconciliationReviewVerifiedTicksV1`), `checklistMergeResult`
+          // is reused by several routing decisions made earlier in this same
+          // function (see the comment above), so this cannot simply re-read
+          // and recompute the merge immediately before writing without
+          // risking those earlier decisions disagreeing with what actually
+          // gets written. `planChecklist` — the exact text the merge was
+          // computed against — is passed as the expected content instead: a
+          // concurrent writer or editor save that lands between that read and
+          // this write is still detected and refused rather than silently
+          // overwritten; only the earlier-computed routing messages remain
+          // based on the read at the time they were built, same as before.
+          const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planChecklist, mergeResult.content);
+          if (!written) {
+            NotificationRouter.showWarning(
+              "⚠️ plan-final.md changed while this round's checklist progress was being merged, so nothing was " +
+                "written — its ticks were not lost, but this round's progress could not be recorded. Re-run " +
+                "reconciliation once the concurrent change settles."
+            );
+          } else {
+            effectivePlanChecklist = mergeResult.content;
+            // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
+            // round verified as already complete rather than built itself —
+            // recorded in the run log, next to the rest of the round's
+            // evidence, so the claim is auditable rather than indistinguishable
+            // from an ordinary this-round tick.
+            if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
+              const existingLog = await readTextIfExists(logUri);
+              if (existingLog !== undefined) {
+                const retroSection =
+                  "\n\n## Retroactive plan ticks\n\n" +
+                  "Items ticked this round via a retroactive claim (verified complete from an " +
+                  "earlier round, not built this round):\n\n" +
+                  mergeResult.retroactiveTicks
+                    .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
+                    .join("\n");
+                await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
+              }
             }
           }
         } else if (mergeResult.kind === "no-match") {
@@ -9496,6 +9672,17 @@ export function registerReviewActionCommands(
       "vs-code-ai-helper.nextStage",
       (node?: TaskNodeArg) =>
         nextStage(context.extensionUri, context, node)
+    ),
+    // wf10 item 19 / Step 28: the "Complete Anyway" override on the
+    // blocker-gate warning in `nextStage`. `{ taskFolderPath }` is
+    // normalized to the same `TaskNodeArg` shape `resolveTask` already
+    // accepts from every other notification-button command in this file
+    // (see `normalizeReviewArg`'s doc comment), so this targets the exact
+    // task the warning was about rather than re-prompting a picker.
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.completeStageAnywayV1",
+      (arg?: { taskFolderPath: string }) =>
+        nextStage(context.extensionUri, context, normalizeReviewArg(arg), true)
     ),
     // The standalone "Generate Implementation Checklist" command was merged
     // into "Implement Actual Work": runImplementationWithAI generates the

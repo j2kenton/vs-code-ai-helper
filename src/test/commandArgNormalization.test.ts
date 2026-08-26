@@ -821,7 +821,7 @@ void describe("resumeTaskArgHasExplicitTask", () => {
 // ---------------------------------------------------------------------------
 
 import { pauseTask } from "../commands/pauseTask";
-import { resumePausedTask } from "../commands/resumeTask";
+import { resumePausedTask, resumeAndRerunReviewV1 } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import type { TaskProgress } from "../types/taskProgress";
@@ -1015,6 +1015,110 @@ void describe("resumePausedTask integration (full command path)", () => {
         "resumePausedTask with no arg and no current task must show generic info message"
       );
     } finally {
+      msgs.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resumeAndRerunReviewV1 — the "Keep iterating" plateau-escalation button
+// must actually resume AND re-dispatch the review, not just resume (wf10
+// Part 13 review: a prior revision dispatched plain resumeTask while its
+// consequence text claimed it "reruns" the stage).
+// ---------------------------------------------------------------------------
+
+void describe("resumeAndRerunReviewV1 (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumes a paused task and then dispatches runReviewWithAI for it", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-rerun-review");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-rerun-review",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndRerunReviewV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "active",
+        "the task must actually be resumed, not just have the review dispatched"
+      );
+
+      const reviewDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runReviewWithAI"
+      );
+      assert.ok(
+        reviewDispatch !== undefined,
+        "must dispatch vs-code-ai-helper.runReviewWithAI after resuming — the whole point of this " +
+          "command over plain resumeTask"
+      );
+      assert.deepEqual(reviewDispatch.arg, { taskFolderPath: folderPath });
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("does not dispatch a review when the task could not be found (resume itself failed)", async () => {
+    const inv = makeEmptyInventoryStub();
+    const currentStore = makeCurrentTaskStoreStub(undefined);
+    const msgs = installMessageCapture();
+    const execCmd = installExecuteCommandStub();
+    try {
+      await resumeAndRerunReviewV1(inv, currentStore, {
+        taskFolderPath: "/fake-workspace/deleted-paused-task",
+      });
+
+      const reviewDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runReviewWithAI"
+      );
+      assert.strictEqual(
+        reviewDispatch,
+        undefined,
+        "must not dispatch a review for a resume that never actually succeeded"
+      );
+    } finally {
+      execCmd.restore();
       msgs.restore();
     }
   });

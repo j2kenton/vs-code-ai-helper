@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { ImplRecoveryV1, TaskStage } from "../types/taskProgress";
+import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
 import { normalizePath } from "./taskRoot";
 import { OperationKind } from "./operationTaxonomy";
@@ -783,6 +783,113 @@ export function hasActiveOperationTargetingStage(
  * carries no `implRecovery` record, falls back to the plain busy message
  * exactly as before.
  */
+/**
+ * Per-task guard for `armReleaseTriggeredContinuationRetryV1` below — at most
+ * one retry armed per task at a time, so repeated busy refusals for the same
+ * owed continuation while its blocker is still live (e.g. several UI actions
+ * clicked in the same window) do not stack up multiple duplicate re-dispatch
+ * listeners, all of which would otherwise fire the instant the blocker
+ * finally clears.
+ */
+const armedContinuationRetries = new Set<string>();
+
+/**
+ * wf10 item 11's release-triggered retry: when the busy guard refuses a
+ * dispatch while a continuation is owed and still `"pending"` (not yet
+ * claimed by a running round), arm a ONE-SHOT listener that re-dispatches the
+ * continuation itself the moment this task's exclusive lock is next
+ * released, instead of leaving the record to sit until
+ * `RECOVERY_TRANSITION_LEASE_MS` (10 minutes) expires and a sweep reclaims
+ * it.
+ *
+ * The observed incident (2026-08-21): the in-process hand-off
+ * (`scheduleAutomationChain`, fired the instant the round that needed
+ * recovery ended) lost a race against an unrelated sibling operation (Fast
+ * Forward Review) that was still finishing against the SAME task and had not
+ * yet released the exclusive lock — that sibling deregistered a fraction of
+ * a second later, but nothing was listening for it, so the continuation sat
+ * "pending" for the full ten-minute lease.
+ *
+ * Deliberately does NOT retry the specific command that was refused (this
+ * function has no way to know what that was — `showTaskBusyWarning` is
+ * called generically from many sites) and does NOT re-check the caller's
+ * intent. It always re-dispatches the canonical continuation command
+ * (`runImplementationWithAI` with `automationDispatch: true`), because that
+ * is the actual owed work regardless of which action happened to trip the
+ * busy guard — matching the shape of `implementationRecoveryV1.ts`'s own
+ * `finishDispatch`. Re-checks `dispatch === "pending"` at fire time (not just
+ * at arm time) so a continuation claimed or cleared by some other path in the
+ * meantime is not redundantly re-run.
+ *
+ * The continuation is NOT exempted from the busy guard itself — this only
+ * shortens the wait once the guard's blocker actually clears, it never lets
+ * the continuation bypass a lock still legitimately held (re-entrancy risk
+ * the plan explicitly calls out). The lease sweep (`scheduleTaskResume.ts`)
+ * remains as backstop if this listener itself never fires (e.g. the window
+ * closes before the blocker clears).
+ *
+ * **No-lost-wakeup:** this is called only after `showTaskBusyWarning`'s own
+ * async progress read resolves, so the blocking operation can already have
+ * deregistered DURING that read — before this function ever subscribes.
+ * `TaskOperationsRegistry.end()` removes the operation from the registry
+ * before firing `onDidEnd` (both synchronous, no await between them), so
+ * checking `getTaskOperations` immediately after subscribing below is
+ * exactly as current as the subscription itself: if the release already
+ * happened, that check sees the now-empty registry and fires right away
+ * instead of waiting on an `onDidEnd` event that has already come and gone
+ * (review-flagged, 2026-08-25 — the original fix only listened for a FUTURE
+ * release and missed exactly this window).
+ */
+function armReleaseTriggeredContinuationRetryV1(taskPath: string): void {
+  const key = taskKey(taskPath);
+  if (armedContinuationRetries.has(key)) {
+    return;
+  }
+  armedContinuationRetries.add(key);
+
+  const fire = (): void => {
+    armedContinuationRetries.delete(key);
+    void (async (): Promise<void> => {
+      try {
+        const strict = await readTaskProgressStrictV1(vscode.Uri.file(taskPath), {
+          expectedTaskFolder: path.basename(taskPath),
+        });
+        if (!strict.ok || strict.decoded.progress.implRecovery?.dispatch !== "pending") {
+          return; // Already claimed or cleared by another path — nothing owed anymore.
+        }
+      } catch {
+        // Best-effort re-check; fall through and let the command's own
+        // routing decide, matching every other best-effort read in this file.
+      }
+      void vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
+        taskFolderPath: taskPath,
+        automationDispatch: true,
+      });
+    })();
+  };
+
+  const sub = taskOperations.onDidEnd((snapshot) => {
+    if (snapshot.key !== key) {
+      return;
+    }
+    // A composite operation can end a CHILD while the root (and the
+    // exclusive lock) is still held — only fire once the task is fully free.
+    if (taskOperations.getTaskOperations(taskPath).length > 0) {
+      return;
+    }
+    sub.dispose();
+    fire();
+  });
+
+  // Closes the lost-wakeup window documented above: if the task is already
+  // free by the time we finish subscribing, the release we needed already
+  // happened and no future `onDidEnd` for it will ever come.
+  if (taskOperations.getTaskOperations(taskPath).length === 0) {
+    sub.dispose();
+    fire();
+  }
+}
+
 export async function showTaskBusyWarning(taskPath: string): Promise<void> {
   const label = taskOperations.busyLabel(taskPath) ?? "An operation";
   const genericMessage = `${label} is already in progress for this task. Please wait for it to finish.`;
@@ -813,6 +920,13 @@ export async function showTaskBusyWarning(taskPath: string): Promise<void> {
 
   const explained = describeOwedContinuationRefusalV1(record, pendingFiles, continuations);
   NotificationRouter.showInformation(explained);
+  if (record.dispatch === "pending" && continuations < MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
+    // Same branch describeOwedContinuationRefusalV1 already tells the user
+    // "will be retried automatically once any existing lease clears" for —
+    // this is what makes that true immediately instead of only after the
+    // lease's full 10-minute ceiling.
+    armReleaseTriggeredContinuationRetryV1(taskPath);
+  }
   try {
     await writeRunLog(
       vscode.Uri.file(taskPath),

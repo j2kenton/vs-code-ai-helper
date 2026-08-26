@@ -6,10 +6,16 @@
 export interface TaskMetadata<TUri extends { toString(): string } = { toString(): string }> {
   folderName: string;
   folderUri: TUri;
+  /** wf10 item 21: rendered as the picker label (with `folderName` as the
+   * description) instead of the unrecognizable folder id. Optional because
+   * a legacy record may not have one, in which case `folderName` is used as
+   * the label exactly as before. */
+  displayName?: string;
 }
 
 export interface PickerItem<TUri extends { toString(): string } = { toString(): string }> {
   label: string;
+  description?: string;
   task: TaskMetadata<TUri>;
 }
 
@@ -56,7 +62,11 @@ export function prepareArtifactPicker<TUri extends { toString(): string }>(
   }
 
   const items: PickerItem<TUri>[] = filteredTasks.map((task) => ({
-    label: task.folderName,
+    label: task.displayName ?? task.folderName,
+    // Only distinguish the folder id when it isn't already the label —
+    // avoids a redundant description repeating the label verbatim for a
+    // task with no separate display name.
+    description: task.displayName ? task.folderName : undefined,
     task,
   }));
 

@@ -34,6 +34,8 @@ import {
   verifyPlanItems,
 } from "../utils/completionLint";
 import { archiveTask, resumeArchivedTask } from "../commands/archiveTask";
+import { pinTask, unpinTask } from "../commands/pinTask";
+import { renameTask } from "../commands/renameTask";
 import { isMarkTaskDoneEligible, markTaskDone, selectNextTask } from "../commands/markTaskDone";
 import { readTaskProgressForTest as readTaskProgress, fixtureOwnershipFor } from "./taskFolderFixture";
 import { TaskInventory } from "../state/taskInventory";
@@ -514,6 +516,155 @@ void describe("pin cap across archive/resume", () => {
         `visible pinned count (${pinnedVisible.length}) must never exceed ${MAX_PINNED_TASKS}`
       );
     } finally {
+      msgs.restore();
+      rf.restore();
+      ws.restore();
+    }
+  });
+});
+
+void describe("pin/unpin bump updatedAt (wf10 item 8 completion blocker)", () => {
+  void it("pinTask bumps updatedAt on both the newly pinned task and any auto-unpinned oldest task", async () => {
+    const seed = async (name: string, progress: TaskProgress): Promise<string> => {
+      const folder = makeTaskFolder(name);
+      await fs.promises.writeFile(
+        path.join(folder, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      return folder;
+    };
+
+    const base: Omit<TaskProgress, "taskFolder"> = {
+      currentStage: "impl",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    } as Omit<TaskProgress, "taskFolder">;
+
+    const tasks: Array<{ canonicalId: string; taskFolderPath: string; progress: TaskProgress }> = [];
+    for (let i = 0; i < MAX_PINNED_TASKS; i++) {
+      const progress: TaskProgress = {
+        ...base,
+        taskFolder: `pin-updatedat-${i}`,
+        pinnedAt: `2026-03-0${(i % 9) + 1}T0${i % 10}:00:00.000Z`,
+      } as TaskProgress;
+      const folder = await seed(`pin-updatedat-${i}`, progress);
+      tasks.push({ canonicalId: folder, taskFolderPath: folder, progress });
+    }
+    const unpinnedProgress: TaskProgress = { ...base, taskFolder: "pin-updatedat-new" } as TaskProgress;
+    const newFolder = await seed("pin-updatedat-new", unpinnedProgress);
+    tasks.push({ canonicalId: newFolder, taskFolderPath: newFolder, progress: unpinnedProgress });
+
+    const inv = makeInventory(tasks);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const msgs = installMessageCapture();
+
+    try {
+      // Index 0 carries the earliest pinnedAt, so it is the one auto-unpinned
+      // when the cap is hit.
+      const oldestTask = tasks[0];
+      assert.ok(oldestTask, "precondition: at least one seeded pinned task");
+      const oldestFolder = oldestTask.taskFolderPath;
+
+      await pinTask(inv, { taskFolderPath: newFolder });
+
+      const oldestAfter = await readTaskProgress(vscode.Uri.file(oldestFolder));
+      assert.equal(oldestAfter?.pinnedAt, undefined, "the oldest pin must be auto-dropped at the cap");
+      assert.notEqual(
+        oldestAfter?.updatedAt,
+        "2026-01-01T00:00:00.000Z",
+        "auto-unpinning the oldest task is a user-visible change and must bump updatedAt"
+      );
+
+      const newAfter = await readTaskProgress(vscode.Uri.file(newFolder));
+      assert.ok(newAfter?.pinnedAt, "the requested task must now be pinned");
+      assert.notEqual(
+        newAfter?.updatedAt,
+        "2026-01-01T00:00:00.000Z",
+        "pinning a task is a user-visible change and must bump updatedAt"
+      );
+    } finally {
+      msgs.restore();
+      rf.restore();
+      ws.restore();
+    }
+  });
+
+  void it("unpinTask bumps updatedAt", async () => {
+    const progress: TaskProgress = {
+      taskFolder: "unpin-updatedat",
+      currentStage: "impl",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      pinnedAt: "2026-02-01T00:00:00.000Z",
+    } as TaskProgress;
+    const folder = makeTaskFolder("unpin-updatedat");
+    await fs.promises.writeFile(
+      path.join(folder, "task-progress.json"),
+      JSON.stringify(progress, null, 2),
+      "utf8"
+    );
+
+    const inv = makeInventory([{ canonicalId: folder, taskFolderPath: folder, progress }]);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const msgs = installMessageCapture();
+
+    try {
+      await unpinTask(inv, { taskFolderPath: folder });
+      const after = await readTaskProgress(vscode.Uri.file(folder));
+      assert.equal(after?.pinnedAt, undefined);
+      assert.notEqual(
+        after?.updatedAt,
+        "2026-01-01T00:00:00.000Z",
+        "unpinning is a user-visible change and must bump updatedAt"
+      );
+    } finally {
+      msgs.restore();
+      rf.restore();
+      ws.restore();
+    }
+  });
+
+  void it("manual renameTask bumps updatedAt", async () => {
+    const progress: TaskProgress = {
+      taskFolder: "rename-updatedat",
+      currentStage: "impl",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      displayName: "original name",
+      nameIsDefault: false,
+    } as TaskProgress;
+    const folder = makeTaskFolder("rename-updatedat");
+    await fs.promises.writeFile(
+      path.join(folder, "task-progress.json"),
+      JSON.stringify(progress, null, 2),
+      "utf8"
+    );
+
+    const inv = makeInventory([{ canonicalId: folder, taskFolderPath: folder, progress }]);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const msgs = installMessageCapture();
+    const win = vscode.window as unknown as { showInputBox: (...args: unknown[]) => unknown };
+    const origInputBox = win.showInputBox;
+    win.showInputBox = (): Promise<string> => Promise.resolve("renamed name");
+
+    try {
+      await renameTask(inv, { taskFolderPath: folder });
+      const after = await readTaskProgress(vscode.Uri.file(folder));
+      assert.equal(after?.displayName, "renamed name");
+      assert.notEqual(
+        after?.updatedAt,
+        "2026-01-01T00:00:00.000Z",
+        "renaming is a user-visible change and must bump updatedAt"
+      );
+    } finally {
+      win.showInputBox = origInputBox;
       msgs.restore();
       rf.restore();
       ws.restore();

@@ -17,6 +17,8 @@ If the "Final Plan" below is an implementation checklist (contains `<!-- ensembl
 
 Before producing the final summary, make sure the workspace files were actually changed. If you cannot write files, report that failure and the reason instead of claiming the implementation is complete.
 
+This project's generated-output locations are fixed: `dist/` is the build output (`tsconfig.json`), `out/` is the test-compile output (`tsconfig.test.json`) that the test runner reads from, and `.scratch/` is the sanctioned location for any one-off compile (e.g. a throwaway `tsc --outDir` check) that must not clobber `out/`. Never invent another output directory (e.g. `.test-out/`, `out-test/`) — an untracked path outside this vocabulary risks being swept into a commit by a broad `git add`.
+
 This run ends the moment you stop producing output — there is no second turn. If you launch a command in the background and end your response promising to report back once it finishes, that promise is discarded and the round is wasted: nothing re-invokes you to collect the result. Any command whose result the summary depends on (tests, builds, type-checks) must be run to completion and awaited inline before you write the summary.
 
 Do NOT create or edit a `plan-final.md` or `implementation.md` file at the repository root — those filenames are reserved there for the extension's own task-tracking artifacts (nested paths, e.g. `docs/implementation.md`, are unaffected and fine to touch if the plan calls for it). When you have finished all changes, output your summary as plain Markdown text in your final response (not written to any file):

@@ -3,8 +3,10 @@ import * as path from "path";
 import * as fs from "fs";
 import {
   DEFAULT_HIDDEN_STATUSES,
+  ImplRecoveryV1,
   IMPLEMENTATION_FILENAME,
   isReviewStage,
+  MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
@@ -346,6 +348,48 @@ function buildTaskTooltip(
 }
 
 /**
+ * Passive-case standing indicator for a task carrying an owed implementation
+ * continuation (`implRecovery.dispatch === "pending"`) with nothing currently
+ * running against the task (wf10 item 11's passive complement to the active
+ * busy-refusal explainer, `describeOwedContinuationRefusalV1`). Without this
+ * the row shows the plain active icon with no description, indistinguishable
+ * from a task with nothing owed, for the full length of the lease — the
+ * observed incident was a ten-minute "task looks dead" window with no visible
+ * cause. `undefined` once the record clears or is claimed (`dispatch`
+ * flips to `"dispatched"`), at which point the running-operation branches
+ * above this one already take over.
+ */
+export function describeOwedContinuationRowIndicatorV1(
+  implRecovery: ImplRecoveryV1 | undefined,
+  continuations: number
+): { description: string; iconId: string; colorId: string } | undefined {
+  if (!implRecovery || implRecovery.dispatch !== "pending") {
+    return undefined;
+  }
+  if (continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
+    // Mirrors describeOwedContinuationRefusalV1's budget-exhausted branch:
+    // automated recovery has stopped, so there is no "next attempt" time to
+    // show — the task needs a human decision instead.
+    return {
+      description: "Continuation owed — budget exhausted, needs your input",
+      iconId: "warning",
+      colorId: "charts.red",
+    };
+  }
+  const nextAttempt =
+    implRecovery.leaseUntil !== undefined
+      ? new Date(implRecovery.leaseUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : undefined;
+  return {
+    description: nextAttempt
+      ? `Continuation owed — next attempt ${nextAttempt}`
+      : "Continuation owed — retrying automatically",
+    iconId: "history",
+    colorId: "charts.yellow",
+  };
+}
+
+/**
  * Return the stable identity key for a task, used as `TreeItem.id` and for
  * matching against the persisted `CurrentTaskStore` value.
  *
@@ -495,10 +539,30 @@ export class TaskNode extends vscode.TreeItem {
         new vscode.ThemeColor("charts.green")
       );
     } else {
-      this.iconPath = new vscode.ThemeIcon(
-        "play-circle",
-        new vscode.ThemeColor("charts.blue")
-      );
+      // "Nothing currently running against it" (the indicator's own contract,
+      // see its doc comment) means ANY live operation for this task, not just
+      // the task-level one `taskLevelOp` above tracks — a stage-scoped round
+      // (e.g. an implementation round already in flight) must suppress the
+      // indicator too, even though it spins its own StageNode rather than
+      // this row. Review-flagged, 2026-08-25: `taskLevelOp` alone let this
+      // row show "Continuation owed" while a round was actively running.
+      // Mirrors `taskStatusBar.ts`'s `thisTaskHasLiveOperation` check.
+      const hasAnyRunningOperation = taskOperations.getTaskOperations(tKey).length > 0;
+      const owedIndicator = hasAnyRunningOperation
+        ? undefined
+        : describeOwedContinuationRowIndicatorV1(
+            task.progress.implRecovery,
+            task.progress.incompleteRoundContinuations ?? 0
+          );
+      if (owedIndicator) {
+        this.iconPath = new vscode.ThemeIcon(owedIndicator.iconId, new vscode.ThemeColor(owedIndicator.colorId));
+        this.description = owedIndicator.description;
+      } else {
+        this.iconPath = new vscode.ThemeIcon(
+          "play-circle",
+          new vscode.ThemeColor("charts.blue")
+        );
+      }
     }
 
     // Highlight current task: synthesize a `current-task:` URI so the
