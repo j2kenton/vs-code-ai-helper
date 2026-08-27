@@ -200,6 +200,10 @@ interface FakeRunResult {
    * reconciliation (production path, end to end)" describe block below).
    */
   appliedOperations?: { kind: string; path: string; contentExcerpt?: string }[];
+  /** See `AssembledPromptCaptureV1`/`AssembledPromptAttemptsV1` (runEditActionV1.ts). */
+  assembledPrompt?: { attemptId: string; prompt: string; promptSha256: string };
+  /** See `AssembledPromptAttemptsV1` — review fix, 2026-08-27 (Step 7, per-attempt cardinality). */
+  assembledPromptAttempts?: { attemptId: string; prompt: string; promptSha256: string }[];
 }
 
 function makeTaskFolder(
@@ -1961,6 +1965,143 @@ void describe("round-outcome classification (wf10 item 4 / Part 4)", () => {
     const persisted = readProgress(folderPath);
     assert.equal(persisted?.roundOutcomes?.length, MAX_ROUND_OUTCOMES);
     assert.equal(persisted?.roundOutcomes?.at(-1)?.classification, "edits-produced");
+  });
+});
+
+/**
+ * Review fix, 2026-08-27 (narrowed blocker: "Step 7 expressly requires
+ * coordinator-attempt identity, per-attempt cardinality, persistence at
+ * assembly time, and attempt-based lookup"). Before this fix,
+ * `executeImplementationRun` wrote exactly one prompt manifest per ROUND,
+ * built from whichever single `AssembledPromptCaptureV1` a mutable variable
+ * happened to hold last — so a round whose primary candidate failed and fell
+ * back to a secondary silently lost the primary's own captured prompt on
+ * disk. These tests drive the real production write path in
+ * reviewActions.ts (via the patched `runImplementationOrSealedV1` result,
+ * exactly as the sibling round-outcome tests above do) and assert on the
+ * actual files it wrote under runs/.
+ */
+void describe("prompt manifest per-attempt persistence (Step 7 review fix, 2026-08-27)", () => {
+  function readRunsDirFileNames(folderPath: string): string[] {
+    const runsDir = path.join(folderPath, "runs");
+    if (!fs.existsSync(runsDir)) {
+      return [];
+    }
+    return fs.readdirSync(runsDir).sort();
+  }
+
+  void it("writes one manifest+prompt pair per captured attempt, not one per round", async () => {
+    const { folderPath, progress } = makeTaskFolder("prompt_manifest_multi_attempt");
+    const primary = {
+      attemptId: "attempt-primary-0001",
+      prompt: "PRIMARY CANDIDATE PROMPT TEXT",
+      promptSha256: "sha-primary",
+    };
+    const secondary = {
+      attemptId: "attempt-secondary-0002",
+      prompt: "SECONDARY CANDIDATE PROMPT TEXT",
+      promptSha256: "sha-secondary",
+    };
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "copilot-lm",
+      providerLabel: "Copilot",
+      storedModelId: "copilot:test-model",
+      assembledPrompt: secondary,
+      assembledPromptAttempts: [primary, secondary],
+    });
+
+    const names = readRunsDirFileNames(folderPath);
+    const manifestNames = names.filter((n) => n.endsWith(".prompt-manifest.json"));
+    const promptNames = names.filter((n) => n.endsWith(".prompt.txt"));
+    assert.equal(manifestNames.length, 2, `expected one manifest per attempt, got: ${manifestNames.join(", ")}`);
+    assert.equal(promptNames.length, 2, `expected one retained prompt per attempt, got: ${promptNames.join(", ")}`);
+
+    // Review blocker, 2026-08-27 (third pass — "keeping the last attempt
+    // unsuffixed"): filenames are now derived purely from roundId/attemptId
+    // (promptManifestV1.ts), so EVERY captured attempt — including the one
+    // that actually completed — is named by its own attemptId. There is no
+    // longer an unsuffixed "last attempt" special case.
+    const secondaryManifest = manifestNames.find((n) => n.includes(`.attempt-${secondary.attemptId}.`));
+    assert.ok(secondaryManifest, "the secondary (completing) attempt must be retained under its own attempt-suffixed filename");
+    const secondaryManifestContent = JSON.parse(
+      fs.readFileSync(path.join(folderPath, "runs", secondaryManifest), "utf8")
+    ) as { attemptId?: string };
+    assert.equal(secondaryManifestContent.attemptId, secondary.attemptId);
+
+    // The earlier (overwritten-in-the-old-scheme) attempt is retained on
+    // disk with its own attemptId in both the filename and the manifest.
+    const primaryManifest = manifestNames.find((n) => n.includes(`.attempt-${primary.attemptId}.`));
+    assert.ok(primaryManifest, "the primary (earlier) attempt must be retained under its own attempt-suffixed filename");
+    const primaryManifestContent = JSON.parse(
+      fs.readFileSync(path.join(folderPath, "runs", primaryManifest), "utf8")
+    ) as { attemptId?: string };
+    assert.equal(primaryManifestContent.attemptId, primary.attemptId);
+
+    const primaryPromptText = fs.readFileSync(
+      path.join(folderPath, "runs", primaryManifest.replace(".prompt-manifest.json", ".prompt.txt")),
+      "utf8"
+    );
+    assert.equal(primaryPromptText, primary.prompt);
+  });
+
+  void it("a single-attempt round still names its manifest/prompt by that attempt's own attemptId", async () => {
+    const { folderPath, progress } = makeTaskFolder("prompt_manifest_single_attempt");
+    const only = {
+      attemptId: "attempt-only-0001",
+      prompt: "ONLY CANDIDATE PROMPT TEXT",
+      promptSha256: "sha-only",
+    };
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "copilot-lm",
+      providerLabel: "Copilot",
+      storedModelId: "copilot:test-model",
+      assembledPrompt: only,
+      assembledPromptAttempts: [only],
+    });
+
+    const names = readRunsDirFileNames(folderPath);
+    const manifestNames = names.filter((n) => n.endsWith(".prompt-manifest.json"));
+    assert.equal(manifestNames.length, 1);
+    // Review blocker, 2026-08-27 (third pass): a manifest that carries an
+    // attemptId always exposes it in the filename — no cardinality-based
+    // exception, single-attempt or otherwise.
+    assert.ok(manifestNames[0]!.includes(`.attempt-${only.attemptId}.`));
+    const content = JSON.parse(fs.readFileSync(path.join(folderPath, "runs", manifestNames[0]!), "utf8")) as {
+      attemptId?: string;
+    };
+    assert.equal(content.attemptId, only.attemptId);
+  });
+
+  void it("a round with NO captured coordinator attempt (CLI dispatch) is named by roundId alone", async () => {
+    const { folderPath, progress } = makeTaskFolder("prompt_manifest_no_attempt");
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "claude-cli",
+      providerLabel: "Claude Code",
+      storedModelId: "claude-code",
+      // No assembledPrompt/assembledPromptAttempts — this dispatch path
+      // never reaches the coordinator.
+    });
+
+    const names = readRunsDirFileNames(folderPath);
+    const manifestNames = names.filter((n) => n.endsWith(".prompt-manifest.json"));
+    assert.equal(manifestNames.length, 1);
+    assert.ok(!manifestNames[0]!.includes(".attempt-"), "a CLI dispatch has no coordinator attemptId to suffix with");
+    const content = JSON.parse(fs.readFileSync(path.join(folderPath, "runs", manifestNames[0]!), "utf8")) as {
+      attemptId?: string;
+    };
+    assert.equal(content.attemptId, undefined);
   });
 });
 
@@ -4169,7 +4310,22 @@ function fakeHex128IdV1(seed: string): string {
 
 void describe("a rejected degenerate review flows through PRODUCTION routing to an automatic second dispatch (Part 5 step 15, causal end-to-end)", () => {
   void it("routeReviewOutcomeV1's real 'advance' conditional dispatches the configured backup with no test-side manual chaining", async () => {
-    const { folderPath, folderUri } = makeTaskFolder("degenerate-causal-e2e-production-routing");
+    // Seed the round-ledger row `claimReviewAttempt` would have opened for
+    // this attempt in production — `terminalizeRoundV1` (the sole writer of
+    // the `roundOutcomes` classification recorded below) only writes when it
+    // can resolve a matching row.
+    const { folderPath, folderUri } = makeTaskFolder("degenerate-causal-e2e-production-routing", {
+      roundLedger: [
+        {
+          roundId: "attempt-degenerate-causal-e2e-00000001",
+          attemptIds: ["attempt-degenerate-causal-e2e-00000001"],
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          state: "open",
+        },
+      ],
+    });
     // Round 2's real automatic dispatch goes through runReviewForFolder,
     // which requires a non-empty plan.md (resolveCurrentPlanUri) in addition
     // to makeTaskFolder's plan-final.md — same precondition as the "two real

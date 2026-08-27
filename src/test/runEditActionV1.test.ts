@@ -574,6 +574,36 @@ void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs provid
     const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
     assert.equal(result.status, "cancelled");
   });
+
+  // Review fix, 2026-08-27 (narrowed blocker 1): this was the one branch of
+  // describeEditActionOutcomeFailureV1 that accepted `assembledPrompt` as a
+  // parameter and then silently dropped it — a preflight that captured its
+  // prompt and was then cancelled had no retained evidence of what it saw.
+  void it("carries a captured assembledPrompt through on a cancelled outcome", () => {
+    const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
+    const assembledPrompt = { attemptId: "attempt-1", prompt: "rendered text", promptSha256: "abc123" };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm", assembledPrompt);
+    assert.equal(result.status, "cancelled");
+    assert.deepEqual(result.assembledPrompt, assembledPrompt);
+  });
+
+  // Review fix, 2026-08-27 (narrowed blocker 1, Step 7): a mutable
+  // single-value capture overwrote earlier attempts on a fallback/retry.
+  // describeEditActionOutcomeFailureV1 must thread the FULL per-attempt list
+  // through unmodified alongside the singular `assembledPrompt`, so a round
+  // that fell back from a failed primary to a working secondary keeps both.
+  void it("carries assembledPromptAttempts through on a cancelled outcome, in addition to the singular assembledPrompt", () => {
+    const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
+    const primary = { attemptId: "attempt-primary", prompt: "primary text", promptSha256: "aaa" };
+    const secondary = { attemptId: "attempt-secondary", prompt: "secondary text", promptSha256: "bbb" };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm", secondary, [
+      primary,
+      secondary,
+    ]);
+    assert.equal(result.status, "cancelled");
+    assert.deepEqual(result.assembledPrompt, secondary);
+    assert.deepEqual(result.assembledPromptAttempts, [primary, secondary]);
+  });
 });
 
 // Workflow-robustness Part 5 item 5: a successful sealed edit only ever

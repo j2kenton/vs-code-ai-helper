@@ -861,7 +861,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       try {
         await startNewTask(makeInventoryStub(), vscode.Uri.file("/extension"), makeStoreStub(oldFolder.fsPath));
-        const claim = await claimReviewAttempt(oldFolder, "review-attempt-after-new-task");
+        const claim = await claimReviewAttempt(oldFolder, "review-attempt-after-new-task", "plan-high-review");
         assert.equal(claim?.status, "active");
         assert.equal(claim?.reviewAttemptId, "review-attempt-after-new-task");
         assert.equal(

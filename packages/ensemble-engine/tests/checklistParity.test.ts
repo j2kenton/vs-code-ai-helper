@@ -446,17 +446,18 @@ test("progress marker parse agrees with the extension", () => {
 test("checklist reconciliation agrees with the extension (checklist authority)", () => {
   const cases: Array<{
     progress: { complete: number; total: number } | null;
-    checklist: { total: number; checked: number; remaining: number; excluded: number } | undefined;
+    checklist: { total: number; settled: number; remaining: number } | undefined;
   }> = [
     // The 47-item plan vs a narrowed 5/5 marker (the historical failure).
-    { progress: { complete: 5, total: 5 }, checklist: { total: 47, checked: 6, remaining: 41, excluded: 0 } },
+    { progress: { complete: 5, total: 5 }, checklist: { total: 47, settled: 6, remaining: 41 } },
     // Fully ticked checklist does NOT override a marker reporting work left.
-    { progress: { complete: 3, total: 5 }, checklist: { total: 4, checked: 4, remaining: 0, excluded: 0 } },
-    { progress: null, checklist: { total: 4, checked: 1, remaining: 3, excluded: 0 } },
+    { progress: { complete: 3, total: 5 }, checklist: { total: 4, settled: 4, remaining: 0 } },
+    { progress: null, checklist: { total: 4, settled: 1, remaining: 3 } },
     { progress: null, checklist: undefined },
     { progress: { complete: 2, total: 4 }, checklist: undefined },
-    // An excluded-item denominator is exactly like any other narrower total.
-    { progress: { complete: 4, total: 4 }, checklist: { total: 5, checked: 4, remaining: 1, excluded: 2 } },
+    // Items closed-without-doing (excluded) are settled just like checked items,
+    // against a fixed denominator that never shrinks.
+    { progress: { complete: 4, total: 4 }, checklist: { total: 7, settled: 6, remaining: 1 } },
   ];
   for (const { progress, checklist } of cases) {
     assert.deepEqual(

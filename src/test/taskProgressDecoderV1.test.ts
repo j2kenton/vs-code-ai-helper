@@ -163,6 +163,37 @@ void describe("taskProgressDecoderV1", () => {
     );
   });
 
+  void it("decodes a roundOutcomes entry's optional originatingReviewStage and fails closed on an unrecognized value (review fix — Step 11 narrowed blocker 2)", () => {
+    const valid = {
+      stage: "impl",
+      classification: "genuine-no-op",
+      at: "2026-07-02T11:00:00.000Z",
+      dispatchMode: "implementation",
+      originatingReviewStage: "impl-high-review",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [valid] })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.roundOutcomes, [valid]);
+    }
+    // Rows written before this field existed decode fine without it.
+    const withoutField = { ...valid };
+    delete (withoutField as Record<string, unknown>)["originatingReviewStage"];
+    const resultWithout = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [withoutField] })
+    );
+    assert.equal(resultWithout.ok, true);
+    if (resultWithout.ok) {
+      assert.deepEqual(resultWithout.decoded.progress.roundOutcomes, [withoutField]);
+    }
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, roundOutcomes: [{ ...valid, originatingReviewStage: "bogus" }] }),
+      "invalidFieldValue"
+    );
+  });
+
   void it("decodes implRecovery's optional sourceDispatchMode/sourceReviewStage and fails closed on unrecognized values (item 17b — Part 2 step 6)", () => {
     const base = {
       sourceAttemptId: "impl-recovery-1",

@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import {
   EscalationKind,
+  IMPL_REVIEW_STAGES,
+  ImplementationDispatchModeV1,
   PLAN_FILENAME,
+  RoundOutcomeEntryV1,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
@@ -48,6 +51,112 @@ export interface ReviewPlateauEvidenceV1 {
   readonly content: string;
   readonly blockers: readonly ReviewBlocker[];
   readonly taskFixableCount: number;
+  /**
+   * `TaskProgress.roundOutcomes` for THIS stage, oldest-first, exactly as
+   * recorded (item 17's `RoundOutcomeEntryV1.dispatchMode`) — not yet reduced
+   * to "last N". Supplied by the caller because it already has the freshly
+   * patched `TaskProgress` in hand; {@link recentDispatchModesForStageV1}
+   * does the stage-filtering/windowing here so every call site does not have
+   * to repeat it. Absent (older call sites, or a caller with no `TaskProgress`
+   * handy) simply omits the evidence line below — a plateau escalation must
+   * never fail to post for lack of this.
+   */
+  readonly stageRoundOutcomes?: readonly RoundOutcomeEntryV1[];
+}
+
+/** Last `limit` `dispatchMode`s recorded for `stage`, oldest-first, from
+ * `TaskProgress.roundOutcomes` — the evidence a plateau escalation needs to
+ * tell a DISPATCH plateau (the loop kept choosing Implementation against a
+ * blocker only Apply Review can fix — see `detectPlateau`'s doc comment) from
+ * a genuine WORK plateau apart. `undefined` entries (rows written before
+ * `dispatchMode` existed) render as `"unknown"` rather than being dropped, so
+ * the count of rounds shown still matches what actually ran.
+ *
+ * **Review blocker, 2026-08-26.** A zero-change/gate implementation round is
+ * deliberately bookkept under the literal stage `"impl"` regardless of which
+ * impl-review stage the task is currently displaying — see the
+ * `appendRoundOutcome` call sites in `reviewActions.ts` (`gateStage`/
+ * `implBookkeepingStage`), which exist so the fallback-provider breaker and
+ * candidate-skip machinery can find a round dispatched while the task sits
+ * on a review stage. A plain `entry.stage === stage` filter therefore made
+ * every such round invisible to an `impl-high-review`/`impl-low-review`
+ * card's "recent dispatch modes" evidence — undercounting exactly the rounds
+ * most likely to show a dispatch plateau. For either impl-review stage, also
+ * match rows stored under `"impl"`, merged back into the same chronological
+ * (not `.slice(-limit)`-per-stage) window.
+ *
+ * **Review fix, 2026-08-27 (narrowed blocker 2).** A literal-"impl" row now
+ * carries `originatingReviewStage` naming which of the two impl-review
+ * stages was actually active when it was dispatched (see the comment on
+ * `RoundOutcomeEntryV1.originatingReviewStage`). A literal-"impl" row is
+ * merged into `stage`'s evidence only when `originatingReviewStage` is
+ * either absent (older rows written before this field existed — kept
+ * visible rather than silently dropped, matching this function's existing
+ * policy of rendering an unknown `dispatchMode` as `"unknown"` instead of
+ * excluding the round) or equal to `stage` — never when it names the OTHER
+ * impl-review stage. This is what stops an `impl-low-review` plateau card
+ * from absorbing a round that ran while the task displayed
+ * `impl-high-review`, and vice versa. */
+function mergedRecentDispatchEntriesForStageV1(
+  roundOutcomes: readonly RoundOutcomeEntryV1[] | undefined,
+  stage: TaskStage,
+  limit: number
+): readonly {
+  readonly dispatchMode: ImplementationDispatchModeV1 | undefined;
+  /** True when this entry is a literal-"impl" row merged into `stage`'s
+   * evidence solely because it predates `originatingReviewStage` (an older
+   * row, absent the field) — its true stage cannot be determined, so it is
+   * shown in BOTH impl-review stages' evidence rather than either. */
+  readonly originAmbiguous: boolean;
+}[] {
+  const isImplReviewStage = IMPL_REVIEW_STAGES.includes(stage);
+  const matchesStage = isImplReviewStage
+    ? (entry: RoundOutcomeEntryV1): boolean =>
+        entry.stage === stage ||
+        (entry.stage === "impl" &&
+          (entry.originatingReviewStage === undefined || entry.originatingReviewStage === stage))
+    : (entry: RoundOutcomeEntryV1): boolean => entry.stage === stage;
+  return (roundOutcomes ?? [])
+    .filter(matchesStage)
+    .slice(-limit)
+    .map((entry) => ({
+      dispatchMode: entry.dispatchMode,
+      originAmbiguous:
+        isImplReviewStage && entry.stage === "impl" && entry.originatingReviewStage === undefined,
+    }));
+}
+
+export function recentDispatchModesForStageV1(
+  roundOutcomes: readonly RoundOutcomeEntryV1[] | undefined,
+  stage: TaskStage,
+  limit = 5
+): readonly (ImplementationDispatchModeV1 | undefined)[] {
+  return mergedRecentDispatchEntriesForStageV1(roundOutcomes, stage, limit).map(
+    (entry) => entry.dispatchMode
+  );
+}
+
+/**
+ * True when {@link recentDispatchModesForStageV1}'s evidence window for
+ * `stage` includes at least one literal-"impl" row recorded before
+ * `originatingReviewStage` existed. That row's dispatch mode is merged into
+ * BOTH impl-review stages' evidence (see the function above) because which
+ * one it actually ran under cannot be determined from the data — a plateau
+ * card's reader could otherwise mistake a mixed-origin count for a clean
+ * same-stage history. Review blocker, 2026-08-27 (narrowed blocker 2):
+ * "existing task history can still appear in both stage-specific evidence
+ * windows without any indication that its origin is unknown" — this is the
+ * indication; the merge policy itself (kept-visible over silently-excluded)
+ * is unchanged and remains the documented, deliberate behavior.
+ */
+export function recentDispatchModesIncludeAmbiguousOriginV1(
+  roundOutcomes: readonly RoundOutcomeEntryV1[] | undefined,
+  stage: TaskStage,
+  limit = 5
+): boolean {
+  return mergedRecentDispatchEntriesForStageV1(roundOutcomes, stage, limit).some(
+    (entry) => entry.originAmbiguous
+  );
 }
 
 function nextStageInOrderV1(stage: TaskStage): TaskStage | undefined {
@@ -432,6 +541,37 @@ async function postReviewPlateauDecisionV1(
               ", so this needs a human decision or action, not more automated iteration.",
           };
 
+  // Item 18 / review blocker (2026-08-26): a frozen `taskFixableCount` while
+  // every recent round dispatched as `implementation` is a DISPATCH plateau
+  // (Implementation only reads the checklist, so it structurally cannot move
+  // the count — see `detectPlateau`'s doc comment), not evidence the problem
+  // itself resists every action tried. Surfacing the modes lets the human
+  // reading this card tell the two apart at a glance instead of having to
+  // dig through run logs.
+  const recentModes = recentDispatchModesForStageV1(evidence.stageRoundOutcomes, stage);
+  // Review blocker, 2026-08-27 (narrowed blocker 2, second half): flag when
+  // this window includes a legacy round whose true impl-review stage is
+  // unknown — see `recentDispatchModesIncludeAmbiguousOriginV1`'s doc
+  // comment. Without this, a mixed-origin count read as a clean same-stage
+  // history with no indication otherwise.
+  const hasAmbiguousOriginModes = recentDispatchModesIncludeAmbiguousOriginV1(
+    evidence.stageRoundOutcomes,
+    stage
+  );
+  const dispatchModeEvidence =
+    recentModes.length > 0
+      ? [
+          {
+            label: "Recent dispatch modes (oldest → newest)",
+            detail:
+              recentModes.map((mode) => mode ?? "unknown").join(", ") +
+              (hasAmbiguousOriginModes
+                ? " — includes round(s) recorded before per-stage attribution existed; their true impl-review stage is unknown, so they are shown here and in the other impl-review stage's evidence alike"
+                : ""),
+          },
+        ]
+      : [];
+
   const decision = await postWorkflowDecisionV1(
     {
       decisionKey: "reviewPlateauEscalation",
@@ -448,7 +588,7 @@ async function postReviewPlateauDecisionV1(
         `${normalized.blockers.length} remaining blocker(s) are task-fixable.`,
       options,
       recommendation,
-      evidence: [{ label: "What clears this", detail: clearingNote }],
+      evidence: [{ label: "What clears this", detail: clearingNote }, ...dispatchModeEvidence],
       gating: {
         holdsTaskPaused: true,
         unblocksProgress: true,

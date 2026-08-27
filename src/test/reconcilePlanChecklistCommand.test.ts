@@ -487,7 +487,7 @@ void describe("reconcilePlanChecklist — confirmation", () => {
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
     assert.match(
       modal,
-      /reads 1\/2 items complete/,
+      /reads 1\/2 items settled/,
       "the decision must state the counts the user is approving"
     );
     assert.match(modal, /1 outstanding/);

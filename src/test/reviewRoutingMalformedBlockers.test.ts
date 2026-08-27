@@ -176,7 +176,28 @@ void describe("handleReviewRoutingOutcome — degenerate rejection records round
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
     const folderUri = makeTaskFolderUri("degenerate-review-round");
-    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-degenerate" }));
+    // Seed the round-ledger row `claimReviewAttempt` would have opened before
+    // dispatching this review round in production — `terminalizeRoundV1`
+    // (called below via `handleReviewRoutingOutcome`'s degenerate-rejection
+    // branch) is the sole writer of `roundOutcomes`/`reviewRejections` for
+    // this path now, and only writes when it can resolve a matching row.
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({
+        reviewAttemptId: "attempt-degenerate",
+        roundLedger: [
+          {
+            roundId: "attempt-degenerate",
+            attemptIds: ["attempt-degenerate"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open",
+          },
+        ],
+      })
+    );
 
     const content = "I read the file but it kept truncating, so here is my current blocker instead.";
 
@@ -257,7 +278,23 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
       },
     });
     const folderUri = makeTaskFolderUri("degenerate-advances-to-backup");
-    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-advance" }));
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({
+        reviewAttemptId: "attempt-advance",
+        roundLedger: [
+          {
+            roundId: "attempt-advance",
+            attemptIds: ["attempt-advance"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open",
+          },
+        ],
+      })
+    );
 
     const content = "I read the file but it kept truncating, so here is my current blocker instead.";
 
@@ -315,7 +352,23 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
     const folderUri = makeTaskFolderUri("degenerate-causal-redispatch");
     const workspaceUri = vscode.Uri.file(TEST_ROOT);
     const extensionUri = vscode.Uri.file(path.join(TEST_ROOT, "ext"));
-    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-causal" }));
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({
+        reviewAttemptId: "attempt-causal",
+        roundLedger: [
+          {
+            roundId: "attempt-causal",
+            attemptIds: ["attempt-causal"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open",
+          },
+        ],
+      })
+    );
 
     const content = "I read the file but it kept truncating, so here is my current blocker instead.";
     const dispatchCalls: string[] = [];
@@ -388,6 +441,10 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
     const folderUri = makeTaskFolderUri("degenerate-chain-exhausted");
     // The primary already failed degenerate this same episode — the only
     // configured backup (claude-cli:sonnet) is now itself the one failing.
+    // Also seed the round-ledger row `claimReviewAttempt` would have opened
+    // for THIS round's attempt, since `terminalizeRoundV1` only records the
+    // `roundOutcomes` classification for a resolvable row (see the sibling
+    // test above).
     seedProgress(
       store,
       folderUri,
@@ -400,6 +457,16 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
             attemptId: "attempt-prior",
             at: "2026-01-01T00:00:00.000Z",
             modelId: "codex-cli:gpt-5.6",
+          },
+        ],
+        roundLedger: [
+          {
+            roundId: "attempt-exhausted",
+            attemptIds: ["attempt-exhausted"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open",
           },
         ],
       })
@@ -438,7 +505,23 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
       },
     });
     const folderUri = makeTaskFolderUri("degenerate-manual-retry");
-    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-manual" }));
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({
+        reviewAttemptId: "attempt-manual",
+        roundLedger: [
+          {
+            roundId: "attempt-manual",
+            attemptIds: ["attempt-manual"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open",
+          },
+        ],
+      })
+    );
 
     const content = "I read the file but it kept truncating, so here is my current blocker instead.";
 

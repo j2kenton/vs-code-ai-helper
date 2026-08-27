@@ -392,6 +392,29 @@ export interface TaskProgress {
    */
   roundOutcomes?: RoundOutcomeEntryV1[];
   /**
+   * The sole lifecycle authority for a round, start to end (wf "make the
+   * stage chat a record of work" Part 4 / item 1): every round the task ever
+   * starts gets exactly one row here, created either from a scheduling
+   * intent (`roundId = intentId`, `state: "scheduled"`) or from the
+   * coordinator's manual-dispatch `operationId` (`state: "open"`), and ended
+   * exactly once by `terminalizeRoundV1` (`roundLedgerV1.ts`) — the only
+   * function that may write a terminal `state` here. Distinct from
+   * `roundOutcomes` above: that is a CLASSIFICATION record the fallback
+   * breaker and degenerate-review advance read, written only for rounds that
+   * reach completion accounting; this is a LIFECYCLE record covering every
+   * round regardless of how it ends, including ones `roundOutcomes` never
+   * sees (a scheduled round that is dropped before dispatch, a review round,
+   * a round terminalized on cancellation or quota-park). A terminalized
+   * round that also has a classification carries it under
+   * `outcome.roundOutcomeAttemptId`, pointing at the corresponding
+   * `roundOutcomes` entry rather than duplicating its fields. Capped at
+   * MAX_ROUND_LEDGER_ENTRIES (oldest dropped first, but never a row still
+   * `"scheduled"`/`"open"` while a newer row is being dropped — the
+   * reconciliation sweep is expected to close orphans before the cap ever
+   * has to choose between an open row and eviction in practice).
+   */
+  roundLedger?: RoundLedgerEntryV1[];
+  /**
    * Set when automated review iteration determined it cannot make further
    * progress on its own and needs a human decision. Cleared on the next
    * stage transition and whenever the user explicitly resumes iteration.
@@ -605,6 +628,22 @@ export type ImplementationDispatchModeV1 =
   | "implementation"
   | "apply-review"
   | "continuation";
+
+/**
+ * `RoundLedgerEntryV1.mode`'s value space — a strict superset of
+ * `ImplementationDispatchModeV1`. The round ledger (unlike `roundOutcomes`,
+ * `implRecovery`'s `sourceDispatchMode`, or the run-log `Mode:` line, all of
+ * which describe only `impl`-stage rounds) also carries rows for rounds run
+ * AT a review stage (`impl-high-review`, `impl-low-review`, and the plan
+ * review stages) — an AI reviewer round is not "dispatched from" a checklist
+ * or a review the way an implementation round is, so none of
+ * `ImplementationDispatchModeV1`'s three values fit it. `"review"` is that
+ * fourth case. Kept as its own type, rather than adding `"review"` to
+ * `ImplementationDispatchModeV1` itself, so the OTHER fields typed
+ * `ImplementationDispatchModeV1` (which are genuinely implementation-only)
+ * cannot silently accept a value that would be meaningless there.
+ */
+export type RoundLedgerModeV1 = ImplementationDispatchModeV1 | "review";
 
 /** `TaskProgress.implRecovery` — one owed recovery continuation. */
 export interface ImplRecoveryV1 {
@@ -941,10 +980,140 @@ export interface RoundOutcomeEntryV1 {
    * rows predate the distinction entirely.
    */
   dispatchMode?: ImplementationDispatchModeV1;
+  /**
+   * Review fix, 2026-08-27 (narrowed blocker 2 on Step 11): the impl-review
+   * stage the task actually displayed when this round was dispatched, set
+   * ONLY on rows bookkept under the literal `stage: "impl"` while the task
+   * was really sitting on `impl-high-review`/`impl-low-review` (see the
+   * `gateStage`/`zeroChangeStage` comments in `reviewActions.ts` — that
+   * literal-"impl" bookkeeping exists so the fallback breaker resolves its
+   * model/quota chain correctly, but it otherwise loses which review stage
+   * was active). `recentDispatchModesForStageV1` uses this to keep an
+   * `impl-high-review` plateau card's evidence from absorbing rounds that
+   * actually ran while the task was at `impl-low-review`, and vice versa.
+   * Absent for every row NOT bookkept under literal "impl" (its own `stage`
+   * is already correct there) and for rows written before this field
+   * existed — both cases fall back to matching the row's own `stage`, never
+   * treated as a match for a review stage this field doesn't name.
+   */
+  originatingReviewStage?: TaskStage;
 }
 
 /** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */
 export const MAX_ROUND_OUTCOMES = 50;
+
+/** Cap on `TaskProgress.roundLedger` length (oldest TERMINAL rows dropped first). */
+export const MAX_ROUND_LEDGER_ENTRIES = 200;
+
+/** `TaskProgress.roundLedger`'s lifecycle states — a strict superset of the
+ * five-value scheduling-posture vocabulary the task tree already renders
+ * (running / scheduled / owed-but-will-not-retry / waiting-for-you /
+ * unknown): `"scheduled"` and `"open"` are the two live states; every other
+ * value is terminal and, once set, may never change (see
+ * `terminalizeRoundV1`'s idempotency contract). */
+export type RoundLedgerStateV1 =
+  | "scheduled"
+  | "open"
+  | "completed"
+  | "rejected"
+  | "cancelled"
+  | "failed"
+  | "quota-blocked"
+  | "dropped"
+  | "interrupted";
+
+/** The durable outcome recorded on a terminalized `RoundLedgerEntryV1` — the
+ * facts a chat outcome message renders (files changed, a review's score and
+ * blocker split, a rejection's reason), never a duplicate of the full review
+ * or run-log content itself. */
+export interface RoundLedgerOutcomeV1 {
+  /** Paths changed by this round, when known. Omitted (not empty) when the
+   * round never reached a point where a change set could be enumerated. */
+  filesChanged?: readonly string[];
+  /** True when a round DID change files but the exact set could not be
+   * enumerated — distinct from `filesChanged` being empty (no changes). */
+  filesChangedUnknown?: boolean;
+  /** A review round's score out of 10, when this row is a review. */
+  score?: number;
+  /** A review round's blocker count actually raised by the reviewer
+   * (excludes mechanical/superseded blockers — see item 12's `origin` split
+   * and item 18's `supersededBlockers`). */
+  reviewerBlockers?: number;
+  /** A review round's blocker count synthesized from failing checks
+   * (`origin: "mechanical"`). */
+  mechanicalBlockers?: number;
+  /** Why a round's summary was rejected, for `state: "rejected"`. */
+  rejectionReason?: string;
+  /** True when ending this round left a recovery continuation owed —
+   * the source round is terminal even though the work is not finished; the
+   * lease wait itself is represented by the task's scheduling posture, never
+   * by a second open ledger row (see `TaskProgress.roundLedger`'s doc
+   * comment). */
+  continuationOwed?: boolean;
+  /** Workspace-relative path of this round's run log, when one was written. */
+  runLogPath?: string;
+  /** Correlates this row with its `TaskProgress.roundOutcomes` classification
+   * entry (matched by `attemptId`), when this round also went through
+   * completion accounting — avoids duplicating those fields here. */
+  roundOutcomeAttemptId?: string;
+  /**
+   * Headings of `## Accepted Non-Goals` entries this review round re-raised a
+   * blocker against (item 18, plan step 11: "write a ledger outcome line
+   * when a review re-raises a blocker matching a non-goal"). Mirrors
+   * `ReviewScoreHistoryEntry.reviewerChallengedNonGoal[].nonGoalHeading` —
+   * headings only, since the ledger outcome is a short renderable summary,
+   * not a duplicate of the full history entry (which carries the blocker
+   * lineage id too).
+   */
+  reviewerChallengedNonGoal?: readonly string[];
+}
+
+/**
+ * One row of `TaskProgress.roundLedger` — the sole lifecycle record of one
+ * round, from its scheduled/open start to its terminal end. See the field's
+ * own doc comment on `TaskProgress` for what distinguishes this from
+ * `roundOutcomes`.
+ */
+export interface RoundLedgerEntryV1 {
+  /** This row's own stable identity — the scheduling intent id for a row
+   * created from an auto-start announcement, or the coordinator's
+   * `operationId` for a row created from a manual/tracked dispatch. Never
+   * reassigned once set. */
+  roundId: string;
+  /** The scheduling intent that announced this round, when it was
+   * auto-started. Absent for a manually dispatched round. */
+  intentId?: string;
+  /** The coordinator's `operationId` for this round, attached once the
+   * coordinator actually starts the operation (flips `state` from
+   * `"scheduled"` to `"open"` in the same patch). Absent while still merely
+   * `"scheduled"`. */
+  operationId?: string;
+  /** Every coordinator `attemptId` this round's operation allocated —
+   * the initial attempt, any item-14 same-candidate retry, any fallback
+   * candidate, and any transport-retry attempt. `resolveRoundV1` matches
+   * against every entry, so a round may be looked up by any attempt it ever
+   * made. */
+  attemptIds: string[];
+  /** This row's own `roundId` when this round is a recovery continuation OF
+   * another round — the source round is itself terminal (`rejected`/
+   * `failed`/`interrupted` with `outcome.continuationOwed: true`) by the time
+   * this row exists; see `TaskProgress.roundLedger`'s doc comment. */
+  continuationOf?: string;
+  /** The stage this round ran against. */
+  stage: TaskStage;
+  /** What this round was dispatched to work from. */
+  mode: RoundLedgerModeV1;
+  /** ISO timestamp this row was created. */
+  startedAt: string;
+  /** Current lifecycle state — `"scheduled"`/`"open"` while live, one of the
+   * seven terminal values once `terminalizeRoundV1` has run. */
+  state: RoundLedgerStateV1;
+  /** ISO timestamp `terminalizeRoundV1` set the terminal `state`. Absent
+   * while `state` is `"scheduled"`/`"open"`. */
+  endedAt?: string;
+  /** Set only once `state` is terminal. */
+  outcome?: RoundLedgerOutcomeV1;
+}
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */
 export const MAX_REVIEW_BLOCKER_IDENTITIES = 32;

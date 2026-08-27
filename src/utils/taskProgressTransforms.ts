@@ -17,10 +17,12 @@ import {
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
+  RoundLedgerEntryV1,
   RoundOutcomeEntryV1,
   TaskEscalation,
   STAGE_ORDER,
@@ -550,6 +552,68 @@ export function appendRoundOutcome(
   return {
     ...progress,
     roundOutcomes: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Look up one `TaskProgress.roundLedger` row by ANY identity it carries —
+ * its own `roundId`, the scheduling `intentId` that announced it, the
+ * coordinator `operationId` that ran it, or any one of its `attemptIds`
+ * (the initial attempt, an item-14 retry, a fallback candidate, or a
+ * transport retry). This is what lets `ImplRecoveryV1.sourceAttemptId` and
+ * `RoundOutcomeEntryV1.attemptId` both resolve to the same row without
+ * either caller needing to know which identity it originally had in hand.
+ * Pure; callers needing the row's INDEX (to replace it) use
+ * `upsertRoundLedgerEntryV1` instead.
+ */
+export function resolveRoundV1(
+  progress: TaskProgress,
+  id: string
+): RoundLedgerEntryV1 | undefined {
+  return (progress.roundLedger ?? []).find(
+    (entry) =>
+      entry.roundId === id ||
+      entry.intentId === id ||
+      entry.operationId === id ||
+      entry.attemptIds.includes(id)
+  );
+}
+
+/**
+ * Insert or replace one `TaskProgress.roundLedger` row, matched by
+ * `roundId` — the identity that never changes once a row is created (see
+ * `RoundLedgerEntryV1.roundId`'s doc comment). Capped at
+ * `MAX_ROUND_LEDGER_ENTRIES`: when over cap, the OLDEST rows already in a
+ * terminal state are dropped first, front to back, before ever considering
+ * dropping a `"scheduled"`/`"open"` row — a live round's own record must
+ * never be silently evicted out from under it. If every row is still live
+ * (pathological — the reconciliation sweep exists precisely so this does
+ * not happen in practice), the array is left over cap rather than dropping
+ * a live round's record.
+ */
+export function upsertRoundLedgerEntryV1(
+  progress: TaskProgress,
+  entry: RoundLedgerEntryV1
+): TaskProgress {
+  const existing = progress.roundLedger ?? [];
+  const index = existing.findIndex((row) => row.roundId === entry.roundId);
+  const next = index === -1
+    ? [...existing, entry]
+    : existing.map((row, i) => (i === index ? entry : row));
+  let trimmed = next;
+  while (trimmed.length > MAX_ROUND_LEDGER_ENTRIES) {
+    const dropIndex = trimmed.findIndex((row) => row.state !== "scheduled" && row.state !== "open");
+    if (dropIndex === -1) {
+      // Every remaining row is still live — cannot drop any without losing
+      // a live round's record; leave the array over cap rather than do so.
+      break;
+    }
+    trimmed = [...trimmed.slice(0, dropIndex), ...trimmed.slice(dropIndex + 1)];
+  }
+  return {
+    ...progress,
+    roundLedger: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

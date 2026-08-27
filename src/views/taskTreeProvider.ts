@@ -38,6 +38,7 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 import {
+  formatChecklistPercentV1,
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
@@ -709,10 +710,19 @@ export class StageNode extends vscode.TreeItem {
           // verdict on the current workspace. No "current" status word in the
           // text — the arrow icon already says that; only information the
           // icon cannot carry (score/steps, staleness, escalation) renders.
+          //
+          // wf "make the stage chat a record of work", Part 5 / item 6: a
+          // percentage over a MOVING denominator was worse than the raw
+          // fraction it replaced, because it discarded the very information
+          // that explained its own movement. Now that the denominator is
+          // fixed (implementationChecklist.ts's `ChecklistProgressV1`), the
+          // percentage is a faithful "how far along" headline and the raw
+          // count moves to the tooltip (below) rather than competing with it
+          // as a second fraction on the same row.
           const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
           const readinessLabel = readiness
             ? (readiness.progress
-                ? `${readiness.label} · ${readiness.progress.complete} of ${readiness.progress.total} steps`
+                ? `${formatChecklistPercentV1(readiness.progress.complete, readiness.progress.total)}% · ${readiness.label}`
                 : readiness.label) + staleSuffix
             : undefined;
           this.description = readinessLabel
@@ -762,9 +772,14 @@ export class StageNode extends vscode.TreeItem {
     if (readiness?.progress) {
       // The score on one line, a divider, then the step progress on the next
       // — the two read as separate facts instead of one conflated number.
+      // The row shows only the percentage (above); the tooltip keeps the raw
+      // count AND the remaining-steps figure, which stays the more concrete
+      // number when deciding whether to continue ("3 steps left" beats "96%"
+      // — wf "make the stage chat a record of work", Part 5 / item 6).
+      const stepsLeft = readiness.progress.total - readiness.progress.complete;
       tooltipStr +=
         `\n\nReview score: ${readiness.label}\n\n---\n\n` +
-        `${readiness.progress.complete} of ${readiness.progress.total} steps completed`;
+        `${readiness.progress.complete} of ${readiness.progress.total} steps · ${stepsLeft} left`;
     }
     if (readiness && isReviewStage(stage)) {
       // Reviewer/mechanical split (wf10 continuation item 12): the newest

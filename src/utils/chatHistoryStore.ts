@@ -256,6 +256,29 @@ export interface ChatMessage {
     blockerDescription: string;
     reviewStage: TaskStage;
   };
+  /**
+   * Classifies a message for rendering (wf "make the stage chat a record of
+   * work" Part 4 / item 1): `"activity"` for a dispatch-log line an
+   * auto-start/redirect/drop announces (collapsed into an "Activity" group
+   * rather than the main transcript flow), `"outcome"` for the terminal line
+   * `terminalizeRoundV1` (`roundLedgerV1.ts`) writes once a round ends, and
+   * `"decision"` for the anchor message a `WorkflowDecisionV1` is posted
+   * alongside, letting the card interleave with the transcript by time
+   * instead of always rendering as a trailing block. Absent on every message
+   * written before this field existed, and on an ordinary user/assistant
+   * chat turn — never assume absence means `"activity"`.
+   */
+  kind?: "activity" | "outcome" | "decision";
+  /** The `RoundLedgerEntryV1.roundId` this message reports on — set together
+   * with `kind: "outcome"` (and, where known, `kind: "activity"`). */
+  roundId?: string;
+  /** The scheduling intent that announced the round this message concerns,
+   * when known — lets an activity/outcome pair be correlated back to the
+   * announcement that started it even before a ledger row existed. */
+  intentId?: string;
+  /** The `WorkflowDecisionV1` id this message anchors, set together with
+   * `kind: "decision"`. */
+  decisionId?: string;
 }
 
 /** The display-mirror states a structured-question interaction can be in (plan §5.1/§5.5). */
@@ -644,6 +667,23 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
     } else if (typeof e.stage !== "string" || !VALID_STAGES.has(e.stage)) {
       return undefined;
     }
+    if (
+      e.kind !== undefined &&
+      e.kind !== "activity" &&
+      e.kind !== "outcome" &&
+      e.kind !== "decision"
+    ) {
+      return undefined;
+    }
+    if (e.roundId !== undefined && (typeof e.roundId !== "string" || e.roundId.length === 0)) {
+      return undefined;
+    }
+    if (e.intentId !== undefined && (typeof e.intentId !== "string" || e.intentId.length === 0)) {
+      return undefined;
+    }
+    if (e.decisionId !== undefined && (typeof e.decisionId !== "string" || e.decisionId.length === 0)) {
+      return undefined;
+    }
     messages.push({
       role: e.role,
       text: e.text,
@@ -666,6 +706,10 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
             },
           }
         : {}),
+      ...(e.kind !== undefined ? { kind: e.kind as "activity" | "outcome" | "decision" } : {}),
+      ...(typeof e.roundId === "string" ? { roundId: e.roundId } : {}),
+      ...(typeof e.intentId === "string" ? { intentId: e.intentId } : {}),
+      ...(typeof e.decisionId === "string" ? { decisionId: e.decisionId } : {}),
     });
   }
   return messages;

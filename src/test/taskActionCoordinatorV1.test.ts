@@ -2826,6 +2826,69 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(resumePrompts.length, 1);
   });
 
+  void it("forwards onPromptAssembled during a Resume drive (review blocker 2026-08-27: Resume omitted the attempt observer)", async () => {
+    const questionsHarness = makeHarness([RESUME_QUESTIONS_TRANSPORT()], snapshotProvingPromptBuilder);
+    const original = await questionsHarness.coordinator.executeAction(
+      baseRequest({ target: "plan.md", advisoryRevision: "r7" })
+    );
+    assert.equal(original.kind, "questions");
+    if (original.kind !== "questions") {
+      assert.fail("expected a questions outcome");
+    }
+    const ref = {
+      operationId: original.correlation.operationId,
+      interactionId: original.interactionId,
+      taskBindingId: original.correlation.taskBindingId,
+      chatDocumentId: original.correlation.chatDocumentId,
+      sourceAttemptId: original.correlation.attemptId,
+    };
+    const submitted = await questionsHarness.orchestrator.submitAnswers(
+      ref,
+      [{ questionId: "q1", kind: "text", state: "answered", value: "publish" }],
+      allocateHex128IdV1()
+    );
+    assert.equal(submitted.ok, true);
+
+    const resumeTransport: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: (request, output): Promise<{ kind: "completed" }> => {
+        output.write(
+          frame({
+            version: 1,
+            correlation: request.correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# resumed" },
+          })
+        );
+        return Promise.resolve({ kind: "completed" as const });
+      },
+    };
+    const resumeHarness = makeHarness([resumeTransport], snapshotProvingPromptBuilder);
+    const observed: { attemptId: string; prompt: string; promptSha256: string }[] = [];
+    const outcome = await resumeHarness.coordinator.resumeAction({
+      interaction: ref,
+      taskBinding: TASK_BINDING,
+      taskStatus: "active",
+      taskStage: "plan",
+      resumeIdempotencyId: allocateHex128IdV1(),
+      cancellationToken: fakeToken(),
+      onPromptAssembled: (info) => {
+        observed.push(info);
+      },
+    });
+    assert.equal(outcome.kind, "completed");
+    if (outcome.kind !== "completed") {
+      assert.fail("expected a completed outcome");
+    }
+    // The Resume drive's own attempt was captured — same identity as the
+    // outcome's correlation, and a non-empty assembled prompt/hash, exactly
+    // as a fresh `executeAction` drive's `onPromptAssembled` would report.
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]!.attemptId, outcome.correlation.attemptId);
+    assert.ok(observed[0]!.prompt.length > 0);
+    assert.ok(/^[0-9a-f]{64}$/.test(observed[0]!.promptSha256));
+  });
+
   void it("recovers the recorded attempt when an identical-id replay re-drives a Resume that crashed before provider invocation (AC-ID-04)", async () => {
     const questionsHarness = makeHarness([RESUME_QUESTIONS_TRANSPORT()], snapshotProvingPromptBuilder);
     const original = await questionsHarness.coordinator.executeAction(

@@ -195,15 +195,23 @@ export function isPlanIncomplete(
  * building the remaining items, and a task that genuinely cannot progress hits
  * the existing no-progress breaker and escalates to the human there — which is
  * the intended route for a plan that cannot be implemented as written.
+ *
+ * Reports `settled`/`total` (wf "make the stage chat a record of work",
+ * Part 5 / item 4's fixed-denominator model), not `checked`/total-minus-
+ * excluded: `total` here is the checklist's fixed, never-shrinking item
+ * count, and `settled` already folds in items closed without doing the work
+ * (excluded) alongside items actually checked — both are "not open work" for
+ * this reconciliation's purpose, since `checklist.remaining` (the only field
+ * that gates below) is computed the same way either way.
  */
 export function reconcileProgressWithChecklistV1(
   progress: ReviewProgress | null,
-  checklist: { total: number; checked: number; remaining: number } | undefined
+  checklist: { total: number; settled: number; remaining: number } | undefined
 ): ReviewProgress | null {
   if (!checklist || checklist.remaining <= 0) {
     return progress;
   }
-  return { complete: checklist.checked, total: checklist.total };
+  return { complete: checklist.settled, total: checklist.total };
 }
 
 export function readyToAdvanceStage(
@@ -283,6 +291,27 @@ export interface ReviewBlocker {
    * record (wf10 continuation item 12).
    */
   origin?: "reviewer" | "mechanical";
+}
+
+/**
+ * Splits a stage's task-fixable blockers by who raised them, using item 12's
+ * `origin` field (`ReviewBlocker.origin`) — `"mechanical"` for one
+ * synthesized from a failing Verified Check, everything else (including an
+ * older/hand-built fixture with `origin` absent) reviewer-raised. The single
+ * place this split is computed, so a round-ledger outcome's
+ * `reviewerBlockers`/`mechanicalBlockers` counts can never disagree with how
+ * `origin` is defined elsewhere (2026-08-27 review fix: a prior version
+ * counted every task-fixable blocker — reviewer AND mechanical — as
+ * `reviewerBlockers` and never recorded a mechanical count at all).
+ */
+export function splitTaskFixableBlockersByOriginV1(
+  blockers: readonly ReviewBlocker[]
+): { reviewerBlockers: number; mechanicalBlockers: number } {
+  const taskFixable = blockers.filter((b) => b.resolver === "task-fixable");
+  return {
+    reviewerBlockers: taskFixable.filter((b) => b.origin !== "mechanical").length,
+    mechanicalBlockers: taskFixable.filter((b) => b.origin === "mechanical").length,
+  };
 }
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;

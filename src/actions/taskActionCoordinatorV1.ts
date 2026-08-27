@@ -301,6 +301,27 @@ export interface TaskActionRequestV1 {
   readonly cancellationToken: vscode.CancellationToken;
   readonly preInvocationHook?: () => Promise<void>;
   /**
+   * Best-effort observability side channel (review blocker, 2026-08-26:
+   * "prompt observability still uses post-run raw-prompt sidecars instead of
+   * the attempt-bound canonical transaction input"). Invoked synchronously,
+   * at most once per attempt, the moment THIS attempt's
+   * `AssembledAttemptPromptV1` is finalized below (`assembleAttemptPromptV1`)
+   * — the exact text this attempt actually dispatches, including the
+   * preflight preamble and result-contract suffix a caller-supplied
+   * `rawInput.prompt` does not carry on its own. Never awaited and never
+   * allowed to affect dispatch: a caller (`runTwoPhaseEditActionV1`) that
+   * only wants to retain the text for later inspection must not be able to
+   * slow or fail a live round by doing so. Like `lifecycleBeforeWrite`, this
+   * is never validated, digested, or persisted as part of a Chat interaction
+   * transaction's input snapshot — it is a plain in-process callback, not
+   * part of the closed `TaskActionOutcomeV1` contract.
+   */
+  readonly onPromptAssembled?: (info: {
+    readonly attemptId: string;
+    readonly prompt: string;
+    readonly promptSha256: string;
+  }) => void;
+  /**
    * Lifecycle-row-only side channel (plan §6.6's `nextStage.v1`): forwarded
    * verbatim into `LifecycleExecutionContextV1.beforeWrite` for a `"lifecycle"`
    * row and otherwise ignored (a provider row's admission path never reads
@@ -386,6 +407,18 @@ export interface TaskActionResumeRequestV1 {
   readonly cancellationToken: vscode.CancellationToken;
   /** See `TaskActionRequestV1.parentOperationId` — identical nested-lease meaning for a Resume drive. */
   readonly parentOperationId?: OperationIdV1;
+  /**
+   * See `TaskActionRequestV1.onPromptAssembled` (review blocker, 2026-08-27,
+   * fourth pass: "Resume execution calls `runProviderRow` without an attempt
+   * observer, so fallback/retry attempts during a resumed review are also
+   * absent"). `executeResume`'s own `runProviderRow` call previously omitted
+   * this entirely — a resumed round's fallback candidate or item-14 retry
+   * attempt had no way to report its assembled prompt back to the caller,
+   * unlike a fresh `executeAction` drive (`continueAdmittedAction` already
+   * forwards `ticket.request.onPromptAssembled`). Optional and best-effort,
+   * exactly like the fresh-drive field it mirrors.
+   */
+  readonly onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"];
 }
 
 /**
@@ -1378,7 +1411,9 @@ export function createTaskActionCoordinatorV1(
      * of calling `assembleAttemptPromptV1` a second time for that one
      * attempt.
      */
-    initialCandidateAssembledPrompt?: AssembledAttemptPromptV1
+    initialCandidateAssembledPrompt?: AssembledAttemptPromptV1,
+    /** See `TaskActionRequestV1.onPromptAssembled`. */
+    onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"]
   ): Promise<TaskActionOutcomeV1> {
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
@@ -1589,6 +1624,14 @@ export function createTaskActionCoordinatorV1(
         return { kind: "failed", correlation, code: assembled.code, retryable: false };
       }
       const { toolHandler, context, prompt, promptSha256 } = assembled;
+      // See `TaskActionRequestV1.onPromptAssembled`'s doc comment — best
+      // effort, synchronous, never allowed to affect this attempt.
+      try {
+        onPromptAssembled?.({ attemptId, prompt, promptSha256 });
+      } catch {
+        // Caller-supplied observability hook; a failure here must never
+        // affect the round it is merely observing.
+      }
 
       // Admission only ever ran for a freshly-reserved candidate (never for
       // the initial Resume candidate or an item-14 same-candidate retry) —
@@ -2507,7 +2550,8 @@ export function createTaskActionCoordinatorV1(
           ticket.preInvocationHook,
           ticket.initialCandidate,
           ticket.request.malformedInvocationsAlreadyUsedV1,
-          ticket.initialCandidateAssembledPrompt
+          ticket.initialCandidateAssembledPrompt,
+          ticket.request.onPromptAssembled
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);
@@ -2852,7 +2896,12 @@ export function createTaskActionCoordinatorV1(
         acquireLeasePhase,
         metrics,
         answers,
-        claimInvocationOnce
+        claimInvocationOnce,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        request.onPromptAssembled
       );
       // Best-effort durable mirror of the claimed invocation's terminal
       // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later

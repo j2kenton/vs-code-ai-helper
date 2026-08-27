@@ -259,10 +259,18 @@ void describe("handleReviewOutcomeV1 silent-failure regression", () => {
     // silently produced no artifact — reproducing the exact
     // nothing-to-inspect problem the log exists to end. Pin the structure:
     // the router is called inside try, the log runs in finally.
+    //
+    // 2026-08-27 review fix (Part 4, narrowed blocker 2): the same finally
+    // block now ALSO closes the round-ledger row `claimReviewAttempt` opened
+    // at this round's real start — every non-"completed" outcome, and a
+    // "completed" outcome whose own routing never reaches
+    // `handleReviewRoutingOutcome`'s terminalization, previously left that
+    // row open forever. Pinned alongside the run-log call for the same
+    // reason: an early return must not be able to skip it either.
     assert.match(
       source,
-      /try\s*\{\s*await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await writeReviewRunLogV1\(outcome, ctx\);\s*\}/,
-      "handleReviewOutcomeV1 must run the run log in a finally around the routing body"
+      /try\s*\{\s*await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await writeReviewRunLogV1\(outcome, ctx\);\s*await terminalizeUnclosedReviewRoundV1\(outcome, ctx\);\s*\}/,
+      "handleReviewOutcomeV1 must run the run log AND the round-ledger safety-net terminalizer in a finally around the routing body"
     );
   });
 

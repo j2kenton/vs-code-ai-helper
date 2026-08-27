@@ -5,10 +5,13 @@
  * (item 18's core finding — plan non-goals, checklist content, prompt size)
  * is answerable from disk instead of unknowable.
  *
- * Reads the `.prompt.txt` sibling `writePromptManifestV1` writes beside a
- * round's run log, keyed to the manifest's `roundId` (see that module's doc
- * comment for why this is a plain retained file, keyed by a freshly
- * allocated observability id, rather than a `chatInteractionTransactionV1`
+ * Reads every `.prompt.txt` sibling `writePromptManifestV1` writes beside a
+ * task's run logs (one per captured coordinator attempt as of the review fix,
+ * 2026-08-27 — a round whose primary candidate failed and fell back to a
+ * secondary now retains both attempts' prompts, not just the last), labelled
+ * by the sibling manifest's `attemptId` when present, else its `roundId` (see
+ * that module's doc comment for why this is a plain retained file, keyed by
+ * these observability ids, rather than a `chatInteractionTransactionV1`
  * lookup — that store's `inputSnapshot` is the validated action input for
  * Resume reconstruction, not dispatched prompt text, and would not answer
  * this command's question even where a transaction happens to exist).
@@ -31,16 +34,33 @@ interface RetainedPromptEntry {
   readonly mtime: number;
   /** The sibling manifest's `roundId`, when readable — see promptManifestV1.ts. */
   readonly roundId?: string;
+  /**
+   * The sibling manifest's `attemptId` — the coordinator's own per-attempt
+   * identity (review fix, 2026-08-27: attempt-based lookup). Undefined for a
+   * CLI-resolved round (no coordinator attempt exists) or a manifest
+   * predating this field. A round with a fallback/retry now writes one
+   * `.prompt.txt` per attempt, so this is what distinguishes them in the
+   * picker beyond filename/mtime alone.
+   */
+  readonly attemptId?: string;
 }
 
-async function readManifestRoundIdV1(promptUri: vscode.Uri): Promise<string | undefined> {
+async function readManifestIdentityV1(
+  promptUri: vscode.Uri
+): Promise<{ roundId?: string; attemptId?: string }> {
   const manifestUri = vscode.Uri.file(promptUri.fsPath.replace(/\.prompt\.txt$/, ".prompt-manifest.json"));
   try {
     const raw = await vscode.workspace.fs.readFile(manifestUri);
-    const manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as { roundId?: string };
-    return typeof manifest.roundId === "string" ? manifest.roundId : undefined;
+    const manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as {
+      roundId?: string;
+      attemptId?: string;
+    };
+    return {
+      roundId: typeof manifest.roundId === "string" ? manifest.roundId : undefined,
+      attemptId: typeof manifest.attemptId === "string" ? manifest.attemptId : undefined,
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -65,8 +85,8 @@ async function listRetainedPromptsV1(folderUri: vscode.Uri): Promise<RetainedPro
     } catch {
       // Keep default mtime — the entry still opens fine.
     }
-    const roundId = await readManifestRoundIdV1(promptUri);
-    prompts.push({ label: name.replace(/\.prompt\.txt$/, ""), promptUri, mtime, roundId });
+    const { roundId, attemptId } = await readManifestIdentityV1(promptUri);
+    prompts.push({ label: name.replace(/\.prompt\.txt$/, ""), promptUri, mtime, roundId, attemptId });
   }
   prompts.sort((a, b) => b.mtime - a.mtime);
   return prompts;
@@ -116,7 +136,11 @@ export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise
           await vscode.window.showQuickPick(
             prompts.map((entry) => ({
               label: entry.label,
-              description: entry.roundId ? `Round ID: ${entry.roundId}` : undefined,
+              description: entry.attemptId
+                ? `Attempt ID: ${entry.attemptId}${entry.roundId ? ` (round ${entry.roundId})` : ""}`
+                : entry.roundId
+                  ? `Round ID: ${entry.roundId}`
+                  : undefined,
               entry,
             })),
             { title: "Open Retained Prompt", placeHolder: "Select a round" }

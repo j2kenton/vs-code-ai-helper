@@ -336,7 +336,14 @@ void describe("readEffectivePlanChecklistProgressV1", () => {
     const fsStub = installRealFs();
     try {
       const counts = await readEffectivePlanChecklistProgressV1(uri);
-      assert.deepEqual(counts, { total: 5, checked: 2, remaining: 3, excluded: 0 });
+      assert.deepEqual(counts, {
+        total: 5,
+        checked: 2,
+        closedWithoutDoing: 0,
+        settled: 2,
+        remaining: 3,
+        excluded: 0,
+      });
     } finally {
       fsStub.restore();
     }

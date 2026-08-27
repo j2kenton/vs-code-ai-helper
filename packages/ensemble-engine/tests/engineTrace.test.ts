@@ -206,7 +206,14 @@ test("full round/question/resume scenario: every emitted frame decodes under the
   assert.ok(round1.kind === "completed");
   assert.deepEqual(round1.progress, { complete: 2, total: 4 });
   assert.equal(round1.planComplete, false);
-  assert.deepEqual(task.checklist, { total: 4, checked: 2, remaining: 2, excluded: 0 });
+  assert.deepEqual(task.checklist, {
+    total: 4,
+    checked: 2,
+    closedWithoutDoing: 0,
+    settled: 2,
+    remaining: 2,
+    excluded: 0,
+  });
 
   // Round 2: the provider posts questions; the task pauses.
   const round2 = await task.runRound();

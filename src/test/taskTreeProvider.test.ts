@@ -926,11 +926,11 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 1, total: 5 });
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "9/10 · 1 of 5 steps");
+      assert.strictEqual(node.description, "20% · 9/10");
       const tooltip = (node.tooltip as vscode.MarkdownString).value;
       assert.ok(tooltip.includes("Review score: 9/10"), "score line leads the tooltip block");
       assert.ok(tooltip.includes("\n\n---\n\n"), "a divider sits between score and progress");
-      assert.ok(tooltip.includes("1 of 5 steps completed"));
+      assert.ok(tooltip.includes("1 of 5 steps · 4 left"));
     } finally {
       restore();
     }
@@ -987,9 +987,9 @@ void describe("StageNode — review score and step progress", () => {
       );
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "9/10 · 2 of 5 steps");
+      assert.strictEqual(node.description, "40% · 9/10");
       assert.ok(!String(node.description).includes("5 of 5"));
-      assert.ok((node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps completed"));
+      assert.ok((node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps · 3 left"));
     } finally {
       restore();
     }
@@ -1012,7 +1012,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 3, total: 5 });
 
       const node = new StageNode(makeTask("plan-high-review"), "plan-high-review", "current", planReviewUri, readiness);
-      assert.strictEqual(node.description, "8/10 · 3 of 5 steps");
+      assert.strictEqual(node.description, "60% · 8/10");
     } finally {
       restore();
     }

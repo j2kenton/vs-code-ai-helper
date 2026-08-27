@@ -194,47 +194,22 @@ export function parseAcceptedNonGoalsV1(planContent: string): PlanNonGoalEntryV1
   return entries;
 }
 
-const NON_GOAL_STOPWORDS_V1 = new Set([
-  "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "were",
-  "this", "that", "these", "those", "it", "its", "as", "by", "with", "at", "be", "been", "being",
-  "not", "never", "no", "which", "who", "what", "when", "where", "how", "will", "would", "can",
-  "could", "should", "still", "into", "than", "then", "so", "but", "if", "any", "all", "from",
-]);
-
-function nonGoalSignificantWordsV1(text: string): Set<string> {
-  return new Set(
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]+/g, " ")
-      .split(/\s+/)
-      .filter((word) => word.length > 2 && !NON_GOAL_STOPWORDS_V1.has(word))
-  );
+/**
+ * Normalize for the same "verbatim discipline" `filterSupersededBlockersV1`
+ * already applies to `chat-confirmed` supersessions (exact match on trimmed
+ * text): lower-case, strip markdown decoration (`` ` ``, `*`, `_`, `>`, `#`)
+ * that a plan write-up might wrap a quoted blocker in, and collapse
+ * whitespace. NOT a fuzzy/word-bag normalization — this changes nothing about
+ * which words are present, only case/markup/spacing, so the result is still a
+ * verbatim comparison of the same text.
+ */
+function normalizeForVerbatimNonGoalMatchV1(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[`*_>#]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
-
-/** Fraction of `subject`'s significant words also present in `reference`.
- * Asymmetric on purpose: a blocker's own description is short and specific,
- * and should be near-fully covered by the (typically longer) non-goal
- * write-up describing the same residual — the reverse is not required, since
- * the write-up may add API citations, dates, and reasoning the blocker text
- * never mentions. */
-function nonGoalCoverageV1(subject: string, reference: string): number {
-  const subjectWords = nonGoalSignificantWordsV1(subject);
-  if (subjectWords.size === 0) {
-    return 0;
-  }
-  const referenceWords = nonGoalSignificantWordsV1(reference);
-  let shared = 0;
-  for (const word of subjectWords) {
-    if (referenceWords.has(word)) {
-      shared++;
-    }
-  }
-  return shared / subjectWords.size;
-}
-
-/** How much of a blocker's own distinctive vocabulary must appear in a
- * non-goal entry's body for the two to be treated as the same subject. */
-export const NON_GOAL_MATCH_THRESHOLD_V1 = 0.6;
 
 /** One blocker matched against an Accepted Non-Goals entry describing the
  * same subject. */
@@ -243,12 +218,24 @@ export interface PlanNonGoalMatchV1 {
   readonly nonGoalHeading: string;
 }
 
-/** Match each of `blockers` against `nonGoals`, keeping each blocker's
- * best-scoring entry when it clears {@link NON_GOAL_MATCH_THRESHOLD_V1}. Pure
- * and best-effort: a threshold-based match can miss a genuine match with
- * unusually little shared vocabulary, or (much less likely, given the
- * asymmetric coverage direction) fire on an unrelated blocker that happens to
- * share enough generic terms — callers that persist a match
+/**
+ * Match each of `blockers` against `nonGoals`. A blocker matches an entry
+ * only when the blocker's own (normalized) description text appears VERBATIM
+ * inside that entry's (normalized) body — the same discipline
+ * `filterSupersededBlockersV1` already applies to `chat-confirmed`
+ * supersessions (exact text match), not a word-overlap/fuzzy score. This is
+ * deliberate (review blocker, 2026-08-26: "plan non-goal supersession uses an
+ * unapproved fuzzy matcher that can suppress unrelated live blockers") — a
+ * threshold-based similarity score can suppress a genuinely different,
+ * still-live blocker that happens to share enough generic vocabulary with an
+ * unrelated non-goal write-up. Verbatim containment cannot: it requires the
+ * plan author to have actually cited the blocker's own wording (typically by
+ * quoting a standing `[same:…]` blocker's already-known text when writing the
+ * non-goal entry), so a match is proof the entry is about THIS blocker, not
+ * merely a topically similar one. The cost, stated in the plan's own risk
+ * notes, is accepted: "a reworded re-finding stops matching and is reported
+ * again — which is the intended way a reviewer's genuine new reason
+ * surfaces." Pure. Callers that persist a match
  * (`derivePlanNonGoalSupersessionsV1`) always also record it as a visible
  * `reviewerChallengedNonGoal` fact rather than silently trusting it forever.
  */
@@ -261,15 +248,16 @@ export function matchBlockersAgainstNonGoalsV1(
   }
   const matches: PlanNonGoalMatchV1[] = [];
   for (const blocker of blockers) {
-    let best: { heading: string; score: number } | undefined;
-    for (const entry of nonGoals) {
-      const score = nonGoalCoverageV1(blocker.description, entry.bodyText);
-      if (!best || score > best.score) {
-        best = { heading: entry.heading, score };
-      }
+    const normalizedBlocker = normalizeForVerbatimNonGoalMatchV1(blocker.description);
+    if (!normalizedBlocker) {
+      continue;
     }
-    if (best && best.score >= NON_GOAL_MATCH_THRESHOLD_V1) {
-      matches.push({ blocker, nonGoalHeading: best.heading });
+    for (const entry of nonGoals) {
+      const normalizedEntry = normalizeForVerbatimNonGoalMatchV1(entry.bodyText);
+      if (normalizedEntry.includes(normalizedBlocker)) {
+        matches.push({ blocker, nonGoalHeading: entry.heading });
+        break;
+      }
     }
   }
   return matches;

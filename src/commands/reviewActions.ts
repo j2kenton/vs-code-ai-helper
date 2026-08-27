@@ -25,6 +25,7 @@ import {
   PLAN_FILENAME,
   PLAN_REVIEW_STAGES,
   REVIEW_STAGES,
+  RUNS_DIRNAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
@@ -35,6 +36,7 @@ import {
   ImplementationDispatchModeV1,
   ReviewBlockerIdentity,
   ReviewScoreHistoryEntry,
+  RoundLedgerEntryV1,
   RoundOutcomeClassificationV1,
   TaskEscalation,
   TaskProgress,
@@ -55,6 +57,7 @@ import {
   updateImplReviewFiles,
   updateLintPayload,
   updateTaskStatus,
+  upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
 import {
@@ -64,6 +67,7 @@ import {
   shouldContinueAsApplyReviewV1,
 } from "../utils/implementationDispatchModeV1";
 import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
+import { RoundLedgerTerminalStateV1, terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   computeDegenerateReviewEpisodeModelIdsV1,
@@ -193,7 +197,7 @@ import {
 } from "../actions/rows/reviewRowV1";
 import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
-import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { outcomeCorrelationV1, ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
 import { stageActionRequirementMessageV1 } from "../utils/stageArtifactRequirementsV1";
@@ -225,6 +229,7 @@ import {
   IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
   markReviewInProgressBannerV1,
   ReviewBlocker,
+  splitTaskFixableBlockersByOriginV1,
 } from "../utils/reviewReadiness";
 import {
   refreshStaleReviewBannerForArtifactV1,
@@ -264,7 +269,6 @@ import {
   recordTaskImplementationBaselineShaIfAbsentV1,
 } from "../utils/taskImplementationBaselineV1";
 import {
-  blockerIdentity,
   buildChurnEscalationReasonV1,
   chooseAutomaticImplementationDispatchV1,
   classifyChurnLineageV1,
@@ -428,16 +432,41 @@ export function scheduleAutomaticImplementationAfterReview(
   return true;
 }
 
-/** Claim the review attempt immediately before invoking the AI provider. */
+/**
+ * Claim the review attempt immediately before invoking the AI provider —
+ * the round's true start. Part 4 architectural fix (2026-08-27 review,
+ * narrowed blocker 2: "the replacement still creates an artificial open row
+ * inside review completion handling ... outside the start authority"):
+ * this is now also where the round's `roundLedger` row is OPENED, in the
+ * same transaction as the claim, so the row's `startedAt` is the round's
+ * real start time rather than a value re-derived later at whatever point
+ * completion handling happens to notice it needs one. Both production call
+ * sites (`runReviewForFolder`'s initial dispatch and
+ * `resumeReviewInteractionV1`'s fresh resume attempt) already call this
+ * function as their first act after resolving `targetStage`, so both are
+ * covered without duplicating the open-row logic at each site.
+ * `terminalizeRoundV1` (the sole terminal writer) later resolves this same
+ * row by `reviewAttemptId` — see `handleReviewRoutingOutcome` and
+ * `handleReviewOutcomeV1`'s general safety-net terminalizer.
+ */
 export async function claimReviewAttempt(
   folderUri: vscode.Uri,
-  reviewAttemptId: string
+  reviewAttemptId: string,
+  targetStage: TaskStage
 ): Promise<TaskProgress | undefined> {
   return patchTaskProgressStrictV1(folderUri, (current) => {
     if (current.status === "paused") {
       throw new Error("The task was paused while the review was starting.");
     }
-    return { ...current, reviewAttemptId };
+    const openRow: RoundLedgerEntryV1 = {
+      roundId: reviewAttemptId,
+      attemptIds: [reviewAttemptId],
+      stage: targetStage,
+      mode: "review",
+      startedAt: new Date().toISOString(),
+      state: "open",
+    };
+    return upsertRoundLedgerEntryV1({ ...current, reviewAttemptId }, openRow);
   });
 }
 
@@ -2261,9 +2290,35 @@ export async function handleReviewRoutingOutcome(options: {
   /** wf10 item 7c / Part 6 step 16: the resolved provider id this round
    * dispatched to, used for the known-Read-ceiling advisory. */
   providerId?: string;
+  /** The coordinator's own identities for the provider call that produced
+   * this outcome (`TaskActionOutcomeV1.correlation`), when the caller has
+   * them — forwarded to `terminalizeRoundV1` so the round-ledger row opened
+   * by `claimReviewAttempt` (keyed on the independently-minted
+   * `reviewAttemptId`) also carries the coordinator's `operationId`/
+   * `attemptId` once they exist (2026-08-27 review, blocker "review rows
+   * never attach the coordinator operation or provider attempt identities"). */
+  coordinatorOperationId?: string;
+  coordinatorAttemptId?: string;
+  /** Every OTHER coordinator `attemptId` this round observed (a primary
+   * candidate that failed before a fallback candidate produced the final
+   * correlation, an item-14 same-candidate retry, ...) — see
+   * `TerminalizeRoundOptionsV1.extraAttemptIds`. */
+  coordinatorExtraAttemptIds?: readonly string[];
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
-  const { folderUri, targetStage, reviewAttemptId, content, score, threshold, reviewer, promptLength, providerId } =
-    options;
+  const {
+    folderUri,
+    targetStage,
+    reviewAttemptId,
+    content,
+    score,
+    threshold,
+    reviewer,
+    promptLength,
+    providerId,
+    coordinatorOperationId,
+    coordinatorAttemptId,
+    coordinatorExtraAttemptIds,
+  } = options;
   try {
     const resilience = getResilienceSettings();
     const blockerEvidence = parseReviewBlockersDetailed(content);
@@ -2356,28 +2411,43 @@ export async function handleReviewRoutingOutcome(options: {
     });
     if (rejectionReason !== null) {
       const degenerateModelId = reviewer?.storedModelId;
-      const persistedRejection = await patchTaskProgressStrictV1(folderUri, (current) =>
-        // wf10 item 4 / Part 4: folded into the same patch as the existing
-        // `reviewRejections` trail (not a separate write) — a degenerate
-        // review round is round-completion accounting too, and Part 5's
-        // fallback breaker reads this classification alongside
-        // `provider-failure-empty` implementation rounds.
-        appendRoundOutcome(
-          appendReviewRejection(current, {
-            stage: targetStage,
-            attemptId: reviewAttemptId,
-            at: new Date().toISOString(),
-            reason: rejectionReason,
-          }),
-          {
-            stage: targetStage,
+      // Bugfix (2026-08-27 review, "the compatibility classification and
+      // ledger terminalization remain separate non-atomic writes"): the
+      // `reviewRejections` trail entry, the `roundOutcomes` compatibility
+      // classification, AND the round-ledger terminal state now land in ONE
+      // `patchTaskProgressStrictV1` transaction via `terminalizeRoundV1`'s
+      // `extraPatch`/`roundOutcomeClassification` options — previously these
+      // were two separate patches (this one, then a second inside
+      // `terminalizeRoundV1` below), so a failure of either write could leave
+      // the ledger and the compatibility record disagreeing about whether,
+      // or how, this round ended. `terminalizeRoundV1` is still the sole
+      // writer of the terminal ledger state and the `roundOutcomes` entry;
+      // `extraPatch` only adds the rejection-trail write to that same
+      // transaction, it does not duplicate either write.
+      await terminalizeRoundV1(
+        reviewAttemptId,
+        "rejected",
+        { rejectionReason },
+        {
+          taskFolderUri: folderUri,
+          ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
+          ...(coordinatorAttemptId ? { attemptId: coordinatorAttemptId } : {}),
+          ...(coordinatorExtraAttemptIds?.length ? { extraAttemptIds: coordinatorExtraAttemptIds } : {}),
+          extraPatch: (current) =>
+            appendReviewRejection(current, {
+              stage: targetStage,
+              attemptId: reviewAttemptId,
+              at: new Date().toISOString(),
+              reason: rejectionReason,
+            }),
+          roundOutcomeClassification: {
             classification: "rejected-degenerate",
             attemptId: reviewAttemptId,
-            at: new Date().toISOString(),
             ...(degenerateModelId ? { modelId: degenerateModelId } : {}),
-          }
-        )
+          },
+        }
       );
+      const persistedRejection = await readTaskProgressAdvisoryV1(folderUri);
       // wf10 item 7c / Part 6 step 16: report the diagnosable cause, not just
       // the symptom. `Output length` alone (the old report) is exactly what
       // read as "degenerate output" and pointed at the model when the
@@ -2412,6 +2482,19 @@ export async function handleReviewRoutingOutcome(options: {
           // log itself carries the same token persisted to `roundOutcomes`.
           `Round outcome: rejected-degenerate\n\n${rejectionReason}\n\n${diagnosticLines.join("\n")}`
       );
+      // Note (2026-08-27 review, "Rejected degenerate reviews are recorded
+      // as completed"): this branch returns without ever going through the
+      // outcome-completion path, so the only other closer on this path —
+      // `terminalizeUnclosedReviewRoundV1`'s safety net in
+      // `handleReviewOutcomeV1`'s `finally` — would otherwise map the
+      // coordinator's `outcome.kind === "completed"` (the provider call
+      // itself succeeded; only the CONTENT was judged degenerate here) to
+      // ledger state `"completed"`, contradicting the `rejected-degenerate`
+      // classification recorded above. The row `claimReviewAttempt` opened
+      // at this round's real start was already terminalized as `"rejected"`
+      // above, atomically with the rejection trail and `roundOutcomes`
+      // entry; `terminalizeRoundV1` is idempotent, so that later safety net
+      // simply no-ops against this already-terminal row.
       // wf10 item 7d / Part 5 step 15: a completed-but-unparseable round is a
       // candidate failure for backup-selection purposes, invisible to
       // switch-to-backup's own runner-level failure handling (the runner
@@ -2494,21 +2577,40 @@ export async function handleReviewRoutingOutcome(options: {
     const priorEntryForStage = [...(progressBefore.reviewScoreHistory ?? [])]
       .reverse()
       .find((entry) => entry.stage === targetStage);
-    // wf10 continuation item 18: identities for blockers this round EXCLUDED
-    // for matching an Accepted Non-Goals entry — never fed through
-    // `resolveBlockerLineageV1` (they are not in `blockers`, so they have no
-    // place in next round's prior-list citation), given a distinct id
-    // namespace (`-ng-`) so it can never collide with a same-round citable id.
-    // Capped identically to `resolveBlockerLineageV1`'s own slice so a
-    // pathological match count can never fail the strict decoder's bound on
-    // write — sliced once so `supersededBlockers` and
-    // `reviewerChallengedNonGoal` below stay index-aligned.
+    // wf10 continuation item 18 (review blocker, 2026-08-26: "lacks
+    // lineage-bound challenge identities"): identities for blockers this
+    // round EXCLUDED for matching an Accepted Non-Goals entry. These never
+    // appear in `blockers` (they are not outstanding), so they have no place
+    // in next round's prior-list citation — but a challenged blocker CAN
+    // still carry its own `[same:<id>]`/`[narrowed:<id>]` citation, and doing
+    // so is exactly how a standing `[same:…]` blocker (the case this feature
+    // exists for — a frozen blocker the plan just declared out of scope) is
+    // recognized as the identical issue across rounds rather than a fresh
+    // unlinkable one every time. wf10 continuation review fix (2026-08-27):
+    // when the SAME blocker was already challenged in the prior round, its
+    // id lives in the prior entry's `supersededBlockers`, not `blockers` —
+    // so the citation lookup must include both lists, matching the same
+    // merge used to build `{{priorBlockerLineageList}}` above, or a
+    // repeatedly-challenged blocker would mint a fresh, unlinkable id every
+    // round it is re-raised. Reuse `resolveBlockerLineageV1` itself, seeded
+    // with a distinct attemptId namespace (`-ng` suffix) so an
+    // UNCITED/first-seen challenge still gets a fresh id that can never
+    // collide with a same-round citable one, while a cited challenge carries
+    // the real lineage id forward. Capped identically to
+    // `resolveBlockerLineageV1`'s own slice so a pathological match count can
+    // never fail the strict decoder's bound on write — sliced once so
+    // `supersededBlockers` and `reviewerChallengedNonGoal` below stay
+    // index-aligned.
     const challengedMatches = (planNonGoalResult?.challenged ?? []).slice(0, MAX_REVIEW_BLOCKER_IDENTITIES);
-    const challengedIdentities = challengedMatches.map((match, index) => ({
-      ...blockerIdentity(match.blocker),
-      id: `${reviewAttemptId}-ng-${index}`,
-      description: match.blocker.description.slice(0, 200),
-    }));
+    const priorBlockersAndSuperseded = [
+      ...(priorEntryForStage?.blockers ?? []),
+      ...(priorEntryForStage?.supersededBlockers ?? []),
+    ];
+    const challengedIdentities = resolveBlockerLineageV1(
+      challengedMatches.map((match) => match.blocker),
+      priorBlockersAndSuperseded,
+      `${reviewAttemptId}-ng`
+    );
     const historyEntry = {
       stage: targetStage,
       score,
@@ -2528,6 +2630,22 @@ export async function handleReviewRoutingOutcome(options: {
           }
         : {}),
     };
+    // wf10 continuation item 18 / Part 4 architectural fix (2026-08-27
+    // review, narrowed blocker 2: "the replacement still creates an
+    // artificial open row inside review completion handling ... outside the
+    // start authority"): the row for THIS round already exists — opened by
+    // `claimReviewAttempt` at the round's real start, before the provider was
+    // even dispatched (see that function's doc comment) — so this function
+    // never creates a row of its own; it only ever terminalizes the one
+    // already open. `terminalizeRoundV1` is the plan's SOLE writer of a
+    // terminal round-ledger state and its chat outcome message, and is called
+    // unconditionally below for every review round that reaches this point,
+    // not only a non-goal-challenge — a plain completed review with no
+    // challenge previously left its start-opened row open forever (nothing
+    // else in this call path closed it).
+    const reviewerChallengedNonGoalHeadings = historyEntry.reviewerChallengedNonGoal?.length
+      ? historyEntry.reviewerChallengedNonGoal.map((c) => c.nonGoalHeading)
+      : undefined;
     const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
       let withHistory = appendReviewScoreHistory(current, historyEntry);
       // wf10 continuation item 18: persist every newly-derived plan-non-goal
@@ -2554,24 +2672,40 @@ export async function handleReviewRoutingOutcome(options: {
     }
     // wf10 continuation item 18: "when a review re-raises a blocker the plan
     // declares out of scope, say so" — the run log above already records it,
-    // but a run log is not somewhere the user is looking. A chat line makes
-    // the disagreement visible where the round's other outcomes are read.
-    if (historyEntry.reviewerChallengedNonGoal?.length) {
-      try {
-        await appendChatMessageV1(folderUri.fsPath, {
-          role: "assistant",
-          text:
-            `_${STAGE_DISPLAY_NAMES[targetStage]} re-raised ${historyEntry.reviewerChallengedNonGoal.length} ` +
-            `blocker(s) the plan's Accepted Non-Goals section already declares out of scope: ` +
-            historyEntry.reviewerChallengedNonGoal.map((c) => `"${c.nonGoalHeading}"`).join(", ") +
-            `. Excluded from this round's blocker count — see the run log for detail._`,
-          stage: targetStage,
-          at: new Date().toISOString(),
-        });
-      } catch {
-        // Best-effort — the run log and history entry already carry this.
+    // but a run log is not somewhere the user is looking. `terminalizeRoundV1`
+    // closes the row opened by `claimReviewAttempt` and writes the chat
+    // "kind: outcome" message itself (via `formatRoundOutcomeMessageV1`,
+    // which renders `outcome.reviewerChallengedNonGoal` when present), so
+    // every completed review's outcome — challenged or not — reaches the
+    // transcript through the same canonical path every other round's outcome
+    // does, rather than a bespoke message built here. Idempotent: a resumed/
+    // rerun path that already terminalized this `reviewAttemptId` (unlikely,
+    // since each resume mints its own fresh attempt id) would simply no-op.
+    // Bugfix (2026-08-27 review, "The review ledger counts mechanically
+    // generated task-fixable blockers as reviewer blockers"): `blockers`
+    // merges the reviewer's own `<!-- blockers:start -->` findings with
+    // `getMechanicalBlockersForStage`'s synthesized ones (see `parsedBlockers`
+    // above) — a single `.length` over that merged list attributed every
+    // mechanical blocker to the reviewer and never recorded a mechanical
+    // count at all. `splitTaskFixableBlockersByOriginV1` is the one place
+    // this split is computed (item 12's `origin` field).
+    const blockerSplit = splitTaskFixableBlockersByOriginV1(blockers);
+    await terminalizeRoundV1(
+      reviewAttemptId,
+      "completed",
+      {
+        ...(typeof score === "number" ? { score } : {}),
+        reviewerBlockers: blockerSplit.reviewerBlockers,
+        mechanicalBlockers: blockerSplit.mechanicalBlockers,
+        ...(reviewerChallengedNonGoalHeadings ? { reviewerChallengedNonGoal: reviewerChallengedNonGoalHeadings } : {}),
+      },
+      {
+        taskFolderUri: folderUri,
+        ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
+        ...(coordinatorAttemptId ? { attemptId: coordinatorAttemptId } : {}),
+        ...(coordinatorExtraAttemptIds?.length ? { extraAttemptIds: coordinatorExtraAttemptIds } : {}),
       }
-    }
+    );
 
     // Churn ceiling: an unconditional stop after N configurable rounds
     // without a DECREASE in task-fixable blockers — independent of both the
@@ -2643,7 +2777,7 @@ export async function handleReviewRoutingOutcome(options: {
         updated,
         false,
         undefined,
-        { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
+        { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
       );
       return { escalated };
     }
@@ -2701,7 +2835,7 @@ export async function handleReviewRoutingOutcome(options: {
         updated,
         true,
         undefined,
-        { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
+        { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
       );
       return { escalated };
     }
@@ -2715,7 +2849,7 @@ export async function handleReviewRoutingOutcome(options: {
       updated,
       false,
       undefined,
-      { content, blockers, taskFixableCount: historyEntry.taskFixableCount }
+      { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
     );
     return { escalated };
   } catch (error) {
@@ -2799,6 +2933,14 @@ export interface ReviewOutcomeContextV1 {
    * dispatched to (e.g. "kimi-cli"), used to look up a known Read-tool
    * ceiling for the prompt-size advisory. Absent when not resolvable. */
   providerId?: string;
+  /** 2026-08-27 review, blocker "review rows... omit earlier retry-attempt
+   * identities": every coordinator `attemptId` this round's `onPromptAssembled`
+   * callback observed, beyond the final one carried on `outcome.correlation`
+   * — a primary candidate that failed before a fallback candidate or an
+   * item-14 same-candidate retry produced the outcome. Forwarded to
+   * `terminalizeRoundV1`'s `extraAttemptIds` so the round-ledger row is
+   * findable by any attempt it actually made, not only the last. */
+  extraCoordinatorAttemptIds?: readonly string[];
 }
 
 /**
@@ -2846,6 +2988,72 @@ export async function handleReviewOutcomeV1(
     await routeReviewOutcomeV1(outcome, ctx);
   } finally {
     await writeReviewRunLogV1(outcome, ctx);
+    await terminalizeUnclosedReviewRoundV1(outcome, ctx);
+  }
+}
+
+/**
+ * Safety-net closer for the row `claimReviewAttempt` opened at this round's
+ * real start (Part 4 architectural fix, 2026-08-27 review, narrowed blocker
+ * 2). `routeReviewOutcomeV1`'s "completed" branch already terminalizes an
+ * ordinary review through `handleReviewRoutingOutcome` — but several paths
+ * never reach it: every non-"completed" outcome (failed/cancelled/
+ * unavailable/questions/...), and a "completed" outcome whose stage
+ * transition or persistence itself failed before `handleReviewRoutingOutcome`
+ * was ever called. Left alone, any of those leaves the round's start-opened
+ * row `"open"` forever — worse than before this fix, which never opened a
+ * row for these paths at all. `terminalizeRoundV1` is idempotent, so calling
+ * it here unconditionally, after `routeReviewOutcomeV1` has already run, is
+ * always safe: a no-op for a row already terminal, and the actual close for
+ * every row `routeReviewOutcomeV1` left open. Best-effort like
+ * `writeReviewRunLogV1` beside it — a failure here must never mask the
+ * review's own already-surfaced outcome.
+ */
+async function terminalizeUnclosedReviewRoundV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: ReviewOutcomeContextV1
+): Promise<void> {
+  try {
+    const correlation = outcomeCorrelationV1(outcome);
+    await terminalizeRoundV1(
+      ctx.reviewAttemptId,
+      terminalStateForUnclosedReviewOutcomeV1(outcome),
+      undefined,
+      {
+        taskFolderUri: ctx.folderUri,
+        ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
+        ...(ctx.extraCoordinatorAttemptIds?.length
+          ? { extraAttemptIds: ctx.extraCoordinatorAttemptIds }
+          : {}),
+      }
+    );
+  } catch {
+    // Ignore: this is a best-effort ledger close, never the review's own
+    // outcome — `writeReviewRunLogV1` beside it already recorded the durable
+    // diagnostic artifact for this round.
+  }
+}
+
+/** @internal exported for testing */
+export function terminalStateForUnclosedReviewOutcomeV1(
+  outcome: TaskActionOutcomeV1
+): RoundLedgerTerminalStateV1 {
+  switch (outcome.kind) {
+    case "completed":
+      return "completed";
+    case "cancelled":
+      return "cancelled";
+    default:
+      // "questions", "failed", "malformedResult", "unavailable",
+      // "recoveryRequired", "stalePreflight", "partialEditBlocked" — none of
+      // these produced a usable review artifact for this round, and each
+      // resume mints its own fresh `reviewAttemptId` (see
+      // `resumeReviewInteractionV1`), so nothing later revisits THIS row —
+      // it must close here rather than linger open. Mirrors how a
+      // "questions" outcome is treated for an edit-capable round
+      // (`runEditActionV1.ts`'s `runSealedImplementationV1`) — a failure of
+      // this round, not a pause.
+      return "failed";
   }
 }
 
@@ -2920,16 +3128,22 @@ export async function writeReviewRunLogV1(
             publishedEntry.taskFixableCount,
             publishedEntry.blockers
           )}\n`;
-          // wf10 continuation item 18: the run log is the durable ledger
-          // surface today (Part 4's roundLedger does not exist yet) — record
-          // every blocker this round re-raised despite a matching Accepted
-          // Non-Goals entry, so "did the reviewer see the decision?" has an
-          // answer in the artifact even when it disagreed with it.
+          // wf10 continuation item 18 (review blocker, 2026-08-26: "the
+          // required ledger outcome"): the plan asks for a ledger outcome
+          // line recording this, but Part 4's `roundLedger` does not exist
+          // yet — this run log IS the durable per-round record today, so it
+          // carries the line the ledger will eventually carry, in the exact
+          // wording plan step 11 specifies, so "did the reviewer see the
+          // decision?" has a durable answer even when it disagreed with it.
           if (publishedEntry.reviewerChallengedNonGoal?.length) {
             blockerSection +=
-              `\nReviewer challenged ${publishedEntry.reviewerChallengedNonGoal.length} plan non-goal(s):\n` +
+              "\n" +
               publishedEntry.reviewerChallengedNonGoal
-                .map((c) => `- re-raised despite "${c.nonGoalHeading}"`)
+                .map(
+                  (c) =>
+                    `the reviewer re-raised a blocker the plan declares out of scope: ${c.nonGoalHeading}` +
+                    (c.blockerId ? ` (blocker id: ${c.blockerId})` : "")
+                )
                 .join("\n") +
               "\n";
           }
@@ -3171,6 +3385,11 @@ async function routeReviewOutcomeV1(
           reviewer: outcome.provider,
           promptLength,
           providerId,
+          coordinatorOperationId: outcome.correlation.operationId,
+          coordinatorAttemptId: outcome.correlation.attemptId,
+          ...(ctx.extraCoordinatorAttemptIds?.length
+            ? { coordinatorExtraAttemptIds: ctx.extraCoordinatorAttemptIds }
+            : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -3245,11 +3464,12 @@ async function routeReviewOutcomeV1(
           planIncomplete &&
           meetsAutoAdvanceThreshold(score, autoAdvanceThreshold)
         ) {
-          // Names the operator-action/optional steps the denominator above
-          // already excludes, so "X of Y implemented" doesn't read as though
-          // the plan holds MORE outstanding work than it actually does. Read
-          // lazily here — this notice is the only consumer of the exclusion
-          // count, so the advance path above no longer pays for it.
+          // Names the operator-action/optional steps folded into `progress`'s
+          // now-fixed denominator as settled-without-doing, so "X of Y
+          // implemented" doesn't read as though the plan holds MORE
+          // outstanding work than it actually does. Read lazily here — this
+          // notice is the only consumer of the exclusion count, so the
+          // advance path above no longer pays for it.
           const planChecklistProgress = isPlanReviewStage(targetStage)
             ? undefined
             : await readPlanChecklistProgressV1(folderUri);
@@ -3908,9 +4128,16 @@ export async function runReviewForFolder(
     const priorEntryForLineage = [...(priorHistoryForLineage ?? [])]
       .reverse()
       .find((entry) => entry.stage === targetStage);
-    variables.priorBlockerLineageList = formatPriorBlockerLineageListV1(
-      priorEntryForLineage?.blockers
-    );
+    // wf10 continuation item 18 (review blocker, 2026-08-27): include the
+    // prior round's SUPERSEDED (plan-non-goal-challenged) blockers alongside
+    // its outstanding ones. A challenged blocker never appears in `blockers`
+    // (it isn't outstanding), so without this the reviewer has no id to cite
+    // if it re-raises the same issue next round — every re-raise would mint
+    // a fresh, unlinkable id even though the underlying blocker is identical.
+    variables.priorBlockerLineageList = formatPriorBlockerLineageListV1([
+      ...(priorEntryForLineage?.blockers ?? []),
+      ...(priorEntryForLineage?.supersededBlockers ?? []),
+    ]);
   }
 
   // 2i: stamp the commit this review actually assesses, and — for a
@@ -4131,7 +4358,7 @@ export async function runReviewForFolder(
   // superseded attempt stops spending quota on backups well before it would
   // eventually lose that final CAS anyway.
   const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
+  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
   if (!claimed) return;
 
   // Part 2 (review status messaging): mark the artifact "in progress" now
@@ -4181,6 +4408,15 @@ export async function runReviewForFolder(
       : await resolveFreshModelForStage(folderUri, targetStage);
     if (!modelId) {
       NotificationRouter.showWarning("No model is configured for this stage.");
+      // 2026-08-27 review, blocker "review rows never attach the coordinator
+      // operation or provider attempt identities": this early return happens
+      // BEFORE `coordinator.executeAction` is ever called, so `handleReviewOutcomeV1`
+      // (and its `terminalizeUnclosedReviewRoundV1` safety net) never runs —
+      // left alone, the row `claimReviewAttempt` opened above would stay
+      // "open" until the still-unbuilt reconciliation sweep exists at all.
+      // No coordinator correlation exists yet either, so this closes the row
+      // under its own `reviewAttemptId` alone.
+      await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: folderUri });
       return;
     }
 
@@ -4261,6 +4497,12 @@ export async function runReviewForFolder(
       ...(publishFreshnessGuard !== undefined ? { publishFreshnessGuard } : {}),
     };
 
+    // 2026-08-27 review, blocker "review rows... omit earlier retry-attempt
+    // identities": collect EVERY coordinator attempt this round makes (a
+    // primary candidate that fails before a fallback candidate succeeds, an
+    // item-14 same-candidate retry), not just the final one carried on
+    // `outcome.correlation` — see `ReviewOutcomeContextV1.extraCoordinatorAttemptIds`.
+    const observedCoordinatorAttemptIds: string[] = [];
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -4268,6 +4510,9 @@ export async function runReviewForFolder(
       taskStage: currentStage,
       rawInput: validatedInput,
       cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
+      onPromptAssembled: (info) => {
+        observedCoordinatorAttemptIds.push(info.attemptId);
+      },
     });
     // "completed" is the only outcome that overwrites reviewUri with fresh
     // content (via the coordinator's own write) — every other kind
@@ -4290,6 +4535,9 @@ export async function runReviewForFolder(
       modelId,
       promptLength: promptByteLength,
       providerId: dispatchProviderId,
+      ...(observedCoordinatorAttemptIds.length
+        ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
+        : {}),
     });
   } finally {
     if (!reviewSucceeded) {
@@ -7629,6 +7877,73 @@ async function executeImplementationRun(
   }
   const quarantinedPaths = recovery?.quarantinedPaths ?? [];
 
+  // Prompt manifest (item 17a/18, Part 2 step 7) — written to `runs/` now,
+  // as soon as this round's result (and any captured coordinator attempts)
+  // is known, rather than after the run log is written (review blocker,
+  // 2026-08-27, third pass: "Step 7... still waits until after the run log
+  // is written to persist the captures"). `writePromptManifestV1` now names
+  // files purely from `promptRoundId`/`attemptId` (see promptManifestV1.ts's
+  // doc comment), so this needs nothing the run log produces and can run
+  // this much earlier — still after the recovery transition above, which is
+  // deliberately the first write of any kind after a round settles (see its
+  // own comment), but well before the run log, the checklist merge, and
+  // every banking/blocker step below. A write failure is recorded as a
+  // durable note folded into the run log's OWN content further down
+  // (`manifestFailureNote`) rather than a second write against an
+  // already-written file, so a reader who finds the manifest missing can
+  // tell "it was never attempted" apart from "it was attempted and failed".
+  let manifestFailureNote: string | undefined;
+  try {
+    // See PromptManifestV1.promptCaptureComplete: a direct CLI dispatch
+    // (runnerId !== "copilot-lm") sends dispatchPrompt verbatim, so capture
+    // is complete. A Copilot-resolved round runs through the sealed
+    // pipeline, which prepends/appends content this dispatch path never
+    // built itself — but the coordinator retains that exact text and hands
+    // it back on `result.assembledPrompt`/`result.assembledPromptAttempts`
+    // (see `AssembledPromptCaptureV1`/`AssembledPromptAttemptsV1` in
+    // runEditActionV1.ts). Write ONE manifest+prompt pair PER captured
+    // attempt, not one per round, so a round that fell back from a failing
+    // primary candidate to a working secondary retains BOTH attempts'
+    // prompts on disk instead of losing the primary's to overwrite — EVERY
+    // attempt (including the last) is named by its own `attemptId`; there is
+    // no longer an unsuffixed "last attempt" special case. Only fall back to
+    // the pre-coordinator template (and the honest `promptCaptureComplete:
+    // false`) when no attempt was captured at all (e.g. `initialCandidate`
+    // reuse before this was wired, a best-effort capture failure, or a
+    // CLI-resolved dispatch that never reaches the coordinator).
+    const runsDirUri = vscode.Uri.joinPath(folderUri, RUNS_DIRNAME);
+    const capturedAttempts = result.assembledPromptAttempts ?? (
+      result.assembledPrompt !== undefined ? [result.assembledPrompt] : []
+    );
+    if (capturedAttempts.length > 0) {
+      for (const attempt of capturedAttempts) {
+        const manifest = buildPromptManifestV1(
+          options.templateName ?? "run-implementation.md",
+          options.templateVariables ?? { prompt: dispatchPrompt },
+          attempt.prompt,
+          true,
+          promptRoundId,
+          attempt.attemptId
+        );
+        await writePromptManifestV1(runsDirUri, manifest, attempt.prompt);
+      }
+    } else {
+      const promptCaptureComplete = result.runnerId !== "copilot-lm";
+      const manifest = buildPromptManifestV1(
+        options.templateName ?? "run-implementation.md",
+        options.templateVariables ?? { prompt: dispatchPrompt },
+        dispatchPrompt,
+        promptCaptureComplete,
+        promptRoundId
+      );
+      await writePromptManifestV1(runsDirUri, manifest, dispatchPrompt);
+    }
+  } catch (manifestError) {
+    manifestFailureNote = `\n\n## Prompt manifest\n\nFailed to write the prompt observability manifest for this round: ${
+      manifestError instanceof Error ? manifestError.message : String(manifestError)
+    }\n`;
+  }
+
   // Post-run delta gate, second half (Part 2 step 3): an
   // `inspect-and-complete` continuation is bounded to the quarantined plus
   // previously-reviewed scope. Files it changed OUTSIDE that boundary are
@@ -7726,49 +8041,11 @@ async function executeImplementationRun(
     result.typeCheckFailed
       ? `\n\n## Type-check failure (2g)\n\nThe project no longer type-checks after this round's edits:\n\n\`\`\`\n${result.typeCheckOutput ?? ""}\n\`\`\`\n`
       : ""
-  }`;
+  }${manifestFailureNote ?? ""}`;
 
   const logUri = await writeRunLog(folderUri, result.runnerId, "impl", logContent);
   // No handle in scope here either — resolve the task's live root operation.
   taskOperations.setResultTargetUriForTask(folderUri.fsPath, logUri);
-
-  // Prompt manifest (item 17a/18, Part 2 step 7) — written beside the run
-  // log, best-effort: an observability artifact failing to write must never
-  // be mistaken for the round itself failing. A write failure is no longer
-  // silently swallowed (review blocker, 2026-08-26): it is appended to the
-  // ALREADY-WRITTEN run log as its own durable note, so a reader who goes
-  // looking for the manifest and finds it missing can tell "it was never
-  // attempted" apart from "it was attempted and failed", instead of the
-  // absence being unexplained.
-  try {
-    // See PromptManifestV1.promptCaptureComplete: only a direct CLI dispatch
-    // (runnerId !== "copilot-lm") sends dispatchPrompt verbatim; a
-    // Copilot-resolved round runs through the sealed pipeline, which
-    // prepends/appends content this dispatch path never sees.
-    const promptCaptureComplete = result.runnerId !== "copilot-lm";
-    const manifest = buildPromptManifestV1(
-      options.templateName ?? "run-implementation.md",
-      options.templateVariables ?? { prompt: dispatchPrompt },
-      dispatchPrompt,
-      promptCaptureComplete,
-      promptRoundId
-    );
-    await writePromptManifestV1(logUri, manifest, dispatchPrompt);
-  } catch (manifestError) {
-    try {
-      const note = `\n\n## Prompt manifest\n\nFailed to write the prompt observability manifest for this round: ${
-        manifestError instanceof Error ? manifestError.message : String(manifestError)
-      }\n`;
-      await vscode.workspace.fs.writeFile(
-        logUri,
-        new TextEncoder().encode(logContent + note)
-      );
-    } catch {
-      // Even the durable failure note could not be written (e.g. the
-      // filesystem itself is unavailable) — the round's own bookkeeping
-      // above already succeeded and must not be blocked by this.
-    }
-  }
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
@@ -7947,6 +8224,13 @@ async function executeImplementationRun(
             ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
             ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
             dispatchMode: currentDispatchMode,
+            // Review fix, Step 11 narrowed blocker 2: record which review
+            // stage was actually active so a plateau card for one impl-review
+            // stage cannot absorb a round dispatched while the task was at
+            // the other. Omitted when `gateStage` is itself "impl" (no review
+            // stage was active) or matches something outside the impl-review
+            // pair (nothing to disambiguate).
+            ...(IMPL_REVIEW_STAGES.includes(gateStage) ? { originatingReviewStage: gateStage } : {}),
           })
         );
         await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
@@ -8080,6 +8364,12 @@ async function executeImplementationRun(
         // actually resolves its model/quota/fallback chain) and on the
         // candidate that actually produced `result`, not on the task's
         // current review stage or the originally-requested model.
+        // Review fix, Step 11 narrowed blocker 2: same originating-stage
+        // stamp as the gate block above, computed from the same
+        // `priorProgress?.currentStage ?? postRunReviewStage` this block
+        // already reads just below as `zeroChangeStage` — read here directly
+        // since `zeroChangeStage` itself is declared after this patch.
+        const zeroChangeOriginatingStage = priorProgress?.currentStage ?? postRunReviewStage;
         const withOutcome = appendRoundOutcome(withStreak, {
           stage: zeroChangeBookkeepingStage,
           classification: zeroChangeClassification,
@@ -8087,6 +8377,9 @@ async function executeImplementationRun(
           ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
           ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
           dispatchMode: currentDispatchMode,
+          ...(IMPL_REVIEW_STAGES.includes(zeroChangeOriginatingStage)
+            ? { originatingReviewStage: zeroChangeOriginatingStage }
+            : {}),
         });
         return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
           ? { ...withOutcome, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
@@ -9357,6 +9650,20 @@ export async function runImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
+  // Set by the automation-redirect branch below (review blocker, 2026-08-26:
+  // "the automatic Apply Review redirect cannot safely execute from inside
+  // the live Implementation root operation"). `goToReviewAndApplyV1` moves
+  // the task's stage, which calls `cancelRunningOperationsForTask` and then
+  // POLLS for this task's live operations to reach zero — but this very
+  // "Run Implementation" operation is one of them, and it cannot reach zero
+  // until the `runTrackedOperation` callback below returns. Calling it from
+  // inside the callback was a guaranteed self-wait (observed: the redirect
+  // announces itself, then blocks ~15s, then `goToReviewAndApplyV1` gives up
+  // and the redirect never dispatches). The fix: the callback only RECORDS
+  // the redirect and returns (ending the operation normally), and the actual
+  // redirect runs here, after `runTrackedOperation` has resolved and the
+  // operation has genuinely ended.
+  let redirectAfterOperationV1: { reviewStage: TaskStage; reason: string } | undefined;
   await runTrackedOperation(
     lockKey,
     { label: "Run Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "run-implementation", cancellable: true },
@@ -9674,10 +9981,14 @@ export async function runImplementationWithAI(
           // Best-effort record only — the redirect itself must still happen
           // even when the chat write fails.
         }
-        await goToReviewAndApplyV1({
-          taskFolderPath: resolved.folderUri.fsPath,
+        // Do NOT dispatch the redirect here — see `redirectAfterOperationV1`'s
+        // declaration comment above. Recording it and returning ends this
+        // operation cleanly; the actual `goToReviewAndApplyV1` call runs once
+        // `runTrackedOperation` has resolved, below.
+        redirectAfterOperationV1 = {
           reviewStage: autoDispatch.reviewStage,
-        });
+          reason: autoDispatch.reason,
+        };
         return;
       }
     }
@@ -9833,6 +10144,39 @@ export async function runImplementationWithAI(
     );
     }
   );
+
+  // Runs only after the "Run Implementation" operation above has genuinely
+  // ended — see `redirectAfterOperationV1`'s declaration comment. The stage
+  // transition inside `goToReviewAndApplyV1` no longer has to wait on (and
+  // cancel) the operation that is dispatching it.
+  if (redirectAfterOperationV1) {
+    const dispatched = await goToReviewAndApplyV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      reviewStage: redirectAfterOperationV1.reviewStage,
+    });
+    if (!dispatched) {
+      // `goToReviewAndApplyV1` already reports the specific cause (stage
+      // transition failure, verification mismatch) via its own
+      // notification/`setTaskStage` path; this is unattended automation, so
+      // there is no human present to act on a second notification here — but
+      // the failure must still be visible in the durable record rather than
+      // silently dropped, since this is exactly the loop the redirect exists
+      // to break.
+      try {
+        await appendChatMessageV1(resolved.folderUri.fsPath, {
+          role: "assistant",
+          text:
+            `_Automation redirect failed: could not move the task to ` +
+            `${STAGE_DISPLAY_NAMES[redirectAfterOperationV1.reviewStage]} to dispatch Apply Review. ` +
+            "No round ran this cycle — retry from the tree, or check whether another operation is still live._",
+          stage: resolved.progress.currentStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort record only.
+      }
+    }
+  }
 }
 
 /**
@@ -10691,7 +11035,7 @@ export async function resumeReviewInteractionV1(
   // runReviewForFolder) — distinct from the coordinator's own fresh
   // provider attemptId for the resumed operation.
   const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(taskFolderUri, reviewAttemptId);
+  const claimed = await claimReviewAttempt(taskFolderUri, reviewAttemptId, targetStage);
   if (!claimed) {
     return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
   }
@@ -10710,9 +11054,21 @@ export async function resumeReviewInteractionV1(
   );
   if (!variablesResult.ok) {
     NotificationRouter.showWarning(variablesResult.warning);
+    // 2026-08-27 review, same blocker as the "no configured model" early
+    // return in `runReviewForFolder`: this happens before `coordinator.resumeAction`
+    // is ever called, so `handleReviewOutcomeV1`'s safety net never runs and
+    // the row `claimReviewAttempt` opened above would otherwise stay "open"
+    // until the still-unbuilt reconciliation sweep exists at all.
+    await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: taskFolderUri });
     return { ok: false, reason: variablesResult.warning };
   }
 
+  // 2026-08-27 review, blocker "lifecycle identity", fourth pass: "Resume
+  // execution calls `runProviderRow` without an attempt observer, so
+  // fallback/retry attempts during a resumed review are also absent" — mirror
+  // `runReviewForFolder`'s `observedCoordinatorAttemptIds` collection here now
+  // that `TaskActionResumeRequestV1.onPromptAssembled` exists.
+  const observedCoordinatorAttemptIds: string[] = [];
   const outcome = await coordinator.resumeAction({
     interaction: interactionRef,
     taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
@@ -10720,6 +11076,9 @@ export async function resumeReviewInteractionV1(
     taskStage: currentStage,
     resumeIdempotencyId,
     cancellationToken,
+    onPromptAssembled: (info) => {
+      observedCoordinatorAttemptIds.push(info.attemptId);
+    },
   });
 
   await handleReviewOutcomeV1(outcome, {
@@ -10733,6 +11092,9 @@ export async function resumeReviewInteractionV1(
     reviewAttemptId,
     chatViewProvider,
     modelId,
+    ...(observedCoordinatorAttemptIds.length
+      ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
+      : {}),
   });
 
   const after = await orchestrator.loadInteraction(interactionRef);

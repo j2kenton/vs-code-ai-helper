@@ -186,6 +186,19 @@ export interface TaskProgress {
    * candidate) never reach that accounting and are not recorded here.
    * Capped at MAX_ROUND_OUTCOMES (oldest dropped). */
   roundOutcomes?: RoundOutcomeEntryV1[];
+  /**
+   * The sole lifecycle authority for a round, start to end (mirror of
+   * `src/types/taskProgress.ts`): every round the task ever starts gets
+   * exactly one row here, created either from a scheduling intent
+   * (`roundId = intentId`, `state: "scheduled"`) or from the coordinator's
+   * manual-dispatch `operationId` (`state: "open"`), and ended exactly once
+   * by `terminalizeRoundV1`. Distinct from `roundOutcomes` above: that is a
+   * CLASSIFICATION record written only for rounds that reach completion
+   * accounting; this is a LIFECYCLE record covering every round regardless
+   * of how it ends. Capped at MAX_ROUND_LEDGER_ENTRIES (oldest dropped
+   * first).
+   */
+  roundLedger?: RoundLedgerEntryV1[];
   /** Set when automated review iteration needs a human decision. */
   escalation?: TaskEscalation;
   /** Durable record of every escalation Fast Forward rode through rather than
@@ -262,6 +275,25 @@ export type ImplRecoveryModeV1 =
 
 /** Dispatch state of the owed recovery continuation. */
 export type ImplRecoveryDispatchStateV1 = "pending" | "dispatched";
+
+/**
+ * What an implementation round was actually working from (mirror of
+ * `src/types/taskProgress.ts`) — distinguishes a checklist-driven
+ * Implementation round from a review-driven Apply Review round from a
+ * recovery continuation of either.
+ */
+export type ImplementationDispatchModeV1 =
+  | "implementation"
+  | "apply-review"
+  | "continuation";
+
+/** `RoundLedgerEntryV1.mode`'s value space — a strict superset of
+ * `ImplementationDispatchModeV1` (mirror of `src/types/taskProgress.ts`);
+ * adds `"review"` for rows recorded at a review stage, which none of the
+ * three implementation-only values fit. Kept as its own type so the OTHER
+ * fields typed `ImplementationDispatchModeV1` (genuinely implementation-only)
+ * cannot silently accept it. */
+export type RoundLedgerModeV1 = ImplementationDispatchModeV1 | "review";
 
 /** `TaskProgress.implRecovery` — one owed recovery continuation. */
 export interface ImplRecoveryV1 {
@@ -448,6 +480,79 @@ export interface RoundOutcomeEntryV1 {
 
 /** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */
 export const MAX_ROUND_OUTCOMES = 50;
+
+/** Cap on `TaskProgress.roundLedger` length (oldest TERMINAL rows dropped first). */
+export const MAX_ROUND_LEDGER_ENTRIES = 200;
+
+/** `TaskProgress.roundLedger`'s lifecycle states (mirror of
+ * `src/types/taskProgress.ts`): `"scheduled"` and `"open"` are the two live
+ * states; every other value is terminal and, once set, may never change. */
+export type RoundLedgerStateV1 =
+  | "scheduled"
+  | "open"
+  | "completed"
+  | "rejected"
+  | "cancelled"
+  | "failed"
+  | "quota-blocked"
+  | "dropped"
+  | "interrupted";
+
+/** The durable outcome recorded on a terminalized `RoundLedgerEntryV1`
+ * (mirror of `src/types/taskProgress.ts`). */
+export interface RoundLedgerOutcomeV1 {
+  /** Paths changed by this round, when known. */
+  filesChanged?: readonly string[];
+  /** True when a round DID change files but the exact set could not be enumerated. */
+  filesChangedUnknown?: boolean;
+  /** A review round's score out of 10, when this row is a review. */
+  score?: number;
+  /** A review round's blocker count actually raised by the reviewer. */
+  reviewerBlockers?: number;
+  /** A review round's blocker count synthesized from failing checks. */
+  mechanicalBlockers?: number;
+  /** Why a round's summary was rejected, for `state: "rejected"`. */
+  rejectionReason?: string;
+  /** True when ending this round left a recovery continuation owed. */
+  continuationOwed?: boolean;
+  /** Workspace-relative path of this round's run log, when one was written. */
+  runLogPath?: string;
+  /** Correlates this row with its `TaskProgress.roundOutcomes` classification
+   * entry (matched by `attemptId`), when this round also went through
+   * completion accounting. */
+  roundOutcomeAttemptId?: string;
+  /** Headings of `## Accepted Non-Goals` entries this review round re-raised
+   * a blocker against (mirror of `src/types/taskProgress.ts`). */
+  reviewerChallengedNonGoal?: readonly string[];
+}
+
+/** One row of `TaskProgress.roundLedger` — the sole lifecycle record of one
+ * round, from its scheduled/open start to its terminal end (mirror of
+ * `src/types/taskProgress.ts`). */
+export interface RoundLedgerEntryV1 {
+  /** This row's own stable identity. Never reassigned once set. */
+  roundId: string;
+  /** The scheduling intent that announced this round, when it was auto-started. */
+  intentId?: string;
+  /** The coordinator's `operationId` for this round. */
+  operationId?: string;
+  /** Every coordinator `attemptId` this round's operation allocated. */
+  attemptIds: string[];
+  /** This row's own `roundId` when this round is a recovery continuation OF another round. */
+  continuationOf?: string;
+  /** The stage this round ran against. */
+  stage: TaskStage;
+  /** What this round was dispatched to work from. */
+  mode: RoundLedgerModeV1;
+  /** ISO timestamp this row was created. */
+  startedAt: string;
+  /** Current lifecycle state. */
+  state: RoundLedgerStateV1;
+  /** ISO timestamp `terminalizeRoundV1` set the terminal `state`. */
+  endedAt?: string;
+  /** Set only once `state` is terminal. */
+  outcome?: RoundLedgerOutcomeV1;
+}
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */
 export const MAX_REVIEW_BLOCKER_IDENTITIES = 32;

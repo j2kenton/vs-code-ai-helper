@@ -354,6 +354,37 @@ export interface SealedAppliedOperationV1 {
 /** See `SealedAppliedOperationV1.contentExcerpt`'s doc comment. */
 export const SEALED_OPERATION_CONTENT_EXCERPT_MAX_CHARS_V1 = 4000;
 
+/**
+ * The preflight phase's actual dispatched text, captured via
+ * `TaskActionRequestV1.onPromptAssembled` at the moment the coordinator
+ * finalizes it (review blocker, 2026-08-26: "prompt observability still uses
+ * post-run raw-prompt sidecars instead of the attempt-bound canonical
+ * transaction input"). This IS the preamble + rendered prompt + result-
+ * contract suffix the model actually received for the preflight (exploration/
+ * planning) phase — the phase the sealed pipeline actually prompts a model
+ * for. The mechanical execution phase (`continueSealedEditExecutionV1`)
+ * applies the already-decided sealed plan; it has no further model-facing
+ * prompt for this to capture.
+ */
+export interface AssembledPromptCaptureV1 {
+  readonly attemptId: string;
+  readonly prompt: string;
+  readonly promptSha256: string;
+}
+
+/**
+ * Every `onPromptAssembled` capture from ONE `coordinator.executeAction` call
+ * for the preflight phase, in firing order (review blocker, 2026-08-27:
+ * "fallback or retry attempts overwrite earlier attempts" — a single mutable
+ * capture variable kept only the LAST attempt, so a round whose primary
+ * candidate failed and fell back to a secondary discarded the primary's own
+ * assembled prompt, the one attempt an operator investigating that failure
+ * would actually want). Always includes whichever single entry `assembledPrompt`
+ * also carries (its last element), so a caller that only reads the singular
+ * field loses nothing already available today.
+ */
+export type AssembledPromptAttemptsV1 = readonly AssembledPromptCaptureV1[];
+
 export type TwoPhaseEditResultV1 =
   | {
       readonly kind: "completed";
@@ -362,9 +393,30 @@ export type TwoPhaseEditResultV1 =
       readonly changedPaths: readonly string[];
       /** The same applied steps as `changedPaths`, kept per-operation with kind — see `SealedAppliedOperationV1`. */
       readonly appliedOperations: readonly SealedAppliedOperationV1[];
+      /** See `AssembledPromptCaptureV1`. Absent when the preflight's callback
+       * never fired (e.g. `initialCandidate` reuse before it was wired, or a
+       * capture failure — best-effort only). */
+      readonly assembledPrompt?: AssembledPromptCaptureV1;
+      /** See `AssembledPromptAttemptsV1`. */
+      readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
     }
-  | { readonly kind: "noChanges" }
-  | { readonly kind: "questions"; readonly outcome: TaskActionOutcomeV1 }
+  | {
+      readonly kind: "noChanges";
+      readonly assembledPrompt?: AssembledPromptCaptureV1;
+      readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+    }
+  | {
+      readonly kind: "questions";
+      readonly outcome: TaskActionOutcomeV1;
+      /** See `AssembledPromptCaptureV1`. Present whenever the preflight's
+       * callback fired before the model answered with questions instead of
+       * an edit plan — review blocker, 2026-08-26: this was previously
+       * discarded here, so "what prompt produced these questions?" was
+       * unanswerable for this outcome. */
+      readonly assembledPrompt?: AssembledPromptCaptureV1;
+      /** See `AssembledPromptAttemptsV1`. */
+      readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+    }
   | {
       readonly kind: "unavailable";
       readonly code:
@@ -384,7 +436,18 @@ export type TwoPhaseEditResultV1 =
       readonly appliedOperations: readonly SealedAppliedOperationV1[];
       readonly reason: string;
     }
-  | { readonly kind: "failed"; readonly outcome: TaskActionOutcomeV1 };
+  | {
+      readonly kind: "failed";
+      readonly outcome: TaskActionOutcomeV1;
+      /** See `AssembledPromptCaptureV1`. Present whenever the preflight's
+       * callback fired before the preflight itself failed — review blocker,
+       * 2026-08-26: this was previously discarded here, so a failed round's
+       * manifest fell back to the pre-coordinator template instead of the
+       * text the model actually saw. */
+      readonly assembledPrompt?: AssembledPromptCaptureV1;
+      /** See `AssembledPromptAttemptsV1`. */
+      readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+    };
 
 export interface RunTwoPhaseEditOptionsV1 {
   readonly actionKey: string;
@@ -435,6 +498,21 @@ export async function runTwoPhaseEditActionV1(
     rootBindingId: availability.rootBindingId,
     requestDigest: computeEditRequestDigestV1(options.prompt),
   };
+  // Best-effort capture of the preflight's actual dispatched text — see
+  // `AssembledPromptCaptureV1`'s doc comment. A plain closure array, not
+  // threaded through `preflightOutcome`: `TaskActionOutcomeV1` is the closed
+  // coordinator contract (plan §3.7) and must not grow an observability-only
+  // field, so this is captured out-of-band and merged onto every outcome kind
+  // below that can carry it instead — "completed", but ALSO "questions" and
+  // "failed" (review blocker, 2026-08-26: these were previously discarded
+  // here, so a round that ended in a question or a preflight failure had no
+  // retained prompt to inspect). An ARRAY, not a single overwritten variable
+  // (review blocker, 2026-08-27: "fallback or retry attempts overwrite
+  // earlier attempts") — `executeAction` fires this callback once per
+  // coordinator attempt within the row (a fresh candidate, an item-14 retry,
+  // or a fallback candidate after the primary failed), and every one of
+  // those is worth retaining, not just whichever fired last.
+  const capturedAssembledPromptAttempts: AssembledPromptCaptureV1[] = [];
   const preflightOutcome = await coordinator.executeAction({
     actionKey: options.actionKey,
     taskBinding: options.taskBinding,
@@ -442,20 +520,54 @@ export async function runTwoPhaseEditActionV1(
     taskStage: options.taskStage,
     rawInput: preflightInput as unknown as Record<string, unknown>,
     cancellationToken: options.cancellationToken,
+    onPromptAssembled: (info) => {
+      capturedAssembledPromptAttempts.push(info);
+    },
   });
+  const capturedAssembledPrompt =
+    capturedAssembledPromptAttempts.length > 0
+      ? capturedAssembledPromptAttempts[capturedAssembledPromptAttempts.length - 1]
+      : undefined;
+  const capturedAttemptsField =
+    capturedAssembledPromptAttempts.length > 0
+      ? { assembledPromptAttempts: capturedAssembledPromptAttempts as AssembledPromptAttemptsV1 }
+      : {};
 
   if (preflightOutcome.kind === "questions") {
-    return { kind: "questions", outcome: preflightOutcome };
+    return capturedAssembledPrompt !== undefined
+      ? {
+          kind: "questions",
+          outcome: preflightOutcome,
+          assembledPrompt: capturedAssembledPrompt,
+          ...capturedAttemptsField,
+        }
+      : { kind: "questions", outcome: preflightOutcome };
   }
   if (preflightOutcome.kind !== "completed") {
-    return { kind: "failed", outcome: preflightOutcome };
+    return capturedAssembledPrompt !== undefined
+      ? {
+          kind: "failed",
+          outcome: preflightOutcome,
+          assembledPrompt: capturedAssembledPrompt,
+          ...capturedAttemptsField,
+        }
+      : { kind: "failed", outcome: preflightOutcome };
   }
   if (preflightOutcome.code === "noChanges") {
     // §7.4: an empty plan settles as completed/noChanges — no edit session.
-    return { kind: "noChanges" };
+    return capturedAssembledPrompt !== undefined
+      ? { kind: "noChanges", assembledPrompt: capturedAssembledPrompt, ...capturedAttemptsField }
+      : { kind: "noChanges" };
   }
 
-  return continueSealedEditExecutionV1(coordinator, preflightOutcome.correlation.operationId, options);
+  const executionResult = await continueSealedEditExecutionV1(
+    coordinator,
+    preflightOutcome.correlation.operationId,
+    options
+  );
+  return executionResult.kind === "completed" && capturedAssembledPrompt !== undefined
+    ? { ...executionResult, assembledPrompt: capturedAssembledPrompt, ...capturedAttemptsField }
+    : executionResult;
 }
 
 /**
@@ -859,13 +971,27 @@ export async function runSealedImplementationV1(
               onProgress: options.onProgress,
             })
           : undefined;
-      return resolveSealedEditCompletionResultV1(
+      const completionResult = resolveSealedEditCompletionResultV1(
         changedPaths,
         result.appliedReceiptIds.length,
         runnerId,
         report,
         result.appliedOperations
       );
+      // Review blocker (2026-08-26): thread the coordinator's own captured
+      // preflight prompt onto the result rather than reconstructing an
+      // approximation post-hoc — see `AssembledPromptCaptureV1`. Also thread
+      // every attempt this round captured (review blocker, 2026-08-27), not
+      // just the one that ultimately completed.
+      return result.assembledPrompt !== undefined
+        ? {
+            ...completionResult,
+            assembledPrompt: result.assembledPrompt,
+            ...(result.assembledPromptAttempts !== undefined
+              ? { assembledPromptAttempts: result.assembledPromptAttempts }
+              : {}),
+          }
+        : completionResult;
     }
     case "noChanges":
       if (
@@ -886,6 +1012,10 @@ export async function runSealedImplementationV1(
           // legitimate no-change completion instead of routing it to review.
           summaryIsSynthetic: true,
           runnerId,
+          ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
+          ...(result.assembledPromptAttempts !== undefined
+            ? { assembledPromptAttempts: result.assembledPromptAttempts }
+            : {}),
         };
       }
       return {
@@ -895,6 +1025,10 @@ export async function runSealedImplementationV1(
         errorMessage:
           "The preflight produced no file changes. Review the prompt/plan and run the action again.",
         runnerId,
+        ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
+        ...(result.assembledPromptAttempts !== undefined
+          ? { assembledPromptAttempts: result.assembledPromptAttempts }
+          : {}),
       };
     case "questions":
       // The durable Chat interaction transaction is already persisted (the
@@ -910,6 +1044,10 @@ export async function runSealedImplementationV1(
         errorMessage:
           "The AI returned structured questions instead of an edit plan. Answer them in Chat With AI and use Resume there to continue.",
         runnerId,
+        ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
+        ...(result.assembledPromptAttempts !== undefined
+          ? { assembledPromptAttempts: result.assembledPromptAttempts }
+          : {}),
       };
     case "unavailable":
       return {
@@ -936,7 +1074,12 @@ export async function runSealedImplementationV1(
         runnerId,
       };
     case "failed":
-      return describeEditActionOutcomeFailureV1(result.outcome, runnerId);
+      return describeEditActionOutcomeFailureV1(
+        result.outcome,
+        runnerId,
+        result.assembledPrompt,
+        result.assembledPromptAttempts
+      );
   }
 }
 
@@ -949,10 +1092,26 @@ export async function runSealedImplementationV1(
  */
 export function describeEditActionOutcomeFailureV1(
   outcome: TaskActionOutcomeV1,
-  runnerId: string
+  runnerId: string,
+  /** See `AssembledPromptCaptureV1`. Review blocker, 2026-08-26: previously
+   * discarded on this path, so a preflight-failed round's manifest fell back
+   * to the pre-coordinator template instead of the text the model saw. */
+  assembledPrompt?: AssembledPromptCaptureV1,
+  /** See `AssembledPromptAttemptsV1`. Review blocker, 2026-08-27. */
+  assembledPromptAttempts?: AssembledPromptAttemptsV1
 ): ImplementationRunResult & { runnerId: string } {
   if (outcome.kind === "cancelled") {
-    return { status: "cancelled", filesChanged: [], runnerId };
+    // Review blocker, 2026-08-27 (narrowed blocker 1): this branch used to
+    // drop `assembledPrompt` even when the preflight's callback had already
+    // fired before cancellation landed — the one `describeEditActionOutcomeFailureV1`
+    // case that discarded it despite accepting it as a parameter.
+    return {
+      status: "cancelled",
+      filesChanged: [],
+      runnerId,
+      ...(assembledPrompt !== undefined ? { assembledPrompt } : {}),
+      ...(assembledPromptAttempts !== undefined ? { assembledPromptAttempts } : {}),
+    };
   }
   const code = outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind;
   // Surface WHY, not just the code. `ProviderChainExhaustionV1`'s own
@@ -1006,6 +1165,8 @@ export function describeEditActionOutcomeFailureV1(
     failureKind: "generic",
     errorMessage: `The edit action did not complete (${code}).${detail}`,
     runnerId,
+    ...(assembledPrompt !== undefined ? { assembledPrompt } : {}),
+    ...(assembledPromptAttempts !== undefined ? { assembledPromptAttempts } : {}),
   };
 }
 

@@ -1460,9 +1460,11 @@ export async function postReconcilePlanChecklistDecisionV1(
             kind: "option",
             optionId: "reconcile",
             reasoning:
-              `plan-final.md currently reads ${counted.checked}/${counted.total} items complete, with 0 ` +
-              "outstanding — the checklist is fully accounted for, so there is nothing left for any review " +
-              "to vouch for. Marking reconciled simply confirms that and restores completeness gating.",
+              `plan-final.md currently reads ${counted.settled}/${counted.total} items settled ` +
+              `(${counted.checked} completed` +
+              (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
+              "), with 0 outstanding — the checklist is fully accounted for, so there is nothing left for any " +
+              "review to vouch for. Marking reconciled simply confirms that and restores completeness gating.",
           }
         : soleBlockerGuidance
           ? {
@@ -1576,8 +1578,10 @@ export async function postReconcilePlanChecklistDecisionV1(
       stage: progress.currentStage,
       whatHappened:
         `This task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
-        `${counted.checked}/${counted.total} items complete, with ${counted.remaining} outstanding, but a ` +
-        "round changed work the checklist could not record, so its counts may understate what is actually done.",
+        `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +
+        (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
+        `), with ${counted.remaining} outstanding, but a round changed work the checklist could not record, ` +
+        "so its counts may understate what is actually done.",
       whyUserNeeded:
         "Ticking a box cannot be distinguished from ticking the LAST box, so no automatic check can tell a " +
         "partial edit from a finished reconciliation — only a human confirming the checklist now matches the " +

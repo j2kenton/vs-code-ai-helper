@@ -201,13 +201,16 @@ export function hasContradictoryNoChecklistChangeClaimV1(
  * item's text via `(.*\S)`, so a trailing marker needs no change to either
  * regex — only to how the captured text is interpreted afterward.
  *
- * A marked item is still a real checklist item for every purpose except the
- * completeness denominator: `itemsInLatestRendering` still returns it (so it
- * is still matched/ticked by `mergeChecklistProgressV1` and still counted by
- * `hasImplementationChecklistV1`/`collectChecklistItemKeysV1`), but
- * `countChecklistProgressV1` excludes it from `total` and `checked` — which
- * is what `reconcileProgressWithChecklistV1` (reviewReadiness.ts) reads as
- * the denominator the completeness gate cannot be satisfied without.
+ * A marked item is still a real checklist item, and still part of the FIXED
+ * denominator: `itemsInLatestRendering` still returns it (so it is still
+ * matched/ticked by `mergeChecklistProgressV1` and still counted by
+ * `hasImplementationChecklistV1`/`collectChecklistItemKeysV1`), and
+ * `countChecklistProgressV1` still counts it toward `total`. It is excluded
+ * from `checked` and instead settles as `closedWithoutDoing` — closed
+ * without the work having been done, rather than open — which is what
+ * `reconcileProgressWithChecklistV1` (reviewReadiness.ts) reads via
+ * `remaining` as the denominator the completeness gate cannot be satisfied
+ * without.
  *
  * Additive only: a plan-final.md with no markers at all has zero lines
  * matching this, so existing in-flight plans are completely unaffected.
@@ -760,19 +763,40 @@ export function hasImplementationChecklistV1(content: string): boolean {
   );
 }
 
-/** Countable state of a plan-of-record checklist. */
+/**
+ * Countable state of a plan-of-record checklist.
+ *
+ * `total` is FIXED: it is every item in the latest rendering and never
+ * shrinks when an item is later marked excluded (wf "make the stage chat a
+ * record of work", Part 5 / item 4 — a moving denominator makes two readings
+ * of the same plan incomparable). An item is always either OPEN or SETTLED,
+ * and settled has two renderings: ✓ `checked` (closed by doing the work) or
+ * ✗ `closedWithoutDoing` (excluded — descoped, superseded, already covered,
+ * or a branch not taken). Both count toward `settled` against the fixed
+ * `total`; neither is ever subtracted from it.
+ */
 export interface ChecklistProgressV1 {
-  /** Checklist items in the latest rendering, excluding marked-excluded items. */
+  /** Every checklist item in the latest rendering. Never shrinks when an
+   * item is later marked excluded — see this interface's doc comment. */
   readonly total: number;
-  /** Items whose box is ticked, excluding marked-excluded items. */
+  /** Items whose box is ticked and NOT marked excluded — a step closed BY
+   * doing the work (✓). */
   readonly checked: number;
-  /** `total - checked` — the work the plan still says is outstanding. */
-  readonly remaining: number;
   /**
-   * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — counted separately
-   * so a caller can say WHY the denominator is smaller than the checklist's
-   * visible line count, without those items affecting `total`/`checked`.
+   * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — a step closed
+   * WITHOUT doing the work (✗): descoped, superseded, turned out trivial,
+   * turned out already done, or a branch not taken. Settled against `total`
+   * exactly like `checked`, never subtracted from it.
    */
+  readonly closedWithoutDoing: number;
+  /** `checked + closedWithoutDoing` — every item settled one way or the
+   * other against the fixed `total`. */
+  readonly settled: number;
+  /** `total - settled` — genuinely open work; the only number a completeness
+   * gate should ever block on. */
+  readonly remaining: number;
+  /** @deprecated Alias for `closedWithoutDoing`, kept for one release so
+   * callers migrate on their own schedule. Identical value. */
   readonly excluded: number;
 }
 
@@ -830,13 +854,16 @@ function itemsInLatestRendering(
  * distinct steps that happen to share wording stay two steps, and neither
  * disappears from the denominator.
  *
- * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` are excluded from both
- * `total` and `checked` — an operator-action/optional/descoped step the
- * implementation stage cannot itself perform must not hold the completeness
- * gate (`reconcileProgressWithChecklistV1`) open forever. The presence check
- * below still counts them: a plan whose only items are all marked excluded is
- * a real (if fully out-of-scope) checklist, not "no checklist", so it must
- * not fall through to `undefined` and silently disable the gate.
+ * `total` counts EVERY item, including ones marked excluded — the
+ * denominator never shrinks (see `ChecklistProgressV1`'s doc comment). An
+ * item marked excluded settles as `closedWithoutDoing` rather than
+ * `checked`, so it still holds the completeness gate
+ * (`reconcileProgressWithChecklistV1`) open only via `remaining`, never by
+ * vanishing from the count entirely. The presence check below still counts
+ * excluded items toward "has a checklist at all": a plan whose only items
+ * are all marked excluded is a real (if fully out-of-scope) checklist, not
+ * "no checklist", so it must not fall through to `undefined` and silently
+ * disable the gate.
  */
 export function countChecklistProgressV1(
   planOfRecord: string
@@ -845,14 +872,36 @@ export function countChecklistProgressV1(
   if (items.length === 0) {
     return undefined;
   }
-  const counted = items.filter((item) => !item.excluded);
-  const checked = counted.filter((item) => item.checked).length;
+  const checked = items.filter((item) => !item.excluded && item.checked).length;
+  const closedWithoutDoing = items.filter((item) => item.excluded).length;
+  const settled = checked + closedWithoutDoing;
   return {
-    total: counted.length,
+    total: items.length,
     checked,
-    remaining: counted.length - checked,
-    excluded: items.length - counted.length,
+    closedWithoutDoing,
+    settled,
+    remaining: items.length - settled,
+    excluded: closedWithoutDoing,
   };
+}
+
+/**
+ * Format a settled/total checklist ratio as a whole-number percentage for
+ * display (wf "make the stage chat a record of work", Part 5 / item 6).
+ *
+ * Floors rather than rounds, and returns 100 ONLY when every item is
+ * actually settled — 84 of 85 settled must never read as "99%" (which reads
+ * as finished) or "100%" (which would make the checklist a liar). `total
+ * <= 0` (no checklist) reads as 0%, matching a fresh/empty progress state.
+ */
+export function formatChecklistPercentV1(settled: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  if (settled >= total) {
+    return 100;
+  }
+  return Math.min(99, Math.floor((settled / total) * 100));
 }
 
 /** Normalized text of every checklist item in `content`'s latest rendering. */

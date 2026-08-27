@@ -523,15 +523,29 @@ function isExcludedChecklistItemText(itemText: string): boolean {
   return itemText.trimEnd().endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
 }
 
-/** Countable state of a plan-of-record checklist. */
+/**
+ * Countable state of a plan-of-record checklist.
+ *
+ * `total` counts EVERY item, including ones marked excluded — the
+ * denominator never shrinks when an item is later marked excluded (wf "make
+ * the stage chat a record of work", Part 5 / item 4's fixed-denominator
+ * model). An excluded item settles as `closedWithoutDoing` rather than
+ * `checked`; `settled = checked + closedWithoutDoing` is "not open work",
+ * and `remaining = total - settled` is the only field that gates
+ * completeness.
+ */
 export interface ChecklistProgressV1 {
-  /** Checklist items in the latest rendering, excluding marked-excluded items. */
+  /** Every checklist item in the latest rendering, including excluded ones. */
   readonly total: number;
   /** Items whose box is ticked, excluding marked-excluded items. */
   readonly checked: number;
-  /** `total - checked` — the work the plan still says is outstanding. */
+  /** Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — closed without doing the work. */
+  readonly closedWithoutDoing: number;
+  /** `checked + closedWithoutDoing` — settled against a denominator that never moves. */
+  readonly settled: number;
+  /** `total - settled` — the work the plan still says is outstanding. */
   readonly remaining: number;
-  /** Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1`, counted separately. */
+  /** Alias of `closedWithoutDoing`, kept for one release. */
   readonly excluded: number;
 }
 
@@ -573,14 +587,34 @@ export function countChecklistProgressV1(
   if (items.length === 0) {
     return undefined;
   }
-  const counted = items.filter((item) => !item.excluded);
-  const checked = counted.filter((item) => item.checked).length;
+  const checked = items.filter((item) => !item.excluded && item.checked).length;
+  const closedWithoutDoing = items.filter((item) => item.excluded).length;
+  const settled = checked + closedWithoutDoing;
   return {
-    total: counted.length,
+    total: items.length,
     checked,
-    remaining: counted.length - checked,
-    excluded: items.length - counted.length,
+    closedWithoutDoing,
+    settled,
+    remaining: items.length - settled,
+    excluded: closedWithoutDoing,
   };
+}
+
+/**
+ * Format a settled/total checklist ratio as a whole-number percentage for
+ * display. Floors rather than rounds, and returns 100 ONLY when every item
+ * is actually settled — 84 of 85 settled must never read as "99%" (reads as
+ * finished) or "100%" (would make the checklist a liar). `total <= 0` (no
+ * checklist) reads as 0%.
+ */
+export function formatChecklistPercentV1(settled: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  if (settled >= total) {
+    return 100;
+  }
+  return Math.min(99, Math.floor((settled / total) * 100));
 }
 
 /** How many times each item is reported CHECKED in `content`. */
@@ -869,10 +903,10 @@ export function isPlanIncompleteV1(
  */
 export function reconcileProgressWithChecklistV1(
   progress: ReviewProgressV1 | null,
-  checklist: ChecklistProgressV1 | undefined
+  checklist: { total: number; settled: number; remaining: number } | undefined
 ): ReviewProgressV1 | null {
   if (!checklist || checklist.remaining <= 0) {
     return progress;
   }
-  return { complete: checklist.checked, total: checklist.total };
+  return { complete: checklist.settled, total: checklist.total };
 }

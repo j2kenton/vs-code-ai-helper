@@ -34,10 +34,12 @@ import {
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
+  RoundLedgerEntryV1,
   RoundOutcomeEntryV1,
   STAGE_ORDER,
   TaskEscalation,
@@ -138,6 +140,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewScoreHistory",
   "reviewRejections",
   "roundOutcomes",
+  "roundLedger",
   "blockerSupersessions",
   "escalation",
   "overriddenEscalations",
@@ -214,6 +217,26 @@ const IMPLEMENTATION_DISPATCH_MODES: ReadonlySet<string> = new Set([
   "implementation",
   "apply-review",
   "continuation",
+]);
+// RoundLedgerModeV1 — a strict superset of IMPLEMENTATION_DISPATCH_MODES
+// (adds "review" for rows recorded at a review stage; see the type's doc
+// comment in taskProgress.ts). Deliberately a SEPARATE set: roundOutcomes'
+// dispatchMode and implRecovery's sourceDispatchMode are genuinely
+// implementation-only and must keep rejecting "review".
+const ROUND_LEDGER_MODES: ReadonlySet<string> = new Set([
+  ...IMPLEMENTATION_DISPATCH_MODES,
+  "review",
+]);
+const ROUND_LEDGER_STATES: ReadonlySet<string> = new Set([
+  "scheduled",
+  "open",
+  "completed",
+  "rejected",
+  "cancelled",
+  "failed",
+  "quota-blocked",
+  "dropped",
+  "interrupted",
 ]);
 
 /** Bounded-representation limits for strict field validation. */
@@ -982,6 +1005,7 @@ function validateRoundOutcomes(
       "modelId",
       "providerId",
       "dispatchMode",
+      "originatingReviewStage",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1033,6 +1057,219 @@ function validateRoundOutcomes(
         !IMPLEMENTATION_DISPATCH_MODES.has(entry["dispatchMode"]))
     ) {
       return "roundOutcomes entry dispatchMode must be a recognized dispatch mode";
+    }
+    if (
+      entry["originatingReviewStage"] !== undefined &&
+      (typeof entry["originatingReviewStage"] !== "string" ||
+        resolveStage(entry["originatingReviewStage"], family) === undefined)
+    ) {
+      return "roundOutcomes entry originatingReviewStage must be a recognized stage";
+    }
+  }
+  return undefined;
+}
+
+/** Cap on `RoundLedgerEntryV1.attemptIds` length — same bound as
+ * `MAX_REVIEW_BLOCKER_IDENTITIES`; a round that somehow allocated more
+ * attempts than this is a data anomaly, not a case to accommodate. */
+const MAX_ROUND_LEDGER_ATTEMPT_IDS = 32;
+
+function validateRoundLedgerOutcome(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "roundLedger entry outcome must be an object";
+  }
+  const allowed = new Set([
+    "filesChanged",
+    "filesChangedUnknown",
+    "score",
+    "reviewerBlockers",
+    "mechanicalBlockers",
+    "rejectionReason",
+    "continuationOwed",
+    "runLogPath",
+    "roundOutcomeAttemptId",
+    "reviewerChallengedNonGoal",
+  ]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `roundLedger entry outcome has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (value["filesChanged"] !== undefined) {
+    if (!Array.isArray(value["filesChanged"]) || value["filesChanged"].length > MAX_IMPL_REVIEW_FILES) {
+      return "roundLedger entry outcome filesChanged must be a bounded array";
+    }
+    for (const entry of value["filesChanged"] as unknown[]) {
+      if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_PATH_LENGTH) {
+        return "roundLedger entry outcome filesChanged entries must be bounded non-empty strings";
+      }
+    }
+  }
+  if (value["filesChangedUnknown"] !== undefined && typeof value["filesChangedUnknown"] !== "boolean") {
+    return "roundLedger entry outcome filesChangedUnknown must be a boolean";
+  }
+  if (
+    value["score"] !== undefined &&
+    (typeof value["score"] !== "number" || !Number.isFinite(value["score"]))
+  ) {
+    return "roundLedger entry outcome score must be a finite number";
+  }
+  if (
+    value["reviewerBlockers"] !== undefined &&
+    (typeof value["reviewerBlockers"] !== "number" || !Number.isInteger(value["reviewerBlockers"]))
+  ) {
+    return "roundLedger entry outcome reviewerBlockers must be an integer";
+  }
+  if (
+    value["mechanicalBlockers"] !== undefined &&
+    (typeof value["mechanicalBlockers"] !== "number" || !Number.isInteger(value["mechanicalBlockers"]))
+  ) {
+    return "roundLedger entry outcome mechanicalBlockers must be an integer";
+  }
+  if (
+    value["rejectionReason"] !== undefined &&
+    (typeof value["rejectionReason"] !== "string" ||
+      value["rejectionReason"].length === 0 ||
+      value["rejectionReason"].length > MAX_ESCALATION_REASON_LENGTH)
+  ) {
+    return "roundLedger entry outcome rejectionReason must be a bounded non-empty string";
+  }
+  if (value["continuationOwed"] !== undefined && typeof value["continuationOwed"] !== "boolean") {
+    return "roundLedger entry outcome continuationOwed must be a boolean";
+  }
+  if (
+    value["runLogPath"] !== undefined &&
+    (typeof value["runLogPath"] !== "string" ||
+      value["runLogPath"].length === 0 ||
+      value["runLogPath"].length > MAX_PATH_LENGTH)
+  ) {
+    return "roundLedger entry outcome runLogPath must be a bounded non-empty string";
+  }
+  if (
+    value["roundOutcomeAttemptId"] !== undefined &&
+    (typeof value["roundOutcomeAttemptId"] !== "string" ||
+      value["roundOutcomeAttemptId"].length === 0 ||
+      value["roundOutcomeAttemptId"].length > MAX_ID_LENGTH)
+  ) {
+    return "roundLedger entry outcome roundOutcomeAttemptId must be a bounded non-empty string";
+  }
+  if (value["reviewerChallengedNonGoal"] !== undefined) {
+    if (
+      !Array.isArray(value["reviewerChallengedNonGoal"]) ||
+      value["reviewerChallengedNonGoal"].length > MAX_REVIEW_BLOCKER_IDENTITIES
+    ) {
+      return "roundLedger entry outcome reviewerChallengedNonGoal must be a bounded array";
+    }
+    for (const heading of value["reviewerChallengedNonGoal"] as unknown[]) {
+      if (typeof heading !== "string" || heading.length === 0 || heading.length > 200) {
+        return "roundLedger entry outcome reviewerChallengedNonGoal entries must be bounded non-empty strings";
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_ROUND_LEDGER_ENTRIES) {
+    return "roundLedger must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "roundLedger entries must be objects";
+    }
+    const allowed = new Set([
+      "roundId",
+      "intentId",
+      "operationId",
+      "attemptIds",
+      "continuationOf",
+      "stage",
+      "mode",
+      "startedAt",
+      "state",
+      "endedAt",
+      "outcome",
+    ]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `roundLedger entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (
+      typeof entry["roundId"] !== "string" ||
+      entry["roundId"].length === 0 ||
+      entry["roundId"].length > MAX_ID_LENGTH
+    ) {
+      return "roundLedger entry roundId must be a bounded non-empty string";
+    }
+    if (entry["intentId"] !== undefined) {
+      if (
+        typeof entry["intentId"] !== "string" ||
+        entry["intentId"].length === 0 ||
+        entry["intentId"].length > MAX_ID_LENGTH
+      ) {
+        return "roundLedger entry intentId must be a bounded non-empty string";
+      }
+    }
+    if (entry["operationId"] !== undefined) {
+      if (
+        typeof entry["operationId"] !== "string" ||
+        entry["operationId"].length === 0 ||
+        entry["operationId"].length > MAX_ID_LENGTH
+      ) {
+        return "roundLedger entry operationId must be a bounded non-empty string";
+      }
+    }
+    if (
+      !Array.isArray(entry["attemptIds"]) ||
+      entry["attemptIds"].length > MAX_ROUND_LEDGER_ATTEMPT_IDS
+    ) {
+      return "roundLedger entry attemptIds must be a bounded array";
+    }
+    for (const attemptId of entry["attemptIds"] as unknown[]) {
+      if (typeof attemptId !== "string" || attemptId.length === 0 || attemptId.length > MAX_ID_LENGTH) {
+        return "roundLedger entry attemptIds entries must be bounded non-empty strings";
+      }
+    }
+    if (entry["continuationOf"] !== undefined) {
+      if (
+        typeof entry["continuationOf"] !== "string" ||
+        entry["continuationOf"].length === 0 ||
+        entry["continuationOf"].length > MAX_ID_LENGTH
+      ) {
+        return "roundLedger entry continuationOf must be a bounded non-empty string";
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "roundLedger entry stage must be a recognized stage";
+    }
+    if (typeof entry["mode"] !== "string" || !ROUND_LEDGER_MODES.has(entry["mode"])) {
+      return "roundLedger entry mode must be a recognized dispatch mode";
+    }
+    if (!isIsoTimestamp(entry["startedAt"])) {
+      return "roundLedger entry startedAt must be an ISO timestamp";
+    }
+    if (typeof entry["state"] !== "string" || !ROUND_LEDGER_STATES.has(entry["state"])) {
+      return "roundLedger entry state must be a recognized lifecycle state";
+    }
+    const isTerminal = entry["state"] !== "scheduled" && entry["state"] !== "open";
+    if (entry["endedAt"] !== undefined && !isIsoTimestamp(entry["endedAt"])) {
+      return "roundLedger entry endedAt must be an ISO timestamp";
+    }
+    if (isTerminal && entry["endedAt"] === undefined) {
+      return "roundLedger entry endedAt is required once state is terminal";
+    }
+    if (!isTerminal && entry["endedAt"] !== undefined) {
+      return "roundLedger entry endedAt must be absent while state is scheduled/open";
+    }
+    if (entry["outcome"] !== undefined) {
+      const outcomeError = validateRoundLedgerOutcome(entry["outcome"]);
+      if (outcomeError) {
+        return outcomeError;
+      }
+    }
+    if (!isTerminal && entry["outcome"] !== undefined) {
+      return "roundLedger entry outcome must be absent while state is scheduled/open";
     }
   }
   return undefined;
@@ -1807,6 +2044,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.roundOutcomes = value as RoundOutcomeEntryV1[];
+        break;
+      }
+      case "roundLedger": {
+        const error = validateRoundLedger(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.roundLedger = value as RoundLedgerEntryV1[];
         break;
       }
       case "blockerSupersessions": {

@@ -554,6 +554,35 @@ export interface ImplementationRunResult {
   timedOut?: boolean;
   /** Which watchdog produced `timedOut`, mirroring CliExecResult.timeoutReason. */
   timeoutReason?: "wall-clock" | "inactivity";
+  /**
+   * The sealed two-phase pipeline's own preflight prompt, captured verbatim
+   * at the moment the coordinator finalized it — see
+   * `runEditActionV1.ts`'s `AssembledPromptCaptureV1` (review blocker,
+   * 2026-08-26: "prompt observability still uses post-run raw-prompt
+   * sidecars instead of the attempt-bound canonical transaction input").
+   * Only `runSealedImplementationV1` (Copilot-resolved) ever sets this; a
+   * CLI-resolved run dispatches the exact prompt text itself, so its own
+   * caller already has verbatim capture without needing this field. Inlined
+   * rather than importing `AssembledPromptCaptureV1` from
+   * `runEditActionV1.ts` to avoid a module cycle (that file imports this
+   * interface).
+   */
+  assembledPrompt?: { readonly attemptId: string; readonly prompt: string; readonly promptSha256: string };
+  /**
+   * Every preflight-phase attempt this round's `onPromptAssembled` callback
+   * captured, in firing order — review blocker, 2026-08-27: "fallback or
+   * retry attempts overwrite earlier attempts". `assembledPrompt` above
+   * carries only the last of these (kept for callers that only need one);
+   * this carries all of them, so a round that fell back from a failed
+   * primary candidate to a working secondary retains BOTH attempts' prompts
+   * instead of losing the primary's on overwrite. Same inlining rationale as
+   * `assembledPrompt` above (avoids a module cycle with `runEditActionV1.ts`).
+   */
+  assembledPromptAttempts?: readonly {
+    readonly attemptId: string;
+    readonly prompt: string;
+    readonly promptSha256: string;
+  }[];
 }
 
 /**
