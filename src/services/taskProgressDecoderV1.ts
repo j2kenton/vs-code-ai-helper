@@ -1361,6 +1361,7 @@ function validateImplRecovery(
     "leaseUntil",
     "sourceDispatchMode",
     "sourceReviewStage",
+    "sourceRoundId",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1434,6 +1435,14 @@ function validateImplRecovery(
       resolveStage(value["sourceReviewStage"], family) === undefined)
   ) {
     return "implRecovery.sourceReviewStage must be a recognized stage when present";
+  }
+  if (
+    value["sourceRoundId"] !== undefined &&
+    (typeof value["sourceRoundId"] !== "string" ||
+      value["sourceRoundId"].length === 0 ||
+      value["sourceRoundId"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.sourceRoundId must be a bounded non-empty string when present";
   }
   return undefined;
 }

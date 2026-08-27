@@ -41,22 +41,90 @@
  * coordinator call is dispatched, so no coordinator id exists yet at open
  * time, only at the terminal write.
  *
- * NOT YET WIRED into the implementation-round path: the six
- * `appendRoundOutcome` call sites in `reviewActions.ts` that record
- * implementation-round completion accounting do not yet open a
- * corresponding round-ledger row at dispatch or call `terminalizeRoundV1` at
- * completion, nor does `automationChain.ts`'s dropped/cancelled handling or
- * the implementation-recovery continuation path. That remains a separate,
- * larger integration step. Likewise the reconciliation sweep (orphan-closing
- * passes a/b/c) is not yet implemented. This module implements the
+ * PARTIALLY WIRED into the automation-dispatch path (2026-08-27 review
+ * follow-up): `announceAutoStartBestEffortV1` (`schedulingIntentV1.ts`) now
+ * opens a GENERIC `"open"` row for every auto-started round, keyed by the
+ * dispatch's own `intentId` (see `openAutomationRoundLedgerRowBestEffortV1`
+ * below), and `automationChain.ts`'s two `deps.execute` settle points
+ * (immediate and deferred dispatch) call `terminalizeRoundV1` on that SAME
+ * row the moment the dispatched command's promise settles — paired 1:1 with
+ * the existing `recordTerminalIntentBestEffortV1` calls at those same four
+ * branches, so a row opened this way can never leak `"open"`: every path
+ * that terminates the scheduling-intent already terminates the ledger row.
+ * This is deliberately GENERIC (mode inferred from the command name alone,
+ * `outcome` left unset beyond an error's message) because `automationChain.ts`
+ * sees only the command string before dispatch, never the round's actual
+ * files-changed/score/blocker facts — a call site with real per-round data
+ * (`claimReviewAttempt`, or a future implementation-round integration) always
+ * wins the terminal write, since `terminalizeRoundV1` is idempotent and the
+ * generic settle point in `automationChain.ts` fires strictly AFTER the
+ * dispatched command's own promise (and any internal terminalization it
+ * performed) has already resolved.
+ *
+ * NOW WIRED into the implementation-round path's own rich accounting
+ * (2026-08-27 review follow-up, closing the gap this comment used to
+ * describe as outstanding): `executeImplementationRun` claims THIS round's
+ * own row at its own start via `claimImplementationRoundLedgerV1` — reusing
+ * a continuation's row (already opened/linked by
+ * `claimImplRecoveryDispatchV1`) or an auto-dispatch's pending generic row
+ * when either exists, opening a fresh row under the round's own
+ * `promptRoundId` otherwise, which is what closes the "a manually-triggered
+ * implementation round receives NO ledger row at all" gap. Every one of its
+ * former `appendRoundOutcome` call sites (the gate/degenerate-episode branch,
+ * the zero-change branch, the edits-produced/no-edits branches, and the
+ * cancellation branch) now calls `terminalizeRoundV1` against that claimed
+ * `implRoundId` with the round's real files-changed facts instead, via the
+ * `roundOutcomeClassification` option (see `TerminalizeRoundOutcomeClassificationV1`)
+ * so the compatibility `roundOutcomes` entry and the ledger's own terminal
+ * state are written in the SAME transaction. This module implements the
  * terminalizer itself to the plan's idempotency/ordering contract, verified
  * in isolation against directly-constructed `TaskProgress` fixtures and,
- * for the review path, against the real `reviewActions.ts` call sites.
+ * for the review and implementation-round paths, against the real
+ * `reviewActions.ts` call sites (`roundLedgerV1.test.ts`).
+ *
+ * Residual gap, unaffected by the above: `runImplementationOrSealedV1`
+ * (`runEditActionV1.ts`) still surfaces no coordinator `attemptId`/
+ * `operationId` at all for a CLI-resolved dispatch, so an implementation
+ * round's ledger row carries no coordinator-issued identity beyond its own
+ * `promptRoundId`/`attemptId` — `resolveRoundV1` can still find it by that
+ * id, but not by a coordinator `operationId` the way a review round's row
+ * can be enriched (see the coordinator-correlation paragraph above). See
+ * this task's Accepted Non-Goals (Part 2 step 7) for the same underlying
+ * surface gap as it affects prompt retention.
+ *
+ * The implementation-RECOVERY continuation path's source/continuation
+ * linkage IS wired, separately from the rich per-round accounting above (2026-
+ * 08-27 review follow-up): `beginImplementationRecoveryV1`
+ * (`implementationRecoveryV1.ts`) terminalizes the task's own live
+ * `roundLedger` row (or synthesizes one under its `sourceAttemptId` when the
+ * triggering round never opened one) as `rejected`/`failed`/`interrupted`
+ * with `outcome.continuationOwed: true`, in the SAME patch that records
+ * `implRecovery`, and stores the terminalized row's id as
+ * `implRecovery.sourceRoundId`. `claimImplRecoveryDispatchV1` then links the
+ * continuation's own row to it via `continuationOf: sourceRoundId` — reusing
+ * the task's existing live row (an auto-dispatched continuation's own generic
+ * row, opened by the SAME dispatch moments earlier) rather than opening a
+ * second one for the identical round, or synthesizing one under the fresh
+ * continuation `attemptId` for a manual rerun. See
+ * `implementationRecoveryRoundLedgerV1.test.ts`.
+ *
+ * Reconciliation sweep status: all three passes are wired in
+ * `roundLedgerReconciliationV1.ts`, orchestrated by `reconcileRoundLedgerV1`
+ * and called from `TaskActionScheduler.armAll()` (activation + the periodic
+ * sweep) — (c) synthesize legacy rows, then (a) close genuine orphans, then
+ * (b) repair any terminal row missing its outcome message. Pass (a) closes
+ * any `"scheduled"`/`"open"` row with no live operation and no pending
+ * scheduling intent, regardless of which dispatch path opened it — review
+ * rows (`claimReviewAttempt`) and implementation rows
+ * (`claimImplementationRoundLedgerV1`) are both live-row-opening paths now;
+ * passes (b) and (c) operate on terminal rows and legacy chat messages
+ * respectively, so they were never limited to one path's rows.
  */
 import * as vscode from "vscode";
 import {
   ImplementationDispatchModeV1,
   RoundLedgerEntryV1,
+  RoundLedgerModeV1,
   RoundLedgerOutcomeV1,
   RoundOutcomeClassificationV1,
   STAGE_DISPLAY_NAMES,
@@ -86,6 +154,19 @@ export interface TerminalizeRoundOutcomeClassificationV1 {
   readonly providerId?: string;
   readonly dispatchMode?: ImplementationDispatchModeV1;
   readonly originatingReviewStage?: TaskStage;
+  /**
+   * Overrides the ledger row's own `stage` for THIS `roundOutcomes` entry
+   * only, when the two must legitimately differ: an implementation round
+   * dispatched while the task displays an impl-review stage still resolves
+   * its model/quota/fallback chain, and is bookkept by the fallback circuit
+   * breaker, under the literal stage `"impl"` (see the `gateStage`/
+   * `implBookkeepingStage` split documented at the `reviewActions.ts` call
+   * sites this exists for) — while the SAME round's ledger row correctly
+   * carries the review stage it actually ran against, for chat rendering.
+   * Defaults to the ledger row's own `stage` when omitted, which is correct
+   * for every review-round call site (the two are the same there).
+   */
+  readonly stage?: TaskStage;
 }
 
 export interface TerminalizeRoundOptionsV1 {
@@ -142,7 +223,16 @@ export interface TerminalizeRoundOptionsV1 {
 }
 
 export type TerminalizeRoundResultV1 =
-  | { readonly ok: true; readonly alreadyTerminal: boolean; readonly entry: RoundLedgerEntryV1 }
+  | {
+      readonly ok: true;
+      readonly alreadyTerminal: boolean;
+      readonly entry: RoundLedgerEntryV1;
+      /** The full patched `TaskProgress`, when this call actually wrote (not
+       * `alreadyTerminal`) — lets a caller that also needed the SAME
+       * transaction's other effects (e.g. `roundOutcomes`, for the fallback
+       * circuit breaker's own read) avoid a second, separately-racing read. */
+      readonly progress?: TaskProgress;
+    }
   | { readonly ok: false; readonly reason: "notFound" | "writeFailed" };
 
 /** The `_Ended: …_` line rendered into the chat transcript for a
@@ -240,7 +330,7 @@ export async function terminalizeRoundV1(
     if (options.roundOutcomeClassification) {
       const c = options.roundOutcomeClassification;
       next = appendRoundOutcome(next, {
-        stage: nextEntry.stage,
+        stage: c.stage ?? nextEntry.stage,
         classification: c.classification,
         at: endedAt,
         ...(c.attemptId !== undefined ? { attemptId: c.attemptId } : {}),
@@ -288,5 +378,263 @@ export async function terminalizeRoundV1(
     // landed; reconciliation pass (b) repairs a missing outcome message.
   }
 
-  return { ok: true, alreadyTerminal: false, entry };
+  return { ok: true, alreadyTerminal: false, entry, progress: patched };
+}
+
+/**
+ * Best-effort, coarse classification of a round-ledger row's `mode` from the
+ * automation command about to be dispatched — `automationChain.ts` sees only
+ * the command string before dispatch, never the rich per-round dispatch-mode
+ * facts `RoundOutcomeEntryV1.dispatchMode` captures once a round actually
+ * runs. Distinguishes only the buckets a command name can reliably signal;
+ * anything else (plan generation, publish checks, review retries dispatched
+ * under a differently-named command, etc.) defaults to `"implementation"`,
+ * mirroring `resolveIntentMetadataV1`'s own "generic entry" fallback
+ * philosophy (`schedulingIntentV1.ts`) rather than inventing a mode this
+ * type does not have a value for.
+ */
+export function roundLedgerModeForCommandV1(command: string): RoundLedgerModeV1 {
+  if (/applyReview/i.test(command)) {
+    return "apply-review";
+  }
+  if (/review/i.test(command)) {
+    return "review";
+  }
+  return "implementation";
+}
+
+export interface OpenAutomationRoundLedgerRowOptionsV1 {
+  readonly taskFolderUri: vscode.Uri;
+  /** The dispatch's own scheduling `intentId`, reused as this row's
+   * `roundId` — the SAME id `automationChain.ts`'s settle handlers resolve
+   * against to terminalize this row (see this module's own doc comment). */
+  readonly roundId: string;
+  readonly command: string;
+  readonly stage: TaskStage;
+}
+
+/**
+ * Open a `"open"` round-ledger row for an automation-dispatched round (wf
+ * "make the stage chat a record of work" Part 4 step 12: "create a ledger
+ * row from `announceAutoStartBestEffortV1`"). Paired 1:1 with
+ * `automationChain.ts`'s existing generic settle handling — every
+ * `deps.execute` outcome already calls `recordTerminalIntentBestEffortV1`
+ * with a real terminal classification for this same `intentId`, and that
+ * same settle point also calls `terminalizeRoundV1` for the row this opens —
+ * so a row opened here can never leak `"open"` the way a bare row-open
+ * would; the orphan-reconciliation sweep (pass (a)) is still the backstop
+ * for the case where the extension host dies before either settle handler
+ * ever runs. A no-op when a row already resolves this `roundId` (e.g. a
+ * retried announce for the same intent) — never overwrites an existing row.
+ * Best-effort: swallows its own failure, never blocks dispatch.
+ */
+export async function openAutomationRoundLedgerRowBestEffortV1(
+  options: OpenAutomationRoundLedgerRowOptionsV1
+): Promise<void> {
+  try {
+    await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
+      if (resolveRoundV1(current, options.roundId)) {
+        return undefined;
+      }
+      const openRow: RoundLedgerEntryV1 = {
+        roundId: options.roundId,
+        intentId: options.roundId,
+        attemptIds: [],
+        stage: options.stage,
+        mode: roundLedgerModeForCommandV1(options.command),
+        startedAt: new Date().toISOString(),
+        state: "open",
+      };
+      return upsertRoundLedgerEntryV1(current, openRow);
+    });
+  } catch {
+    // Best-effort — never surfaces to the caller, never blocks dispatch.
+  }
+}
+
+/**
+ * A dispatch's scheduling `intentId`, staged for the automation-dispatched
+ * command to pick up and consume as SOON as it opens its own round-ledger
+ * row (Part 4 review follow-up, 2026-08-27 blocker "coordinator-owned
+ * lifecycle identity" / "Automated rounds now add an intent-keyed generic
+ * row while review rows still use a separate synthetic ID"): without this,
+ * `announceAutoStartBestEffortV1` opens a GENERIC row keyed by `intentId`,
+ * then the dispatched command (when it is a review) independently opens its
+ * OWN row keyed by its own `reviewAttemptId` — two rows for one round, and
+ * `automationChain.ts`'s generic settle handler can then write a misleading
+ * `"completed"` onto the generic row's independent identity even when the
+ * review's own richer terminalizer already recorded the round's true ending
+ * on the OTHER row.
+ *
+ * `scheduleAutomationChain` sets this immediately before calling
+ * `deps.execute`, keyed by `dispatch.taskKey` (the task folder path, the
+ * same string `claimReviewAttempt`'s `folderUri.fsPath` resolves to for that
+ * same dispatch); `claimReviewAttempt` consumes it the moment it opens its
+ * own row, and — when present — REUSES the generic row instead of opening a
+ * second one (see its own doc comment), so the two settle points end up
+ * racing to terminalize the SAME row and idempotency picks whichever carries
+ * the richer facts.
+ *
+ * A lightweight, best-effort, in-memory side channel rather than threading
+ * `intentId` through every `AutomationDispatch.arg` shape across the ~12
+ * `scheduleAutomationChain` call sites (a far larger change) — safe because
+ * a task's rounds are exclusive-locked one at a time (`automationChain.ts`'s
+ * own duplicate-chain guard, `taskOperations`' exclusive-operation model), so
+ * at most one dispatch's `deps.execute` is ever actually in flight for a
+ * given task, and therefore at most one pending entry per task key can ever
+ * be live. Consuming ALWAYS deletes the entry (hit or miss), and a short TTL
+ * bounds how long a leaked entry (a dispatch whose command never reaches a
+ * consumer, e.g. Implementation) can survive — it is simply left to expire,
+ * unconsumed, with no effect on that dispatch's own (unchanged) generic-row
+ * handling.
+ *
+ * This does NOT attach identity at the coordinator's own operation/attempt
+ * allocation sites (`taskActionCoordinatorV1.ts`) — the review's literal
+ * ask — because that requires surfacing a coordinator-issued id out of
+ * `runImplementationOrSealedV1`/`executeImplementationRun`, which has no
+ * such id to surface today (see this task's Remaining Blockers). It DOES
+ * eliminate the concrete duplicate-row symptom for every automation-
+ * dispatched review, which is the majority of real automatic dispatches
+ * (auto-review, auto-advance, Fast Forward, the periodic recovery sweep all
+ * dispatch review commands this way).
+ *
+ * Stale-rebinding fix (2026-08-27 review follow-up, blocker "the replacement
+ * task-key/TTL correlation can attach a later review to a stale,
+ * already-terminal round"): an entry left unconsumed here (the dispatched
+ * command was not a review, or a review errored before reaching
+ * `claimReviewAttempt`) can sit in this map — still resolving to a row the
+ * generic settle handler has since terminalized — until its TTL expires or a
+ * later same-taskKey dispatch overwrites it. `claimReviewAttempt` no longer
+ * trusts presence alone: it only reuses the resolved row when that row is
+ * still in a LIVE state (`"scheduled"`/`"open"`); a resolved-but-terminal row
+ * is discarded exactly as if nothing were pending, so a stale id can no
+ * longer reopen an already-ended round under a new review's facts.
+ */
+const pendingAutomationRoundIntents = new Map<string, { readonly intentId: string; readonly expiresAt: number }>();
+
+/** Generous upper bound on how long a set-but-unconsumed pending intent may
+ * linger before it is treated as abandoned — `deps.execute` starting the
+ * dispatched command (and that command reaching its own row-open call, when
+ * it has one) happens within milliseconds of this being set, so this is
+ * purely a leak guard against a dispatch whose command never consumes it. */
+export const PENDING_AUTOMATION_ROUND_INTENT_TTL_MS = 2 * 60 * 1000;
+
+/**
+ * Stage `intentId` for `taskKey` to be picked up by the next consumer.
+ * Overwrites any still-pending entry for the same key — safe, since only one
+ * dispatch's command can be in flight for a given task at a time (see this
+ * export's own doc comment above), so a second `set` for the same key can
+ * only mean the first was already consumed (or genuinely superseded).
+ */
+export function setPendingAutomationRoundIntentV1(taskKey: string, intentId: string): void {
+  pendingAutomationRoundIntents.set(taskKey, { intentId, expiresAt: Date.now() + PENDING_AUTOMATION_ROUND_INTENT_TTL_MS });
+}
+
+/**
+ * Consume (read and delete) the pending `intentId` staged for `taskKey`, or
+ * `undefined` when nothing is pending or the entry has expired. Always
+ * deletes on read — a stale or already-consumed entry is never reused.
+ */
+export function consumePendingAutomationRoundIntentV1(taskKey: string): string | undefined {
+  const entry = pendingAutomationRoundIntents.get(taskKey);
+  if (!entry) {
+    return undefined;
+  }
+  pendingAutomationRoundIntents.delete(taskKey);
+  if (entry.expiresAt < Date.now()) {
+    return undefined;
+  }
+  return entry.intentId;
+}
+
+/** Test-only: clear pending-intent state between unit tests. */
+export function __resetPendingAutomationRoundIntentsForTestV1(): void {
+  pendingAutomationRoundIntents.clear();
+}
+
+export interface ClaimedImplementationRoundLedgerV1 {
+  /** The row's real `roundId` — either `candidateRoundId` (a fresh row was
+   * opened) or the reused pending-automation row's own pre-existing id. */
+  readonly roundId: string;
+}
+
+/**
+ * Claim (open or reuse) THIS implementation round's own `roundLedger` row, at
+ * the round's real start — generalizing `claimReviewAttempt`'s "claim at
+ * start" pattern to the implementation-round path (Part 4 architectural
+ * fix, 2026-08-27 review follow-up, blocker "coordinator-owned lifecycle
+ * identity" / "recovery linkage selects the first task-wide live row rather
+ * than resolving the actual source identity"): without a round-owned id
+ * captured HERE, at the round's own start, every later consumer (recovery
+ * linkage chief among them) has nothing to resolve against but "whichever
+ * row is currently live for this task" — correct only by the accident that
+ * at most one round runs per task at a time, and unable to name the round
+ * that actually failed if that ever stops holding.
+ *
+ * `candidateRoundId` is the caller's own pre-allocated per-round id (e.g.
+ * `executeImplementationRun`'s `promptRoundId`, or a continuation's own
+ * `attemptId`) — reused as this row's `roundId` when nothing is pending to
+ * reuse instead. When this dispatch was auto-started, `scheduleAutomationChain`
+ * already opened a GENERIC row keyed by its own `intentId` and staged that id
+ * for the dispatched command to consume (`setPendingAutomationRoundIntentV1`)
+ * — consumed and reused here exactly as `claimReviewAttempt` does for review
+ * rounds, so the round collapses to the ONE row `automationChain.ts`'s own
+ * settle handler already knows how to terminalize generically, rather than a
+ * second one under `candidateRoundId` racing it. A manually-triggered round
+ * has nothing pending and opens a fresh row under `candidateRoundId` — the
+ * gap this closes: a manually-triggered implementation round previously
+ * received NO ledger row at all.
+ *
+ * A no-op (returns the existing row's id unchanged) when `candidateRoundId`
+ * already resolves to a row — the continuation-linkage case, where
+ * `claimImplRecoveryDispatchV1` already opened or reused this exact round's
+ * row moments earlier under the same id.
+ */
+export async function claimImplementationRoundLedgerV1(
+  folderUri: vscode.Uri,
+  candidateRoundId: string,
+  stage: TaskStage,
+  mode: RoundLedgerModeV1
+): Promise<ClaimedImplementationRoundLedgerV1> {
+  const pendingIntentId = consumePendingAutomationRoundIntentV1(folderUri.fsPath);
+  let finalRoundId = candidateRoundId;
+  await patchTaskProgressStrictV1(folderUri, (current) => {
+    const alreadyOwn = resolveRoundV1(current, candidateRoundId);
+    if (alreadyOwn) {
+      // The continuation-linkage case: this round's row already exists.
+      // Nothing to open or reuse.
+      finalRoundId = alreadyOwn.roundId;
+      return undefined;
+    }
+    const resolvedPending = pendingIntentId ? resolveRoundV1(current, pendingIntentId) : undefined;
+    // Same stale-rebinding guard as `claimReviewAttempt`: only a row still
+    // LIVE is eligible for reuse — a resolved-but-terminal row is treated
+    // exactly like no pending intent existed.
+    const reused =
+      resolvedPending && (resolvedPending.state === "scheduled" || resolvedPending.state === "open")
+        ? resolvedPending
+        : undefined;
+    const openRow: RoundLedgerEntryV1 = reused
+      ? {
+          ...reused,
+          attemptIds: reused.attemptIds.includes(candidateRoundId)
+            ? reused.attemptIds
+            : [...reused.attemptIds, candidateRoundId],
+          stage,
+          mode,
+          state: "open",
+        }
+      : {
+          roundId: candidateRoundId,
+          attemptIds: [candidateRoundId],
+          stage,
+          mode,
+          startedAt: new Date().toISOString(),
+          state: "open",
+          ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
+        };
+    finalRoundId = openRow.roundId;
+    return upsertRoundLedgerEntryV1(current, openRow);
+  });
+  return { roundId: finalRoundId };
 }

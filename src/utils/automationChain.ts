@@ -7,6 +7,7 @@ import {
   recordTerminalIntentBestEffortV1,
   SchedulingIntentMetadataV1,
 } from "../state/schedulingIntentV1";
+import { setPendingAutomationRoundIntentV1, terminalizeRoundV1 } from "./roundLedgerV1";
 
 /**
  * Lock-safe guarded dispatch for automation chains (auto-review,
@@ -274,6 +275,40 @@ function claimChainGuard(
 }
 
 /**
+ * Best-effort close of the generic round-ledger row
+ * `openAutomationRoundLedgerRowBestEffortV1` opened for this dispatch (wf
+ * "make the stage chat a record of work" Part 4 step 12) — called from the
+ * SAME `deps.execute` settle points that already call
+ * `recordTerminalIntentBestEffortV1` for the scheduling intent, so a row
+ * opened at dispatch can never leak `"open"`: no-op when `taskKey`/`intentId`
+ * is absent (nothing was ever opened to close) or when a richer call site
+ * (`claimReviewAttempt` + its own terminalizer) already closed the SAME row
+ * with real per-round facts — `terminalizeRoundV1` is idempotent, and this
+ * settle point fires strictly after the dispatched command's own promise
+ * (and any terminalization it performed internally) has already resolved, so
+ * it can only ever WIN the race for a row nothing else closed.
+ */
+function terminalizeGenericAutomationRoundBestEffortV1(
+  taskKey: string | undefined,
+  intentId: string | undefined,
+  state: "completed" | "failed",
+  error?: unknown
+): void {
+  if (!taskKey || !intentId) {
+    return;
+  }
+  const outcome =
+    state === "failed"
+      ? { rejectionReason: error instanceof Error ? error.message : String(error) }
+      : undefined;
+  void terminalizeRoundV1(intentId, state, outcome, {
+    taskFolderUri: vscode.Uri.file(taskKey),
+  }).catch(() => {
+    // Best-effort — never surfaces to the dispatch caller.
+  });
+}
+
+/**
  * Dispatch `dispatch.command` once it is lock-safe to do so.
  *
  * - Without a `rootOperation`, the command runs immediately and the returned
@@ -332,19 +367,41 @@ export function scheduleAutomationChain(
     }
     return intentIdPromise
       .then(async (id) => {
-        await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent });
+        await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent, intentId: id });
         await recordRunningIntentBestEffortV1(id);
+        // Stage this dispatch's intentId for the dispatched command to
+        // consume the moment it opens its own round-ledger row (Part 4
+        // review follow-up: see `setPendingAutomationRoundIntentV1`'s doc
+        // comment) — set here, immediately before `deps.execute` runs, so a
+        // consumer reading it during the command's own start-of-round logic
+        // always sees the entry for THIS dispatch.
+        if (dispatch.taskKey && id) {
+          setPendingAutomationRoundIntentV1(dispatch.taskKey, id);
+        }
       })
       .then(() => deps.execute(dispatch.command, dispatch.arg))
       .then(
         () => {
           release();
-          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+          void intentIdPromise.then((id) => {
+            void recordTerminalIntentBestEffortV1(id, "completed");
+            terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+          });
           return true;
         },
         (error) => {
           release();
-          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+          // Review fix (wf "stage chat as a record of work" Part 4 step 13):
+          // `deps.execute` rejecting means the dispatched command itself
+          // threw — recording that as "completed" would durably misrepresent
+          // an automation crash as a clean ending. No downstream consumer
+          // branches on the specific terminal value today (posture derivation
+          // only checks for "running"/"scheduled"), so this only corrects the
+          // durable record, not current rendering.
+          void intentIdPromise.then((id) => {
+            void recordTerminalIntentBestEffortV1(id, "failed");
+            terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "failed", error);
+          });
           throw error;
         }
       );
@@ -384,18 +441,31 @@ export function scheduleAutomationChain(
         // command settles so a duplicate cannot start while it runs.
         void intentIdPromise
           .then(async (id) => {
-            await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent });
+            await announceAutoStartBestEffortV1({ taskKey: dispatch.taskKey, command: dispatch.command, intent: dispatch.intent, intentId: id });
             await recordRunningIntentBestEffortV1(id);
+            // Same staging as the immediate-dispatch branch above.
+            if (dispatch.taskKey && id) {
+              setPendingAutomationRoundIntentV1(dispatch.taskKey, id);
+            }
           })
           .then(() => {
             Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
               () => {
                 release();
-                void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+                void intentIdPromise.then((id) => {
+                  void recordTerminalIntentBestEffortV1(id, "completed");
+                  terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+                });
               },
-              () => {
+              (error) => {
                 release();
-                void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "completed"));
+                // Same fix as the immediate-dispatch branch above: the
+                // deferred dispatch's command also rejected, so the real
+                // terminal state is "failed", never "completed".
+                void intentIdPromise.then((id) => {
+                  void recordTerminalIntentBestEffortV1(id, "failed");
+                  terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "failed", error);
+                });
               }
             );
             resolve(true);

@@ -28,6 +28,7 @@ import {
   buildAutoStartAnnouncementTextV1,
   deriveOwedContinuationRecordV1,
   deriveSchedulingPostureV1,
+  hasLiveSchedulingIntentBestEffortV1,
   OwedContinuationSourceV1,
   pruneStaleSchedulingIntentsV1,
   SchedulingIntentStoreV1,
@@ -581,5 +582,67 @@ void describe("announceAutoStartBestEffortV1 (review-flagged 2026-08-23: schema-
     } finally {
       fs.rmSync(fixture.folder, { recursive: true, force: true });
     }
+  });
+
+  // wf "make the stage chat a record of work" Part 4 / item 1: the
+  // announcement must be classifiable as an activity line (for the
+  // collapsed "Activity" group, Part 9) and correlatable back to the
+  // scheduling-intent id that caused it, so the reconciliation sweep's
+  // pass (c) can eventually pair a legacy-shaped announcement with a
+  // round-ledger row.
+  void it("stamps the announcement with kind:'activity' and the caller's intentId", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-scheduling-announce-activity-");
+    const restore = installRealDiskReadFile();
+    try {
+      await announceAutoStartBestEffortV1({
+        taskKey: fixture.folder,
+        command: "ensemble.runImplementation",
+        intent: { trigger: "auto-implement after review completes", willRetry: false },
+        intentId: "intent-abc-123",
+      });
+      const messages = await readChatHistory(fixture.folder);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0]!.kind, "activity");
+      assert.equal(messages[0]!.intentId, "intent-abc-123");
+    } finally {
+      restore();
+      fs.rmSync(fixture.folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("still stamps kind:'activity' when no intentId is supplied, just without the correlation field", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-scheduling-announce-activity-no-intent-");
+    const restore = installRealDiskReadFile();
+    try {
+      await announceAutoStartBestEffortV1({
+        taskKey: fixture.folder,
+        command: "ensemble.runImplementation",
+        intent: { trigger: "auto-implement after review completes", willRetry: false },
+      });
+      const messages = await readChatHistory(fixture.folder);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0]!.kind, "activity");
+      assert.equal(messages[0]!.intentId, undefined);
+    } finally {
+      restore();
+      fs.rmSync(fixture.folder, { recursive: true, force: true });
+    }
+  });
+});
+
+// 2026-08-27 review-flagged: this helper's ONLY caller
+// (`roundLedgerReconciliationV1.ts`) reads a `false` return as authorization
+// to terminalize a `roundLedger` row as orphaned. An earlier version failed
+// to `false` on both the "no extension context" and "read threw" paths,
+// which is exactly the "definitely nothing live" claim the function's own
+// doc comment says must never be made from an indeterminate read. It must
+// fail OPEN (`true`) instead, so "cannot determine" is never mistaken for
+// "safe to close".
+void describe("hasLiveSchedulingIntentBestEffortV1 (fails open, never closed, when indeterminate)", () => {
+  void it("returns true when no extension context is available, never false", () => {
+    // No `getExtensionContextV1()` has been configured anywhere in this test
+    // file, so this exercises the exact "context unavailable" path the
+    // review flagged.
+    assert.equal(hasLiveSchedulingIntentBestEffortV1("some-canonical-id-with-no-context"), true);
   });
 });

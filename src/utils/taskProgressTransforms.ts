@@ -581,6 +581,31 @@ export function resolveRoundV1(
 }
 
 /**
+ * Drift check (wf "make the stage chat a record of work" Part 4 step 46):
+ * every `TaskProgress.roundOutcomes` classification entry that carries an
+ * `attemptId` must resolve to a `roundLedger` row via that same id — a
+ * classification recorded against an identity with no corresponding
+ * lifecycle row is exactly the "two stores disagreeing about the same
+ * round" defect Part 4 exists to close (mirrors item 12's "one quarantine
+ * decision, computed once and consumed everywhere" rule, applied to round
+ * identity instead of blocker quarantine).
+ *
+ * An entry with no `attemptId` is skipped, not flagged: `RoundOutcomeEntryV1
+ * .attemptId`'s own doc comment notes it is populated for review rounds only
+ * today, so an un-set `attemptId` is a known, separate gap (Part 4's
+ * implementation-round rich-accounting integration, still outstanding — see
+ * `roundLedgerV1.ts`'s module doc comment), not a drift this check can
+ * observe.
+ */
+export function findRoundOutcomesMissingLedgerRowV1(
+  progress: TaskProgress
+): readonly RoundOutcomeEntryV1[] {
+  return (progress.roundOutcomes ?? []).filter(
+    (entry) => entry.attemptId !== undefined && !resolveRoundV1(progress, entry.attemptId)
+  );
+}
+
+/**
  * Insert or replace one `TaskProgress.roundLedger` row, matched by
  * `roundId` — the identity that never changes once a row is created (see
  * `RoundLedgerEntryV1.roundId`'s doc comment). Capped at

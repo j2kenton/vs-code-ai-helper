@@ -4,6 +4,7 @@ import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { HandoffGuidanceFieldsV1 } from "../types/handoffGuidanceV1";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { openAutomationRoundLedgerRowBestEffortV1 } from "../utils/roundLedgerV1";
 
 /**
  * The scheduling-intent ledger (task: "Actionable Hand-offs", PART 6).
@@ -35,7 +36,8 @@ export type SchedulingIntentLifecycleStateV1 =
   | "running"
   | "completed"
   | "cancelled"
-  | "expired";
+  | "expired"
+  | "failed";
 
 export interface SchedulingIntentTransitionV1 {
   readonly state: SchedulingIntentLifecycleStateV1;
@@ -629,7 +631,10 @@ export class SchedulingIntentStoreV1 {
   }
 
   /** Transition an entry to a terminal state. */
-  recordTerminal(intentId: string, state: "completed" | "cancelled" | "expired"): Promise<void> {
+  recordTerminal(
+    intentId: string,
+    state: "completed" | "cancelled" | "expired" | "failed"
+  ): Promise<void> {
     return this.transition(intentId, state);
   }
 
@@ -853,6 +858,18 @@ export async function announceAutoStartBestEffortV1(input: {
   readonly taskKey: string | undefined;
   readonly command: string;
   readonly intent?: SchedulingIntentMetadataV1;
+  /**
+   * This dispatch's scheduling-intent id, when the caller already has it
+   * (wf "make the stage chat a record of work" Part 4 / item 1) — stamped
+   * onto the announcement message as `kind: "activity"` + `intentId` so the
+   * reconciliation sweep's pass (c) can correlate a legacy-shaped
+   * announcement against a round-ledger row, and so the renderer (Part 9)
+   * can group it into the collapsed "Activity" section rather than the main
+   * transcript flow. Omitted only by call sites that have not been updated
+   * to thread their `intentId` through yet — the announcement is still
+   * written either way, just without the correlation fields.
+   */
+  readonly intentId?: string;
 }): Promise<void> {
   if (!input.taskKey) {
     return;
@@ -877,11 +894,67 @@ export async function announceAutoStartBestEffortV1(input: {
     const text = buildAutoStartAnnouncementTextV1(metadata);
     await appendChatMessageV1(
       input.taskKey,
-      { role: "assistant", text, stage: progressResult.decoded.progress.currentStage, at: new Date().toISOString() },
+      {
+        role: "assistant",
+        text,
+        stage: progressResult.decoded.progress.currentStage,
+        at: new Date().toISOString(),
+        kind: "activity",
+        ...(input.intentId !== undefined ? { intentId: input.intentId } : {}),
+      },
       input.taskKey
     );
+    // wf "make the stage chat a record of work" Part 4 step 12: open this
+    // round's ledger row under the SAME intentId, paired with
+    // `automationChain.ts`'s existing generic settle handling terminalizing
+    // it (see `openAutomationRoundLedgerRowBestEffortV1`'s own doc comment).
+    // Only when this dispatch actually has an intentId to key the row on —
+    // an un-enriched call site with no intent metadata has nothing to attach
+    // a row's later termination to.
+    if (input.intentId !== undefined) {
+      await openAutomationRoundLedgerRowBestEffortV1({
+        taskFolderUri: vscode.Uri.file(input.taskKey),
+        roundId: input.intentId,
+        command: input.command,
+        stage: progressResult.decoded.progress.currentStage,
+      });
+    }
   } catch {
     // Best-effort — never surfaces to the caller, never blocks dispatch.
+  }
+}
+
+/**
+ * Best-effort, synchronous check for whether a task has any `scheduled`/
+ * `running` scheduling-intent entry right now — the second half of the
+ * round-ledger reconciliation sweep's orphan check (Part 4 step 14,
+ * `roundLedgerReconciliationV1.ts`): a `roundLedger` row left `"scheduled"`/
+ * `"open"` must not be closed as an orphan while the chokepoint that would
+ * eventually run or end it is itself still live, even though no live
+ * `TaskOperationSnapshot` exists yet (the announce-then-dispatch window
+ * between `recordScheduled` and the command actually starting). Unlike the
+ * other best-effort helpers in this section (which fail closed to a no-op
+ * because their callers only treat `true` as license to do MORE work), this
+ * one fails OPEN to `true` when the extension context is unavailable or the
+ * read fails (2026-08-27 review-flagged: an earlier version failed to
+ * `false` on both paths, which its one caller — about to terminalize a row
+ * as orphaned on the basis of this returning `false` — would have read as
+ * exactly the "definitely idle" claim this function must never make).
+ * "Cannot determine" must resolve to "assume live", the conservative
+ * direction, never to "definitely nothing live".
+ */
+export function hasLiveSchedulingIntentBestEffortV1(taskCanonicalId: string): boolean {
+  const store = storeFromActivatingContext();
+  if (!store) {
+    return true;
+  }
+  try {
+    return store.listForTask(taskCanonicalId).some((entry) => {
+      const latest = entry.transitions[entry.transitions.length - 1]?.state ?? "scheduled";
+      return latest === "scheduled" || latest === "running";
+    });
+  } catch {
+    return true;
   }
 }
 
@@ -906,7 +979,7 @@ export async function recordRunningIntentBestEffortV1(intentId: string | undefin
  * `recordRunningIntentBestEffortV1`. */
 export async function recordTerminalIntentBestEffortV1(
   intentId: string | undefined,
-  state: "completed" | "cancelled"
+  state: "completed" | "cancelled" | "failed"
 ): Promise<void> {
   if (!intentId) {
     return;

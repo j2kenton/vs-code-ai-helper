@@ -689,6 +689,17 @@ export interface ImplRecoveryV1 {
    * Only meaningful when `sourceDispatchMode === "apply-review"`.
    */
   sourceReviewStage?: TaskStage;
+  /**
+   * The `roundLedger` row id `beginImplementationRecoveryV1` terminalized as
+   * the source round (Part 4 / item 1 "source/continuation linkage") — the
+   * live `roundLedger` row for this task at transition time when one existed,
+   * or a row freshly synthesized under `sourceAttemptId` when none did (a
+   * manually-dispatched round never opened one). `claimImplRecoveryDispatchV1`
+   * reads this to set the continuation's own row `continuationOf`, so
+   * `resolveRoundV1` can walk from a continuation back to the round it
+   * continues. Absent for a record persisted before this field existed.
+   */
+  sourceRoundId?: string;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */

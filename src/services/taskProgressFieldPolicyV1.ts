@@ -169,7 +169,7 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
   },
   implRecovery: {
     migration:
-      "Validate exact record shape (source attempt, reason, trigger, mode, dispatch state, optional lease/attempt/sourceDispatchMode/sourceReviewStage fields); absent on new tasks.",
+      "Validate exact record shape (source attempt, reason, trigger, mode, dispatch state, optional lease/attempt/sourceDispatchMode/sourceReviewStage/sourceRoundId fields); absent on new tasks.",
     nextStage:
       "Clear — the owed recovery continuation belongs to the implementation loop of the stage being left (parity with incompleteRoundContinuations).",
     markTaskDone: "Clear.",

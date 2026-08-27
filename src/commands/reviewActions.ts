@@ -47,11 +47,11 @@ import {
   appendOverriddenEscalation,
   appendReviewRejection,
   appendReviewScoreHistory,
-  appendRoundOutcome,
   clearImplementationTypeCheckFailure,
   clearReviewInvalidatedByRound,
   promotePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
+  resolveRoundV1,
   setZeroChangeImplRounds,
   pauseTaskWithReason,
   updateImplReviewFiles,
@@ -67,7 +67,12 @@ import {
   shouldContinueAsApplyReviewV1,
 } from "../utils/implementationDispatchModeV1";
 import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
-import { RoundLedgerTerminalStateV1, terminalizeRoundV1 } from "../utils/roundLedgerV1";
+import {
+  claimImplementationRoundLedgerV1,
+  consumePendingAutomationRoundIntentV1,
+  RoundLedgerTerminalStateV1,
+  terminalizeRoundV1,
+} from "../utils/roundLedgerV1";
 import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   computeDegenerateReviewEpisodeModelIdsV1,
@@ -448,24 +453,77 @@ export function scheduleAutomaticImplementationAfterReview(
  * `terminalizeRoundV1` (the sole terminal writer) later resolves this same
  * row by `reviewAttemptId` — see `handleReviewRoutingOutcome` and
  * `handleReviewOutcomeV1`'s general safety-net terminalizer.
+ *
+ * Part 4 review follow-up (2026-08-27, blocker "coordinator-owned lifecycle
+ * identity" / "Automated rounds now add an intent-keyed generic row while
+ * review rows still use a separate synthetic ID"): when this review round
+ * was itself dispatched by `scheduleAutomationChain`, that dispatcher already
+ * opened a GENERIC round-ledger row keyed by its own scheduling `intentId`
+ * (`openAutomationRoundLedgerRowBestEffortV1`) and staged that `intentId`
+ * here via `setPendingAutomationRoundIntentV1`, immediately before invoking
+ * this review command. Consuming it below and REUSING that same row (rather
+ * than opening a second one keyed by `reviewAttemptId`) collapses the round
+ * to one identity: `automationChain.ts`'s settle-point terminalizer and this
+ * review's own terminalizer then race to close the ONE row, and
+ * `terminalizeRoundV1`'s idempotency guarantees the richer of the two calls
+ * always wins regardless of which fires first (see that function's doc
+ * comment). A manually-invoked review has nothing pending to consume and
+ * keeps opening its own row exactly as before.
  */
 export async function claimReviewAttempt(
   folderUri: vscode.Uri,
   reviewAttemptId: string,
   targetStage: TaskStage
 ): Promise<TaskProgress | undefined> {
+  const pendingIntentId = consumePendingAutomationRoundIntentV1(folderUri.fsPath);
   return patchTaskProgressStrictV1(folderUri, (current) => {
     if (current.status === "paused") {
       throw new Error("The task was paused while the review was starting.");
     }
-    const openRow: RoundLedgerEntryV1 = {
-      roundId: reviewAttemptId,
-      attemptIds: [reviewAttemptId],
-      stage: targetStage,
-      mode: "review",
-      startedAt: new Date().toISOString(),
-      state: "open",
-    };
+    const resolvedPending = pendingIntentId ? resolveRoundV1(current, pendingIntentId) : undefined;
+    // Stale-intent guard (2026-08-27 review follow-up, blocker "the
+    // replacement task-key/TTL correlation can attach a later review to a
+    // stale, already-terminal round"): `pendingIntentId` is a best-effort
+    // side channel (see `setPendingAutomationRoundIntentV1`'s doc comment)
+    // that can go unconsumed — the dispatched command was not this review, or
+    // a review errored before reaching this function — and then sit in the
+    // map, still resolving to a row `automationChain.ts`'s generic settle
+    // handler has since terminalized, until its TTL expires or a later
+    // same-taskKey dispatch overwrites it. Reusing a row regardless of
+    // whether the PRIOR round already ended would silently reopen an
+    // already-terminal row under this review's own facts, corrupting the
+    // prior round's durable ending and letting one `roundId` serve two
+    // unrelated rounds. Only a row still LIVE (`"scheduled"`/`"open"`) is
+    // eligible for reuse; a resolved-but-terminal row is treated exactly like
+    // no pending intent existed.
+    const reused =
+      resolvedPending && (resolvedPending.state === "scheduled" || resolvedPending.state === "open")
+        ? resolvedPending
+        : undefined;
+    const openRow: RoundLedgerEntryV1 = reused
+      ? {
+          ...reused,
+          attemptIds: reused.attemptIds.includes(reviewAttemptId)
+            ? reused.attemptIds
+            : [...reused.attemptIds, reviewAttemptId],
+          stage: targetStage,
+          mode: "review",
+          state: "open",
+        }
+      : {
+          roundId: reviewAttemptId,
+          attemptIds: [reviewAttemptId],
+          stage: targetStage,
+          mode: "review",
+          startedAt: new Date().toISOString(),
+          state: "open",
+          // Only attach `pendingIntentId` when it resolved to nothing at all
+          // (a genuinely fresh, not-yet-opened row for THIS dispatch) — never
+          // when it resolved to a stale terminal row (`resolvedPending`
+          // truthy but not reused above), since that id belongs to a
+          // different, already-ended round and must not be attached here.
+          ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
+        };
     return upsertRoundLedgerEntryV1({ ...current, reviewAttemptId }, openRow);
   });
 }
@@ -7581,6 +7639,27 @@ async function executeImplementationRun(
     claimedRecovery.record !== undefined,
     options.editActionKey
   );
+  // Part 4 architectural fix (2026-08-27 review follow-up, blocker
+  // "recovery linkage selects the first task-wide live row rather than
+  // resolving the actual source identity"): claim THIS round's own
+  // `roundLedger` row at start, mirroring `claimReviewAttempt`'s review-round
+  // pattern, so every later consumer — a recovery transition this round may
+  // trigger, and the completion-accounting terminalizers below — resolves
+  // against this round's own identity rather than "whichever row is
+  // currently live for this task". A continuation round already had its row
+  // opened/linked by `claimImplRecoveryDispatchV1` under its own `attemptId`
+  // moments earlier; reusing that id here is a no-op (see
+  // `claimImplementationRoundLedgerV1`'s doc comment) rather than opening a
+  // second row for the same round. A fresh (non-continuation) round claims
+  // under its own `promptRoundId`.
+  const implRoundId = (
+    await claimImplementationRoundLedgerV1(
+      folderUri,
+      claimedRecovery.record?.attemptId ?? promptRoundId,
+      postRunReviewStage,
+      currentDispatchMode
+    )
+  ).roundId;
   // What a NEW recovery (if this round needs one) should record as ITS
   // source — propagated from a continuation's own source so a continuation
   // of a continuation of an apply-review round still resolves to
@@ -7873,6 +7952,7 @@ async function executeImplementationRun(
       ...(incompleteRound === undefined ? { offerRestoreOption: true } : {}),
       sourceDispatchMode: nextRecoverySourceDispatchMode,
       ...(nextRecoverySourceReviewStage ? { sourceReviewStage: nextRecoverySourceReviewStage } : {}),
+      sourceRoundIdHint: implRoundId,
     });
   }
   const quarantinedPaths = recovery?.quarantinedPaths ?? [];
@@ -8216,23 +8296,35 @@ async function executeImplementationRun(
         // (e.g. "claude-cli", or "copilot-lm" for every Copilot dispatch,
         // which is routed exclusively through the sealed pipeline here).
         const gateActualProviderId = result.runnerId;
-        const persistedGateRounds = await patchTaskProgressStrictV1(folderUri, (current) =>
-          appendRoundOutcome(current, {
-            stage: implBookkeepingStage,
-            classification: gateClassification,
-            at: new Date().toISOString(),
-            ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
-            ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
-            dispatchMode: currentDispatchMode,
-            // Review fix, Step 11 narrowed blocker 2: record which review
-            // stage was actually active so a plateau card for one impl-review
-            // stage cannot absorb a round dispatched while the task was at
-            // the other. Omitted when `gateStage` is itself "impl" (no review
-            // stage was active) or matches something outside the impl-review
-            // pair (nothing to disambiguate).
-            ...(IMPL_REVIEW_STAGES.includes(gateStage) ? { originatingReviewStage: gateStage } : {}),
-          })
+        // Part 4 (item 1): this round already reached this branch because it
+        // FINISHED — providing an unusable/empty result, not owing a
+        // recovery continuation (that path is handled by
+        // `beginImplementationRecoveryV1` above and never reaches here) — so
+        // its ledger state is "completed" regardless of `gateClassification`
+        // describing the OUTCOME as unproductive.
+        const gateTerminalization = await terminalizeRoundV1(
+          implRoundId,
+          "completed",
+          { filesChanged: [] },
+          {
+            taskFolderUri: folderUri,
+            roundOutcomeClassification: {
+              classification: gateClassification,
+              stage: implBookkeepingStage,
+              ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
+              ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
+              dispatchMode: currentDispatchMode,
+              // Review fix, Step 11 narrowed blocker 2: record which review
+              // stage was actually active so a plateau card for one impl-review
+              // stage cannot absorb a round dispatched while the task was at
+              // the other. Omitted when `gateStage` is itself "impl" (no review
+              // stage was active) or matches something outside the impl-review
+              // pair (nothing to disambiguate).
+              ...(IMPL_REVIEW_STAGES.includes(gateStage) ? { originatingReviewStage: gateStage } : {}),
+            },
+          }
         );
+        const persistedGateRounds = gateTerminalization.ok ? gateTerminalization.progress : undefined;
         await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
         // wf10 item 3 / item 6b / Part 5 step 13: a fallback provider that has
         // now produced `fallbackProviderBreakerRounds` consecutive zero-file
@@ -8343,48 +8435,49 @@ async function executeImplementationRun(
       // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): same
       // full-provider-path identity fix as the gate block above.
       const zeroChangeActualProviderId = result.runnerId;
-      const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) => {
-        const withStreak = setZeroChangeImplRounds(
-          current,
-          zeroChangeRounds > 0 ? zeroChangeRounds : undefined
-        );
-        // wf10 item 4 / Part 4: this branch is reached only once the gate
-        // above has already ruled out the NAMED `uncheckedItemsWithoutClearingReview`
-        // shape of `provider-failure-empty` — but `checklistClaimedButUnmerged`
-        // rounds are deliberately let past that gate too (see the comment at
-        // its computation above), and when real work remains with no
-        // clearing review, this round is about to be refused below by
-        // `checklistClaimedButUnmergedWithoutClearingReview` for the exact
-        // same reason — that is a provider failure, not a justified no-op,
-        // even though it reaches this same patch.
-        // Same bookkeeping-vs-display split, and same actual-vs-requested
-        // candidate fix, as the gate block above (review fix, Part 5 steps
-        // 13-14): the round-outcome entry and the breaker read below must
-        // key on literal "impl" (where `runImplementationOrSealedV1`
-        // actually resolves its model/quota/fallback chain) and on the
-        // candidate that actually produced `result`, not on the task's
-        // current review stage or the originally-requested model.
-        // Review fix, Step 11 narrowed blocker 2: same originating-stage
-        // stamp as the gate block above, computed from the same
-        // `priorProgress?.currentStage ?? postRunReviewStage` this block
-        // already reads just below as `zeroChangeStage` — read here directly
-        // since `zeroChangeStage` itself is declared after this patch.
-        const zeroChangeOriginatingStage = priorProgress?.currentStage ?? postRunReviewStage;
-        const withOutcome = appendRoundOutcome(withStreak, {
-          stage: zeroChangeBookkeepingStage,
-          classification: zeroChangeClassification,
-          at: new Date().toISOString(),
-          ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
-          ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
-          dispatchMode: currentDispatchMode,
-          ...(IMPL_REVIEW_STAGES.includes(zeroChangeOriginatingStage)
-            ? { originatingReviewStage: zeroChangeOriginatingStage }
-            : {}),
-        });
-        return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
-          ? { ...withOutcome, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
-          : withOutcome;
-      });
+      // Same bookkeeping-vs-display split, and same actual-vs-requested
+      // candidate fix, as the gate block above (review fix, Part 5 steps
+      // 13-14): the round-outcome entry and the breaker read below must key
+      // on literal "impl" (where `runImplementationOrSealedV1` actually
+      // resolves its model/quota/fallback chain) and on the candidate that
+      // actually produced `result`, not on the task's current review stage or
+      // the originally-requested model. Same formula as `zeroChangeStage`
+      // below (computed once here since it is needed before that point too).
+      const zeroChangeOriginatingStage = priorProgress?.currentStage ?? postRunReviewStage;
+      // Part 4 (item 1): this branch is reached only once the gate above has
+      // already ruled out the NAMED `uncheckedItemsWithoutClearingReview`
+      // shape of `provider-failure-empty` — but `checklistClaimedButUnmerged`
+      // rounds are deliberately let past that gate too, and this round
+      // FINISHED regardless of classification, so its ledger state is
+      // "completed" here too (see the gate block's own comment above).
+      const zeroChangeTerminalization = await terminalizeRoundV1(
+        implRoundId,
+        "completed",
+        { filesChanged: [] },
+        {
+          taskFolderUri: folderUri,
+          extraPatch: (current) => {
+            const withStreak = setZeroChangeImplRounds(
+              current,
+              zeroChangeRounds > 0 ? zeroChangeRounds : undefined
+            );
+            return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
+              ? { ...withStreak, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+              : withStreak;
+          },
+          roundOutcomeClassification: {
+            classification: zeroChangeClassification,
+            stage: zeroChangeBookkeepingStage,
+            ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
+            ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
+            dispatchMode: currentDispatchMode,
+            ...(IMPL_REVIEW_STAGES.includes(zeroChangeOriginatingStage)
+              ? { originatingReviewStage: zeroChangeOriginatingStage }
+              : {}),
+          },
+        }
+      );
+      const persistedRounds = zeroChangeTerminalization.ok ? zeroChangeTerminalization.progress : undefined;
       await appendRoundOutcomeLogNoteV1(logUri, zeroChangeClassification);
       // wf10 item 3 / Part 5 step 13: the same fallback-provider circuit
       // breaker as the earlier gate — this branch reaches
@@ -8744,14 +8837,19 @@ async function executeImplementationRun(
       // (its report is unusable, so "nothing to fix" was never established),
       // and it produced no edits that would justify clearing the streak.
       if (summaryIssue === undefined) {
-        await patchTaskProgressStrictV1(folderUri, (current) =>
-          appendRoundOutcome(setZeroChangeImplRounds(current, undefined), {
-            stage: current.currentStage,
-            classification: "edits-produced",
-            at: new Date().toISOString(),
-            ...(modelId ? { modelId } : {}),
-            dispatchMode: currentDispatchMode,
-          })
+        await terminalizeRoundV1(
+          implRoundId,
+          "completed",
+          { filesChanged: [...result.filesChanged] },
+          {
+            taskFolderUri: folderUri,
+            extraPatch: (current) => setZeroChangeImplRounds(current, undefined),
+            roundOutcomeClassification: {
+              classification: "edits-produced",
+              ...(modelId ? { modelId } : {}),
+              dispatchMode: currentDispatchMode,
+            },
+          }
         );
         await appendRoundOutcomeLogNoteV1(logUri, "edits-produced");
       } else {
@@ -8781,14 +8879,18 @@ async function executeImplementationRun(
         checklistAdvanced,
         warnedAsZeroFileFailure: false,
       });
-      await patchTaskProgressStrictV1(folderUri, (current) =>
-        appendRoundOutcome(current, {
-          stage: current.currentStage,
-          classification: noEditsClassification,
-          at: new Date().toISOString(),
-          ...(modelId ? { modelId } : {}),
-          dispatchMode: currentDispatchMode,
-        })
+      await terminalizeRoundV1(
+        implRoundId,
+        "completed",
+        result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
+        {
+          taskFolderUri: folderUri,
+          roundOutcomeClassification: {
+            classification: noEditsClassification,
+            ...(modelId ? { modelId } : {}),
+            dispatchMode: currentDispatchMode,
+          },
+        }
       );
       await appendRoundOutcomeLogNoteV1(logUri, noEditsClassification);
     }
@@ -9520,13 +9622,17 @@ async function executeImplementationRun(
     // run log's `Status:` line reads `cancelled` with no distinguishing
     // classification unless this note is appended too — same idiom as every
     // other outcome branch in this function.
-    await patchTaskProgressStrictV1(folderUri, (current) =>
-      appendRoundOutcome(current, {
-        stage: current.currentStage,
-        classification: "cancelled",
-        at: new Date().toISOString(),
-        dispatchMode: currentDispatchMode,
-      })
+    await terminalizeRoundV1(
+      implRoundId,
+      "cancelled",
+      result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
+      {
+        taskFolderUri: folderUri,
+        roundOutcomeClassification: {
+          classification: "cancelled",
+          dispatchMode: currentDispatchMode,
+        },
+      }
     );
     await appendRoundOutcomeLogNoteV1(logUri, "cancelled");
     return false;

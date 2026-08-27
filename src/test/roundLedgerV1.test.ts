@@ -7,10 +7,15 @@
  * describe. Wiring status, kept in sync with `roundLedgerV1.ts`'s own module
  * doc comment: the review-round path (`claimReviewAttempt` opening the row,
  * `handleReviewRoutingOutcome`/`terminalizeUnclosedReviewRoundV1` closing it)
- * is wired and covered below by real calls into `reviewActions.ts`; the six
- * implementation-round `appendRoundOutcome` sites, `automationChain.ts`, the
- * implementation-recovery continuation path, and the reconciliation sweep
- * remain unwired — that is the rest of Part 4, still outstanding.
+ * is wired and covered below by real calls into `reviewActions.ts`; the
+ * generic automation-dispatch path (`openAutomationRoundLedgerRowBestEffortV1`
+ * opening a row under the dispatch's `intentId`, `automationChain.ts`'s
+ * `deps.execute` settle points closing it) is also wired and covered below —
+ * see `automationChain.test.ts` for the end-to-end open+close coverage
+ * through `scheduleAutomationChain` itself. The six implementation-round
+ * `appendRoundOutcome` sites' OWN rich per-round accounting (files
+ * changed/score/blockers) and the implementation-recovery continuation-row
+ * linkage remain unwired — that is the rest of Part 4, still outstanding.
  */
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
@@ -25,10 +30,20 @@ import {
   TaskProgress,
 } from "../types/taskProgress";
 import {
+  findRoundOutcomesMissingLedgerRowV1,
   resolveRoundV1,
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
-import { formatRoundOutcomeMessageV1, terminalizeRoundV1 } from "../utils/roundLedgerV1";
+import {
+  __resetPendingAutomationRoundIntentsForTestV1,
+  claimImplementationRoundLedgerV1,
+  consumePendingAutomationRoundIntentV1,
+  formatRoundOutcomeMessageV1,
+  openAutomationRoundLedgerRowBestEffortV1,
+  roundLedgerModeForCommandV1,
+  setPendingAutomationRoundIntentV1,
+  terminalizeRoundV1,
+} from "../utils/roundLedgerV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -403,10 +418,62 @@ void describe("terminalizeRoundV1 (Part 4 step 12/13/47)", () => {
       // Both writes happened in the SAME patch — the ledger row's endedAt and
       // the roundOutcomes entry's at must match exactly.
       assert.equal(raw.roundOutcomes?.[0]?.at, raw.roundLedger?.[0]?.endedAt);
+      // Part 4 step 46's drift check: the classification this same patch just
+      // recorded must resolve to the ledger row it belongs to — proving the
+      // real `terminalizeRoundV1` write path never produces the drift this
+      // check exists to catch.
+      assert.deepEqual(findRoundOutcomesMissingLedgerRowV1(raw), []);
     } finally {
       wsStub.restore();
       fsBridge.restore();
     }
+  });
+});
+
+// Part 4 step 46: "add a drift test asserting every new roundOutcomes row has
+// a ledger row containing its attemptId." `findRoundOutcomesMissingLedgerRowV1`
+// is the enforcement primitive; these tests exercise it directly against
+// constructed fixtures (an orphan classification is exactly the "one store
+// says a round happened, the other has never heard of it" defect Part 4 as a
+// whole exists to close), while the test above proves the real write path
+// never produces one.
+void describe("findRoundOutcomesMissingLedgerRowV1 (Part 4 step 46 — roundOutcomes-to-ledger drift enforcement)", () => {
+  void it("reports no drift when every attemptId-carrying roundOutcomes entry resolves to a ledger row", () => {
+    const entry = makeBaseEntry({ roundId: "round-1", attemptIds: ["attempt-1"], state: "completed" });
+    const progress = makeProgress({
+      roundLedger: [entry],
+      roundOutcomes: [{ stage: "impl", classification: "edits-produced", at: "2026-01-01T00:05:00.000Z", attemptId: "attempt-1" }],
+    });
+    assert.deepEqual(findRoundOutcomesMissingLedgerRowV1(progress), []);
+  });
+
+  void it("flags a roundOutcomes entry whose attemptId resolves to no ledger row at all", () => {
+    const orphan: TaskProgress["roundOutcomes"] = [
+      { stage: "impl", classification: "edits-produced", at: "2026-01-01T00:05:00.000Z", attemptId: "attempt-orphan" },
+    ];
+    const progress = makeProgress({ roundLedger: [], roundOutcomes: orphan });
+    const missing = findRoundOutcomesMissingLedgerRowV1(progress);
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0]?.attemptId, "attempt-orphan");
+  });
+
+  void it("flags a roundOutcomes entry whose attemptId matches no row's attemptIds, even when other rows exist", () => {
+    const entry = makeBaseEntry({ roundId: "round-1", attemptIds: ["attempt-1"], state: "completed" });
+    const progress = makeProgress({
+      roundLedger: [entry],
+      roundOutcomes: [{ stage: "impl", classification: "edits-produced", at: "2026-01-01T00:05:00.000Z", attemptId: "attempt-unrelated" }],
+    });
+    const missing = findRoundOutcomesMissingLedgerRowV1(progress);
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0]?.attemptId, "attempt-unrelated");
+  });
+
+  void it("never flags a roundOutcomes entry with no attemptId at all — a known, separate gap, not drift", () => {
+    const progress = makeProgress({
+      roundLedger: [],
+      roundOutcomes: [{ stage: "impl", classification: "edits-produced", at: "2026-01-01T00:05:00.000Z" }],
+    });
+    assert.deepEqual(findRoundOutcomesMissingLedgerRowV1(progress), []);
   });
 });
 
@@ -1085,6 +1152,326 @@ void describe("claimReviewAttempt — opens the round-ledger row at the round's 
   });
 });
 
+void describe("roundLedgerModeForCommandV1 (Part 4 step 12)", () => {
+  void it("classifies an applyReview-named command as apply-review", () => {
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.applyReviewWithAI"), "apply-review");
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.applyReviewEditWithAI"), "apply-review");
+  });
+
+  void it("classifies a review-named command (that is not apply-review) as review", () => {
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.runReviewWithAI"), "review");
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.fastForwardReviewWithAI"), "review");
+  });
+
+  void it("defaults every other command to implementation", () => {
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.runImplementationWithAI"), "implementation");
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.generatePlanWithAI"), "implementation");
+    assert.equal(roundLedgerModeForCommandV1("vs-code-ai-helper.runPublishChecks"), "implementation");
+  });
+});
+
+void describe("openAutomationRoundLedgerRowBestEffortV1 (Part 4 step 12)", () => {
+  void it("opens an 'open' row keyed by roundId/intentId, mode inferred from the command", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "open_automation_round_ledger_row");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "open_automation_round_ledger_row",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      await openAutomationRoundLedgerRowBestEffortV1({
+        taskFolderUri: folderUri,
+        roundId: "intent-auto-1",
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        stage: "impl",
+      });
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = resolveRoundV1(raw, "intent-auto-1");
+      assert.ok(row, "must open a row for the given roundId");
+      assert.equal(row?.intentId, "intent-auto-1");
+      assert.equal(row?.mode, "implementation");
+      assert.equal(row?.stage, "impl");
+      assert.equal(row?.state, "open");
+      assert.equal(row?.endedAt, undefined);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("is a no-op when a row already resolves the given roundId — never overwrites it", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "open_automation_round_ledger_row_existing");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const existingRow = makeBaseEntry({ roundId: "intent-auto-2", intentId: "intent-auto-2", mode: "review", stage: "impl-high-review" });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "open_automation_round_ledger_row_existing",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        roundLedger: [existingRow],
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      await openAutomationRoundLedgerRowBestEffortV1({
+        taskFolderUri: folderUri,
+        roundId: "intent-auto-2",
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        stage: "impl",
+      });
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.deepEqual(raw.roundLedger, [existingRow], "an existing row for this roundId must never be overwritten");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+// 2026-08-27 review follow-up: the side channel `scheduleAutomationChain`
+// uses to stage an automation dispatch's intentId for `claimReviewAttempt`
+// to consume — see `setPendingAutomationRoundIntentV1`'s own doc comment for
+// why this is a lightweight in-memory correlation rather than threading
+// intentId through every dispatch's `arg`.
+void describe("setPendingAutomationRoundIntentV1 / consumePendingAutomationRoundIntentV1 (Part 4 review follow-up)", () => {
+  void it("returns the staged intentId once, then undefined on a second read", () => {
+    __resetPendingAutomationRoundIntentsForTestV1();
+    setPendingAutomationRoundIntentV1("task-key-1", "intent-abc");
+    assert.equal(consumePendingAutomationRoundIntentV1("task-key-1"), "intent-abc");
+    assert.equal(consumePendingAutomationRoundIntentV1("task-key-1"), undefined);
+  });
+
+  void it("returns undefined for a key nothing was ever staged under", () => {
+    __resetPendingAutomationRoundIntentsForTestV1();
+    assert.equal(consumePendingAutomationRoundIntentV1("never-staged"), undefined);
+  });
+
+  void it("keeps entries for different task keys independent", () => {
+    __resetPendingAutomationRoundIntentsForTestV1();
+    setPendingAutomationRoundIntentV1("task-a", "intent-a");
+    setPendingAutomationRoundIntentV1("task-b", "intent-b");
+    assert.equal(consumePendingAutomationRoundIntentV1("task-b"), "intent-b");
+    assert.equal(consumePendingAutomationRoundIntentV1("task-a"), "intent-a");
+  });
+});
+
+void describe("claimReviewAttempt — reuses an automation-staged generic row instead of opening a second one (Part 4 review follow-up, blocker 1)", () => {
+  void it("merges into the existing intent-keyed row when a pending automation intentId resolves it", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_reuses_generic_row");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const genericRow = makeBaseEntry({
+        roundId: "auto-intent-1",
+        intentId: "auto-intent-1",
+        attemptIds: [],
+        mode: "implementation",
+        stage: "impl-high-review",
+      });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_reuses_generic_row",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        roundLedger: [genericRow],
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      // Simulates scheduleAutomationChain staging the intentId immediately
+      // before dispatching the review command that will call this.
+      setPendingAutomationRoundIntentV1(folderUri.fsPath, "auto-intent-1");
+
+      const claimed = await claimReviewAttempt(folderUri, "review-attempt-1", "impl-high-review");
+      if (!claimed) throw new Error("unreachable");
+
+      // Exactly one row survives — no second row keyed by reviewAttemptId.
+      assert.equal(claimed.roundLedger?.length, 1, "the round must remain a single identity, not two rows");
+      const row = claimed.roundLedger?.[0];
+      assert.equal(row?.roundId, "auto-intent-1", "the row's own roundId is never replaced");
+      assert.equal(row?.intentId, "auto-intent-1");
+      assert.equal(row?.mode, "review", "reuse must still flip mode to review");
+      assert.equal(row?.stage, "impl-high-review");
+      assert.equal(row?.state, "open");
+      assert.deepEqual(row?.attemptIds, ["review-attempt-1"]);
+
+      // Both identities now resolve to the SAME row.
+      assert.equal(resolveRoundV1(claimed, "auto-intent-1"), row);
+      assert.equal(resolveRoundV1(claimed, "review-attempt-1"), row);
+
+      // The pending entry was consumed — a second claim (no new staging)
+      // falls back to opening its own row, exactly as a manual dispatch would.
+      const claimed2 = await claimReviewAttempt(folderUri, "review-attempt-2", "impl-high-review");
+      assert.equal(claimed2?.roundLedger?.length, 2, "an unstaged claim must open its own row, not reuse an unrelated one");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("discards a stale pending intentId that resolves to an already-terminal row, instead of reopening it (2026-08-27 review, blocker 1)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_stale_terminal_row");
+      fs.mkdirSync(folderPath, { recursive: true });
+      // A PRIOR round's generic row, already terminalized (e.g. an
+      // Implementation dispatch that finished, or errored before this
+      // review's own claim ever ran) — its intentId is left unconsumed in
+      // the pending-intent side channel until this claim reads it.
+      const terminalRow = makeBaseEntry({
+        roundId: "auto-intent-stale",
+        intentId: "auto-intent-stale",
+        attemptIds: ["prior-attempt"],
+        mode: "implementation",
+        stage: "impl",
+        state: "completed",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        outcome: { filesChanged: ["src/foo.ts"] },
+      });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_stale_terminal_row",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        roundLedger: [terminalRow],
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      // The stale entry — left over from the prior, already-terminal round —
+      // is still sitting in the side channel when this unrelated review
+      // claims its attempt.
+      setPendingAutomationRoundIntentV1(folderUri.fsPath, "auto-intent-stale");
+
+      const claimed = await claimReviewAttempt(folderUri, "review-attempt-fresh", "impl-high-review");
+      if (!claimed) throw new Error("unreachable");
+
+      assert.equal(claimed.roundLedger?.length, 2, "the terminal row must be left alone, not reopened — a fresh row is opened instead");
+      const priorRow = resolveRoundV1(claimed, "auto-intent-stale");
+      assert.equal(priorRow?.state, "completed", "the prior round's terminal state must never be reverted to open");
+      assert.equal(priorRow?.endedAt, "2026-01-01T00:05:00.000Z", "the prior round's ending must be untouched");
+      assert.deepEqual(priorRow?.attemptIds, ["prior-attempt"], "the stale row must not gain this review's attemptId");
+
+      const freshRow = resolveRoundV1(claimed, "review-attempt-fresh");
+      assert.ok(freshRow, "a fresh row must be opened for this review");
+      assert.equal(freshRow?.roundId, "review-attempt-fresh");
+      assert.equal(freshRow?.state, "open");
+      assert.equal(
+        freshRow?.intentId,
+        undefined,
+        "the stale intentId must not be attached to the fresh row — it belongs to a different, already-ended round"
+      );
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("opens its own row exactly as before when nothing was staged (manual dispatch)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_no_pending_intent");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_no_pending_intent",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimReviewAttempt(folderUri, "review-attempt-manual", "impl-high-review");
+      if (!claimed) throw new Error("unreachable");
+      const row = resolveRoundV1(claimed, "review-attempt-manual");
+      assert.ok(row);
+      assert.equal(row?.roundId, "review-attempt-manual");
+      assert.equal(row?.intentId, undefined, "a manual claim has no intentId to attach");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
 void describe("terminalStateForUnclosedReviewOutcomeV1 (item 18 / Part 4 safety net)", () => {
   void it("maps 'completed' to 'completed' and 'cancelled' to 'cancelled'", () => {
     assert.equal(
@@ -1112,6 +1499,141 @@ void describe("terminalStateForUnclosedReviewOutcomeV1 (item 18 / Part 4 safety 
         "failed",
         `outcome kind "${kind}" must map to a terminal "failed" ledger state`
       );
+    }
+  });
+});
+
+void describe("claimImplementationRoundLedgerV1 (Part 4 architectural fix, 2026-08-27 review follow-up)", () => {
+  void it("opens a fresh row under candidateRoundId when nothing is pending (manual dispatch)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_impl_round_manual");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_impl_round_manual",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimImplementationRoundLedgerV1(folderUri, "prompt-round-1", "impl", "implementation");
+      assert.equal(claimed.roundId, "prompt-round-1");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.length, 1);
+      assert.equal(raw.roundLedger?.[0]?.roundId, "prompt-round-1");
+      assert.equal(raw.roundLedger?.[0]?.state, "open");
+      assert.equal(raw.roundLedger?.[0]?.intentId, undefined, "a manual claim has no intentId to attach");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("reuses a pending automation-staged generic row instead of opening a second one", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_impl_round_reuses_generic_row");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const genericRow = makeBaseEntry({
+        roundId: "auto-intent-impl-1",
+        intentId: "auto-intent-impl-1",
+        attemptIds: [],
+        mode: "implementation",
+        stage: "impl",
+      });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_impl_round_reuses_generic_row",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        roundLedger: [genericRow],
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      setPendingAutomationRoundIntentV1(folderUri.fsPath, "auto-intent-impl-1");
+
+      const claimed = await claimImplementationRoundLedgerV1(folderUri, "prompt-round-2", "impl", "implementation");
+      assert.equal(claimed.roundId, "auto-intent-impl-1", "the reused row's own roundId is never replaced");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.length, 1, "the round must remain a single identity, not two rows");
+      assert.deepEqual(raw.roundLedger?.[0]?.attemptIds, ["prompt-round-2"]);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("is a no-op when candidateRoundId already resolves to a row (the continuation-linkage case)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_impl_round_already_own");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const continuationRow = makeBaseEntry({
+        roundId: "impl-continuation-1",
+        attemptIds: [],
+        mode: "continuation",
+        stage: "impl",
+        continuationOf: "source-round-1",
+      });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_impl_round_already_own",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        roundLedger: [continuationRow],
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimImplementationRoundLedgerV1(
+        folderUri,
+        "impl-continuation-1",
+        "impl",
+        "continuation"
+      );
+      assert.equal(claimed.roundId, "impl-continuation-1");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.length, 1, "no second row must be opened for a round that already has one");
+      assert.equal(raw.roundLedger?.[0]?.continuationOf, "source-round-1", "the existing row must be untouched");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
     }
   });
 });
