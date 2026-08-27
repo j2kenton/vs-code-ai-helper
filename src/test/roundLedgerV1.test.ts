@@ -36,6 +36,7 @@ import {
 } from "../utils/taskProgressTransforms";
 import {
   __resetPendingAutomationRoundIntentsForTestV1,
+  attachCoordinatorIdentityToRoundBestEffortV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   formatRoundOutcomeMessageV1,
@@ -1637,3 +1638,120 @@ void describe("claimImplementationRoundLedgerV1 (Part 4 architectural fix, 2026-
     }
   });
 });
+
+void describe(
+  "attachCoordinatorIdentityToRoundBestEffortV1 (Part 4 architectural fix, 2026-08-27 review follow-up: " +
+    "\"coordinator allocation sites still do not attach operation and attempt identities to a round-ledger row ... at allocation time\")",
+  () => {
+    void it("attaches operationId and merges attemptId into a still-live row", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_live_row");
+        fs.mkdirSync(folderPath, { recursive: true });
+        const row = makeBaseEntry({
+          roundId: "review-attempt-1",
+          intentId: undefined,
+          attemptIds: [],
+          state: "open",
+        });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify({ ...makeProgress({ taskFolder: "attach_identity_live_row", roundLedger: [row] }) }, null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await attachCoordinatorIdentityToRoundBestEffortV1({
+          taskFolderUri: folderUri,
+          roundId: "review-attempt-1",
+          operationId: "coordinator-op-1",
+          attemptId: "coordinator-attempt-1",
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        const updated = raw.roundLedger?.[0];
+        assert.equal(updated?.state, "open", "attaching identity must never change the row's live state");
+        assert.equal(updated?.operationId, "coordinator-op-1");
+        assert.ok(
+          updated?.attemptIds.includes("coordinator-attempt-1"),
+          "the coordinator's attemptId must be merged into attemptIds"
+        );
+      } finally {
+        fsBridge.restore();
+      }
+    });
+
+    void it("never overwrites an operationId the row already carries", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_no_overwrite");
+        fs.mkdirSync(folderPath, { recursive: true });
+        const row = makeBaseEntry({
+          roundId: "review-attempt-2",
+          intentId: undefined,
+          operationId: "already-attached-op",
+          attemptIds: ["already-attached-op"],
+          state: "open",
+        });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify({ ...makeProgress({ taskFolder: "attach_identity_no_overwrite", roundLedger: [row] }) }, null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await attachCoordinatorIdentityToRoundBestEffortV1({
+          taskFolderUri: folderUri,
+          roundId: "review-attempt-2",
+          operationId: "a-different-op",
+          attemptId: "a-retry-attempt",
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        const updated = raw.roundLedger?.[0];
+        assert.equal(updated?.operationId, "already-attached-op", "operationId is attached once, never reassigned");
+        assert.ok(
+          updated?.attemptIds.includes("a-retry-attempt"),
+          "a later attempt (fallback/retry) is still merged into attemptIds"
+        );
+      } finally {
+        fsBridge.restore();
+      }
+    });
+
+    void it("is a no-op once the row has already terminalized (loses the race with terminalizeRoundV1)", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_terminal_race");
+        fs.mkdirSync(folderPath, { recursive: true });
+        const row = makeBaseEntry({
+          roundId: "review-attempt-3",
+          intentId: undefined,
+          attemptIds: ["review-attempt-3"],
+          state: "completed",
+          endedAt: "2026-01-01T00:05:00.000Z",
+        });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify({ ...makeProgress({ taskFolder: "attach_identity_terminal_race", roundLedger: [row] }) }, null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await attachCoordinatorIdentityToRoundBestEffortV1({
+          taskFolderUri: folderUri,
+          roundId: "review-attempt-3",
+          operationId: "too-late-op",
+          attemptId: "too-late-attempt",
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        const updated = raw.roundLedger?.[0];
+        assert.equal(updated?.operationId, undefined, "a terminal row's facts must never be amended after the fact");
+        assert.equal(updated?.state, "completed");
+      } finally {
+        fsBridge.restore();
+      }
+    });
+  }
+);

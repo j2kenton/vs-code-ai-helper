@@ -111,6 +111,8 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.deepEqual(result.closed, ["attempt-orphan-1"]);
 
@@ -150,6 +152,11 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
         taskFolderUri: folderUri,
         hasLiveOperation: true,
         hasLiveSchedulingIntent: false,
+        // The row carries no operationId/intentId of its own, so this falls
+        // back to the task-wide `hasLiveOperation` boolean above — the ids
+        // lists are irrelevant to this row's protection.
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.deepEqual(result.closed, []);
 
@@ -181,6 +188,10 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: true,
+        liveOperationIds: [],
+        // This row DOES carry its own `intentId`, so it is now checked
+        // precisely against this list rather than the task-wide boolean.
+        liveSchedulingIntentIds: ["intent-live-1"],
       });
       assert.deepEqual(result.closed, []);
 
@@ -212,8 +223,83 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.deepEqual(result.closed, []);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes a stale row by its own identity even while a DIFFERENT round is live for the same task (2026-08-27 review regression)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_row_specific_identity", [
+        {
+          // A stale row left over from an earlier crash — its own intentId
+          // is no longer live.
+          roundId: "intent-stale-1",
+          intentId: "intent-stale-1",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "scheduled",
+        },
+      ]);
+
+      // A task-wide boolean would protect the stale row too, since SOME
+      // scheduling intent is live for the task — but it is a DIFFERENT
+      // intent than the one the stale row itself carries.
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: true,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: ["intent-fresh-2"],
+      });
+      assert.deepEqual(result.closed, ["intent-stale-1"]);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "intent-stale-1")?.state, "interrupted");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("protects a row via its own intentId even when the task-wide fallback booleans are false (indeterminate liveSchedulingIntentIds fails open)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_indeterminate_fails_open", [
+        {
+          roundId: "intent-indeterminate-1",
+          intentId: "intent-indeterminate-1",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "scheduled",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        // `undefined` means "could not be determined" — must fail open and
+        // protect a row that carries an intentId, not treat it as orphaned.
+        liveSchedulingIntentIds: undefined,
+      });
+      assert.deepEqual(result.closed, []);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "intent-indeterminate-1")?.state, "scheduled");
     } finally {
       wsStub.restore();
       fsBridge.restore();
@@ -247,6 +333,8 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.deepEqual(new Set(result.closed), new Set(["attempt-multi-1", "attempt-multi-2"]));
     } finally {
@@ -483,6 +571,8 @@ void describe("reconcileRoundLedgerV1 (Part 4 step 14, orchestrator: (c) then (a
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.equal(result.synthesized.length, 1);
       assert.deepEqual(result.closed, []);
@@ -500,6 +590,8 @@ void describe("reconcileRoundLedgerV1 (Part 4 step 14, orchestrator: (c) then (a
         taskFolderUri: folderUri,
         hasLiveOperation: false,
         hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
       });
       assert.deepEqual(second.synthesized, []);
       assert.deepEqual(second.closed, []);

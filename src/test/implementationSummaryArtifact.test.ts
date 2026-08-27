@@ -61,6 +61,7 @@ import {
   RETROACTIVE_TICK_MARKER_V1,
   scopeToLatestChecklistV1,
   splitSummaryAtEchoV1,
+  truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import {
   isPlanIncomplete,
@@ -2229,6 +2230,43 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
       const result = listUncheckedChecklistItemTextsV1(done);
       assert.deepEqual(result.items, []);
       assert.equal(result.total, 0);
+    });
+
+    // wf "make the stage chat a record of work" item 16: an evidence block
+    // consuming this function must be able to bound each item's own text, not
+    // just the count of items — a single long item (e.g. a multi-paragraph
+    // deferral annotation) could still blow out a decision card on its own.
+    void it("caps each item to maxItemChars when requested, leaving other callers unaffected", () => {
+      const longPlan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        `- [ ] ${"x".repeat(200)}`,
+      ].join("\n");
+      const capped = listUncheckedChecklistItemTextsV1(longPlan, 10, { maxItemChars: 160 });
+      assert.equal(capped.items[0]?.length, 161, "160 chars plus the ellipsis marker");
+      assert.ok(capped.items[0]?.endsWith("…"));
+
+      const uncapped = listUncheckedChecklistItemTextsV1(longPlan);
+      assert.equal(uncapped.items[0]?.length, 200, "default call site behaviour is unchanged");
+    });
+  });
+
+  void describe("truncateChecklistItemTextV1", () => {
+    void it("passes short single-line text through unchanged", () => {
+      assert.equal(truncateChecklistItemTextV1("Wire the completeness gate", 160), "Wire the completeness gate");
+    });
+
+    void it("cuts at the first line when the text carries embedded newlines", () => {
+      assert.equal(
+        truncateChecklistItemTextV1("Wire the completeness gate\nDeferred 2026-08-24: reason...", 160),
+        "Wire the completeness gate…"
+      );
+    });
+
+    void it("cuts at maxChars when the first line alone exceeds it", () => {
+      const result = truncateChecklistItemTextV1("x".repeat(200), 160);
+      assert.equal(result.length, 161);
+      assert.ok(result.endsWith("…"));
     });
   });
 

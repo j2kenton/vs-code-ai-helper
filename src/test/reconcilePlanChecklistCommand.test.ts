@@ -2375,6 +2375,87 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
     }
   });
 
+  // wf "make the stage chat a record of work" item 16: reproduces wf10's own
+  // plan-final.md shape observed live — 33 ticked, 4 unticked, all 4 carrying
+  // `<!-- ensemble:excluded -->`. The panel used to read the RAW count (33/37,
+  // "4 outstanding"), withhold the recommendation, and instruct ticking items
+  // excluded by design. Under the fixed-denominator count every excluded item
+  // settles as `closedWithoutDoing`, so this must read 37/37 settled, 0
+  // outstanding, and recommend "Mark reconciled" — exactly like the
+  // all-checked case above, reached through a different item mix.
+  void it("recommends Mark reconciled and reads 37/37 settled when the only unticked items are excluded (wf10 regression)", async () => {
+    const name = "evidence-all-excluded-remainder";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    const checkedItems = Array.from(
+      { length: 33 },
+      (_, i) => `- [x] Step ${i + 1} — completed work item`
+    );
+    const excludedItems = [
+      "- [ ] Bastion stops after linger expires with no borrowers — Priority: HIGH <!-- ensemble:excluded -->",
+      "- [ ] Ctrl+C during linger stops the bastion — Priority: HIGH <!-- ensemble:excluded -->",
+      "- [ ] Concurrent borrow extends the linger window — Priority: LOW <!-- ensemble:excluded -->",
+      "- [ ] Bastion survives a host reboot mid-linger — Priority: LOW <!-- ensemble:excluded -->",
+    ];
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      ["# Final Plan", "", "<!-- ensemble:implementation-checklist -->", "", ...checkedItems, ...excludedItems, ""].join(
+        "\n"
+      ),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.match(decision.recommendation.reasoning, /37\/37 items settled/);
+        assert.match(decision.recommendation.reasoning, /33 completed/);
+        assert.match(decision.recommendation.reasoning, /4 closed without doing/);
+        assert.match(decision.recommendation.reasoning, /0 outstanding/);
+        assert.doesNotMatch(decision.recommendation.reasoning, /no basis/);
+      }
+      const notYet = decision.options.find((o) => o.optionId === "notYet");
+      assert.ok(notYet, "a Not yet option must still be offered");
+      assert.doesNotMatch(
+        notYet.consequence,
+        /tick the missed items in plan-final\.md/,
+        "the 4 unticked items are excluded by design, not missed work to tick"
+      );
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // Task "Actionable Hand-offs" PART 5: the reconciliation decision must cite
   // the recorded reason the checklist was flagged unreliable — the stronger
   // discriminating fact — not only the weaker unticked-item count, and must

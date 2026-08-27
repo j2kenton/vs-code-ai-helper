@@ -85,8 +85,11 @@ import type { TaskOperationHandle } from "../utils/taskOperations";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import type { ChatTarget } from "../views/chatView";
 import { syncOwedContinuationLedgerBestEffortV1, OwedContinuationSourceV1 } from "../state/schedulingIntentV1";
-import { appendChatMessageV1 } from "../utils/chatHistoryStore";
-import { formatRoundOutcomeMessageV1, RoundLedgerTerminalStateV1 } from "../utils/roundLedgerV1";
+import {
+  terminalizeRoundV1,
+  peekPendingAutomationRoundIntentV1,
+  RoundLedgerTerminalStateV1,
+} from "../utils/roundLedgerV1";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -405,115 +408,119 @@ export async function beginImplementationRecoveryV1(
   // from two different snapshots. Selected-at-transition-time, persisted on
   // the record — never re-derived later.
   let selectedMode: ImplRecoveryModeV1 = "unconstrained";
-  // Captured from whichever run of the callback below actually commits (the
-  // callback may re-run on a CAS retry) — read after the patch resolves, to
-  // best-effort append this terminalization's chat outcome message the same
-  // way `terminalizeRoundV1` does for every other round ending.
-  let sourceLedgerEntry: RoundLedgerEntryV1 | undefined;
-  const persisted = await patchTaskProgressStrictV1(folderUri, (current) => {
-    selectedMode = selectImplRecoveryModeV1({
-      terminatedExternally: input.terminatedExternally,
-      filesChangedUnknown: input.filesChangedUnknown,
-      changedFileCount: quarantinedPaths.length,
-      latestHighReviewPassedZeroBlockers: latestHighReviewPassedZeroBlockersV1(current),
-      latestHighReviewDescribesPreRoundTree: highReviewDescribesPreRoundTree,
-      preRoundBoundaryClean:
-        (current.pendingImplReviewFiles?.length ?? 0) === 0 &&
-        current.reviewInvalidatedByRound === undefined,
-      summaryOnlyDispatchAvailable: isSummaryOnlyDispatchAvailableV1(),
-      escalatedFromSummaryOnly: input.escalatedFromSummaryOnly === true,
-    });
-    continuations = (current.incompleteRoundContinuations ?? 0) + 1;
-    let next = setIncompleteRoundContinuations(current, continuations);
-    if (quarantinedPaths.length > 0) {
-      next = quarantinePendingImplReviewFiles(next, [...quarantinedPaths]);
-    }
-    if (isReviewStage(input.postRunReviewStage)) {
-      next = recordReviewInvalidatedByRound(next, input.postRunReviewStage);
-    }
-    // Part 4 / item 1 ("source/continuation linkage"): terminalize the round
-    // that triggered this recovery IN THE SAME PATCH the recovery record is
-    // written — never a second transaction, so the ledger can never show the
-    // recovery as owed while the source round still reads "open"/"scheduled".
-    // Reuses the task's own live row when one exists (an auto-dispatched
-    // round, or a review round claimed via `claimReviewAttempt`); a
-    // manually-triggered implementation round never opened one (see
-    // `roundLedgerV1.ts`'s doc comment), so a row is synthesized here under
-    // `sourceAttemptId` — the one identity this function already mints for
-    // exactly this round.
-    // Resolve by the caller's own hint first — the ACTUAL round that
-    // triggered this recovery — falling back to "whichever row is currently
-    // live for this task" only when no hint was supplied (review fix,
-    // 2026-08-27: see `ImplementationRecoveryInputV1.sourceRoundIdHint`'s doc
-    // comment). The fallback scan is unsound if more than one row is ever
-    // live for a task at once; the hint removes that assumption for every
-    // caller that supplies one.
-    const hintedRow = input.sourceRoundIdHint
-      ? resolveRoundV1(next, input.sourceRoundIdHint)
-      : undefined;
-    const sourceLiveRow =
-      hintedRow && (hintedRow.state === "open" || hintedRow.state === "scheduled")
-        ? hintedRow
-        : (next.roundLedger ?? []).find(
-            (row) => row.state === "open" || row.state === "scheduled"
-          );
-    const sourceEndedAt = new Date().toISOString();
-    const sourceState: RoundLedgerTerminalStateV1 =
-      input.trigger === "summaryRejected"
-        ? "rejected"
-        : input.terminatedExternally
-          ? "interrupted"
-          : "failed";
-    const sourceOutcome: RoundLedgerOutcomeV1 = {
-      rejectionReason: input.reason,
-      continuationOwed: true,
-      ...(quarantinedPaths.length > 0
-        ? { filesChanged: quarantinedPaths }
-        : input.filesChangedUnknown
-          ? { filesChangedUnknown: true }
-          : {}),
-    };
-    const sourceRoundId = sourceLiveRow?.roundId ?? sourceAttemptId;
-    const terminalizedSourceRow: RoundLedgerEntryV1 = sourceLiveRow
-      ? { ...sourceLiveRow, state: sourceState, endedAt: sourceEndedAt, outcome: sourceOutcome }
-      : {
-          roundId: sourceAttemptId,
-          attemptIds: [],
-          stage: input.postRunReviewStage,
-          mode: input.sourceDispatchMode ?? "implementation",
-          startedAt: sourceEndedAt,
-          state: sourceState,
-          endedAt: sourceEndedAt,
-          outcome: sourceOutcome,
-        };
-    next = upsertRoundLedgerEntryV1(next, terminalizedSourceRow);
-    sourceLedgerEntry = terminalizedSourceRow;
-    const capReached = continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1;
-    const record: ImplRecoveryV1 = {
-      sourceAttemptId,
-      sourceRoundId,
-      reason: input.reason,
-      trigger: input.trigger,
-      mode: selectedMode,
-      dispatch: "pending",
-      at: new Date().toISOString(),
-      ...(input.filesChangedUnknown ? { filesChangedUnknown: true } : {}),
-      ...(input.sourceDispatchMode ? { sourceDispatchMode: input.sourceDispatchMode } : {}),
-      ...(input.sourceDispatchMode === "apply-review" && input.sourceReviewStage
-        ? { sourceReviewStage: input.sourceReviewStage }
+  const sourceState: RoundLedgerTerminalStateV1 =
+    input.trigger === "summaryRejected"
+      ? "rejected"
+      : input.terminatedExternally
+        ? "interrupted"
+        : "failed";
+  const sourceOutcome: RoundLedgerOutcomeV1 = {
+    rejectionReason: input.reason,
+    continuationOwed: true,
+    ...(quarantinedPaths.length > 0
+      ? { filesChanged: quarantinedPaths }
+      : input.filesChangedUnknown
+        ? { filesChangedUnknown: true }
         : {}),
-      // The lease covers only the in-process hand-off to the continuation
-      // chain; a cap-reached record gets none — nothing will ever fire it,
-      // and a lease would just delay the sweep noticing it is parked.
-      ...(capReached
-        ? {}
-        : {
-            leaseOwner: ownerToken(),
-            leaseUntil: new Date(Date.now() + RECOVERY_TRANSITION_LEASE_MS).toISOString(),
-          }),
-    };
-    return { ...next, implRecovery: record, updatedAt: new Date().toISOString() };
+  };
+  // Part 4 / item 1 ("source/continuation linkage") + 2026-08-27 review fix
+  // ("beginImplementationRecoveryV1 directly constructs/upserts a terminal
+  // row and appends chat separately, bypassing the declared sole terminal
+  // writer"): the round that triggered this recovery is now terminalized
+  // through `terminalizeRoundV1` itself — the one function that writes a
+  // terminal ledger state, and the one function that appends the chat
+  // outcome message — rather than this file duplicating either. The
+  // `implRecovery` record is written via `postTerminalizePatch`, in the SAME
+  // transaction as the termination, so the ledger can never show the
+  // recovery as owed while the source round still reads "open"/"scheduled",
+  // and `sourceRoundId` is read off the terminalized entry itself rather
+  // than re-derived by a second, separately-racing resolution.
+  //
+  // Resolve by the caller's own hint first — the ACTUAL round that triggered
+  // this recovery — falling back to "whichever row is currently live for
+  // this task" only when the hint is absent (`fallbackToAnyLiveRow`; review
+  // fix, 2026-08-27: see `ImplementationRecoveryInputV1.sourceRoundIdHint`'s
+  // doc comment). The fallback scan is unsound if more than one row is ever
+  // live for a task at once; the hint removes that assumption for every
+  // caller that supplies one — and today's one production caller
+  // (`reviewActions.ts`) always does, having claimed that exact row moments
+  // earlier via `claimImplementationRoundLedgerV1`. Narrowed 2026-08-27
+  // review follow-up (blocker "recovery still permits fallbackToAnyLiveRow
+  // ... so an unresolved source hint can terminalize an unrelated live row
+  // instead of preserving strict round identity"): gating the option itself
+  // on hint-ABSENCE, not merely preferring the hint when present, means a
+  // caller that DID supply a hint can never fall through to an unrelated
+  // round's row even if that hint fails to resolve to a live one (a race, or
+  // a caller bug) — it falls straight to `synthesizeIfMissing` instead,
+  // opening a fresh row under its own `sourceAttemptId` rather than
+  // terminalizing a DIFFERENT round's row under a mistaken identity. Only a
+  // hypothetical future caller that supplies no hint at all still gets the
+  // any-live-row scan, exactly as this function's own doc comment on
+  // `sourceRoundIdHint` describes ("the scan remains as the fallback for
+  // callers that predate this field"). `sourceAttemptId` doubles as the id
+  // passed when no hint exists (guaranteed not to resolve to any existing
+  // row, so resolution falls through to the scan immediately) and as the
+  // synthesized row's own id when nothing is live to reuse either.
+  const terminalization = await terminalizeRoundV1(input.sourceRoundIdHint ?? sourceAttemptId, sourceState, sourceOutcome, {
+    taskFolderUri: folderUri,
+    fallbackToAnyLiveRow: input.sourceRoundIdHint === undefined,
+    synthesizeIfMissing: () => ({
+      roundId: sourceAttemptId,
+      stage: input.postRunReviewStage,
+      mode: input.sourceDispatchMode ?? "implementation",
+    }),
+    extraPatch: (current) => {
+      selectedMode = selectImplRecoveryModeV1({
+        terminatedExternally: input.terminatedExternally,
+        filesChangedUnknown: input.filesChangedUnknown,
+        changedFileCount: quarantinedPaths.length,
+        latestHighReviewPassedZeroBlockers: latestHighReviewPassedZeroBlockersV1(current),
+        latestHighReviewDescribesPreRoundTree: highReviewDescribesPreRoundTree,
+        preRoundBoundaryClean:
+          (current.pendingImplReviewFiles?.length ?? 0) === 0 &&
+          current.reviewInvalidatedByRound === undefined,
+        summaryOnlyDispatchAvailable: isSummaryOnlyDispatchAvailableV1(),
+        escalatedFromSummaryOnly: input.escalatedFromSummaryOnly === true,
+      });
+      continuations = (current.incompleteRoundContinuations ?? 0) + 1;
+      let next = setIncompleteRoundContinuations(current, continuations);
+      if (quarantinedPaths.length > 0) {
+        next = quarantinePendingImplReviewFiles(next, [...quarantinedPaths]);
+      }
+      if (isReviewStage(input.postRunReviewStage)) {
+        next = recordReviewInvalidatedByRound(next, input.postRunReviewStage);
+      }
+      return next;
+    },
+    postTerminalizePatch: (afterTermination, terminalizedEntry) => {
+      const capReachedNow = continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1;
+      const record: ImplRecoveryV1 = {
+        sourceAttemptId,
+        sourceRoundId: terminalizedEntry.roundId,
+        reason: input.reason,
+        trigger: input.trigger,
+        mode: selectedMode,
+        dispatch: "pending",
+        at: new Date().toISOString(),
+        ...(input.filesChangedUnknown ? { filesChangedUnknown: true } : {}),
+        ...(input.sourceDispatchMode ? { sourceDispatchMode: input.sourceDispatchMode } : {}),
+        ...(input.sourceDispatchMode === "apply-review" && input.sourceReviewStage
+          ? { sourceReviewStage: input.sourceReviewStage }
+          : {}),
+        // The lease covers only the in-process hand-off to the continuation
+        // chain; a cap-reached record gets none — nothing will ever fire it,
+        // and a lease would just delay the sweep noticing it is parked.
+        ...(capReachedNow
+          ? {}
+          : {
+              leaseOwner: ownerToken(),
+              leaseUntil: new Date(Date.now() + RECOVERY_TRANSITION_LEASE_MS).toISOString(),
+            }),
+      };
+      return { ...afterTermination, implRecovery: record, updatedAt: new Date().toISOString() };
+    },
   });
+  const persisted = terminalization.ok ? terminalization.progress : undefined;
   // PART 6.5: push the just-committed fact into the scheduling-intent
   // ledger right after the CAS resolves (never from inside the callback,
   // which may re-run on a retry) — see `owedContinuationSourceV1`'s doc
@@ -522,29 +529,6 @@ export async function beginImplementationRecoveryV1(
     folderUri.fsPath,
     owedContinuationSourceV1(persisted?.implRecovery, persisted?.pendingImplReviewFiles ?? [])
   );
-  // Best-effort chat outcome message for the source round's terminalization
-  // above, AFTER the ledger write has landed — same ordering/failure
-  // contract as `terminalizeRoundV1` itself (a write failure here never rolls
-  // back the already-durable ledger state; the reconciliation sweep's pass
-  // (b) repairs a missing outcome message on the next sweep).
-  if (sourceLedgerEntry) {
-    try {
-      await appendChatMessageV1(
-        folderUri.fsPath,
-        {
-          role: "assistant",
-          text: formatRoundOutcomeMessageV1(sourceLedgerEntry),
-          stage: sourceLedgerEntry.stage,
-          at: sourceLedgerEntry.endedAt ?? new Date().toISOString(),
-          kind: "outcome",
-          roundId: sourceLedgerEntry.roundId,
-        },
-        folderUri.fsPath
-      );
-    } catch {
-      // Best-effort only — see comment above.
-    }
-  }
   const capReached = continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1;
 
   const finishDispatch = async (): Promise<void> => {
@@ -794,9 +778,31 @@ export async function claimImplRecoveryDispatchV1(
     if (claimed.sourceRoundId) {
       const continuationOf = claimed.sourceRoundId;
       const continuationAttemptId = claimed.attemptId as string;
-      const openRow = (current.roundLedger ?? []).find(
-        (row) => row.state === "open" || row.state === "scheduled"
-      );
+      // Resolve the SPECIFIC row this dispatch already opened, when this is
+      // an auto-dispatched continuation — `scheduleAutomationChain` staged
+      // its `intentId` for exactly this purpose moments ago
+      // (`setPendingAutomationRoundIntentV1`), and `announceAutoStartBestEffortV1`
+      // opened a row keyed by that same id. PEEK, not consume: the real
+      // consumer of this entry is `executeImplementationRun`'s own
+      // `claimImplementationRoundLedgerV1` call, which runs moments after
+      // this claim for the SAME dispatch — consuming it here would starve
+      // that later call, which would then open a SECOND row for the
+      // identical round instead of reusing this one (2026-08-27 review
+      // follow-up, blocker "recovery linkage selects the first task-wide
+      // live row rather than resolving the actual source identity"). Falls
+      // back to "whichever row is currently live for this task" only when no
+      // continuation was auto-dispatched (a manual rerun opens no such row)
+      // or the peeked id resolves to nothing live (stale/expired peek) —
+      // same stale-rebinding guard `claimReviewAttempt` and
+      // `claimImplementationRoundLedgerV1` both apply to this same map.
+      const peekedIntentId = peekPendingAutomationRoundIntentV1(folderUri.fsPath);
+      const peekedRow = peekedIntentId ? resolveRoundV1(current, peekedIntentId) : undefined;
+      const openRow =
+        peekedRow && (peekedRow.state === "open" || peekedRow.state === "scheduled")
+          ? peekedRow
+          : (current.roundLedger ?? []).find(
+              (row) => row.state === "open" || row.state === "scheduled"
+            );
       // The reused row keeps its own pre-existing `roundId` (an
       // auto-dispatched continuation's own generic row, keyed by its
       // dispatch's `intentId`) — but `claimed.attemptId` is the id every

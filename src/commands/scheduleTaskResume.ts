@@ -13,7 +13,11 @@ import {
   scheduleAutomationChain,
 } from "../utils/automationChain";
 import { IMPL_CONTINUATION_CHAIN_ID_V1, owedContinuationSourceV1 } from "./implementationRecoveryV1";
-import { hasLiveSchedulingIntentBestEffortV1, syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
+import {
+  hasLiveSchedulingIntentBestEffortV1,
+  liveSchedulingIntentIdsBestEffortV1,
+  syncOwedContinuationLedgerBestEffortV1,
+} from "../state/schedulingIntentV1";
 import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 
@@ -157,10 +161,11 @@ export class TaskActionScheduler implements vscode.Disposable {
    * on activation and every periodic sweep, same entry point as
    * `armPendingImplRecoveries`'s self-healing: (c) synthesizes a ledger row
    * for any legacy `_Auto-starting_` transcript entry that never had one, (a)
-   * closes a `"scheduled"`/`"open"` row as `"interrupted"` once this task has
-   * no live operation AND no live scheduling-intent entry (see
-   * `reconcileOrphanedRoundLedgerRowsV1`'s doc comment for why a per-task
-   * liveness check is used rather than a per-row identity match), and (b)
+   * closes a `"scheduled"`/`"open"` row as `"interrupted"` once that row's OWN
+   * `operationId`/`intentId` is no longer among this task's live operations/
+   * scheduling-intents — falling back to the task-wide booleans only for a
+   * row with neither id (see `reconcileOrphanedRoundLedgerRowsV1`'s doc
+   * comment), and (b)
    * appends a missing outcome message for any terminal row — including one
    * (c) just synthesized. Unlike pass (a) alone, (b)/(c) are not gated on an
    * open row existing, so every task is reconciled every sweep; each pass is
@@ -168,10 +173,13 @@ export class TaskActionScheduler implements vscode.Disposable {
    */
   private async reconcileRoundLedgerOrphans(): Promise<void> {
     for (const task of this.inventory.getTasks()) {
+      const liveOperations = taskOperations.getTaskOperations(task.taskFolderPath);
       await reconcileRoundLedgerV1({
         taskFolderUri: vscode.Uri.file(task.taskFolderPath),
-        hasLiveOperation: taskOperations.getTaskOperations(task.taskFolderPath).length > 0,
+        hasLiveOperation: liveOperations.length > 0,
         hasLiveSchedulingIntent: hasLiveSchedulingIntentBestEffortV1(task.taskFolderPath),
+        liveOperationIds: liveOperations.map((op) => op.id),
+        liveSchedulingIntentIds: liveSchedulingIntentIdsBestEffortV1(task.taskFolderPath),
       });
     }
   }

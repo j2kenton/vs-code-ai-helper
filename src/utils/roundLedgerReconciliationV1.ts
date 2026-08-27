@@ -12,22 +12,25 @@
  * the chat transcript into the ledger that now backs it.
  *
  * This module closes those rows as `"interrupted"` once nothing live remains
- * that could still terminalize them: no `TaskOperationSnapshot` registered for
- * the task (`taskOperations` deletes an operation's entry the moment it ends —
- * see `TaskOperationRegistry.end`, so a non-empty result is genuine live
- * state, never a stale leftover) AND no scheduling-intent entry for the task
- * still sitting `"scheduled"`/`"running"` (the announce-then-dispatch window
- * before a `TaskOperationSnapshot` exists yet). Checked per TASK rather than
- * per row/operationId: a review round's row is opened under its own
+ * that could still terminalize them. Checked PER ROW where the row carries an
+ * identity to check (`operationId` against `liveOperationIds`, or `intentId`
+ * against `liveSchedulingIntentIds`) — a task-wide "is ANYTHING live right
+ * now" boolean over-protects: a task's rounds ARE exclusive-locked one at a
+ * time in the steady state, but that invariant is exactly what a crash can
+ * violate (a fresh round starts, and is genuinely live, while an EARLIER
+ * row from a still-unreconciled crash sits open from a previous window) —
+ * checked task-wide, that earlier stale row would be shielded from
+ * orphan-closure for as long as ANYTHING else is live on the task, which can
+ * be indefinitely (2026-08-27 review follow-up, blocker "orphan
+ * reconciliation still returns early on task-wide booleans... rather than
+ * checking each row's own operationId or intentId"). A row that carries
+ * NEITHER id — a review round's row is opened under its own
  * independently-minted `reviewAttemptId` before the coordinator's
- * `operationId` exists (see `terminalizeRoundV1`'s doc comment), so an
- * orphan's row very often carries no `operationId` to match against at all —
- * exactly the rows this pass exists to catch. A task's rounds are
- * exclusive-locked one at a time (`automationChain.ts`'s duplicate-chain
- * guard, `taskOperations`' own exclusive-operation model), so "does this task
- * have ANY live operation/intent right now" is the correct proxy for "is the
- * row genuinely still live", not an approximation of a per-row check that
- * would otherwise need identities most orphaned rows do not have.
+ * `operationId` exists (see `terminalizeRoundV1`'s doc comment), and some
+ * manually-dispatched rows never acquire an `intentId` either — has nothing
+ * to check per-row and falls back to the task-wide booleans exactly as
+ * before; this is a narrower, still-honest degradation rather than the
+ * blanket over-protection the task-wide check used to apply to every row.
  *
  * Deliberately conservative: this only ever closes a row as `"interrupted"`
  * with a short, honest `outcome.rejectionReason` naming when it started and
@@ -94,13 +97,62 @@ function isLegacyAutoStartMessageV1(message: ChatMessage): boolean {
 export interface ReconcileOrphanedRoundLedgerRowsInputV1 {
   readonly taskFolderUri: vscode.Uri;
   /** True when `taskOperations.getTaskOperations(taskFolderPath)` is
-   * non-empty for this task — a genuinely live in-flight round. */
+   * non-empty for this task — a genuinely live in-flight round. Retained as
+   * the fallback protection for a row that carries neither `operationId` nor
+   * `intentId` to correlate against (see `liveOperationIds` below). */
   readonly hasLiveOperation: boolean;
   /** True when this task has a `"scheduled"`/`"running"` scheduling-intent
    * entry (`hasLiveSchedulingIntentBestEffortV1`, `schedulingIntentV1.ts`) —
    * covers the announce-then-dispatch window before a live operation is
-   * registered. */
+   * registered. Same fallback role as `hasLiveOperation` above. */
   readonly hasLiveSchedulingIntent: boolean;
+  /**
+   * `id`s of every live `TaskOperationSnapshot` for this task
+   * (`taskOperations.getTaskOperations(taskFolderPath).map(op => op.id)`) —
+   * the row-identifying counterpart to `hasLiveOperation` (2026-08-27 review
+   * follow-up, blocker "orphan reconciliation still returns early on
+   * task-wide booleans... rather than checking each row's own operationId or
+   * intentId"). A row whose `operationId` is one of these is protected
+   * regardless of what else is live for the task; a row whose `operationId`
+   * is set but NOT among these is an orphan even if some OTHER round is live
+   * for the same task.
+   */
+  readonly liveOperationIds: readonly string[];
+  /**
+   * `intentId`s of every `"scheduled"`/`"running"` scheduling-intent entry
+   * for this task (`liveSchedulingIntentIdsBestEffortV1`), or `undefined`
+   * when this could not be determined — the row-identifying counterpart to
+   * `hasLiveSchedulingIntent`. `undefined` means "indeterminate": a row whose
+   * `intentId` cannot be checked against a real list is protected
+   * conservatively (fail-open), matching `hasLiveSchedulingIntentBestEffortV1`'s
+   * own fail-open contract, rather than being treated as definitely orphaned.
+   */
+  readonly liveSchedulingIntentIds: readonly string[] | undefined;
+}
+
+/**
+ * A row is protected from orphan-closure when its OWN identity is
+ * demonstrably still live — checked in preference to the task-wide booleans,
+ * which over-protect (any live round anywhere on the task shields every
+ * other open row too, including a genuinely stale one left by an earlier
+ * crash). A row carrying NEITHER `operationId` nor `intentId` (a manually
+ * dispatched round whose row predates the coordinator attaching either — see
+ * `roundLedgerV1.ts`'s own doc comment on this residual gap) has no identity
+ * to check and falls back to the task-wide booleans, exactly as before.
+ */
+function isRoundLedgerRowProtectedV1(
+  row: RoundLedgerEntryV1,
+  input: ReconcileOrphanedRoundLedgerRowsInputV1
+): boolean {
+  if (row.operationId !== undefined) {
+    return input.liveOperationIds.includes(row.operationId);
+  }
+  if (row.intentId !== undefined) {
+    return input.liveSchedulingIntentIds === undefined
+      ? true
+      : input.liveSchedulingIntentIds.includes(row.intentId);
+  }
+  return input.hasLiveOperation || input.hasLiveSchedulingIntent;
 }
 
 export interface ReconcileOrphanedRoundLedgerRowsResultV1 {
@@ -121,15 +173,14 @@ export interface ReconcileOrphanedRoundLedgerRowsResultV1 {
 export async function reconcileOrphanedRoundLedgerRowsV1(
   input: ReconcileOrphanedRoundLedgerRowsInputV1
 ): Promise<ReconcileOrphanedRoundLedgerRowsResultV1> {
-  if (input.hasLiveOperation || input.hasLiveSchedulingIntent) {
-    return { closed: [] };
-  }
   const read = await readTaskProgressStrictV1(input.taskFolderUri);
   if (!read.ok) {
     return { closed: [] };
   }
   const openRows = (read.decoded.progress.roundLedger ?? []).filter(
-    (row) => row.state === "scheduled" || row.state === "open"
+    (row) =>
+      (row.state === "scheduled" || row.state === "open") &&
+      !isRoundLedgerRowProtectedV1(row, input)
   );
   const closed: string[] = [];
   for (const row of openRows) {

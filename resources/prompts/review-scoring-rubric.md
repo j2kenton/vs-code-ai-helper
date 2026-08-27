@@ -53,6 +53,8 @@ When the implementation notes below include a plan checklist (`<!-- ensemble:imp
 
 This drives a one-click action that ticks exactly these items in plan-final.md on the strength of your verification alone — so only list an item here when you actually checked it against the tree yourself, never because it merely seems likely to be done. Omit an item you did not personally verify. Skip this block entirely when there is no checklist to check items against (e.g. a plan review), or emit it with the two markers and no entries when a checklist exists but you verified nothing beyond what is already ticked.
 
+A checklist item carrying the literal marker `<!-- ensemble:excluded -->` is already settled — closed WITHOUT doing the work (descoped, superseded, or a branch not taken) rather than closed by completing it. Treat it exactly like a ticked (`- [x]`) item for readiness purposes: it is not outstanding work, and its absence from `## Verified Complete` above is expected, not a gap to flag.
+
 ## Automatic Reconciliation Evidence — Not Yet Ticked
 
 A synthetic (tool-only) edit round with no checklist echo may trigger a bounded automatic reconciliation pass. It never ticks a box on the strength of its own lexical corroboration alone — matching file paths, operation kinds, and keyword content is evidence, not verification, and is surfaced elsewhere (the round log, the reconciliation decision) as a candidate pending explicit human attestation. If you independently open a candidate item's referenced file(s) and confirm the described requirement is genuinely met, name it in the `## Verified Complete` block above exactly like any other item you verified — that is the only way this kind of evidence becomes a tick.

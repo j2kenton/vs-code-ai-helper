@@ -68,6 +68,7 @@ import {
 } from "../utils/implementationDispatchModeV1";
 import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
 import {
+  attachCoordinatorIdentityToRoundBestEffortV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   RoundLedgerTerminalStateV1,
@@ -4570,6 +4571,18 @@ export async function runReviewForFolder(
       cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
+        // Part 4 architectural fix (2026-08-27 review follow-up, blocker
+        // "coordinator allocation sites still do not attach operation and
+        // attempt identities to a round-ledger row ... at allocation time"):
+        // attach the coordinator's own identities to THIS round's already-
+        // open row the moment they exist, rather than waiting for
+        // terminalizeRoundV1's post-hoc attachment.
+        void attachCoordinatorIdentityToRoundBestEffortV1({
+          taskFolderUri: folderUri,
+          roundId: reviewAttemptId,
+          operationId: info.operationId,
+          attemptId: info.attemptId,
+        });
       },
     });
     // "completed" is the only outcome that overwrites reviewUri with fresh
@@ -8311,6 +8324,7 @@ async function executeImplementationRun(
             roundOutcomeClassification: {
               classification: gateClassification,
               stage: implBookkeepingStage,
+              attemptId: implRoundId,
               ...(gateActualModelId ? { modelId: gateActualModelId } : {}),
               ...(gateActualProviderId ? { providerId: gateActualProviderId } : {}),
               dispatchMode: currentDispatchMode,
@@ -8468,6 +8482,7 @@ async function executeImplementationRun(
           roundOutcomeClassification: {
             classification: zeroChangeClassification,
             stage: zeroChangeBookkeepingStage,
+            attemptId: implRoundId,
             ...(zeroChangeActualModelId ? { modelId: zeroChangeActualModelId } : {}),
             ...(zeroChangeActualProviderId ? { providerId: zeroChangeActualProviderId } : {}),
             dispatchMode: currentDispatchMode,
@@ -8846,6 +8861,7 @@ async function executeImplementationRun(
             extraPatch: (current) => setZeroChangeImplRounds(current, undefined),
             roundOutcomeClassification: {
               classification: "edits-produced",
+              attemptId: implRoundId,
               ...(modelId ? { modelId } : {}),
               dispatchMode: currentDispatchMode,
             },
@@ -8887,6 +8903,7 @@ async function executeImplementationRun(
           taskFolderUri: folderUri,
           roundOutcomeClassification: {
             classification: noEditsClassification,
+            attemptId: implRoundId,
             ...(modelId ? { modelId } : {}),
             dispatchMode: currentDispatchMode,
           },
@@ -9630,6 +9647,7 @@ async function executeImplementationRun(
         taskFolderUri: folderUri,
         roundOutcomeClassification: {
           classification: "cancelled",
+          attemptId: implRoundId,
           dispatchMode: currentDispatchMode,
         },
       }
@@ -11184,6 +11202,15 @@ export async function resumeReviewInteractionV1(
     cancellationToken,
     onPromptAssembled: (info) => {
       observedCoordinatorAttemptIds.push(info.attemptId);
+      // Part 4 architectural fix, same as `runReviewForFolder`'s initial
+      // dispatch above: attach the coordinator's identities to this resumed
+      // round's already-open row at allocation time, not only at its end.
+      void attachCoordinatorIdentityToRoundBestEffortV1({
+        taskFolderUri: taskFolderUri,
+        roundId: reviewAttemptId,
+        operationId: info.operationId,
+        attemptId: info.attemptId,
+      });
     },
   });
 

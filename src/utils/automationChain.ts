@@ -7,7 +7,11 @@ import {
   recordTerminalIntentBestEffortV1,
   SchedulingIntentMetadataV1,
 } from "../state/schedulingIntentV1";
-import { setPendingAutomationRoundIntentV1, terminalizeRoundV1 } from "./roundLedgerV1";
+import {
+  openScheduledAutomationRoundLedgerRowBestEffortV1,
+  setPendingAutomationRoundIntentV1,
+  terminalizeRoundV1,
+} from "./roundLedgerV1";
 
 /**
  * Lock-safe guarded dispatch for automation chains (auto-review,
@@ -276,31 +280,50 @@ function claimChainGuard(
 
 /**
  * Best-effort close of the generic round-ledger row
+ * `openScheduledAutomationRoundLedgerRowBestEffortV1` /
  * `openAutomationRoundLedgerRowBestEffortV1` opened for this dispatch (wf
- * "make the stage chat a record of work" Part 4 step 12) — called from the
- * SAME `deps.execute` settle points that already call
- * `recordTerminalIntentBestEffortV1` for the scheduling intent, so a row
- * opened at dispatch can never leak `"open"`: no-op when `taskKey`/`intentId`
- * is absent (nothing was ever opened to close) or when a richer call site
- * (`claimReviewAttempt` + its own terminalizer) already closed the SAME row
- * with real per-round facts — `terminalizeRoundV1` is idempotent, and this
- * settle point fires strictly after the dispatched command's own promise
- * (and any terminalization it performed internally) has already resolved, so
- * it can only ever WIN the race for a row nothing else closed.
+ * "make the stage chat a record of work" Part 4 step 12/13) — called from
+ * EVERY point this dispatch can end, not only the `deps.execute` settle
+ * points: a chain dropped before it ever reaches `deps.execute` (automation
+ * disabled meanwhile, or the root operation it was deferred behind ended
+ * unsuccessfully) already has a `"scheduled"` row from the schedule-time open
+ * above, and closing it here is what the narrowed blocker "dropped/cancelled
+ * scheduling paths record only a terminal scheduling intent, never a ledger
+ * ending" asks for. No-op when `taskKey`/`intentId` is absent (nothing was
+ * ever opened to close) or when a richer call site (`claimReviewAttempt` +
+ * its own terminalizer) already closed the SAME row with real per-round facts
+ * — `terminalizeRoundV1` is idempotent, and the `deps.execute` settle points
+ * fire strictly after the dispatched command's own promise (and any
+ * terminalization it performed internally) has already resolved, so they can
+ * only ever WIN the race for a row nothing else closed.
+ *
+ * `dropReason`, added 2026-08-27 (review follow-up, narrowed completion
+ * blocker: "terminalizeGenericAutomationRoundBestEffortV1 creates an outcome
+ * only for failed ... the root-unsuccessful branch also records the
+ * scheduling intent as cancelled but the ledger as dropped ... leaving the
+ * two durable classifications inconsistent"): every call site now passes
+ * `"cancelled"` (never `"dropped"`, matching the scheduling-intent ledger's
+ * own vocabulary — `SchedulingIntentLifecycleStateV1` has no `"dropped"`
+ * value, so the two stores could never have agreed while this function used
+ * a state the other side cannot express) together with a short reason, so a
+ * dropped/cancelled row's `outcome.rejectionReason` is never silently absent
+ * the way it was before — only `"failed"` carried one.
  */
 function terminalizeGenericAutomationRoundBestEffortV1(
   taskKey: string | undefined,
   intentId: string | undefined,
-  state: "completed" | "failed",
-  error?: unknown
+  state: "completed" | "failed" | "cancelled",
+  errorOrReason?: unknown
 ): void {
   if (!taskKey || !intentId) {
     return;
   }
   const outcome =
     state === "failed"
-      ? { rejectionReason: error instanceof Error ? error.message : String(error) }
-      : undefined;
+      ? { rejectionReason: errorOrReason instanceof Error ? errorOrReason.message : String(errorOrReason) }
+      : state === "cancelled" && typeof errorOrReason === "string"
+        ? { rejectionReason: errorOrReason }
+        : undefined;
   void terminalizeRoundV1(intentId, state, outcome, {
     taskFolderUri: vscode.Uri.file(taskKey),
   }).catch(() => {
@@ -351,17 +374,43 @@ export function scheduleAutomationChain(
   // own failure and never throw), so this only adds a short, bounded delay
   // ahead of a dispatch that was already asynchronous, never a new failure
   // mode.
+  // 2026-08-27 review follow-up (narrowed blocker "rows are still created
+  // directly as open rather than scheduled ... dropped/cancelled scheduling
+  // paths record only a terminal scheduling intent, never a ledger ending"):
+  // open THIS dispatch's round-ledger row as `"scheduled"` the moment its
+  // intentId exists, before any of the drop gates below run, so every path
+  // that can end this dispatch — including a drop before `deps.execute` is
+  // ever reached — has a real row to terminalize instead of leaving only a
+  // scheduling-intent record. `announceAutoStartBestEffortV1` (below) flips
+  // this SAME row to `"open"` once the command actually starts.
   const intentIdPromise = recordScheduledIntentBestEffortV1({
     taskKey: dispatch.taskKey,
     command: dispatch.command,
     chainId: dispatch.chainId ?? dispatch.command,
     intent: dispatch.intent,
+  }).then(async (id) => {
+    if (dispatch.taskKey && id) {
+      await openScheduledAutomationRoundLedgerRowBestEffortV1({
+        taskFolderUri: vscode.Uri.file(dispatch.taskKey),
+        roundId: id,
+        command: dispatch.command,
+      });
+    }
+    return id;
   });
   const rootOperationId = rootOperation?.id;
   if (!rootOperationId) {
     if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
       release();
-      void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+      void intentIdPromise.then((id) => {
+        void recordTerminalIntentBestEffortV1(id, "cancelled");
+        terminalizeGenericAutomationRoundBestEffortV1(
+          dispatch.taskKey,
+          id,
+          "cancelled",
+          "automation was disabled before this round could start"
+        );
+      });
       dispatch.onDropped?.("automation-disabled");
       return Promise.resolve(false); // Automation disabled since scheduling — dropped.
     }
@@ -424,7 +473,15 @@ export function scheduleAutomationChain(
           // Automation disabled between scheduling and the root operation
           // ending — drop the chain at fire time.
           release();
-          void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+          void intentIdPromise.then((id) => {
+            void recordTerminalIntentBestEffortV1(id, "cancelled");
+            terminalizeGenericAutomationRoundBestEffortV1(
+              dispatch.taskKey,
+              id,
+              "cancelled",
+              "automation was disabled before this round could start"
+            );
+          });
           dispatch.onDropped?.("automation-disabled");
           resolve(false);
           return;
@@ -472,7 +529,15 @@ export function scheduleAutomationChain(
           });
       } else {
         release();
-        void intentIdPromise.then((id) => recordTerminalIntentBestEffortV1(id, "cancelled"));
+        void intentIdPromise.then((id) => {
+          void recordTerminalIntentBestEffortV1(id, "cancelled");
+          terminalizeGenericAutomationRoundBestEffortV1(
+            dispatch.taskKey,
+            id,
+            "cancelled",
+            "the operation this round was chained behind did not succeed"
+          );
+        });
         dispatch.onDropped?.("root-operation-unsuccessful");
         resolve(false);
       }

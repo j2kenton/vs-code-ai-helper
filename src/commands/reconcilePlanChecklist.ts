@@ -305,13 +305,22 @@ async function gatherReconcileEvidenceV1(
   perStage: { stage: TaskStage; hasArtifact: boolean; evidence?: NormalizedReviewEvidenceV1; mtimeMs?: number }[];
 }> {
   const evidence: WorkflowDecisionEvidenceItemV1[] = [];
-  const unchecked = listUncheckedChecklistItemTextsV1(planOfRecord, Number.MAX_SAFE_INTEGER);
+  // wf "make the stage chat a record of work" item 16: this evidence block
+  // once inlined every unticked item's FULL text — including multi-paragraph
+  // deferral annotations — which could push a decision card's actual options
+  // below the fold. Bounded to a preview of items, each capped to its first
+  // line/160 chars, with an honest "and N more" tail for the rest.
+  const unchecked = listUncheckedChecklistItemTextsV1(planOfRecord, 10, { maxItemChars: 160 });
+  const uncheckedMore =
+    unchecked.total > unchecked.items.length
+      ? `\n…and ${unchecked.total - unchecked.items.length} more.`
+      : "";
   evidence.push({
     label: "Unchecked plan items",
     detail:
       unchecked.total === 0
         ? "None — the checklist already shows every item complete."
-        : `${unchecked.total} item(s) unticked:\n${unchecked.items.map((item) => `- ${item}`).join("\n")}`,
+        : `${unchecked.total} item(s) unticked:\n${unchecked.items.map((item) => `- ${item}`).join("\n")}${uncheckedMore}`,
   });
 
   evidence.push({

@@ -620,6 +620,92 @@ void test("a failing automation dispatch closes its round-ledger row as failed, 
   }
 });
 
+// 2026-08-27 review follow-up, narrowed completion blocker: "the root-
+// unsuccessful branch also records the scheduling intent as cancelled but the
+// ledger as dropped ... leaving the two durable classifications inconsistent"
+// / "terminalizeGenericAutomationRoundBestEffortV1 creates an outcome only
+// for failed". The two tests below prove both drop causes now close the
+// round-ledger row with the SAME terminal state the scheduling-intent ledger
+// already used for them (`SchedulingIntentLifecycleStateV1` has no "dropped"
+// value at all), and that both carry a human-readable reason rather than an
+// empty outcome.
+void test("automation disabled before dispatch closes its round-ledger row as cancelled with a reason", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-disabled-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    const chain = makeFakeChain();
+    const result = await scheduleAutomationChain(
+      {
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        taskKey: fixture.folder,
+        chainId: "impl-ledger-disabled",
+        stillEnabled: () => false,
+      },
+      undefined,
+      chain.deps
+    );
+    assert.equal(result, false);
+
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    assert.equal(raw.roundLedger?.length, 1);
+    const row = raw.roundLedger?.[0];
+    assert.ok(row, "must resolve the opened row");
+    assert.equal(row?.state, "cancelled");
+    assert.ok(
+      row?.outcome?.rejectionReason?.includes("automation was disabled"),
+      "a cancelled row must carry a human-readable reason, not an empty outcome"
+    );
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    fs.rmSync(fixture.folder, { recursive: true, force: true });
+  }
+});
+
+void test("a root operation ending unsuccessfully closes the deferred chain's round-ledger row as cancelled with a reason, matching the scheduling-intent's own classification", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-root-fail-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    const chain = makeFakeChain();
+    const pending = scheduleAutomationChain(
+      {
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        taskKey: fixture.folder,
+        chainId: "impl-ledger-root-fail",
+      },
+      { id: "root-1" },
+      chain.deps
+    );
+    chain.end({ id: "root-1", state: "failed" });
+    const result = await pending;
+    assert.equal(result, false);
+
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    assert.equal(raw.roundLedger?.length, 1);
+    const row = raw.roundLedger?.[0];
+    assert.ok(row, "must resolve the opened row");
+    assert.equal(
+      row?.state,
+      "cancelled",
+      'must never be "dropped" — the scheduling-intent ledger has no such value and already records this same event as "cancelled"'
+    );
+    assert.ok(
+      row?.outcome?.rejectionReason?.includes("did not succeed"),
+      "a cancelled row must carry a human-readable reason, not an empty outcome"
+    );
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    fs.rmSync(fixture.folder, { recursive: true, force: true });
+  }
+});
+
 // 2026-08-27 review follow-up (blocker "coordinator-owned lifecycle
 // identity" / "Automated rounds now add an intent-keyed generic row while
 // review rows still use a separate synthetic ID"): a dispatched command that

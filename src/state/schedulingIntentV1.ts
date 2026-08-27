@@ -892,6 +892,39 @@ export async function announceAutoStartBestEffortV1(input: {
     }
     const metadata = resolveIntentMetadataV1(input.command, input.intent);
     const text = buildAutoStartAnnouncementTextV1(metadata);
+    // wf "make the stage chat a record of work" Part 4 step 12/14: flip this
+    // round's ledger row (opened as `"scheduled"` at
+    // `recordScheduledIntentBestEffortV1` time by
+    // `openScheduledAutomationRoundLedgerRowBestEffortV1`, in
+    // `automationChain.ts`) to `"open"` under the SAME intentId BEFORE the
+    // chat message that references it — paired with `automationChain.ts`'s
+    // existing generic settle handling terminalizing it (see
+    // `openAutomationRoundLedgerRowBestEffortV1`'s own doc comment, which also
+    // falls back to creating a fresh `"open"` row when nothing was scheduled
+    // first). Ordering matters (2026-08-27 review follow-up, blocker "the
+    // activity projection is written first and a best-effort row is then
+    // created directly as open"): a message carrying an `intentId` is NOT the
+    // shape legacy reconciliation pass (c) repairs — that pass only
+    // synthesizes a row for messages with NO `intentId` — so if the row-open
+    // below ran second and failed, the message would already be durable with
+    // an `intentId` that resolves to nothing, and no reconciliation pass would
+    // ever create the row it is missing. Opening the row FIRST means the only
+    // failure window left is "row exists, message never got written" —
+    // recovered by reconciliation pass (b), which repairs any terminal row
+    // with no outcome message, and by the row simply rendering with no
+    // matching activity line (a cosmetic gap, not an unrecoverable one). Only
+    // when this dispatch actually has an intentId to key the row on — an
+    // un-enriched call site with no intent metadata has nothing to attach a
+    // row's later termination to, and writes the message with no row at all
+    // (the legacy-shaped case pass (c) already covers).
+    if (input.intentId !== undefined) {
+      await openAutomationRoundLedgerRowBestEffortV1({
+        taskFolderUri: vscode.Uri.file(input.taskKey),
+        roundId: input.intentId,
+        command: input.command,
+        stage: progressResult.decoded.progress.currentStage,
+      });
+    }
     await appendChatMessageV1(
       input.taskKey,
       {
@@ -904,21 +937,6 @@ export async function announceAutoStartBestEffortV1(input: {
       },
       input.taskKey
     );
-    // wf "make the stage chat a record of work" Part 4 step 12: open this
-    // round's ledger row under the SAME intentId, paired with
-    // `automationChain.ts`'s existing generic settle handling terminalizing
-    // it (see `openAutomationRoundLedgerRowBestEffortV1`'s own doc comment).
-    // Only when this dispatch actually has an intentId to key the row on —
-    // an un-enriched call site with no intent metadata has nothing to attach
-    // a row's later termination to.
-    if (input.intentId !== undefined) {
-      await openAutomationRoundLedgerRowBestEffortV1({
-        taskFolderUri: vscode.Uri.file(input.taskKey),
-        roundId: input.intentId,
-        command: input.command,
-        stage: progressResult.decoded.progress.currentStage,
-      });
-    }
   } catch {
     // Best-effort — never surfaces to the caller, never blocks dispatch.
   }
@@ -955,6 +973,41 @@ export function hasLiveSchedulingIntentBestEffortV1(taskCanonicalId: string): bo
     });
   } catch {
     return true;
+  }
+}
+
+/**
+ * The `intentId`s of every `"scheduled"`/`"running"` scheduling-intent entry
+ * for a task, or `undefined` when this cannot be determined (no activating
+ * context, or a read error) — the row-identifying counterpart to
+ * `hasLiveSchedulingIntentBestEffortV1`'s boolean (2026-08-27 review follow-
+ * up, blocker "orphan reconciliation still returns early on task-wide
+ * booleans... rather than checking each row's own operationId or intentId"):
+ * a task-wide "is ANYTHING live" boolean protects every `"scheduled"`/`"open"`
+ * `roundLedger` row from orphan-closure the moment ONE round is live, even a
+ * stale row left over from an earlier crash that the live round has nothing
+ * to do with. Returning the actual live ids lets the reconciliation pass
+ * match each row against its OWN `intentId`/`operationId` instead.
+ * `undefined` (not an empty array) signals "indeterminate" so the caller can
+ * apply the same fail-open-to-live rule this function's boolean sibling
+ * already documents — an empty array is a real, positive claim that nothing
+ * is live, which only a successful read may make.
+ */
+export function liveSchedulingIntentIdsBestEffortV1(taskCanonicalId: string): readonly string[] | undefined {
+  const store = storeFromActivatingContext();
+  if (!store) {
+    return undefined;
+  }
+  try {
+    return store
+      .listForTask(taskCanonicalId)
+      .filter((entry) => {
+        const latest = entry.transitions[entry.transitions.length - 1]?.state ?? "scheduled";
+        return latest === "scheduled" || latest === "running";
+      })
+      .map((entry) => entry.intentId);
+  } catch {
+    return undefined;
   }
 }
 

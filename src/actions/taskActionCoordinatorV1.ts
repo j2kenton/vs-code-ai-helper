@@ -315,9 +315,23 @@ export interface TaskActionRequestV1 {
    * is never validated, digested, or persisted as part of a Chat interaction
    * transaction's input snapshot — it is a plain in-process callback, not
    * part of the closed `TaskActionOutcomeV1` contract.
+   *
+   * `operationId` (wf "make the stage chat a record of work" Part 4 review
+   * follow-up, 2026-08-27, blocker "coordinator allocation sites still do not
+   * attach operation and attempt identities to a round-ledger row ... at
+   * allocation time"): this callback already fires once per coordinator
+   * attempt, at the exact point `correlation.operationId`/`attemptId` are
+   * both in scope (`runProviderRow`) — well before the round's own
+   * `terminalizeRoundV1` call, which is the only place either id was
+   * previously surfaced. A caller that already has this round's own
+   * `roundLedger` row open (`claimReviewAttempt`) can therefore attach both
+   * ids to that LIVE row the moment this fires, rather than waiting for the
+   * round to end — see `attachCoordinatorIdentityToRoundBestEffortV1`
+   * (`roundLedgerV1.ts`).
    */
   readonly onPromptAssembled?: (info: {
     readonly attemptId: string;
+    readonly operationId: string;
     readonly prompt: string;
     readonly promptSha256: string;
   }) => void;
@@ -1627,7 +1641,7 @@ export function createTaskActionCoordinatorV1(
       // See `TaskActionRequestV1.onPromptAssembled`'s doc comment — best
       // effort, synchronous, never allowed to affect this attempt.
       try {
-        onPromptAssembled?.({ attemptId, prompt, promptSha256 });
+        onPromptAssembled?.({ attemptId, operationId: correlation.operationId, prompt, promptSha256 });
       } catch {
         // Caller-supplied observability hook; a failure here must never
         // affect the round it is merely observing.

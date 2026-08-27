@@ -936,6 +936,24 @@ export interface UncheckedChecklistItemsV1 {
 }
 
 /**
+ * Truncates a single checklist item's display text to its first line, then to
+ * `maxChars`, appending an ellipsis when either cut discards content (wf
+ * "make the stage chat a record of work" item 16 — the reconcile panel's
+ * evidence block once inlined whole multi-paragraph annotated items,
+ * pushing a decision card's real options below the fold). The full text
+ * always remains on disk in `plan-final.md`; this only bounds what a decision
+ * card or notification excerpts.
+ */
+export function truncateChecklistItemTextV1(text: string, maxChars: number): string {
+  const firstLine = text.split("\n", 1)[0] ?? "";
+  const lineTruncated = firstLine.length < text.length;
+  if (firstLine.length <= maxChars) {
+    return lineTruncated ? `${firstLine}…` : firstLine;
+  }
+  return `${firstLine.slice(0, maxChars).trimEnd()}…`;
+}
+
+/**
  * Plan-item texts whose box is currently UNCHECKED in `planOfRecord`'s latest
  * rendering, in document order, unescaped for display and bounded to `limit`.
  *
@@ -948,16 +966,26 @@ export interface UncheckedChecklistItemsV1 {
  * task-tree tooltip — so that instruction names the items instead of leaving
  * the reader to search a plan they may not have open (workflow 3 continuation
  * plan, Part 5).
+ *
+ * `maxItemChars`, when given, caps each returned item to its first line and
+ * to that many characters via {@link truncateChecklistItemTextV1} (item 16's
+ * evidence-block fix). Omitted by default so existing callers that rely on
+ * full item text (lexical matching, single-item lookups) are unaffected.
  */
 export function listUncheckedChecklistItemTextsV1(
   planOfRecord: string,
-  limit: number = 10
+  limit: number = 10,
+  options?: { readonly maxItemChars?: number }
 ): UncheckedChecklistItemsV1 {
   const outstanding = itemsInLatestRendering(planOfRecord).filter(
     (item) => !item.excluded && !item.checked
   );
+  const maxItemChars = options?.maxItemChars;
   return {
-    items: outstanding.slice(0, limit).map((item) => unescapeChecklistItemTextV1(item.text)),
+    items: outstanding.slice(0, limit).map((item) => {
+      const text = unescapeChecklistItemTextV1(item.text);
+      return maxItemChars !== undefined ? truncateChecklistItemTextV1(text, maxItemChars) : text;
+    }),
     total: outstanding.length,
   };
 }

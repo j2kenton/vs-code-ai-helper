@@ -212,6 +212,50 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
     }
   });
 
+  void it("synthesizes a fresh row instead of grabbing an unrelated live row when a supplied sourceRoundIdHint does not resolve (2026-08-27 review follow-up, narrowed blocker)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("stale_hint_does_not_fall_back", [
+        {
+          roundId: "unrelated-live-row",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:01:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const begun = await beginImplementationRecoveryV1(folderUri, {
+        trigger: "summaryRejected",
+        reason: "the provider did not return a usable summary",
+        terminatedExternally: false,
+        filesChanged: ["src/a.ts"],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+        // A hint the ledger has no row for at all — simulating a caller that
+        // supplied a hint which, for whatever reason, never resolves. Once a
+        // hint is supplied, `fallbackToAnyLiveRow` must be OFF: the row this
+        // recovery did not itself trigger must never be silently
+        // terminalized in its place.
+        sourceRoundIdHint: "a-hint-with-no-matching-row",
+      });
+
+      const raw = readProgress(folderPath);
+      const unrelatedRow = raw.roundLedger?.find((r) => r.roundId === "unrelated-live-row");
+      assert.equal(unrelatedRow?.state, "open", "a live row must never be terminalized under a mistaken identity");
+      const synthesizedRow = raw.roundLedger?.find((r) => r.roundId === begun.sourceAttemptId);
+      assert.ok(synthesizedRow, "a fresh row must be synthesized under sourceAttemptId instead");
+      assert.equal(synthesizedRow?.state, "rejected");
+      assert.equal(raw.implRecovery?.sourceRoundId, begun.sourceAttemptId);
+      assert.equal(raw.roundLedger?.length, 2, "the unrelated row and the synthesized row must both exist, distinctly");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("terminalizes as interrupted for an externally-terminated round", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
