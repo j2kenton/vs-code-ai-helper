@@ -1739,6 +1739,36 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.selection.reserved, 0);
   });
 
+  void it(
+    "fires onAttemptAllocated even when no candidate remains, before onPromptAssembled " +
+      "(2026-08-28 review, blocker: pre-prompt failure branches never attach an identity)",
+    async () => {
+      // `admitAction`'s own pre-admission allocation loop reaches its
+      // `noneRemaining` branch immediately with zero candidates — assembly
+      // never runs, so `onPromptAssembled` never fires for this attempt at
+      // all. `onAttemptAllocated` must still report it, since it fires the
+      // instant `session.allocateAttempt()` returns, strictly before the
+      // `noneRemaining` check that produces the "unavailable" outcome.
+      const harness = makeHarness([]);
+      const allocated: { attemptId: string; operationId: string }[] = [];
+      const assembled: unknown[] = [];
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: (info) => {
+          allocated.push(info);
+        },
+        onPromptAssembled: (info) => {
+          assembled.push(info);
+        },
+      });
+      assert.deepEqual(outcome, { kind: "unavailable", code: "providerModeUnavailable" });
+      assert.equal(allocated.length, 1);
+      assert.ok(/^[0-9a-f]+$/i.test(allocated[0]!.attemptId));
+      assert.ok(/^[0-9a-f]+$/i.test(allocated[0]!.operationId));
+      assert.equal(assembled.length, 0);
+    }
+  );
+
   void it("passes the registry's chain-exhaustion evidence through verbatim, mutating no task state", async () => {
     // Finding 4: the coordinator is a pure pass-through for the structured
     // exhaustion evidence — the stage owner (not the coordinator) pauses the

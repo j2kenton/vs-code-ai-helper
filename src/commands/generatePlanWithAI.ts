@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { formatPlanRevisionProposalVariableV1, listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
+import { readNonEmptyText } from "../utils/fileUtils";
 import { IncompleteTask } from "../types/incompleteTask";
 import {
   generateContextPack,
@@ -549,11 +553,29 @@ async function generatePlanWithAIForResolvedTask(
     workspaceFolderUri
   );
 
+  // Part 6 / item 6: tell the model when this generation is a plan revision
+  // (`TaskProgress.planRevision`, set by `applyPlanRevisionPolicyV1`) —
+  // including the discovered items it must incorporate and the currently
+  // checked items it must never renumber or drop. `plan-final.md` is still
+  // the PRE-revision artifact at this point (untouched since the round back
+  // at `plan` stage started — see planRevisionV1.ts's doc comment), so its
+  // checked items are exactly the ones this revision must preserve.
+  const revisionProgress = await readTaskProgressStrictV1(taskFolderUri);
+  const planRevision = revisionProgress.ok ? revisionProgress.decoded.progress.planRevision : undefined;
+  const priorPlanFinalContent = planRevision
+    ? await readNonEmptyText(getCanonicalImplementationUri(taskFolderUri))
+    : undefined;
+  const planRevisionProposal = formatPlanRevisionProposalVariableV1(
+    planRevision,
+    priorPlanFinalContent ? listCheckedChecklistItemTextsV1(priorPlanFinalContent) : []
+  );
+
   const prompt = await renderPromptTemplate(
     context.extensionUri,
     "create-plan.md",
     {
       contextPack: contextPackContent,
+      planRevisionProposal,
     }
   );
 

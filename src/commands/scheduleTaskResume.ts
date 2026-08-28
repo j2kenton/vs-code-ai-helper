@@ -20,6 +20,7 @@ import {
 } from "../state/schedulingIntentV1";
 import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
+import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -152,7 +153,29 @@ export class TaskActionScheduler implements vscode.Disposable {
     // orphaned row from the SAME task without reconciliation having had a
     // chance to close the stale one first).
     await this.reconcileRoundLedgerOrphans();
+    await this.retryStuckPlanRevisionAdoptions();
     await this.armPendingImplRecoveries();
+  }
+
+  /**
+   * Guaranteed re-entry for a plan revision whose durable adoption record
+   * (`checklistChangeProposals` entry flipping to `"adopted"`) failed to land
+   * after its bounded in-place retry (2026-08-28 review fix, completion
+   * blocker: "finalizePlanRevisionBestEffortV1 ... permits the stage
+   * transition to continue with planRevision and the proposal still in
+   * progress" — no code path is guaranteed to retry it, since neither
+   * production caller of `preparePlanPromotion` runs again once the task has
+   * left `plan`/`plan-review`). Same self-healing slot as the round-ledger
+   * reconciliation above and `armPendingImplRecoveries` below: idempotent,
+   * cheap once nothing is stuck, safe to call every sweep.
+   */
+  private async retryStuckPlanRevisionAdoptions(): Promise<void> {
+    for (const task of this.inventory.getTasks()) {
+      if (task.progress.planRevision === undefined) {
+        continue;
+      }
+      await retryStuckPlanRevisionAdoptionV1(vscode.Uri.file(task.taskFolderPath));
+    }
   }
 
   /**

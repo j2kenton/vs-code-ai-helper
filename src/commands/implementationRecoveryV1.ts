@@ -794,15 +794,38 @@ export async function claimImplRecoveryDispatchV1(
       // continuation was auto-dispatched (a manual rerun opens no such row)
       // or the peeked id resolves to nothing live (stale/expired peek) —
       // same stale-rebinding guard `claimReviewAttempt` and
-      // `claimImplementationRoundLedgerV1` both apply to this same map.
+      // `claimImplementationRoundLedgerV1` both apply to this same map. That
+      // fallback picks the MOST RECENTLY OPENED live row, not the first one
+      // in the array (review follow-up, 2026-08-28: `roundLedger` is
+      // insertion-ordered oldest-first — `upsertRoundLedgerEntryV1` always
+      // appends — so a plain `.find()` would prefer a leftover row the
+      // reconciliation sweep has not yet closed over the fresh row THIS
+      // dispatch actually opened, mis-linking the continuation to a stale,
+      // unrelated round instead of the one it is really continuing).
+      //
+      // Narrowed further (2026-08-28 review follow-up, blocker "continuation
+      // claiming ... still use task-wide heuristics instead of exact dispatch
+      // identity"): also require the candidate row's own `stage` to match
+      // `current.currentStage` — the stage this claim is running for. This
+      // cannot make the fallback exact (an identity-less row is inherently
+      // ambiguous without a real `operationId`/`intentId` to check, which is
+      // the deeper, deliberately-accepted residual documented on
+      // `isRoundLedgerRowProtectedV1`), but it does rule out a live row left
+      // open by an unrelated stage — e.g. a review round still finishing on
+      // this same task while an implementation continuation claims here —
+      // from ever being picked over one that actually belongs to this stage.
       const peekedIntentId = peekPendingAutomationRoundIntentV1(folderUri.fsPath);
       const peekedRow = peekedIntentId ? resolveRoundV1(current, peekedIntentId) : undefined;
       const openRow =
         peekedRow && (peekedRow.state === "open" || peekedRow.state === "scheduled")
           ? peekedRow
-          : (current.roundLedger ?? []).find(
-              (row) => row.state === "open" || row.state === "scheduled"
-            );
+          : [...(current.roundLedger ?? [])]
+              .reverse()
+              .find(
+                (row) =>
+                  (row.state === "open" || row.state === "scheduled") &&
+                  row.stage === current.currentStage
+              );
       // The reused row keeps its own pre-existing `roundId` (an
       // auto-dispatched continuation's own generic row, keyed by its
       // dispatch's `intentId`) — but `claimed.attemptId` is the id every

@@ -559,6 +559,91 @@ export function appendChecklistChangeProposal(
 }
 
 /**
+ * Flip one `"pending"` `checklistChangeProposals` entry to `"discarded"` (wf
+ * "make the stage chat a record of work" Part 6 / item 19's "Discard the
+ * proposal" option). Matches `applyPlanRevisionPolicyV1`'s own
+ * `markProposalRevising` in requiring an exact `at` + `"pending"` match and
+ * never inventing/removing an entry — returns `progress` unchanged when no
+ * such entry exists, so a caller can treat that as "already resolved" rather
+ * than throwing on a race with a concurrent decision answer.
+ */
+export function markChecklistChangeProposalDiscardedV1(
+  progress: TaskProgress,
+  proposalAt: string
+): TaskProgress {
+  const proposals = progress.checklistChangeProposals;
+  if (proposals === undefined) {
+    return progress;
+  }
+  const matched = proposals.some((p) => p.at === proposalAt && p.status === "pending");
+  if (!matched) {
+    return progress;
+  }
+  return {
+    ...progress,
+    checklistChangeProposals: proposals.map((p) =>
+      p.at === proposalAt && p.status === "pending" ? { ...p, status: "discarded" as const } : p
+    ),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/** Optional durable resolution facts recorded onto a `checklistChangeProposals`
+ * entry the moment it is marked `"adopted"` — see
+ * `ChecklistChangeProposalV1.resolvedAt`/`itemCountBefore`/`itemCountAfter`'s
+ * doc comments (2026-08-28 review fix, Part 6 completion blocker: "records
+ * the completion in chat rather than the round ledger"). */
+export interface ChecklistChangeProposalResolutionV1 {
+  readonly resolvedAt: string;
+  readonly itemCountBefore?: number;
+  readonly itemCountAfter?: number;
+}
+
+/**
+ * Re-finalization transform (wf "make the stage chat a record of work" Part
+ * 6 / item 7): flip a `"revising"` `checklistChangeProposals` entry to
+ * `"adopted"` and clear `TaskProgress.planRevision`, in the same patch that
+ * publishes the revised `plan-final.md` (`preparePlanPromotion`'s plan-
+ * revision branch). Matches the other two proposal-status transforms' "no
+ * match, no-op" contract rather than throwing — the promotion path already
+ * treats "no in-flight revision" as nothing to adopt. `resolution`, when
+ * supplied, is stamped onto the SAME entry in the SAME transaction, making
+ * the item-count change a durable fact in `task-progress.json` rather than
+ * something only ever narrated in chat prose.
+ */
+export function markChecklistChangeProposalAdoptedV1(
+  progress: TaskProgress,
+  proposalAt: string,
+  resolution?: ChecklistChangeProposalResolutionV1
+): TaskProgress {
+  const proposals = progress.checklistChangeProposals;
+  const matched = proposals?.some((p) => p.at === proposalAt && p.status === "revising") ?? false;
+  if (!matched) {
+    return progress;
+  }
+  return {
+    ...progress,
+    checklistChangeProposals: proposals!.map((p) =>
+      p.at === proposalAt && p.status === "revising"
+        ? {
+            ...p,
+            status: "adopted" as const,
+            ...(resolution?.resolvedAt !== undefined ? { resolvedAt: resolution.resolvedAt } : {}),
+            ...(resolution?.itemCountBefore !== undefined
+              ? { itemCountBefore: resolution.itemCountBefore }
+              : {}),
+            ...(resolution?.itemCountAfter !== undefined
+              ? { itemCountAfter: resolution.itemCountAfter }
+              : {}),
+          }
+        : p
+    ),
+    planRevision: undefined,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Append one round-outcome classification (wf10 item 4 / Part 4, see
  * `TaskProgress.roundOutcomes`) to the durable trail. Trims from the front
  * once the cap is exceeded — same shape as `appendReviewRejection` and

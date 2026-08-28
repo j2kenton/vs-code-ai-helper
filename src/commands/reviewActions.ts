@@ -75,6 +75,7 @@ import {
   RoundLedgerTerminalStateV1,
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
+import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
 import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   computeDegenerateReviewEpisodeModelIdsV1,
@@ -174,6 +175,8 @@ import {
   resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
   preparePlanPromotion,
+  applyDeferredPlanRevisionAdoptionV1,
+  PlanRevisionAdoptionV1,
 } from "../utils/implementationArtifactResolver";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -212,6 +215,7 @@ import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatVi
 import { stageActionRequirementMessageV1 } from "../utils/stageArtifactRequirementsV1";
 import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
 import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
+import { postChecklistChangeProposedDecisionV1 } from "./planRevisionV1";
 import {
   postReconcilePlanChecklistDecisionV1,
   runAutomaticChecklistReconciliationV1,
@@ -3583,6 +3587,11 @@ async function routeReviewOutcomeV1(
             // that loses the race still materialize plan-final.md for a
             // transition that never happens.
             let publishArtifact: (() => Promise<void>) | undefined;
+            // Set only when publishArtifact's deferred publish() call finds a
+            // plan revision in flight — applied AFTER the transition below
+            // has released its lock (see applyDeferredPlanRevisionAdoptionV1's
+            // doc comment for why it cannot be written any earlier).
+            let deferredPlanRevisionAdoption: PlanRevisionAdoptionV1 | undefined;
             if (next === "impl") {
               const promotion = await preparePlanPromotion(folderUri);
               if (!promotion.ready) {
@@ -3591,7 +3600,20 @@ async function routeReviewOutcomeV1(
                 );
                 return;
               }
-              publishArtifact = promotion.publish;
+              // This closure runs as advanceStageViaNextStageRowV1's
+              // beforeWrite side effect below — i.e. while nextStage.v1's own
+              // patchTaskProgressStrictV1 call already holds withTaskLock for
+              // this task folder. A plan-revision publish that needs its own
+              // durable adoption write must defer it (never write
+              // task-progress.json here — see finalizePlanRevisionBestEffortV1's
+              // doc comment for why that would deadlock or silently clobber
+              // the outer write's own stale-snapshot-derived write).
+              const publish = promotion.publish;
+              publishArtifact = publish
+                ? async () => {
+                    deferredPlanRevisionAdoption = await publish({ deferAdoptionWrite: true });
+                  }
+                : undefined;
             }
             // Re-check pause status immediately before advancing: the AI
             // review call above can run for minutes, during which the user
@@ -3616,6 +3638,14 @@ async function routeReviewOutcomeV1(
             );
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+              if (deferredPlanRevisionAdoption) {
+                // Safe now: advanceStageViaNextStageRowV1's own
+                // patchTaskProgressStrictV1 call has returned, so its
+                // withTaskLock hold on this task folder has been released —
+                // this is a separate, sequential, normally-locked write, not
+                // nested inside the transition above.
+                await applyDeferredPlanRevisionAdoptionV1(folderUri, deferredPlanRevisionAdoption);
+              }
               // Auto-advancing into Implementation must also start the
               // implementation itself (which generates the checklist first
               // when absent). runImplementationWithAI claims the task's
@@ -4573,6 +4603,51 @@ export async function runReviewForFolder(
       taskStage: currentStage,
       rawInput: validatedInput,
       cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
+      // 2026-08-28 review, blocker "coordinator allocation sites still do not
+      // synchronously attach durable round identities before pre-prompt
+      // failures can return": an attempt that fails BEFORE reaching
+      // `onPromptAssembled` (every candidate exhausted, `candidateUnavailable`)
+      // previously left NO record of itself anywhere on this round, not even
+      // at termination — `onAttemptAllocated` fires for every attempt this
+      // coordinator allocates, assembly-eligible or not, strictly before any
+      // such failure branch can return.
+      //
+      // Deliberately IN-MEMORY ONLY here (a synchronous array push, no I/O):
+      // an earlier version of this fix also called
+      // `attachCoordinatorIdentityToRoundBestEffortV1` from this hook — the
+      // same disk attach `onPromptAssembled` below already performs — and was
+      // reverted the same day. `publishOwnershipMatrix.test.ts`'s "paused
+      // while the review was running" case failed reproducibly with that
+      // wired: moving a fire-and-forget `patchTaskProgressStrictV1` write's
+      // start time earlier (before assembly, instead of after) shifts when it
+      // completes relative to a concurrent out-of-band progress write (the
+      // test's deliberate mid-review pause) enough to lose that write's
+      // update. This version carries zero I/O risk instead: the pushed id
+      // reaches disk only through the SAME already-proven path every id in
+      // `observedCoordinatorAttemptIds` already takes — forwarded as
+      // `extraCoordinatorAttemptIds` into whichever `terminalizeRoundV1` call
+      // ends this round (below, and the failure/rejection paths in
+      // `handleReviewOutcomeV1`) — so even an attempt that never reaches
+      // assembly is now recorded on the row once the round ends, closing the
+      // gap without moving any disk write earlier.
+      //
+      // 2026-08-28 review fix, same blocker, DURABLE half: also append this
+      // allocation to the round-identity sidecar log (`roundIdentityLogV1.ts`)
+      // — a file independent of `task-progress.json`, so this write carries
+      // NONE of the timing risk the reverted direct-attach attempts hit (see
+      // that module's own doc comment). Reconciliation's identity-backfill
+      // pass reads this log and completes the row later, so an attempt that
+      // crashes before ever reaching `onPromptAssembled` now has a durable
+      // record of its own allocation, not just an in-memory one.
+      onAttemptAllocated: (info) => {
+        observedCoordinatorAttemptIds.push(info.attemptId);
+        void appendRoundIdentityLogEntryBestEffortV1(folderUri, {
+          roundId: reviewAttemptId,
+          operationId: info.operationId,
+          attemptId: info.attemptId,
+          at: new Date().toISOString(),
+        });
+      },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
         // Part 4 architectural fix (2026-08-27 review follow-up, blocker
@@ -7834,6 +7909,21 @@ async function executeImplementationRun(
     return false;
   }
 
+  // 2026-08-28 review fix, blocker "coordinator allocation sites still do not
+  // synchronously attach durable round identities before pre-prompt failures
+  // can return": the sealed pipeline's `allocatedAttemptIds` (every
+  // coordinator attempt allocated, assembly-eligible or not — see
+  // `AllocatedAttemptIdsV1`) union `assembledPromptAttempts`'s ids, forwarded
+  // to `terminalizeRoundV1` below exactly like the review-round path's
+  // `observedCoordinatorAttemptIds`/`extraCoordinatorAttemptIds`, so a
+  // pre-assembly-failed attempt is recorded on this round's ledger row at its
+  // terminal write even though nothing attached it to disk while live. A
+  // CLI-resolved dispatch never sets either field (no coordinator involved),
+  // so this is empty there, matching prior behavior exactly.
+  const implExtraAttemptIds = Array.from(
+    new Set([...(result.assembledPromptAttempts?.map((a) => a.attemptId) ?? []), ...(result.allocatedAttemptIds ?? [])])
+  );
+
   const implProviderLine = result.providerLabel
     ? `Provider: ${result.providerLabel}${
         result.storedModelId && attributionModelLabel(result.storedModelId)
@@ -8191,15 +8281,11 @@ async function executeImplementationRun(
   if (checklistMutation !== undefined) {
     // Durable trace (Part 6 / item 5) — the run log above already carries the
     // discarded delta; this is what a stage gate or panel reads back without
-    // re-parsing run logs. `status` stays "pending": the two-option
-    // `checklistChangeProposed` decision this is meant to anchor needs a real
-    // "Revise the plan" action to route to (Part 6 items 19-20, not yet
-    // built) — posting it now would offer an option the system already knows
-    // does nothing, which item 10 of this same workflow-defects investigation
-    // says never to do. A plain warning stands in until that command exists.
-    await patchTaskProgressStrictV1(folderUri, (current) =>
+    // re-parsing run logs.
+    const checklistMutationAt = new Date().toISOString();
+    const patchedForMutation = await patchTaskProgressStrictV1(folderUri, (current) =>
       appendChecklistChangeProposal(current, {
-        at: new Date().toISOString(),
+        at: checklistMutationAt,
         roundId: implRoundId,
         stage: postRunReviewStage,
         kind: checklistMutation.kind,
@@ -8213,6 +8299,22 @@ async function executeImplementationRun(
         "never mutates the checklist — the item set was reverted to what it read at the start of this " +
         "round, and any ticks it genuinely reported were still recorded against the reverted set. See the " +
         "run log for what was discarded."
+    );
+    // Both options this decision offers are now real commands
+    // (planRevisionV1.ts), so — unlike when this block was first written —
+    // posting it no longer offers an option the system already knows does
+    // nothing (item 10 of this same workflow-defects investigation).
+    await postChecklistChangeProposedDecisionV1(
+      folderUri.fsPath,
+      folderUri.fsPath,
+      postRunReviewStage,
+      {
+        at: checklistMutationAt,
+        kind: checklistMutation.kind,
+        proposedItems: checklistMutation.addedItems,
+        removedItems: checklistMutation.removedItems,
+      },
+      patchedForMutation?.displayName
     );
   }
 
@@ -8397,6 +8499,7 @@ async function executeImplementationRun(
           { filesChanged: [] },
           {
             taskFolderUri: folderUri,
+            ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             roundOutcomeClassification: {
               classification: gateClassification,
               stage: implBookkeepingStage,
@@ -8546,6 +8649,7 @@ async function executeImplementationRun(
         { filesChanged: [] },
         {
           taskFolderUri: folderUri,
+          ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           extraPatch: (current) => {
             const withStreak = setZeroChangeImplRounds(
               current,
@@ -8934,6 +9038,7 @@ async function executeImplementationRun(
           { filesChanged: [...result.filesChanged] },
           {
             taskFolderUri: folderUri,
+            ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             extraPatch: (current) => setZeroChangeImplRounds(current, undefined),
             roundOutcomeClassification: {
               classification: "edits-produced",
@@ -8977,6 +9082,7 @@ async function executeImplementationRun(
         result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
         {
           taskFolderUri: folderUri,
+          ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           roundOutcomeClassification: {
             classification: noEditsClassification,
             attemptId: implRoundId,
@@ -9721,6 +9827,7 @@ async function executeImplementationRun(
       result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
       {
         taskFolderUri: folderUri,
+        ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
         roundOutcomeClassification: {
           classification: "cancelled",
           attemptId: implRoundId,
@@ -11276,6 +11383,23 @@ export async function resumeReviewInteractionV1(
     taskStage: currentStage,
     resumeIdempotencyId,
     cancellationToken,
+    // See `runReviewForFolder`'s matching `onAttemptAllocated` comment: an
+    // in-memory-only (zero-I/O) collection of every attempt id, including one
+    // that fails before `onPromptAssembled` ever fires for it, reaching disk
+    // only through the same already-proven `extraCoordinatorAttemptIds` →
+    // `terminalizeRoundV1` forwarding every id here already takes — AND (see
+    // that same call site's 2026-08-28 review fix) also appended to the
+    // round-identity sidecar log for allocation-time durability independent
+    // of `task-progress.json`.
+    onAttemptAllocated: (info) => {
+      observedCoordinatorAttemptIds.push(info.attemptId);
+      void appendRoundIdentityLogEntryBestEffortV1(taskFolderUri, {
+        roundId: reviewAttemptId,
+        operationId: info.operationId,
+        attemptId: info.attemptId,
+        at: new Date().toISOString(),
+      });
+    },
     onPromptAssembled: (info) => {
       observedCoordinatorAttemptIds.push(info.attemptId);
       // Part 4 architectural fix, same as `runReviewForFolder`'s initial

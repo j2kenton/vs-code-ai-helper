@@ -5,9 +5,11 @@
  */
 import * as vscode from "vscode";
 import {
+  ChecklistChangeProposalV1,
   IMPLEMENTATION_FILENAME,
   IMPLEMENTATION_SUMMARY_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
+  PlanRevisionStateV1,
   TaskStage,
 } from "../types/taskProgress";
 import { readNonEmptyText, resolveCurrentPlanUri, statIfExists, withPlanFileWriteLockV1 } from "./fileUtils";
@@ -28,6 +30,7 @@ import {
   hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
   hasPlanItemChecklistClaimV1,
+  mergeChecklistProgressV1,
   splitSummaryAtEchoV1,
 } from "./implementationChecklist";
 import { readTextIfExists } from "./fileUtils";
@@ -37,6 +40,11 @@ import {
   sectionHasContentV1,
   walkLinesV1,
 } from "./markdownStructure";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { markChecklistChangeProposalAdoptedV1 } from "./taskProgressTransforms";
+import { recordChecklistRevisionOnRoundLedgerV1 } from "./roundLedgerV1";
+import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
 
 export interface ResolvedImplementationArtifact {
   /** The URI to use for reading/opening */
@@ -1036,9 +1044,28 @@ export async function firstUnmetStagePrerequisiteV1(
   return undefined;
 }
 
+/**
+ * Computed but not-yet-durably-recorded plan-revision adoption facts,
+ * returned by `publish({ deferAdoptionWrite: true })` so a caller that
+ * cannot safely write task-progress.json at that moment (running inside an
+ * outer transaction's `beforeWrite`) can apply them afterward via
+ * {@link applyDeferredPlanRevisionAdoptionV1}.
+ */
+export interface PlanRevisionAdoptionV1 {
+  readonly proposalAt: string;
+  readonly stage: TaskStage;
+  readonly oldTotal: number | undefined;
+  readonly newTotal: number | undefined;
+}
+
 /** Result of {@link preparePlanPromotion}. */
 export type PlanPromotion =
-  | { ready: true; publish?: () => Promise<void> }
+  | {
+      ready: true;
+      publish?: (options?: {
+        deferAdoptionWrite?: boolean;
+      }) => Promise<PlanRevisionAdoptionV1 | undefined>;
+    }
   | { ready: false };
 
 /**
@@ -1064,11 +1091,295 @@ export type PlanPromotion =
  * attempt that loses the race still materialize plan-final.md for a stage
  * transition that never happens.
  */
+/**
+ * Filename for the plan-revision journal snapshot (2026-08-28 review fix,
+ * Part 6 completion blocker: "Step 19 still persists ... instead of ...
+ * snapshot plan-final.md to the revert journal and record a journaledPlanRef
+ * when revision begins"). A revision-owned copy of `plan-final.md`, distinct
+ * from the shared `_prev` backup slot (`artifactBackups.ts`) any other
+ * artifact write could otherwise reuse/clobber while the revision is in
+ * flight — a single fixed name is safe because `applyPlanRevisionPolicyV1`
+ * refuses a second revision while one is already `"revising"`, so at most one
+ * of these can ever be meaningful at a time.
+ */
+export const PLAN_REVISION_JOURNAL_FILENAME = "plan-final.revision-journal.md";
+
+function getPlanRevisionJournalUri(taskFolderUri: vscode.Uri): vscode.Uri {
+  return vscode.Uri.joinPath(taskFolderUri, PLAN_REVISION_JOURNAL_FILENAME);
+}
+
+/**
+ * Snapshot the current canonical `plan-final.md` into the revision journal,
+ * the moment "Revise the plan" runs — BEFORE `applyPlanRevisionPolicyV1`
+ * writes `TaskProgress.planRevision`, so the returned filename can be stored
+ * on that same record as `journaledPlanRef`. Returns `undefined` (nothing to
+ * journal, not a failure) only when no canonical `plan-final.md` exists yet —
+ * the round that raised the proposal necessarily mutated one, so this is
+ * expected only in tests/edge cases that skip that precondition.
+ */
+export async function snapshotPlanForRevisionV1(
+  taskFolderUri: vscode.Uri
+): Promise<string | undefined> {
+  const canonicalUri = getCanonicalImplementationUri(taskFolderUri);
+  const content = await readNonEmptyText(canonicalUri);
+  if (content === undefined) {
+    return undefined;
+  }
+  await vscode.workspace.fs.writeFile(
+    getPlanRevisionJournalUri(taskFolderUri),
+    new TextEncoder().encode(content)
+  );
+  return PLAN_REVISION_JOURNAL_FILENAME;
+}
+
+/** Best-effort cleanup of the revision journal once its revision has been
+ * durably adopted — never blocks or fails the transition it follows. */
+async function deletePlanRevisionJournalBestEffortV1(taskFolderUri: vscode.Uri): Promise<void> {
+  try {
+    await vscode.workspace.fs.delete(getPlanRevisionJournalUri(taskFolderUri));
+  } catch {
+    // Best-effort — a leftover journal file is harmless: the next revision
+    // (if any) overwrites this same fixed filename fresh.
+  }
+}
+
+/**
+ * Trace for a plan revision's re-finalization (wf "make the stage chat a
+ * record of work" Part 6 / item 7): marks the originating
+ * `checklistChangeProposals` entry `"adopted"` — stamping `resolvedAt` and
+ * the item-count change onto that SAME durable record, in the SAME
+ * `patchTaskProgressStrictV1` transaction as the status flip (2026-08-28
+ * review fix, completion blocker: "records the completion in chat rather
+ * than the round ledger") — then appends one chat line as a best-effort UX
+ * echo of that already-durable fact. Runs AFTER `preparePlanPromotion.publish`'s
+ * artifact write has already succeeded, so this never rolls back the
+ * artifact write over a failure recording that it landed.
+ *
+ * Exactly-once / re-entry: when the `patchTaskProgressStrictV1` write itself
+ * fails, the proposal is left `"revising"` and the chat line says so
+ * explicitly instead of falsely claiming the durable record landed. The
+ * journal snapshot (`journaledPlanRef`) is deleted only once adoption
+ * actually succeeds, so a retry after a failed write still has its frozen
+ * pre-revision source available. Re-entry is NOT left to chance: both
+ * production call sites (`reviewActions.ts`'s auto-advance and its manual
+ * "Complete Stage & Move On" counterpart) only ever run this once, at the
+ * moment the task leaves `plan`/`plan-review` — once the stage has moved to
+ * `impl`, neither call recurs for this same transition, so a proposal stuck
+ * `"revising"` after 3 failed attempts would otherwise stay stuck forever
+ * (2026-08-28 review fix, completion blocker: "permits the stage transition
+ * to continue with planRevision and the proposal still in progress" — no
+ * code path guaranteed a retry). `retryStuckPlanRevisionAdoptionV1` below is
+ * the guaranteed re-entry point: called from the same periodic reconciliation
+ * sweep that already self-heals `roundLedger` orphans and owed
+ * `implRecovery` continuations (`scheduleTaskResume.ts`), it re-derives
+ * `oldTotal`/`newTotal` from disk (the plan-final.md write already landed;
+ * only the adoption record did not) and calls this function again — a no-op
+ * once the proposal actually reads `"adopted"`.
+ *
+ * Callers must never invoke this while already holding `withTaskLock` for
+ * `taskFolderUri` (e.g. from inside a `patchTaskProgressStrictV1` `beforeWrite`
+ * side effect) — `withTaskLock` queues on a single per-tasks-root local
+ * mutation queue regardless of which lock file backs it (see its doc
+ * comment), so a nested call would await the outer call's own completion,
+ * which would itself be waiting on this function to return: a self-deadlock.
+ * Worse, even skipping the lock in that position would not help: the outer
+ * call's `patched` value is computed from a snapshot of `current` taken
+ * BEFORE `beforeWrite` runs, so the outer call's own write — which happens
+ * immediately after `beforeWrite` returns — would silently overwrite
+ * whatever this function just wrote, clobbering the adoption record with the
+ * stale pre-`beforeWrite` `planRevision`/`checklistChangeProposals` (2026-08-28
+ * review fix, new completion blocker: "Automated plan-revision advancement
+ * deadlocks by reacquiring the non-reentrant task lock from the next-stage
+ * beforeWrite callback"). The score-based auto-advance caller
+ * (`reviewActions.ts`) therefore never calls this from inside `beforeWrite` —
+ * it defers via `publish({ deferAdoptionWrite: true })`, which returns the
+ * computed counts instead of writing them, and applies them through
+ * `applyDeferredPlanRevisionAdoptionV1` only AFTER the outer stage-transition
+ * write has released its lock — a separate, sequential, normally-locked call.
+ *
+ * The whole body below (retry loop, dedupe read, and echo append) runs under
+ * `withPlanFileWriteLockV1`, keyed by a task-scoped SYNTHETIC uri distinct
+ * from `canonicalUri` (2026-08-28 review fix, narrowing the completion
+ * blocker further: "the read-before-append dedupe is still vulnerable to two
+ * concurrent callers both reading no echo and then appending"). Two real
+ * callers can race for the SAME task: `applyDeferredPlanRevisionAdoptionV1`
+ * (run immediately after a stage transition lands) and
+ * `retryStuckPlanRevisionAdoptionV1` (the periodic reconciliation sweep) can
+ * both observe a proposal still `"revising"` and both reach this function
+ * before either has written anything — without a lock spanning the entire
+ * read-adopt-echo sequence, both can independently read "no echo yet" and
+ * both append one. A DIFFERENT key than `canonicalUri` is required, not the
+ * same one: the immediate (non-deferred) call path already runs this
+ * function from INSIDE `withPlanFileWriteLockV1(canonicalUri, ...)`
+ * (`preparePlanPromotion`'s `publish` closure) — re-acquiring that same key
+ * here would await its own already-in-flight outer task, a self-deadlock
+ * identical in kind to the `withTaskLock` reentrancy hazard documented above.
+ * The synthetic key still serializes that immediate path against the two
+ * deferred/retry callers (which hold no lock when they call this), which is
+ * the actual race being closed.
+ */
+function getPlanRevisionFinalizeLockUri(taskFolderUri: vscode.Uri): vscode.Uri {
+  return vscode.Uri.joinPath(taskFolderUri, ".plan-revision-finalize.lock");
+}
+
+async function finalizePlanRevisionBestEffortV1(
+  taskFolderUri: vscode.Uri,
+  planRevision: PlanRevisionStateV1,
+  stage: TaskStage,
+  oldTotal: number | undefined,
+  newTotal: number | undefined
+): Promise<void> {
+  await withPlanFileWriteLockV1(getPlanRevisionFinalizeLockUri(taskFolderUri), () =>
+    finalizePlanRevisionLockedV1(taskFolderUri, planRevision, stage, oldTotal, newTotal)
+  );
+}
+
+async function finalizePlanRevisionLockedV1(
+  taskFolderUri: vscode.Uri,
+  planRevision: PlanRevisionStateV1,
+  stage: TaskStage,
+  oldTotal: number | undefined,
+  newTotal: number | undefined
+): Promise<void> {
+  const resolvedAt = new Date().toISOString();
+  // Bounded in-place retry rather than relying on some later, unguaranteed
+  // re-entry into this function: nothing else in the workflow is certain to
+  // call `preparePlanPromotion` for this task again once the stage transition
+  // this is part of has already advanced past `plan`/`plan-review`. A short
+  // retry absorbs a transient read/write hiccup; a genuinely broken
+  // task-progress.json (a decode failure) will keep failing regardless, and
+  // is reported honestly below rather than promised a retry that cannot help.
+  const ADOPT_ATTEMPTS = 3;
+  let adopted = false;
+  // The proposal's own round-ledger row identity (`ChecklistChangeProposalV1.roundId`
+  // — the round that mutated the checklist and was reverted), read back off
+  // whichever attempt's write actually landed. Used below to correlate the
+  // completion echo to a REAL `RoundLedgerEntryV1.roundId` (matching
+  // `ChatMessage.roundId`'s documented contract) and to dedupe the append
+  // itself — see the review fix note below this loop.
+  let correlationRoundId: string | undefined;
+  // The proposal record actually read back as "adopted" — which may belong
+  // to a DIFFERENT caller's write than this loop's own (see the doc comment
+  // immediately below) — captured so the round-ledger annotation below uses
+  // the durable record's own `resolvedAt`/item counts, never this call's own
+  // local `resolvedAt`/`oldTotal`/`newTotal`, which would be wrong whenever
+  // some OTHER caller's write is the one that actually landed first.
+  let adoptedProposal: ChecklistChangeProposalV1 | undefined;
+  for (let attempt = 0; attempt < ADOPT_ATTEMPTS && !adopted; attempt++) {
+    try {
+      const patched = await patchTaskProgressStrictV1(taskFolderUri, (current) =>
+        markChecklistChangeProposalAdoptedV1(current, planRevision.proposalAt, {
+          resolvedAt,
+          ...(oldTotal !== undefined ? { itemCountBefore: oldTotal } : {}),
+          ...(newTotal !== undefined ? { itemCountAfter: newTotal } : {}),
+        })
+      );
+      // `patched !== undefined` alone does NOT prove this write actually
+      // adopted the proposal (2026-08-28 review fix, completion blocker:
+      // "does not prove the proposal transform matched"): `update` returning
+      // its own unchanged input on a stale/non-revising proposal, and
+      // `patchTaskProgressStrictV1`'s own no-op short-circuit
+      // (`unversionedEncoded === currentEncoded`), BOTH resolve to `current`
+      // — a defined object — indistinguishable by presence alone from a real
+      // write. Only a durable record showing this exact proposal as
+      // `"adopted"` counts as success; any OTHER resolvedAt on that entry
+      // means it was already adopted by a prior attempt/call, which is still
+      // success (exactly-once from the durable record's point of view, even
+      // if not from this loop's).
+      const proposal = patched?.checklistChangeProposals?.find((p) => p.at === planRevision.proposalAt);
+      adopted = proposal?.status === "adopted";
+      if (adopted) {
+        correlationRoundId = proposal?.roundId;
+        adoptedProposal = proposal;
+      }
+    } catch {
+      // adopted stays false; loop retries (or falls through) — see doc
+      // comment above.
+    }
+  }
+  if (adopted && planRevision.journaledPlanRef) {
+    await deletePlanRevisionJournalBestEffortV1(taskFolderUri);
+  }
+  if (adopted && adoptedProposal && adoptedProposal.resolvedAt) {
+    // Part 6 completion blocker, 2026-08-28 review fix: "the implementation
+    // does not append or update a round-ledger event for 'Plan revised: N →
+    // M'" — the round ledger, not only the proposal and the chat echo below,
+    // now carries this completion too. See `recordChecklistRevisionOnRoundLedgerV1`'s
+    // doc comment for why this annotates the existing mutating round's row
+    // rather than opening a new one.
+    await recordChecklistRevisionOnRoundLedgerV1({
+      taskFolderUri,
+      roundId: adoptedProposal.roundId,
+      revision: {
+        resolvedAt: adoptedProposal.resolvedAt,
+        ...(adoptedProposal.itemCountBefore !== undefined
+          ? { itemCountBefore: adoptedProposal.itemCountBefore }
+          : {}),
+        ...(adoptedProposal.itemCountAfter !== undefined
+          ? { itemCountAfter: adoptedProposal.itemCountAfter }
+          : {}),
+      },
+    });
+  }
+  try {
+    // Dedupe (2026-08-28 review fix, narrowed completion blocker: "concurrent/
+    // repeated finalization can still produce more than one chat projection
+    // because the chat append is outside the adoption transaction"): TWO
+    // independent callers can both observe `adopted === true` for the SAME
+    // proposal — the durable write is exactly-once by design (a second
+    // caller's own no-op write still reads the FIRST caller's already-
+    // "adopted" entry as success, per the doc comment above) — but nothing
+    // previously stopped both from also appending their own echo of it. Skip
+    // the append if one already exists for this exact completion.
+    let alreadyEchoed = false;
+    if (correlationRoundId) {
+      const existing = await readChatHistory(taskFolderUri.fsPath, taskFolderUri.fsPath);
+      alreadyEchoed = existing.some(
+        (m) => m.kind === "activity" && m.roundId === correlationRoundId && m.text.startsWith("Plan revised")
+      );
+    }
+    if (!alreadyEchoed) {
+      await appendChatMessageV1(
+        taskFolderUri.fsPath,
+        {
+          role: "assistant",
+          text: adopted
+            ? `Plan revised: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items — Implementation and later reviews ` +
+              "re-run."
+            : `Plan revised on disk: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items, but the durable adoption ` +
+              "record could not be written after 3 attempts — the proposal may still read as in-progress. " +
+              "task-progress.json may need manual repair.",
+          stage,
+          at: resolvedAt,
+          kind: "activity",
+          ...(correlationRoundId ? { roundId: correlationRoundId } : {}),
+        },
+        taskFolderUri.fsPath
+      );
+    }
+  } catch {
+    // Best-effort — never blocks the transition this promotion is part of.
+  }
+}
+
 export async function preparePlanPromotion(
   taskFolderUri: vscode.Uri
 ): Promise<PlanPromotion> {
   const resolved = await resolveImplementationArtifact(taskFolderUri);
-  if (resolved.isCanonical) {
+
+  // Part 6 / item 7: an in-flight plan revision (`applyPlanRevisionPolicyV1`)
+  // must re-publish plan-final.md even though the canonical artifact already
+  // exists — normally this promotion is a one-time seed (nothing to do once
+  // canonical exists), but a revision's whole point is replacing that seed
+  // with the freshly-revised plan.md, ticks re-merged from the pre-revision
+  // copy. Read once here, before the CAS-gated publish() closure below is
+  // even constructed, so a caller that never calls publish() (a losing CAS
+  // attempt) never touches task-progress.json either.
+  const progressRead = await readTaskProgressStrictV1(taskFolderUri);
+  const planRevision = progressRead.ok ? progressRead.decoded.progress.planRevision : undefined;
+  const revisionStage = progressRead.ok ? progressRead.decoded.progress.currentStage : "plan";
+
+  if (resolved.isCanonical && planRevision === undefined) {
     return { ready: true };
   }
 
@@ -1080,22 +1391,148 @@ export async function preparePlanPromotion(
 
   return {
     ready: true,
-    publish: async () => {
+    publish: async (options) => {
+      const deferAdoptionWrite = options?.deferAdoptionWrite ?? false;
       const canonicalUri = getCanonicalImplementationUri(taskFolderUri);
+      let deferredAdoption: PlanRevisionAdoptionV1 | undefined;
       // Same per-uri lock and in-lock existence re-check as
       // materializeCanonicalIfNeeded above: a concurrent publish() or
       // materialize call for this uri may have already created the file
       // while this call was queued, and must not be silently overwritten.
       await withPlanFileWriteLockV1(canonicalUri, async () => {
-        if (await statIfExists(canonicalUri)) {
+        const canonicalContent = await readNonEmptyText(canonicalUri);
+        if (canonicalContent !== undefined && planRevision === undefined) {
+          // Ordinary one-time seed: canonical already exists and this is not
+          // a revision — nothing to do (original behavior).
           return;
         }
+        // Revision re-finalization merge source: prefer the revision-owned
+        // journal snapshot (`snapshotPlanForRevisionV1`, taken BEFORE this
+        // task's stage ever left `plan`/`plan-review`) over the live
+        // canonical file — closing the gap where the live file was the only
+        // source of prior ticks (2026-08-28 review fix, completion blocker:
+        // "leaves the mutable canonical file as the only source until
+        // promotion"). Falls back to the live canonical read when no journal
+        // was taken (defensive; matches the pre-journal behavior exactly)
+        // or the journal file is unexpectedly missing.
+        let priorContent = canonicalContent;
+        if (planRevision?.journaledPlanRef !== undefined) {
+          const journaled = await readNonEmptyText(getPlanRevisionJournalUri(taskFolderUri));
+          if (journaled !== undefined) {
+            priorContent = journaled;
+          }
+        }
+        // Revision re-finalization (or the ordinary first-seed case, where
+        // priorContent is undefined and the merge below is a no-op):
+        // re-merge whatever ticks the pre-revision plan-final.md carried into
+        // the freshly-revised plan.md, so items the revision left unchanged
+        // keep their checked state (item 7's explicit requirement).
+        const merged = priorContent !== undefined ? mergeChecklistProgressV1(planContent, priorContent) : undefined;
+        const finalContent = merged?.kind === "merged" ? merged.content : planContent;
         await backupArtifactBeforeWrite(canonicalUri);
         await vscode.workspace.fs.writeFile(
           canonicalUri,
-          new TextEncoder().encode(planContent)
+          new TextEncoder().encode(finalContent)
         );
+        if (planRevision !== undefined) {
+          const oldTotal = priorContent !== undefined ? countChecklistProgressV1(priorContent)?.total : undefined;
+          const newTotal = countChecklistProgressV1(finalContent)?.total;
+          if (deferAdoptionWrite) {
+            // Never write task-progress.json here — see
+            // finalizePlanRevisionBestEffortV1's doc comment. The journal is
+            // deliberately left in place too: it is deleted only once the
+            // deferred adoption write actually lands, so a retry after a
+            // failed deferred write still has its frozen pre-revision source.
+            deferredAdoption = { proposalAt: planRevision.proposalAt, stage: revisionStage, oldTotal, newTotal };
+          } else {
+            await finalizePlanRevisionBestEffortV1(taskFolderUri, planRevision, revisionStage, oldTotal, newTotal);
+          }
+        }
       });
+      return deferredAdoption;
     },
   };
+}
+
+/**
+ * Apply a `publish({ deferAdoptionWrite: true })` result once it is safe to
+ * write task-progress.json again — i.e. after the outer stage-transition
+ * `patchTaskProgressStrictV1` call that ran `publish` from its `beforeWrite`
+ * has fully released `withTaskLock` (2026-08-28 review fix, new completion
+ * blocker: see `finalizePlanRevisionBestEffortV1`'s doc comment for why the
+ * write cannot happen any earlier). Re-reads progress fresh and only acts
+ * when the SAME proposal is still the one in flight — a defensive check
+ * against the (expected-rare) case where something else has already
+ * resolved or superseded it between `publish()` returning and this running.
+ */
+export async function applyDeferredPlanRevisionAdoptionV1(
+  taskFolderUri: vscode.Uri,
+  adoption: PlanRevisionAdoptionV1
+): Promise<void> {
+  const progressRead = await readTaskProgressStrictV1(taskFolderUri);
+  if (!progressRead.ok) {
+    return;
+  }
+  const planRevision = progressRead.decoded.progress.planRevision;
+  if (!planRevision || planRevision.proposalAt !== adoption.proposalAt) {
+    return;
+  }
+  await finalizePlanRevisionBestEffortV1(
+    taskFolderUri,
+    planRevision,
+    progressRead.decoded.progress.currentStage,
+    adoption.oldTotal,
+    adoption.newTotal
+  );
+}
+
+/**
+ * Guaranteed re-entry for a plan revision whose durable adoption record
+ * failed to land (`finalizePlanRevisionBestEffortV1`'s bounded 3-attempt
+ * retry exhausted, or the deferred write's own re-validation found nothing
+ * to do because it raced something else). See that function's doc comment:
+ * neither production caller of `preparePlanPromotion` runs again once the
+ * task has moved past `plan`/`plan-review`, so without this, a proposal
+ * stuck `"revising"` would stay stuck for the life of the task — permanently
+ * blocking any FUTURE revision too (`applyPlanRevisionPolicyV1` refuses a
+ * second revision while one is already `"revising"`).
+ *
+ * Meant to be called from the same periodic reconciliation sweep that already
+ * self-heals `roundLedger` orphans and re-arms owed `implRecovery`
+ * continuations (`scheduleTaskResume.ts`) — cheap and a true no-op whenever
+ * nothing is stuck (`planRevision` unset, or its proposal already resolved
+ * one way or the other). Re-derives `oldTotal`/`newTotal` from disk rather
+ * than persisting them: the plan-final.md write always lands before the
+ * adoption record is even attempted (`preparePlanPromotion`'s `publish`
+ * closure writes the file, THEN computes the deferred/immediate adoption), so
+ * by the time this runs the journal (pre-revision) and canonical (post-
+ * revision) content are both already the right sources to recount from.
+ */
+export async function retryStuckPlanRevisionAdoptionV1(taskFolderUri: vscode.Uri): Promise<void> {
+  const progressRead = await readTaskProgressStrictV1(taskFolderUri);
+  if (!progressRead.ok) {
+    return;
+  }
+  const { progress } = progressRead.decoded;
+  const planRevision = progress.planRevision;
+  if (!planRevision) {
+    return;
+  }
+  const stillRevising = progress.checklistChangeProposals?.some(
+    (p) => p.at === planRevision.proposalAt && p.status === "revising"
+  );
+  if (!stillRevising) {
+    // Either already adopted (a prior attempt's write landed after all — the
+    // stale `planRevision` on this read is about to be cleared by that same
+    // write) or discarded; nothing for this sweep to do.
+    return;
+  }
+  const canonicalContent = await readNonEmptyText(getCanonicalImplementationUri(taskFolderUri));
+  const newTotal = canonicalContent !== undefined ? countChecklistProgressV1(canonicalContent)?.total : undefined;
+  let oldTotal: number | undefined;
+  if (planRevision.journaledPlanRef !== undefined) {
+    const journaled = await readNonEmptyText(getPlanRevisionJournalUri(taskFolderUri));
+    oldTotal = journaled !== undefined ? countChecklistProgressV1(journaled)?.total : undefined;
+  }
+  await finalizePlanRevisionBestEffortV1(taskFolderUri, planRevision, progress.currentStage, oldTotal, newTotal);
 }

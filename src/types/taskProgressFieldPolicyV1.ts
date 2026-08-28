@@ -57,13 +57,30 @@ export interface ReopenPolicyInputV1 {
   readonly selectedStage: TaskStage;
 }
 
+/** Input to `applyPlanRevisionPolicyV1` (wf "make the stage chat a record of
+ * work" Part 6 / items 4-5). */
+export interface PlanRevisionPolicyInputV1 {
+  /** Coordinator clock (ISO timestamp) applied to updatedAt and planRevision.startedAt. */
+  readonly now: string;
+  /** The `checklistChangeProposals` entry (`at`) this revision resolves — must currently be `"pending"`. */
+  readonly proposalAt: string;
+  /** Plain-language reason surfaced to the plan-stage prompt once `{{planRevisionProposal}}` is built (Part 6 item 6, not yet built). */
+  readonly reason: string;
+  /** The revision-owned journal snapshot's filename (`snapshotPlanForRevisionV1`,
+   * `implementationArtifactResolver.ts`), taken by the caller BEFORE this
+   * policy runs — see `PlanRevisionStateV1.journaledPlanRef`'s doc comment.
+   * Omitted only when there was no pre-existing `plan-final.md` to snapshot. */
+  readonly journaledPlanRef?: string;
+}
+
 export type TaskProgressPolicyErrorCodeV1 =
   | "invalidTimestamp"
   | "statusNotActive"
   | "statusNotCompleted"
   | "noNextStage"
   | "invalidTargetStage"
-  | "invalidSelectedStage";
+  | "invalidSelectedStage"
+  | "checklistChangeProposalNotPending";
 
 export type TaskProgressPolicyResultV1 =
   | { readonly ok: true; readonly progress: PersistedTaskProgressV1 }

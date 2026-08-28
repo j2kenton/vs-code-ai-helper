@@ -604,6 +604,24 @@ void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs provid
     assert.deepEqual(result.assembledPrompt, secondary);
     assert.deepEqual(result.assembledPromptAttempts, [primary, secondary]);
   });
+
+  // Review fix, 2026-08-28: `allocatedAttemptIds` is a strict superset of
+  // `assembledPromptAttempts`'s ids — it must survive on a cancelled outcome
+  // even when it names an attempt (a pre-assembly failure) that has no
+  // corresponding `assembledPromptAttempts` entry at all.
+  void it("carries allocatedAttemptIds through on a cancelled outcome, including an attempt with no assembled prompt", () => {
+    const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
+    const assembled = { attemptId: "attempt-assembled", prompt: "text", promptSha256: "aaa" };
+    const result = describeEditActionOutcomeFailureV1(
+      outcome,
+      "copilot-lm",
+      assembled,
+      [assembled],
+      ["attempt-pre-assembly-failure", "attempt-assembled"]
+    );
+    assert.equal(result.status, "cancelled");
+    assert.deepEqual(result.allocatedAttemptIds, ["attempt-pre-assembly-failure", "attempt-assembled"]);
+  });
 });
 
 // Workflow-robustness Part 5 item 5: a successful sealed edit only ever

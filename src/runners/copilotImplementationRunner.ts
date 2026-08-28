@@ -583,6 +583,23 @@ export interface ImplementationRunResult {
     readonly prompt: string;
     readonly promptSha256: string;
   }[];
+  /**
+   * EVERY coordinator attempt the sealed preflight allocated for this round,
+   * including one that failed before ever reaching prompt assembly — a
+   * superset of `assembledPromptAttempts`'s ids (2026-08-28 review fix,
+   * blocker "coordinator allocation sites still do not synchronously attach
+   * durable round identities before pre-prompt failures can return":
+   * `runEditActionV1.ts` previously omitted `onAttemptAllocated` entirely, so
+   * a pre-assembly-failed attempt left no trace anywhere on this round).
+   * Captured the same safe, zero-I/O way the review-round path already does
+   * (`observedCoordinatorAttemptIds`, `reviewActions.ts`) — a synchronous
+   * array push with no disk write — then forwarded into
+   * `terminalizeRoundV1`'s `extraAttemptIds` once the round ends, rather than
+   * attaching to disk at allocation time (the approach tried and reverted
+   * for this same reason: see `roundLedgerV1.ts`'s doc comment on the
+   * `publishOwnershipMatrix.test.ts` regression).
+   */
+  allocatedAttemptIds?: readonly string[];
 }
 
 /**

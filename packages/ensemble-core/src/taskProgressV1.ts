@@ -199,6 +199,13 @@ export interface TaskProgress {
    * first).
    */
   roundLedger?: RoundLedgerEntryV1[];
+  /** Durable record of a round that tried to add, remove, or renumber a
+   * checklist item in `plan-final.md` (mirror of `src/types/taskProgress.ts`).
+   * Capped at MAX_CHECKLIST_CHANGE_PROPOSALS (oldest dropped first). */
+  checklistChangeProposals?: ChecklistChangeProposalV1[];
+  /** Set while a checklist-mutation proposal is being turned into an actual
+   * `plan-final.md` revision (mirror of `src/types/taskProgress.ts`). */
+  planRevision?: PlanRevisionStateV1;
   /** Set when automated review iteration needs a human decision. */
   escalation?: TaskEscalation;
   /** Durable record of every escalation Fast Forward rode through rather than
@@ -428,6 +435,61 @@ export interface BlockerSupersessionRecordV1 {
 
 /** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
 export const MAX_BLOCKER_SUPERSESSIONS = 50;
+
+/** One row of `TaskProgress.checklistChangeProposals` (mirror of
+ * `src/types/taskProgress.ts`). */
+export interface ChecklistChangeProposalV1 {
+  /** ISO timestamp the mutation was caught and reverted. */
+  at: string;
+  /** This round's own round-ledger row identity. */
+  roundId: string;
+  /** The stage the round was dispatched at when it mutated the checklist. */
+  stage: TaskStage;
+  /** How the item set changed, before it was reverted. */
+  kind: "added" | "removed" | "renumbered";
+  /** The item texts the round tried to add (for `"added"`/`"renumbered"`). */
+  proposedItems: readonly string[];
+  /** The item texts the round's edit dropped (for `"removed"`/`"renumbered"`). */
+  removedItems: readonly string[];
+  /** `"pending"` until a `checklistChangeProposed` decision is answered;
+   * `"revising"` while a chosen plan revision is in flight; `"discarded"` if
+   * the user declined the proposal; `"adopted"` once a revision
+   * incorporating it lands. */
+  status: "pending" | "revising" | "discarded" | "adopted";
+  /** ISO timestamp the entry was marked `"adopted"` (mirror of
+   * `src/types/taskProgress.ts`). */
+  resolvedAt?: string;
+  /** Checklist total immediately before this revision's re-finalization
+   * merge (mirror of `src/types/taskProgress.ts`). */
+  itemCountBefore?: number;
+  /** Checklist total immediately after this revision's re-finalization
+   * merge (mirror of `src/types/taskProgress.ts`). */
+  itemCountAfter?: number;
+}
+
+/** Cap on `TaskProgress.checklistChangeProposals` length (oldest entries dropped first). */
+export const MAX_CHECKLIST_CHANGE_PROPOSALS = 50;
+
+/** `TaskProgress.planRevision` (mirror of `src/types/taskProgress.ts`) — set
+ * by `applyPlanRevisionPolicyV1` when a caught checklist-mutation proposal is
+ * turned into an actual plan revision. */
+export interface PlanRevisionStateV1 {
+  /** The `checklistChangeProposals` entry (`at`) this revision resolves. */
+  readonly proposalAt: string;
+  /** ISO timestamp the revision transition itself ran (coordinator clock). */
+  readonly startedAt: string;
+  /** The stage the round was dispatched at when it produced the proposal. */
+  readonly stage: TaskStage;
+  /** Item texts the round tried to add, carried through unchanged from the proposal. */
+  readonly discardedItems: readonly string[];
+  /** Item texts the round's edit tried to drop, carried through unchanged. */
+  readonly removedItems: readonly string[];
+  /** Plain-language reason a revision is needed, surfaced to the plan-stage prompt. */
+  readonly reason: string;
+  /** The revision-owned journal snapshot's filename, relative to the task
+   * folder (mirror of `src/types/taskProgress.ts`). */
+  readonly journaledPlanRef?: string;
+}
 
 /**
  * Fixed-vocabulary outcome of a completed round (mirror of

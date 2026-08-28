@@ -15,7 +15,13 @@ out-test/
 # swept it into a commit. Same class as the /implementation.md and
 # /plan-final.md entries below: a stray write from a CLI run inventing a path
 # outside the project's vocabulary. The real output dirs are dist/ and out/.
-.test-out/
+# Widened from `.test-out/` to the glob on 2026-08-28: the exact-name rule
+# caught nothing once rounds started inventing suffixed variants. Found
+# .test-out-planrev/ (914 files) and .test-out-roundledger/ (918 files)
+# sitting untracked and unignored beside the ignored .test-out/ (846) —
+# 2,678 files, all scratch compile output, one `git add -A` from a commit.
+# Ignoring the shape rather than the name is what makes this hold.
+.test-out*/
 *.vsix
 
 # Logs

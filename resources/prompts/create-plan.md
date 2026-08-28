@@ -40,6 +40,10 @@ One plan is one task. A plan too large for a single round is delivered as ordere
 
 Do not invent requirements that are not implied by the context. If the request is unclear, say so explicitly instead of guessing.
 
+## Plan Revision
+
+{{planRevisionProposal}}
+
 ## Context Pack
 
 {{contextPack}}

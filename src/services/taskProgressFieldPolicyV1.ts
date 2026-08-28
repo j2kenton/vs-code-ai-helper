@@ -17,7 +17,12 @@
  *  - `completedStages` remains a canonical stage-order prefix;
  *  - the current-task checkpoint is external coordinator state, untouched here.
  */
-import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
+import {
+  ChecklistChangeProposalV1,
+  STAGE_ORDER,
+  TaskProgress,
+  TaskStage,
+} from "../types/taskProgress";
 import {
   ENSEMBLE_PROGRESS_VERSION_FIELD_V1,
   PersistedTaskProgressV1,
@@ -25,6 +30,7 @@ import {
 import {
   MarkTaskDonePolicyInputV1,
   NextStagePolicyInputV1,
+  PlanRevisionPolicyInputV1,
   ReopenPolicyInputV1,
   TaskProgressFieldPolicyRowV1,
   TaskProgressPolicyResultV1,
@@ -267,6 +273,13 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve (durable checklist-mutation-guard trail).",
     reopen: "Preserve (durable checklist-mutation-guard trail).",
   },
+  planRevision: {
+    migration: "Validate exact shape; preserve.",
+    nextStage:
+      "Preserve — a revision in flight must survive the ordinary Plan -> plan-high-review -> plan-low-review advances re-finalization runs it through; it is cleared only by re-finalization explicitly adopting or discarding the proposal, never by a routine stage transition.",
+    markTaskDone: "Clear.",
+    reopen: "Clear (explicit user resume decision — parity with escalation/lintPayload).",
+  },
   escalation: {
     migration: "Validate exact shape; preserve.",
     nextStage:
@@ -374,6 +387,30 @@ function clearMapEntry(
 }
 
 /**
+ * Find the `"pending"` `checklistChangeProposals` entry matching `proposalAt`
+ * and flip it to `"revising"` in place. Returns `undefined` (never throws) if
+ * no such entry exists — a caller must treat that as a policy failure rather
+ * than silently proceeding, since `applyPlanRevisionPolicyV1` has nothing
+ * else to anchor `planRevision` to.
+ */
+function markProposalRevising(
+  proposals: readonly ChecklistChangeProposalV1[] | undefined,
+  proposalAt: string
+): { proposals: ChecklistChangeProposalV1[]; matched: ChecklistChangeProposalV1 } | undefined {
+  if (proposals === undefined) {
+    return undefined;
+  }
+  const matched = proposals.find((p) => p.at === proposalAt && p.status === "pending");
+  if (matched === undefined) {
+    return undefined;
+  }
+  const next = proposals.map((p) =>
+    p.at === proposalAt && p.status === "pending" ? { ...p, status: "revising" as const } : p
+  );
+  return { proposals: next, matched };
+}
+
+/**
  * `nextStage.v1` column: advance an active task to the immediate next stage,
  * consuming per-run state (lint payload, schedule, review attempt,
  * escalation) and marking the departing stage complete.
@@ -452,6 +489,7 @@ export function applyNextStagePolicyV1(
     archivedFrom: progress.archivedFrom,
     pinnedAt: progress.pinnedAt,
     publishScopePath: progress.publishScopePath,
+    planRevision: progress.planRevision,
   };
   return { ok: true, progress: result };
 }
@@ -615,6 +653,131 @@ export function applyReopenPolicyV1(
     archivedFrom: progress.archivedFrom,
     pinnedAt: progress.pinnedAt,
     publishScopePath: progress.publishScopePath,
+  };
+  return { ok: true, progress: result };
+}
+
+/**
+ * Plan-revision column (wf "make the stage chat a record of work" Part 6 /
+ * items 4-5): the ONLY sanctioned way a caught checklist-item-set mutation
+ * (`TaskProgress.checklistChangeProposals`, `"pending"` status) becomes an
+ * actual edit to `plan-final.md` — a deliberate, reviewable, re-reviewed
+ * stage transition back to `plan`, never a side effect of an implementation
+ * round (Part 6 item 5's rule: "a round never mutates the checklist").
+ * Truncates `completedStages`/fallback state to the contiguous prefix before
+ * `plan` (parity with `applyReopenPolicyV1`'s truncation), but — unlike
+ * reopen — retains `implReviewFiles`/`pendingImplReviewFiles` and
+ * `reviewScoreHistory`: the accumulated implementation review surface is not
+ * being discarded, only re-planned around (Part 6 item 4's explicit
+ * requirement).
+ *
+ * Fails `"checklistChangeProposalNotPending"` when `input.proposalAt` does
+ * not name a `"pending"` entry — this function is the sole writer of
+ * `planRevision`, so it must never invent one with nothing to anchor to.
+ */
+export function applyPlanRevisionPolicyV1(
+  progress: PersistedTaskProgressV1,
+  input: PlanRevisionPolicyInputV1
+): TaskProgressPolicyResultV1 {
+  if (!isCoordinatorTimestamp(input.now)) {
+    return failure("invalidTimestamp", "coordinator clock must be a valid ISO timestamp");
+  }
+  if (progress.status !== "active") {
+    return failure(
+      "statusNotActive",
+      `planRevision requires an active task, found status ${JSON.stringify(progress.status)}`
+    );
+  }
+  const marked = markProposalRevising(progress.checklistChangeProposals, input.proposalAt);
+  if (marked === undefined) {
+    return failure(
+      "checklistChangeProposalNotPending",
+      `no pending checklistChangeProposals entry with at ${JSON.stringify(input.proposalAt)} was found`
+    );
+  }
+
+  const planIndex = stageIndex("plan");
+  const retainedStages = (progress.completedStages ?? []).filter(
+    (stage) => stageIndex(stage) < planIndex
+  );
+
+  // Same "clear only where an entry already exists" rule as
+  // applyReopenPolicyV1 — never materializes fallback state for a stage that
+  // never had any.
+  let fallbackActive: Partial<Record<TaskStage, boolean>> | undefined;
+  if (progress.fallbackActive !== undefined) {
+    fallbackActive = {};
+    for (const [stage, active] of Object.entries(progress.fallbackActive)) {
+      fallbackActive[stage as TaskStage] =
+        stageIndex(stage as TaskStage) < planIndex ? active : false;
+    }
+  }
+  let fallbackModelId = progress.fallbackModelId;
+  for (const stage of STAGE_ORDER) {
+    if (stageIndex(stage) >= planIndex) {
+      fallbackModelId = clearMapEntry(fallbackModelId, stage);
+    }
+  }
+
+  const result: PersistedTaskProgressV1 = {
+    ensembleProgressVersion: 1,
+    ownership: progress.ownership,
+    taskFolder: progress.taskFolder,
+    status: "active",
+    currentStage: "plan",
+    createdAt: progress.createdAt,
+    updatedAt: input.now,
+    progressVersion: progress.progressVersion,
+    displayName: progress.displayName,
+    checklistProgressUnreliable: progress.checklistProgressUnreliable,
+    checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    zeroChangeImplRounds: undefined,
+    nameIsDefault: progress.nameIsDefault,
+    preImageDescription: progress.preImageDescription,
+    completedAt: undefined,
+    completedStages: retainedStages,
+    // Retained deliberately (unlike reopen, which clears these below `impl`)
+    // — a plan revision does not discard the accumulated implementation
+    // review surface or score history (Part 6 item 4's own requirement).
+    implReviewFiles: progress.implReviewFiles,
+    pendingImplReviewFiles: progress.pendingImplReviewFiles,
+    // Cleared, unlike implReviewFiles/reviewScoreHistory above — a plan
+    // revision invalidates whatever review-tracking state pointed at the
+    // pre-revision plan, the same as every other later-stage runtime field
+    // this transition clears (implRecovery, quotaParkRecord, pausedReason,
+    // incompleteRoundContinuations). Parity with applyReopenPolicyV1.
+    reviewInvalidatedByRound: undefined,
+    incompleteRoundContinuations: undefined,
+    implRecovery: undefined,
+    quotaParkRecord: undefined,
+    pausedReason: undefined,
+    lintPayload: undefined,
+    scheduledRun: undefined,
+    scheduledResumeTime: undefined,
+    fallbackActive,
+    fallbackModelId,
+    reviewAttemptId: undefined,
+    reviewScoreHistory: progress.reviewScoreHistory,
+    reviewRejections: progress.reviewRejections,
+    roundOutcomes: progress.roundOutcomes,
+    roundLedger: progress.roundLedger,
+    blockerSupersessions: progress.blockerSupersessions,
+    checklistChangeProposals: marked.proposals,
+    overriddenEscalations: progress.overriddenEscalations,
+    escalation: undefined,
+    implementationTypeCheckFailure: undefined,
+    archivedFrom: progress.archivedFrom,
+    pinnedAt: progress.pinnedAt,
+    publishScopePath: progress.publishScopePath,
+    planRevision: {
+      proposalAt: marked.matched.at,
+      startedAt: input.now,
+      stage: marked.matched.stage,
+      discardedItems: marked.matched.proposedItems,
+      removedItems: marked.matched.removedItems,
+      reason: input.reason,
+      ...(input.journaledPlanRef !== undefined ? { journaledPlanRef: input.journaledPlanRef } : {}),
+    },
   };
   return { ok: true, progress: result };
 }

@@ -1085,6 +1085,70 @@ export function listUncheckedChecklistItemTextsV1(
 }
 
 /**
+ * Plan-item texts whose box is currently CHECKED in `planOfRecord`'s latest
+ * rendering, in document order, unescaped for display — the mirror of
+ * {@link listUncheckedChecklistItemTextsV1}, minus excluded items (which are
+ * neither "checked" nor a revision's concern either way).
+ *
+ * Used by {@link formatPlanRevisionProposalVariableV1} so a plan revision's
+ * `{{planRevisionProposal}}` prompt variable can tell the model exactly which
+ * items are already done and must not be renumbered or dropped (wf "make the
+ * stage chat a record of work" Part 6 / item 6).
+ */
+export function listCheckedChecklistItemTextsV1(planOfRecord: string): readonly string[] {
+  return itemsInLatestRendering(planOfRecord)
+    .filter((item) => !item.excluded && item.checked)
+    .map((item) => unescapeChecklistItemTextV1(item.text));
+}
+
+/**
+ * Render an in-flight `TaskProgress.planRevision` as the `{{planRevisionProposal}}`
+ * plan-generation prompt variable (wf "make the stage chat a record of work"
+ * Part 6 / item 6). Always returns non-empty text — a plan generated with no
+ * revision in flight states that explicitly, the same discipline
+ * `formatAcceptedNonGoalsVariableV1` uses for the review-side equivalent —
+ * rather than leaving a silently-empty section in the rendered prompt.
+ *
+ * `alreadyCheckedItems` — the CURRENT `plan-final.md`'s checked item texts —
+ * are listed so the revision incorporates the discovered items without
+ * renumbering or dropping any of them (item 6's explicit requirement); pass
+ * an empty array when no prior canonical plan exists to read from.
+ */
+export function formatPlanRevisionProposalVariableV1(
+  planRevision: { readonly reason: string; readonly discardedItems: readonly string[]; readonly removedItems: readonly string[] } | undefined,
+  alreadyCheckedItems: readonly string[]
+): string {
+  if (planRevision === undefined) {
+    return "_No plan revision is in flight — this is an ordinary plan generation._";
+  }
+  const sections: string[] = [
+    `A round's edit to plan-final.md tried to change the checklist item set. A round never mutates the ` +
+      `checklist — the change was reverted, and now needs to be incorporated deliberately, through this plan ` +
+      `revision, instead.\n\nReason: ${planRevision.reason}`,
+  ];
+  if (planRevision.discardedItems.length > 0) {
+    sections.push(
+      `Proposed additions the round attempted (discarded, now yours to evaluate and incorporate if warranted):\n` +
+        planRevision.discardedItems.map((item) => `- ${item}`).join("\n")
+    );
+  }
+  if (planRevision.removedItems.length > 0) {
+    sections.push(
+      `Items the round's edit tried to drop (restored — do not drop these again without an explicit reason):\n` +
+        planRevision.removedItems.map((item) => `- ${item}`).join("\n")
+    );
+  }
+  sections.push(
+    alreadyCheckedItems.length > 0
+      ? `Items already checked in the plan of record — a rule this plan MUST follow: never renumber, reword, or ` +
+        `drop any of these; each must appear in the revised plan exactly as listed below, still checked:\n` +
+        alreadyCheckedItems.map((item) => `- ${item}`).join("\n")
+      : "No items are currently checked in the plan of record."
+  );
+  return sections.join("\n\n");
+}
+
+/**
  * The priority an item's own authored text declares for field 5 of the
  * shared hand-off contract (`HandoffImpactV1`'s `"priority"` kind, task
  * "Actionable Hand-offs", PART 2) — HIGH when a failure here would be silent

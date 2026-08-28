@@ -94,4 +94,4 @@ dist/meta.json
 # .gitignore whenever a .vscodeignore exists (see the notes above), and this
 # directory duly broke the next `npm run release` with 214 test files in the
 # package. Ignored by directory name so a re-run cannot reintroduce it.
-.test-out/**
+.test-out*/**

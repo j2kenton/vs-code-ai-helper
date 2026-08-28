@@ -18,6 +18,7 @@ import {
   TASK_PROGRESS_FIELD_POLICY_V1,
   applyMarkTaskDonePolicyV1,
   applyNextStagePolicyV1,
+  applyPlanRevisionPolicyV1,
   applyReopenPolicyV1,
 } from "../services/taskProgressFieldPolicyV1";
 import { encodeTaskProgressV1 } from "../services/taskProgressWriterV1";
@@ -402,6 +403,181 @@ void describe("taskProgressFieldPolicyV1", () => {
     if (!notCompleted.ok) {
       assert.equal(notCompleted.code, "statusNotCompleted");
     }
+  });
+
+  void it("planRevision truncates to before `plan` while retaining review surface (Part 6 items 4-5)", () => {
+    const input = baseProgress({
+      currentStage: "impl-high-review",
+      completedStages: [
+        "desc",
+        "plan",
+        "plan-high-review",
+        "plan-low-review",
+        "impl",
+      ],
+      implReviewFiles: ["src/a.ts"],
+      pendingImplReviewFiles: ["src/b.ts"],
+      reviewScoreHistory: [
+        {
+          stage: "impl-high-review",
+          score: 6,
+          attemptId: "attempt-5",
+          blockerCount: 2,
+          taskFixableCount: 2,
+          at: "2026-07-09T00:00:00.000Z",
+        },
+      ],
+      lintPayload: { runAt: NOW, passed: true },
+      fallbackActive: { plan: true, impl: true, "impl-high-review": true },
+      fallbackModelId: { plan: "model-a", impl: "model-b", "impl-high-review": "model-c" },
+      checklistChangeProposals: [
+        {
+          at: "2026-07-08T00:00:00.000Z",
+          roundId: "round-1",
+          stage: "impl",
+          kind: "added",
+          proposedItems: ["Present the remaining sites to a human reviewer"],
+          removedItems: [],
+          status: "pending",
+        },
+      ],
+    });
+
+    const revised = applyPlanRevisionPolicyV1(input, {
+      now: NOW,
+      proposalAt: "2026-07-08T00:00:00.000Z",
+      reason: "21 sites need an owner policy decision",
+    });
+    assert.equal(revised.ok, true);
+    if (revised.ok) {
+      const progress = revised.progress;
+      assert.equal(progress.status, "active");
+      assert.equal(progress.currentStage, "plan");
+      // Truncated to the contiguous prefix strictly before `plan`.
+      assert.deepEqual(progress.completedStages, ["desc"]);
+      // Retained deliberately — unlike reopen, a plan revision does not
+      // discard the accumulated implementation review surface.
+      assert.deepEqual(progress.implReviewFiles, ["src/a.ts"]);
+      assert.deepEqual(progress.pendingImplReviewFiles, ["src/b.ts"]);
+      assert.equal(progress.reviewScoreHistory?.length, 1);
+      // Per-round runtime state tied to the departing stage is consumed.
+      assert.equal(progress.lintPayload, undefined);
+      assert.deepEqual(progress.fallbackActive, {
+        plan: false,
+        impl: false,
+        "impl-high-review": false,
+      });
+      assert.equal(progress.fallbackModelId, undefined);
+      // The matched proposal flips to "revising"; the plan-revision record
+      // carries its identity and content forward.
+      assert.equal(progress.checklistChangeProposals?.[0]?.status, "revising");
+      assert.deepEqual(progress.planRevision, {
+        proposalAt: "2026-07-08T00:00:00.000Z",
+        startedAt: NOW,
+        stage: "impl",
+        discardedItems: ["Present the remaining sites to a human reviewer"],
+        removedItems: [],
+        reason: "21 sites need an owner policy decision",
+      });
+    }
+
+    const wrongProposal = applyPlanRevisionPolicyV1(input, {
+      now: NOW,
+      proposalAt: "2026-01-01T00:00:00.000Z",
+      reason: "no such proposal",
+    });
+    assert.equal(wrongProposal.ok, false);
+    if (!wrongProposal.ok) {
+      assert.equal(wrongProposal.code, "checklistChangeProposalNotPending");
+    }
+
+    const alreadyRevising = applyPlanRevisionPolicyV1(
+      baseProgress({
+        checklistChangeProposals: [
+          {
+            at: "2026-07-08T00:00:00.000Z",
+            roundId: "round-1",
+            stage: "impl",
+            kind: "added",
+            proposedItems: ["x"],
+            removedItems: [],
+            status: "revising",
+          },
+        ],
+      }),
+      { now: NOW, proposalAt: "2026-07-08T00:00:00.000Z", reason: "already in flight" }
+    );
+    assert.equal(alreadyRevising.ok, false);
+    if (!alreadyRevising.ok) {
+      assert.equal(alreadyRevising.code, "checklistChangeProposalNotPending");
+    }
+
+    const notActive = applyPlanRevisionPolicyV1(
+      baseProgress({ status: "completed", completedAt: "2026-07-09T00:00:00.000Z" }),
+      { now: NOW, proposalAt: "2026-07-08T00:00:00.000Z", reason: "n/a" }
+    );
+    assert.equal(notActive.ok, false);
+    if (!notActive.ok) {
+      assert.equal(notActive.code, "statusNotActive");
+    }
+  });
+
+  void it("plan revision clears reviewInvalidatedByRound (review blocker: was preserved contrary to Part 6 item 19)", () => {
+    const input = baseProgress({
+      checklistChangeProposals: [
+        {
+          at: "2026-07-08T00:00:00.000Z",
+          roundId: "round-1",
+          stage: "impl",
+          kind: "added",
+          proposedItems: ["x"],
+          removedItems: [],
+          status: "pending",
+        },
+      ],
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-07-08T12:00:00.000Z" },
+    });
+    const revised = applyPlanRevisionPolicyV1(input, {
+      now: NOW,
+      proposalAt: "2026-07-08T00:00:00.000Z",
+      reason: "stale review tracking must not survive a revision",
+    });
+    assert.equal(revised.ok, true);
+    if (revised.ok) {
+      assert.equal(revised.progress.reviewInvalidatedByRound, undefined);
+    }
+  });
+
+  void it("planRevision survives the ordinary nextStage advances re-finalization runs it through (review blocker: was cleared on the first nextStage)", () => {
+    const planRevision = {
+      proposalAt: "2026-07-08T00:00:00.000Z",
+      startedAt: NOW,
+      stage: "impl" as const,
+      discardedItems: ["21 sites need an owner policy decision"],
+      removedItems: [],
+      reason: "21 sites need an owner policy decision",
+    };
+    const atPlan = baseProgress({
+      currentStage: "plan",
+      completedStages: ["desc"],
+      planRevision,
+    });
+
+    const toHighReview = applyNextStagePolicyV1(atPlan, { now: NOW });
+    assert.equal(toHighReview.ok, true);
+    if (!toHighReview.ok) {
+      return;
+    }
+    assert.equal(toHighReview.progress.currentStage, "plan-high-review");
+    assert.deepEqual(toHighReview.progress.planRevision, planRevision);
+
+    const toLowReview = applyNextStagePolicyV1(toHighReview.progress, { now: NOW });
+    assert.equal(toLowReview.ok, true);
+    if (!toLowReview.ok) {
+      return;
+    }
+    assert.equal(toLowReview.progress.currentStage, "plan-low-review");
+    assert.deepEqual(toLowReview.progress.planRevision, planRevision);
   });
 
   void it("advances and completes tasks whose completedStages was never written (real emitter state)", () => {

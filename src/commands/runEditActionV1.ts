@@ -65,6 +65,7 @@ import {
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
 import { attachCoordinatorIdentityToRoundBestEffortV1 } from "../utils/roundLedgerV1";
+import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
 import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../utils/modelSelection";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
@@ -386,6 +387,21 @@ export interface AssembledPromptCaptureV1 {
  */
 export type AssembledPromptAttemptsV1 = readonly AssembledPromptCaptureV1[];
 
+/**
+ * Every coordinator attempt the preflight's `onAttemptAllocated` observed for
+ * this round, in allocation order — a SUPERSET of `AssembledPromptAttemptsV1`'s
+ * ids, since this fires for an attempt that fails before ever reaching
+ * `onPromptAssembled` too (2026-08-28 review fix, blocker "coordinator
+ * allocation sites still do not synchronously attach durable round identities
+ * before pre-prompt failures can return" — `runEditActionV1.ts` previously
+ * wired neither hook, so a pre-assembly-failed attempt left no trace anywhere
+ * on this round, not even at its terminal write). Captured the SAME safe,
+ * zero-I/O pattern `reviewActions.ts`'s review-round path already uses
+ * (`observedCoordinatorAttemptIds`) — see this type's own usage sites for why
+ * it is not instead attached to disk at allocation time.
+ */
+export type AllocatedAttemptIdsV1 = readonly string[];
+
 export type TwoPhaseEditResultV1 =
   | {
       readonly kind: "completed";
@@ -400,11 +416,14 @@ export type TwoPhaseEditResultV1 =
       readonly assembledPrompt?: AssembledPromptCaptureV1;
       /** See `AssembledPromptAttemptsV1`. */
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+      /** See `AllocatedAttemptIdsV1`. */
+      readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
     }
   | {
       readonly kind: "noChanges";
       readonly assembledPrompt?: AssembledPromptCaptureV1;
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+      readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
     }
   | {
       readonly kind: "questions";
@@ -417,6 +436,7 @@ export type TwoPhaseEditResultV1 =
       readonly assembledPrompt?: AssembledPromptCaptureV1;
       /** See `AssembledPromptAttemptsV1`. */
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+      readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
     }
   | {
       readonly kind: "unavailable";
@@ -448,6 +468,7 @@ export type TwoPhaseEditResultV1 =
       readonly assembledPrompt?: AssembledPromptCaptureV1;
       /** See `AssembledPromptAttemptsV1`. */
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
+      readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
     };
 
 export interface RunTwoPhaseEditOptionsV1 {
@@ -533,6 +554,15 @@ export async function runTwoPhaseEditActionV1(
   // or a fallback candidate after the primary failed), and every one of
   // those is worth retaining, not just whichever fired last.
   const capturedAssembledPromptAttempts: AssembledPromptCaptureV1[] = [];
+  // See `AllocatedAttemptIdsV1`'s doc comment: a synchronous, zero-I/O array
+  // push mirroring the review-round path's `observedCoordinatorAttemptIds`
+  // (`reviewActions.ts`) — records every attempt this round allocates, even
+  // one that fails before reaching `onPromptAssembled`, WITHOUT moving any
+  // disk write earlier. `attachCoordinatorIdentityToRoundBestEffortV1` below
+  // stays wired only to `onPromptAssembled`, unchanged — see that call's own
+  // NOTE for why attaching it to `onAttemptAllocated` too was tried and
+  // reverted.
+  const capturedAllocatedAttemptIds: string[] = [];
   const preflightOutcome = await coordinator.executeAction({
     actionKey: options.actionKey,
     taskBinding: options.taskBinding,
@@ -540,6 +570,38 @@ export async function runTwoPhaseEditActionV1(
     taskStage: options.taskStage,
     rawInput: preflightInput as unknown as Record<string, unknown>,
     cancellationToken: options.cancellationToken,
+    onAttemptAllocated: (info) => {
+      capturedAllocatedAttemptIds.push(info.attemptId);
+      // 2026-08-28 review fix, same blocker as the NOTE below: append this
+      // allocation to the round-identity sidecar log instead of attaching it
+      // directly onto `task-progress.json` — see `roundIdentityLogV1.ts`'s
+      // own doc comment for why this carries none of the timing risk the
+      // reverted direct-attach attempt (still documented in the NOTE below)
+      // hit. A no-op when `options.taskFolderUri`/`options.roundId` are
+      // absent (this round claims no `roundLedger` row at all — e.g. the
+      // `lint.v1` call site), matching `onPromptAssembled`'s own disk attach
+      // below exactly.
+      if (options.taskFolderUri && options.roundId) {
+        void appendRoundIdentityLogEntryBestEffortV1(options.taskFolderUri, {
+          roundId: options.roundId,
+          operationId: info.operationId,
+          attemptId: info.attemptId,
+          at: new Date().toISOString(),
+        });
+      }
+    },
+    // NOTE (2026-08-28 review): an `onAttemptAllocated` wiring that ALSO
+    // calls `attachCoordinatorIdentityToRoundBestEffortV1` — firing that disk
+    // attach earlier, before assembly, to also cover an attempt that fails
+    // before ever reaching assembly — was tried here too and reverted the
+    // same day. It carries the identical timing risk demonstrated at the
+    // review-round call sites in `reviewActions.ts` (see that file's matching
+    // NOTE): moving a fire-and-forget `patchTaskProgressStrictV1` write's
+    // start time earlier changes when it completes relative to a concurrent
+    // out-of-band progress write, and this path has no equivalent test to
+    // rule that out. The disk attach stays on `onPromptAssembled` only, as
+    // before that review; the durable identity now reaches disk through the
+    // sidecar log above instead, which carries no such risk.
     onPromptAssembled: (info) => {
       capturedAssembledPromptAttempts.push(info);
       // Attach at allocation time, not only when this function's own return
@@ -564,6 +626,10 @@ export async function runTwoPhaseEditActionV1(
     capturedAssembledPromptAttempts.length > 0
       ? { assembledPromptAttempts: capturedAssembledPromptAttempts as AssembledPromptAttemptsV1 }
       : {};
+  const capturedAllocatedAttemptIdsField =
+    capturedAllocatedAttemptIds.length > 0
+      ? { allocatedAttemptIds: capturedAllocatedAttemptIds as AllocatedAttemptIdsV1 }
+      : {};
 
   if (preflightOutcome.kind === "questions") {
     return capturedAssembledPrompt !== undefined
@@ -572,8 +638,9 @@ export async function runTwoPhaseEditActionV1(
           outcome: preflightOutcome,
           assembledPrompt: capturedAssembledPrompt,
           ...capturedAttemptsField,
+          ...capturedAllocatedAttemptIdsField,
         }
-      : { kind: "questions", outcome: preflightOutcome };
+      : { kind: "questions", outcome: preflightOutcome, ...capturedAllocatedAttemptIdsField };
   }
   if (preflightOutcome.kind !== "completed") {
     return capturedAssembledPrompt !== undefined
@@ -582,14 +649,20 @@ export async function runTwoPhaseEditActionV1(
           outcome: preflightOutcome,
           assembledPrompt: capturedAssembledPrompt,
           ...capturedAttemptsField,
+          ...capturedAllocatedAttemptIdsField,
         }
-      : { kind: "failed", outcome: preflightOutcome };
+      : { kind: "failed", outcome: preflightOutcome, ...capturedAllocatedAttemptIdsField };
   }
   if (preflightOutcome.code === "noChanges") {
     // §7.4: an empty plan settles as completed/noChanges — no edit session.
     return capturedAssembledPrompt !== undefined
-      ? { kind: "noChanges", assembledPrompt: capturedAssembledPrompt, ...capturedAttemptsField }
-      : { kind: "noChanges" };
+      ? {
+          kind: "noChanges",
+          assembledPrompt: capturedAssembledPrompt,
+          ...capturedAttemptsField,
+          ...capturedAllocatedAttemptIdsField,
+        }
+      : { kind: "noChanges", ...capturedAllocatedAttemptIdsField };
   }
 
   const executionResult = await continueSealedEditExecutionV1(
@@ -597,8 +670,13 @@ export async function runTwoPhaseEditActionV1(
     preflightOutcome.correlation.operationId,
     options
   );
-  return executionResult.kind === "completed" && capturedAssembledPrompt !== undefined
-    ? { ...executionResult, assembledPrompt: capturedAssembledPrompt, ...capturedAttemptsField }
+  return executionResult.kind === "completed"
+    ? {
+        ...executionResult,
+        ...(capturedAssembledPrompt !== undefined ? { assembledPrompt: capturedAssembledPrompt } : {}),
+        ...capturedAttemptsField,
+        ...capturedAllocatedAttemptIdsField,
+      }
     : executionResult;
 }
 
@@ -1022,15 +1100,16 @@ export async function runSealedImplementationV1(
       // approximation post-hoc — see `AssembledPromptCaptureV1`. Also thread
       // every attempt this round captured (review blocker, 2026-08-27), not
       // just the one that ultimately completed.
-      return result.assembledPrompt !== undefined
-        ? {
-            ...completionResult,
-            assembledPrompt: result.assembledPrompt,
-            ...(result.assembledPromptAttempts !== undefined
-              ? { assembledPromptAttempts: result.assembledPromptAttempts }
-              : {}),
-          }
-        : completionResult;
+      return {
+        ...completionResult,
+        ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
+        ...(result.assembledPromptAttempts !== undefined
+          ? { assembledPromptAttempts: result.assembledPromptAttempts }
+          : {}),
+        ...(result.allocatedAttemptIds !== undefined
+          ? { allocatedAttemptIds: result.allocatedAttemptIds }
+          : {}),
+      };
     }
     case "noChanges":
       if (
@@ -1055,6 +1134,9 @@ export async function runSealedImplementationV1(
           ...(result.assembledPromptAttempts !== undefined
             ? { assembledPromptAttempts: result.assembledPromptAttempts }
             : {}),
+          ...(result.allocatedAttemptIds !== undefined
+            ? { allocatedAttemptIds: result.allocatedAttemptIds }
+            : {}),
         };
       }
       return {
@@ -1067,6 +1149,9 @@ export async function runSealedImplementationV1(
         ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
         ...(result.assembledPromptAttempts !== undefined
           ? { assembledPromptAttempts: result.assembledPromptAttempts }
+          : {}),
+        ...(result.allocatedAttemptIds !== undefined
+          ? { allocatedAttemptIds: result.allocatedAttemptIds }
           : {}),
       };
     case "questions":
@@ -1086,6 +1171,9 @@ export async function runSealedImplementationV1(
         ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
         ...(result.assembledPromptAttempts !== undefined
           ? { assembledPromptAttempts: result.assembledPromptAttempts }
+          : {}),
+        ...(result.allocatedAttemptIds !== undefined
+          ? { allocatedAttemptIds: result.allocatedAttemptIds }
           : {}),
       };
     case "unavailable":
@@ -1117,7 +1205,8 @@ export async function runSealedImplementationV1(
         result.outcome,
         runnerId,
         result.assembledPrompt,
-        result.assembledPromptAttempts
+        result.assembledPromptAttempts,
+        result.allocatedAttemptIds
       );
   }
 }
@@ -1137,7 +1226,9 @@ export function describeEditActionOutcomeFailureV1(
    * to the pre-coordinator template instead of the text the model saw. */
   assembledPrompt?: AssembledPromptCaptureV1,
   /** See `AssembledPromptAttemptsV1`. Review blocker, 2026-08-27. */
-  assembledPromptAttempts?: AssembledPromptAttemptsV1
+  assembledPromptAttempts?: AssembledPromptAttemptsV1,
+  /** See `AllocatedAttemptIdsV1`. Review fix, 2026-08-28. */
+  allocatedAttemptIds?: AllocatedAttemptIdsV1
 ): ImplementationRunResult & { runnerId: string } {
   if (outcome.kind === "cancelled") {
     // Review blocker, 2026-08-27 (narrowed blocker 1): this branch used to
@@ -1150,6 +1241,7 @@ export function describeEditActionOutcomeFailureV1(
       runnerId,
       ...(assembledPrompt !== undefined ? { assembledPrompt } : {}),
       ...(assembledPromptAttempts !== undefined ? { assembledPromptAttempts } : {}),
+      ...(allocatedAttemptIds !== undefined ? { allocatedAttemptIds } : {}),
     };
   }
   const code = outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind;
@@ -1206,6 +1298,7 @@ export function describeEditActionOutcomeFailureV1(
     runnerId,
     ...(assembledPrompt !== undefined ? { assembledPrompt } : {}),
     ...(assembledPromptAttempts !== undefined ? { assembledPromptAttempts } : {}),
+    ...(allocatedAttemptIds !== undefined ? { allocatedAttemptIds } : {}),
   };
 }
 

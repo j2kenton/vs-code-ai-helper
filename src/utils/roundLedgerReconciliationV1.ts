@@ -72,6 +72,7 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendChatMessageV1, ChatMessage, readChatHistory } from "./chatHistoryStore";
 import { formatRoundOutcomeMessageV1, terminalizeRoundV1 } from "./roundLedgerV1";
+import { backfillRoundIdentityFromLogV1 } from "./roundIdentityLogV1";
 import { resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
@@ -390,15 +391,28 @@ export interface ReconcileRoundLedgerResultV1 {
 }
 
 /**
- * Run every reconciliation pass for one task, in the plan's own order: (c)
- * synthesize legacy rows, then (a) close genuine orphans, then (b) repair any
- * terminal row (including one (c) just synthesized) missing its outcome
- * message. Each pass is independently idempotent, so is this call as a whole
- * — running it twice in a row against unchanged state changes nothing.
+ * Run every reconciliation pass for one task, in the plan's own order: an
+ * identity backfill FIRST (2026-08-28 review fix, architectural blocker
+ * "coordinator allocation sites still do not attach operation and attempt
+ * identities to a round-ledger row ... at allocation time"), reading the
+ * round-identity sidecar log (`roundIdentityLogV1.ts`) and attaching any
+ * logged `operationId`/`attemptId` onto its matching row before this same
+ * sweep evaluates orphan-closure — an attempt that crashed between
+ * allocation and `onPromptAssembled` (so its row never received an
+ * `operationId` through the normal disk-attach path) is otherwise
+ * indistinguishable, to pass (a)'s per-row check, from a row that never had
+ * one to check against at all, and falls back to the coarser task-wide
+ * liveness booleans; backfilling first lets that row be checked precisely
+ * instead. Then (c) synthesize legacy rows, then (a) close genuine orphans,
+ * then (b) repair any terminal row (including one (c) just synthesized)
+ * missing its outcome message. Each pass is independently idempotent, so is
+ * this call as a whole — running it twice in a row against unchanged state
+ * changes nothing.
  */
 export async function reconcileRoundLedgerV1(
   input: ReconcileRoundLedgerInputV1
 ): Promise<ReconcileRoundLedgerResultV1> {
+  await backfillRoundIdentityFromLogV1(input.taskFolderUri);
   const synth = await synthesizeLegacyRoundLedgerRowsV1(input);
   const orphan = await reconcileOrphanedRoundLedgerRowsV1(input);
   const repair = await repairMissingRoundOutcomeMessagesV1(input);

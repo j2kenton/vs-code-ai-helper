@@ -412,4 +412,163 @@ void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 
       fsBridge.restore();
     }
   });
+
+  void it("prefers the most recently opened live row over an older one when no pending intent is peeked (2026-08-28 review follow-up: .find() picked the oldest live row, not the current dispatch's own)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("claim_prefers_freshest_live_row", [
+        {
+          roundId: "source-round-3",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:05:00.000Z",
+          state: "failed",
+          outcome: { rejectionReason: "round incomplete", continuationOwed: true },
+        },
+        // A leftover row the reconciliation sweep has not yet closed —
+        // OLDER than, and unrelated to, the row this dispatch actually
+        // opened. Array order is insertion order (oldest first), so a plain
+        // `.find()` would pick this one.
+        {
+          roundId: "stale-unrelated-row",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:01:00.000Z",
+          state: "open",
+        },
+        // The row THIS dispatch actually opened, moments before this claim —
+        // newer than the stale row above.
+        {
+          roundId: "fresh-continuation-row",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:06:00.000Z",
+          state: "open",
+        },
+      ]);
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(
+          {
+            ...readProgress(folderPath),
+            implRecovery: {
+              sourceAttemptId: "impl-recovery-3",
+              sourceRoundId: "source-round-3",
+              reason: "round incomplete",
+              trigger: "roundIncomplete",
+              mode: "unconstrained",
+              dispatch: "pending",
+              at: "2026-01-01T00:05:00.000Z",
+            },
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+
+      const claimed = await claimImplRecoveryDispatchV1(folderUri);
+      assert.equal(claimed.record?.dispatch, "dispatched");
+
+      const raw = readProgress(folderPath);
+      // No new row synthesized — the freshest live row was reused.
+      assert.equal(raw.roundLedger?.length, 3);
+      const freshRow = raw.roundLedger?.find((r) => r.roundId === "fresh-continuation-row");
+      assert.equal(freshRow?.mode, "continuation", "the FRESHEST live row must be the one linked to the continuation");
+      assert.equal(freshRow?.continuationOf, "source-round-3");
+      assert.ok(
+        freshRow?.attemptIds.includes(claimed.record?.attemptId as string),
+        "the continuation's attemptId must resolve to the freshest row"
+      );
+
+      // The stale, unrelated row must be left untouched — not mis-linked as
+      // the continuation.
+      const staleRow = raw.roundLedger?.find((r) => r.roundId === "stale-unrelated-row");
+      assert.equal(staleRow?.mode, "implementation");
+      assert.equal(staleRow?.continuationOf, undefined);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it(
+    "never links to a freshest live row from a DIFFERENT stage — synthesizes a new row instead " +
+      "(2026-08-28 review follow-up: continuation claiming used a task-wide heuristic instead of exact dispatch identity)",
+    async () => {
+      const fsBridge = installFsBridge();
+      const wsStub = installWorkspaceFoldersStub();
+      try {
+        const { folderUri, folderPath } = makeTaskFolder("claim_ignores_wrong_stage_row", [
+          {
+            roundId: "source-round-4",
+            attemptIds: [],
+            stage: "impl",
+            mode: "implementation",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            endedAt: "2026-01-01T00:05:00.000Z",
+            state: "failed",
+            outcome: { rejectionReason: "round incomplete", continuationOwed: true },
+          },
+          // Newer than the source round, and still live — but for a
+          // DIFFERENT stage (e.g. a review round on this same task that has
+          // not yet been reconciled). The old "most recently opened live
+          // row" fallback would have picked this one purely on recency.
+          {
+            roundId: "live-row-wrong-stage",
+            attemptIds: [],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:06:00.000Z",
+            state: "open",
+          },
+        ]);
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify(
+            {
+              ...readProgress(folderPath),
+              implRecovery: {
+                sourceAttemptId: "impl-recovery-4",
+                sourceRoundId: "source-round-4",
+                reason: "round incomplete",
+                trigger: "roundIncomplete",
+                mode: "unconstrained",
+                dispatch: "pending",
+                at: "2026-01-01T00:05:00.000Z",
+              },
+            },
+            null,
+            2
+          ),
+          "utf8"
+        );
+
+        const claimed = await claimImplRecoveryDispatchV1(folderUri);
+        assert.equal(claimed.record?.dispatch, "dispatched");
+
+        const raw = readProgress(folderPath);
+        // A new row was synthesized under the continuation's own attemptId —
+        // the wrong-stage row must never be reused.
+        const wrongStageRow = raw.roundLedger?.find((r) => r.roundId === "live-row-wrong-stage");
+        assert.equal(wrongStageRow?.mode, "review", "the wrong-stage row must be left untouched");
+        assert.equal(wrongStageRow?.continuationOf, undefined);
+
+        const synthesizedRow = raw.roundLedger?.find(
+          (r) => r.roundId === claimed.record?.attemptId
+        );
+        assert.ok(synthesizedRow, "a fresh row must be synthesized when no live row matches the current stage");
+        assert.equal(synthesizedRow?.mode, "continuation");
+        assert.equal(synthesizedRow?.continuationOf, "source-round-4");
+      } finally {
+        wsStub.restore();
+        fsBridge.restore();
+      }
+    }
+  );
 });

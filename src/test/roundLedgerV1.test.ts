@@ -41,10 +41,12 @@ import {
   consumePendingAutomationRoundIntentV1,
   formatRoundOutcomeMessageV1,
   openAutomationRoundLedgerRowBestEffortV1,
+  recordChecklistRevisionOnRoundLedgerV1,
   roundLedgerModeForCommandV1,
   setPendingAutomationRoundIntentV1,
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
+import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -1753,5 +1755,178 @@ void describe(
         fsBridge.restore();
       }
     });
+  }
+);
+
+void describe(
+  "recordChecklistRevisionOnRoundLedgerV1 (Part 6 items 5/19, 2026-08-28 review fix: " +
+    "\"the implementation does not append or update a round-ledger event for 'Plan revised: N → M'\")",
+  () => {
+    void it("attaches checklistRevisionAdopted onto the existing (terminal) mutating round's row", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "revision_adopted_onto_row");
+        fs.mkdirSync(folderPath, { recursive: true });
+        const row = makeBaseEntry({
+          roundId: "mutating-round-1",
+          intentId: "mutating-round-1",
+          state: "rejected",
+          endedAt: "2026-01-01T00:05:00.000Z",
+          outcome: { rejectionReason: "checklist mutation reverted" },
+        });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify(makeProgress({ taskFolder: "revision_adopted_onto_row", roundLedger: [row] }), null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await recordChecklistRevisionOnRoundLedgerV1({
+          taskFolderUri: folderUri,
+          roundId: "mutating-round-1",
+          revision: { resolvedAt: "2026-01-02T00:00:00.000Z", itemCountBefore: 80, itemCountAfter: 85 },
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        const updated = raw.roundLedger?.find((r) => r.roundId === "mutating-round-1");
+        assert.deepEqual(updated?.checklistRevisionAdopted, {
+          resolvedAt: "2026-01-02T00:00:00.000Z",
+          itemCountBefore: 80,
+          itemCountAfter: 85,
+        });
+        // The row's own frozen terminal facts must survive untouched.
+        assert.equal(updated?.state, "rejected");
+        assert.equal(updated?.outcome?.rejectionReason, "checklist mutation reverted");
+      } finally {
+        fsBridge.restore();
+      }
+    });
+
+    void it("is a no-op when roundId resolves to no row (pruned by the ledger's own cap)", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "revision_adopted_no_row");
+        fs.mkdirSync(folderPath, { recursive: true });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify(makeProgress({ taskFolder: "revision_adopted_no_row", roundLedger: [] }), null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await recordChecklistRevisionOnRoundLedgerV1({
+          taskFolderUri: folderUri,
+          roundId: "long-gone-round",
+          revision: { resolvedAt: "2026-01-02T00:00:00.000Z" },
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        assert.deepEqual(raw.roundLedger, []);
+      } finally {
+        fsBridge.restore();
+      }
+    });
+
+    void it("never reassigns an already-set checklistRevisionAdopted", async () => {
+      const fsBridge = installFsBridge();
+      try {
+        const folderPath = path.join(REAL_ROOT, "plans", "revision_adopted_never_reassigned");
+        fs.mkdirSync(folderPath, { recursive: true });
+        const row = makeBaseEntry({
+          roundId: "mutating-round-2",
+          state: "rejected",
+          endedAt: "2026-01-01T00:05:00.000Z",
+          checklistRevisionAdopted: { resolvedAt: "2026-01-02T00:00:00.000Z", itemCountBefore: 80, itemCountAfter: 85 },
+        });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify(makeProgress({ taskFolder: "revision_adopted_never_reassigned", roundLedger: [row] }), null, 2),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+
+        await recordChecklistRevisionOnRoundLedgerV1({
+          taskFolderUri: folderUri,
+          roundId: "mutating-round-2",
+          revision: { resolvedAt: "2026-05-05T00:00:00.000Z", itemCountBefore: 1, itemCountAfter: 2 },
+        });
+
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+        const updated = raw.roundLedger?.find((r) => r.roundId === "mutating-round-2");
+        assert.equal(updated?.checklistRevisionAdopted?.resolvedAt, "2026-01-02T00:00:00.000Z");
+      } finally {
+        fsBridge.restore();
+      }
+    });
+  }
+);
+
+void describe(
+  "terminalizeRoundV1 — opportunistic identity backfill (2026-08-28 review fix, narrowing the " +
+    "architectural blocker: \"the actual roundLedger row is updated only when reconcileRoundLedgerV1 " +
+    "later invokes backfillRoundIdentityFromLogV1 ... until that sweep, resolveRoundV1 and every live " +
+    "ledger consumer still lack the allocation identity\")",
+  () => {
+    void it(
+      "attaches a logged identity onto a DIFFERENT still-live row the moment any round on the same " +
+        "task terminalizes, without waiting for the periodic reconciliation sweep",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "opportunistic_backfill");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const liveRow = makeBaseEntry({
+            roundId: "live-row-1",
+            intentId: undefined,
+            attemptIds: [],
+            state: "open",
+          });
+          const otherRow = makeBaseEntry({
+            roundId: "other-round-1",
+            intentId: "other-round-1",
+            attemptIds: ["other-round-1"],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              makeProgress({ taskFolder: "opportunistic_backfill", roundLedger: [liveRow, otherRow] }),
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          // A crash between allocation and `onPromptAssembled` left this
+          // identity durable only in the sidecar log — nothing has backfilled
+          // it onto `live-row-1` yet.
+          await appendRoundIdentityLogEntryBestEffortV1(folderUri, {
+            roundId: "live-row-1",
+            operationId: "op-from-sidecar",
+            attemptId: "attempt-from-sidecar",
+            at: "2026-01-01T00:00:00.000Z",
+          });
+
+          // A completely unrelated round on the SAME task ends.
+          const result = await terminalizeRoundV1(
+            "other-round-1",
+            "completed",
+            { filesChanged: [] },
+            { taskFolderUri: folderUri }
+          );
+          assert.equal(result.ok, true);
+
+          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+          const backfilled = raw.roundLedger?.find((r) => r.roundId === "live-row-1");
+          assert.equal(backfilled?.operationId, "op-from-sidecar");
+          assert.ok(backfilled?.attemptIds.includes("attempt-from-sidecar"));
+          // Still live — the backfill must never touch state/endedAt/outcome.
+          assert.equal(backfilled?.state, "open");
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
   }
 );

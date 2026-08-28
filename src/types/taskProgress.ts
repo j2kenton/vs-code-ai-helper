@@ -428,6 +428,17 @@ export interface TaskProgress {
    */
   checklistChangeProposals?: ChecklistChangeProposalV1[];
   /**
+   * Set while a checklist-mutation proposal (`checklistChangeProposals`,
+   * `"pending"`→`"revising"` status) is being turned into an actual
+   * `plan-final.md` revision (wf "make the stage chat a record of work"
+   * Part 6 / item 5) — `applyPlanRevisionPolicyV1` writes this in the same
+   * transition that moves the task back to the `plan` stage, so the task
+   * sits at `plan` with this record naming what the revision is meant to
+   * incorporate. Cleared once re-finalization adopts or discards it (Part 6
+   * item 7, not yet built).
+   */
+  planRevision?: PlanRevisionStateV1;
+  /**
    * Set when automated review iteration determined it cannot make further
    * progress on its own and needs a human decision. Cleared on the next
    * stage transition and whenever the user explicitly resumes iteration.
@@ -959,10 +970,66 @@ export interface ChecklistChangeProposalV1 {
    * flight; `"discarded"` if the user declined the proposal; `"adopted"`
    * once a revision incorporating it lands. */
   status: "pending" | "revising" | "discarded" | "adopted";
+  /** ISO timestamp `markChecklistChangeProposalAdoptedV1` set this entry
+   * `"adopted"` (2026-08-28 review fix, Part 6 completion blocker: "records
+   * the completion in chat rather than the round ledger"). The durable
+   * record of a revision's completion — set in the SAME
+   * `patchTaskProgressStrictV1` transaction that flips `status`, so it can
+   * never exist without the status flip having actually landed, unlike the
+   * best-effort chat line that narrates the same event. */
+  resolvedAt?: string;
+  /** Checklist `total` (settled/total denominator, Part 5) immediately
+   * before this revision's re-finalization merge — set alongside
+   * `resolvedAt`, for an auditable record of the item-count change that does
+   * not depend on parsing the chat transcript's prose. */
+  itemCountBefore?: number;
+  /** Checklist `total` immediately after this revision's re-finalization
+   * merge — set alongside `resolvedAt`. */
+  itemCountAfter?: number;
 }
 
 /** Cap on `TaskProgress.checklistChangeProposals` length (oldest entries dropped first). */
 export const MAX_CHECKLIST_CHANGE_PROPOSALS = 50;
+
+/** `TaskProgress.planRevision` (wf "make the stage chat a record of work"
+ * Part 6 / items 4-5) — set by `applyPlanRevisionPolicyV1` when a caught
+ * checklist-mutation proposal is turned into an actual plan revision.
+ * Carries forward the discarded/removed item texts and the originating
+ * proposal's identity so a later `{{planRevisionProposal}}` template
+ * variable (Part 6 item 6, not yet built) and re-finalization merge (Part 6
+ * item 7, not yet built) can reconstruct what changed and re-apply prior
+ * ticks without re-deriving them from a stale `plan-final.md` diff. */
+export interface PlanRevisionStateV1 {
+  /** The `checklistChangeProposals` entry (`at`) this revision resolves. */
+  readonly proposalAt: string;
+  /** ISO timestamp the revision transition itself ran (coordinator clock). */
+  readonly startedAt: string;
+  /** The stage the round was dispatched at when it produced the proposal. */
+  readonly stage: TaskStage;
+  /** Item texts the round tried to add, carried through unchanged from the proposal. */
+  readonly discardedItems: readonly string[];
+  /** Item texts the round's edit tried to drop, carried through unchanged. */
+  readonly removedItems: readonly string[];
+  /** Plain-language reason a revision is needed, surfaced to the plan-stage prompt. */
+  readonly reason: string;
+  /**
+   * The revision-owned journal snapshot's filename, relative to the task
+   * folder (2026-08-28 review fix, Part 6 completion blocker: "Step 19 still
+   * persists ... instead of ... snapshot plan-final.md to the revert journal
+   * and record a journaledPlanRef when revision begins"). Written by
+   * `snapshotPlanForRevisionV1` (`implementationArtifactResolver.ts`) the
+   * moment "Revise the plan" runs, BEFORE this record is even written —
+   * a frozen copy of the pre-revision `plan-final.md`, independent of the
+   * shared `_prev` backup slot any other artifact write could otherwise
+   * clobber during the plan/plan-review stages this revision passes
+   * through. `preparePlanPromotion`'s re-finalization merge reads prior
+   * ticks from this file when present, falling back to the (in practice
+   * identical) live canonical file only when it is unexpectedly absent.
+   * Absent when the round that raised the proposal had, unusually, not yet
+   * produced a `plan-final.md` for this task at all — nothing to snapshot.
+   */
+  readonly journaledPlanRef?: string;
+}
 
 /** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
 export const MAX_BLOCKER_SUPERSESSIONS = 50;
@@ -1165,6 +1232,44 @@ export interface RoundLedgerEntryV1 {
   endedAt?: string;
   /** Set only once `state` is terminal. */
   outcome?: RoundLedgerOutcomeV1;
+  /**
+   * Set once, well after this round already terminalized, when this row's
+   * OWN checklist mutation (recorded as a `TaskProgress.checklistChangeProposals`
+   * entry naming this row's `roundId` — see that type's own doc comment) is
+   * later formalized into an actual plan revision (Part 6 items 5/19)
+   * (2026-08-28 review fix, completion blocker: "the implementation does not
+   * append or update a round-ledger event for 'Plan revised: N → M'" — the
+   * durable record of that completion previously lived only on the proposal
+   * itself and a best-effort chat line, never on the round ledger the plan
+   * names as the sole lifecycle authority). Deliberately NOT one of this
+   * row's own terminal facts: those are frozen the moment `terminalizeRoundV1`
+   * sets them (this round's own `state`/`endedAt`/`outcome` describe what the
+   * round itself did, during its own execution) — a plan revision is a human
+   * decision and a later stage transition, which can happen minutes or days
+   * afterward and is never part of what "the round did". Attaching it here
+   * afterward, without amending any frozen field, mirrors the precedent
+   * `operationId`'s own "attached once, never reassigned" contract already
+   * establishes for post-hoc enrichment of a row. Absent for every row that
+   * never mutated the checklist, and for one whose proposal was discarded
+   * rather than adopted.
+   */
+  checklistRevisionAdopted?: ChecklistRevisionAdoptedV1;
+}
+
+/** `RoundLedgerEntryV1.checklistRevisionAdopted` — see that field's own doc
+ * comment. Mirrors `ChecklistChangeProposalV1.resolvedAt`/`itemCountBefore`/
+ * `itemCountAfter` (the proposal's own copy of the same fact) rather than
+ * inventing a second shape for it. */
+export interface ChecklistRevisionAdoptedV1 {
+  /** ISO timestamp the revision was adopted — copied from the proposal's own
+   * `resolvedAt` once the durable adoption write actually lands, never a
+   * fresh timestamp of this annotation's own write (which may happen on a
+   * later retry than the write that actually adopted the proposal). */
+  readonly resolvedAt: string;
+  /** Checklist `total` immediately before the revision's re-finalization merge. */
+  readonly itemCountBefore?: number;
+  /** Checklist `total` immediately after the revision's re-finalization merge. */
+  readonly itemCountAfter?: number;
 }
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */

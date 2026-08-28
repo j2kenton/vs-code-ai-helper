@@ -55,6 +55,82 @@
  * (`roundLedgerReconciliationV1.ts`) can check per-identity rather than
  * falling back to the task-wide liveness booleans.
  *
+ * NARROWED FURTHER (2026-08-28 review, blocker "coordinator allocation sites
+ * still do not synchronously attach durable round identities before
+ * pre-prompt failures can return"): `onPromptAssembled` only fires once an
+ * attempt reaches successful prompt assembly (`assembleAttemptPromptV1`
+ * returning ok), so an attempt that fails BEFORE that point — every
+ * candidate exhausted before invocation (`providerUnavailablePreInvocation`
+ * at `taskActionCoordinatorV1.ts`'s two `noneRemaining` branches, one inside
+ * `runProviderRow`'s invocation loop, one inside `admitAction`'s own
+ * pre-admission loop) — was previously never recorded anywhere, not even at
+ * the round's own terminal write. `TaskActionRequestV1`/
+ * `TaskActionResumeRequestV1` now also carry `onAttemptAllocated`, which
+ * fires synchronously the instant `session.allocateAttempt()` returns, at
+ * every one of the coordinator's attempt-allocation sites, strictly before
+ * any of those failure branches can execute.
+ *
+ * Both review-round call sites (`runReviewForFolder`, `resumeReviewInteractionV1`)
+ * wire `onAttemptAllocated` to ONLY a synchronous, zero-I/O array push
+ * (`observedCoordinatorAttemptIds`) — deliberately NOT to a second
+ * `attachCoordinatorIdentityToRoundBestEffortV1` call. Wiring both hooks to
+ * attach to disk independently was tried first and reverted the same day:
+ * moving a fire-and-forget `patchTaskProgressStrictV1` write's start time
+ * earlier (to allocation time instead of post-assembly) shifts when it
+ * completes relative to a concurrent out-of-band progress write enough to
+ * lose that write's update — `publishOwnershipMatrix.test.ts`'s "paused
+ * while the review was running" case caught it, reproducibly, even with only
+ * ONE such write per attempt (moved earlier), not just with two. The
+ * in-memory push instead reaches disk only through the SAME already-proven
+ * path every id in that array already takes: forwarded as
+ * `extraCoordinatorAttemptIds` into whichever `terminalizeRoundV1` call ends
+ * the round. `onPromptAssembled` at those two call sites is UNCHANGED from
+ * before this review (still does both the push and the disk attach) — so a
+ * pre-assembly-failed attempt is now recorded on the row at ROUND END
+ * (through the existing, safe forwarding path) rather than live during the
+ * round, which is a real improvement without the disk-write timing risk.
+ * CLOSED for the implementation-round path too (2026-08-28 review follow-up,
+ * same day): `runTwoPhaseEditActionV1` (`runEditActionV1.ts`) now wires the
+ * SAME zero-I/O `onAttemptAllocated` push (`capturedAllocatedAttemptIds`,
+ * surfaced as `TwoPhaseEditResultV1.allocatedAttemptIds` /
+ * `ImplementationRunResult.allocatedAttemptIds`), forwarded by
+ * `executeImplementationRun` (`reviewActions.ts`) into `extraAttemptIds` at
+ * every one of its five `terminalizeRoundV1` call sites — the same
+ * end-of-round forwarding path the review-round call sites already use, not a
+ * new disk-write timing risk. `onPromptAssembled`'s own disk attach there
+ * (`attachCoordinatorIdentityToRoundBestEffortV1`) is UNCHANGED — still fired
+ * only from `onPromptAssembled`, never from `onAttemptAllocated`, for the
+ * identical reason given above. Residual, unaffected by this: a CLI-resolved
+ * implementation round never goes through this coordinator at all, so it has
+ * no `onAttemptAllocated` to wire in the first place — see this module's own
+ * "Residual gap" paragraph below, which already documents that case.
+ *
+ * DURABLE AT ALLOCATION TIME, closing the residual gap the two reverted
+ * direct-attach attempts above left open (2026-08-28 review fix, same
+ * architectural blocker: "A pre-assembly live attempt therefore still lacks
+ * the allocation-time durable identity required by Step 12"): every
+ * `onAttemptAllocated` hook wired above (both review-round call sites,
+ * `runTwoPhaseEditActionV1`) now ALSO calls
+ * `appendRoundIdentityLogEntryBestEffortV1` (`roundIdentityLogV1.ts`) —
+ * writing to that module's OWN sidecar file, `round-identity-log.jsonl`,
+ * never `task-progress.json`. This is deliberately NOT a third attempt at
+ * the direct-attach fix the two NOTEs above document reverting: it sidesteps
+ * the hazard by construction rather than trying to time around it — nothing
+ * on this write path ever reads or writes `task-progress.json`, so it cannot
+ * participate in that file's read-modify-write window and cannot reproduce
+ * the `publishOwnershipMatrix.test.ts` regression (verified: the full suite,
+ * including that exact test, passes with this wired). Reconciliation's
+ * `backfillRoundIdentityFromLogV1` (`roundIdentityLogV1.ts`, run first in
+ * `reconcileRoundLedgerV1`, `roundLedgerReconciliationV1.ts`) is the read
+ * side: it attaches any logged identity onto its matching row that doesn't
+ * already carry one, so an attempt that crashes between allocation and
+ * `onPromptAssembled` — before which this module previously had nothing
+ * durable to show for it beyond the in-memory arrays above — now has a real
+ * `operationId`/`attemptId` on disk once the next reconciliation sweep runs,
+ * closing pass (a)'s own "falls back to the coarser task-wide booleans"
+ * degradation for exactly that row. See `roundIdentityLogV1.ts`'s own doc
+ * comment for the full design and its own test coverage.
+ *
  * EXTENDED to the Copilot-resolved sealed implementation pipeline (same-day
  * follow-up, blocker "wired only for review rounds"): `runTwoPhaseEditActionV1`
  * (`runEditActionV1.ts`) now accepts optional `taskFolderUri`/`roundId`
@@ -157,19 +233,22 @@
  * Reconciliation sweep status: all three passes are wired in
  * `roundLedgerReconciliationV1.ts`, orchestrated by `reconcileRoundLedgerV1`
  * and called from `TaskActionScheduler.armAll()` (activation + the periodic
- * sweep) — (c) synthesize legacy rows, then (a) close genuine orphans, then
- * (b) repair any terminal row missing its outcome message. Pass (a) now
- * closes a `"scheduled"`/`"open"` row PER ROW — checked against that row's
- * own `operationId`/`intentId` where the row carries one, falling back to the
- * task-wide "no live operation and no live scheduling intent" check only for
- * a row with neither id — regardless of which dispatch path opened it; review
- * rows (`claimReviewAttempt`) and implementation rows
- * (`claimImplementationRoundLedgerV1`) are both live-row-opening paths now;
- * passes (b) and (c) operate on terminal rows and legacy chat messages
- * respectively, so they were never limited to one path's rows.
+ * sweep) — a round-identity backfill runs FIRST (see the "DURABLE AT
+ * ALLOCATION TIME" paragraph above), then (c) synthesize legacy rows, then
+ * (a) close genuine orphans, then (b) repair any terminal row missing its
+ * outcome message. Pass (a) now closes a `"scheduled"`/`"open"` row PER ROW —
+ * checked against that row's own `operationId`/`intentId` where the row
+ * carries one, falling back to the task-wide "no live operation and no live
+ * scheduling intent" check only for a row with neither id — regardless of
+ * which dispatch path opened it; review rows (`claimReviewAttempt`) and
+ * implementation rows (`claimImplementationRoundLedgerV1`) are both
+ * live-row-opening paths now; passes (b) and (c) operate on terminal rows and
+ * legacy chat messages respectively, so they were never limited to one
+ * path's rows.
  */
 import * as vscode from "vscode";
 import {
+  ChecklistRevisionAdoptedV1,
   ImplementationDispatchModeV1,
   RoundLedgerEntryV1,
   RoundLedgerModeV1,
@@ -183,6 +262,7 @@ import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendRoundOutcome, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
+import { backfillRoundIdentityFromLogV1 } from "./roundIdentityLogV1";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
  * value except the two live states. */
@@ -483,6 +563,27 @@ export async function terminalizeRoundV1(
     // Best-effort only — the ledger write above is authoritative and already
     // landed; reconciliation pass (b) repairs a missing outcome message.
   }
+
+  // Opportunistic identity backfill (2026-08-28 review fix, narrowing the
+  // architectural blocker "the actual roundLedger row is updated only when
+  // reconcileRoundLedgerV1 later invokes backfillRoundIdentityFromLogV1 ...
+  // until that sweep, resolveRoundV1 and every live ledger consumer still
+  // lack the allocation identity"): every round's own natural end already
+  // performs a `task-progress.json` write (the terminal write above) — this
+  // reads the round-identity sidecar log and attaches any logged
+  // `operationId`/`attemptId` onto whichever OTHER row on this same task is
+  // still missing it, closing the "must wait for the next periodic/activation
+  // sweep" gap down to "at most one round's worth of latency" for any task
+  // whose rounds end at all, without adding a single write to the
+  // allocation-time hot path the two reverted direct-attach attempts hit (see
+  // `roundIdentityLogV1.ts`'s own doc comment) — this call fires once per
+  // round, at that round's own conclusion, never earlier. Deliberately never
+  // touches the row this call just terminalized (that row's own identity was
+  // already attached via `options.operationId`/`options.attemptId` above);
+  // it can only help SOME OTHER identity-less live/terminal row. Best-effort:
+  // `backfillRoundIdentityFromLogV1` swallows its own failure and never
+  // blocks or delays this function's return.
+  await backfillRoundIdentityFromLogV1(options.taskFolderUri);
 
   return { ok: true, alreadyTerminal: false, entry, progress: patched };
 }
@@ -912,5 +1013,66 @@ export async function attachCoordinatorIdentityToRoundBestEffortV1(
     });
   } catch {
     // Best-effort — never surfaces to the caller, never blocks dispatch.
+  }
+}
+
+export interface RecordChecklistRevisionOnRoundLedgerOptionsV1 {
+  readonly taskFolderUri: vscode.Uri;
+  /** The `roundLedger` row identity this checklist mutation was recorded
+   * under — `ChecklistChangeProposalV1.roundId`. */
+  readonly roundId: string;
+  readonly revision: ChecklistRevisionAdoptedV1;
+}
+
+/**
+ * Annotate the round-ledger row that mutated the checklist with the plan
+ * revision that later formalized the change (Part 6 items 5/19, 2026-08-28
+ * review fix, completion blocker: "the implementation does not append or
+ * update a round-ledger event for 'Plan revised: N → M'" — the durable
+ * record of that completion previously lived only on
+ * `TaskProgress.checklistChangeProposals` and a best-effort chat line, never
+ * on the round ledger the plan names as the sole lifecycle authority).
+ *
+ * Deliberately narrow: this attaches `checklistRevisionAdopted` onto the
+ * EXISTING row named by `roundId` — it never amends that row's own frozen
+ * terminal facts (`state`/`endedAt`/`outcome`, already set when the mutating
+ * round was originally terminalized under Part 6 step 18's guard) and never
+ * opens a NEW row. A plan revision is not itself a dispatched round — it has
+ * no attempt, no provider, no files-changed set of its own — so giving it a
+ * full `RoundLedgerEntryV1` (a new `mode`, a new lifecycle) would be
+ * inventing a "non-dispatch-round ledger concept" this task's own plan
+ * explicitly flags as a genuine architecture decision requiring a human, not
+ * something a review-fix round should decide unilaterally. Annotating the
+ * originating row instead — the same "attach a fact after the fact without
+ * amending what's frozen" precedent `operationId`'s own contract already
+ * establishes — durably answers the concrete question the blocker names
+ * ("was this mutation ever formalized, and into how many items?") without
+ * that decision.
+ *
+ * A no-op when `roundId` resolves to no row (the row was pruned by the
+ * ledger's own 200-row cap in the time since) or when the row already carries
+ * `checklistRevisionAdopted` (attached once, never reassigned, mirroring
+ * every other post-hoc enrichment in this module). Best-effort: swallows its
+ * own failure, matching every other caller of this pattern — the proposal's
+ * own `resolvedAt`/`itemCountBefore`/`itemCountAfter` (set in the SAME
+ * transaction that flips its `status` to `"adopted"`, `taskProgressTransforms.ts`)
+ * remains the durable record of record if this best-effort echo never lands.
+ */
+export async function recordChecklistRevisionOnRoundLedgerV1(
+  options: RecordChecklistRevisionOnRoundLedgerOptionsV1
+): Promise<void> {
+  try {
+    await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
+      const row = resolveRoundV1(current, options.roundId);
+      if (!row || row.checklistRevisionAdopted !== undefined) {
+        return undefined;
+      }
+      return upsertRoundLedgerEntryV1(current, {
+        ...row,
+        checklistRevisionAdopted: options.revision,
+      });
+    });
+  } catch {
+    // Best-effort — never blocks the plan-revision adoption this echoes.
   }
 }

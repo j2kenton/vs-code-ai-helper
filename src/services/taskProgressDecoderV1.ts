@@ -38,6 +38,7 @@ import {
   MAX_REVIEW_SCORE_HISTORY,
   MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
+  PlanRevisionStateV1,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
@@ -145,6 +146,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "roundLedger",
   "blockerSupersessions",
   "checklistChangeProposals",
+  "planRevision",
   "escalation",
   "overriddenEscalations",
   "implementationTypeCheckFailure",
@@ -1032,6 +1034,9 @@ function validateChecklistChangeProposals(
       "proposedItems",
       "removedItems",
       "status",
+      "resolvedAt",
+      "itemCountBefore",
+      "itemCountAfter",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1074,6 +1079,77 @@ function validateChecklistChangeProposals(
     ) {
       return "checklistChangeProposals entry status must be a recognized proposal status";
     }
+    if (entry["resolvedAt"] !== undefined && !isIsoTimestamp(entry["resolvedAt"])) {
+      return "checklistChangeProposals entry resolvedAt must be an ISO timestamp";
+    }
+    if (entry["itemCountBefore"] !== undefined && !isNonNegativeInteger(entry["itemCountBefore"])) {
+      return "checklistChangeProposals entry itemCountBefore must be a non-negative integer";
+    }
+    if (entry["itemCountAfter"] !== undefined && !isNonNegativeInteger(entry["itemCountAfter"])) {
+      return "checklistChangeProposals entry itemCountAfter must be a non-negative integer";
+    }
+  }
+  return undefined;
+}
+
+function validatePlanRevision(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!isPlainObject(value)) {
+    return "planRevision must be an object";
+  }
+  const allowed = new Set([
+    "proposalAt",
+    "startedAt",
+    "stage",
+    "discardedItems",
+    "removedItems",
+    "reason",
+    "journaledPlanRef",
+  ]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `planRevision has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (!isIsoTimestamp(value["proposalAt"])) {
+    return "planRevision.proposalAt must be an ISO timestamp";
+  }
+  if (!isIsoTimestamp(value["startedAt"])) {
+    return "planRevision.startedAt must be an ISO timestamp";
+  }
+  if (typeof value["stage"] !== "string" || resolveStage(value["stage"], family) === undefined) {
+    return "planRevision.stage must be a recognized stage";
+  }
+  const discardedError = validateChecklistItemTextArray(
+    value["discardedItems"],
+    "planRevision.discardedItems"
+  );
+  if (discardedError !== undefined) {
+    return discardedError;
+  }
+  const removedError = validateChecklistItemTextArray(
+    value["removedItems"],
+    "planRevision.removedItems"
+  );
+  if (removedError !== undefined) {
+    return removedError;
+  }
+  if (
+    typeof value["reason"] !== "string" ||
+    value["reason"].length === 0 ||
+    value["reason"].length > MAX_ESCALATION_REASON_LENGTH
+  ) {
+    return "planRevision.reason must be a bounded non-empty string";
+  }
+  if (
+    value["journaledPlanRef"] !== undefined &&
+    (typeof value["journaledPlanRef"] !== "string" ||
+      value["journaledPlanRef"].length === 0 ||
+      value["journaledPlanRef"].length > MAX_ID_LENGTH)
+  ) {
+    return "planRevision.journaledPlanRef must be a bounded non-empty string";
   }
   return undefined;
 }
@@ -1281,6 +1357,7 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
       "state",
       "endedAt",
       "outcome",
+      "checklistRevisionAdopted",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1363,6 +1440,44 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
     if (!isTerminal && entry["outcome"] !== undefined) {
       return "roundLedger entry outcome must be absent while state is scheduled/open";
     }
+    if (entry["checklistRevisionAdopted"] !== undefined) {
+      const revisionError = validateChecklistRevisionAdopted(entry["checklistRevisionAdopted"]);
+      if (revisionError) {
+        return revisionError;
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateChecklistRevisionAdopted(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "roundLedger entry checklistRevisionAdopted must be an object";
+  }
+  const allowed = new Set(["resolvedAt", "itemCountBefore", "itemCountAfter"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `roundLedger entry checklistRevisionAdopted has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (!isIsoTimestamp(value["resolvedAt"])) {
+    return "roundLedger entry checklistRevisionAdopted resolvedAt must be an ISO timestamp";
+  }
+  if (
+    value["itemCountBefore"] !== undefined &&
+    (typeof value["itemCountBefore"] !== "number" ||
+      !Number.isInteger(value["itemCountBefore"]) ||
+      value["itemCountBefore"] < 0)
+  ) {
+    return "roundLedger entry checklistRevisionAdopted itemCountBefore must be a non-negative integer";
+  }
+  if (
+    value["itemCountAfter"] !== undefined &&
+    (typeof value["itemCountAfter"] !== "number" ||
+      !Number.isInteger(value["itemCountAfter"]) ||
+      value["itemCountAfter"] < 0)
+  ) {
+    return "roundLedger entry checklistRevisionAdopted itemCountAfter must be a non-negative integer";
   }
   return undefined;
 }
@@ -2169,6 +2284,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.checklistChangeProposals = value as ChecklistChangeProposalV1[];
+        break;
+      }
+      case "planRevision": {
+        const error = validatePlanRevision(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.planRevision = value as PlanRevisionStateV1;
         break;
       }
       case "escalation": {

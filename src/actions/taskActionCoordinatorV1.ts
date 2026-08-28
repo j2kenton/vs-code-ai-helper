@@ -336,6 +336,26 @@ export interface TaskActionRequestV1 {
     readonly promptSha256: string;
   }) => void;
   /**
+   * Fires SYNCHRONOUSLY the moment an attempt id is allocated
+   * (`session.allocateAttempt()`), strictly earlier than `onPromptAssembled`
+   * (which requires a successful `assembleAttemptPromptV1`) — review blocker,
+   * 2026-08-28 (wf "make the stage chat a record of work" Part 4, narrowed
+   * again): "coordinator allocation sites still do not attach operation and
+   * attempt identities to a round-ledger row ... Failure branches [that occur
+   * before assembly ever runs, e.g. `providerUnavailablePreInvocation` when no
+   * candidate remains] can occur before that callback." An attempt that never
+   * reaches assembly (every candidate exhausted before invocation, or a
+   * `candidateUnavailable` skip) previously left `onPromptAssembled` unfired
+   * for that attempt, so a caller with an already-open `roundLedger` row could
+   * not attach that attempt's id at all — only a later attempt on the SAME
+   * operation that did reach assembly would ever be recorded. This hook fires
+   * for every attempt this coordinator allocates, assembly-eligible or not, so
+   * `attachCoordinatorIdentityToRoundBestEffortV1` can be called from it
+   * instead of (or in addition to) `onPromptAssembled`. Same "best-effort,
+   * never allowed to affect dispatch" contract as `onPromptAssembled`.
+   */
+  readonly onAttemptAllocated?: (info: { readonly attemptId: string; readonly operationId: string }) => void;
+  /**
    * Lifecycle-row-only side channel (plan §6.6's `nextStage.v1`): forwarded
    * verbatim into `LifecycleExecutionContextV1.beforeWrite` for a `"lifecycle"`
    * row and otherwise ignored (a provider row's admission path never reads
@@ -433,6 +453,8 @@ export interface TaskActionResumeRequestV1 {
    * exactly like the fresh-drive field it mirrors.
    */
   readonly onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"];
+  /** See `TaskActionRequestV1.onAttemptAllocated` — identical Resume-drive meaning. */
+  readonly onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"];
 }
 
 /**
@@ -1427,8 +1449,27 @@ export function createTaskActionCoordinatorV1(
      */
     initialCandidateAssembledPrompt?: AssembledAttemptPromptV1,
     /** See `TaskActionRequestV1.onPromptAssembled`. */
-    onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"]
+    onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"],
+    /**
+     * This operation's id, needed so `onAttemptAllocated` can report a full
+     * `{ attemptId, operationId }` pair the moment each attempt is allocated
+     * — every candidate this function reserves shares the one operation
+     * `admitAction`/`executeResume` already allocated before calling in.
+     */
+    operationId?: OperationIdV1,
+    /** See `TaskActionRequestV1.onAttemptAllocated`. */
+    onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"]
   ): Promise<TaskActionOutcomeV1> {
+    const reportAttemptAllocatedV1 = (allocatedAttemptId: string): void => {
+      if (operationId === undefined) {
+        return;
+      }
+      try {
+        onAttemptAllocated?.({ attemptId: allocatedAttemptId, operationId });
+      } catch {
+        // Best-effort observability hook — must never affect dispatch.
+      }
+    };
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
     // released before provider waits).
@@ -1555,6 +1596,7 @@ export function createTaskActionCoordinatorV1(
       } else {
         isFreshCandidateReservationThisIterationV1 = true;
         attemptId = session.allocateAttempt();
+        reportAttemptAllocatedV1(attemptId);
 
         const next = selection.reserveNext(attemptId);
         if (next.kind === "noneRemaining") {
@@ -1831,6 +1873,7 @@ export function createTaskActionCoordinatorV1(
           ) {
             networkFaultRetriesUsedV1++;
             const retryAttemptId = session.allocateAttempt();
+            reportAttemptAllocatedV1(retryAttemptId);
             networkFaultRetryAttemptIdsV1.add(retryAttemptId);
             const retryHandle = session.reserve({
               attemptId: retryAttemptId,
@@ -2400,6 +2443,11 @@ export function createTaskActionCoordinatorV1(
     let initialCandidate: AdmittedProviderActionTicketV1["initialCandidate"] | undefined;
     for (;;) {
       const attemptId = session.allocateAttempt();
+      try {
+        request.onAttemptAllocated?.({ attemptId, operationId });
+      } catch {
+        // Best-effort observability hook — must never affect dispatch.
+      }
       const next = selection.reserveNext(attemptId);
       if (next.kind === "noneRemaining") {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
@@ -2565,7 +2613,9 @@ export function createTaskActionCoordinatorV1(
           ticket.initialCandidate,
           ticket.request.malformedInvocationsAlreadyUsedV1,
           ticket.initialCandidateAssembledPrompt,
-          ticket.request.onPromptAssembled
+          ticket.request.onPromptAssembled,
+          ticket.operationId,
+          ticket.request.onAttemptAllocated
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);
@@ -2915,7 +2965,9 @@ export function createTaskActionCoordinatorV1(
         undefined,
         undefined,
         undefined,
-        request.onPromptAssembled
+        request.onPromptAssembled,
+        operationRef.operationId,
+        request.onAttemptAllocated
       );
       // Best-effort durable mirror of the claimed invocation's terminal
       // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later

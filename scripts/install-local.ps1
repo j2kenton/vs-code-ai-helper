@@ -5,8 +5,8 @@
 
   Deliberately NOT scripts/release.ps1. That script bumps the version, commits,
   tags and publishes to the Marketplace, and refuses to run on a dirty tree.
-  This one exists for the dogfooding loop — testing an uncommitted change in the
-  real editor — so it:
+  This one exists for the dogfooding loop (testing an uncommitted change in the
+  real editor), so it:
     * requires no version bump (installs over the same version with --force)
     * requires no clean tree (testing uncommitted work is the point)
     * publishes nothing
@@ -14,6 +14,11 @@
   A locally installed build is replaced the next time a HIGHER version is
   published to the Marketplace, since the extension is still Marketplace-linked.
   Same-version publishes will not displace it.
+
+  ASCII only, deliberately. npm runs this through `powershell` (Windows
+  PowerShell 5.1), which reads a BOM-less file as ANSI: a UTF-8 em dash decodes
+  to three CP1252 characters, one of which is a double quote, which terminates
+  the surrounding string and produces a parse error far from the real line.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -42,12 +47,14 @@ $version = [string]$package.version
 if (-not $name -or -not $version) {
     throw "package.json is missing 'name' or 'version'."
 }
-$vsixPath = Join-Path $repoRoot "$name-$version.vsix"
+# Braces are required: "$name-$version.vsix" parses as $version.vsix, a
+# property access on the version string, and yields "<name>-.vsix".
+$vsixPath = Join-Path $repoRoot "${name}-${version}.vsix"
 
 $dirty = & git status --porcelain
 if ($dirty) {
     $count = ($dirty | Measure-Object -Line).Lines
-    Write-Host "Packaging working tree with $count uncommitted change(s) — that is the point of this script." -ForegroundColor DarkGray
+    Write-Host "Packaging working tree with $count uncommitted change(s) - that is the point of this script." -ForegroundColor DarkGray
 }
 
 Write-Host ""
@@ -63,7 +70,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if (-not (Test-Path $vsixPath)) {
-    throw "Packaging reported success but $vsixPath was not produced. Check whether package.json's name/version changed mid-build."
+    throw "Packaging reported success but $vsixPath was not produced. Check whether the name or version in package.json changed mid-build."
 }
 
 $sizeMb = [Math]::Round((Get-Item $vsixPath).Length / 1MB, 2)
