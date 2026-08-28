@@ -1403,7 +1403,13 @@ export async function collectCompletionLint(
     retriedPasses,
     missingScripts,
     verificationEnvironment: {
-      cwd: safeCwdForDisclosure(folder),
+      // Normalized, because this field's contract (see its doc comment) is
+      // "the resolved cwd checks ran in" — and since normalizeSpawnCwdV1 the
+      // spawned cwd is not necessarily the `folder` this function received.
+      // Disclosing the un-normalized one would be wrong in exactly the case
+      // this whole disclosure block exists to diagnose: an extension-host run
+      // behaving differently from a terminal run of the same command.
+      cwd: safeCwdForDisclosure(normalizeSpawnCwdV1(folder)),
       packageManager: describePackageManagerVersion(folder, manager),
       envVarNames: Object.keys(process.env).sort(),
     },

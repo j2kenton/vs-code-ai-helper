@@ -734,6 +734,61 @@ export const KNOWN_PROVIDER_READ_CEILING_BYTES_V1: Readonly<Record<string, numbe
 };
 
 /**
+ * Pick the first candidate in an already-ranked chain whose known Read
+ * ceiling the prompt does NOT exceed.
+ *
+ * The advisory below deliberately never refuses a dispatch, because the
+ * ceiling is token-based and variable: a prompt under the floor can still
+ * truncate and one over it can still land fine. That reasoning is sound for
+ * REFUSING, and does not extend to CHOOSING. When the chain already offers a
+ * candidate with no known ceiling problem, preferring it costs nothing and
+ * risks nothing — the rejected candidate keeps its place for every future
+ * round whose prompt fits.
+ *
+ * Why this exists (jester, 2026-08-28 14:38): a 66,136-byte prompt was
+ * dispatched to `kimi-cli`, whose ceiling is 66,000. The advisory fired
+ * correctly BEFORE dispatch and was shown as a warning — then the round ran
+ * anyway. kimi read a truncated prompt, announced "the file is too large for
+ * a single read; I'll page through it in chunks", emitted nothing else, and
+ * the 154-byte result was rejected as degenerate — after overwriting the
+ * stage's previous accepted review. Every fact needed to avoid that was
+ * known before the round started.
+ *
+ * Returns undefined when nothing better is available: no ranked candidates,
+ * the head already fits, or every candidate exceeds its ceiling. Undefined
+ * means "change nothing" — the caller dispatches as it would have, keeping
+ * the advisory. Pure; no settings or provider I/O.
+ */
+export function preferCandidateWithinReadCeilingV1(
+  rankedStoredIds: readonly string[],
+  promptByteLength: number | undefined,
+  providerIdOf: (storedModelId: string) => string | undefined
+): string | undefined {
+  if (promptByteLength === undefined || rankedStoredIds.length === 0) {
+    return undefined;
+  }
+  const exceedsCeiling = (storedModelId: string): boolean => {
+    const providerId = providerIdOf(storedModelId);
+    if (providerId === undefined) {
+      // Unknown provider: no known ceiling, so nothing to avoid. Treated as
+      // fitting rather than as suspect — the same fail-open stance the
+      // advisory takes for providers absent from the ceiling table.
+      return false;
+    }
+    const ceiling = KNOWN_PROVIDER_READ_CEILING_BYTES_V1[providerId];
+    return ceiling !== undefined && promptByteLength > ceiling;
+  };
+  // The head is what would be dispatched. If it fits, there is nothing to do
+  // — never reorder a chain the user configured for any other reason.
+  if (!exceedsCeiling(rankedStoredIds[0]!)) {
+    return undefined;
+  }
+  // Cannot return the head: it was just shown to exceed, and `exceedsCeiling`
+  // is deterministic per id, so `find` skips it (and any duplicate of it).
+  return rankedStoredIds.find((id) => !exceedsCeiling(id));
+}
+
+/**
  * Advisory text when an assembled prompt exceeds a provider's known Read
  * ceiling (wf10 item 7c / Part 6 step 16). Never a hard rejection — the
  * ceiling is token-based/variable and the prompt is measured in bytes, so a

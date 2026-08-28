@@ -13,6 +13,7 @@ import {
   detectBlockerSetStall,
   detectPlateau,
   isProviderExhaustionReplyShapeV1,
+  preferCandidateWithinReadCeilingV1,
   promptCeilingAdvisoryV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
@@ -1395,6 +1396,68 @@ void describe("promptCeilingAdvisoryV1 (wf10 item 7c / Part 6 step 16)", () => {
     assert.match(advisory, /70000 bytes/);
     assert.match(advisory, /kimi-cli/);
     assert.match(advisory, /Shrink the prompt|route this stage/);
+  });
+});
+
+void describe("preferCandidateWithinReadCeilingV1", () => {
+  // kimi-cli is the only entry in KNOWN_PROVIDER_READ_CEILING_BYTES_V1
+  // (66,000). Stored ids are opaque here — the mapping to a provider id is
+  // the caller's, so these tests supply it directly rather than resolving
+  // real settings.
+  const providerIdOf = (storedModelId: string): string | undefined =>
+    storedModelId.startsWith("kimi") ? "kimi-cli" : storedModelId.startsWith("unknown") ? "mystery-cli" : "codex-cli";
+
+  void it("returns undefined when the head already fits", () => {
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["codex-a", "kimi-b"], 70000, providerIdOf),
+      undefined,
+      "a chain whose head has no ceiling problem must never be reordered"
+    );
+  });
+
+  void it("prefers the first fitting backup when the head exceeds its ceiling", () => {
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "codex-b", "codex-c"], 70000, providerIdOf),
+      "codex-b"
+    );
+  });
+
+  void it("returns undefined when every candidate exceeds its ceiling", () => {
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "kimi-b"], 70000, providerIdOf),
+      undefined,
+      "nothing better exists, so the caller dispatches as it would have"
+    );
+  });
+
+  void it("treats a provider with no known ceiling as fitting", () => {
+    // Fail open, matching promptCeilingAdvisoryV1: absence of a measured
+    // ceiling is not evidence of a small one.
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "unknown-b"], 70000, providerIdOf),
+      "unknown-b"
+    );
+  });
+
+  void it("treats a prompt exactly at the ceiling as fitting", () => {
+    // Boundary must match promptCeilingAdvisoryV1, which advises only on
+    // `> ceiling` — the two must never disagree about the same prompt.
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "codex-b"], 66000, providerIdOf),
+      undefined
+    );
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "codex-b"], 66001, providerIdOf),
+      "codex-b"
+    );
+  });
+
+  void it("returns undefined for an empty chain or an unknown prompt size", () => {
+    assert.equal(preferCandidateWithinReadCeilingV1([], 70000, providerIdOf), undefined);
+    assert.equal(
+      preferCandidateWithinReadCeilingV1(["kimi-a", "codex-b"], undefined, providerIdOf),
+      undefined
+    );
   });
 });
 

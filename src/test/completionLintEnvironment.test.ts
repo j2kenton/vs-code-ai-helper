@@ -162,8 +162,8 @@ void describe("buildVerifiedChecksSection — environment rendering (fixture-bas
  * host and unreproducible in a plain shell". Twice now — worth a guard rather
  * than a comment.
  */
-describe("normalizeSpawnCwdV1", () => {
-  it("uppercases a lowercase Windows drive letter", () => {
+void describe("normalizeSpawnCwdV1", () => {
+  void it("uppercases a lowercase Windows drive letter", () => {
     assert.equal(
       normalizeSpawnCwdV1("c:\\dev\\PERSONAL\\jester\\apps\\server"),
       "C:\\dev\\PERSONAL\\jester\\apps\\server"
@@ -174,18 +174,18 @@ describe("normalizeSpawnCwdV1", () => {
     );
   });
 
-  it("leaves an already-uppercase drive letter untouched", () => {
+  void it("leaves an already-uppercase drive letter untouched", () => {
     assert.equal(normalizeSpawnCwdV1("C:\\dev\\x"), "C:\\dev\\x");
   });
 
-  it("only touches the drive letter, never the rest of the path", () => {
+  void it("only touches the drive letter, never the rest of the path", () => {
     // Deliberately mixed-case after the drive: normalizing more than the
     // first character would break a case-sensitive lookup on a POSIX host and
     // change nothing useful on Windows.
     assert.equal(normalizeSpawnCwdV1("d:/Dev/MiXeD/Case"), "D:/Dev/MiXeD/Case");
   });
 
-  it("returns POSIX and UNC paths unchanged", () => {
+  void it("returns POSIX and UNC paths unchanged", () => {
     assert.equal(normalizeSpawnCwdV1("/home/user/project"), "/home/user/project");
     assert.equal(
       normalizeSpawnCwdV1("\\\\server\\share\\project"),

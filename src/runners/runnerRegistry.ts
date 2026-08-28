@@ -1564,7 +1564,7 @@ interface V1CandidateV1 {
  * when no primary is configured — the same legacy misconfiguration error
  * selection surfaces.
  */
-function rankedStageChainStoredIdsV1(
+export function rankedStageChainStoredIdsV1(
   stage: TaskStage | undefined,
   modelId: string | undefined
 ): string[] {
