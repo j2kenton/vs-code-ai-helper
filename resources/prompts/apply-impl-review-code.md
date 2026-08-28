@@ -19,6 +19,8 @@ Read the approved plan, implementation notes, and review below, then:
 
    Scope: the whole plan is THIS task's, and `M` counts every step in it. A plan delivered in parts is still one task's work, so a part the plan claims to assign to a separate or follow-up task is not a boundary — continue into it in the plan's own order when the earlier parts are done. Build in order rather than jumping ahead: implementing a later part before the foundations it rests on is a worse outcome than a round that builds fewer steps well. If the plan's own text conflicts with this (it declares a division across tasks, or its marker counts only a slice), follow the plan's ORDER but the full denominator, and say so plainly in your summary.
 
+9. Never add, remove, or renumber checklist items in `plan-final.md` yourself, even to record discovered work or a needed decision — raise it as a blocker for a human to decide instead. If an item turns out to be genuinely not applicable (descoped, superseded by other work already built, or a branch not taken), do not delete it or renumber the list: append the literal marker `<!-- ensemble:excluded -->` to its own line, after a short note of why. A round's edit to the checklist item SET (not its tick state) is detected and reverted automatically — the discarded delta is recorded, not banked as progress.
+
 The approved plan is the binding delivery contract. Implementation notes are
 historical evidence, not approval to reduce, substitute, or defer a plan
 requirement. Do not claim the plan is unavailable: it is included below. When

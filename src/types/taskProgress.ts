@@ -415,6 +415,19 @@ export interface TaskProgress {
    */
   roundLedger?: RoundLedgerEntryV1[];
   /**
+   * Durable record of a round that tried to add, remove, or renumber a
+   * checklist item in `plan-final.md` (wf "make the stage chat a record of
+   * work" Part 6 / item 5): "a round never mutates the checklist" is a
+   * standing rule, so a caught mutation is always reverted the same round it
+   * happens (`detectChecklistItemSetMutationV1`, `implementationChecklist.ts`)
+   * — this array is the visible trace of that reversal, and the anchor a
+   * `checklistChangeProposed` `WorkflowDecisionV1` resolves against. A round
+   * never writes a SECOND entry for the same reverted delta; `status`
+   * transitions from `"pending"` in place once the user answers the decision.
+   * Capped at MAX_CHECKLIST_CHANGE_PROPOSALS (oldest dropped first).
+   */
+  checklistChangeProposals?: ChecklistChangeProposalV1[];
+  /**
    * Set when automated review iteration determined it cannot make further
    * progress on its own and needs a human decision. Cleared on the next
    * stage transition and whenever the user explicitly resumes iteration.
@@ -922,6 +935,34 @@ export interface BlockerSupersessionRecordV1 {
    */
   source?: "chat-confirmed" | "plan-non-goal";
 }
+
+/** One row of `TaskProgress.checklistChangeProposals` (wf "make the stage
+ * chat a record of work" Part 6 / item 5). */
+export interface ChecklistChangeProposalV1 {
+  /** ISO timestamp the mutation was caught and reverted. */
+  at: string;
+  /** This round's own round-ledger row identity, for correlation with the
+   * run log that recorded the discarded delta. */
+  roundId: string;
+  /** The stage the round was dispatched at when it mutated the checklist. */
+  stage: TaskStage;
+  /** How the item set changed, before it was reverted. */
+  kind: "added" | "removed" | "renumbered";
+  /** The item texts the round tried to add (for `"added"`/`"renumbered"`) —
+   * exactly as they appeared in the round's own edit, before being discarded. */
+  proposedItems: readonly string[];
+  /** The item texts the round's edit dropped (for `"removed"`/`"renumbered"`),
+   * verbatim from the pre-round plan of record. */
+  removedItems: readonly string[];
+  /** `"pending"` until a `checklistChangeProposed` decision is answered;
+   * `"revising"` while a chosen plan revision (Part 6 / item 19) is in
+   * flight; `"discarded"` if the user declined the proposal; `"adopted"`
+   * once a revision incorporating it lands. */
+  status: "pending" | "revising" | "discarded" | "adopted";
+}
+
+/** Cap on `TaskProgress.checklistChangeProposals` length (oldest entries dropped first). */
+export const MAX_CHECKLIST_CHANGE_PROPOSALS = 50;
 
 /** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
 export const MAX_BLOCKER_SUPERSESSIONS = 50;

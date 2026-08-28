@@ -46,6 +46,7 @@ import {
   collectChecklistItemKeysV1,
   collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
+  detectChecklistItemSetMutationV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
   filterUncheckedPlanItemsV1,
   formatChecklistPercentV1,
@@ -498,6 +499,62 @@ void describe("formatChecklistPercentV1 — floors, and 100% means every item is
     // 999999 of 1000000 floors to 99.9999...% — must still read as 99%, not
     // 100%, however close settled gets without actually reaching total.
     assert.equal(formatChecklistPercentV1(999999, 1000000), 99);
+  });
+});
+
+// wf "make the stage chat a record of work", Part 6 / item 5: "a round never
+// mutates the checklist" — this is the pure detector the guard in
+// executeImplementationRun (reviewActions.ts) consults before banking a
+// round's checklist merge. mergeChecklistProgressV1 itself never adds,
+// removes, or renumbers items (only flips existing checkboxes), so under
+// ordinary operation before/after always key-match; a mismatch can only come
+// from a round directly editing plan-final.md's item list.
+void describe("detectChecklistItemSetMutationV1 — the checklist-mutation guard's detector", () => {
+  const BEFORE = ["## Plan", "", "- [ ] Add the resolver", "- [ ] Wire the decoder"].join("\n");
+
+  void it("returns undefined when the item set is unchanged, even if tick state changed", () => {
+    const after = ["## Plan", "", "- [x] Add the resolver", "- [ ] Wire the decoder"].join("\n");
+    assert.equal(detectChecklistItemSetMutationV1(BEFORE, after), undefined);
+  });
+
+  void it("detects a pure addition", () => {
+    const after = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "- [ ] Wire the decoder",
+      "- [ ] Present the remaining sites to a human reviewer",
+    ].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(BEFORE, after);
+    assert.ok(mutation);
+    assert.equal(mutation.kind, "added");
+    assert.deepEqual(mutation.addedItems, ["Present the remaining sites to a human reviewer"]);
+    assert.deepEqual(mutation.removedItems, []);
+  });
+
+  void it("detects a pure removal", () => {
+    const after = ["## Plan", "", "- [ ] Add the resolver"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(BEFORE, after);
+    assert.ok(mutation);
+    assert.equal(mutation.kind, "removed");
+    assert.deepEqual(mutation.addedItems, []);
+    assert.deepEqual(mutation.removedItems, ["Wire the decoder"]);
+  });
+
+  void it("detects a renumbering (reworded item text) as both added and removed", () => {
+    const after = ["## Plan", "", "- [ ] Add the resolver", "- [ ] Wire the decoder into the reader"].join(
+      "\n"
+    );
+    const mutation = detectChecklistItemSetMutationV1(BEFORE, after);
+    assert.ok(mutation);
+    assert.equal(mutation.kind, "renumbered");
+    assert.deepEqual(mutation.addedItems, ["Wire the decoder into the reader"]);
+    assert.deepEqual(mutation.removedItems, ["Wire the decoder"]);
+  });
+
+  void it("is insensitive to excluded-marker and whitespace normalization", () => {
+    const after = ["## Plan", "", "- [ ] Add the resolver", "- [ ]  Wire the decoder  "].join("\n");
+    assert.equal(detectChecklistItemSetMutationV1(BEFORE, after), undefined);
   });
 });
 

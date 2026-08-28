@@ -3733,7 +3733,7 @@ void describe("describeOutstandingChecklistItemsV1", () => {
     ].join("\n");
     assert.equal(
       describeOutstandingChecklistItemsV1(plan),
-      "\n- Wire the completeness gate\n- Add the retry button"
+      "\n- ☐ Wire the completeness gate\n- ☐ Add the retry button"
     );
   });
 
@@ -3747,7 +3747,7 @@ void describe("describeOutstandingChecklistItemsV1", () => {
     ].join("\n");
     assert.equal(
       describeOutstandingChecklistItemsV1(plan, 2),
-      "\n- item one\n- item two\n…and 1 more."
+      "\n- ☐ item one\n- ☐ item two\n…and 1 more."
     );
   });
 });

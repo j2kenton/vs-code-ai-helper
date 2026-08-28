@@ -64,6 +64,7 @@ import {
   runImplementationForModel,
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
+import { attachCoordinatorIdentityToRoundBestEffortV1 } from "../utils/roundLedgerV1";
 import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../utils/modelSelection";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
@@ -464,6 +465,25 @@ export interface RunTwoPhaseEditOptionsV1 {
   /** The model/quota stage `stageModelId` was resolved against — see checkEditActionAvailabilityV1's `stage` param. */
   readonly modelStage: TaskStage;
   readonly cancellationToken: vscode.CancellationToken;
+  /**
+   * This round's own `roundLedger` row identity (e.g.
+   * `executeImplementationRun`'s `implRoundId`, claimed via
+   * `claimImplementationRoundLedgerV1` before this dispatch), and the task
+   * folder it lives under — when both are supplied, every coordinator
+   * attempt this call makes is attached to that row AT ALLOCATION TIME via
+   * `attachCoordinatorIdentityToRoundBestEffortV1`, the same pattern
+   * `runReviewForFolder`/`resumeReviewInteractionV1` already use for review
+   * rounds (Part 4 architectural fix, 2026-08-27 review follow-up: "the
+   * Copilot-resolved sealed implementation pipeline ... does not yet expose
+   * [`onPromptAssembled`] as a live callback to its own caller ... merges
+   * every captured attempt into the RETURNED result instead, after the round
+   * ends"). Optional and best-effort — a caller with no round-ledger row yet
+   * (or no `taskFolderUri`, e.g. a workspace-scoped run with no bound task)
+   * simply gets the pre-existing behavior of capturing attempts onto the
+   * returned result only.
+   */
+  readonly taskFolderUri?: vscode.Uri;
+  readonly roundId?: string;
 }
 
 /** SHA-256 the plan must echo (§7.3): digest of the exact prompt bytes. */
@@ -522,6 +542,18 @@ export async function runTwoPhaseEditActionV1(
     cancellationToken: options.cancellationToken,
     onPromptAssembled: (info) => {
       capturedAssembledPromptAttempts.push(info);
+      // Attach at allocation time, not only when this function's own return
+      // value is later inspected — see this field's doc comment on
+      // `RunTwoPhaseEditOptionsV1`. Best-effort and never awaited, mirroring
+      // `onPromptAssembled`'s own "never allowed to affect dispatch" contract.
+      if (options.taskFolderUri && options.roundId) {
+        void attachCoordinatorIdentityToRoundBestEffortV1({
+          taskFolderUri: options.taskFolderUri,
+          roundId: options.roundId,
+          operationId: info.operationId,
+          attemptId: info.attemptId,
+        });
+      }
     },
   });
   const capturedAssembledPrompt =
@@ -770,6 +802,11 @@ export interface RunSealedImplementationOptionsV1 {
    */
   readonly taskStage?: TaskStage;
   readonly taskFolderUri?: vscode.Uri;
+  /** This round's own `roundLedger` row identity, when the caller already
+   * claimed one — see `RunTwoPhaseEditOptionsV1.roundId`'s doc comment.
+   * Forwarded unchanged into the sealed pipeline's `onPromptAssembled`
+   * attachment; has no effect without `taskFolderUri` also set. */
+  readonly roundId?: string;
   /** Mirrors the retired runner option: false lets a no-op plan complete. */
   readonly requireFileChange?: boolean;
   /**
@@ -939,6 +976,8 @@ export async function runSealedImplementationV1(
     stageModelId: options.modelId,
     modelStage: stage,
     cancellationToken: options.token,
+    taskFolderUri: options.taskFolderUri,
+    roundId: options.roundId,
   });
 
   const runnerId = "copilot-lm";

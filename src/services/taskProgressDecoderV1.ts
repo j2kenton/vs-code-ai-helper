@@ -26,10 +26,12 @@
  */
 import {
   BlockerSupersessionRecordV1,
+  ChecklistChangeProposalV1,
   ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
   MAX_BLOCKER_SUPERSESSIONS,
+  MAX_CHECKLIST_CHANGE_PROPOSALS,
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
@@ -142,6 +144,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "roundOutcomes",
   "roundLedger",
   "blockerSupersessions",
+  "checklistChangeProposals",
   "escalation",
   "overriddenEscalations",
   "implementationTypeCheckFailure",
@@ -238,6 +241,18 @@ const ROUND_LEDGER_STATES: ReadonlySet<string> = new Set([
   "dropped",
   "interrupted",
 ]);
+const CHECKLIST_CHANGE_PROPOSAL_KINDS: ReadonlySet<string> = new Set([
+  "added",
+  "removed",
+  "renumbered",
+]);
+const CHECKLIST_CHANGE_PROPOSAL_STATUSES: ReadonlySet<string> = new Set([
+  "pending",
+  "revising",
+  "discarded",
+  "adopted",
+]);
+const MAX_CHECKLIST_CHANGE_PROPOSAL_ITEMS = 200;
 
 /** Bounded-representation limits for strict field validation. */
 const MAX_NAME_LENGTH = 4096;
@@ -981,6 +996,83 @@ function validateBlockerSupersessions(
     const source = entry["source"];
     if (source !== undefined && source !== "chat-confirmed" && source !== "plan-non-goal") {
       return "blockerSupersessions entry source must be chat-confirmed or plan-non-goal";
+    }
+  }
+  return undefined;
+}
+
+function validateChecklistItemTextArray(value: unknown, fieldLabel: string): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_CHECKLIST_CHANGE_PROPOSAL_ITEMS) {
+    return `${fieldLabel} must be a bounded array`;
+  }
+  for (const item of value as unknown[]) {
+    if (typeof item !== "string" || item.length === 0 || item.length > MAX_ESCALATION_REASON_LENGTH) {
+      return `${fieldLabel} entries must be bounded non-empty strings`;
+    }
+  }
+  return undefined;
+}
+
+function validateChecklistChangeProposals(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_CHECKLIST_CHANGE_PROPOSALS) {
+    return "checklistChangeProposals must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "checklistChangeProposals entries must be objects";
+    }
+    const allowed = new Set([
+      "at",
+      "roundId",
+      "stage",
+      "kind",
+      "proposedItems",
+      "removedItems",
+      "status",
+    ]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `checklistChangeProposals entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (!isIsoTimestamp(entry["at"])) {
+      return "checklistChangeProposals entry at must be an ISO timestamp";
+    }
+    if (
+      typeof entry["roundId"] !== "string" ||
+      entry["roundId"].length === 0 ||
+      entry["roundId"].length > MAX_ID_LENGTH
+    ) {
+      return "checklistChangeProposals entry roundId must be a bounded non-empty string";
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "checklistChangeProposals entry stage must be a recognized stage";
+    }
+    if (typeof entry["kind"] !== "string" || !CHECKLIST_CHANGE_PROPOSAL_KINDS.has(entry["kind"])) {
+      return "checklistChangeProposals entry kind must be a recognized mutation kind";
+    }
+    const proposedError = validateChecklistItemTextArray(
+      entry["proposedItems"],
+      "checklistChangeProposals entry proposedItems"
+    );
+    if (proposedError !== undefined) {
+      return proposedError;
+    }
+    const removedError = validateChecklistItemTextArray(
+      entry["removedItems"],
+      "checklistChangeProposals entry removedItems"
+    );
+    if (removedError !== undefined) {
+      return removedError;
+    }
+    if (
+      typeof entry["status"] !== "string" ||
+      !CHECKLIST_CHANGE_PROPOSAL_STATUSES.has(entry["status"])
+    ) {
+      return "checklistChangeProposals entry status must be a recognized proposal status";
     }
   }
   return undefined;
@@ -2069,6 +2161,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.blockerSupersessions = value as BlockerSupersessionRecordV1[];
+        break;
+      }
+      case "checklistChangeProposals": {
+        const error = validateChecklistChangeProposals(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.checklistChangeProposals = value as ChecklistChangeProposalV1[];
         break;
       }
       case "escalation": {

@@ -40,12 +40,19 @@ import {
 } from "../utils/reviewEvidenceNormalizerV1";
 import {
   appendCoversAnnotationV1,
+  formatChecklistItemGlyphV1,
   listOutstandingManualVerificationItemsV1,
   parseChecklistItemCoversV1,
   parseChecklistItemPriorityV1,
   parseChecklistItemStepNumberV1,
 } from "../utils/implementationChecklist";
 import { ReviewBlocker } from "../utils/reviewReadiness";
+
+/** Glyph for a genuinely open (unticked, non-excluded) checklist item — every
+ * item this file's evidence blocks name is drawn from an unticked-items list,
+ * so this is always `☐` in practice; shared via {@link formatChecklistItemGlyphV1}
+ * so the vocabulary matches every other UI list of checklist items. */
+const OPEN_ITEM_GLYPH = formatChecklistItemGlyphV1({ checked: false, excluded: false });
 
 type ReconcileArg =
   | { task?: IncompleteTask }
@@ -320,7 +327,7 @@ async function gatherReconcileEvidenceV1(
     detail:
       unchecked.total === 0
         ? "None — the checklist already shows every item complete."
-        : `${unchecked.total} item(s) unticked:\n${unchecked.items.map((item) => `- ${item}`).join("\n")}${uncheckedMore}`,
+        : `${unchecked.total} item(s) unticked:\n${unchecked.items.map((item) => `- ${OPEN_ITEM_GLYPH} ${item}`).join("\n")}${uncheckedMore}`,
   });
 
   evidence.push({
@@ -348,7 +355,9 @@ async function gatherReconcileEvidenceV1(
       detail:
         `${pendingOperationEvidence.length} unticked item(s) have lexical corroboration from this round's own ` +
         `applied operations — not a reviewer's judgement, so none of these were ticked:\n` +
-        pendingOperationEvidence.map(({ item, evidence: itemEvidence }) => `- ${item} — ${itemEvidence}`).join("\n"),
+        pendingOperationEvidence
+          .map(({ item, evidence: itemEvidence }) => `- ${OPEN_ITEM_GLYPH} ${item} — ${itemEvidence}`)
+          .join("\n"),
     });
   }
 
@@ -369,7 +378,7 @@ async function gatherReconcileEvidenceV1(
       label: "Review-verified evidence (pending explicit selection, not ticked automatically)",
       detail:
         `${coveredItems.length} unticked item(s) are named verified complete by an implementation review ` +
-        `already on file:\n${coveredItems.map((item) => `- ${item}`).join("\n")}`,
+        `already on file:\n${coveredItems.map((item) => `- ${OPEN_ITEM_GLYPH} ${item}`).join("\n")}`,
     });
   }
   for (const entry of perStage) {
@@ -382,7 +391,7 @@ async function gatherReconcileEvidenceV1(
       detail:
         `Readiness: ${entry.readiness}. ` +
         (entry.matches.length > 0
-          ? `Names ${entry.matches.length} of the unticked item(s) above as verified complete:\n${entry.matches.map((item) => `- ${item}`).join("\n")}`
+          ? `Names ${entry.matches.length} of the unticked item(s) above as verified complete:\n${entry.matches.map((item) => `- ${OPEN_ITEM_GLYPH} ${item}`).join("\n")}`
           : "Names none of the currently unticked items as verified complete."),
     });
   }

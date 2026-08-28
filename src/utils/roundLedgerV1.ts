@@ -53,14 +53,24 @@
  * `operationId` for its entire live window, not only from its terminal write
  * onward, so a crash mid-round leaves a row reconciliation
  * (`roundLedgerReconciliationV1.ts`) can check per-identity rather than
- * falling back to the task-wide liveness booleans. See
- * `attachCoordinatorIdentityToRoundBestEffortV1`'s own doc comment for what
- * remains unwired (the Copilot-resolved sealed implementation pipeline) and
- * why (a change to the shared two-phase edit-action driver with no existing
- * round-trip test, the same class of risk already declined in this task's
- * Accepted Non-Goals for Part 2 Step 7). CLI-resolved implementation rounds
- * never reach this coordinator at all and remain the separate, larger,
- * already-documented residual gap below.
+ * falling back to the task-wide liveness booleans.
+ *
+ * EXTENDED to the Copilot-resolved sealed implementation pipeline (same-day
+ * follow-up, blocker "wired only for review rounds"): `runTwoPhaseEditActionV1`
+ * (`runEditActionV1.ts`) now accepts optional `taskFolderUri`/`roundId`
+ * options and, when both are supplied, attaches identity from inside its OWN
+ * `onPromptAssembled` closure — the same allocation-time hook, reached via the
+ * SAME coordinator call every Copilot-resolved implementation/Fast-Forward/
+ * Apply-Review dispatch already makes, rather than a new code path. Threaded
+ * from `executeImplementationRun` (`reviewActions.ts`), which passes its own
+ * already-claimed `implRoundId` (`claimImplementationRoundLedgerV1`) straight
+ * through `runImplementationOrSealedV1`/`runSealedImplementationV1`'s shared
+ * `options` spread. Not wired at the `lint.v1` call site
+ * (`runLintingFixes.ts`), which claims no `roundLedger` row at all — an
+ * absent `roundId` is a no-op there, matching prior behavior exactly. See
+ * `attachCoordinatorIdentityToRoundBestEffortV1`'s own doc comment for the
+ * one path this still does not reach (CLI-resolved implementation rounds,
+ * which never go through this coordinator at all) and why.
  *
  * PARTIALLY WIRED into the automation-dispatch path (2026-08-27 review
  * follow-up, revised again the same day): `automationChain.ts` now opens a
@@ -855,23 +865,28 @@ export interface AttachCoordinatorIdentityToRoundOptionsV1 {
  * is merely observing (mirrors `onPromptAssembled`'s own "never allowed to
  * affect dispatch" contract).
  *
- * Wired so far only into the review-round path (`runReviewForFolder`'s
- * initial dispatch and `resumeReviewInteractionV1`'s resume drive,
- * `reviewActions.ts`) — the majority of real automatic dispatches (auto-
- * review, auto-advance, Fast Forward, the periodic recovery sweep all
- * dispatch review commands). The Copilot-resolved sealed implementation
- * pipeline (`runTwoPhaseEditActionV1`, `runEditActionV1.ts`) also fires
- * `onPromptAssembled`, but does not yet expose it as a live callback to ITS
- * OWN caller (`runSealedImplementationV1`/`runImplementationOrSealedV1`
- * merge every captured attempt into the RETURNED result instead, after the
- * round ends) — extending that is a change to the shared two-phase edit-
- * action driver with no existing host-level round-trip test to verify it
- * against (the same class of risk this task's Accepted Non-Goals section
- * already declined for Part 2 Step 7's prompt retention) and is left as
- * further work, not attempted here. CLI-resolved implementation rounds never
- * go through this coordinator at all (`runImplementationForModel` /
- * `runImplementationWithCli`) and remain the separate, larger, already-
- * documented residual gap this module's own header describes.
+ * Wired into the review-round path (`runReviewForFolder`'s initial dispatch
+ * and `resumeReviewInteractionV1`'s resume drive, `reviewActions.ts`) and,
+ * as of the same-day follow-up fixing the "wired only for review rounds"
+ * blocker, into the Copilot-resolved sealed implementation pipeline too:
+ * `runTwoPhaseEditActionV1` (`runEditActionV1.ts`) now calls this from its
+ * OWN `onPromptAssembled` closure whenever its caller supplies both
+ * `taskFolderUri` and `roundId` — `runSealedImplementationV1`/
+ * `runImplementationOrSealedV1` forward those two fields straight through
+ * (they share `RunSealedImplementationOptionsV1` via an object spread), and
+ * `executeImplementationRun` is the one caller that supplies them, passing
+ * its own already-claimed `implRoundId`. This covers every real Copilot-
+ * resolved implementation/Fast-Forward/Apply-Review dispatch, since they all
+ * share that one function. The `lint.v1` call site (`runLintingFixes.ts`)
+ * claims no `roundLedger` row and so passes neither field — an absent
+ * `roundId` is simply a no-op, not a gap this blocker is about.
+ *
+ * CLI-resolved implementation rounds still never go through this coordinator
+ * at all (`runImplementationForModel` / `runImplementationWithCli`) and
+ * remain the separate, larger, already-documented residual gap this module's
+ * own header describes — there is no coordinator `operationId`/`attemptId`
+ * for those rounds to attach in the first place, so `resolveRoundV1` can only
+ * ever find them by their own `promptRoundId`/`attemptId`.
  */
 export async function attachCoordinatorIdentityToRoundBestEffortV1(
   options: AttachCoordinatorIdentityToRoundOptionsV1

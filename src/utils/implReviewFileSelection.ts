@@ -62,9 +62,30 @@ export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
  * prompt actually weighed, which nothing retains. 30000 is chosen to leave
  * margin for that uncertainty, not because 55000 would fail the arithmetic.
  *
- * TEMPORARY — delete this constant, do not re-tune it. It is the third guess
- * at a number that is not knowable in advance, and each guess has held for
- * about three weeks. The fix is item 9 of workflow 11
+ * Lowered 30000 -> 15000 (2026-08-27 23:49, fourth live rejection — workflow
+ * 11 again, run 089). Nothing grew anomalously this time; everything grew
+ * normally and the sum crossed the line again. Measured composition at the
+ * rejection: context pack 92,449 (of which `task.md` alone is 55,678),
+ * `plan.md` 73,859, `impl-summary.md` 48,418, template 8,804, non-goals
+ * ~3,400 — 226,930 before `{{verifiedChecks}}` and `{{ownerDecisions}}`.
+ *
+ * Derived as before: a 30000 cap was in force, so
+ *   non_content > 262144/1.045 - 30000 = 220,855
+ * The lowering sheds exactly 15,000, which clears the limit only if the
+ * overshoot was under that. This is a THIN margin, chosen deliberately with
+ * the owner ("if it buys us a day that should be enough") over a larger cut
+ * that would gut review coverage further. Expect it to hold days, not weeks:
+ * `impl-summary.md` grows every round, so this recurs on a schedule.
+ *
+ * Note the review-quality cost is now material. 15,000 characters across 30+
+ * changed files means most arrive as a name plus a token excerpt. A reviewer
+ * working from the pack alone can no longer meaningfully read the diff, and a
+ * shallow or hedged review is the expected symptom — not a model failure.
+ *
+ * TEMPORARY — delete this constant, do not re-tune it. It is the fourth guess
+ * at a number that is not knowable in advance, and the interval between
+ * guesses has collapsed from three weeks to a single day. The fix is item 9 of
+ * workflow 11
  * (`.ensemble/2026-08-24_task_1`): measure the assembled input against the
  * canonical limit BEFORE dispatch and shed content until it fits. When that
  * lands, the budget for embedded file contents is a computed remainder and
@@ -73,7 +94,7 @@ export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
  * thing standing between a growing task and an undiagnosable
  * `chatTransaction.chatTransactionRejected`.
  */
-export const IMPL_REVIEW_MAX_TOTAL_CHARS = 30000;
+export const IMPL_REVIEW_MAX_TOTAL_CHARS = 15000;
 
 /**
  * Workflow findings round 8, item 1 (fixes 1 and 5): the flat 8 KB

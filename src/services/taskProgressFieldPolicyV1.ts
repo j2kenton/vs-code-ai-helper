@@ -261,6 +261,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve (durable chat-resolved-blocker trail — parity with reviewRejections).",
     reopen: "Preserve (durable chat-resolved-blocker trail — parity with reviewRejections).",
   },
+  checklistChangeProposals: {
+    migration: "Validate bounded exact-shape entry array; preserve.",
+    nextStage: "Preserve (durable checklist-mutation-guard trail — a round's caught mutation attempt is evidence about the plan, not the departing stage).",
+    markTaskDone: "Preserve (durable checklist-mutation-guard trail).",
+    reopen: "Preserve (durable checklist-mutation-guard trail).",
+  },
   escalation: {
     migration: "Validate exact shape; preserve.",
     nextStage:
@@ -440,6 +446,7 @@ export function applyNextStagePolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     blockerSupersessions: progress.blockerSupersessions,
+    checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
@@ -501,6 +508,7 @@ export function applyMarkTaskDonePolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     blockerSupersessions: progress.blockerSupersessions,
+    checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
@@ -601,6 +609,7 @@ export function applyReopenPolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     blockerSupersessions: progress.blockerSupersessions,
+    checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,

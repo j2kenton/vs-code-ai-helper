@@ -904,6 +904,32 @@ export function formatChecklistPercentV1(settled: number, total: number): number
   return Math.min(99, Math.floor((settled / total) * 100));
 }
 
+/**
+ * Tri-state glyph for one checklist item, matching {@link ChecklistProgressV1}'s
+ * settled/total scheme exactly: `✓` for a step closed BY doing the work
+ * (checked and not excluded), `✗` for a step closed WITHOUT doing the work
+ * (carries `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — descoped, superseded, or a
+ * branch not taken — regardless of its own checkbox state), and `☐` for
+ * genuinely open work.
+ *
+ * Shared so every UI list of checklist items (the reconcile evidence blocks,
+ * the outstanding-items tooltip, the reviewer-verified-ticks confirmation)
+ * renders the same three symbols instead of a bare `-` bullet that cannot by
+ * itself distinguish "closed without doing" from "still open" (wf "make the
+ * stage chat a record of work", Part 5 / item 6). The on-disk
+ * `<!-- ensemble:excluded -->` marker format this reads is unchanged by this
+ * function — it only affects how a list is displayed, never how it is stored.
+ */
+export function formatChecklistItemGlyphV1(item: {
+  readonly checked: boolean;
+  readonly excluded: boolean;
+}): "✓" | "✗" | "☐" {
+  if (item.excluded) {
+    return "✗";
+  }
+  return item.checked ? "✓" : "☐";
+}
+
 /** Normalized text of every checklist item in `content`'s latest rendering. */
 export function collectChecklistItemKeysV1(content: string): ReadonlySet<string> {
   return new Set(
@@ -911,6 +937,74 @@ export function collectChecklistItemKeysV1(content: string): ReadonlySet<string>
       normalizeChecklistItemTextV1(item.text)
     )
   );
+}
+
+/** Result of {@link detectChecklistItemSetMutationV1}: the item texts a round
+ * added and/or dropped, exactly as they read in each side's own rendering. */
+export interface ChecklistItemSetMutationV1 {
+  /** `"added"` — only new items; `"removed"` — only dropped items;
+   * `"renumbered"` — both, which is what a plan reads as when an item's text
+   * changed enough to no longer match (its old key drops out while a new one
+   * appears), not only when literal numbering shifted. */
+  readonly kind: "added" | "removed" | "renumbered";
+  /** Item texts present after but not before, in the after-content's document
+   * order, each key reported once even if the round duplicated it. */
+  readonly addedItems: readonly string[];
+  /** Item texts present before but not after, in the before-content's
+   * document order, each key reported once. */
+  readonly removedItems: readonly string[];
+}
+
+/**
+ * Compares two renderings of a plan checklist by item-text KEY (not tick
+ * state, not position) and reports whether the item SET itself changed —
+ * the guard behind wf "make the stage chat a record of work" item 5's rule
+ * that a round never adds, removes, or renumbers a checklist item.
+ * {@link mergeChecklistProgressV1} only ever flips existing items' checkbox
+ * glyphs, so under ordinary operation `before`/`after` always key-match
+ * exactly; a mismatch can only come from a round directly editing
+ * `plan-final.md`'s item list (an edit-mode round with file-write access —
+ * see the wf10 "Batch F" incident this guard exists to catch). Returns
+ * `undefined` when the item sets match exactly, regardless of tick-state
+ * changes.
+ */
+export function detectChecklistItemSetMutationV1(
+  beforeContent: string,
+  afterContent: string
+): ChecklistItemSetMutationV1 | undefined {
+  const beforeItems = itemsInLatestRendering(beforeContent);
+  const afterItems = itemsInLatestRendering(afterContent);
+  const beforeKeys = new Set(beforeItems.map((item) => normalizeChecklistItemTextV1(item.text)));
+  const afterKeys = new Set(afterItems.map((item) => normalizeChecklistItemTextV1(item.text)));
+
+  const addedItems: string[] = [];
+  const seenAdded = new Set<string>();
+  for (const item of afterItems) {
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (!beforeKeys.has(key) && !seenAdded.has(key)) {
+      seenAdded.add(key);
+      addedItems.push(item.text);
+    }
+  }
+  const removedItems: string[] = [];
+  const seenRemoved = new Set<string>();
+  for (const item of beforeItems) {
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (!afterKeys.has(key) && !seenRemoved.has(key)) {
+      seenRemoved.add(key);
+      removedItems.push(item.text);
+    }
+  }
+  if (addedItems.length === 0 && removedItems.length === 0) {
+    return undefined;
+  }
+  const kind: ChecklistItemSetMutationV1["kind"] =
+    addedItems.length > 0 && removedItems.length > 0
+      ? "renumbered"
+      : addedItems.length > 0
+        ? "added"
+        : "removed";
+  return { kind, addedItems, removedItems };
 }
 
 /** How many times each item is reported CHECKED in `content`. */

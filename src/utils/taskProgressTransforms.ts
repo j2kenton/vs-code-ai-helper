@@ -12,8 +12,10 @@
  */
 import {
   BlockerSupersessionRecordV1,
+  ChecklistChangeProposalV1,
   ImplementationTypeCheckFailure,
   MAX_BLOCKER_SUPERSESSIONS,
+  MAX_CHECKLIST_CHANGE_PROPOSALS,
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
@@ -530,6 +532,28 @@ export function appendBlockerSupersession(
   return {
     ...progress,
     blockerSupersessions: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append one checklist-mutation record (wf "make the stage chat a record of
+ * work" Part 6 / item 5, see `TaskProgress.checklistChangeProposals`'s doc
+ * comment) — the durable trace of a round whose direct edit to
+ * `plan-final.md`'s item list was caught and reverted. Same append-and-cap
+ * shape as `appendReviewRejection`/`appendBlockerSupersession`.
+ */
+export function appendChecklistChangeProposal(
+  progress: TaskProgress,
+  entry: ChecklistChangeProposalV1
+): TaskProgress {
+  const proposals = [...(progress.checklistChangeProposals ?? []), entry];
+  const trimmed = proposals.length > MAX_CHECKLIST_CHANGE_PROPOSALS
+    ? proposals.slice(proposals.length - MAX_CHECKLIST_CHANGE_PROPOSALS)
+    : proposals;
+  return {
+    ...progress,
+    checklistChangeProposals: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

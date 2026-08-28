@@ -281,7 +281,15 @@ void test("total embed cap stays anchored under the chat-transaction input snaps
   // argument for item 9 of workflow 11 replacing both sides of this inequality
   // with a pre-dispatch measurement; when it does, delete this test with the
   // constant it guards.
-  const WORST_OBSERVED_NON_CONTENT_BYTES = 195_000;
+  // Raised 195_000 -> 225_000 (2026-08-27 23:49, fourth rejection). Derived the
+  // same way, from a rejection with IMPL_REVIEW_MAX_TOTAL_CHARS=30000 in force:
+  //   non_content > MAX/ESCAPE_OVERHEAD - 30000 = 220,855
+  // 225_000 is the nearest round figure above that floor. The measured
+  // composition at this rejection — context pack 92,449 (task.md alone 55,678),
+  // plan.md 73,859, impl-summary.md 48,418, template 8,804 — is consistent with
+  // it, and impl-summary.md grows every round, so treat this floor as still
+  // rising rather than finally correct.
+  const WORST_OBSERVED_NON_CONTENT_BYTES = 225_000;
   const ESCAPE_OVERHEAD = 1.045;
   assert.ok(
     (IMPL_REVIEW_MAX_TOTAL_CHARS + WORST_OBSERVED_NON_CONTENT_BYTES) * ESCAPE_OVERHEAD <

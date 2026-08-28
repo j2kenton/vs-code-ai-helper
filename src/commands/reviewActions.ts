@@ -44,6 +44,7 @@ import {
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import {
   appendBlockerSupersession,
+  appendChecklistChangeProposal,
   appendOverriddenEscalation,
   appendReviewRejection,
   appendReviewScoreHistory,
@@ -120,6 +121,8 @@ import {
 } from "../utils/fileUtils";
 import {
   ChecklistProgressV1,
+  detectChecklistItemSetMutationV1,
+  formatChecklistItemGlyphV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
@@ -1721,7 +1724,8 @@ export function describeOutstandingChecklistItemsV1(
   if (unchecked.total === 0) {
     return "";
   }
-  const bullets = unchecked.items.map((item) => `- ${item}`).join("\n");
+  const glyph = formatChecklistItemGlyphV1({ checked: false, excluded: false });
+  const bullets = unchecked.items.map((item) => `- ${glyph} ${item}`).join("\n");
   const more =
     unchecked.total > unchecked.items.length
       ? `\n…and ${unchecked.total - unchecked.items.length} more.`
@@ -7690,6 +7694,15 @@ async function executeImplementationRun(
   );
   const nextRecoverySourceDispatchMode = nextRecoverySource.sourceDispatchMode;
   const nextRecoverySourceReviewStage = nextRecoverySource.sourceReviewStage;
+  // Checklist-mutation guard snapshot (wf "make the stage chat a record of
+  // work" Part 6 / item 5: "a round never mutates the checklist"). Read
+  // BEFORE dispatch, mirroring the baseline-SHA capture's own "must run
+  // before any edit" placement, so a round that directly edits
+  // plan-final.md's item list (an edit-mode round with file-write access)
+  // can be detected against what the plan actually read at round start —
+  // see detectChecklistItemSetMutationV1's doc comment.
+  const preRoundPlan = await readPlanOfRecordV1(folderUri);
+  const preRoundChecklistText = preRoundPlan.hasChecklist ? preRoundPlan.text : undefined;
   const wasEscalatedFromSummaryOnly =
     claimedAtStart.record?.mode === "summary-only" && escalatedRecord?.mode !== "summary-only";
   const dispatchPrompt = wasEscalatedFromSummaryOnly
@@ -7771,6 +7784,11 @@ async function executeImplementationRun(
         // review stage when at review, "impl" otherwise.
         taskStage: postRunReviewStage,
         taskFolderUri: folderUri,
+        // Part 4 architectural fix (2026-08-27 review follow-up): give the
+        // sealed Copilot pipeline this round's own round-ledger row identity
+        // so its coordinator attempts attach to it at allocation time, the
+        // same as a review round — see `RunSealedImplementationOptionsV1.roundId`.
+        roundId: implRoundId,
         // Structured preflight questions get their full Chat lifecycle
         // (mirror → Answer → Resume via extension.ts's dispatcher).
         onQuestions: async (questionsOutcome) => {
@@ -7867,9 +7885,29 @@ async function executeImplementationRun(
     result.status === "completed" &&
     claimedRecovery.record?.mode === "summary-only" &&
     roundMayHaveChangedFiles;
+  // Checklist-mutation guard (Part 6 / item 5): set when this round's own
+  // edit changed plan-final.md's item SET (not merely tick state) relative to
+  // `preRoundChecklistText`. Consulted by the run-log write and the
+  // decision-post below; `planChecklist` is reset to the pre-round text the
+  // moment this is detected, so every downstream read (the ordinary
+  // tick-merge included) operates on the reverted content — a round's
+  // genuinely reported ticks still land, via that same merge, once the item
+  // set itself is back to what it was at dispatch.
+  let checklistMutation: ReturnType<typeof detectChecklistItemSetMutationV1> | undefined;
   if (result.status === "completed") {
     plan = await readPlanOfRecordV1(folderUri);
     planChecklist = plan.hasChecklist ? plan.text : undefined;
+    if (
+      preRoundChecklistText !== undefined &&
+      planChecklist !== undefined &&
+      planChecklist !== preRoundChecklistText
+    ) {
+      checklistMutation = detectChecklistItemSetMutationV1(preRoundChecklistText, planChecklist);
+      if (checklistMutation !== undefined) {
+        await writeTextFile(getCanonicalImplementationUri(folderUri), preRoundChecklistText);
+        planChecklist = preRoundChecklistText;
+      }
+    }
     effectivePlanChecklist = planChecklist;
     if (summaryOnlyViolation) {
       summaryIssue =
@@ -8134,11 +8172,49 @@ async function executeImplementationRun(
     result.typeCheckFailed
       ? `\n\n## Type-check failure (2g)\n\nThe project no longer type-checks after this round's edits:\n\n\`\`\`\n${result.typeCheckOutput ?? ""}\n\`\`\`\n`
       : ""
+  }${
+    checklistMutation !== undefined
+      ? `\n\n## Checklist change discarded (Part 6 guard)\n\nThis round's edit to plan-final.md changed the checklist item set (${checklistMutation.kind}). A round never mutates the checklist — discovered work and needed decisions surface as blockers and decisions instead. The item set was reverted to what it read at dispatch; any ticks this round genuinely reported were still re-merged against the reverted set.\n\n` +
+        (checklistMutation.addedItems.length > 0
+          ? `Proposed additions (discarded):\n${checklistMutation.addedItems.map((item) => `- ${item}`).join("\n")}\n\n`
+          : "") +
+        (checklistMutation.removedItems.length > 0
+          ? `Dropped items (restored):\n${checklistMutation.removedItems.map((item) => `- ${item}`).join("\n")}\n`
+          : "")
+      : ""
   }${manifestFailureNote ?? ""}`;
 
   const logUri = await writeRunLog(folderUri, result.runnerId, "impl", logContent);
   // No handle in scope here either — resolve the task's live root operation.
   taskOperations.setResultTargetUriForTask(folderUri.fsPath, logUri);
+
+  if (checklistMutation !== undefined) {
+    // Durable trace (Part 6 / item 5) — the run log above already carries the
+    // discarded delta; this is what a stage gate or panel reads back without
+    // re-parsing run logs. `status` stays "pending": the two-option
+    // `checklistChangeProposed` decision this is meant to anchor needs a real
+    // "Revise the plan" action to route to (Part 6 items 19-20, not yet
+    // built) — posting it now would offer an option the system already knows
+    // does nothing, which item 10 of this same workflow-defects investigation
+    // says never to do. A plain warning stands in until that command exists.
+    await patchTaskProgressStrictV1(folderUri, (current) =>
+      appendChecklistChangeProposal(current, {
+        at: new Date().toISOString(),
+        roundId: implRoundId,
+        stage: postRunReviewStage,
+        kind: checklistMutation.kind,
+        proposedItems: checklistMutation.addedItems,
+        removedItems: checklistMutation.removedItems,
+        status: "pending",
+      })
+    );
+    NotificationRouter.showWarning(
+      "⚠️ This round tried to change plan-final.md's checklist item set (not just tick state). A round " +
+        "never mutates the checklist — the item set was reverted to what it read at the start of this " +
+        "round, and any ticks it genuinely reported were still recorded against the reverted set. See the " +
+        "run log for what was discarded."
+    );
+  }
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);

@@ -11,6 +11,7 @@ import {
 } from "../utils/implementationArtifactResolver";
 import {
   filterUncheckedPlanItemsV1,
+  formatChecklistItemGlyphV1,
   mergeChecklistProgressV1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
@@ -201,7 +202,9 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}`,
           consequence:
             `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}:\n` +
-            applicable.map((item) => `- ${item}`).join("\n"),
+            applicable
+              .map((item) => `- ${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}`)
+              .join("\n"),
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",

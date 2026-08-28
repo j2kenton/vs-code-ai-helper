@@ -301,18 +301,31 @@ function claimChainGuard(
  * blocker: "terminalizeGenericAutomationRoundBestEffortV1 creates an outcome
  * only for failed ... the root-unsuccessful branch also records the
  * scheduling intent as cancelled but the ledger as dropped ... leaving the
- * two durable classifications inconsistent"): every call site now passes
- * `"cancelled"` (never `"dropped"`, matching the scheduling-intent ledger's
- * own vocabulary — `SchedulingIntentLifecycleStateV1` has no `"dropped"`
- * value, so the two stores could never have agreed while this function used
- * a state the other side cannot express) together with a short reason, so a
- * dropped/cancelled row's `outcome.rejectionReason` is never silently absent
- * the way it was before — only `"failed"` carried one.
+ * two durable classifications inconsistent"): every chain-drop call site
+ * passes a short reason, so a dropped/cancelled row's `outcome.rejectionReason`
+ * is never silently absent the way it was before — only `"failed"` carried
+ * one.
+ *
+ * Ledger state corrected 2026-08-27 (second review follow-up, blocker "dropped
+ * automation chains are terminalized as cancelled contrary to the plan"):
+ * every chain-drop path below now passes the round-ledger's OWN `"dropped"`
+ * state to this function — `RoundLedgerStateV1` (`taskProgress.ts`) has a
+ * `"dropped"` value distinct from `"cancelled"` (the latter reserved for a
+ * genuinely user-cancelled operation, `taskActionCoordinatorV1.ts`'s
+ * `kind: "cancelled"`/`code: "userCancelled"`), so the plan's "chain-drop
+ * paths terminalize the round ledger as `dropped`" requirement is directly
+ * expressible and no longer needs to borrow the scheduling-intent store's
+ * narrower vocabulary. The scheduling-intent record at each call site keeps
+ * recording `"cancelled"` unchanged — a different store, with its own
+ * `SchedulingIntentLifecycleStateV1` vocabulary that genuinely has no
+ * `"dropped"` value — so the two stores now each use the state that is
+ * actually correct for what they track, rather than being forced to agree on
+ * one that fit neither.
  */
 function terminalizeGenericAutomationRoundBestEffortV1(
   taskKey: string | undefined,
   intentId: string | undefined,
-  state: "completed" | "failed" | "cancelled",
+  state: "completed" | "failed" | "dropped",
   errorOrReason?: unknown
 ): void {
   if (!taskKey || !intentId) {
@@ -321,7 +334,7 @@ function terminalizeGenericAutomationRoundBestEffortV1(
   const outcome =
     state === "failed"
       ? { rejectionReason: errorOrReason instanceof Error ? errorOrReason.message : String(errorOrReason) }
-      : state === "cancelled" && typeof errorOrReason === "string"
+      : state === "dropped" && typeof errorOrReason === "string"
         ? { rejectionReason: errorOrReason }
         : undefined;
   void terminalizeRoundV1(intentId, state, outcome, {
@@ -407,7 +420,7 @@ export function scheduleAutomationChain(
         terminalizeGenericAutomationRoundBestEffortV1(
           dispatch.taskKey,
           id,
-          "cancelled",
+          "dropped",
           "automation was disabled before this round could start"
         );
       });
@@ -478,7 +491,7 @@ export function scheduleAutomationChain(
             terminalizeGenericAutomationRoundBestEffortV1(
               dispatch.taskKey,
               id,
-              "cancelled",
+              "dropped",
               "automation was disabled before this round could start"
             );
           });
@@ -534,7 +547,7 @@ export function scheduleAutomationChain(
           terminalizeGenericAutomationRoundBestEffortV1(
             dispatch.taskKey,
             id,
-            "cancelled",
+            "dropped",
             "the operation this round was chained behind did not succeed"
           );
         });

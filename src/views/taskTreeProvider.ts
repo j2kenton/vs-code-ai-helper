@@ -38,6 +38,7 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 import {
+  formatChecklistItemGlyphV1,
   formatChecklistPercentV1,
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
@@ -286,7 +287,9 @@ function buildTaskTooltip(
     const outstanding = readOutstandingChecklistItemsForTooltipV1(task);
     const outstandingSuffix =
       outstanding.total > 0
-        ? ` Outstanding: ${outstanding.items.join("; ")}` +
+        ? ` Outstanding: ${outstanding.items
+            .map((item) => `${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}`)
+            .join("; ")}` +
           (outstanding.total > outstanding.items.length
             ? ` (+${outstanding.total - outstanding.items.length} more)`
             : "") +

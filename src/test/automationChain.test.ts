@@ -624,12 +624,16 @@ void test("a failing automation dispatch closes its round-ledger row as failed, 
 // unsuccessful branch also records the scheduling intent as cancelled but the
 // ledger as dropped ... leaving the two durable classifications inconsistent"
 // / "terminalizeGenericAutomationRoundBestEffortV1 creates an outcome only
-// for failed". The two tests below prove both drop causes now close the
-// round-ledger row with the SAME terminal state the scheduling-intent ledger
-// already used for them (`SchedulingIntentLifecycleStateV1` has no "dropped"
-// value at all), and that both carry a human-readable reason rather than an
+// for failed". Corrected again the same day (blocker "dropped automation
+// chains are terminalized as cancelled contrary to the plan"): the two tests
+// below now prove both drop causes close the round-ledger row as the ledger's
+// OWN `"dropped"` state (`RoundLedgerStateV1` has one; the scheduling-intent
+// store's `SchedulingIntentLifecycleStateV1` does not, and keeps recording
+// `"cancelled"` for the same event — the two stores deliberately disagree on
+// vocabulary because each is using the value that is actually correct for
+// what it tracks), and that both carry a human-readable reason rather than an
 // empty outcome.
-void test("automation disabled before dispatch closes its round-ledger row as cancelled with a reason", async () => {
+void test("automation disabled before dispatch closes its round-ledger row as dropped with a reason", async () => {
   const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-disabled-");
   const fsBridge = installFsBridgeV1();
   __extensionContextV1TestOnly.set({
@@ -653,10 +657,10 @@ void test("automation disabled before dispatch closes its round-ledger row as ca
     assert.equal(raw.roundLedger?.length, 1);
     const row = raw.roundLedger?.[0];
     assert.ok(row, "must resolve the opened row");
-    assert.equal(row?.state, "cancelled");
+    assert.equal(row?.state, "dropped");
     assert.ok(
       row?.outcome?.rejectionReason?.includes("automation was disabled"),
-      "a cancelled row must carry a human-readable reason, not an empty outcome"
+      "a dropped row must carry a human-readable reason, not an empty outcome"
     );
   } finally {
     __extensionContextV1TestOnly.reset();
@@ -665,7 +669,7 @@ void test("automation disabled before dispatch closes its round-ledger row as ca
   }
 });
 
-void test("a root operation ending unsuccessfully closes the deferred chain's round-ledger row as cancelled with a reason, matching the scheduling-intent's own classification", async () => {
+void test("a root operation ending unsuccessfully closes the deferred chain's round-ledger row as dropped with a reason, while the scheduling-intent keeps its own 'cancelled' classification", async () => {
   const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-root-fail-");
   const fsBridge = installFsBridgeV1();
   __extensionContextV1TestOnly.set({
@@ -692,12 +696,12 @@ void test("a root operation ending unsuccessfully closes the deferred chain's ro
     assert.ok(row, "must resolve the opened row");
     assert.equal(
       row?.state,
-      "cancelled",
-      'must never be "dropped" — the scheduling-intent ledger has no such value and already records this same event as "cancelled"'
+      "dropped",
+      'the round-ledger row must use its own "dropped" state, per the plan\'s "chain-drop paths terminalize the round ledger as dropped" requirement'
     );
     assert.ok(
       row?.outcome?.rejectionReason?.includes("did not succeed"),
-      "a cancelled row must carry a human-readable reason, not an empty outcome"
+      "a dropped row must carry a human-readable reason, not an empty outcome"
     );
   } finally {
     __extensionContextV1TestOnly.reset();
