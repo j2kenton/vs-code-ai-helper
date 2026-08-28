@@ -2819,11 +2819,10 @@ export async function completeCommitAndPushTask(
       // 1. Transition stage to "publish", then persist completion — both
       // through the coordinator's lifecycle rows (§10.2's transfer: the
       // strict progress stack and the exhaustive field policy own these
-      // writes, never the permissive patch). Completion itself is ungated
-      // (C3): no checks run here — the commitPush.v1 row invoked below (via
-      // invokeCommitPushRowV1) runs fresh checks and owns the failing-checks
-      // prompt/override flow, so the completion step can never be blocked
-      // by lint/test state.
+      // writes, never the permissive patch). Completion does not run lint or
+      // test checks here — the commitPush.v1 row invoked below owns those —
+      // but its lifecycle row does require the stage artifact, so a missing
+      // Publish review cannot be silently completed.
       const workspaceCwd =
         resolvedTask.workspaceFolder?.fsPath ?? path.dirname(resolvedTask.taskFolderPath);
       // Plan §3.9: the task-binding identity is the digest derived from this

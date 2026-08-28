@@ -21,7 +21,9 @@ import { TaskActionOutcomeV1 } from "../../types/taskActionOutcomeV1";
 import { PUBLISH_STAGE } from "../../types/taskProgress";
 import { applyMarkTaskDonePolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
+import { readTaskProgressStrictV1 } from "../../services/taskProgressReaderV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
+import { missingCompletionArtifactsV1 } from "../../utils/stageArtifactRequirementsV1";
 import {
   LifecyclePolicyFailureError,
   LifecycleStageMismatchError,
@@ -32,6 +34,8 @@ export const MARK_TASK_DONE_ACTION_KEY_V1 = "markTaskDone.v1";
 
 export interface MarkTaskDoneActionInputV1 {
   readonly taskFolderPath: string;
+  /** Only an explicit human completion override may set this. */
+  readonly artifactOverride?: "user";
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -47,13 +51,19 @@ export function validateMarkTaskDoneInputV1(rawInput: unknown): TaskActionInputV
   if (!isNonEmptyString(raw.taskFolderPath)) {
     return { ok: false, reason: "input is missing a non-empty \"taskFolderPath\" string" };
   }
-  const allowedKeys = new Set(["taskFolderPath"]);
+  if (raw.artifactOverride !== undefined && raw.artifactOverride !== "user") {
+    return { ok: false, reason: 'input has an invalid "artifactOverride" value' };
+  }
+  const allowedKeys = new Set(["taskFolderPath", "artifactOverride"]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
       return { ok: false, reason: `input has an unknown field: ${key}` };
     }
   }
-  const validated: MarkTaskDoneActionInputV1 = { taskFolderPath: raw.taskFolderPath };
+  const validated: MarkTaskDoneActionInputV1 = {
+    taskFolderPath: raw.taskFolderPath,
+    ...(raw.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
+  };
   return { ok: true, input: validated };
 }
 
@@ -79,6 +89,11 @@ export async function executeMarkTaskDoneV1(
 ): Promise<TaskActionOutcomeV1> {
   const input = context.validatedInput as MarkTaskDoneActionInputV1;
   const taskFolderUri = vscode.Uri.file(input.taskFolderPath);
+  const preflight = await readTaskProgressStrictV1(taskFolderUri);
+  if (!preflight.ok) {
+    return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
+  }
+  const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, PUBLISH_STAGE);
 
   let patched;
   try {
@@ -88,7 +103,19 @@ export async function executeMarkTaskDoneV1(
           `Task changed before completion (expected ${PUBLISH_STAGE}, found ${current.currentStage}).`
         );
       }
-      const result = applyMarkTaskDonePolicyV1(current, { now: new Date().toISOString() });
+      const baseResult = applyMarkTaskDonePolicyV1(current, {
+        now: new Date().toISOString(),
+        completionArtifactsPresent: true,
+      });
+      if (!baseResult.ok) {
+        throw new LifecyclePolicyFailureError(baseResult.code);
+      }
+      const result = applyMarkTaskDonePolicyV1(current, {
+        now: new Date().toISOString(),
+        completionArtifactsPresent: missingArtifacts.length === 0,
+        artifactOverride: input.artifactOverride,
+        missingArtifacts,
+      });
       if (!result.ok) {
         throw new LifecyclePolicyFailureError(result.code);
       }

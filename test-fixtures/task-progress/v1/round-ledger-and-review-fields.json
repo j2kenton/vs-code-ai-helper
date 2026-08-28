@@ -1,0 +1,133 @@
+{
+  "ensembleProgressVersion": 1,
+  "taskFolder": "2026-08-27_task_9",
+  "currentStage": "impl-high-review",
+  "status": "active",
+  "createdAt": "2026-08-27T09:00:00.000Z",
+  "updatedAt": "2026-08-27T12:00:00.000Z",
+  "completedStages": ["desc", "plan", "plan-high-review", "plan-low-review", "impl"],
+  "completedWithMissingArtifacts": [
+    {
+      "stage": "publish",
+      "artifact": "publish-review.md",
+      "at": "2026-08-27T11:55:00.000Z",
+      "override": "user"
+    }
+  ],
+  "reviewScoreHistory": [
+    {
+      "stage": "impl-high-review",
+      "score": 6,
+      "attemptId": "attempt-1",
+      "at": "2026-08-27T11:00:00.000Z",
+      "blockerCount": 2,
+      "taskFixableCount": 2,
+      "blockers": [
+        {
+          "category": "completion",
+          "resolver": "reviewer",
+          "subject": "src/utils/fileUtils.ts",
+          "id": "blocker-1",
+          "lineage": { "kind": "same", "refId": "blocker-1" },
+          "description": "the save guard remains uri-wide during the async save",
+          "origin": "reviewer"
+        },
+        {
+          "category": "completion",
+          "resolver": "mechanical",
+          "subject": "npm run test",
+          "origin": "mechanical"
+        }
+      ],
+      "supersededBlockers": [
+        {
+          "category": "completion",
+          "resolver": "reviewer",
+          "subject": "src/utils/legacySaveGuard.ts",
+          "id": "blocker-0",
+          "description": "legacy save guard behavior",
+          "origin": "reviewer"
+        }
+      ],
+      "reviewerChallengedNonGoal": [
+        {
+          "blockerId": "blocker-0",
+          "nonGoalHeading": "Part 2 Step 7 — attempt-bound canonical prompt retention"
+        }
+      ],
+      "reviewer": { "providerLabel": "OpenAI Codex", "storedModelId": "gpt-5.6-sol" }
+    }
+  ],
+  "blockerSupersessions": [
+    {
+      "stage": "impl-high-review",
+      "blockerDescription": "legacy save guard behavior",
+      "supersededAt": "2026-08-27T11:30:00.000Z",
+      "planRelPath": "plan-final.md",
+      "confirmingMessageAt": "2026-08-27T11:29:00.000Z",
+      "source": "plan-non-goal"
+    }
+  ],
+  "roundOutcomes": [
+    {
+      "stage": "impl",
+      "classification": "edits-produced",
+      "at": "2026-08-27T10:45:00.000Z",
+      "attemptId": "attempt-1",
+      "modelId": "claude-sonnet-5",
+      "providerId": "claude-cli",
+      "dispatchMode": "apply-review",
+      "originatingReviewStage": "impl-high-review"
+    }
+  ],
+  "roundLedger": [
+    {
+      "roundId": "round-1",
+      "intentId": "intent-1",
+      "operationId": "op-1",
+      "attemptIds": ["attempt-1"],
+      "stage": "impl",
+      "mode": "apply-review",
+      "startedAt": "2026-08-27T10:30:00.000Z",
+      "state": "completed",
+      "endedAt": "2026-08-27T10:45:00.000Z",
+      "outcome": {
+        "filesChanged": ["src/utils/fileUtils.ts"],
+        "runLogPath": "runs/attempt-1.md",
+        "roundOutcomeAttemptId": "attempt-1"
+      },
+      "checklistRevisionAdopted": {
+        "resolvedAt": "2026-08-27T10:50:00.000Z",
+        "itemCountBefore": 80,
+        "itemCountAfter": 85
+      }
+    }
+  ],
+  "checklistChangeProposals": [
+    {
+      "at": "2026-08-27T10:20:00.000Z",
+      "roundId": "round-1",
+      "stage": "impl",
+      "kind": "added",
+      "proposedItems": ["Present the remaining sites to a human reviewer with two concrete options"],
+      "removedItems": [],
+      "status": "adopted",
+      "resolvedAt": "2026-08-27T10:50:00.000Z",
+      "itemCountBefore": 80,
+      "itemCountAfter": 85,
+      "ledgerAnnotated": true
+    }
+  ],
+  "implRecovery": {
+    "sourceAttemptId": "attempt-0",
+    "reason": "the round's summary was rejected",
+    "trigger": "summaryRejected",
+    "mode": "inspect-and-complete",
+    "dispatch": "dispatched",
+    "at": "2026-08-27T10:00:00.000Z",
+    "attemptId": "attempt-1",
+    "sourceDispatchMode": "apply-review",
+    "sourceReviewStage": "impl-high-review",
+    "sourceRoundId": "round-0"
+  }
+}

@@ -43,11 +43,23 @@ export interface NextStagePolicyInputV1 {
    * omit to advance to the immediate `STAGE_ORDER` successor.
    */
   readonly targetStage?: TaskStage;
+  /** Result of the completion-artifact check immediately before transition. */
+  readonly completionArtifactsPresent?: boolean;
+  /** Human-only acceptance of artifacts reported absent by that check. */
+  readonly artifactOverride?: "user";
+  /** Names recorded when the human supplied the override. */
+  readonly missingArtifacts?: readonly string[];
 }
 
 export interface MarkTaskDonePolicyInputV1 {
   /** Coordinator clock (ISO timestamp) applied to updatedAt and completedAt. */
   readonly now: string;
+  /** Result of the completion-artifact check immediately before completion. */
+  readonly completionArtifactsPresent?: boolean;
+  /** Human-only acceptance of artifacts reported absent by that check. */
+  readonly artifactOverride?: "user";
+  /** Names recorded when the human supplied the override. */
+  readonly missingArtifacts?: readonly string[];
 }
 
 export interface ReopenPolicyInputV1 {
@@ -80,6 +92,7 @@ export type TaskProgressPolicyErrorCodeV1 =
   | "noNextStage"
   | "invalidTargetStage"
   | "invalidSelectedStage"
+  | "missingStageArtifact"
   | "checklistChangeProposalNotPending";
 
 export type TaskProgressPolicyResultV1 =

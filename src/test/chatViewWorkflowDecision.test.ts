@@ -38,11 +38,9 @@
  *    not by itself assert any of the three active-posture claims (round 5,
  *    2026-08-22: the badge was the last of the three still keyed off
  *    persisted-only state after the banner was fixed in round 4).
- *  - When genuinely busy, an explicit "no status is available until this
- *    finishes" statement renders in place of a bare implied wait whenever no
- *    live operation has reported an incremental detail (`busyDetail`); a
- *    live operation that HAS called `report(...)` (e.g. a review loop's
- *    "iteration 2/3") surfaces that text instead.
+ *  - When genuinely busy, the panel names the running stage, start time and
+ *    resolved model (when known), with any incremental `busyDetail` appended;
+ *    it never mistakes missing detail for missing task status.
  *  - The rendered entry count always equals the persisted transcript length
  *    (no entry is ever synthesized or silently dropped).
  */
@@ -57,6 +55,7 @@ import {
   ChatInteractionServicesV1,
   ChatTarget,
   ChatViewProvider,
+  formatChatSchedulingPostureLineV1,
   notifyPendingWorkflowDecision,
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
@@ -252,6 +251,31 @@ async function waitForState(fake: FakeWebviewView, predicate: (state: Record<str
   }
   throw new Error("timed out waiting for the expected state");
 }
+
+void describe("Chat With AI — stage-chat posture footer", () => {
+  void it("uses the five posture vocabulary and names the next continuation attempt", () => {
+    assert.equal(formatChatSchedulingPostureLineV1({ kind: "running" }), "running — a round is running now");
+    assert.match(
+      formatChatSchedulingPostureLineV1(
+        { kind: "scheduled", trigger: "continuation" },
+        "2026-08-28T15:20:00.000Z"
+      ),
+      /^scheduled — next attempt /
+    );
+    assert.match(
+      formatChatSchedulingPostureLineV1({
+        kind: "owedWillNotRetry",
+        blocker: "quota",
+        surfacedAt: "2026-08-28T15:00:00.000Z",
+        quarantinedFiles: [],
+        willRetry: false,
+      }),
+      /^owed-but-will-not-retry/
+    );
+    assert.match(formatChatSchedulingPostureLineV1({ kind: "waitingForYou" }), /^waiting-for-you/);
+    assert.match(formatChatSchedulingPostureLineV1({ kind: "unknown" }), /^unknown/);
+  });
+});
 
 void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () => {
   void it("render() surfaces a pending decision for its exact task and stage", async () => {
@@ -927,8 +951,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       await waitForStateMessage(fake);
       assert.equal(lastState(fake)?.busy, false, "nothing is running yet");
 
-      op = taskOperations.begin(folder, { label: "Doing work" });
+      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
       assert.ok(op, "expected the exclusive operation lock to be acquired");
+      op.setModel?.("claude-code");
       await waitForState(fake, (s) => s.busy === true);
 
       taskOperations.end(op);
@@ -1574,13 +1599,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("busyDetail renders the live operation's reported detail, or an explicit no-status statement when none was reported", async () => {
-    // Part 4.3: "Where a transport genuinely reports nothing until it
-    // finishes, render that statement explicitly (contract rule: explicit
-    // unknown, not implied wait)." Most busy operations never call
-    // `report(...)`, so a bare "Waiting for the AI…" cannot be told apart
-    // from a genuinely narrated wait — `busyDetail` is the field that closes
-    // that gap.
+  void it("busy status names the live operation even before it reports incremental detail", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -1597,13 +1616,19 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       // `busy` is true but `busyDetail` stays undefined so the webview falls
       // back to the explicit no-status statement rather than implying a
       // narrated wait that isn't happening.
-      op = taskOperations.begin(folder, { label: "Doing work" });
+      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
       assert.ok(op, "expected the exclusive operation lock to be acquired");
+      op.setModel?.("claude-code");
       await waitForState(fake, (s) => s.busy === true);
       assert.equal(
         lastState(fake)?.busyDetail,
         undefined,
         "an operation that never called report(...) must not synthesize a detail"
+      );
+      assert.match(
+        String((lastState(fake) as { busyText?: string } | undefined)?.busyText ?? ""),
+        /^Running Implementation since .* — claude-code$/,
+        "a live operation without incremental detail must name its stage, start time, and resolved model"
       );
 
       // The same operation reports an incremental detail: it must now
@@ -1635,7 +1660,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("the webview's busy-status renderer actually renders the busyDetail fallback and detail text (not just the posted state field)", () => {
+  void it("the webview's busy-status renderer uses the informative busyText and never claims task status is unavailable", () => {
     // The lifecycle test above ("busyDetail renders...") only proves the
     // `busyDetail` field on the posted "state" message is computed
     // correctly. It never inspects the webview's rendering script, so it
@@ -1645,33 +1670,24 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     // exact review-flagged gap. This asserts the STRUCTURE of the real
     // `bt.textContent=...` assignment pulled out of the actual generated
     // webview HTML (not a hand-duplicated copy of it): a ternary keyed on
-    // `s.busyDetail`, whose false-branch is the exact required no-status
-    // literal and whose true-branch concatenates `s.busyDetail` between the
-    // expected prefix/suffix. A regression to a bare spinner (no ternary), a
-    // swapped/merged branch, or wording drift on either branch fails to
-    // match and fails this test. (No `Function`/`eval` — this file's own
-    // lint config forbids implied eval — so the extracted text is verified
-    // structurally rather than executed.)
+    // `s.busyText`, which the host derives from the live operation's stage,
+    // start time, model, and optional detail. The webview must not recreate
+    // the old plumbing-centric "no status is available" fallback.
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
     try {
       provider.resolveWebviewView(fake.view);
       const html = fake.view.webview.html;
-      const match = html.match(
-        /bt\.textContent=s\.busyDetail\?\('([^']*)'\+s\.busyDetail\+'([^']*)'\):'([^']*)';b\.style\.display='block';b\.title='';\}/
+      assert.match(
+        html,
+        /bt\.textContent=s\.busyText\|\|'cannot determine what this task is doing';b\.style\.display='block';b\.title='';\}/,
+        "the webview must render the host-derived informative busy text and reserve an explicit fallback for an unresolvable live operation"
       );
-      assert.ok(
-        match,
-        "expected the busy-status assignment to be a ternary on s.busyDetail with a concatenated true-branch and a literal false-branch"
-      );
-      const [, detailPrefix, detailSuffix, noDetailText] = match;
-
       assert.equal(
-        noDetailText,
-        "Waiting for the AI… — no status is available until this finishes",
-        "a busy operation with no reported detail must render the explicit no-status statement, not an implied wait"
+        html.includes("no status is available until this finishes"),
+        false,
+        "the obsolete plumbing-centric busy message must not remain in the webview"
       );
-      assert.equal(`${detailPrefix}iteration 2/3${detailSuffix}`, "Waiting for the AI… (iteration 2/3)", "a busy operation's reported detail must render verbatim");
     } finally {
       provider.dispose();
     }

@@ -68,6 +68,25 @@ export class TaskStatusBar implements vscode.Disposable {
     const isRunning = taskOperations.hasAny();
     const icon = isRunning ? "$(sync~spin)" : "$(checklist)";
 
+    if (taskToShow && isCompleted && (taskToShow.progress.completedWithMissingArtifacts?.length ?? 0) > 0) {
+      const missing = taskToShow.progress.completedWithMissingArtifacts!
+        .map((entry) => `${STAGE_DISPLAY_NAMES[entry.stage]}: ${entry.artifact}`)
+        .join(", ");
+      this.item.text = `$(warning) ${taskToShow.folderName}: completed with missing artifact`;
+      this.item.tooltip = new vscode.MarkdownString(
+        [
+          `**Ensemble — completed with missing required artifact(s)**`,
+          "",
+          `Task: \`${taskToShow.folderName}\``,
+          `Missing when explicitly completed: ${missing}`,
+          "",
+          `_Click to open Ensemble menu_`,
+        ].join("\n")
+      );
+      this.item.show();
+      return;
+    }
+
     if (!hasActiveNonCompleted) {
       // Neutral state when no active non-completed task exists
       this.item.text = `${icon} Ensemble: No active task`;

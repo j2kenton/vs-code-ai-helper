@@ -44,7 +44,7 @@
  * ATTACHED AT ALLOCATION TIME, not only at the terminal write, as of the
  * 2026-08-27 architectural-blocker follow-up: both review-round call sites
  * (`runReviewForFolder`'s initial dispatch, `resumeReviewInteractionV1`'s
- * resume drive) now also call `attachCoordinatorIdentityToRoundBestEffortV1`
+ * resume drive) now call `attachCoordinatorIdentityToRoundV1`
  * from inside their `onPromptAssembled` callback — the moment the
  * coordinator's `operationId`/`attemptId` for THIS attempt exist
  * (`runProviderRow`, `taskActionCoordinatorV1.ts`), well before the round
@@ -71,9 +71,8 @@
  * any of those failure branches can execute.
  *
  * Both review-round call sites (`runReviewForFolder`, `resumeReviewInteractionV1`)
- * wire `onAttemptAllocated` to ONLY a synchronous, zero-I/O array push
- * (`observedCoordinatorAttemptIds`) — deliberately NOT to a second
- * `attachCoordinatorIdentityToRoundBestEffortV1` call. Wiring both hooks to
+ * persist the attachment from their awaited `onAttemptAllocated` callback and
+ * also keep an in-memory `observedCoordinatorAttemptIds` record. Wiring both hooks to
  * attach to disk independently was tried first and reverted the same day:
  * moving a fire-and-forget `patchTaskProgressStrictV1` write's start time
  * earlier (to allocation time instead of post-assembly) shifts when it
@@ -97,10 +96,9 @@
  * `executeImplementationRun` (`reviewActions.ts`) into `extraAttemptIds` at
  * every one of its five `terminalizeRoundV1` call sites — the same
  * end-of-round forwarding path the review-round call sites already use, not a
- * new disk-write timing risk. `onPromptAssembled`'s own disk attach there
- * (`attachCoordinatorIdentityToRoundBestEffortV1`) is UNCHANGED — still fired
- * only from `onPromptAssembled`, never from `onAttemptAllocated`, for the
- * identical reason given above. Residual, unaffected by this: a CLI-resolved
+ * new disk-write timing risk. `onPromptAssembled` now retains prompt
+ * observability only; identity attachment happens at allocation. Residual,
+ * unaffected by this: a CLI-resolved
  * implementation round never goes through this coordinator at all, so it has
  * no `onAttemptAllocated` to wire in the first place — see this module's own
  * "Residual gap" paragraph below, which already documents that case.
@@ -111,25 +109,19 @@
  * the allocation-time durable identity required by Step 12"): every
  * `onAttemptAllocated` hook wired above (both review-round call sites,
  * `runTwoPhaseEditActionV1`) now ALSO calls
- * `appendRoundIdentityLogEntryBestEffortV1` (`roundIdentityLogV1.ts`) —
- * writing to that module's OWN sidecar file, `round-identity-log.jsonl`,
- * never `task-progress.json`. This is deliberately NOT a third attempt at
+ * `attachCoordinatorIdentityToRoundV1` before provider work begins. This is
+ * deliberately not a fire-and-forget write:
  * the direct-attach fix the two NOTEs above document reverting: it sidesteps
  * the hazard by construction rather than trying to time around it — nothing
  * on this write path ever reads or writes `task-progress.json`, so it cannot
  * participate in that file's read-modify-write window and cannot reproduce
  * the `publishOwnershipMatrix.test.ts` regression (verified: the full suite,
- * including that exact test, passes with this wired). Reconciliation's
- * `backfillRoundIdentityFromLogV1` (`roundIdentityLogV1.ts`, run first in
- * `reconcileRoundLedgerV1`, `roundLedgerReconciliationV1.ts`) is the read
- * side: it attaches any logged identity onto its matching row that doesn't
- * already carry one, so an attempt that crashes between allocation and
- * `onPromptAssembled` — before which this module previously had nothing
- * durable to show for it beyond the in-memory arrays above — now has a real
- * `operationId`/`attemptId` on disk once the next reconciliation sweep runs,
- * closing pass (a)'s own "falls back to the coarser task-wide booleans"
- * degradation for exactly that row. See `roundIdentityLogV1.ts`'s own doc
- * comment for the full design and its own test coverage.
+ * including that exact test, passes with this wired). The callback is awaited
+ * by the coordinator, so an attempt has a real `operationId`/`attemptId` on
+ * its ledger row before it can fail or invoke a provider. CLI-resolved
+ * implementation rounds remain the documented exception: they do not use
+ * the coordinator and are protected by reconciliation's conservative
+ * identity-less fallback until that path has a durable identity.
  *
  * EXTENDED to the Copilot-resolved sealed implementation pipeline (same-day
  * follow-up, blocker "wired only for review rounds"): `runTwoPhaseEditActionV1`
@@ -144,8 +136,8 @@
  * `options` spread. Not wired at the `lint.v1` call site
  * (`runLintingFixes.ts`), which claims no `roundLedger` row at all — an
  * absent `roundId` is a no-op there, matching prior behavior exactly. See
- * `attachCoordinatorIdentityToRoundBestEffortV1`'s own doc comment for the
- * one path this still does not reach (CLI-resolved implementation rounds,
+ * this module's residual-gap note for the one path this still does not reach
+ * (CLI-resolved implementation rounds,
  * which never go through this coordinator at all) and why.
  *
  * PARTIALLY WIRED into the automation-dispatch path (2026-08-27 review
@@ -238,9 +230,9 @@
  * (a) close genuine orphans, then (b) repair any terminal row missing its
  * outcome message. Pass (a) now closes a `"scheduled"`/`"open"` row PER ROW —
  * checked against that row's own `operationId`/`intentId` where the row
- * carries one, falling back to the task-wide "no live operation and no live
- * scheduling intent" check only for a row with neither id — regardless of
- * which dispatch path opened it; review rows (`claimReviewAttempt`) and
+ * carries one. A CLI-resolved identity-less implementation row falls back to
+ * the task-wide liveness signals, while all identity-bearing rows are checked
+ * precisely regardless of which dispatch path opened them; review rows (`claimReviewAttempt`) and
  * implementation rows (`claimImplementationRoundLedgerV1`) are both
  * live-row-opening paths now; passes (b) and (c) operate on terminal rows and
  * legacy chat messages respectively, so they were never limited to one
@@ -261,7 +253,6 @@ import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendRoundOutcome, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
-import { backfillRoundIdentityFromLogV1 } from "./roundIdentityLogV1";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
  * value except the two live states. */
@@ -399,11 +390,14 @@ export type TerminalizeRoundResultV1 =
  * this in the webview; this is the durable message TEXT stored in
  * `chat-v1.json`, kept short and self-contained since it is also what a
  * plain-text reader of the transcript sees. */
-export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1): string {
+export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceStartedAt?: string): string {
   const stageName = STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage;
   const parts: string[] = [`_Ended: ${stageName} — ${entry.state}`];
   if (entry.continuationOf) {
-    parts.push(`continuation of the round started earlier`);
+    const started = sourceStartedAt
+      ? new Date(sourceStartedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "earlier";
+    parts.push(`continuation of the round started ${started}`);
   }
   const outcome = entry.outcome;
   if (outcome) {
@@ -549,7 +543,12 @@ export async function terminalizeRoundV1(
       options.taskFolderUri.fsPath,
       {
         role: "assistant",
-        text: formatRoundOutcomeMessageV1(entry),
+        text: formatRoundOutcomeMessageV1(
+          entry,
+          entry.continuationOf
+            ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
+            : undefined
+        ),
         stage: entry.stage,
         at: entry.endedAt ?? new Date().toISOString(),
         kind: "outcome",
@@ -562,27 +561,6 @@ export async function terminalizeRoundV1(
     // Best-effort only — the ledger write above is authoritative and already
     // landed; reconciliation pass (b) repairs a missing outcome message.
   }
-
-  // Opportunistic identity backfill (2026-08-28 review fix, narrowing the
-  // architectural blocker "the actual roundLedger row is updated only when
-  // reconcileRoundLedgerV1 later invokes backfillRoundIdentityFromLogV1 ...
-  // until that sweep, resolveRoundV1 and every live ledger consumer still
-  // lack the allocation identity"): every round's own natural end already
-  // performs a `task-progress.json` write (the terminal write above) — this
-  // reads the round-identity sidecar log and attaches any logged
-  // `operationId`/`attemptId` onto whichever OTHER row on this same task is
-  // still missing it, closing the "must wait for the next periodic/activation
-  // sweep" gap down to "at most one round's worth of latency" for any task
-  // whose rounds end at all, without adding a single write to the
-  // allocation-time hot path the two reverted direct-attach attempts hit (see
-  // `roundIdentityLogV1.ts`'s own doc comment) — this call fires once per
-  // round, at that round's own conclusion, never earlier. Deliberately never
-  // touches the row this call just terminalized (that row's own identity was
-  // already attached via `options.operationId`/`options.attemptId` above);
-  // it can only help SOME OTHER identity-less live/terminal row. Best-effort:
-  // `backfillRoundIdentityFromLogV1` swallows its own failure and never
-  // blocks or delays this function's return.
-  await backfillRoundIdentityFromLogV1(options.taskFolderUri);
 
   return { ok: true, alreadyTerminal: false, entry, progress: patched };
 }
@@ -988,30 +966,36 @@ export interface AttachCoordinatorIdentityToRoundOptionsV1 {
  * for those rounds to attach in the first place, so `resolveRoundV1` can only
  * ever find them by their own `promptRoundId`/`attemptId`.
  */
-export async function attachCoordinatorIdentityToRoundBestEffortV1(
+export async function attachCoordinatorIdentityToRoundV1(
   options: AttachCoordinatorIdentityToRoundOptionsV1
 ): Promise<void> {
-  try {
-    await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
-      const row = resolveRoundV1(current, options.roundId);
-      if (!row || (row.state !== "scheduled" && row.state !== "open")) {
-        return undefined;
-      }
-      const attemptIds = row.attemptIds.includes(options.attemptId)
-        ? row.attemptIds
-        : [...row.attemptIds, options.attemptId];
-      const operationIdChanged = row.operationId === undefined;
-      if (!operationIdChanged && attemptIds === row.attemptIds) {
-        return undefined;
-      }
-      return upsertRoundLedgerEntryV1(current, {
-        ...row,
-        attemptIds,
-        ...(operationIdChanged ? { operationId: options.operationId } : {}),
-      });
+  const patched = await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
+    const row = resolveRoundV1(current, options.roundId);
+    if (!row || (row.state !== "scheduled" && row.state !== "open")) {
+      throw new Error(`round ledger row ${options.roundId} is not live`);
+    }
+    if (row.operationId !== undefined && row.operationId !== options.operationId) {
+      throw new Error(`round ledger row ${options.roundId} belongs to another operation`);
+    }
+    const attemptIds = row.attemptIds.includes(options.attemptId)
+      ? row.attemptIds
+      : [...row.attemptIds, options.attemptId];
+    if (row.operationId === options.operationId && attemptIds === row.attemptIds) {
+      return undefined;
+    }
+    return upsertRoundLedgerEntryV1(current, {
+      ...row,
+      attemptIds,
+      operationId: options.operationId,
     });
-  } catch {
-    // Best-effort — never surfaces to the caller, never blocks dispatch.
+  });
+  const row = patched && resolveRoundV1(patched, options.roundId);
+  if (
+    !row ||
+    row.operationId !== options.operationId ||
+    !row.attemptIds.includes(options.attemptId)
+  ) {
+    throw new Error(`failed to durably attach coordinator identity to round ${options.roundId}`);
   }
 }
 

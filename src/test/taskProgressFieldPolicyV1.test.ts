@@ -22,7 +22,7 @@ import {
   applyReopenPolicyV1,
 } from "../services/taskProgressFieldPolicyV1";
 import { encodeTaskProgressV1 } from "../services/taskProgressWriterV1";
-import { TaskStage } from "../types/taskProgress";
+import { STAGE_ARTIFACT_FILENAMES, STAGE_ORDER, TaskStage } from "../types/taskProgress";
 
 const NOW = "2026-07-10T09:00:00.000Z";
 const TRANSITIONS_DIR = path.resolve(
@@ -306,6 +306,58 @@ void describe("taskProgressFieldPolicyV1", () => {
     assert.equal(notActive.ok, false);
     if (!notActive.ok) {
       assert.equal(notActive.code, "statusNotActive");
+    }
+  });
+
+  void it("refuses every stage completion with an absent artifact, and records only an explicit human override", () => {
+    for (const stage of STAGE_ORDER) {
+      const artifact = STAGE_ARTIFACT_FILENAMES[stage];
+      assert.ok(artifact, `${stage} has a canonical completion artifact`);
+      if (stage === "publish") {
+        const input = baseProgress({ currentStage: "publish" });
+        const rejected = applyMarkTaskDonePolicyV1(input, {
+          now: NOW,
+          completionArtifactsPresent: false,
+        });
+        assert.equal(rejected.ok, false, `${stage} missing artifact is refused`);
+        if (!rejected.ok) {
+          assert.equal(rejected.code, "missingStageArtifact");
+        }
+        const overridden = applyMarkTaskDonePolicyV1(input, {
+          now: NOW,
+          completionArtifactsPresent: false,
+          artifactOverride: "user",
+          missingArtifacts: [artifact],
+        });
+        assert.equal(overridden.ok, true, `${stage} explicit override is accepted`);
+        if (overridden.ok) {
+          assert.deepEqual(overridden.progress.completedWithMissingArtifacts, [
+            { stage, artifact, at: NOW, override: "user" },
+          ]);
+        }
+        continue;
+      }
+      const input = baseProgress({ currentStage: stage });
+      const rejected = applyNextStagePolicyV1(input, {
+        now: NOW,
+        completionArtifactsPresent: false,
+      });
+      assert.equal(rejected.ok, false, `${stage} missing artifact is refused`);
+      if (!rejected.ok) {
+        assert.equal(rejected.code, "missingStageArtifact");
+      }
+      const overridden = applyNextStagePolicyV1(input, {
+        now: NOW,
+        completionArtifactsPresent: false,
+        artifactOverride: "user",
+        missingArtifacts: [artifact],
+      });
+      assert.equal(overridden.ok, true, `${stage} explicit override is accepted`);
+      if (overridden.ok) {
+        assert.deepEqual(overridden.progress.completedWithMissingArtifacts, [
+          { stage, artifact, at: NOW, override: "user" },
+        ]);
+      }
     }
   });
 

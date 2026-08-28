@@ -28,6 +28,7 @@
 import {
   BlockerSupersessionRecordV1,
   ChecklistChangeProposalV1,
+  CompletedWithMissingArtifactV1,
   ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
@@ -129,6 +130,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "pinnedAt",
   "publishScopePath",
   "completedStages",
+  "completedWithMissingArtifacts",
   "preImageDescription",
   "ownership",
   "createdAt",
@@ -666,6 +668,123 @@ function validateScheduledRun(
   return undefined;
 }
 
+/**
+ * Shared shape validation for a `ReviewBlockerIdentity[]` field, factored out
+ * so `reviewScoreHistory` entries' `blockers` and `supersededBlockers`
+ * (mirror of `src/services/taskProgressDecoderV1.ts`) validate identically
+ * instead of risking two independently-maintained copies of the same rules
+ * drifting apart. `fieldLabel` names the field in every returned message
+ * (e.g. `"reviewScoreHistory entry blocker"`).
+ */
+function validateBlockerIdentityListV1(value: unknown, fieldLabel: string): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
+    return `${fieldLabel}s must be a bounded array`;
+  }
+  for (const blocker of value as unknown[]) {
+    if (!isPlainObject(blocker)) {
+      return `${fieldLabel} entries must be objects`;
+    }
+    const allowedBlockerKeys = new Set([
+      "category",
+      "resolver",
+      "subject",
+      "id",
+      "lineage",
+      "description",
+      "origin",
+    ]);
+    for (const key of Object.keys(blocker)) {
+      if (!allowedBlockerKeys.has(key)) {
+        return `${fieldLabel} has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    for (const key of ["category", "resolver", "subject"] as const) {
+      const field = blocker[key];
+      if (typeof field !== "string" || field.length === 0 || field.length > 200) {
+        return `${fieldLabel} ${key} must be a bounded non-empty string`;
+      }
+    }
+    const id = blocker["id"];
+    if (id !== undefined && (typeof id !== "string" || id.length === 0 || id.length > MAX_ID_LENGTH)) {
+      return `${fieldLabel} id must be a bounded non-empty string`;
+    }
+    const description = blocker["description"];
+    if (
+      description !== undefined &&
+      (typeof description !== "string" || description.length === 0 || description.length > 500)
+    ) {
+      return `${fieldLabel} description must be a bounded non-empty string`;
+    }
+    const origin = blocker["origin"];
+    if (origin !== undefined && origin !== "reviewer" && origin !== "mechanical") {
+      return `${fieldLabel} origin must be reviewer or mechanical`;
+    }
+    const lineage = blocker["lineage"];
+    if (lineage !== undefined) {
+      if (!isPlainObject(lineage)) {
+        return `${fieldLabel} lineage must be an object`;
+      }
+      const kind = lineage["kind"];
+      if (kind === "new") {
+        const allowedLineageKeys = new Set(["kind"]);
+        for (const key of Object.keys(lineage)) {
+          if (!allowedLineageKeys.has(key)) {
+            return `${fieldLabel} lineage has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+      } else if (kind === "same" || kind === "narrowed") {
+        const allowedLineageKeys = new Set(["kind", "refId"]);
+        for (const key of Object.keys(lineage)) {
+          if (!allowedLineageKeys.has(key)) {
+            return `${fieldLabel} lineage has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+        const refId = lineage["refId"];
+        if (typeof refId !== "string" || refId.length === 0 || refId.length > MAX_ID_LENGTH) {
+          return `${fieldLabel} lineage refId must be a bounded non-empty string`;
+        }
+      } else {
+        return `${fieldLabel} lineage kind must be new, same, or narrowed`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Shape validation for `ReviewScoreHistoryEntry.reviewerChallengedNonGoal`
+ * (mirror of `src/services/taskProgressDecoderV1.ts`). */
+function validateReviewerChallengedNonGoalV1(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
+    return "reviewScoreHistory entry reviewerChallengedNonGoal must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entries must be objects";
+    }
+    const allowed = new Set(["blockerId", "nonGoalHeading"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `reviewScoreHistory entry reviewerChallengedNonGoal entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    const blockerId = entry["blockerId"];
+    if (
+      blockerId !== undefined &&
+      (typeof blockerId !== "string" || blockerId.length === 0 || blockerId.length > MAX_ID_LENGTH)
+    ) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entry blockerId must be a bounded non-empty string";
+    }
+    if (
+      typeof entry["nonGoalHeading"] !== "string" ||
+      entry["nonGoalHeading"].length === 0 ||
+      entry["nonGoalHeading"].length > 200
+    ) {
+      return "reviewScoreHistory entry reviewerChallengedNonGoal entry nonGoalHeading must be a bounded non-empty string";
+    }
+  }
+  return undefined;
+}
+
 function validateReviewScoreHistory(
   value: unknown,
   family: TaskProgressFamilyV1
@@ -686,6 +805,8 @@ function validateReviewScoreHistory(
       "taskFixableCount",
       "blockers",
       "reviewer",
+      "supersededBlockers",
+      "reviewerChallengedNonGoal",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -717,71 +838,26 @@ function validateReviewScoreHistory(
     }
     const blockers = entry["blockers"];
     if (blockers !== undefined) {
-      if (!Array.isArray(blockers) || blockers.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
-        return "reviewScoreHistory entry blockers must be a bounded array";
+      const blockersError = validateBlockerIdentityListV1(blockers, "reviewScoreHistory entry blocker");
+      if (blockersError) {
+        return blockersError;
       }
-      for (const blocker of blockers as unknown[]) {
-        if (!isPlainObject(blocker)) {
-          return "reviewScoreHistory entry blockers entries must be objects";
-        }
-        const allowedBlockerKeys = new Set([
-          "category",
-          "resolver",
-          "subject",
-          "id",
-          "lineage",
-          "description",
-        ]);
-        for (const key of Object.keys(blocker)) {
-          if (!allowedBlockerKeys.has(key)) {
-            return `reviewScoreHistory entry blocker has an unknown property ${JSON.stringify(key)}`;
-          }
-        }
-        for (const key of ["category", "resolver", "subject"] as const) {
-          const field = blocker[key];
-          if (typeof field !== "string" || field.length === 0 || field.length > 200) {
-            return `reviewScoreHistory entry blocker ${key} must be a bounded non-empty string`;
-          }
-        }
-        const id = blocker["id"];
-        if (id !== undefined && (typeof id !== "string" || id.length === 0 || id.length > MAX_ID_LENGTH)) {
-          return "reviewScoreHistory entry blocker id must be a bounded non-empty string";
-        }
-        const description = blocker["description"];
-        if (
-          description !== undefined &&
-          (typeof description !== "string" || description.length === 0 || description.length > 500)
-        ) {
-          return "reviewScoreHistory entry blocker description must be a bounded non-empty string";
-        }
-        const lineage = blocker["lineage"];
-        if (lineage !== undefined) {
-          if (!isPlainObject(lineage)) {
-            return "reviewScoreHistory entry blocker lineage must be an object";
-          }
-          const kind = lineage["kind"];
-          if (kind === "new") {
-            const allowedLineageKeys = new Set(["kind"]);
-            for (const key of Object.keys(lineage)) {
-              if (!allowedLineageKeys.has(key)) {
-                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
-              }
-            }
-          } else if (kind === "same" || kind === "narrowed") {
-            const allowedLineageKeys = new Set(["kind", "refId"]);
-            for (const key of Object.keys(lineage)) {
-              if (!allowedLineageKeys.has(key)) {
-                return `reviewScoreHistory entry blocker lineage has an unknown property ${JSON.stringify(key)}`;
-              }
-            }
-            const refId = lineage["refId"];
-            if (typeof refId !== "string" || refId.length === 0 || refId.length > MAX_ID_LENGTH) {
-              return "reviewScoreHistory entry blocker lineage refId must be a bounded non-empty string";
-            }
-          } else {
-            return "reviewScoreHistory entry blocker lineage kind must be new, same, or narrowed";
-          }
-        }
+    }
+    const supersededBlockers = entry["supersededBlockers"];
+    if (supersededBlockers !== undefined) {
+      const supersededBlockersError = validateBlockerIdentityListV1(
+        supersededBlockers,
+        "reviewScoreHistory entry supersededBlocker"
+      );
+      if (supersededBlockersError) {
+        return supersededBlockersError;
+      }
+    }
+    const reviewerChallengedNonGoal = entry["reviewerChallengedNonGoal"];
+    if (reviewerChallengedNonGoal !== undefined) {
+      const challengedError = validateReviewerChallengedNonGoalV1(reviewerChallengedNonGoal);
+      if (challengedError) {
+        return challengedError;
       }
     }
     const reviewer = entry["reviewer"];
@@ -858,7 +934,14 @@ function validateBlockerSupersessions(
     if (!isPlainObject(entry)) {
       return "blockerSupersessions entries must be objects";
     }
-    const allowed = new Set(["stage", "blockerDescription", "supersededAt", "planRelPath", "confirmingMessageAt"]);
+    const allowed = new Set([
+      "stage",
+      "blockerDescription",
+      "supersededAt",
+      "planRelPath",
+      "confirmingMessageAt",
+      "source",
+    ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
         return `blockerSupersessions entry has an unknown property ${JSON.stringify(key)}`;
@@ -887,6 +970,10 @@ function validateBlockerSupersessions(
     if (entry["confirmingMessageAt"] !== undefined && !isIsoTimestamp(entry["confirmingMessageAt"])) {
       return "blockerSupersessions entry confirmingMessageAt must be an ISO timestamp";
     }
+    const source = entry["source"];
+    if (source !== undefined && source !== "chat-confirmed" && source !== "plan-non-goal") {
+      return "blockerSupersessions entry source must be chat-confirmed or plan-non-goal";
+    }
   }
   return undefined;
 }
@@ -902,7 +989,16 @@ function validateRoundOutcomes(
     if (!isPlainObject(entry)) {
       return "roundOutcomes entries must be objects";
     }
-    const allowed = new Set(["stage", "classification", "at", "attemptId", "modelId", "providerId"]);
+    const allowed = new Set([
+      "stage",
+      "classification",
+      "at",
+      "attemptId",
+      "modelId",
+      "providerId",
+      "dispatchMode",
+      "originatingReviewStage",
+    ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
         return `roundOutcomes entry has an unknown property ${JSON.stringify(key)}`;
@@ -946,6 +1042,20 @@ function validateRoundOutcomes(
       ) {
         return "roundOutcomes entry providerId must be a bounded non-empty string";
       }
+    }
+    if (
+      entry["dispatchMode"] !== undefined &&
+      (typeof entry["dispatchMode"] !== "string" ||
+        !IMPLEMENTATION_DISPATCH_MODES.has(entry["dispatchMode"]))
+    ) {
+      return "roundOutcomes entry dispatchMode must be a recognized dispatch mode";
+    }
+    if (
+      entry["originatingReviewStage"] !== undefined &&
+      (typeof entry["originatingReviewStage"] !== "string" ||
+        resolveStage(entry["originatingReviewStage"], family) === undefined)
+    ) {
+      return "roundOutcomes entry originatingReviewStage must be a recognized stage";
     }
   }
   return undefined;
@@ -1071,6 +1181,7 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
       "state",
       "endedAt",
       "outcome",
+      "checklistRevisionAdopted",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1153,6 +1264,44 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
     if (!isTerminal && entry["outcome"] !== undefined) {
       return "roundLedger entry outcome must be absent while state is scheduled/open";
     }
+    if (entry["checklistRevisionAdopted"] !== undefined) {
+      const revisionError = validateChecklistRevisionAdopted(entry["checklistRevisionAdopted"]);
+      if (revisionError) {
+        return revisionError;
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateChecklistRevisionAdopted(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "roundLedger entry checklistRevisionAdopted must be an object";
+  }
+  const allowed = new Set(["resolvedAt", "itemCountBefore", "itemCountAfter"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `roundLedger entry checklistRevisionAdopted has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (!isIsoTimestamp(value["resolvedAt"])) {
+    return "roundLedger entry checklistRevisionAdopted resolvedAt must be an ISO timestamp";
+  }
+  if (
+    value["itemCountBefore"] !== undefined &&
+    (typeof value["itemCountBefore"] !== "number" ||
+      !Number.isInteger(value["itemCountBefore"]) ||
+      value["itemCountBefore"] < 0)
+  ) {
+    return "roundLedger entry checklistRevisionAdopted itemCountBefore must be a non-negative integer";
+  }
+  if (
+    value["itemCountAfter"] !== undefined &&
+    (typeof value["itemCountAfter"] !== "number" ||
+      !Number.isInteger(value["itemCountAfter"]) ||
+      value["itemCountAfter"] < 0)
+  ) {
+    return "roundLedger entry checklistRevisionAdopted itemCountAfter must be a non-negative integer";
   }
   return undefined;
 }
@@ -1191,6 +1340,7 @@ function validateChecklistChangeProposals(
       "resolvedAt",
       "itemCountBefore",
       "itemCountAfter",
+      "ledgerAnnotated",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1241,6 +1391,9 @@ function validateChecklistChangeProposals(
     }
     if (entry["itemCountAfter"] !== undefined && !isNonNegativeInteger(entry["itemCountAfter"])) {
       return "checklistChangeProposals entry itemCountAfter must be a non-negative integer";
+    }
+    if (entry["ledgerAnnotated"] !== undefined && typeof entry["ledgerAnnotated"] !== "boolean") {
+      return "checklistChangeProposals entry ledgerAnnotated must be a boolean";
     }
   }
   return undefined;
@@ -1373,7 +1526,10 @@ const IMPL_RECOVERY_DISPATCH_STATES: ReadonlySet<string> = new Set([
   "dispatched",
 ]);
 
-function validateImplRecovery(value: unknown): string | undefined {
+function validateImplRecovery(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
   if (!isPlainObject(value)) {
     return "implRecovery must be an object";
   }
@@ -1388,6 +1544,9 @@ function validateImplRecovery(value: unknown): string | undefined {
     "attemptId",
     "leaseOwner",
     "leaseUntil",
+    "sourceDispatchMode",
+    "sourceReviewStage",
+    "sourceRoundId",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1447,6 +1606,28 @@ function validateImplRecovery(value: unknown): string | undefined {
   }
   if (value["leaseUntil"] !== undefined && !isIsoTimestamp(value["leaseUntil"])) {
     return "implRecovery.leaseUntil must be an ISO timestamp when present";
+  }
+  if (
+    value["sourceDispatchMode"] !== undefined &&
+    (typeof value["sourceDispatchMode"] !== "string" ||
+      !IMPLEMENTATION_DISPATCH_MODES.has(value["sourceDispatchMode"]))
+  ) {
+    return "implRecovery.sourceDispatchMode must be a recognized dispatch mode when present";
+  }
+  if (
+    value["sourceReviewStage"] !== undefined &&
+    (typeof value["sourceReviewStage"] !== "string" ||
+      resolveStage(value["sourceReviewStage"], family) === undefined)
+  ) {
+    return "implRecovery.sourceReviewStage must be a recognized stage when present";
+  }
+  if (
+    value["sourceRoundId"] !== undefined &&
+    (typeof value["sourceRoundId"] !== "string" ||
+      value["sourceRoundId"].length === 0 ||
+      value["sourceRoundId"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.sourceRoundId must be a bounded non-empty string when present";
   }
   return undefined;
 }
@@ -1582,6 +1763,39 @@ function validateCompletedStages(
     ...canonical.map((stage) => STAGE_ORDER.indexOf(stage))
   );
   return { stages: [...STAGE_ORDER.slice(0, highestIndex + 1)] };
+}
+
+function validateCompletedWithMissingArtifacts(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > STAGE_ORDER.length * 4) {
+    return "completedWithMissingArtifacts must be a bounded array";
+  }
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return "completedWithMissingArtifacts entries must be objects";
+    }
+    const allowed = new Set(["stage", "artifact", "at", "override"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `completedWithMissingArtifacts entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "completedWithMissingArtifacts entry stage must be a recognized stage";
+    }
+    if (!boundedString(entry["artifact"], MAX_PATH_LENGTH)) {
+      return "completedWithMissingArtifacts entry artifact must be a bounded string";
+    }
+    if (!isIsoTimestamp(entry["at"])) {
+      return "completedWithMissingArtifacts entry at must be an ISO timestamp";
+    }
+    if (entry["override"] !== "user") {
+      return 'completedWithMissingArtifacts entry override must be "user"';
+    }
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,6 +2051,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", result.error ?? "completedStages is invalid");
         }
         draft.completedStages = result.stages;
+        break;
+      }
+      case "completedWithMissingArtifacts": {
+        const error = validateCompletedWithMissingArtifacts(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.completedWithMissingArtifacts = value as CompletedWithMissingArtifactV1[];
         break;
       }
       case "preImageDescription": {
@@ -2116,7 +2338,7 @@ export function decodeTaskProgressTextV1(
         break;
       }
       case "implRecovery": {
-        const error = validateImplRecovery(value);
+        const error = validateImplRecovery(value, family);
         if (error !== undefined) {
           return recovery("invalidFieldValue", error);
         }

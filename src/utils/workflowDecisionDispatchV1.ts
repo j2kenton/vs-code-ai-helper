@@ -7,6 +7,7 @@ import {
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { HandoffGatingV1 } from "../types/handoffGuidanceV1";
 import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
+import { appendChatMessageV1 } from "./chatHistoryStore";
 
 /**
  * Backoff schedule for `retryOrphanDismissV1`'s background retries of a
@@ -130,6 +131,24 @@ export async function postWorkflowDecisionV1(
   });
   if (!result.ok) {
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${result.reason}`);
+  }
+  // The card itself lives in workspaceState, while the transcript is a
+  // file. Write a small durable anchor beside it so the chat can place the
+  // pending card at the moment it was raised rather than appending every
+  // decision after every message. A failed projection is harmless: the
+  // renderer falls back to the decision's createdAt timestamp.
+  try {
+    await appendChatMessageV1(target.taskFolderPath, {
+      role: "assistant",
+      text: `Decision raised: ${result.decision.whatHappened}`,
+      stage: result.decision.stage,
+      at: result.decision.createdAt,
+      kind: "decision",
+      decisionId: result.decision.decisionId,
+    }, target.canonicalId);
+  } catch {
+    // The decision store is authoritative for the card; leave timestamp
+    // ordering as the compatibility fallback when the projection cannot run.
   }
   notifyPendingWorkflowDecision(result.decision, target);
   return result.decision;

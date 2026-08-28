@@ -226,6 +226,12 @@ function buildTaskTooltip(
   if (task.progress.status === "archived") {
     lines.push("$(archive) **Archived**", "");
   }
+  if ((task.progress.completedWithMissingArtifacts?.length ?? 0) > 0) {
+    const missing = task.progress.completedWithMissingArtifacts!
+      .map((entry) => `${STAGE_DISPLAY_NAMES[entry.stage]}: \`${entry.artifact}\``)
+      .join("; ");
+    lines.push(`$(warning) **Completed with missing required artifact(s)** — ${missing}.`, "");
+  }
   if (task.progress.pinnedAt) {
     lines.push("$(pinned) **Pinned**", "");
   }

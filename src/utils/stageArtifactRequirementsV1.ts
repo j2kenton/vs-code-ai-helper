@@ -13,7 +13,16 @@
  * the two can never drift apart, and lets the pre-flight surface exist at
  * all.
  */
-import { IMPLEMENTATION_FILENAME, IMPLEMENTATION_SUMMARY_FILENAME, LEGACY_IMPLEMENTATION_FILENAME, PLAN_FILENAME, TaskStage } from "../types/taskProgress";
+import {
+  IMPLEMENTATION_FILENAME,
+  IMPLEMENTATION_SUMMARY_FILENAME,
+  LEGACY_IMPLEMENTATION_FILENAME,
+  PLAN_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
+  TaskStage,
+} from "../types/taskProgress";
+import * as vscode from "vscode";
+import { statIfExists } from "./fileUtils";
 
 /** Which artifact family a requirement is about — used only to group/label; the message and label strings below are the actual source of truth. */
 export type StageArtifactIdV1 = "plan" | "implementationArtifact" | "implementationNotes";
@@ -122,6 +131,39 @@ export const STAGE_ACTION_ARTIFACT_REQUIREMENTS_V1: Readonly<Record<StageActionI
   runImplementation: [IMPLEMENTATION_ARTIFACT_REQUIREMENT_FOR_RUN],
   generateImplementationChecklist: [PLAN_REQUIREMENT_FOR_GENERATE_CHECKLIST],
 };
+
+/**
+ * Artifacts which make a stage completion meaningful. This intentionally
+ * reuses the canonical stage-to-artifact map: completion must not invent a
+ * second idea of what a stage produces. `desc` is task.md, created with every
+ * loadable task, so its completion check is a documented no-op in practice.
+ */
+export const STAGE_COMPLETION_ARTIFACTS_V1: Readonly<Record<TaskStage, readonly string[]>> =
+  {
+    desc: STAGE_ARTIFACT_FILENAMES.desc === undefined ? [] : [STAGE_ARTIFACT_FILENAMES.desc],
+    plan: STAGE_ARTIFACT_FILENAMES.plan === undefined ? [] : [STAGE_ARTIFACT_FILENAMES.plan],
+    "plan-high-review": STAGE_ARTIFACT_FILENAMES["plan-high-review"] === undefined ? [] : [STAGE_ARTIFACT_FILENAMES["plan-high-review"]],
+    "plan-low-review": STAGE_ARTIFACT_FILENAMES["plan-low-review"] === undefined ? [] : [STAGE_ARTIFACT_FILENAMES["plan-low-review"]],
+    impl: STAGE_ARTIFACT_FILENAMES.impl === undefined ? [] : [STAGE_ARTIFACT_FILENAMES.impl],
+    "impl-high-review": STAGE_ARTIFACT_FILENAMES["impl-high-review"] === undefined ? [] : [STAGE_ARTIFACT_FILENAMES["impl-high-review"]],
+    "impl-low-review": STAGE_ARTIFACT_FILENAMES["impl-low-review"] === undefined ? [] : [STAGE_ARTIFACT_FILENAMES["impl-low-review"]],
+    publish: STAGE_ARTIFACT_FILENAMES.publish === undefined ? [] : [STAGE_ARTIFACT_FILENAMES.publish],
+  };
+
+/** Return the canonical completion artifacts absent from a task folder. */
+export async function missingCompletionArtifactsV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<readonly string[]> {
+  const required = STAGE_COMPLETION_ARTIFACTS_V1[stage];
+  const missing: string[] = [];
+  for (const artifact of required) {
+    if ((await statIfExists(vscode.Uri.joinPath(folderUri, artifact))) === undefined) {
+      missing.push(artifact);
+    }
+  }
+  return missing;
+}
 
 /**
  * Which stage action a review/apply attempt against a given `TaskStage`

@@ -23,6 +23,8 @@ import {
   stageActionsForPreflightV1,
   stageActionRequirementMessageV1,
   StageActionIdV1,
+  missingCompletionArtifactsV1,
+  STAGE_COMPLETION_ARTIFACTS_V1,
   STAGE_ACTION_ARTIFACT_REQUIREMENTS_V1,
 } from "../utils/stageArtifactRequirementsV1";
 import {
@@ -78,6 +80,40 @@ void describe("stageArtifactRequirementsV1 — single source of truth for pre-fl
     ]);
     assert.deepEqual(stageActionsForPreflightV1("desc"), []);
     assert.deepEqual(stageActionsForPreflightV1("plan"), []);
+  });
+});
+
+void describe("stage completion artifacts", () => {
+  const FOLDER = vscode.Uri.file("/tasks/stage-completion-artifacts");
+  const files = new Map<string, string>();
+  const workspace = vscode.workspace as unknown as {
+    fs: { stat: (uri: vscode.Uri) => Promise<vscode.FileStat> };
+  };
+  let originalStat: typeof workspace.fs.stat;
+
+  before(() => {
+    originalStat = workspace.fs.stat;
+    workspace.fs.stat = (uri: vscode.Uri): Promise<vscode.FileStat> => {
+      if (!files.has(uri.fsPath)) {
+        return Promise.reject(new Error(`ENOENT: ${uri.fsPath}`));
+      }
+      return Promise.resolve({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 1 });
+    };
+  });
+  after(() => { workspace.fs.stat = originalStat; });
+  afterEach(() => { files.clear(); });
+
+  void it("uses the canonical stage map and treats Description's task.md as present for every loadable folder", async () => {
+    assert.deepEqual(STAGE_COMPLETION_ARTIFACTS_V1.desc, ["task.md"]);
+    files.set(vscode.Uri.joinPath(FOLDER, "task.md").fsPath, "# Task");
+    assert.deepEqual(await missingCompletionArtifactsV1(FOLDER, "desc"), []);
+  });
+
+  void it("reports each stage's own absent artifact and no other stage's artifact", async () => {
+    for (const [stage, artifacts] of Object.entries(STAGE_COMPLETION_ARTIFACTS_V1)) {
+      const missing = await missingCompletionArtifactsV1(FOLDER, stage as import("../types/taskProgress").TaskStage);
+      assert.deepEqual(missing, artifacts, `${stage} must be gated by its canonical artifact only`);
+    }
   });
 });
 

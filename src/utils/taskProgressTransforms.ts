@@ -548,9 +548,27 @@ export function appendChecklistChangeProposal(
   entry: ChecklistChangeProposalV1
 ): TaskProgress {
   const proposals = [...(progress.checklistChangeProposals ?? []), entry];
-  const trimmed = proposals.length > MAX_CHECKLIST_CHANGE_PROPOSALS
-    ? proposals.slice(proposals.length - MAX_CHECKLIST_CHANGE_PROPOSALS)
-    : proposals;
+  // A `"pending"`/`"revising"` proposal names a round-ledger row that
+  // `upsertRoundLedgerEntryV1` is itself keeping alive on the strength of
+  // THIS entry still existing (2026-08-28 review fix, completion blocker:
+  // "`appendChecklistChangeProposal` still evicts oldest proposals without
+  // protecting an active revision" — the round-ledger side of this same
+  // protection was fixed first, but evicting the proposal record itself
+  // just relocates the gap one level up). Mirror that same "protect the
+  // live one, drop terminal ones oldest-first" rule here: a proposal only
+  // ages out once it has resolved (`"discarded"`/`"adopted"`). If every
+  // entry over cap is still open (pathological — normally at most one
+  // revision is in flight on a task at a time) the array is left over cap
+  // rather than discarding an unresolved proposal out from under its own
+  // revision.
+  let trimmed = proposals;
+  while (trimmed.length > MAX_CHECKLIST_CHANGE_PROPOSALS) {
+    const dropIndex = trimmed.findIndex((p) => p.status === "discarded" || p.status === "adopted");
+    if (dropIndex === -1) {
+      break;
+    }
+    trimmed = [...trimmed.slice(0, dropIndex), ...trimmed.slice(dropIndex + 1)];
+  }
   return {
     ...progress,
     checklistChangeProposals: trimmed,
@@ -640,11 +658,34 @@ export function markChecklistChangeProposalAdoptedV1(
   if (!target) {
     return progress;
   }
-  const row = resolveRoundV1(progress, target.roundId);
-  const canAnnotate = row !== undefined && row.checklistRevisionAdopted === undefined;
-  const alreadyAnnotated = row?.checklistRevisionAdopted !== undefined;
-  let next: TaskProgress = {
-    ...progress,
+  const existingRow = resolveRoundV1(progress, target.roundId);
+  const annotation = resolution?.resolvedAt === undefined
+    ? undefined
+    : {
+        resolvedAt: resolution.resolvedAt,
+        ...(resolution.itemCountBefore !== undefined ? { itemCountBefore: resolution.itemCountBefore } : {}),
+        ...(resolution.itemCountAfter !== undefined ? { itemCountAfter: resolution.itemCountAfter } : {}),
+      };
+  // The proposal itself is the durable evidence needed to reconstruct an
+  // evicted source row. Do that before flipping its status to adopted, while
+  // `upsertRoundLedgerEntryV1` still sees this proposal as revising and
+  // therefore protects the reconstructed terminal row from its normal cap.
+  // A plan revision is not complete unless this ledger event exists.
+  const row = existingRow ?? {
+    roundId: target.roundId,
+    attemptIds: [],
+    stage: target.stage,
+    mode: "implementation" as const,
+    startedAt: target.at,
+    endedAt: resolution?.resolvedAt ?? new Date().toISOString(),
+    state: "rejected" as const,
+    outcome: { rejectionReason: "checklist mutation reverted" },
+  };
+  let next = annotation !== undefined && row.checklistRevisionAdopted === undefined
+    ? upsertRoundLedgerEntryV1(progress, { ...row, checklistRevisionAdopted: annotation })
+    : progress;
+  next = {
+    ...next,
     checklistChangeProposals: proposals!.map((p) =>
       p.at === proposalAt && p.status === "revising"
         ? {
@@ -657,23 +698,13 @@ export function markChecklistChangeProposalAdoptedV1(
             ...(resolution?.itemCountAfter !== undefined
               ? { itemCountAfter: resolution.itemCountAfter }
               : {}),
-            ledgerAnnotated: canAnnotate || alreadyAnnotated,
+            ledgerAnnotated: true,
           }
         : p
     ),
     planRevision: undefined,
     updatedAt: new Date().toISOString(),
   };
-  if (canAnnotate && row && resolution?.resolvedAt !== undefined) {
-    next = upsertRoundLedgerEntryV1(next, {
-      ...row,
-      checklistRevisionAdopted: {
-        resolvedAt: resolution.resolvedAt,
-        ...(resolution.itemCountBefore !== undefined ? { itemCountBefore: resolution.itemCountBefore } : {}),
-        ...(resolution.itemCountAfter !== undefined ? { itemCountAfter: resolution.itemCountAfter } : {}),
-      },
-    });
-  }
   return next;
 }
 
@@ -760,6 +791,16 @@ export function findRoundOutcomesMissingLedgerRowV1(
  * (pathological — the reconciliation sweep exists precisely so this does
  * not happen in practice), the array is left over cap rather than dropping
  * a live round's record.
+ *
+ * A terminal row is ALSO protected from this drop while it is the
+ * `roundId` named by a `checklistChangeProposals` entry still `"pending"` or
+ * `"revising"` (2026-08-28 review fix, completion blocker: a plan revision
+ * can take many rounds — through plan, both plan reviews, implementation and
+ * both impl reviews — before `markChecklistChangeProposalAdoptedV1` runs; if
+ * the mutating round's own row were evicted by ordinary FIFO pressure during
+ * that window, adoption could never annotate it). Once a proposal resolves
+ * (`"discarded"`/`"adopted"`) its row loses this protection and ages out
+ * normally, same as any other terminal row.
  */
 export function upsertRoundLedgerEntryV1(
   progress: TaskProgress,
@@ -770,12 +811,24 @@ export function upsertRoundLedgerEntryV1(
   const next = index === -1
     ? [...existing, entry]
     : existing.map((row, i) => (i === index ? entry : row));
+  const protectedRoundIds = new Set(
+    (progress.checklistChangeProposals ?? [])
+      .filter((p) => p.status === "pending" || p.status === "revising")
+      .map((p) => p.roundId)
+  );
   let trimmed = next;
   while (trimmed.length > MAX_ROUND_LEDGER_ENTRIES) {
-    const dropIndex = trimmed.findIndex((row) => row.state !== "scheduled" && row.state !== "open");
+    const dropIndex = trimmed.findIndex(
+      (row) =>
+        row.state !== "scheduled" &&
+        row.state !== "open" &&
+        !protectedRoundIds.has(row.roundId)
+    );
     if (dropIndex === -1) {
-      // Every remaining row is still live — cannot drop any without losing
-      // a live round's record; leave the array over cap rather than do so.
+      // Every remaining row is still live, or protected by a pending plan
+      // revision — cannot drop any without losing a live round's record or
+      // orphaning an in-flight revision; leave the array over cap rather
+      // than do so.
       break;
     }
     trimmed = [...trimmed.slice(0, dropIndex), ...trimmed.slice(dropIndex + 1)];

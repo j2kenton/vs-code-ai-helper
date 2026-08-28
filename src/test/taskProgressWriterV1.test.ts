@@ -418,6 +418,89 @@ void describe("taskProgressWriterV1 — patchTaskProgressStrictV1 parity", () =>
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Out-of-band write guard (2026-08-28 review fix, architectural blocker
+  // "coordinator allocation sites still do not attach ... identities to a
+  // round-ledger row at allocation time"): a deterministic reproduction of
+  // the exact race two earlier direct-attach attempts hit —
+  // `publishOwnershipMatrix.test.ts`'s "paused while the review was running"
+  // case reproduces it only probabilistically via real async timing; this
+  // forces the out-of-band write to land in the precise window between this
+  // function's own read and its own write, on every run, by performing it as
+  // a side effect of the `update` callback itself (which always runs strictly
+  // between the two).
+  // ---------------------------------------------------------------------------
+
+  void it("retries against a fresh read instead of clobbering a write that lands outside this function's own lock", async () => {
+    const h = installHarness();
+    try {
+      let outOfBandWritesPerformed = 0;
+      const patched = await patchTaskProgressStrictV1(h.folderUri, (current) => {
+        // Simulate a raw external edit (bypasses withTaskLock entirely, same
+        // as the regression test's direct fs.writeFileSync) landing exactly
+        // between this function's read (which produced `current`) and its
+        // own pending write.
+        const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as Record<string, unknown>;
+        onDisk.status = "paused";
+        fs.writeFileSync(h.progressPath, JSON.stringify(onDisk, null, 2));
+        outOfBandWritesPerformed += 1;
+        return { ...current, currentStage: "plan" };
+      });
+      assert.equal(patched?.currentStage, "plan", "this caller's own patch must still land");
+      assert.ok(outOfBandWritesPerformed >= 1, "the out-of-band write must actually have run");
+      const onDisk = decodeTaskProgressTextV1(fs.readFileSync(h.progressPath, "utf8"), {
+        expectedTaskFolder: TASK_FOLDER_NAME,
+      });
+      assert.equal(onDisk.ok, true);
+      if (onDisk.ok) {
+        assert.equal(
+          onDisk.decoded.progress.status,
+          "paused",
+          "the out-of-band write must survive — this is the exact update the two reverted direct-attach attempts lost"
+        );
+        assert.equal(onDisk.decoded.progress.currentStage, "plan", "this caller's own patch must also be present");
+      }
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("does not apply the out-of-band retry when beforeWrite is supplied (its side effect must never fire twice)", async () => {
+    const h = installHarness();
+    try {
+      let beforeWriteCalls = 0;
+      let updateCalls = 0;
+      const patched = await patchTaskProgressStrictV1(
+        h.folderUri,
+        (current) => {
+          updateCalls += 1;
+          if (updateCalls === 1) {
+            const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as Record<string, unknown>;
+            onDisk.status = "paused";
+            fs.writeFileSync(h.progressPath, JSON.stringify(onDisk, null, 2));
+          }
+          return { ...current, currentStage: "plan" };
+        },
+        {
+          beforeWrite: (): Promise<void> => {
+            beforeWriteCalls += 1;
+            return Promise.resolve();
+          },
+        }
+      );
+      // A caller supplying `beforeWrite` keeps today's single-read, single-
+      // side-effect behavior exactly as before this guard existed — it is
+      // documented as remaining responsible for its own external
+      // synchronization, since retrying would risk firing its side effect
+      // more than once.
+      assert.equal(updateCalls, 1);
+      assert.equal(beforeWriteCalls, 1);
+      assert.equal(patched?.currentStage, "plan");
+    } finally {
+      h.restore();
+    }
+  });
+
   void it("createTaskProgressV1 emits a strict, version-marked creating sentinel", () => {
     const created = createTaskProgressV1(TASK_FOLDER_NAME);
     assert.equal(created.ensembleProgressVersion, 1);

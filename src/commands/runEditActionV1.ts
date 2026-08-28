@@ -64,8 +64,7 @@ import {
   runImplementationForModel,
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
-import { attachCoordinatorIdentityToRoundBestEffortV1 } from "../utils/roundLedgerV1";
-import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
+import { attachCoordinatorIdentityToRoundV1 } from "../utils/roundLedgerV1";
 import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../utils/modelSelection";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
@@ -492,7 +491,7 @@ export interface RunTwoPhaseEditOptionsV1 {
    * `claimImplementationRoundLedgerV1` before this dispatch), and the task
    * folder it lives under — when both are supplied, every coordinator
    * attempt this call makes is attached to that row AT ALLOCATION TIME via
-   * `attachCoordinatorIdentityToRoundBestEffortV1`, the same pattern
+   * `attachCoordinatorIdentityToRoundV1`, the same pattern
    * `runReviewForFolder`/`resumeReviewInteractionV1` already use for review
    * rounds (Part 4 architectural fix, 2026-08-27 review follow-up: "the
    * Copilot-resolved sealed implementation pipeline ... does not yet expose
@@ -554,14 +553,8 @@ export async function runTwoPhaseEditActionV1(
   // or a fallback candidate after the primary failed), and every one of
   // those is worth retaining, not just whichever fired last.
   const capturedAssembledPromptAttempts: AssembledPromptCaptureV1[] = [];
-  // See `AllocatedAttemptIdsV1`'s doc comment: a synchronous, zero-I/O array
-  // push mirroring the review-round path's `observedCoordinatorAttemptIds`
-  // (`reviewActions.ts`) — records every attempt this round allocates, even
-  // one that fails before reaching `onPromptAssembled`, WITHOUT moving any
-  // disk write earlier. `attachCoordinatorIdentityToRoundBestEffortV1` below
-  // stays wired only to `onPromptAssembled`, unchanged — see that call's own
-  // NOTE for why attaching it to `onAttemptAllocated` too was tried and
-  // reverted.
+  // Records every allocated attempt for the returned diagnostic result as
+  // well as attaching it to the durable ledger in the awaited callback below.
   const capturedAllocatedAttemptIds: string[] = [];
   const preflightOutcome = await coordinator.executeAction({
     actionKey: options.actionKey,
@@ -570,52 +563,21 @@ export async function runTwoPhaseEditActionV1(
     taskStage: options.taskStage,
     rawInput: preflightInput as unknown as Record<string, unknown>,
     cancellationToken: options.cancellationToken,
-    onAttemptAllocated: (info) => {
+    onAttemptAllocated: async (info) => {
       capturedAllocatedAttemptIds.push(info.attemptId);
-      // 2026-08-28 review fix, same blocker as the NOTE below: append this
-      // allocation to the round-identity sidecar log instead of attaching it
-      // directly onto `task-progress.json` — see `roundIdentityLogV1.ts`'s
-      // own doc comment for why this carries none of the timing risk the
-      // reverted direct-attach attempt (still documented in the NOTE below)
-      // hit. A no-op when `options.taskFolderUri`/`options.roundId` are
-      // absent (this round claims no `roundLedger` row at all — e.g. the
-      // `lint.v1` call site), matching `onPromptAssembled`'s own disk attach
-      // below exactly.
+      // No round identity is claimed for lint.v1; all implementation paths
+      // supply both fields and are durably attached before provider work.
       if (options.taskFolderUri && options.roundId) {
-        void appendRoundIdentityLogEntryBestEffortV1(options.taskFolderUri, {
+        await attachCoordinatorIdentityToRoundV1({
           roundId: options.roundId,
           operationId: info.operationId,
           attemptId: info.attemptId,
-          at: new Date().toISOString(),
+          taskFolderUri: options.taskFolderUri,
         });
       }
     },
-    // NOTE (2026-08-28 review): an `onAttemptAllocated` wiring that ALSO
-    // calls `attachCoordinatorIdentityToRoundBestEffortV1` — firing that disk
-    // attach earlier, before assembly, to also cover an attempt that fails
-    // before ever reaching assembly — was tried here too and reverted the
-    // same day. It carries the identical timing risk demonstrated at the
-    // review-round call sites in `reviewActions.ts` (see that file's matching
-    // NOTE): moving a fire-and-forget `patchTaskProgressStrictV1` write's
-    // start time earlier changes when it completes relative to a concurrent
-    // out-of-band progress write, and this path has no equivalent test to
-    // rule that out. The disk attach stays on `onPromptAssembled` only, as
-    // before that review; the durable identity now reaches disk through the
-    // sidecar log above instead, which carries no such risk.
     onPromptAssembled: (info) => {
       capturedAssembledPromptAttempts.push(info);
-      // Attach at allocation time, not only when this function's own return
-      // value is later inspected — see this field's doc comment on
-      // `RunTwoPhaseEditOptionsV1`. Best-effort and never awaited, mirroring
-      // `onPromptAssembled`'s own "never allowed to affect dispatch" contract.
-      if (options.taskFolderUri && options.roundId) {
-        void attachCoordinatorIdentityToRoundBestEffortV1({
-          taskFolderUri: options.taskFolderUri,
-          roundId: options.roundId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-        });
-      }
     },
   });
   const capturedAssembledPrompt =

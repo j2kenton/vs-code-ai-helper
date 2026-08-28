@@ -58,6 +58,7 @@ function installFsBridge(): { restore: () => void } {
   const fsObj = vscode.workspace.fs as unknown as Record<string, unknown>;
   const origReadFile = fsObj.readFile;
   const origReadDirectory = fsObj.readDirectory;
+  const origStat = fsObj.stat;
   fsObj.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
   fsObj.readDirectory = (uri: vscode.Uri): Promise<[string, number][]> => {
@@ -71,10 +72,18 @@ function installFsBridge(): { restore: () => void } {
       ])
     );
   };
+  fsObj.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+    fs.promises.stat(uri.fsPath).then((stat) => ({
+      type: vscode.FileType.File,
+      ctime: stat.ctimeMs,
+      mtime: stat.mtimeMs,
+      size: stat.size,
+    }));
   return {
     restore: (): void => {
       fsObj.readFile = origReadFile;
       fsObj.readDirectory = origReadDirectory;
+      fsObj.stat = origStat;
     },
   };
 }

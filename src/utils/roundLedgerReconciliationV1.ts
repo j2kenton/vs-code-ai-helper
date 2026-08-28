@@ -72,7 +72,6 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendChatMessageV1, ChatMessage, readChatHistory } from "./chatHistoryStore";
 import { formatRoundOutcomeMessageV1, terminalizeRoundV1 } from "./roundLedgerV1";
-import { backfillRoundIdentityFromLogV1 } from "./roundIdentityLogV1";
 import { resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
@@ -136,10 +135,10 @@ export interface ReconcileOrphanedRoundLedgerRowsInputV1 {
  * demonstrably still live — checked in preference to the task-wide booleans,
  * which over-protect (any live round anywhere on the task shields every
  * other open row too, including a genuinely stale one left by an earlier
- * crash). A row carrying NEITHER `operationId` nor `intentId` (a manually
- * dispatched round whose row predates the coordinator attaching either — see
- * `roundLedgerV1.ts`'s own doc comment on this residual gap) has no identity
- * to check and falls back to the task-wide booleans, exactly as before.
+ * crash). A row carrying NEITHER `operationId` nor `intentId` is the one
+ * exception: CLI-resolved implementation rounds cannot acquire coordinator
+ * identities, so that legacy-compatible shape deliberately falls back to
+ * task-wide liveness until the CLI path gets a durable identity.
  */
 function isRoundLedgerRowProtectedV1(
   row: RoundLedgerEntryV1,
@@ -153,6 +152,13 @@ function isRoundLedgerRowProtectedV1(
       ? true
       : input.liveSchedulingIntentIds.includes(row.intentId);
   }
+  // CLI-resolved implementation rounds never enter the coordinator, so their
+  // live ledger row has no operation or scheduling-intent identity to compare
+  // here. Until that dispatch path has a durable identity of its own, retain
+  // the established task-wide protection for this narrow identity-less case.
+  // This is deliberately conservative: closing a live round would make the
+  // terminalizer discard its true ending, whereas a stale row is repaired on
+  // the first sweep with no live task activity.
   return input.hasLiveOperation || input.hasLiveSchedulingIntent;
 }
 
@@ -165,11 +171,11 @@ export interface ReconcileOrphanedRoundLedgerRowsResultV1 {
 
 /**
  * Close every `"scheduled"`/`"open"` `roundLedger` row for one task as
- * `"interrupted"`, but ONLY when neither `hasLiveOperation` nor
- * `hasLiveSchedulingIntent` holds — i.e. nothing live remains that could
- * still terminalize the row itself. Safe to call repeatedly: rows already
- * closed are simply absent from the next read, and `terminalizeRoundV1` is
- * independently idempotent per row.
+ * `"interrupted"` when that row's own identity is no longer live. Rows with
+ * neither identity retain the conservative historical rule: close only when
+ * neither task-wide liveness signal holds. Safe to call repeatedly: rows
+ * already closed are simply absent from the next read, and
+ * `terminalizeRoundV1` is independently idempotent per row.
  */
 export async function reconcileOrphanedRoundLedgerRowsV1(
   input: ReconcileOrphanedRoundLedgerRowsInputV1
@@ -391,19 +397,8 @@ export interface ReconcileRoundLedgerResultV1 {
 }
 
 /**
- * Run every reconciliation pass for one task, in the plan's own order: an
- * identity backfill FIRST (2026-08-28 review fix, architectural blocker
- * "coordinator allocation sites still do not attach operation and attempt
- * identities to a round-ledger row ... at allocation time"), reading the
- * round-identity sidecar log (`roundIdentityLogV1.ts`) and attaching any
- * logged `operationId`/`attemptId` onto its matching row before this same
- * sweep evaluates orphan-closure — an attempt that crashed between
- * allocation and `onPromptAssembled` (so its row never received an
- * `operationId` through the normal disk-attach path) is otherwise
- * indistinguishable, to pass (a)'s per-row check, from a row that never had
- * one to check against at all, and falls back to the coarser task-wide
- * liveness booleans; backfilling first lets that row be checked precisely
- * instead. Then (c) synthesize legacy rows, then (a) close genuine orphans,
+ * Run every reconciliation pass for one task, in the plan's own order:
+ * synthesize legacy rows, then close genuine orphans,
  * then (b) repair any terminal row (including one (c) just synthesized)
  * missing its outcome message. Each pass is independently idempotent, so is
  * this call as a whole — running it twice in a row against unchanged state
@@ -412,7 +407,6 @@ export interface ReconcileRoundLedgerResultV1 {
 export async function reconcileRoundLedgerV1(
   input: ReconcileRoundLedgerInputV1
 ): Promise<ReconcileRoundLedgerResultV1> {
-  await backfillRoundIdentityFromLogV1(input.taskFolderUri);
   const synth = await synthesizeLegacyRoundLedgerRowsV1(input);
   const orphan = await reconcileOrphanedRoundLedgerRowsV1(input);
   const repair = await repairMissingRoundOutcomeMessagesV1(input);

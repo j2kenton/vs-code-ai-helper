@@ -19,6 +19,7 @@
  */
 import {
   ChecklistChangeProposalV1,
+  CompletedWithMissingArtifactV1,
   STAGE_ORDER,
   TaskProgress,
   TaskStage,
@@ -144,6 +145,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     nextStage: "Add departing stage exactly once.",
     markTaskDone: "Add current stage exactly once.",
     reopen: "Retain only stages strictly before selected stage.",
+  },
+  completedWithMissingArtifacts: {
+    migration: "Validate bounded human completion overrides; preserve.",
+    nextStage: "Append the departed stage's missing artifacts only for an explicit human override.",
+    markTaskDone: "Append the current stage's missing artifacts only for an explicit human override.",
+    reopen: "Preserve as durable completion history.",
   },
   implReviewFiles: {
     migration:
@@ -338,6 +345,20 @@ function stageIndex(stage: TaskStage): number {
   return STAGE_ORDER.indexOf(stage);
 }
 
+function completedArtifactOverrides(
+  existing: readonly CompletedWithMissingArtifactV1[] | undefined,
+  stage: TaskStage,
+  now: string,
+  artifacts: readonly string[] | undefined,
+  override: "user" | undefined
+): CompletedWithMissingArtifactV1[] | undefined {
+  if (override !== "user" || artifacts === undefined || artifacts.length === 0) {
+    return existing === undefined ? undefined : [...existing];
+  }
+  const additions = artifacts.map((artifact) => ({ stage, artifact, at: now, override: "user" as const }));
+  return [...(existing ?? []), ...additions];
+}
+
 /**
  * Add one stage to `completedStages` and canonicalize to the contiguous
  * stage-order prefix through the highest stage present. `undefined` existing
@@ -428,6 +449,9 @@ export function applyNextStagePolicyV1(
       `nextStage requires an active task, found status ${JSON.stringify(progress.status)}`
     );
   }
+  if (input.completionArtifactsPresent === false && input.artifactOverride !== "user") {
+    return failure("missingStageArtifact", "the departing stage's required artifact is absent");
+  }
   const departing = progress.currentStage;
   const departingIndex = stageIndex(departing);
   const defaultNextStage = STAGE_ORDER[departingIndex + 1];
@@ -465,6 +489,13 @@ export function applyNextStagePolicyV1(
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
     completedStages: addCompletedStage(progress.completedStages, departing),
+    completedWithMissingArtifacts: completedArtifactOverrides(
+      progress.completedWithMissingArtifacts,
+      departing,
+      input.now,
+      input.missingArtifacts,
+      input.artifactOverride
+    ),
     implReviewFiles: progress.implReviewFiles,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: progress.reviewInvalidatedByRound,
@@ -511,6 +542,9 @@ export function applyMarkTaskDonePolicyV1(
       `markTaskDone requires an active task, found status ${JSON.stringify(progress.status)}`
     );
   }
+  if (input.completionArtifactsPresent === false && input.artifactOverride !== "user") {
+    return failure("missingStageArtifact", "the current stage's required artifact is absent");
+  }
   const result: PersistedTaskProgressV1 = {
     ensembleProgressVersion: 1,
     ownership: progress.ownership,
@@ -528,6 +562,13 @@ export function applyMarkTaskDonePolicyV1(
     preImageDescription: progress.preImageDescription,
     completedAt: input.now,
     completedStages: addCompletedStage(progress.completedStages, progress.currentStage),
+    completedWithMissingArtifacts: completedArtifactOverrides(
+      progress.completedWithMissingArtifacts,
+      progress.currentStage,
+      input.now,
+      input.missingArtifacts,
+      input.artifactOverride
+    ),
     implReviewFiles: progress.implReviewFiles,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
@@ -629,6 +670,7 @@ export function applyReopenPolicyV1(
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
     completedStages: retainedStages,
+    completedWithMissingArtifacts: progress.completedWithMissingArtifacts,
     implReviewFiles,
     pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
@@ -736,6 +778,7 @@ export function applyPlanRevisionPolicyV1(
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
     completedStages: retainedStages,
+    completedWithMissingArtifacts: progress.completedWithMissingArtifacts,
     // Retained deliberately (unlike reopen, which clears these below `impl`)
     // — a plan revision does not discard the accumulated implementation
     // review surface or score history (Part 6 item 4's own requirement).

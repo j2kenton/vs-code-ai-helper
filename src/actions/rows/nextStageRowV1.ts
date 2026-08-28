@@ -39,8 +39,10 @@ import { TaskActionOutcomeV1 } from "../../types/taskActionOutcomeV1";
 import { STAGE_ORDER, TaskStage } from "../../types/taskProgress";
 import { applyNextStagePolicyV1 } from "../../services/taskProgressFieldPolicyV1";
 import { patchTaskProgressStrictV1 } from "../../services/taskProgressWriterV1";
+import { readTaskProgressStrictV1 } from "../../services/taskProgressReaderV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
 import { ensurePublishReviewArtifactExistsV1 } from "../../utils/publishChecksFreshness";
+import { missingCompletionArtifactsV1 } from "../../utils/stageArtifactRequirementsV1";
 import {
   LifecyclePolicyFailureError,
   LifecycleReviewAttemptMismatchError,
@@ -78,6 +80,8 @@ export interface NextStageActionInputV1 {
    * of silently advancing on its behalf.
    */
   readonly expectedReviewAttemptId?: string;
+  /** Only the explicit human "Complete Anyway" command may set this. */
+  readonly artifactOverride?: "user";
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -106,11 +110,15 @@ export function validateNextStageInputV1(rawInput: unknown): TaskActionInputVali
   if (raw.expectedReviewAttemptId !== undefined && !isNonEmptyString(raw.expectedReviewAttemptId)) {
     return { ok: false, reason: "input has an invalid \"expectedReviewAttemptId\" value" };
   }
+  if (raw.artifactOverride !== undefined && raw.artifactOverride !== "user") {
+    return { ok: false, reason: 'input has an invalid "artifactOverride" value' };
+  }
   const allowedKeys = new Set([
     "taskFolderPath",
     "expectedSourceStage",
     "targetStage",
     "expectedReviewAttemptId",
+    "artifactOverride",
   ]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
@@ -124,6 +132,7 @@ export function validateNextStageInputV1(rawInput: unknown): TaskActionInputVali
     ...(raw.expectedReviewAttemptId !== undefined
       ? { expectedReviewAttemptId: raw.expectedReviewAttemptId }
       : {}),
+    ...(raw.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
   };
   return { ok: true, input: validated };
 }
@@ -150,6 +159,13 @@ export async function executeNextStageV1(
 ): Promise<TaskActionOutcomeV1> {
   const input = context.validatedInput as NextStageActionInputV1;
   const taskFolderUri = vscode.Uri.file(input.taskFolderPath);
+  // Preserve the lifecycle row's established recovery result for a missing or
+  // malformed progress document before asking the filesystem about artifacts.
+  const preflight = await readTaskProgressStrictV1(taskFolderUri);
+  if (!preflight.ok) {
+    return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
+  }
+  const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, input.expectedSourceStage);
 
   let patched;
   try {
@@ -169,9 +185,22 @@ export async function executeNextStageV1(
             "Review result is stale; a newer review attempt owns this transition."
           );
         }
+        // Validate lifecycle semantics first, so terminal/stale/invalid target
+        // errors are not masked by an unrelated absent artifact.
+        const baseResult = applyNextStagePolicyV1(current, {
+          now: new Date().toISOString(),
+          targetStage: input.targetStage,
+          completionArtifactsPresent: true,
+        });
+        if (!baseResult.ok) {
+          throw new LifecyclePolicyFailureError(baseResult.code);
+        }
         const result = applyNextStagePolicyV1(current, {
           now: new Date().toISOString(),
           targetStage: input.targetStage,
+          completionArtifactsPresent: missingArtifacts.length === 0,
+          artifactOverride: input.artifactOverride,
+          missingArtifacts,
         });
         if (!result.ok) {
           throw new LifecyclePolicyFailureError(result.code);

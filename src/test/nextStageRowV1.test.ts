@@ -60,9 +60,17 @@ function setProgress(folder: string, patch: Record<string, unknown>): void {
 function installReadFileBridge(): { restore: () => void } {
   const target = vscode.workspace.fs as unknown as Record<string, unknown>;
   const orig = target.readFile;
+  const origStat = target.stat;
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
-  return { restore: (): void => { target.readFile = orig; } };
+  target.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+    fs.promises.stat(uri.fsPath).then((stat) => ({
+      type: vscode.FileType.File,
+      ctime: stat.ctimeMs,
+      mtime: stat.mtimeMs,
+      size: stat.size,
+    }));
+  return { restore: (): void => { target.readFile = orig; target.stat = origStat; } };
 }
 
 void describe("nextStage.v1 registry row", () => {
@@ -145,6 +153,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("advances an active task to the immediate next canonical stage and marks the departing stage complete", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
 
     const outcome = await executeNextStageV1(contextFor(fixture.folder, "plan"));
     assert.equal(outcome.kind, "completed");
@@ -159,6 +168,30 @@ void describe("nextStage.v1 registry row", () => {
       assert.equal(strict.decoded.progress.currentStage, "plan-high-review");
       assert.ok(strict.decoded.progress.completedStages?.includes("plan"));
       assert.equal(strict.decoded.progress.status, "active");
+    }
+  });
+
+  void it("refuses a stage completion with its artifact absent unless the human explicitly overrides it", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-missing-artifact-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+
+    const rejected = await executeNextStageV1(contextFor(fixture.folder, "plan"));
+    assert.equal(rejected.kind, "failed");
+    if (rejected.kind === "failed") {
+      assert.equal(rejected.code, "nextStage.missingStageArtifact");
+    }
+
+    const overridden = await executeNextStageV1(contextForWith(fixture.folder, {
+      expectedSourceStage: "plan",
+      artifactOverride: "user",
+    }));
+    assert.equal(overridden.kind, "completed");
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.deepEqual(strict.decoded.progress.completedWithMissingArtifacts, [
+        { stage: "plan", artifact: "plan.md", at: strict.decoded.progress.updatedAt, override: "user" },
+      ]);
     }
   });
 
@@ -228,6 +261,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("surfaces a sanitized writeFailed code when the strict writer throws, without touching progress", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-writefail-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
 
     const throwingDeps: NextStageRowDepsV1 = {
       patchTaskProgress: () => {
@@ -256,6 +290,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("lands directly on an explicit targetStage, skipping the configured review stage's completion tick", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-skip-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
 
     const outcome = await executeNextStageV1(
       contextForWith(fixture.folder, { expectedSourceStage: "plan", targetStage: "impl" })
@@ -297,6 +332,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("advances when expectedReviewAttemptId matches the freshly re-read progress", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-attempt-match-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan", reviewAttemptId: "attempt-1" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
 
     const outcome = await executeNextStageV1(
       contextForWith(fixture.folder, { expectedSourceStage: "plan", expectedReviewAttemptId: "attempt-1" })
@@ -339,6 +375,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("runs beforeWrite atomically with a winning CAS, before the write", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-beforewrite-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
 
     const calls: string[] = [];
     const outcome = await executeNextStageV1(
@@ -364,6 +401,7 @@ void describe("nextStage.v1 registry row", () => {
   void it("creates publish-review.md when landing on Publish (plan item 17, step 20a) — the primary review-driven/manual transition writer, not just the legacy advanceStage path", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-publish-artifact-");
     setProgress(fixture.folder, { status: "active", currentStage: "impl-low-review" });
+    fs.writeFileSync(path.join(fixture.folder, "impl-low-review.md"), "Readiness: 10/10");
     const artifactPath = path.join(fixture.folder, "publish-review.md");
     assert.equal(fs.existsSync(artifactPath), false);
 

@@ -27,6 +27,7 @@
 import {
   BlockerSupersessionRecordV1,
   ChecklistChangeProposalV1,
+  CompletedWithMissingArtifactV1,
   ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
@@ -128,6 +129,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "pinnedAt",
   "publishScopePath",
   "completedStages",
+  "completedWithMissingArtifacts",
   "preImageDescription",
   "ownership",
   "createdAt",
@@ -1791,6 +1793,39 @@ function validateCompletedStages(
   return { stages: [...STAGE_ORDER.slice(0, highestIndex + 1)] };
 }
 
+function validateCompletedWithMissingArtifacts(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > STAGE_ORDER.length * 4) {
+    return "completedWithMissingArtifacts must be a bounded array";
+  }
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return "completedWithMissingArtifacts entries must be objects";
+    }
+    const allowed = new Set(["stage", "artifact", "at", "override"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `completedWithMissingArtifacts entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "completedWithMissingArtifacts entry stage must be a recognized stage";
+    }
+    if (!boundedString(entry["artifact"], MAX_PATH_LENGTH)) {
+      return "completedWithMissingArtifacts entry artifact must be a bounded string";
+    }
+    if (!isIsoTimestamp(entry["at"])) {
+      return "completedWithMissingArtifacts entry at must be an ISO timestamp";
+    }
+    if (entry["override"] !== "user") {
+      return 'completedWithMissingArtifacts entry override must be "user"';
+    }
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Full strict decode
 // ---------------------------------------------------------------------------
@@ -2044,6 +2079,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", result.error ?? "completedStages is invalid");
         }
         draft.completedStages = result.stages;
+        break;
+      }
+      case "completedWithMissingArtifacts": {
+        const error = validateCompletedWithMissingArtifacts(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.completedWithMissingArtifacts = value as CompletedWithMissingArtifactV1[];
         break;
       }
       case "preImageDescription": {

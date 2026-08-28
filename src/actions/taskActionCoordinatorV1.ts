@@ -326,7 +326,7 @@ export interface TaskActionRequestV1 {
    * previously surfaced. A caller that already has this round's own
    * `roundLedger` row open (`claimReviewAttempt`) can therefore attach both
    * ids to that LIVE row the moment this fires, rather than waiting for the
-   * round to end — see `attachCoordinatorIdentityToRoundBestEffortV1`
+   * round to end — see `attachCoordinatorIdentityToRoundV1`
    * (`roundLedgerV1.ts`).
    */
   readonly onPromptAssembled?: (info: {
@@ -350,11 +350,16 @@ export interface TaskActionRequestV1 {
    * not attach that attempt's id at all — only a later attempt on the SAME
    * operation that did reach assembly would ever be recorded. This hook fires
    * for every attempt this coordinator allocates, assembly-eligible or not, so
-   * `attachCoordinatorIdentityToRoundBestEffortV1` can be called from it
-   * instead of (or in addition to) `onPromptAssembled`. Same "best-effort,
-   * never allowed to affect dispatch" contract as `onPromptAssembled`.
+   * `attachCoordinatorIdentityToRoundV1` can be called from it
+   * instead of (or in addition to) `onPromptAssembled`. Unlike the prompt
+   * observer, this hook may be awaited: callers that own a round ledger use
+   * it as an admission gate. A rejected hook never escapes the coordinator;
+   * it produces a settled `attemptIdentityAttachmentFailed` outcome before a
+   * provider can run.
    */
-  readonly onAttemptAllocated?: (info: { readonly attemptId: string; readonly operationId: string }) => void;
+  readonly onAttemptAllocated?: (
+    info: { readonly attemptId: string; readonly operationId: string }
+  ) => void | Promise<void>;
   /**
    * Lifecycle-row-only side channel (plan §6.6's `nextStage.v1`): forwarded
    * verbatim into `LifecycleExecutionContextV1.beforeWrite` for a `"lifecycle"`
@@ -1458,16 +1463,39 @@ export function createTaskActionCoordinatorV1(
      */
     operationId?: OperationIdV1,
     /** See `TaskActionRequestV1.onAttemptAllocated`. */
-    onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"]
+    onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"],
+    taskBinding?: TaskBindingRefV1
   ): Promise<TaskActionOutcomeV1> {
-    const reportAttemptAllocatedV1 = (allocatedAttemptId: string): void => {
+    const attachmentFailureOutcomeV1 = (attemptId: string): TaskActionOutcomeV1 => ({
+      kind: "failed",
+      ...(operationId !== undefined && taskBinding !== undefined
+        ? {
+            correlation: {
+              actionKey: row.actionKey,
+              operationId,
+              attemptId,
+              taskBindingId: taskBinding.taskBindingId,
+              chatDocumentId: taskBinding.chatDocumentId,
+            },
+          }
+        : {}),
+      code: "attemptIdentityAttachmentFailed",
+      retryable: true,
+    });
+    const reportAttemptAllocatedV1 = async (allocatedAttemptId: string): Promise<boolean> => {
       if (operationId === undefined) {
-        return;
+        return true;
       }
       try {
-        onAttemptAllocated?.({ attemptId: allocatedAttemptId, operationId });
-      } catch {
-        // Best-effort observability hook — must never affect dispatch.
+        await onAttemptAllocated?.({ attemptId: allocatedAttemptId, operationId });
+        return true;
+      } catch (error) {
+        // The attachment is required for ledger-owning callers, but a failed
+        // attachment must still take the coordinator's normal settlement
+        // path. Letting it reject here previously leaked progress and skipped
+        // the stage owner's terminalization path entirely.
+        console.error("onAttemptAllocated failed:", error);
+        return false;
       }
     };
     // No task-operation lease is held anywhere in this function except the
@@ -1596,7 +1624,10 @@ export function createTaskActionCoordinatorV1(
       } else {
         isFreshCandidateReservationThisIterationV1 = true;
         attemptId = session.allocateAttempt();
-        reportAttemptAllocatedV1(attemptId);
+        if (!(await reportAttemptAllocatedV1(attemptId))) {
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return attachmentFailureOutcomeV1(attemptId);
+        }
 
         const next = selection.reserveNext(attemptId);
         if (next.kind === "noneRemaining") {
@@ -1873,7 +1904,10 @@ export function createTaskActionCoordinatorV1(
           ) {
             networkFaultRetriesUsedV1++;
             const retryAttemptId = session.allocateAttempt();
-            reportAttemptAllocatedV1(retryAttemptId);
+            if (!(await reportAttemptAllocatedV1(retryAttemptId))) {
+              session.reportAttemptOutcome(retryAttemptId, "providerUnavailablePreInvocation");
+              return attachmentFailureOutcomeV1(retryAttemptId);
+            }
             networkFaultRetryAttemptIdsV1.add(retryAttemptId);
             const retryHandle = session.reserve({
               attemptId: retryAttemptId,
@@ -2443,10 +2477,40 @@ export function createTaskActionCoordinatorV1(
     let initialCandidate: AdmittedProviderActionTicketV1["initialCandidate"] | undefined;
     for (;;) {
       const attemptId = session.allocateAttempt();
+      let identityAttached = true;
       try {
-        request.onAttemptAllocated?.({ attemptId, operationId });
-      } catch {
-        // Best-effort observability hook — must never affect dispatch.
+        await request.onAttemptAllocated?.({ attemptId, operationId });
+      } catch (error) {
+        // `admitAction` owns an open progress handle at this point. Convert
+        // an attachment failure into a normal, settled result so it cannot
+        // escape `executeAction` before `progress.end()` and audit logging.
+        console.error("onAttemptAllocated failed:", error);
+        identityAttached = false;
+      }
+      if (!identityAttached) {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        progress.end();
+        return {
+          kind: "settled",
+          outcome: finalizeOutcome(
+            row,
+            request,
+            operationId,
+            {
+              kind: "failed",
+              correlation: {
+                actionKey: row.actionKey,
+                operationId,
+                attemptId,
+                taskBindingId: request.taskBinding.taskBindingId,
+                chatDocumentId: request.taskBinding.chatDocumentId,
+              },
+              code: "attemptIdentityAttachmentFailed",
+              retryable: true,
+            },
+            metrics
+          ),
+        };
       }
       const next = selection.reserveNext(attemptId);
       if (next.kind === "noneRemaining") {
@@ -2615,7 +2679,8 @@ export function createTaskActionCoordinatorV1(
           ticket.initialCandidateAssembledPrompt,
           ticket.request.onPromptAssembled,
           ticket.operationId,
-          ticket.request.onAttemptAllocated
+          ticket.request.onAttemptAllocated,
+          ticket.request.taskBinding
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);
@@ -2967,7 +3032,8 @@ export function createTaskActionCoordinatorV1(
         undefined,
         request.onPromptAssembled,
         operationRef.operationId,
-        request.onAttemptAllocated
+        request.onAttemptAllocated,
+        request.taskBinding
       );
       // Best-effort durable mirror of the claimed invocation's terminal
       // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later

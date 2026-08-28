@@ -1,9 +1,8 @@
 /**
- * Coverage for the C3 "Complete Task is never gated" requirement: markTaskDone
- * completes a Publish-stage task unconditionally — it runs no completion
- * checks, shows no modal prompt, and never invokes the Fix-with-AI command.
- * The completion-check + override flow belongs to the publishing commands
- * (commitAndPushTask), not to task completion.
+ * Completion never runs completion checks or invokes Fix with AI. Its only
+ * lifecycle gate is the required Publish artifact, exercised elsewhere; this
+ * suite supplies that artifact to prove the completion-check flow remains
+ * owned by publishing commands.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -58,9 +57,17 @@ function fixtureProgress(taskFolderPath: string): TaskProgress {
 function installReadFileBridge(): { restore: () => void } {
   const target = vscode.workspace.fs as unknown as Record<string, unknown>;
   const orig = target.readFile;
+  const origStat = target.stat;
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
-  return { restore: (): void => { target.readFile = orig; } };
+  target.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+    fs.promises.stat(uri.fsPath).then((stat) => ({
+      type: vscode.FileType.File,
+      ctime: stat.ctimeMs,
+      mtime: stat.mtimeMs,
+      size: stat.size,
+    }));
+  return { restore: (): void => { target.readFile = orig; target.stat = origStat; } };
 }
 
 function installWorkspaceFoldersStub(): { restore: () => void } {
@@ -106,10 +113,11 @@ class RecordingSurface {
   }
 }
 
-void describe("markTaskDone is ungated (C3: Complete Task never runs or blocks on checks)", () => {
+void describe("markTaskDone does not run completion checks", () => {
   void it("completes the task without running completion checks, prompting, or invoking fixes", async () => {
     const taskFolderPath = makeTaskFolder("ungated-complete");
     writeProgress(taskFolderPath, fixtureProgress(taskFolderPath));
+    fs.writeFileSync(path.join(taskFolderPath, "publish-review.md"), "Readiness: 10/10");
 
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
@@ -175,6 +183,7 @@ void describe("markTaskDone is ungated (C3: Complete Task never runs or blocks o
   void it("clears the current task when no other active task remains", async () => {
     const taskFolderPath = makeTaskFolder("ungated-next-selection");
     writeProgress(taskFolderPath, fixtureProgress(taskFolderPath));
+    fs.writeFileSync(path.join(taskFolderPath, "publish-review.md"), "Readiness: 10/10");
 
     const surface = new RecordingSurface();
     initNotificationRouter(surface);

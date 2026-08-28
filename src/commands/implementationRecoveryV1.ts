@@ -819,13 +819,7 @@ export async function claimImplRecoveryDispatchV1(
       const openRow =
         peekedRow && (peekedRow.state === "open" || peekedRow.state === "scheduled")
           ? peekedRow
-          : [...(current.roundLedger ?? [])]
-              .reverse()
-              .find(
-                (row) =>
-                  (row.state === "open" || row.state === "scheduled") &&
-                  row.stage === current.currentStage
-              );
+          : undefined;
       // The reused row keeps its own pre-existing `roundId` (an
       // auto-dispatched continuation's own generic row, keyed by its
       // dispatch's `intentId`) — but `claimed.attemptId` is the id every

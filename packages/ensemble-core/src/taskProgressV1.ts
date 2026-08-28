@@ -131,6 +131,12 @@ export interface TaskProgress {
   publishScopePath?: string;
   /** Stages explicitly completed by a terminal lifecycle action. */
   completedStages?: TaskStage[];
+  /**
+   * Explicit human acceptances of a stage whose required artifact was absent
+   * at completion time. A completed task with this record is intentionally
+   * distinguishable from one whose complete stage artifacts all existed.
+   */
+  completedWithMissingArtifacts?: CompletedWithMissingArtifactV1[];
   /** Original description captured before an AI draft is applied. */
   preImageDescription?: string;
   /** Stable project binding used for workspace-scoped operations. */
@@ -251,6 +257,14 @@ export interface TaskProgress {
   quotaParkRecord?: QuotaParkRecordV1;
 }
 
+/** One artifact deliberately accepted as absent by a human completion override. */
+export interface CompletedWithMissingArtifactV1 {
+  readonly stage: TaskStage;
+  readonly artifact: string;
+  readonly at: string;
+  readonly override: "user";
+}
+
 /** `TaskProgress.quotaParkRecord` — mirror of `src/types/taskProgress.ts`. */
 export interface QuotaParkRecordV1 {
   /** The model id that hit the failure. */
@@ -323,6 +337,18 @@ export interface ImplRecoveryV1 {
   /** Same lease semantics as `scheduledRun`: one window arms the dispatch. */
   leaseOwner?: string;
   leaseUntil?: string;
+  /** Dispatch mode of the round that triggered this recovery (mirror of
+   * `src/types/taskProgress.ts`). Absent for recoveries recorded before this
+   * field existed; treat absence as `"implementation"`. */
+  sourceDispatchMode?: ImplementationDispatchModeV1;
+  /** The review stage whose blockers the source `"apply-review"` round was
+   * applying (mirror of `src/types/taskProgress.ts`). Only meaningful when
+   * `sourceDispatchMode === "apply-review"`. */
+  sourceReviewStage?: TaskStage;
+  /** The `roundLedger` row id terminalized as the source round (mirror of
+   * `src/types/taskProgress.ts`). Absent for a record persisted before this
+   * field existed. */
+  sourceRoundId?: string;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -364,6 +390,23 @@ export interface ReviewBlockerIdentity {
   /** Truncated original description, for re-review prompt context only —
    * never used for identity comparisons. */
   description?: string;
+  /** Carried forward from `ReviewBlocker.origin` (mirror of
+   * `src/types/taskProgress.ts`): `"reviewer"` for a blocker the AI reviewer
+   * itself raised in prose, `"mechanical"` for one synthesized directly from
+   * a failed Verified Check. Absent on entries written before this field
+   * existed. */
+  origin?: "reviewer" | "mechanical";
+}
+
+/** One blocker a round re-raised that matches a `plan-final.md`
+ * `## Accepted Non-Goals` entry (mirror of `src/types/taskProgress.ts`). */
+export interface ReviewerChallengedNonGoalV1 {
+  /** The stable blocker lineage id (`ReviewBlockerIdentity.id`) of the
+   * re-raised blocker, when one could be resolved. */
+  readonly blockerId?: string;
+  /** The `## Accepted Non-Goals` sub-heading (or the section heading itself,
+   * for a plan with no sub-headings) the blocker matched. */
+  readonly nonGoalHeading: string;
 }
 
 /** See `ReviewBlockerIdentity.lineage`; mirrors src/types/taskProgress.ts. */
@@ -391,6 +434,16 @@ export interface ReviewScoreHistoryEntry {
    * review (absent on older entries). See the mirrored doc in
    * src/types/taskProgress.ts. */
   reviewer?: ReviewerIdentityV1;
+  /** Stable identities of blockers this round reported that were EXCLUDED
+   * from `blockerCount`/`taskFixableCount`/`blockers` because they matched a
+   * `plan-final.md` `## Accepted Non-Goals` entry (mirror of
+   * `src/types/taskProgress.ts`). Absent when nothing was superseded this
+   * round. */
+  supersededBlockers?: ReviewBlockerIdentity[];
+  /** Every blocker this round re-raised that matches an Accepted Non-Goals
+   * entry (mirror of `src/types/taskProgress.ts`). Absent when nothing
+   * matched. */
+  reviewerChallengedNonGoal?: ReviewerChallengedNonGoalV1[];
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */
@@ -431,6 +484,11 @@ export interface BlockerSupersessionRecordV1 {
    * edit — the pointer to the confirming chat exchange. Optional only so a
    * record from before this field existed remains decodable. */
   confirmingMessageAt?: string;
+  /** Where this supersession came from (mirror of
+   * `src/types/taskProgress.ts`). Absent decodes as `"chat-confirmed"` —
+   * every record written before this field existed came from the stage-chat
+   * resolution path, the only one that existed then. */
+  source?: "chat-confirmed" | "plan-non-goal";
 }
 
 /** Cap on `TaskProgress.blockerSupersessions` length (oldest entries dropped first). */
@@ -465,6 +523,13 @@ export interface ChecklistChangeProposalV1 {
   /** Checklist total immediately after this revision's re-finalization
    * merge (mirror of `src/types/taskProgress.ts`). */
   itemCountAfter?: number;
+  /** Whether the ledger annotation for this adoption landed atomically with
+   * `resolvedAt` (mirror of `src/types/taskProgress.ts`). Set `true` only
+   * when the row was found and annotated; `false` when adoption succeeded
+   * but the row named by `roundId` no longer exists in `roundLedger`
+   * (evicted by its own cap). Absent only when the proposal has not yet been
+   * adopted. */
+  ledgerAnnotated?: boolean;
 }
 
 /** Cap on `TaskProgress.checklistChangeProposals` length (oldest entries dropped first). */
@@ -538,6 +603,16 @@ export interface RoundOutcomeEntryV1 {
    * existed; treat absence as "unknown provider", never as a match.
    */
   providerId?: string;
+  /** What the round was dispatched to work from (mirror of
+   * `src/types/taskProgress.ts`). Absent for entries written before this
+   * field existed; treat absence as unknown, never as `"implementation"` by
+   * default. */
+  dispatchMode?: ImplementationDispatchModeV1;
+  /** The impl-review stage the task actually displayed when this round was
+   * dispatched, set only on rows bookkept under the literal `stage: "impl"`
+   * (mirror of `src/types/taskProgress.ts`). Absent for rows not bookkept
+   * that way and for rows written before this field existed. */
+  originatingReviewStage?: TaskStage;
 }
 
 /** Cap on `TaskProgress.roundOutcomes` length (oldest entries dropped first). */
@@ -614,6 +689,24 @@ export interface RoundLedgerEntryV1 {
   endedAt?: string;
   /** Set only once `state` is terminal. */
   outcome?: RoundLedgerOutcomeV1;
+  /** Set once, well after this round already terminalized, when this row's
+   * own checklist mutation is later formalized into an actual plan revision
+   * (mirror of `src/types/taskProgress.ts`). Absent for every row that never
+   * mutated the checklist, and for one whose proposal was discarded rather
+   * than adopted. */
+  checklistRevisionAdopted?: ChecklistRevisionAdoptedV1;
+}
+
+/** `RoundLedgerEntryV1.checklistRevisionAdopted` — see that field's own doc
+ * comment (mirror of `src/types/taskProgress.ts`). */
+export interface ChecklistRevisionAdoptedV1 {
+  /** ISO timestamp the revision was adopted — copied from the proposal's own
+   * `resolvedAt`. */
+  readonly resolvedAt: string;
+  /** Checklist `total` immediately before the revision's re-finalization merge. */
+  readonly itemCountBefore?: number;
+  /** Checklist `total` immediately after the revision's re-finalization merge. */
+  readonly itemCountAfter?: number;
 }
 
 /** Cap on per-entry `blockers` length (a review with more is truncated). */

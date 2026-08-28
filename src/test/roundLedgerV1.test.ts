@@ -26,6 +26,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import {
+  ChecklistChangeProposalV1,
   RoundLedgerEntryV1,
   TaskProgress,
 } from "../types/taskProgress";
@@ -36,7 +37,7 @@ import {
 } from "../utils/taskProgressTransforms";
 import {
   __resetPendingAutomationRoundIntentsForTestV1,
-  attachCoordinatorIdentityToRoundBestEffortV1,
+  attachCoordinatorIdentityToRoundV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   formatRoundOutcomeMessageV1,
@@ -45,7 +46,6 @@ import {
   setPendingAutomationRoundIntentV1,
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
-import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -192,6 +192,68 @@ void describe("upsertRoundLedgerEntryV1 (Part 4 step 12/44)", () => {
       ["live-1", "terminal-1", "terminal-2"]
     );
   });
+
+  void it(
+    "protects a terminal row named by a pending/revising checklistChangeProposals entry from cap eviction, even as the OLDEST terminal row present (2026-08-28 review fix, completion blocker: a plan revision can outlive the round-ledger's ordinary FIFO pressure)",
+    () => {
+      const protectedRow = makeBaseEntry({
+        roundId: "protected-mutating-round",
+        state: "completed",
+        endedAt: "2026-01-01T00:00:01.000Z",
+      });
+      // Fill the ledger to exactly the cap with terminal rows OLDER than
+      // protectedRow is not needed — protectedRow is deliberately the FIRST
+      // (oldest) entry, then MAX_ROUND_LEDGER_ENTRIES - 1 more terminal
+      // filler rows bring the array to exactly cap before the upsert below
+      // pushes it one over.
+      const filler: RoundLedgerEntryV1[] = Array.from({ length: 199 }, (_, i) =>
+        makeBaseEntry({
+          roundId: `filler-${i}`,
+          state: "completed",
+          endedAt: `2026-01-01T00:00:${String(2 + i).padStart(2, "0")}.000Z`,
+        })
+      );
+      const revisingProposal: ChecklistChangeProposalV1 = {
+        at: "2026-01-01T00:00:00.000Z",
+        roundId: "protected-mutating-round",
+        stage: "impl",
+        kind: "added",
+        proposedItems: ["some new step"],
+        removedItems: [],
+        status: "revising",
+      };
+      const progress = makeProgress({
+        roundLedger: [protectedRow, ...filler],
+        checklistChangeProposals: [revisingProposal],
+      });
+      assert.equal(progress.roundLedger?.length, 200);
+
+      const oneMore = makeBaseEntry({ roundId: "pushes-over-cap", state: "completed", endedAt: "2026-01-01T00:05:00.000Z" });
+      const next = upsertRoundLedgerEntryV1(progress, oneMore);
+
+      assert.equal(next.roundLedger?.length, 200, "stays at cap");
+      assert.ok(
+        next.roundLedger?.some((r) => r.roundId === "protected-mutating-round"),
+        "the row named by the pending revision proposal must survive eviction even as the oldest terminal row"
+      );
+      assert.ok(
+        !next.roundLedger?.some((r) => r.roundId === "filler-0"),
+        "the oldest UNPROTECTED terminal row is the one actually dropped"
+      );
+
+      // Once the proposal resolves (adopted/discarded), protection lifts and
+      // the same row becomes evictable like any other terminal row again.
+      const adoptedProgress = {
+        ...progress,
+        checklistChangeProposals: [{ ...revisingProposal, status: "adopted" as const }],
+      };
+      const afterAdoption = upsertRoundLedgerEntryV1(adoptedProgress, oneMore);
+      assert.ok(
+        !afterAdoption.roundLedger?.some((r) => r.roundId === "protected-mutating-round"),
+        "protection lifts once the proposal is no longer pending/revising"
+      );
+    }
+  );
 });
 
 function makeTaskFolder(name: string): { folderPath: string; folderUri: vscode.Uri } {
@@ -1641,7 +1703,7 @@ void describe("claimImplementationRoundLedgerV1 (Part 4 architectural fix, 2026-
 });
 
 void describe(
-  "attachCoordinatorIdentityToRoundBestEffortV1 (Part 4 architectural fix, 2026-08-27 review follow-up: " +
+  "attachCoordinatorIdentityToRoundV1 (Part 4 architectural fix, 2026-08-28: " +
     "\"coordinator allocation sites still do not attach operation and attempt identities to a round-ledger row ... at allocation time\")",
   () => {
     void it("attaches operationId and merges attemptId into a still-live row", async () => {
@@ -1662,7 +1724,7 @@ void describe(
         );
         const folderUri = vscode.Uri.file(folderPath);
 
-        await attachCoordinatorIdentityToRoundBestEffortV1({
+        await attachCoordinatorIdentityToRoundV1({
           taskFolderUri: folderUri,
           roundId: "review-attempt-1",
           operationId: "coordinator-op-1",
@@ -1701,10 +1763,10 @@ void describe(
         );
         const folderUri = vscode.Uri.file(folderPath);
 
-        await attachCoordinatorIdentityToRoundBestEffortV1({
+        await attachCoordinatorIdentityToRoundV1({
           taskFolderUri: folderUri,
           roundId: "review-attempt-2",
-          operationId: "a-different-op",
+          operationId: "already-attached-op",
           attemptId: "a-retry-attempt",
         });
 
@@ -1739,12 +1801,12 @@ void describe(
         );
         const folderUri = vscode.Uri.file(folderPath);
 
-        await attachCoordinatorIdentityToRoundBestEffortV1({
+        await assert.rejects(() => attachCoordinatorIdentityToRoundV1({
           taskFolderUri: folderUri,
           roundId: "review-attempt-3",
           operationId: "too-late-op",
           attemptId: "too-late-attempt",
-        });
+        }), /not live/);
 
         const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
         const updated = raw.roundLedger?.[0];
@@ -1765,73 +1827,3 @@ void describe(
 // `markChecklistChangeProposalAdoptedV1` directly, and end-to-end coverage
 // through the real `preparePlanPromotion` publish path lives in
 // `planRevisionV1.test.ts`.
-
-void describe(
-  "terminalizeRoundV1 — opportunistic identity backfill (2026-08-28 review fix, narrowing the " +
-    "architectural blocker: \"the actual roundLedger row is updated only when reconcileRoundLedgerV1 " +
-    "later invokes backfillRoundIdentityFromLogV1 ... until that sweep, resolveRoundV1 and every live " +
-    "ledger consumer still lack the allocation identity\")",
-  () => {
-    void it(
-      "attaches a logged identity onto a DIFFERENT still-live row the moment any round on the same " +
-        "task terminalizes, without waiting for the periodic reconciliation sweep",
-      async () => {
-        const fsBridge = installFsBridge();
-        try {
-          const folderPath = path.join(REAL_ROOT, "plans", "opportunistic_backfill");
-          fs.mkdirSync(folderPath, { recursive: true });
-          const liveRow = makeBaseEntry({
-            roundId: "live-row-1",
-            intentId: undefined,
-            attemptIds: [],
-            state: "open",
-          });
-          const otherRow = makeBaseEntry({
-            roundId: "other-round-1",
-            intentId: "other-round-1",
-            attemptIds: ["other-round-1"],
-            state: "open",
-          });
-          fs.writeFileSync(
-            path.join(folderPath, "task-progress.json"),
-            JSON.stringify(
-              makeProgress({ taskFolder: "opportunistic_backfill", roundLedger: [liveRow, otherRow] }),
-              null,
-              2
-            ),
-            "utf8"
-          );
-          const folderUri = vscode.Uri.file(folderPath);
-
-          // A crash between allocation and `onPromptAssembled` left this
-          // identity durable only in the sidecar log — nothing has backfilled
-          // it onto `live-row-1` yet.
-          await appendRoundIdentityLogEntryBestEffortV1(folderUri, {
-            roundId: "live-row-1",
-            operationId: "op-from-sidecar",
-            attemptId: "attempt-from-sidecar",
-            at: "2026-01-01T00:00:00.000Z",
-          });
-
-          // A completely unrelated round on the SAME task ends.
-          const result = await terminalizeRoundV1(
-            "other-round-1",
-            "completed",
-            { filesChanged: [] },
-            { taskFolderUri: folderUri }
-          );
-          assert.equal(result.ok, true);
-
-          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
-          const backfilled = raw.roundLedger?.find((r) => r.roundId === "live-row-1");
-          assert.equal(backfilled?.operationId, "op-from-sidecar");
-          assert.ok(backfilled?.attemptIds.includes("attempt-from-sidecar"));
-          // Still live — the backfill must never touch state/endedAt/outcome.
-          assert.equal(backfilled?.state, "open");
-        } finally {
-          fsBridge.restore();
-        }
-      }
-    );
-  }
-);

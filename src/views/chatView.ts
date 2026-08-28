@@ -32,12 +32,12 @@ import {
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
-import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
+import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import {
   deriveOwedContinuationRecordV1,
   deriveSchedulingPostureV1,
-  describeSchedulingPostureV1,
   SchedulingIntentStoreV1,
+  SchedulingPostureV1,
 } from "../state/schedulingIntentV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
@@ -305,6 +305,60 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
     }
   }
   return awaiting;
+}
+
+/** The transcript footer is a posture, not a hand-off essay. Keep its five
+ * durable states explicit so the last line always answers whether this task
+ * is alive, scheduled, waiting on the user, or genuinely unknown. */
+export function formatChatSchedulingPostureLineV1(
+  posture: SchedulingPostureV1,
+  leaseUntil?: string
+): string {
+  switch (posture.kind) {
+    case "running":
+      return "running — a round is running now";
+    case "scheduled": {
+      const next = leaseUntil ? ` — next attempt ${formatTimestampForDisplay(new Date(leaseUntil))}` : "";
+      return `scheduled${next}`;
+    }
+    case "owedWillNotRetry":
+      return "owed-but-will-not-retry — a continuation is owed but will not retry automatically";
+    case "waitingForYou":
+      return "waiting-for-you — no work is running; choose the next action";
+    case "unknown":
+      return "unknown — cannot determine this task's scheduling posture";
+  }
+}
+
+/** Merge durable transcript records and workspace-state decision cards by
+ * their recorded time. A decision anchor wins over its `createdAt` fallback
+ * and sits immediately after the message that announced it. */
+function buildChatTimelineV1<
+  T extends { readonly at: string; readonly decisionId?: string },
+  D extends WorkflowDecisionV1
+>(entries: readonly T[], decisions: readonly D[]): Array<{ type: "message"; value: T } | { type: "decision"; value: D }> {
+  const anchorAt = new Map<string, string>();
+  for (const entry of entries) {
+    if (entry.decisionId) anchorAt.set(entry.decisionId, entry.at);
+  }
+  const ordered = [
+    ...entries.map((value, index) => ({ type: "message" as const, value, at: value.at, order: index * 2 })),
+    ...decisions.map((value, index) => ({
+      type: "decision" as const,
+      value,
+      at: anchorAt.get(value.decisionId) ?? value.createdAt,
+      order: anchorAt.has(value.decisionId) ? entries.findIndex((entry) => entry.decisionId === value.decisionId) * 2 + 1 : index * 2 + 1,
+    })),
+  ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.order - b.order);
+  const timeline: Array<{ type: "message"; value: T } | { type: "decision"; value: D }> = [];
+  for (const item of ordered) {
+    if (item.type === "message") {
+      timeline.push({ type: "message", value: item.value });
+    } else {
+      timeline.push({ type: "decision", value: item.value });
+    }
+  }
+  return timeline;
 }
 
 /**
@@ -1519,21 +1573,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       : undefined;
     const waitingForUser = waitingForUserSource !== undefined;
     const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
-    // Part 4.3: "Where a transport genuinely reports nothing until it
-    // finishes, render that statement explicitly (contract rule: explicit
-    // unknown, not implied wait)." Most busy operations never call
-    // `TaskOperationHandle.report(detail)`, so a bare "Waiting for the AI…"
-    // reads as an implied wait with no way to tell whether progress is being
-    // narrated or not. `busyDetail` surfaces the most recently started
-    // non-waiting op's `detail` when one exists (e.g. a review loop's
-    // "iteration 2/3"); when none of the live ops have reported anything,
-    // it is left `undefined` and the webview renders the explicit
-    // no-status-available statement instead of a bare spinner.
-    const busyDetail = busy
-      ? [...targetOps]
-          .filter((op) => !op.waitingForUser && op.detail !== undefined)
-          .sort((a, b) => b.startedAt - a.startedAt)[0]?.detail
+    // The operation registry is the source of task status, not the panel's
+    // optional progress-detail plumbing. A live operation always supplies a
+    // label/stage and start time; its incremental detail and resolved model
+    // enrich that statement when available. Only an impossible busy-without-
+    // operation state renders an explicit "cannot determine" admission.
+    const busyOperation = busy
+      ? [...targetOps].filter((op) => !op.waitingForUser).sort((a, b) => b.startedAt - a.startedAt)[0]
       : undefined;
+    const busyDetail = busyOperation?.detail;
+    const busyText = !busy
+      ? undefined
+      : !busyOperation
+        ? "cannot determine what this task is doing"
+        : `Running ${busyOperation.stage ? STAGE_DISPLAY_NAMES[busyOperation.stage] : busyOperation.label} since ` +
+          `${formatTimestampForDisplay(new Date(busyOperation.startedAt))}` +
+          `${busyOperation.modelId ? ` — ${busyOperation.modelId}` : ""}` +
+          `${busyDetail ? ` — ${busyDetail}` : ""}`;
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -1563,6 +1619,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // (the same source `awaitingQuestionIndices` above uses, so the two can
     // never disagree) settles a question only on a later `role: "user"` entry — an unrelated
     // assistant/system message appended after it must NOT falsely settle it.
+    const outcomeIntentIds = new Set(
+      entries.filter((entry) => entry.kind === "outcome" && entry.intentId !== undefined).map((entry) => entry.intentId!)
+    );
     const displayEntries = entries.map((entry, index) => {
       const date = new Date(entry.at);
       return {
@@ -1571,6 +1630,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         atLabel: formatTimestampForDisplay(date),
         atTitle: date.toLocaleString(),
         awaitingAnswer: awaitingQuestionIndices.has(index),
+        endingPendingReconciliation:
+          entry.kind === "activity" && entry.intentId !== undefined && !outcomeIntentIds.has(entry.intentId),
       };
     });
     // The webview script cannot import host-side code (see the comment on
@@ -1679,16 +1740,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           inFlight: taskOperations.rootOperationIdFor(target.canonicalId) !== undefined,
           owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
         });
-        schedulingPostureLine = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture))
-          .map((line) => line.text)
-          .join(" ");
+        schedulingPostureLine = formatChatSchedulingPostureLineV1(posture, progress?.implRecovery?.leaseUntil);
       } catch {
         // A failure deriving the posture is exactly the "cannot establish
         // the fact" case the `unknown` posture exists for — never silence,
         // never a guess at `waitingForYou`/`running`.
-        schedulingPostureLine = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1({ kind: "unknown" }))
-          .map((line) => line.text)
-          .join(" ");
+        schedulingPostureLine = formatChatSchedulingPostureLineV1({ kind: "unknown" });
       }
       // The progress read above is async: a target switch mid-read must drop
       // this stale render rather than painting one task's scheduling posture
@@ -1715,10 +1772,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       label,
       schedulingPostureLine,
       entries: displayEntries,
+      timeline: buildChatTimelineV1(displayEntries, displayDecisions),
       interaction,
       decisions: displayDecisions,
       busy,
       busyDetail,
+      busyText,
       waitingForUser,
       waitingForUserSource,
       errorMessage,
@@ -1948,7 +2007,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
-      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">Waiting for the AI…</span></div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">No task is running.</span></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
@@ -2101,10 +2160,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // basis"), and ONE Confirm button per card — the same single-commit-
       // path and acknowledge-on-press rules renderInteraction above applies
       // to structured questions, so the two decision surfaces do not diverge.
-      function renderDecisions(decisions){
-        dc.replaceChildren();
-        if(!decisions || !decisions.length){ dc.style.display='none'; return; }
-        dc.style.display='block';
+      function renderDecisions(decisions,container){
+        const root=container||dc;
+        root.replaceChildren();
+        if(!decisions || !decisions.length){ root.style.display='none'; return; }
+        root.style.display='block';
         for(const dcs of decisions){
           const card=document.createElement('div'); card.className='decision-card'+(dcs.isGating?' decision-card-gating':'');
           const err=document.createElement('div'); err.className='interaction-error';
@@ -2191,7 +2251,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           });
           actions.appendChild(confirmBtn);
           card.appendChild(actions);
-          dc.appendChild(card);
+          root.appendChild(card);
         }
       }
       window.addEventListener('message', event=>{
@@ -2201,7 +2261,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
         sp.textContent=s.schedulingPostureLine??'';sp.classList.toggle('visible',!!s.schedulingPostureLine);
-        m.replaceChildren(...s.entries.map(x=>{
+        function renderMessage(x){
           const row=document.createElement('div');row.className='msg-row';
           const meta=document.createElement('div');meta.className='msg-meta';
           const time=document.createElement('span');time.className='msg-time';time.textContent=x.atLabel??'';time.title=x.atTitle??'';
@@ -2216,15 +2276,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
           });
           meta.appendChild(copyBtn);meta.appendChild(time);
-          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.awaitingAnswer?' — awaiting your answer':'')+'] '+x.text;
+          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.awaitingAnswer?' — awaiting your answer':'')+'] '+x.text+(x.endingPendingReconciliation?' — ending pending reconciliation':'');
           row.appendChild(d);row.appendChild(meta);
           return row;
-        }));
+        }
+        m.replaceChildren();
+        dc.replaceChildren();dc.style.display='none';
+        const activities=[];
+        for(const item of (s.timeline||s.entries.map(value=>({type:'message',value})))){
+          if(item.type==='decision'){
+            const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
+            renderDecisions([item.value],decisionWrap);m.appendChild(decisionWrap);
+          }else if(item.value.kind==='activity'){
+            activities.push(item.value);
+          }else{
+            m.appendChild(renderMessage(item.value));
+          }
+        }
+        if(activities.length){
+          const group=document.createElement('details');group.className='activity-group';
+          const summary=document.createElement('summary');summary.textContent='Activity ('+activities.length+')';group.appendChild(summary);
+          for(const activity of activities){group.appendChild(renderMessage(activity));}
+          m.appendChild(group);
+        }
         renderInteraction(s.interaction);
-        renderDecisions(s.decisions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
-        if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyDetail?('Waiting for the AI… ('+s.busyDetail+')'):'Waiting for the AI… — no status is available until this finishes';b.style.display='block';b.title='';}
+        if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyText||'cannot determine what this task is doing';b.style.display='block';b.title='';}
         else if(s.waitingForUser){
           bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';
           b.title=s.waitingForUserSource==='liveOperation'?'A running operation is paused waiting on your input.':'';

@@ -340,7 +340,7 @@ void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 
     }
   });
 
-  void it("reuses the task's existing live row (an auto-dispatched continuation's own generic row) rather than opening a second one", async () => {
+  void it("does not adopt an identity-less live row when no dispatch intent identifies it", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     try {
@@ -390,30 +390,23 @@ void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 
       assert.equal(claimed.record?.dispatch, "dispatched");
 
       const raw = readProgress(folderPath);
-      // No new row was synthesized under the continuation attemptId — the
-      // existing generic row (opened by the automation dispatch) was reused.
-      assert.equal(raw.roundLedger?.length, 2);
+      // An unbound live row cannot safely be assumed to belong to this
+      // recovery. The continuation gets a distinct row instead.
+      assert.equal(raw.roundLedger?.length, 3);
       const continuationRow = raw.roundLedger?.find((r) => r.roundId === "intent-continuation-2");
-      assert.equal(continuationRow?.mode, "continuation");
-      assert.equal(continuationRow?.continuationOf, "source-round-2");
+      assert.equal(continuationRow?.mode, "implementation");
+      assert.equal(continuationRow?.continuationOf, undefined);
       assert.equal(continuationRow?.intentId, "intent-continuation-2", "the reused row's own identity must survive");
-      // 2026-08-27 review follow-up: the continuation's own `attemptId` must
-      // ALSO resolve to this reused row — a later caller (e.g.
-      // `executeImplementationRun`'s own `claimImplementationRoundLedgerV1`
-      // call, or a further recovery transition's `sourceRoundIdHint`) holds
-      // only `claimed.record?.attemptId`, never the row's own pre-existing
-      // `roundId`.
-      assert.ok(
-        continuationRow?.attemptIds.includes(claimed.record?.attemptId as string),
-        "the reused row must carry the continuation's own attemptId so callers holding only that id can resolve it"
-      );
+      const synthesized = raw.roundLedger?.find((row) => row.roundId === claimed.record?.attemptId);
+      assert.equal(synthesized?.mode, "continuation");
+      assert.equal(synthesized?.continuationOf, "source-round-2");
     } finally {
       wsStub.restore();
       fsBridge.restore();
     }
   });
 
-  void it("prefers the most recently opened live row over an older one when no pending intent is peeked (2026-08-28 review follow-up: .find() picked the oldest live row, not the current dispatch's own)", async () => {
+  void it("does not use same-stage recency when no pending intent is available", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     try {
@@ -476,15 +469,13 @@ void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 
       assert.equal(claimed.record?.dispatch, "dispatched");
 
       const raw = readProgress(folderPath);
-      // No new row synthesized — the freshest live row was reused.
-      assert.equal(raw.roundLedger?.length, 3);
+      assert.equal(raw.roundLedger?.length, 4);
       const freshRow = raw.roundLedger?.find((r) => r.roundId === "fresh-continuation-row");
-      assert.equal(freshRow?.mode, "continuation", "the FRESHEST live row must be the one linked to the continuation");
-      assert.equal(freshRow?.continuationOf, "source-round-3");
-      assert.ok(
-        freshRow?.attemptIds.includes(claimed.record?.attemptId as string),
-        "the continuation's attemptId must resolve to the freshest row"
-      );
+      assert.equal(freshRow?.mode, "implementation");
+      assert.equal(freshRow?.continuationOf, undefined);
+      const synthesized = raw.roundLedger?.find((row) => row.roundId === claimed.record?.attemptId);
+      assert.equal(synthesized?.mode, "continuation");
+      assert.equal(synthesized?.continuationOf, "source-round-3");
 
       // The stale, unrelated row must be left untouched — not mis-linked as
       // the continuation.

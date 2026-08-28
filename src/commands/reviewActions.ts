@@ -69,13 +69,12 @@ import {
 } from "../utils/implementationDispatchModeV1";
 import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
 import {
-  attachCoordinatorIdentityToRoundBestEffortV1,
+  attachCoordinatorIdentityToRoundV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   RoundLedgerTerminalStateV1,
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
-import { appendRoundIdentityLogEntryBestEffortV1 } from "../utils/roundIdentityLogV1";
 import { shouldTripFallbackProviderBreakerV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   computeDegenerateReviewEpisodeModelIdsV1,
@@ -115,7 +114,6 @@ import {
   readTextIfExists,
   resolveCurrentPlanUri,
   safeOpenTextDocument,
-  statIfExists,
   withAttribution,
   writeTextFile,
   writeTextFileIfUnchangedV1,
@@ -140,6 +138,7 @@ import {
   checkImplementationAvailabilityForModel,
   getConfiguredBackupModelsForStage,
   preflightStageChainAvailabilityV1,
+  rankedStageChainStoredIdsV1,
   recordActiveFallbackModel,
   resolveEffectiveProvider,
 } from "../runners/runnerRegistry";
@@ -172,7 +171,6 @@ import {
   PlanOfRecordV1,
   readImplementationReviewContent,
   readPlanOfRecordV1,
-  resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
   preparePlanPromotion,
   applyDeferredPlanRevisionAdoptionV1,
@@ -212,7 +210,10 @@ import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { outcomeCorrelationV1, ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
-import { stageActionRequirementMessageV1 } from "../utils/stageArtifactRequirementsV1";
+import {
+  missingCompletionArtifactsV1,
+  stageActionRequirementMessageV1,
+} from "../utils/stageArtifactRequirementsV1";
 import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
 import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
 import { postChecklistChangeProposedDecisionV1 } from "./planRevisionV1";
@@ -295,6 +296,7 @@ import {
   formatPriorBlockerLineageListV1,
   isProviderExhaustionReplyShapeV1,
   latestQualifyingReviewMeetsThresholdV1,
+  preferCandidateWithinReadCeilingV1,
   promptCeilingAdvisoryV1,
   resolveBlockerLineageV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
@@ -4528,8 +4530,42 @@ export async function runReviewForFolder(
       }
     })();
     const dispatchCeilingAdvisory = promptCeilingAdvisoryV1(promptByteLength, dispatchProviderId);
+    // The advisory alone was not enough (jester, 2026-08-28): it fired
+    // correctly before dispatch, was shown as a warning, and the round ran on
+    // the over-ceiling provider regardless — producing a 154-byte degenerate
+    // review that was rejected AND overwrote the stage's previous accepted
+    // one. Not refusing is right (the ceiling is token-based and variable),
+    // but when the configured chain already offers a candidate the prompt
+    // fits, preferring it costs nothing: the skipped candidate keeps its
+    // place for every future round whose prompt is within its ceiling.
+    const ceilingPreferredModelId =
+      dispatchCeilingAdvisory === undefined
+        ? undefined
+        : preferCandidateWithinReadCeilingV1(
+            rankedStageChainStoredIdsV1(targetStage, modelId),
+            promptByteLength,
+            (storedModelId) => {
+              try {
+                const effective = resolveEffectiveProvider(storedModelId);
+                return effective.kind === "cli" ? effective.def.id : undefined;
+              } catch {
+                return undefined;
+              }
+            }
+          );
+    // What this round actually dispatches to. Only ever differs from the
+    // stage's configured primary when that primary's known ceiling is
+    // exceeded AND a configured backup's is not; the stored configuration is
+    // never written to.
+    const dispatchModelId = ceilingPreferredModelId ?? modelId;
+    options.operation?.setModel?.(dispatchModelId);
     if (dispatchCeilingAdvisory !== undefined) {
-      NotificationRouter.showWarning(`${STAGE_DISPLAY_NAMES[targetStage]}: ${dispatchCeilingAdvisory}`);
+      NotificationRouter.showWarning(
+        `${STAGE_DISPLAY_NAMES[targetStage]}: ${dispatchCeilingAdvisory}` +
+          (ceilingPreferredModelId !== undefined
+            ? ` Using ${attributionModelLabel(ceilingPreferredModelId) ?? ceilingPreferredModelId} for this round instead.`
+            : "")
+      );
     }
 
     // Pre-flight the stage's resolved provider chain BEFORE burning a round
@@ -4572,7 +4608,7 @@ export async function runReviewForFolder(
 
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceRoot.uri.fsPath,
-      resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+      resolveStagePrimaryModel: () => ({ modelId: dispatchModelId, stage: targetStage }),
     });
 
     const relativePath = path.relative(folderUri.fsPath, reviewUri.fsPath) || STAGE_ARTIFACT_FILENAMES[targetStage] || "review.md";
@@ -4612,56 +4648,21 @@ export async function runReviewForFolder(
       // coordinator allocates, assembly-eligible or not, strictly before any
       // such failure branch can return.
       //
-      // Deliberately IN-MEMORY ONLY here (a synchronous array push, no I/O):
-      // an earlier version of this fix also called
-      // `attachCoordinatorIdentityToRoundBestEffortV1` from this hook — the
-      // same disk attach `onPromptAssembled` below already performs — and was
-      // reverted the same day. `publishOwnershipMatrix.test.ts`'s "paused
-      // while the review was running" case failed reproducibly with that
-      // wired: moving a fire-and-forget `patchTaskProgressStrictV1` write's
-      // start time earlier (before assembly, instead of after) shifts when it
-      // completes relative to a concurrent out-of-band progress write (the
-      // test's deliberate mid-review pause) enough to lose that write's
-      // update. This version carries zero I/O risk instead: the pushed id
-      // reaches disk only through the SAME already-proven path every id in
-      // `observedCoordinatorAttemptIds` already takes — forwarded as
-      // `extraCoordinatorAttemptIds` into whichever `terminalizeRoundV1` call
-      // ends this round (below, and the failure/rejection paths in
-      // `handleReviewOutcomeV1`) — so even an attempt that never reaches
-      // assembly is now recorded on the row once the round ends, closing the
-      // gap without moving any disk write earlier.
-      //
-      // 2026-08-28 review fix, same blocker, DURABLE half: also append this
-      // allocation to the round-identity sidecar log (`roundIdentityLogV1.ts`)
-      // — a file independent of `task-progress.json`, so this write carries
-      // NONE of the timing risk the reverted direct-attach attempts hit (see
-      // that module's own doc comment). Reconciliation's identity-backfill
-      // pass reads this log and completes the row later, so an attempt that
-      // crashes before ever reaching `onPromptAssembled` now has a durable
-      // record of its own allocation, not just an in-memory one.
-      onAttemptAllocated: (info) => {
+      // The callback is awaited by the coordinator. Identity therefore lands
+      // before an allocation can take a pre-prompt failure branch or invoke a
+      // provider; unlike the old fire-and-forget hook, it cannot later race a
+      // user pause written while the provider is running.
+      onAttemptAllocated: async (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        void appendRoundIdentityLogEntryBestEffortV1(folderUri, {
+        await attachCoordinatorIdentityToRoundV1({
           roundId: reviewAttemptId,
           operationId: info.operationId,
           attemptId: info.attemptId,
-          at: new Date().toISOString(),
+          taskFolderUri: folderUri,
         });
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        // Part 4 architectural fix (2026-08-27 review follow-up, blocker
-        // "coordinator allocation sites still do not attach operation and
-        // attempt identities to a round-ledger row ... at allocation time"):
-        // attach the coordinator's own identities to THIS round's already-
-        // open row the moment they exist, rather than waiting for
-        // terminalizeRoundV1's post-hoc attachment.
-        void attachCoordinatorIdentityToRoundBestEffortV1({
-          taskFolderUri: folderUri,
-          roundId: reviewAttemptId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-        });
       },
     });
     // "completed" is the only outcome that overwrites reviewUri with fresh
@@ -6555,32 +6556,6 @@ export async function viewReview(
 }
 
 /**
- * Whether the artifact for a task's current stage exists and has content.
- */
-async function currentStageArtifactExists(
-  folderUri: vscode.Uri,
-  stage: TaskStage
-): Promise<boolean> {
-  if (isReviewStage(stage)) {
-    return true;
-  }
-  const name = STAGE_ARTIFACT_FILENAMES[stage];
-  if (!name) {
-    return true;
-  }
-  // For implementation stage use the artifact resolver
-  if (stage === "impl") {
-    const resolved = await resolveImplementationArtifact(folderUri);
-    const stat = await statIfExists(resolved.uri);
-    return stat !== undefined;
-  }
-  const content = await readNonEmptyText(
-    vscode.Uri.joinPath(folderUri, name)
-  );
-  return content !== undefined;
-}
-
-/**
  * Advance a task to the next stage in the workflow.
  * Auto-triggers review when advancing into a review stage from its
  * immediately preceding non-review stage (plan -> plan-high-review, or
@@ -6637,7 +6612,8 @@ async function advanceStageViaNextStageRowV1(
   isPaused: boolean,
   optIn: boolean,
   expectedReviewAttemptId?: string,
-  publishArtifact?: () => Promise<void>
+  publishArtifact?: () => Promise<void>,
+  artifactOverride?: "user"
 ): Promise<StageTransitionResult> {
   // Plan §3.9: the task-binding identity is the digest derived from this
   // task's persisted ownership + taskFolder EXACTLY AS PERSISTED (never a
@@ -6668,6 +6644,7 @@ async function advanceStageViaNextStageRowV1(
       // directly on `next` — see this function's header.
       targetStage: next,
       ...(expectedReviewAttemptId !== undefined ? { expectedReviewAttemptId } : {}),
+      ...(artifactOverride === "user" ? { artifactOverride } : {}),
     },
     beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
@@ -6734,7 +6711,8 @@ export async function nextStage(
    * full re-review remains an offered stronger option, never a
    * requirement") — this is the one-click override, not a hard block.
    */
-  bypassBlockerGate = false
+  bypassBlockerGate = false,
+  artifactOverride = false
 ): Promise<void> {
   // Publish is the final executable stage: its review is generated here and
   // completion/release remain explicit actions. There is no stage after it.
@@ -6773,17 +6751,23 @@ export async function nextStage(
   }
 
   // Check artifact existence for non-review stages
-  if (
-    !(await currentStageArtifactExists(
-      resolved.folderUri,
-      resolved.progress.currentStage
-    ))
-  ) {
-    const artifactName =
-      STAGE_ARTIFACT_FILENAMES[resolved.progress.currentStage];
+  const missingCompletionArtifacts = await missingCompletionArtifactsV1(
+    resolved.folderUri,
+    resolved.progress.currentStage
+  );
+  if (missingCompletionArtifacts.length > 0 && !artifactOverride) {
+    const artifactName = missingCompletionArtifacts.join(", ");
     NotificationRouter.showWarning(
-      `${artifactName ?? "The current stage's artifact"} hasn't been created yet. ` +
-        `Write or generate it before advancing.`
+      `${artifactName} hasn't been created yet. Write or generate it before advancing, ` +
+        "or explicitly complete this stage anyway.",
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.completeStageAnywayV1",
+        title: "Complete Anyway",
+        args: [{ taskFolderPath: resolved.folderUri.fsPath, artifactOverride: "user" }],
+      }
     );
     return;
   }
@@ -6864,6 +6848,10 @@ export async function nextStage(
       // the workspace explicitly enables that behavior. Manual stage
       // selection deliberately does not use this path.
       completeAndMoveOnTriggersAI()
+      ,
+      undefined,
+      undefined,
+      artifactOverride ? "user" : undefined
     );
   } catch (error) {
     // Both paths throw (rather than resolving falsy) on a rejected
@@ -10102,6 +10090,7 @@ export async function runImplementationWithAI(
       );
       return;
     }
+    op.setModel?.(model.modelId);
 
     // The routing check on the path users actually take. The tree view's
     // Implementation button invokes THIS command directly — only the
@@ -10784,8 +10773,14 @@ export function registerReviewActionCommands(
     // task the warning was about rather than re-prompting a picker.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.completeStageAnywayV1",
-      (arg?: { taskFolderPath: string }) =>
-        nextStage(context.extensionUri, context, normalizeReviewArg(arg), true)
+      (arg?: { taskFolderPath: string; artifactOverride?: "user" }) =>
+        nextStage(
+          context.extensionUri,
+          context,
+          normalizeReviewArg(arg),
+          true,
+          arg?.artifactOverride === "user"
+        )
     ),
     // The standalone "Generate Implementation Checklist" command was merged
     // into "Implement Actual Work": runImplementationWithAI generates the
@@ -11388,29 +11383,19 @@ export async function resumeReviewInteractionV1(
     // that fails before `onPromptAssembled` ever fires for it, reaching disk
     // only through the same already-proven `extraCoordinatorAttemptIds` →
     // `terminalizeRoundV1` forwarding every id here already takes — AND (see
-    // that same call site's 2026-08-28 review fix) also appended to the
-    // round-identity sidecar log for allocation-time durability independent
-    // of `task-progress.json`.
-    onAttemptAllocated: (info) => {
+    // that same call site's 2026-08-28 review fix) durably attached to the
+    // round ledger before the provider can run.
+    onAttemptAllocated: async (info) => {
       observedCoordinatorAttemptIds.push(info.attemptId);
-      void appendRoundIdentityLogEntryBestEffortV1(taskFolderUri, {
+      await attachCoordinatorIdentityToRoundV1({
         roundId: reviewAttemptId,
         operationId: info.operationId,
         attemptId: info.attemptId,
-        at: new Date().toISOString(),
+        taskFolderUri,
       });
     },
     onPromptAssembled: (info) => {
       observedCoordinatorAttemptIds.push(info.attemptId);
-      // Part 4 architectural fix, same as `runReviewForFolder`'s initial
-      // dispatch above: attach the coordinator's identities to this resumed
-      // round's already-open row at allocation time, not only at its end.
-      void attachCoordinatorIdentityToRoundBestEffortV1({
-        taskFolderUri: taskFolderUri,
-        roundId: reviewAttemptId,
-        operationId: info.operationId,
-        attemptId: info.attemptId,
-      });
     },
   });
 

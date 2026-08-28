@@ -43,9 +43,17 @@ function setProgress(folder: string, patch: Record<string, unknown>): void {
 function installReadFileBridge(): { restore: () => void } {
   const target = vscode.workspace.fs as unknown as Record<string, unknown>;
   const orig = target.readFile;
+  const origStat = target.stat;
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
-  return { restore: (): void => { target.readFile = orig; } };
+  target.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+    fs.promises.stat(uri.fsPath).then((stat) => ({
+      type: vscode.FileType.File,
+      ctime: stat.ctimeMs,
+      mtime: stat.mtimeMs,
+      size: stat.size,
+    }));
+  return { restore: (): void => { target.readFile = orig; target.stat = origStat; } };
 }
 
 void describe("markTaskDone.v1 registry row", () => {
@@ -75,6 +83,7 @@ void describe("markTaskDone.v1 registry row", () => {
   void it("completes an active Publish-stage task, stamping completedAt and recording the completed stage", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-marktaskdone-row-");
     setProgress(fixture.folder, { status: "active", currentStage: "publish" });
+    fs.writeFileSync(path.join(fixture.folder, "publish-review.md"), "Readiness: 10/10");
 
     const outcome = await executeMarkTaskDoneV1(contextFor(fixture.folder));
     assert.equal(outcome.kind, "completed");
@@ -91,6 +100,30 @@ void describe("markTaskDone.v1 registry row", () => {
       assert.ok(strict.decoded.progress.completedStages?.includes("publish"));
       assert.equal(strict.decoded.progress.scheduledRun, undefined);
       assert.equal(strict.decoded.progress.scheduledResumeTime, undefined);
+    }
+  });
+
+  void it("refuses a missing Publish review unless an explicit human override records it", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-marktaskdone-row-missing-artifact-");
+    setProgress(fixture.folder, { status: "active", currentStage: "publish" });
+
+    const rejected = await executeMarkTaskDoneV1(contextFor(fixture.folder));
+    assert.equal(rejected.kind, "failed");
+    if (rejected.kind === "failed") {
+      assert.equal(rejected.code, "markTaskDone.missingStageArtifact");
+    }
+
+    const overridden = await executeMarkTaskDoneV1({
+      ...contextFor(fixture.folder),
+      validatedInput: { taskFolderPath: fixture.folder, artifactOverride: "user" },
+    });
+    assert.equal(overridden.kind, "completed");
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.deepEqual(strict.decoded.progress.completedWithMissingArtifacts, [
+        { stage: "publish", artifact: "publish-review.md", at: strict.decoded.progress.updatedAt, override: "user" },
+      ]);
     }
   });
 
@@ -143,6 +176,7 @@ void describe("markTaskDone.v1 registry row", () => {
   void it("surfaces a sanitized writeFailed code when the strict writer throws, without touching progress", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-marktaskdone-row-writefail-");
     setProgress(fixture.folder, { status: "active", currentStage: "publish" });
+    fs.writeFileSync(path.join(fixture.folder, "publish-review.md"), "Readiness: 10/10");
 
     const throwingDeps: MarkTaskDoneRowDepsV1 = {
       patchTaskProgress: () => {

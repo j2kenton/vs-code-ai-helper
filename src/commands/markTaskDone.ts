@@ -11,6 +11,7 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { invokeLifecycleRowV1 } from "../actions/productionTaskActionRuntimeV1";
 import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
+import { missingCompletionArtifactsV1 } from "../utils/stageArtifactRequirementsV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -19,7 +20,7 @@ import { deriveTaskBindingV1 } from "../types/taskBindingV1";
  */
 type MarkTaskDoneArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string };
+  | { canonicalId?: string; taskFolderPath?: string; artifactOverride?: "user" };
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
@@ -27,6 +28,7 @@ type MarkTaskDoneArg =
 function normalizeArg(node: MarkTaskDoneArg | undefined): {
   canonicalId?: string;
   taskFolderPath?: string;
+  artifactOverride?: "user";
 } | undefined {
   if (!node) {
     return undefined;
@@ -36,10 +38,14 @@ function normalizeArg(node: MarkTaskDoneArg | undefined): {
     return { taskFolderPath: node.task.folderUri.fsPath };
   }
 
-  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  const n = node as { canonicalId?: string; taskFolderPath?: string; artifactOverride?: "user" };
   const hasExplicit = !!(n.canonicalId || n.taskFolderPath);
   return hasExplicit
-    ? { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath }
+    ? {
+        canonicalId: n.canonicalId,
+        taskFolderPath: n.taskFolderPath,
+        ...(n.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
+      }
     : undefined;
 }
 
@@ -111,12 +117,10 @@ export function selectNextTask(
  * commit, and push on the Publish row first. This command only performs the
  * final "move on" step.
  *
- * Completion is deliberately UNGATED (C3): it never runs completion checks,
- * never prompts, and never refuses a Publish-stage task. The completion-check
- * flow (run checks, offer "Fix with AI", record a "Publish Anyway"-style
- * override in publish-review.md) belongs to the publishing commands
- * (commitAndPushTask / runLintingFixes), not to task completion — the user
- * may complete a task whenever they want.
+ * Completion never runs completion checks, but it does require the Publish
+ * artifact to exist. A human may explicitly override that artifact gate; the
+ * override is persisted so a task completed without its publish review is
+ * never indistinguishable from a fully reviewed task.
  *
  * Ordering (strict):
  *   1. Persist completion (status + completedAt + completedStages).
@@ -173,6 +177,22 @@ export async function markTaskDone(
   }
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, "publish");
+  if (missingArtifacts.length > 0 && resolverArg?.artifactOverride !== "user") {
+    NotificationRouter.showWarning(
+      `Cannot complete ${resolvedTask.folderName}: ${missingArtifacts.join(", ")} has not been created. ` +
+        "Run or create the Publish review first, or explicitly complete anyway.",
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.markTaskDone",
+        title: "Complete Anyway",
+        args: [{ taskFolderPath: taskFolderUri.fsPath, artifactOverride: "user" }],
+      }
+    );
+    return;
+  }
 
   // ── Step 1: Acquire the task lock and complete — no checks, no prompts ───
   // Task-level: completing a task is not scoped to one stage, so it spins the
@@ -208,7 +228,10 @@ export async function markTaskDone(
       workspaceCwd: resolvedTask.workspaceFolder?.fsPath ?? path.dirname(taskFolderUri.fsPath),
       taskStatus: resolvedTask.progress.status ?? "active",
       taskStage: resolvedTask.progress.currentStage,
-      rawInput: { taskFolderPath: taskFolderUri.fsPath },
+      rawInput: {
+        taskFolderPath: taskFolderUri.fsPath,
+        ...(resolverArg?.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
+      },
     });
     if (outcome.kind !== "completed") {
       const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;

@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -738,7 +738,7 @@ void test(
 );
 
 void test(
-  "records ledgerAnnotated: false, not a silent drop, when the mutating round's row was pruned",
+  "reconstructs and annotates the mutating round's ledger event when its original row was pruned",
   () => {
     const progress: TaskProgress = {
       ...makeProgress(),
@@ -750,9 +750,12 @@ void test(
     });
 
     const proposal = updated.checklistChangeProposals?.find((p) => p.at === "2026-08-27T23:05:00.000Z");
-    assert.equal(proposal?.status, "adopted", "adoption must still succeed — the ledger row is a separate concern");
-    assert.equal(proposal?.ledgerAnnotated, false);
-    assert.deepEqual(updated.roundLedger, []);
+    assert.equal(proposal?.status, "adopted");
+    assert.equal(proposal?.ledgerAnnotated, true);
+    const reconstructed = updated.roundLedger?.find((row) => row.roundId === "long-gone-round");
+    assert.equal(reconstructed?.state, "rejected");
+    assert.equal(reconstructed?.outcome?.rejectionReason, "checklist mutation reverted");
+    assert.equal(reconstructed?.checklistRevisionAdopted?.resolvedAt, "2026-01-02T00:00:00.000Z");
   }
 );
 
@@ -778,6 +781,81 @@ void test("never reassigns an already-set checklistRevisionAdopted", () => {
   const proposal = updated.checklistChangeProposals?.find((p) => p.at === "2026-08-27T23:05:00.000Z");
   assert.equal(proposal?.resolvedAt, "2026-05-05T00:00:00.000Z");
   assert.equal(proposal?.ledgerAnnotated, true, "already-annotated counts as annotated");
+});
+
+// ---------------------------------------------------------------------------
+// appendChecklistChangeProposal cap eviction (2026-08-28 review fix,
+// completion blocker: "ordinary ledger-cap eviction is prevented, but
+// plan-revision adoption can still lack its required ledger completion event
+// when ... the active proposal record is unavailable" — the proposal cap
+// itself could evict the one entry naming the round-ledger row that
+// `upsertRoundLedgerEntryV1`'s own protection depends on). Mirrors that same
+// round-ledger over-cap test's shape: fill to the cap, push one more, and
+// prove the unresolved entry survives while a resolved one is dropped first.
+// ---------------------------------------------------------------------------
+
+void test(
+  "protects a pending/revising proposal from cap eviction, dropping a resolved one first",
+  () => {
+    const resolved = makeRevisingProposal({
+      at: "2026-01-01T00:00:00.000Z",
+      roundId: "resolved-round-0",
+      status: "adopted",
+    });
+    const others = Array.from({ length: MAX_CHECKLIST_CHANGE_PROPOSALS - 2 }, (_, i) =>
+      makeRevisingProposal({
+        at: `2026-01-01T00:${String(i + 1).padStart(2, "0")}:00.000Z`,
+        roundId: `filler-round-${i}`,
+        status: "discarded",
+      })
+    );
+    const pending = makeRevisingProposal({
+      at: "2026-08-27T23:05:00.000Z",
+      roundId: "mutating-round-1",
+      status: "revising",
+    });
+    let progress: TaskProgress = {
+      ...makeProgress(),
+      checklistChangeProposals: [resolved, ...others, pending],
+    };
+    assert.equal(progress.checklistChangeProposals?.length, MAX_CHECKLIST_CHANGE_PROPOSALS);
+
+    const pushedOver = appendChecklistChangeProposal(
+      progress,
+      makeRevisingProposal({ at: "2026-08-28T00:00:00.000Z", roundId: "new-round" })
+    );
+
+    assert.equal(pushedOver.checklistChangeProposals?.length, MAX_CHECKLIST_CHANGE_PROPOSALS);
+    assert.ok(
+      pushedOver.checklistChangeProposals?.some((p) => p.at === "2026-08-27T23:05:00.000Z" && p.status === "revising"),
+      "the unresolved proposal must survive cap eviction"
+    );
+    assert.ok(
+      pushedOver.checklistChangeProposals?.some((p) => p.at === "2026-08-28T00:00:00.000Z"),
+      "the newly appended proposal must be present"
+    );
+    assert.ok(
+      !pushedOver.checklistChangeProposals?.some((p) => p.at === "2026-01-01T00:00:00.000Z"),
+      "the oldest RESOLVED proposal must be dropped first, not the pending one"
+    );
+    progress = pushedOver;
+  }
+);
+
+void test("leaves the array over cap rather than evicting an unresolved proposal when nothing resolved remains", () => {
+  const allPending = Array.from({ length: MAX_CHECKLIST_CHANGE_PROPOSALS }, (_, i) =>
+    makeRevisingProposal({
+      at: `2026-01-01T00:${String(i).padStart(2, "0")}:00.000Z`,
+      roundId: `live-round-${i}`,
+      status: "revising",
+    })
+  );
+  const progress: TaskProgress = { ...makeProgress(), checklistChangeProposals: allPending };
+  const pushedOver = appendChecklistChangeProposal(
+    progress,
+    makeRevisingProposal({ at: "2026-08-28T00:00:00.000Z", roundId: "new-round" })
+  );
+  assert.equal(pushedOver.checklistChangeProposals?.length, MAX_CHECKLIST_CHANGE_PROPOSALS + 1);
 });
 
 void test("setIncompleteRoundContinuations sets and clears the persisted counter", () => {

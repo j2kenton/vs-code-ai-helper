@@ -76,6 +76,8 @@ export interface TaskOperationHandle {
   /** Present when the operation was registered with `cancellable: true`. */
   readonly token?: vscode.CancellationToken;
   report(detail: string | undefined): void;   // live-row sub-text, e.g. "waiting for your answer"
+  /** Records the resolved model for live task-status surfaces when known. */
+  setModel?(modelId: string | undefined): void;
   /**
    * Mark this operation as blocked on the user, not doing background work —
    * e.g. a round-limit pause or a chat question the AI can't proceed past.
@@ -106,6 +108,8 @@ export interface TaskOperationSnapshot {
   readonly taskName: string;
   readonly startedAt: number;
   readonly detail?: string;
+  /** The resolved provider/model identity, when the operation has one. */
+  readonly modelId?: string;
   readonly exclusive: boolean;
   readonly kind?: OperationKind;
   readonly parentId?: string;
@@ -140,6 +144,7 @@ interface MutableOperation {
   taskName: string;
   startedAt: number;
   detail?: string;
+  modelId?: string;
   exclusive: boolean;
   kind?: OperationKind;
   parentId?: string;
@@ -318,6 +323,10 @@ export class TaskOperationRegistry implements vscode.Disposable {
       token,
       report: (d: string | undefined) => {
         operation.detail = d;
+        this.triggerChange();
+      },
+      setModel: (modelId: string | undefined) => {
+        operation.modelId = modelId;
         this.triggerChange();
       },
       setWaitingForUser: (waiting: boolean) => {

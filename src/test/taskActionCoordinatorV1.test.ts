@@ -1769,6 +1769,55 @@ void describe("taskActionCoordinatorV1", () => {
     }
   );
 
+  void it("settles rather than leaking progress when allocation-ledger attachment rejects during admission", async () => {
+    const harness = makeHarness([]);
+    const outcome = await harness.coordinator.executeAction({
+      ...baseRequest(),
+      onAttemptAllocated: () => Promise.reject(new Error("ledger write unavailable")),
+    });
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
+      assert.equal(outcome.retryable, true);
+      assert.ok(outcome.correlation, "the failed allocation keeps its attempt identity");
+      assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
+    }
+    assert.equal(harness.presentationEnded.value, true, "admission failure must close progress");
+    assert.equal(harness.settlementRecords.length, 1, "admission failure must be audited once");
+    assert.equal(harness.settlementRecords[0]!.outcomeCode, "attemptIdentityAttachmentFailed");
+    assert.equal(harness.selection.reserved, 0, "a failed attachment must prevent provider reservation");
+  });
+
+  void it("settles a retry allocation attachment rejection without invoking the retry", async () => {
+    const networkFault: AgentTransportV1 = {
+      runnerId: "network-fault",
+      invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "connectionLost", networkFault: true }),
+    };
+    const harness = makeHarness([networkFault]);
+    let allocations = 0;
+    const outcome = await harness.coordinator.executeAction({
+      ...baseRequest(),
+      onAttemptAllocated: () => {
+        allocations++;
+        if (allocations === 2) {
+          return Promise.reject(new Error("ledger write unavailable"));
+        }
+        return Promise.resolve();
+      },
+    });
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
+      assert.equal(outcome.retryable, true);
+      assert.ok(outcome.correlation, "the failed retry keeps its attempt identity");
+      assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
+    }
+    assert.equal(allocations, 2);
+    assert.equal(harness.presentationEnded.value, true);
+    assert.equal(harness.settlementRecords.length, 1);
+    assert.equal(harness.selection.reserved, 1, "the retry must not reserve or invoke a provider");
+  });
+
   void it("passes the registry's chain-exhaustion evidence through verbatim, mutating no task state", async () => {
     // Finding 4: the coordinator is a pure pass-through for the structured
     // exhaustion evidence — the stage owner (not the coordinator) pauses the

@@ -189,6 +189,12 @@ export interface TaskProgress {
   publishScopePath?: string;
   /** Stages explicitly completed by a terminal lifecycle action. */
   completedStages?: TaskStage[];
+  /**
+   * Explicit human acceptances of a stage whose required artifact was absent
+   * at completion time. A completed task with this record is intentionally
+   * distinguishable from one whose complete stage artifacts all existed.
+   */
+  completedWithMissingArtifacts?: CompletedWithMissingArtifactV1[];
   /** Original description captured before an AI draft is applied. */
   preImageDescription?: string;
   /** Stable project binding used for workspace-scoped operations. */
@@ -993,13 +999,40 @@ export interface ChecklistChangeProposalV1 {
    * completion blocker: "the separate best-effort write may fail or no-op
    * after the originating row is pruned — adoption may be marked durable on
    * the proposal while the required ledger record remains absent"). Set
-   * `true` only when the row was found and successfully annotated in this
-   * transaction (or a prior one); `false` when adoption succeeded but the
-   * row named by `roundId` no longer exists in `roundLedger` (evicted by its
-   * own 200-row cap) — a structurally permanent gap, not a transient
-   * failure, and now an OBSERVABLE fact on the durable proposal record
-   * rather than a silently swallowed best-effort attempt. Absent only when
-   * the proposal itself has not yet been adopted.
+   * `true` when the row was found and successfully annotated in this
+   * transaction (or a prior one).
+   *
+   * A second review pass (same date) found the FIRST fix insufficient —
+   * making the omission observable does not fulfill "the ledger records
+   * revision completion" if the omission can still happen in the ordinary
+   * case. The actual gap was `upsertRoundLedgerEntryV1`'s cap eviction: a
+   * revision can take many rounds (through plan, both plan reviews,
+   * implementation, both impl reviews) before this transform runs, and the
+   * mutating round's own terminal row could be evicted by ordinary FIFO
+   * pressure during that window. `upsertRoundLedgerEntryV1` now protects a
+   * terminal row from eviction for as long as it is named by a
+   * `checklistChangeProposals` entry still `"pending"`/`"revising"` — so in
+   * the ordinary case the row is guaranteed to still exist when adoption
+   * runs, and `false` should not occur in practice.
+   *
+   * A third review pass (same date) found that protection alone insufficient
+   * too: `appendChecklistChangeProposal`'s own cap eviction could drop the
+   * proposal entry itself — the thing naming the protected row — before
+   * adoption ever ran, at which point the round-ledger protection lapses with
+   * it regardless of how sound it is. `appendChecklistChangeProposal` now
+   * applies the identical rule one level up: a `"pending"`/`"revising"`
+   * proposal is never evicted by the ordinary cap, only `"discarded"`/
+   * `"adopted"` (already-resolved) entries are, oldest first. The field is
+   * kept (rather than made required) only for the one residual case both
+   * protections still cannot reach: `MAX_CHECKLIST_CHANGE_PROPOSALS` (50)
+   * OTHER proposals simultaneously unresolved on the same task at once — at
+   * that point the array is deliberately left over cap (see
+   * `appendChecklistChangeProposal`'s own doc comment) rather than evicting
+   * an unresolved one, so this field would in fact still end up `true`; only
+   * a decoder/writer failure on that specific write remains as a truly
+   * unreachable-in-practice cause for `false`. `false` remains the observable
+   * trace of that outcome rather than a silently swallowed no-op. Absent only
+   * when the proposal itself has not yet been adopted.
    */
   ledgerAnnotated?: boolean;
 }
@@ -1377,6 +1410,14 @@ export const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> =
     "impl-low-review": "impl-low-review.md",
     publish: "publish-review.md",
   };
+
+/** One artifact deliberately accepted as absent by a human completion override. */
+export interface CompletedWithMissingArtifactV1 {
+  readonly stage: TaskStage;
+  readonly artifact: string;
+  readonly at: string;
+  readonly override: "user";
+}
 
 export const PLAN_REVIEW_STAGES: readonly TaskStage[] = [
   "plan-high-review",

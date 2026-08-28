@@ -27,6 +27,7 @@ the shape, say so explicitly and justify the fixture another way.
 | Fixture | Producing writer / scenario |
 |---|---|
 | `valid.json` | Canonical strict-writer output (`encodeTaskProgressV1`) for a completed task, plus an opaque vendor property. |
+| `round-ledger-and-review-fields.json` | Hand-authored to exercise every field the "make the stage chat a record of work" task's Parts 1–6 added to `reviewScoreHistory` (`blockers[].origin`, `supersededBlockers`, `reviewerChallengedNonGoal`), `blockerSupersessions[].source`, `roundOutcomes[].dispatchMode`/`originatingReviewStage`, `roundLedger[].checklistRevisionAdopted`, `checklistChangeProposals[].ledgerAnnotated`, and `implRecovery.sourceDispatchMode`/`sourceReviewStage`/`sourceRoundId` — a 2026-08-28 review found the core package's strict decoder rejected several of these as unknown properties even though the extension writes and accepts them; this fixture is the regression guard for that parity gap, not a captured single writer's output. |
 
 ## recovery/ (fails closed)
 
