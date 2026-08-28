@@ -610,6 +610,25 @@ export interface ChecklistChangeProposalResolutionV1 {
  * supplied, is stamped onto the SAME entry in the SAME transaction, making
  * the item-count change a durable fact in `task-progress.json` rather than
  * something only ever narrated in chat prose.
+ *
+ * Also annotates the mutating round's `roundLedger` row (via the proposal's
+ * own `roundId`) with `checklistRevisionAdopted`, in this SAME pure
+ * transform rather than a separate best-effort `patchTaskProgressStrictV1`
+ * call (2026-08-28 review fix, completion blocker: "the separate best-effort
+ * write may fail or no-op after the originating row is pruned — adoption may
+ * be marked durable on the proposal while the required ledger record remains
+ * absent"). Being folded into the caller's own single transaction makes the
+ * two facts atomic — there is no longer a window in which one can land
+ * without the other because of an independent I/O failure. The one case
+ * that remains structurally impossible — the row has already been evicted by
+ * `roundLedger`'s own 200-row cap — is recorded as an observable
+ * `ledgerAnnotated: false` on the durable proposal record instead of being a
+ * silently swallowed no-op, matching `promptCaptureComplete`'s "declare the
+ * gap rather than overclaim" precedent elsewhere in this codebase. Never
+ * reassigns an already-set `checklistRevisionAdopted` (same "attached once"
+ * contract every other post-hoc round-ledger enrichment in this codebase
+ * follows) — a proposal already carrying `ledgerAnnotated: true` from an
+ * earlier call is left alone.
  */
 export function markChecklistChangeProposalAdoptedV1(
   progress: TaskProgress,
@@ -617,11 +636,14 @@ export function markChecklistChangeProposalAdoptedV1(
   resolution?: ChecklistChangeProposalResolutionV1
 ): TaskProgress {
   const proposals = progress.checklistChangeProposals;
-  const matched = proposals?.some((p) => p.at === proposalAt && p.status === "revising") ?? false;
-  if (!matched) {
+  const target = proposals?.find((p) => p.at === proposalAt && p.status === "revising");
+  if (!target) {
     return progress;
   }
-  return {
+  const row = resolveRoundV1(progress, target.roundId);
+  const canAnnotate = row !== undefined && row.checklistRevisionAdopted === undefined;
+  const alreadyAnnotated = row?.checklistRevisionAdopted !== undefined;
+  let next: TaskProgress = {
     ...progress,
     checklistChangeProposals: proposals!.map((p) =>
       p.at === proposalAt && p.status === "revising"
@@ -635,12 +657,24 @@ export function markChecklistChangeProposalAdoptedV1(
             ...(resolution?.itemCountAfter !== undefined
               ? { itemCountAfter: resolution.itemCountAfter }
               : {}),
+            ledgerAnnotated: canAnnotate || alreadyAnnotated,
           }
         : p
     ),
     planRevision: undefined,
     updatedAt: new Date().toISOString(),
   };
+  if (canAnnotate && row && resolution?.resolvedAt !== undefined) {
+    next = upsertRoundLedgerEntryV1(next, {
+      ...row,
+      checklistRevisionAdopted: {
+        resolvedAt: resolution.resolvedAt,
+        ...(resolution.itemCountBefore !== undefined ? { itemCountBefore: resolution.itemCountBefore } : {}),
+        ...(resolution.itemCountAfter !== undefined ? { itemCountAfter: resolution.itemCountAfter } : {}),
+      },
+    });
+  }
+  return next;
 }
 
 /**

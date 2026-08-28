@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { BlockerSupersessionRecordV1, MAX_BLOCKER_SUPERSESSIONS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
+import { appendBlockerSupersession, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -664,6 +664,120 @@ void test("clearReviewInvalidatedByRound removes the marker; no-op when absent",
   const cleared = clearReviewInvalidatedByRound(marked);
   assert.equal(cleared.reviewInvalidatedByRound, undefined);
   assert.equal(clearReviewInvalidatedByRound(progress), progress);
+});
+
+// ---------------------------------------------------------------------------
+// markChecklistChangeProposalAdoptedV1: the proposal-adoption write and the
+// mutating round's roundLedger annotation now happen in this ONE pure
+// transform (2026-08-28 review fix, completion blocker: "the separate
+// best-effort write may fail or no-op after the originating row is pruned —
+// adoption may be marked durable on the proposal while the required ledger
+// record remains absent"). Moved here from roundLedgerV1.test.ts's now-
+// removed `recordChecklistRevisionOnRoundLedgerV1` coverage: same three
+// behaviors, now exercised as one atomic transform instead of two
+// independently-racing writes.
+// ---------------------------------------------------------------------------
+
+function makeRevisingProposal(overrides?: Partial<ChecklistChangeProposalV1>): ChecklistChangeProposalV1 {
+  return {
+    at: "2026-08-27T23:05:00.000Z",
+    roundId: "mutating-round-1",
+    stage: "impl",
+    kind: "added",
+    proposedItems: ["Add the retry button"],
+    removedItems: [],
+    status: "revising",
+    ...overrides,
+  };
+}
+
+function makeMutatingRow(overrides?: Partial<RoundLedgerEntryV1>): RoundLedgerEntryV1 {
+  return {
+    roundId: "mutating-round-1",
+    intentId: "mutating-round-1",
+    attemptIds: [],
+    stage: "impl",
+    mode: "implementation",
+    startedAt: "2026-08-27T23:00:00.000Z",
+    endedAt: "2026-08-27T23:05:00.000Z",
+    state: "rejected",
+    outcome: { rejectionReason: "checklist mutation reverted" },
+    ...overrides,
+  };
+}
+
+void test(
+  "marks the proposal adopted AND annotates the mutating round's roundLedger row, atomically",
+  () => {
+    const row = makeMutatingRow();
+    const progress: TaskProgress = {
+      ...makeProgress(),
+      checklistChangeProposals: [makeRevisingProposal()],
+      roundLedger: [row],
+    };
+    const updated = markChecklistChangeProposalAdoptedV1(progress, "2026-08-27T23:05:00.000Z", {
+      resolvedAt: "2026-01-02T00:00:00.000Z",
+      itemCountBefore: 80,
+      itemCountAfter: 85,
+    });
+
+    const proposal = updated.checklistChangeProposals?.find((p) => p.at === "2026-08-27T23:05:00.000Z");
+    assert.equal(proposal?.status, "adopted");
+    assert.equal(proposal?.ledgerAnnotated, true);
+
+    const updatedRow = updated.roundLedger?.find((r) => r.roundId === "mutating-round-1");
+    assert.deepEqual(updatedRow?.checklistRevisionAdopted, {
+      resolvedAt: "2026-01-02T00:00:00.000Z",
+      itemCountBefore: 80,
+      itemCountAfter: 85,
+    });
+    // The row's own frozen terminal facts must survive untouched.
+    assert.equal(updatedRow?.state, "rejected");
+    assert.equal(updatedRow?.outcome?.rejectionReason, "checklist mutation reverted");
+  }
+);
+
+void test(
+  "records ledgerAnnotated: false, not a silent drop, when the mutating round's row was pruned",
+  () => {
+    const progress: TaskProgress = {
+      ...makeProgress(),
+      checklistChangeProposals: [makeRevisingProposal({ roundId: "long-gone-round" })],
+      roundLedger: [],
+    };
+    const updated = markChecklistChangeProposalAdoptedV1(progress, "2026-08-27T23:05:00.000Z", {
+      resolvedAt: "2026-01-02T00:00:00.000Z",
+    });
+
+    const proposal = updated.checklistChangeProposals?.find((p) => p.at === "2026-08-27T23:05:00.000Z");
+    assert.equal(proposal?.status, "adopted", "adoption must still succeed — the ledger row is a separate concern");
+    assert.equal(proposal?.ledgerAnnotated, false);
+    assert.deepEqual(updated.roundLedger, []);
+  }
+);
+
+void test("never reassigns an already-set checklistRevisionAdopted", () => {
+  const row = makeMutatingRow({
+    checklistRevisionAdopted: { resolvedAt: "2026-01-02T00:00:00.000Z", itemCountBefore: 80, itemCountAfter: 85 },
+  });
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    checklistChangeProposals: [makeRevisingProposal()],
+    roundLedger: [row],
+  };
+  const updated = markChecklistChangeProposalAdoptedV1(progress, "2026-08-27T23:05:00.000Z", {
+    resolvedAt: "2026-05-05T00:00:00.000Z",
+    itemCountBefore: 1,
+    itemCountAfter: 2,
+  });
+
+  const updatedRow = updated.roundLedger?.find((r) => r.roundId === "mutating-round-1");
+  assert.equal(updatedRow?.checklistRevisionAdopted?.resolvedAt, "2026-01-02T00:00:00.000Z");
+  // The proposal itself still records its OWN resolution facts, distinct
+  // from the (already-set, untouched) row annotation.
+  const proposal = updated.checklistChangeProposals?.find((p) => p.at === "2026-08-27T23:05:00.000Z");
+  assert.equal(proposal?.resolvedAt, "2026-05-05T00:00:00.000Z");
+  assert.equal(proposal?.ledgerAnnotated, true, "already-annotated counts as annotated");
 });
 
 void test("setIncompleteRoundContinuations sets and clears the persisted counter", () => {

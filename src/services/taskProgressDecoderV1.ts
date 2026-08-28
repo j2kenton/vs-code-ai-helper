@@ -1037,6 +1037,7 @@ function validateChecklistChangeProposals(
       "resolvedAt",
       "itemCountBefore",
       "itemCountAfter",
+      "ledgerAnnotated",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1087,6 +1088,9 @@ function validateChecklistChangeProposals(
     }
     if (entry["itemCountAfter"] !== undefined && !isNonNegativeInteger(entry["itemCountAfter"])) {
       return "checklistChangeProposals entry itemCountAfter must be a non-negative integer";
+    }
+    if (entry["ledgerAnnotated"] !== undefined && typeof entry["ledgerAnnotated"] !== "boolean") {
+      return "checklistChangeProposals entry ledgerAnnotated must be a boolean";
     }
   }
   return undefined;

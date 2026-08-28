@@ -507,11 +507,13 @@ void describe("preparePlanPromotion — plan-revision re-finalization (Part 6 / 
       assert.ok(promotion.ready && promotion.publish, "expected a publish() closure for the revision branch");
       await (promotion as { publish: () => Promise<void> }).publish();
 
-      // 3 for the adoption retry loop (2 failures + 1 success), plus 1 more
-      // for `recordChecklistRevisionOnRoundLedgerV1`'s own best-effort
-      // round-ledger annotation attempt (a harmless no-op here — this
-      // fixture seeds no `roundLedger` row for PENDING_PROPOSAL.roundId).
-      assert.equal(calls, 4, "expected exactly 2 failed attempts, 1 successful adoption, then the ledger echo");
+      // 3 for the adoption retry loop (2 failures + 1 success). The
+      // round-ledger annotation is no longer a separate call (2026-08-28
+      // review fix, completion blocker: "the separate best-effort write may
+      // fail or no-op after the originating row is pruned") — it is folded
+      // into `markChecklistChangeProposalAdoptedV1` itself, inside this SAME
+      // adoption transaction, so there is nothing left to count separately.
+      assert.equal(calls, 3, "expected exactly 2 failed attempts, then 1 successful atomic adoption");
       const progress = readProgress(folderPath);
       const adopted = progress.checklistChangeProposals?.find((p) => p.at === PENDING_PROPOSAL.at);
       assert.equal(adopted?.status, "adopted", "the bounded retry must recover within this same publish() call");

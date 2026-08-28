@@ -248,7 +248,6 @@
  */
 import * as vscode from "vscode";
 import {
-  ChecklistRevisionAdoptedV1,
   ImplementationDispatchModeV1,
   RoundLedgerEntryV1,
   RoundLedgerModeV1,
@@ -1016,63 +1015,19 @@ export async function attachCoordinatorIdentityToRoundBestEffortV1(
   }
 }
 
-export interface RecordChecklistRevisionOnRoundLedgerOptionsV1 {
-  readonly taskFolderUri: vscode.Uri;
-  /** The `roundLedger` row identity this checklist mutation was recorded
-   * under — `ChecklistChangeProposalV1.roundId`. */
-  readonly roundId: string;
-  readonly revision: ChecklistRevisionAdoptedV1;
-}
-
-/**
- * Annotate the round-ledger row that mutated the checklist with the plan
- * revision that later formalized the change (Part 6 items 5/19, 2026-08-28
- * review fix, completion blocker: "the implementation does not append or
- * update a round-ledger event for 'Plan revised: N → M'" — the durable
- * record of that completion previously lived only on
- * `TaskProgress.checklistChangeProposals` and a best-effort chat line, never
- * on the round ledger the plan names as the sole lifecycle authority).
- *
- * Deliberately narrow: this attaches `checklistRevisionAdopted` onto the
- * EXISTING row named by `roundId` — it never amends that row's own frozen
- * terminal facts (`state`/`endedAt`/`outcome`, already set when the mutating
- * round was originally terminalized under Part 6 step 18's guard) and never
- * opens a NEW row. A plan revision is not itself a dispatched round — it has
- * no attempt, no provider, no files-changed set of its own — so giving it a
- * full `RoundLedgerEntryV1` (a new `mode`, a new lifecycle) would be
- * inventing a "non-dispatch-round ledger concept" this task's own plan
- * explicitly flags as a genuine architecture decision requiring a human, not
- * something a review-fix round should decide unilaterally. Annotating the
- * originating row instead — the same "attach a fact after the fact without
- * amending what's frozen" precedent `operationId`'s own contract already
- * establishes — durably answers the concrete question the blocker names
- * ("was this mutation ever formalized, and into how many items?") without
- * that decision.
- *
- * A no-op when `roundId` resolves to no row (the row was pruned by the
- * ledger's own 200-row cap in the time since) or when the row already carries
- * `checklistRevisionAdopted` (attached once, never reassigned, mirroring
- * every other post-hoc enrichment in this module). Best-effort: swallows its
- * own failure, matching every other caller of this pattern — the proposal's
- * own `resolvedAt`/`itemCountBefore`/`itemCountAfter` (set in the SAME
- * transaction that flips its `status` to `"adopted"`, `taskProgressTransforms.ts`)
- * remains the durable record of record if this best-effort echo never lands.
- */
-export async function recordChecklistRevisionOnRoundLedgerV1(
-  options: RecordChecklistRevisionOnRoundLedgerOptionsV1
-): Promise<void> {
-  try {
-    await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
-      const row = resolveRoundV1(current, options.roundId);
-      if (!row || row.checklistRevisionAdopted !== undefined) {
-        return undefined;
-      }
-      return upsertRoundLedgerEntryV1(current, {
-        ...row,
-        checklistRevisionAdopted: options.revision,
-      });
-    });
-  } catch {
-    // Best-effort — never blocks the plan-revision adoption this echoes.
-  }
-}
+// `recordChecklistRevisionOnRoundLedgerV1` (Part 6 items 5/19) was removed
+// 2026-08-28 (review fix, completion blocker: "the separate best-effort
+// write may fail or no-op after the originating row is pruned — adoption may
+// be marked durable on the proposal while the required ledger record remains
+// absent"): a separate best-effort `patchTaskProgressStrictV1` call after
+// adoption could not be made to GUARANTEE the ledger annotation lands
+// alongside it, no matter how it was retried, because the two were two
+// independent transactions. The annotation is now folded directly into
+// `markChecklistChangeProposalAdoptedV1` (`taskProgressTransforms.ts`) — the
+// SAME pure transform, applied inside the SAME transaction the caller
+// already uses to mark the proposal `"adopted"` — so the two facts can never
+// observably disagree because of an independent I/O failure. The one case
+// that remains structurally impossible (the row was evicted by the ledger's
+// own 200-row cap before adoption) is now recorded as `ledgerAnnotated:
+// false` on the durable `ChecklistChangeProposalV1` itself, an observable
+// fact rather than a silently swallowed no-op.

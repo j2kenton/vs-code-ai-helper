@@ -43,7 +43,6 @@ import {
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { markChecklistChangeProposalAdoptedV1 } from "./taskProgressTransforms";
-import { recordChecklistRevisionOnRoundLedgerV1 } from "./roundLedgerV1";
 import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
 
 export interface ResolvedImplementationArtifact {
@@ -1300,27 +1299,17 @@ async function finalizePlanRevisionLockedV1(
   if (adopted && planRevision.journaledPlanRef) {
     await deletePlanRevisionJournalBestEffortV1(taskFolderUri);
   }
-  if (adopted && adoptedProposal && adoptedProposal.resolvedAt) {
-    // Part 6 completion blocker, 2026-08-28 review fix: "the implementation
-    // does not append or update a round-ledger event for 'Plan revised: N →
-    // M'" — the round ledger, not only the proposal and the chat echo below,
-    // now carries this completion too. See `recordChecklistRevisionOnRoundLedgerV1`'s
-    // doc comment for why this annotates the existing mutating round's row
-    // rather than opening a new one.
-    await recordChecklistRevisionOnRoundLedgerV1({
-      taskFolderUri,
-      roundId: adoptedProposal.roundId,
-      revision: {
-        resolvedAt: adoptedProposal.resolvedAt,
-        ...(adoptedProposal.itemCountBefore !== undefined
-          ? { itemCountBefore: adoptedProposal.itemCountBefore }
-          : {}),
-        ...(adoptedProposal.itemCountAfter !== undefined
-          ? { itemCountAfter: adoptedProposal.itemCountAfter }
-          : {}),
-      },
-    });
-  }
+  // Part 6 completion blocker, 2026-08-28 review fix: "the separate
+  // best-effort write may fail or no-op after the originating row is
+  // pruned — adoption may be marked durable on the proposal while the
+  // required ledger record remains absent". The round-ledger annotation now
+  // happens INSIDE `markChecklistChangeProposalAdoptedV1` itself, in the
+  // SAME `patchTaskProgressStrictV1` transaction as the adoption write above
+  // — there is no longer a separate call here that can fail independently.
+  // `adoptedProposal.ledgerAnnotated` (read back from that same transaction)
+  // records whether the row still existed to annotate; see that field's own
+  // doc comment for why `false` there is a structural fact, not a retryable
+  // failure.
   try {
     // Dedupe (2026-08-28 review fix, narrowed completion blocker: "concurrent/
     // repeated finalization can still produce more than one chat projection
@@ -1345,7 +1334,11 @@ async function finalizePlanRevisionLockedV1(
           role: "assistant",
           text: adopted
             ? `Plan revised: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items — Implementation and later reviews ` +
-              "re-run."
+              "re-run." +
+              (adoptedProposal?.ledgerAnnotated === false
+                ? " (the mutating round's own ledger row was no longer available to annotate — the " +
+                  "proposal record above is the durable evidence of this completion.)"
+                : "")
             : `Plan revised on disk: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items, but the durable adoption ` +
               "record could not be written after 3 attempts — the proposal may still read as in-progress. " +
               "task-progress.json may need manual repair.",

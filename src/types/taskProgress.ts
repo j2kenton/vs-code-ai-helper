@@ -986,6 +986,22 @@ export interface ChecklistChangeProposalV1 {
   /** Checklist `total` immediately after this revision's re-finalization
    * merge — set alongside `resolvedAt`. */
   itemCountAfter?: number;
+  /**
+   * Whether `markChecklistChangeProposalAdoptedV1` also annotated the
+   * mutating round's `roundLedger` row with `checklistRevisionAdopted`, in
+   * the SAME transaction that set `resolvedAt` above (2026-08-28 review fix,
+   * completion blocker: "the separate best-effort write may fail or no-op
+   * after the originating row is pruned — adoption may be marked durable on
+   * the proposal while the required ledger record remains absent"). Set
+   * `true` only when the row was found and successfully annotated in this
+   * transaction (or a prior one); `false` when adoption succeeded but the
+   * row named by `roundId` no longer exists in `roundLedger` (evicted by its
+   * own 200-row cap) — a structurally permanent gap, not a transient
+   * failure, and now an OBSERVABLE fact on the durable proposal record
+   * rather than a silently swallowed best-effort attempt. Absent only when
+   * the proposal itself has not yet been adopted.
+   */
+  ledgerAnnotated?: boolean;
 }
 
 /** Cap on `TaskProgress.checklistChangeProposals` length (oldest entries dropped first). */
