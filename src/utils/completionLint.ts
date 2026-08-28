@@ -964,6 +964,43 @@ function attachRunGuards(
   child.on("exit", (code) => { if (killed) { finish({ code: code ?? 1, output }); } });
 }
 
+/**
+ * Uppercase a Windows drive letter in a spawn `cwd`.
+ *
+ * VS Code hands extensions workspace paths with a LOWERCASE drive letter
+ * (`c:\dev\...`), and this module passes that straight to `spawn`. A terminal
+ * never does — cmd.exe and PowerShell both normalize the drive letter to
+ * uppercase — so the difference is invisible to a human running the same
+ * command by hand, which is exactly what made the failure below look
+ * environmental for days.
+ *
+ * Vite resolves module ids from the process cwd, and on Windows `c:/x` and
+ * `C:/x` produce two DIFFERENT module graphs. Under a lowercase drive letter
+ * a Vitest run dies during collection with
+ * `TypeError: Cannot read properties of undefined (reading 'config')`,
+ * collecting zero tests — every suite, every workspace, before any test runs.
+ *
+ * Reproduced deterministically on 2026-08-28 against jester's `apps/server`
+ * (78 files, 1097 tests), spawning the same command three ways:
+ *   cwd `c:/dev/PERSONAL/jester/apps/server`  -> fails (undefined.config)
+ *   cwd `C:/dev/PERSONAL/jester/apps/server`  -> passes
+ *   cwd `C:\dev\PERSONAL\jester\apps\server`  -> passes
+ * The drive letter is the only variable. Environment inheritance,
+ * ELECTRON_RUN_AS_NODE, DEBUG and the workspace's own vitest config were each
+ * eliminated by experiment first.
+ *
+ * That failure surfaced to the user as an `environmental` review blocker on a
+ * task that was otherwise complete, with a suite that passed cleanly in any
+ * terminal — unfixable from inside the task, and not actually the task's
+ * fault. Normalizing here fixes it for every repo Ensemble runs checks in.
+ *
+ * Non-Windows paths and paths without a drive letter are returned unchanged.
+ */
+/** @internal exported for testing */
+export function normalizeSpawnCwdV1(cwd: string): string {
+  return /^[a-z]:/.test(cwd) ? cwd.charAt(0).toUpperCase() + cwd.slice(1) : cwd;
+}
+
 function runCheck(
   cwd: string,
   args: string[],
@@ -990,7 +1027,7 @@ function runCheck(
     const child = spawn(
       useShell ? quote(resolved) : resolved,
       useShell ? args.slice(1).map(quote) : args.slice(1),
-      { cwd, shell: useShell, env: extraEnv ? { ...process.env, ...extraEnv } : undefined }
+      { cwd: normalizeSpawnCwdV1(cwd), shell: useShell, env: extraEnv ? { ...process.env, ...extraEnv } : undefined }
     );
     attachRunGuards(child, guard, resolve);
   });
@@ -1095,7 +1132,7 @@ function runExplicitCheck(
   extraEnv?: NodeJS.ProcessEnv
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true, env: extraEnv ? { ...process.env, ...extraEnv } : undefined });
+    const child = spawn(command, { cwd: normalizeSpawnCwdV1(cwd), shell: true, env: extraEnv ? { ...process.env, ...extraEnv } : undefined });
     attachRunGuards(child, guard, resolve);
   });
 }

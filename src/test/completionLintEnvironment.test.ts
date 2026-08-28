@@ -21,6 +21,7 @@ import {
   buildVerifiedChecksSection,
   collectCompletionLint,
   CompletionLintResult,
+  normalizeSpawnCwdV1,
 } from "../utils/completionLint";
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-env-disclosure-test-"));
@@ -136,5 +137,60 @@ void describe("buildVerifiedChecksSection — environment rendering (fixture-bas
     const section = buildVerifiedChecksSection(result);
     assert.match(section, /Overall: All checks passed\./);
     assert.match(section, /Environment these checks ran in/);
+  });
+});
+
+/**
+ * A Windows drive letter's CASE in the spawn cwd is load-bearing, and the
+ * failure it causes is invisible to a human reproducing the same command.
+ *
+ * VS Code hands extensions workspace paths with a lowercase drive letter
+ * (`c:\dev\...`); cmd.exe and PowerShell both normalize it to uppercase. Vite
+ * resolves module ids from the cwd and treats `c:/x` and `C:/x` as different
+ * roots, so a Vitest run under the lowercase form dies during collection with
+ * `TypeError: Cannot read properties of undefined (reading 'config')` and
+ * collects zero tests — every suite, every workspace.
+ *
+ * Verified against a real repo on 2026-08-28 (jester `apps/server`, 78 files /
+ * 1097 tests) by spawning the identical command with only the drive letter
+ * changed: lowercase failed, uppercase passed, backslashes passed. It had
+ * surfaced as an `environmental` review blocker on an otherwise-complete task
+ * whose suite passed cleanly in any terminal.
+ *
+ * Note this file's own header records the same shape a month earlier: jester
+ * "sat at 7/10 for eight rounds on a blocker that was real in the extension
+ * host and unreproducible in a plain shell". Twice now — worth a guard rather
+ * than a comment.
+ */
+describe("normalizeSpawnCwdV1", () => {
+  it("uppercases a lowercase Windows drive letter", () => {
+    assert.equal(
+      normalizeSpawnCwdV1("c:\\dev\\PERSONAL\\jester\\apps\\server"),
+      "C:\\dev\\PERSONAL\\jester\\apps\\server"
+    );
+    assert.equal(
+      normalizeSpawnCwdV1("c:/dev/PERSONAL/jester/apps/server"),
+      "C:/dev/PERSONAL/jester/apps/server"
+    );
+  });
+
+  it("leaves an already-uppercase drive letter untouched", () => {
+    assert.equal(normalizeSpawnCwdV1("C:\\dev\\x"), "C:\\dev\\x");
+  });
+
+  it("only touches the drive letter, never the rest of the path", () => {
+    // Deliberately mixed-case after the drive: normalizing more than the
+    // first character would break a case-sensitive lookup on a POSIX host and
+    // change nothing useful on Windows.
+    assert.equal(normalizeSpawnCwdV1("d:/Dev/MiXeD/Case"), "D:/Dev/MiXeD/Case");
+  });
+
+  it("returns POSIX and UNC paths unchanged", () => {
+    assert.equal(normalizeSpawnCwdV1("/home/user/project"), "/home/user/project");
+    assert.equal(
+      normalizeSpawnCwdV1("\\\\server\\share\\project"),
+      "\\\\server\\share\\project"
+    );
+    assert.equal(normalizeSpawnCwdV1(""), "");
   });
 });
