@@ -1494,16 +1494,16 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         true,
         false
       );
-      await waitForState(fake, (s) => s.interaction !== undefined);
+      await waitForState(fake, (s) => (s.interactions as unknown[] | undefined)?.length === 1);
       assert.equal(
         lastState(fake)?.waitingForUser,
         false,
         "a persisted-only structured interaction must not assert the waiting posture"
       );
       assert.equal(lastState(fake)?.waitingForUserSource, undefined);
-      const renderedInteraction = lastState(fake)?.interaction as { interactionId?: string } | undefined;
+      const renderedInteractions = lastState(fake)?.interactions as ReadonlyArray<{ interactionId?: string }> | undefined;
       assert.equal(
-        renderedInteraction?.interactionId,
+        renderedInteractions?.[0]?.interactionId,
         "7".repeat(32),
         "the interaction content must name the actual posted interaction"
       );
@@ -1568,7 +1568,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         true,
         false
       );
-      await waitForState(fake, (s) => s.interaction !== undefined);
+      await waitForState(fake, (s) => (s.interactions as unknown[] | undefined)?.length === 1);
 
       assert.equal(
         lastState(fake)?.busy,
@@ -1687,6 +1687,26 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         html.includes("no status is available until this finishes"),
         false,
         "the obsolete plumbing-centric busy message must not remain in the webview"
+      );
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("renders legacy auto-starts in the collapsed Activity group and places posture after the transcript", () => {
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const html = fake.view.webview.html;
+      assert.match(
+        html,
+        /item\.value\.kind==='activity'\|\|\(item\.value\.kind===undefined&&typeof item\.value\.text==='string'&&item\.value\.text\.trim\(\)\.startsWith\('_Auto-starting:'\)\)/,
+        "legacy auto-start messages must share the collapsed Activity group with typed activity records"
+      );
+      assert.ok(
+        html.indexOf('<div id="messages"') < html.indexOf('<div id="scheduling-posture"'),
+        "the scheduling posture must be a footer after the transcript"
       );
     } finally {
       provider.dispose();

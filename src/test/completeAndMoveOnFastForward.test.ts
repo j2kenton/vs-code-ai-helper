@@ -335,6 +335,11 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
           `ff_impl_${armed ? "armed" : "off"}`,
           "plan-low-review"
         );
+        // Completing Plan Low-Level Review now requires its own review
+        // artifact to exist before the stage can advance; this test is about
+        // the dispatch-independent-of-the-gate behavior, not the artifact
+        // gate itself.
+        fs.writeFileSync(path.join(folderPath, "plan-low-review.md"), "# Review\n", "utf8");
         const buttonArg = makeButtonPressArg(folderPath, progress);
         const gateSeam = patch(settingsModule, "isAutoImplementAfterReviewEnabled", () => armed);
         dispatches.length = 0;

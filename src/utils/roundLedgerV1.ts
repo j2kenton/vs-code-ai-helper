@@ -424,9 +424,13 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
     if (outcome.continuationOwed) {
       parts.push("a continuation is owed");
     }
-    if (outcome.runLogPath) {
-      parts.push(outcome.runLogPath);
-    }
+  }
+  // The dispatch mode is part of the terminal record, not merely metadata in
+  // task-progress.json.  A reader needs it to distinguish checklist-driven
+  // Implementation from Apply Review and a continuation after the fact.
+  parts.push(`mode ${entry.mode}`);
+  if (outcome?.runLogPath) {
+    parts.push(outcome.runLogPath);
   }
   return parts.join(" — ") + "_";
 }

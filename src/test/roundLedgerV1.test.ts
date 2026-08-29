@@ -1087,6 +1087,18 @@ void describe("formatRoundOutcomeMessageV1", () => {
     assert.ok(text.includes("score 8"));
     assert.ok(text.includes("1 reviewer"));
     assert.ok(text.includes("2 mechanical"));
+    assert.ok(text.includes("mode implementation"));
+  });
+
+  void it("renders the dispatch mode before the run-log path", () => {
+    const entry = makeBaseEntry({
+      mode: "apply-review",
+      state: "completed",
+      endedAt: "2026-01-01T00:05:00.000Z",
+      outcome: { filesChanged: [], runLogPath: "runs/attempt-1.md" },
+    });
+    const text = formatRoundOutcomeMessageV1(entry);
+    assert.match(text, /mode apply-review — runs\/attempt-1\.md_/);
   });
 
   void it("renders a rejection reason for a rejected round", () => {

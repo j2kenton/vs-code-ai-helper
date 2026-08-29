@@ -438,6 +438,9 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     const { folderPath, progress } = makeTaskFolder(`promote_${Math.floor(Math.random() * 1e9)}`, "plan-low-review");
     const planContent = "# Plan\n\n1. Do the thing.\n2. Verify the thing.\n";
     fs.writeFileSync(path.join(folderPath, "plan.md"), planContent, "utf8");
+    // Completing the low-level plan review requires its review artifact;
+    // this test exercises promotion, not a missing-artifact refusal.
+    fs.writeFileSync(path.join(folderPath, "plan-low-review.md"), FAKE_REVIEW, "utf8");
     const buttonArg = makeButtonPressArg(folderPath, progress);
 
     const provider = new StatusTreeProvider();
@@ -484,11 +487,11 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     // AFTER the artifact-existence check, which itself can return early — so
     // a task with a missing/empty artifact left its previous stage's
     // operation running underneath it even after "Complete Stage & Move On"
-    // was clicked. Emptying plan.md here deliberately drives nextStage down
+    // was clicked. Removing plan.md here deliberately drives nextStage down
     // that early-return path, so this test can observe that cancellation
     // still happened despite the transition itself not proceeding.
     const { folderPath, progress } = makeTaskFolder(`abort-order-${Math.floor(Math.random() * 1e9)}`, "plan");
-    fs.writeFileSync(path.join(folderPath, "plan.md"), "", "utf8");
+    fs.rmSync(path.join(folderPath, "plan.md"));
     const buttonArg = makeButtonPressArg(folderPath, progress);
 
     const provider = new StatusTreeProvider();
@@ -556,12 +559,12 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     // preparation. This test observes whether the stray operation was
     // already cancelled by the time resolveConfiguredReviewStages is called,
     // which only holds if cancellation now runs strictly first.
-    // Empty plan.md deliberately drives nextStage down the missing-artifact
+    // Removing plan.md deliberately drives nextStage down the missing-artifact
     // early-return path (as the sibling ordering test above does), so this
     // test observes cancel-before-config-resolution without also exercising
     // the real review pipeline.
     const { folderPath, progress } = makeTaskFolder(`abort-order-cfg-${Math.floor(Math.random() * 1e9)}`, "plan");
-    fs.writeFileSync(path.join(folderPath, "plan.md"), "", "utf8");
+    fs.rmSync(path.join(folderPath, "plan.md"));
     const buttonArg = makeButtonPressArg(folderPath, progress);
 
     const provider = new StatusTreeProvider();

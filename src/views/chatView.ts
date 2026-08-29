@@ -1431,7 +1431,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // instead of painting one task's history into another's view.
     const target = this.target;
     let entries: ChatMessage[] = [];
-    let interaction: ChatDocumentInteractionV1 | undefined;
+    let interactions: readonly ChatDocumentInteractionV1[] = [];
     let errorMessage: string | undefined;
     let emptyNotice: string | undefined;
     // A completed/archived task's conversation is hidden, not deleted: skip
@@ -1455,21 +1455,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           target.canonicalId,
           target.kind === "global" ? undefined : target.stage
         );
-        // The most recent unresolved structured-question interaction, if
-        // any, for this same stage-isolated scope (plan §6.1). A read
-        // failure here must not break the rest of Chat — nothing in
-        // production posts these yet, so it degrades to "none" silently
-        // rather than surfacing a second error channel alongside the
-        // transcript's own.
-        const interactions = await readChatInteractions(
+        // Every unresolved structured-question interaction for this same
+        // stage-isolated scope.  A question owns its answer channel, so two
+        // pending questions must render two separate controls; selecting only
+        // the newest one made the older question both invisible and impossible
+        // to answer without using the unrelated stage-chat composer.
+        interactions = (await readChatInteractions(
           target.taskFolderPath,
           target.canonicalId,
           target.kind === "global" ? undefined : target.stage
-        ).catch(() => [] as ChatDocumentInteractionV1[]);
-        interaction = interactions
-          .slice()
-          .reverse()
-          .find((i) => i.state === "unresolved");
+        ).catch(() => [] as ChatDocumentInteractionV1[])).filter((i) => i.state === "unresolved");
       } catch (error) {
         // A transcript that fails to read (e.g. corrupt and unquarantinable —
         // see chatHistoryStore's readChatHistory) must not crash render(), or
@@ -1773,7 +1768,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       schedulingPostureLine,
       entries: displayEntries,
       timeline: buildChatTimelineV1(displayEntries, displayDecisions),
-      interaction,
+      interactions,
       decisions: displayDecisions,
       busy,
       busyDetail,
@@ -1951,10 +1946,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: 0 0 var(--ensemble-space-3);
           padding: var(--ensemble-space-3);
           border: var(--ensemble-border-width) solid var(--vscode-panel-border);
+          border-left: 3px solid var(--vscode-inputValidation-warningBorder);
           border-radius: var(--ensemble-radius);
           background-color: var(--vscode-sideBar-background);
         }
-        .interaction-title { font-weight: bold; margin-bottom: var(--ensemble-space-2); }
+        /* Every rendered interaction is, by definition, an unresolved question
+           — the same "needs a response before automation can continue" claim
+           a gating decision card makes (see .decision-card-gating above).
+           The left-border accent is the one visual cue shared by both, so a
+           user scanning the panel recognizes "something needs me" the same
+           way regardless of which of the two answer channels raised it. */
+        .interaction-title { font-weight: bold; margin-bottom: var(--ensemble-space-2); color: var(--vscode-inputValidation-warningForeground); }
         .interaction-question { margin-bottom: var(--ensemble-space-3); }
         .interaction-prompt { margin-bottom: var(--ensemble-space-1); }
         .interaction-help { font-size: 0.9em; color: var(--vscode-descriptionForeground); margin-bottom: var(--ensemble-space-1); }
@@ -2002,7 +2004,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
       </style>
       </head><body>
-      <div id="context" role="status">Loading chat…</div><div id="scheduling-posture" role="status"></div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
+      <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div><div id="scheduling-posture" role="status"></div>
       <div id="interaction" role="form" aria-label="Question from the AI"></div>
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
@@ -2031,14 +2033,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // answers already recorded on the interaction (e.g. a crash-recovered
       // submission — see chatHistoryStore.ts's RECONCILIATION section) are
       // hydrated into the controls instead of always starting blank.
-      function renderInteraction(interaction){
-        ic.replaceChildren();
+      function renderInteraction(interaction,append){
+        if(!append) ic.replaceChildren();
         if(!interaction){ ic.style.display='none'; return; }
         ic.style.display='block';
         const err=document.createElement('div'); err.className='interaction-error';
         ic.appendChild(err);
         const title=document.createElement('div'); title.className='interaction-title';
-        title.textContent='This action needs your input:';
+        title.textContent='Needs your reply';
         ic.appendChild(title);
         const priorAnswers={};
         for(const a of (interaction.answers||[])){ priorAnswers[a.questionId]=a; }
@@ -2152,6 +2154,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         cancelBtn.addEventListener('click',()=>{ v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); });
         actions.appendChild(confirmBtn); actions.appendChild(chatBtn); actions.appendChild(cancelBtn);
         ic.appendChild(actions);
+        // A question is an interruption that needs a visible reply, not a
+        // passive transcript item. Focus its first control when the block is
+        // initially rendered; later unresolved questions keep their own
+        // controls rather than stealing that first focus.
+        if(!append){ requestAnimationFrame(()=>{ const first=ic.querySelector('textarea,input,button'); if(first) first.focus(); }); }
+      }
+      function renderInteractions(interactions){
+        if(!interactions || !interactions.length){ renderInteraction(undefined,false); return; }
+        for(let index=0;index<interactions.length;index++){
+          renderInteraction(interactions[index],index>0);
+        }
       }
       // Renders every pending WorkflowDecisionV1 for this task/stage as an
       // explained choice: what happened, why the user is needed, evidence
@@ -2276,7 +2289,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
           });
           meta.appendChild(copyBtn);meta.appendChild(time);
-          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.awaitingAnswer?' — awaiting your answer':'')+'] '+x.text+(x.endingPendingReconciliation?' — ending pending reconciliation':'');
+          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+'] '+x.text+(x.endingPendingReconciliation?' — ending pending reconciliation':'');
           row.appendChild(d);row.appendChild(meta);
           return row;
         }
@@ -2287,7 +2300,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           if(item.type==='decision'){
             const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
             renderDecisions([item.value],decisionWrap);m.appendChild(decisionWrap);
-          }else if(item.value.kind==='activity'){
+          }else if(item.value.kind==='activity'||(item.value.kind===undefined&&typeof item.value.text==='string'&&item.value.text.trim().startsWith('_Auto-starting:'))){
             activities.push(item.value);
           }else{
             m.appendChild(renderMessage(item.value));
@@ -2299,7 +2312,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           for(const activity of activities){group.appendChild(renderMessage(activity));}
           m.appendChild(group);
         }
-        renderInteraction(s.interaction);
+        renderInteractions(s.interactions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
         if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyText||'cannot determine what this task is doing';b.style.display='block';b.title='';}

@@ -1347,6 +1347,10 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
       fs.writeFileSync(path.join(folder, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
       fs.writeFileSync(path.join(folder, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
       fs.writeFileSync(path.join(folder, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+      // The shortcut exercises a valid transition out of Low-Level Code
+      // Review; stage completion now correctly refuses an absent review
+      // artifact before it can advance to Publish.
+      fs.writeFileSync(path.join(folder, STAGE_ARTIFACT_FILENAMES["impl-low-review"]!), "# Review\n", "utf8");
       return { folderPath: folder };
     })();
     const provider = new StatusTreeProvider();
@@ -1401,6 +1405,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
 
   void it("nextStage: triggers-AI on — review-owned, dispatches exactly one Publish review, never a direct publish chain", async () => {
     const { folderPath } = makeTaskFolder(`nextstage-on-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    fs.writeFileSync(path.join(folderPath, STAGE_ARTIFACT_FILENAMES["impl-low-review"]!), "# Review\n", "utf8");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1631,6 +1636,15 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       },
     };
     fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    // The composite intentionally completes the Low-Level Code Review and
+    // Publish stages before it reaches the inline git-readiness recheck.
+    // Supply those required artifacts so this fixture tests that ownership
+    // path rather than the separate missing-artifact refusal contract.
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, STAGE_ARTIFACT_FILENAMES["impl-low-review"]!), "# Review\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish!), "# Publish Review\n", "utf8");
 
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -1809,6 +1823,12 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
 
   void it("setTaskStage: manual jump onto Publish scopes the preflight to the task's implReviewFiles", async () => {
     const { folderPath } = makeTaskFolder(`scope-jump-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    // Advancing out of a review stage now validates that stage's own
+    // completion artifact before it reaches the Publish preflight. This
+    // ownership test is about the preflight scope, so establish the valid
+    // outgoing-stage state explicitly rather than relying on the old
+    // artifact-less fixture shape.
+    fs.writeFileSync(path.join(folderPath, STAGE_ARTIFACT_FILENAMES["impl-low-review"]!), "# Review\n", "utf8");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1833,6 +1853,9 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
 
   void it("nextStage (triggers-AI off, entry-owned): scopes the preflight to the task's implReviewFiles", async () => {
     const { folderPath } = makeTaskFolder(`scope-nextstage-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    // See the manual-jump case above: this test exercises Publish preflight
+    // ownership, not refusal of an incomplete Low-Level Code Review stage.
+    fs.writeFileSync(path.join(folderPath, STAGE_ARTIFACT_FILENAMES["impl-low-review"]!), "# Review\n", "utf8");
     const progressPath = path.join(folderPath, "task-progress.json");
     const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
     progress.implReviewFiles = scopeFiles;
@@ -2317,5 +2340,3 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     );
   });
 });
-
-

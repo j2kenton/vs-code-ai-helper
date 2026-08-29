@@ -93,3 +93,10 @@ playwright-report/
 # files document what belongs in each; the real values never leave the machine.
 .env.local
 .env*.local
+
+# Design and verification docs are development-only material: written for the
+# author, not for users, and the verification set records unproven behaviour and
+# known gaps. Already excluded from the package (.vscodeignore, `docs/**`, and
+# asserted absent by scripts/verify-package-contents.js) - this keeps them out
+# of the PUBLIC repository as well.
+/docs/

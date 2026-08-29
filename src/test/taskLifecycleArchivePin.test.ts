@@ -335,6 +335,10 @@ void describe("archive → resume → re-complete round trip", () => {
       JSON.stringify(progress, null, 2),
       "utf8"
     );
+    // Publish completion now has a real artifact gate. This fixture is about
+    // archive/resume lifecycle, not the explicit Complete Anyway override,
+    // so establish the normal Publish precondition before re-completing.
+    await fs.promises.writeFile(path.join(folderPath, "publish-review.md"), "# Publish Review\n", "utf8");
 
     const inv = makeInventory([{ canonicalId, taskFolderPath: folderPath, progress }]);
     const store = makeCurrentTaskStoreStub();

@@ -18,7 +18,7 @@ import { normalizePath } from "./taskRoot";
 import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
-import { postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
+import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
@@ -162,6 +162,104 @@ export function recentDispatchModesIncludeAmbiguousOriginV1(
 function nextStageInOrderV1(stage: TaskStage): TaskStage | undefined {
   const index = STAGE_ORDER.indexOf(stage);
   return index === -1 || index === STAGE_ORDER.length - 1 ? undefined : STAGE_ORDER[index + 1];
+}
+
+/**
+ * The bounded, durable escalation shape used when a caller does not have a
+ * freshly-published review's blocker evidence. Review-stage plateaus retain
+ * their richer, evidence-led card below; implementation-side and
+ * environmental escalations must still be answerable cards rather than a
+ * paragraph whose reply is ambiguously consumed by stage chat.
+ */
+function buildEscalationDecisionV1(
+  kind: EscalationKind,
+  stage: TaskStage,
+  reason: string,
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+): PostWorkflowDecisionInputV1 {
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  const nextStage = nextStageInOrderV1(stage);
+  const environmental = kind === "environmental";
+  const keepIterating: WorkflowDecisionOptionV1 = environmental
+    ? {
+        optionId: "keepIterating",
+        label: "Switch this stage's model",
+        consequence:
+          "Opens AI Models so you can select a working model for this stage. The task stays paused until you resume it.",
+        effect: { kind: "command", command: "vs-code-ai-helper.openAiModels" },
+      }
+    : {
+        optionId: "keepIterating",
+        label: "Keep iterating",
+        consequence: IMPL_REVIEW_STAGES.includes(stage)
+          ? `Resumes the task and reruns ${stageName}.`
+          : "Resumes the task so its owed continuation or next implementation action can proceed.",
+        effect: {
+          kind: "command",
+          command: IMPL_REVIEW_STAGES.includes(stage)
+            ? "vs-code-ai-helper.resumeAndRerunReview"
+            : "vs-code-ai-helper.resumeTask",
+          args: [{ taskFolderPath: target.taskFolderPath }],
+        },
+      };
+  const options: WorkflowDecisionOptionV1[] = [
+    ...(nextStage
+      ? [{
+          optionId: "advance",
+          label: `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`,
+          consequence: `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`,
+          effect: {
+            kind: "command" as const,
+            command: "vs-code-ai-helper.setTaskStage",
+            args: [{ taskFolderPath: target.taskFolderPath, stage: nextStage }],
+          },
+        }]
+      : []),
+    keepIterating,
+    {
+      optionId: "handleMyself",
+      label: "I'll handle it myself",
+      consequence: "Leaves the task paused while you make the needed change yourself.",
+      effect: { kind: "doNothing" },
+    },
+    {
+      optionId: "reconsiderRequirement",
+      label: "Reconsider the requirement itself",
+      consequence: "Leaves the task paused while you review the plan's non-goals and prior decisions.",
+      effect: { kind: "doNothing" },
+    },
+  ];
+  const recommendation: WorkflowDecisionRecommendationV1 = environmental
+    ? {
+        kind: "option",
+        optionId: "keepIterating",
+        reasoning: "This is an environmental failure, so changing this stage's model is the action available in Ensemble.",
+      }
+    : kind === "spec-defect"
+      ? {
+          kind: "option",
+          optionId: "reconsiderRequirement",
+          reasoning: "The reported issue is in the requirement rather than a change the implementation can make.",
+        }
+      : {
+          kind: "option",
+          optionId: "keepIterating",
+          reasoning: "The task is paused and this is the action that returns it to a runnable state.",
+        };
+  return {
+    decisionKey: `reviewEscalation:${kind}`,
+    taskCanonicalId: target.canonicalId,
+    stage,
+    whatHappened: `${stageName} needs your decision: ${reason}`,
+    whyUserNeeded: "Automation paused this task and cannot choose how to proceed on your behalf.",
+    options,
+    recommendation,
+    gating: {
+      holdsTaskPaused: true,
+      unblocksProgress: true,
+      detail: "This decision is holding the task paused until you choose how to proceed.",
+    },
+  };
 }
 
 /**
@@ -740,6 +838,29 @@ export async function escalateReviewToHuman(
       if (posted) {
         return true;
       }
+    }
+
+    // Every escalation with an extension context gets a durable decision
+    // card. The specialized review-plateau card above remains the richer
+    // path when fresh blocker evidence exists; this covers the two
+    // implementation-side plateau callers and all environmental/spec-defect
+    // callers that previously fell straight through to an unbound prose
+    // question.
+    const genericDecision = await postWorkflowDecisionV1(
+      buildEscalationDecisionV1(kind, stage, reason, {
+        canonicalId: normalizePath(folderUri.fsPath),
+        taskFolderPath: folderUri.fsPath,
+        taskName: progressHint?.displayName,
+      }),
+      {
+        canonicalId: normalizePath(folderUri.fsPath),
+        taskFolderPath: folderUri.fsPath,
+        stage,
+        taskName: progressHint?.displayName,
+      }
+    );
+    if (genericDecision !== undefined) {
+      return true;
     }
 
     const stageName = STAGE_DISPLAY_NAMES[stage];

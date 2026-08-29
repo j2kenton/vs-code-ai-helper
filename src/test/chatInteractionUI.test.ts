@@ -177,7 +177,8 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
 
       const lastState = fake.posted.filter((m) => m.type === "state").pop();
       assert.ok(lastState, "expected a posted state message");
-      const interaction = lastState.interaction as { interactionId: string; state: string } | undefined;
+      const interactions = lastState.interactions as ReadonlyArray<{ interactionId: string; state: string }> | undefined;
+      const interaction = interactions?.find((i) => i.interactionId === "1".repeat(32));
       assert.ok(interaction, "expected the interaction to be included in the posted state");
       assert.equal(interaction.interactionId, "1".repeat(32));
       assert.equal(interaction.state, "unresolved");
@@ -443,7 +444,11 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       assert.equal(stored[0]!.state, "cancelled");
 
       const lastState = fake.posted.filter((m) => m.type === "state").pop();
-      assert.equal(lastState!.interaction, undefined, "a settled interaction no longer renders as pending");
+      const interactions = lastState!.interactions as ReadonlyArray<{ interactionId: string }> | undefined;
+      assert.ok(
+        !interactions?.some((i) => i.interactionId === ref.interactionId),
+        "a settled interaction no longer renders as pending"
+      );
     } finally {
       notify.restore();
       cmds.restore();

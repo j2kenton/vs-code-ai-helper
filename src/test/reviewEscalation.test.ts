@@ -301,6 +301,111 @@ function makeExtensionContext(): vscode.ExtensionContext {
   } as unknown as vscode.ExtensionContext;
 }
 
+void describe("escalateReviewToHuman — no-evidence escalations post a bound decision", () => {
+  void it("posts an environmental escalation as a durable card with selectable options", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("environmental-decision-no-evidence");
+    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-1" }));
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "environmental",
+        "The configured provider is unavailable",
+        "attempt-1"
+      );
+      assert.equal(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "reviewEscalation:environmental");
+      assert.ok(decision, "an escalation without review evidence must still post a durable decision");
+      assert.ok(decision.gating?.holdsTaskPaused, "the card must state that it holds the task paused");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "keepIterating");
+      }
+      const switchModel = decision.options.find((option) => option.optionId === "keepIterating");
+      assert.equal(switchModel?.label, "Switch this stage's model");
+      assert.deepEqual(switchModel?.effect, { kind: "command", command: "vs-code-ai-helper.openAiModels" });
+      assert.ok(decision.options.some((option) => option.optionId === "advance"));
+      assert.ok(decision.options.some((option) => option.optionId === "handleMyself"));
+      assert.ok(decision.options.some((option) => option.optionId === "reconsiderRequirement"));
+      assert.equal(
+        surface.entries.some((entry) => entry.message.includes("Automated review iteration is stuck")),
+        false,
+        "a posted card must replace the legacy prose escalation"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("posts an implementation-side plateau escalation (no review evidence) as a durable card that resumes the task", async () => {
+    // Covers implementationRecoveryV1.ts's continuation-budget-exhausted
+    // caller and reviewActions.ts's no-progress breaker — both call
+    // escalateReviewToHuman with kind "plateau" but no reviewPlateauEvidence
+    // (that richer card is reserved for review-stage plateaus, see the
+    // postReviewPlateauDecisionV1 tests below). Distinct from the
+    // environmental case above: "impl" is not a review stage, so keepIterating
+    // must resume the task itself rather than re-run a review.
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-no-evidence");
+    seedProgress(store, folderUri, baseProgress({ currentStage: "impl", reviewAttemptId: undefined }));
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl",
+        "plateau",
+        "3 consecutive implementation round(s) ended without a usable report",
+        undefined
+      );
+      assert.equal(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "reviewEscalation:plateau");
+      assert.ok(decision, "an implementation-side plateau without review evidence must still post a durable decision");
+      assert.ok(decision.gating?.holdsTaskPaused, "the card must state that it holds the task paused");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "keepIterating");
+      }
+      const keepIterating = decision.options.find((option) => option.optionId === "keepIterating");
+      assert.equal(keepIterating?.label, "Keep iterating");
+      assert.deepEqual(keepIterating?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeTask",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
+      assert.ok(decision.options.some((option) => option.optionId === "advance"));
+      assert.ok(decision.options.some((option) => option.optionId === "handleMyself"));
+      assert.ok(decision.options.some((option) => option.optionId === "reconsiderRequirement"));
+      assert.equal(
+        surface.entries.some((entry) => entry.message.includes("Automated review iteration is stuck")),
+        false,
+        "a posted card must replace the legacy prose escalation"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+});
+
 // wf10 item 7b — the plateau escalation is rebuilt as a WorkflowDecisionV1
 // (quoted blocker, taskFixableCount/progress evidence, one ranked
 // recommendation) whenever the caller supplies `reviewPlateauEvidence`,
