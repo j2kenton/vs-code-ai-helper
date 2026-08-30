@@ -825,6 +825,7 @@ import {
   resumePausedTask,
   resumeAndRerunReviewV1,
   resumeAndDispatchImplementationV1,
+  resumeIfPausedThenGoToReviewAndApplyV1,
 } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
@@ -1225,6 +1226,166 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         implDispatch,
         undefined,
         "must not dispatch implementation for a resume that never actually succeeded"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resumeIfPausedThenGoToReviewAndApplyV1 — the "Go to Review & Apply" card
+// option/toast button (sterileRoundRouting, preImplementationRouting, Fast
+// Forward's closing notice) must not fail with a confusing "task could not
+// be found" when the task has since been paused (review blocker 2026-08-30,
+// wf "stage chat as a record of work" item 14 / Part 12 step 34): unlike
+// resumeAndRerunReviewV1 / resumeAndDispatchImplementationV1 above, this
+// command's callers do NOT guarantee the task is paused, so it must resume
+// ONLY when actually paused and otherwise proceed straight through without
+// an extraneous "Task is not paused." notification.
+// ---------------------------------------------------------------------------
+
+void describe("resumeIfPausedThenGoToReviewAndApplyV1 (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumes a paused task and then dispatches Apply Review, since currentStage already matches reviewStage", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-if-paused-goto-review");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-if-paused-goto-review",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      const dispatched = await resumeIfPausedThenGoToReviewAndApplyV1(inv, currentStore, {
+        taskFolderPath: folderPath,
+        reviewStage: "impl-high-review",
+      });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "active",
+        "the task must actually be resumed, not left paused while Apply Review is dispatched against it"
+      );
+      assert.strictEqual(dispatched, true);
+
+      const applyDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyHighLevelReviewChanges"
+      );
+      assert.ok(
+        applyDispatch !== undefined,
+        "must dispatch Apply Review after resuming — the whole point of this command over the plain " +
+          "goToReviewAndApply, which fails with 'task could not be found' on a paused task"
+      );
+      assert.strictEqual(
+        msgs.captured.some((m) => m.message.includes("Task is not paused")),
+        false,
+        "the resumed-task path must not also show the unrelated 'Task is not paused' notice"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("proceeds straight through for an already-active task, without resuming or an extraneous notice", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-if-paused-goto-review-active");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-if-paused-goto-review-active",
+        currentStage: "impl-low-review",
+        status: "active",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "active");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      const dispatched = await resumeIfPausedThenGoToReviewAndApplyV1(inv, currentStore, {
+        taskFolderPath: folderPath,
+        reviewStage: "impl-low-review",
+      });
+
+      assert.strictEqual(dispatched, true);
+      const applyDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyLowLevelReviewChanges"
+      );
+      assert.ok(applyDispatch !== undefined, "must still dispatch Apply Review for an already-active task");
+      assert.strictEqual(
+        msgs.captured.some((m) => m.message.includes("Task is not paused")),
+        false,
+        "an already-active task must never see the 'Task is not paused' notice this command exists to avoid"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("does not dispatch Apply Review when the task could not be found (resume itself failed)", async () => {
+    const inv = makeEmptyInventoryStub();
+    const currentStore = makeCurrentTaskStoreStub(undefined);
+    const msgs = installMessageCapture();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const dispatched = await resumeIfPausedThenGoToReviewAndApplyV1(inv, currentStore, {
+        taskFolderPath: "/fake-workspace/deleted-paused-task",
+        reviewStage: "impl-high-review",
+      });
+
+      assert.strictEqual(dispatched, false);
+      assert.strictEqual(
+        execCmd.captured.some((e) => e.command.startsWith("vs-code-ai-helper.apply")),
+        false,
+        "must not dispatch Apply Review for a resume that never actually succeeded"
       );
     } finally {
       execCmd.restore();

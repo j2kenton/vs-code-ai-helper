@@ -61,7 +61,13 @@ import {
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { makeOwnedTaskFolder, bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
-import { readChatDocumentIdentityV1, readChatHistory, writeChatHistory } from "../utils/chatHistoryStore";
+import {
+  LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+  readChatDocumentIdentityV1,
+  readChatHistory,
+  readChatInteractions,
+  writeChatHistory,
+} from "../utils/chatHistoryStore";
 import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 
@@ -939,6 +945,213 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       // and proves the fix is in rendering, not in silently mutating history.
       const persisted = await readChatHistory(folder);
       assert.equal(persisted[0]!.pending, true, "the persisted flag itself is untouched by design");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Review blocker (2026-08-30): the no-context escalation fallback used to
+   * post a legacy free-text question whose bound option button carried only
+   * `{ optionId, label, description }` — clicking it recorded the label as
+   * ordinary chat text and dispatched nothing. That mechanism is gone; the
+   * fallback now posts a real `singleChoice` interaction with
+   * `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` and an `optionEffects`
+   * map (`askInteraction`), settled entirely within `chatView.ts` — these
+   * tests exercise that mechanism directly through the same
+   * `confirmInteraction` webview message every other structured question
+   * uses.
+   */
+  void it("confirming a local-only singleChoice interaction with a command effect actually dispatches the command", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const interactionId = "7".repeat(32);
+      const operationId = "8".repeat(32);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId,
+          operationId,
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+          optionEffects: {
+            plan: { kind: "command", command: "vs-code-ai-helper.openAiModels" },
+            task: { kind: "doNothing" },
+          },
+        },
+        true,
+        false
+      );
+      cmds.calls.length = 0; // drop any focus-command call askInteraction may issue
+
+      await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+
+      assert.deepEqual(
+        cmds.calls,
+        [{ id: "vs-code-ai-helper.openAiModels", args: [] }],
+        "the chosen option's bound command must actually be dispatched"
+      );
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const ack = entries.find((e) => e.role === "assistant" && /applying now/i.test(e.text));
+      assert.ok(ack, "expected an 'applying now' acknowledgement, matching the decision-card effect path");
+
+      const interactions = await readChatInteractions(folder, folder);
+      const settled = interactions.find((i) => i.interactionId === interactionId);
+      assert.equal(settled?.state, "resumed", "a local-only interaction settles as resumed, with no separate Resume step");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("confirming a local-only singleChoice interaction with a doNothing effect dispatches no command", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const interactionId = "9".repeat(32);
+      const operationId = "e".repeat(32);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId,
+          operationId,
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+          optionEffects: {
+            plan: { kind: "doNothing" },
+            task: { kind: "command", command: "vs-code-ai-helper.openAiModels" },
+          },
+        },
+        true,
+        false
+      );
+      cmds.calls.length = 0;
+
+      await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+
+      assert.deepEqual(cmds.calls, [], "a doNothing effect must dispatch no command");
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const ack = entries.find((e) => e.role === "assistant" && /does nothing further/i.test(e.text));
+      assert.ok(ack, "expected a 'does nothing further' acknowledgement for the doNothing option");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("confirming a local-only interaction persists the durable, stable selectedOptionId", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const interactionId = "a".repeat(32);
+      const operationId = "b".repeat(32);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId,
+          operationId,
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+          optionEffects: { plan: { kind: "doNothing" }, task: { kind: "doNothing" } },
+        },
+        true,
+        false
+      );
+
+      await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+
+      const interactions = await readChatInteractions(folder, folder);
+      const settled = interactions.find((i) => i.interactionId === interactionId);
+      assert.equal(
+        settled?.answers?.[0]?.kind === "singleChoice" && settled.answers[0].state === "answered"
+          ? settled.answers[0].selectedOptionId
+          : undefined,
+        "plan",
+        "the durable record must carry the chosen option's stable id"
+      );
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Review blocker (2026-08-30, second round, now against the interaction
+   * mechanism): a stale render still showing an enabled Confirm button (or
+   * any other double-submit) must not re-run the chosen option's effect a
+   * second time. `settleLocalOnlyInteractionAnswersV1` checks the
+   * interaction's own `state` before doing anything.
+   */
+  void it("confirming an already-resolved local-only interaction a second time does not re-run its effect", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const interactionId = "d".repeat(32);
+      const operationId = "f".repeat(32);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId,
+          operationId,
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+          optionEffects: { plan: { kind: "command", command: "vs-code-ai-helper.openAiModels" }, task: { kind: "doNothing" } },
+        },
+        true,
+        false
+      );
+
+      await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+      cmds.calls.length = 0; // drop the first confirm's own dispatch
+
+      await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+
+      assert.deepEqual(cmds.calls, [], "the second confirm must not re-run the option's effect");
+      const interactions = await readChatInteractions(folder, folder);
+      const settled = interactions.find((i) => i.interactionId === interactionId);
+      assert.equal(settled?.state, "resumed", "the interaction remains settled from the first confirm");
     } finally {
       notify.restore();
       cmds.restore();

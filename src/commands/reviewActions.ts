@@ -6206,8 +6206,12 @@ export async function fastForwardReviewWithAI(
         undefined,
         {
           // The task is at the stage Fast Forward targeted, so the SIBLING
-          // stage's apply command is out of stage — move first.
-          command: "vs-code-ai-helper.goToReviewAndApply",
+          // stage's apply command is out of stage — move first. Resumes the
+          // task first if it has since been paused (review blocker
+          // 2026-08-30, item 14) rather than the plain goToReviewAndApply,
+          // which fails with a confusing "task could not be found" on a
+          // paused task.
+          command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
           title: "Go to Review & Apply",
           args: [
             {
@@ -8848,7 +8852,11 @@ async function executeImplementationRun(
                   "which can fix the blockers Implementation cannot see.",
                 effect: {
                   kind: "command",
-                  command: "vs-code-ai-helper.goToReviewAndApply",
+                  // Resumes the task first if it has since been paused
+                  // (review blocker 2026-08-30, item 14) rather than the
+                  // plain goToReviewAndApply, which fails with a confusing
+                  // "task could not be found" on a paused task.
+                  command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
                   args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetReviewStage }],
                 },
               },
@@ -8874,7 +8882,8 @@ async function executeImplementationRun(
               holdsTaskPaused: false,
               unblocksProgress: false,
               detail:
-                "This does not pause or resume the task — it only offers a shortcut to the review stage. " +
+                "This does not pause the task itself — it only offers a shortcut to the review stage, " +
+                "resuming first if the task happens to be paused by the time you click it. " +
                 "\"Not now\" does nothing further; you can still run Apply Review manually at any time.",
             },
           },
@@ -8891,7 +8900,7 @@ async function executeImplementationRun(
             undefined,
             undefined,
             {
-              command: "vs-code-ai-helper.goToReviewAndApply",
+              command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
               title: "Go to Review & Apply",
               args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetReviewStage }]
             }
@@ -10261,7 +10270,11 @@ export async function runImplementationWithAI(
                 "never has two automations running against it at once — so this also stops the current run.",
               effect: {
                 kind: "command",
-                command: "vs-code-ai-helper.goToReviewAndApply",
+                // Resumes the task first if it has since been paused
+                // (review blocker 2026-08-30, item 14) rather than the
+                // plain goToReviewAndApply, which fails with a confusing
+                // "task could not be found" on a paused task.
+                command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
                 args: [{ taskFolderPath: resolved.folderUri.fsPath, reviewStage: targetReviewStage }],
               },
             },
@@ -10284,9 +10297,10 @@ export async function runImplementationWithAI(
             holdsTaskPaused: false,
             unblocksProgress: false,
             detail:
-              "This does not pause or resume the task. \"Go to Review & Apply\" requests the Implementation " +
+              "This does not pause the task itself. \"Go to Review & Apply\" requests the Implementation " +
               "round already running to cancel first, since moving stages always stops whatever the outgoing " +
-              "stage was doing; \"Keep running Implementation\" leaves the current run going untouched.",
+              "stage was doing, and resumes the task first if it happens to be paused by the time you click " +
+              "it; \"Keep running Implementation\" leaves the current run going untouched.",
           },
         },
         target

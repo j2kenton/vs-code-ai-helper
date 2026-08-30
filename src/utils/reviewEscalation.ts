@@ -19,14 +19,46 @@ import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
-import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
+import {
+  WorkflowDecisionOptionEffectV1,
+  WorkflowDecisionOptionV1,
+  WorkflowDecisionRecommendationV1,
+} from "../types/workflowDecisionV1";
+import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
+import { LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 } from "./chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
  * machinery reviewActions.ts and its callers don't otherwise depend on). */
 export interface EscalationChatTarget {
-  ask(
-    question: { canonicalId: string; taskFolderPath: string; stage: TaskStage; taskName?: string; question: string },
+  /**
+   * The no-context fallback's bound-answer channel (Part 10 items 13d/13e,
+   * 2026-08-30 review blocker: this previously used a separate, app-only
+   * `ask()` options-list mechanism instead of the same
+   * `StructuredQuestionV1`/`askInteraction` channel every other question in
+   * the product uses). Posts a `singleChoice` question with
+   * `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` — there is no
+   * coordinator operation behind an escalation raised from here, so
+   * `chatView.ts` settles it entirely on its own (see that constant's doc
+   * comment) — and `optionEffects` carries the same command each option
+   * would have run as a `WorkflowDecisionV1` card's option.
+   */
+  askInteraction(
+    question: {
+      canonicalId: string;
+      taskFolderPath: string;
+      stage: TaskStage;
+      taskName?: string;
+      interactionId: string;
+      operationId: string;
+      actionKey: string;
+      sourceAttemptId: string;
+      questions: readonly StructuredQuestionV1[];
+      /** Omitted here: no coordinator operation exists to derive it from — `askInteraction` resolves it itself. */
+      binding?: { readonly taskBindingId: string; readonly chatDocumentId: string };
+      optionEffects?: Readonly<Record<string, WorkflowDecisionOptionEffectV1>>;
+    },
     forceOpen?: boolean,
     notify?: { blocking?: boolean; blockedReason?: string }
   ): Promise<void>;
@@ -247,20 +279,178 @@ function buildReconsiderRequirementOptionV1(
 }
 
 /**
- * The bounded, durable escalation shape used when a caller does not have a
- * freshly-published review's blocker evidence. Review-stage plateaus retain
- * their richer, evidence-led card below; implementation-side and
- * environmental escalations must still be answerable cards rather than a
- * paragraph whose reply is ambiguously consumed by stage chat.
+ * The precomputed, evidence-derived pieces `postReviewPlateauDecisionV1`
+ * gathers (blocker text, progress marker, next-stage state, the clearing
+ * note, recent dispatch modes) — everything that function's async I/O
+ * (`readTextIfExists`, `normalizeReviewEvidenceV1`, `recentDispatchModesForStageV1`)
+ * produces that {@link buildEscalationDecisionV1} needs to build the SAME
+ * rich `reviewPlateauEscalation` card it used to build inline. Kept as a
+ * plain data bag (not the raw `ReviewPlateauEvidenceV1`) so the builder stays
+ * synchronous and does not need `folderUri`/plan-file access itself.
+ */
+interface EscalationPlateauContextV1 {
+  readonly blockersCount: number;
+  readonly primaryBlockerDescription?: string;
+  /** Appended immediately after the quoted blocker description; empty string when not narrowed. */
+  readonly narrowedNote: string;
+  readonly progressNote: string;
+  readonly taskFixableCount: number;
+  readonly hasSpecDefect: boolean;
+  readonly nextStageHasRun: boolean;
+  readonly clearingNote: string;
+  readonly dispatchModeEvidence: readonly { label: string; detail: string }[];
+}
+
+/**
+ * The bounded, durable escalation shape every `EscalationKind` posts through
+ * — the plain generic card (no `plateauContext`) for implementation-side and
+ * environmental escalations, and the same rich, evidence-led
+ * `reviewPlateauEscalation` card `postReviewPlateauDecisionV1` used to build
+ * inline (`plateauContext` supplied) for a review-stage plateau with fresh
+ * blocker evidence in hand. Review blocker (2026-08-30): the two used to
+ * independently construct their options/recommendation/gating; this is the
+ * single place both now go through, so a future card cannot silently drift
+ * from the other's option ids, effects, or gating shape.
  */
 function buildEscalationDecisionV1(
   kind: EscalationKind,
   stage: TaskStage,
   reason: string,
-  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string },
+  plateauContext?: EscalationPlateauContextV1
 ): PostWorkflowDecisionInputV1 {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStage = nextStageInOrderV1(stage);
+  const nextStageName = nextStage ? STAGE_DISPLAY_NAMES[nextStage] : undefined;
+
+  if (plateauContext) {
+    const {
+      blockersCount,
+      primaryBlockerDescription,
+      narrowedNote,
+      progressNote,
+      taskFixableCount,
+      hasSpecDefect,
+      nextStageHasRun,
+      clearingNote,
+      dispatchModeEvidence,
+    } = plateauContext;
+    const options: WorkflowDecisionOptionV1[] = [
+      ...(nextStage
+        ? [
+            buildAdvanceOptionV1(
+              nextStage,
+              target.taskFolderPath,
+              nextStageHasRun
+                ? `Moves the task to ${nextStageName}, which has already run once for this task — this accepts the ` +
+                  "current state as good enough to proceed rather than re-reviewing it here."
+                : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
+                  `not necessarily re-find this same blocker the way another ${stageName} round would.`
+            ),
+          ]
+        : []),
+      {
+        optionId: "keepIterating",
+        label: "Keep iterating",
+        consequence:
+          taskFixableCount > 0
+            ? `Resumes the task and reruns ${stageName} — ${taskFixableCount} of the ${blockersCount} ` +
+              "remaining blocker(s) are task-fixable, so another round has real work to act on."
+            : `Resumes the task and reruns ${stageName} — nothing to act on: 0 of the ${blockersCount} ` +
+              "remaining blocker(s) are task-fixable.",
+        // resumeAndRerunReviewV1, not plain resumeTask: a prior revision
+        // dispatched resumeTask alone (which only clears the pause) while this
+        // consequence text claimed it "reruns" the stage — a review flagged
+        // the button as not doing what it said. This command actually resumes
+        // AND re-dispatches the review, matching the text above.
+        effect: {
+          kind: "command" as const,
+          command: "vs-code-ai-helper.resumeAndRerunReview",
+          args: [{ taskFolderPath: target.taskFolderPath }],
+        },
+      },
+      {
+        optionId: "handleMyself",
+        label: "Leave it paused — I'll fix it",
+        consequence:
+          "Leaves the task paused, exactly like \"Change the plan instead\" below — nothing is dispatched. " +
+          "Choose this if you disagree the blocker is outside automation's control, or want to make a fix (or a " +
+          "decision only you can make) yourself before resuming.",
+        effect: { kind: "doNothing" },
+      },
+      buildReconsiderRequirementOptionV1(
+        target.taskFolderPath,
+        hasSpecDefect
+          ? "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
+            "dispatched. At least one remaining blocker here is classified spec-defect — check the plan's " +
+            "non-goals and prior decisions; it may be asking for something no implementation can satisfy as " +
+            "written."
+          : "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
+            "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
+            "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
+            "believe otherwise despite that."
+      ),
+    ];
+
+    const blockerCountLabel = `${blockersCount} of the remaining ${blockersCount === 1 ? "blocker" : "blockers"}`;
+    const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
+      ? {
+          kind: "option",
+          optionId: "reconsiderRequirement",
+          reasoning:
+            "A remaining blocker this round is classified spec-defect — that is exactly the shape where the " +
+            "requirement, not the implementation, is what needs to change.",
+        }
+      : taskFixableCount > 0
+        ? {
+            kind: "option",
+            optionId: "keepIterating",
+            reasoning: `${blockerCountLabel} are still task-fixable, so another round has real work to do.`,
+          }
+        : nextStage && !nextStageHasRun
+          ? {
+              kind: "option",
+              optionId: "advance",
+              reasoning:
+                `Every remaining blocker is non-task-fixable and ${nextStageName} hasn't run yet — further ` +
+                `${stageName} rounds will most likely re-find this same blocker, while ${nextStageName} covers ` +
+                "different ground.",
+            }
+          : {
+              kind: "option",
+              optionId: "handleMyself",
+              reasoning:
+                `Every remaining blocker is non-task-fixable${nextStage ? ` and ${nextStageName} has already run` : ""}` +
+                ", so this needs a human decision or action, not more automated iteration.",
+            };
+
+    return {
+      decisionKey: "reviewPlateauEscalation",
+      taskCanonicalId: target.canonicalId,
+      stage,
+      whatHappened:
+        `${stageName} can't progress on its own. ` +
+        (primaryBlockerDescription !== undefined
+          ? `${blockersCount === 1 ? "One blocker remains" : `${blockersCount} blockers remain`}` +
+            `, and here is the first one, verbatim:\n\n"${primaryBlockerDescription}"${narrowedNote}`
+          : reason),
+      whyUserNeeded:
+        `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
+        `${blockersCount} remaining blocker(s) are task-fixable.`,
+      options,
+      recommendation,
+      evidence: [{ label: "What clears this", detail: clearingNote }, ...dispatchModeEvidence],
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail:
+          "This decision is what is holding the task paused — resolving it with \"Advance\" or \"Keep iterating\" " +
+          "resumes or advances the task immediately; \"Leave it paused — I'll fix it\" and \"Change the plan " +
+          "instead\" both leave it paused and dispatch nothing.",
+      },
+    };
+  }
+
   const environmental = kind === "environmental";
   const keepIterating: WorkflowDecisionOptionV1 = environmental
     ? {
@@ -602,7 +792,6 @@ async function postReviewPlateauDecisionV1(
       : "No plan-progress marker was reported for this round.";
 
   const nextStage = nextStageInOrderV1(stage);
-  const nextStageName = nextStage ? STAGE_DISPLAY_NAMES[nextStage] : undefined;
   let nextStageHasRun = false;
   if (nextStage) {
     const filename = STAGE_ARTIFACT_FILENAMES[nextStage];
@@ -612,7 +801,6 @@ async function postReviewPlateauDecisionV1(
     }
   }
   const hasSpecDefect = normalized.blockers.some((b) => b.resolver === "spec-defect");
-  const blockerCountLabel = `${normalized.blockers.length} of the remaining ${normalized.blockers.length === 1 ? "blocker" : "blockers"}`;
   // Review-narrowed (Step 27, 2026-08-25): read the approved plan alongside
   // the review markdown so `describeResolverClearingActionV1` can also find
   // a clearing command the PLAN itself names (e.g. a "How to verify" step)
@@ -632,94 +820,6 @@ async function postReviewPlateauDecisionV1(
         ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName, evidence.content, planContentForClearingNote)}`
         : "Clears via: an action outside this task — no command in this product can resolve it. Once done, " +
           `"Keep iterating" resumes the task and re-runs ${stageName} to confirm.`;
-
-  const options: WorkflowDecisionOptionV1[] = [
-    ...(nextStage
-      ? [
-          buildAdvanceOptionV1(
-            nextStage,
-            folderUri.fsPath,
-            nextStageHasRun
-              ? `Moves the task to ${nextStageName}, which has already run once for this task — this accepts the ` +
-                "current state as good enough to proceed rather than re-reviewing it here."
-              : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
-                `not necessarily re-find this same blocker the way another ${stageName} round would.`
-          ),
-        ]
-      : []),
-    {
-      optionId: "keepIterating",
-      label: "Keep iterating",
-      consequence:
-        evidence.taskFixableCount > 0
-          ? `Resumes the task and reruns ${stageName} — ${evidence.taskFixableCount} of the ${normalized.blockers.length} ` +
-            "remaining blocker(s) are task-fixable, so another round has real work to act on."
-          : `Resumes the task and reruns ${stageName} — nothing to act on: 0 of the ${normalized.blockers.length} ` +
-            "remaining blocker(s) are task-fixable.",
-      // resumeAndRerunReviewV1, not plain resumeTask: a prior revision
-      // dispatched resumeTask alone (which only clears the pause) while this
-      // consequence text claimed it "reruns" the stage — a review flagged
-      // the button as not doing what it said. This command actually resumes
-      // AND re-dispatches the review, matching the text above.
-      effect: {
-        kind: "command" as const,
-        command: "vs-code-ai-helper.resumeAndRerunReview",
-        args: [{ taskFolderPath: folderUri.fsPath }],
-      },
-    },
-    {
-      optionId: "handleMyself",
-      label: "Leave it paused — I'll fix it",
-      consequence:
-        "Leaves the task paused, exactly like \"Change the plan instead\" below — nothing is dispatched. " +
-        "Choose this if you disagree the blocker is outside automation's control, or want to make a fix (or a " +
-        "decision only you can make) yourself before resuming.",
-      effect: { kind: "doNothing" },
-    },
-    buildReconsiderRequirementOptionV1(
-      folderUri.fsPath,
-      hasSpecDefect
-        ? "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
-          "dispatched. At least one remaining blocker here is classified spec-defect — check the plan's " +
-          "non-goals and prior decisions; it may be asking for something no implementation can satisfy as " +
-          "written."
-        : "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
-          "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
-          "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
-          "believe otherwise despite that."
-    ),
-  ];
-
-  const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
-    ? {
-        kind: "option",
-        optionId: "reconsiderRequirement",
-        reasoning:
-          "A remaining blocker this round is classified spec-defect — that is exactly the shape where the " +
-          "requirement, not the implementation, is what needs to change.",
-      }
-    : evidence.taskFixableCount > 0
-      ? {
-          kind: "option",
-          optionId: "keepIterating",
-          reasoning: `${blockerCountLabel} are still task-fixable, so another round has real work to do.`,
-        }
-      : nextStage && !nextStageHasRun
-        ? {
-            kind: "option",
-            optionId: "advance",
-            reasoning:
-              `Every remaining blocker is non-task-fixable and ${nextStageName} hasn't run yet — further ` +
-              `${stageName} rounds will most likely re-find this same blocker, while ${nextStageName} covers ` +
-              "different ground.",
-          }
-        : {
-            kind: "option",
-            optionId: "handleMyself",
-            reasoning:
-              `Every remaining blocker is non-task-fixable${nextStage ? ` and ${nextStageName} has already run` : ""}` +
-              ", so this needs a human decision or action, not more automated iteration.",
-          };
 
   // Item 18 / review blocker (2026-08-26): a frozen `taskFixableCount` while
   // every recent round dispatched as `implementation` is a DISPATCH plateau
@@ -752,32 +852,22 @@ async function postReviewPlateauDecisionV1(
         ]
       : [];
 
+  // The full option/recommendation/gating construction lives in the shared
+  // `buildEscalationDecisionV1` (review blocker, 2026-08-30) — this function's
+  // remaining job is exactly the async evidence-gathering above, which the
+  // synchronous builder cannot do itself (it has no `folderUri`).
   const decision = await postWorkflowDecisionV1(
-    {
-      decisionKey: "reviewPlateauEscalation",
-      taskCanonicalId: target.canonicalId,
-      stage,
-      whatHappened:
-        `${stageName} can't progress on its own. ` +
-        (primaryBlocker
-          ? `${normalized.blockers.length === 1 ? "One blocker remains" : `${normalized.blockers.length} blockers remain`}` +
-            `, and here is the first one, verbatim:\n\n"${primaryBlocker.description}"${narrowedNote}`
-          : reason),
-      whyUserNeeded:
-        `Automation has done what it can here — ${progressNote} ${evidence.taskFixableCount} of the ` +
-        `${normalized.blockers.length} remaining blocker(s) are task-fixable.`,
-      options,
-      recommendation,
-      evidence: [{ label: "What clears this", detail: clearingNote }, ...dispatchModeEvidence],
-      gating: {
-        holdsTaskPaused: true,
-        unblocksProgress: true,
-        detail:
-          "This decision is what is holding the task paused — resolving it with \"Advance\" or \"Keep iterating\" " +
-          "resumes or advances the task immediately; \"Leave it paused — I'll fix it\" and \"Change the plan " +
-          "instead\" both leave it paused and dispatch nothing.",
-      },
-    },
+    buildEscalationDecisionV1("plateau", stage, reason, target, {
+      blockersCount: normalized.blockers.length,
+      primaryBlockerDescription: primaryBlocker?.description,
+      narrowedNote,
+      progressNote,
+      taskFixableCount: evidence.taskFixableCount,
+      hasSpecDefect,
+      nextStageHasRun,
+      clearingNote,
+      dispatchModeEvidence,
+    }),
     target
   );
   return decision !== undefined;
@@ -789,6 +879,18 @@ async function postReviewPlateauDecisionV1(
 export function initReviewEscalationChat(provider: EscalationChatTarget): void {
   chatTarget = provider;
 }
+
+/** Test-only reset for the module-level `chatTarget` singleton, mirroring
+ * `extensionContextV1.ts`'s `__extensionContextV1TestOnly` — lets a test that
+ * wires a mock target (to reach the no-context fallback branch, which
+ * requires a chat target WITHOUT an activating extension context) restore
+ * the unset default afterward instead of leaking a stub into later tests in
+ * the same process. */
+export const __reviewEscalationChatTestOnly = {
+  reset(): void {
+    chatTarget = undefined;
+  },
+};
 
 /**
  * Stop automated review iteration for this task and hand the decision to
@@ -927,20 +1029,21 @@ export async function escalateReviewToHuman(
     // path when fresh blocker evidence exists; this covers the two
     // implementation-side plateau callers and all environmental/spec-defect
     // callers that previously fell straight through to an unbound prose
-    // question.
-    const genericDecision = await postWorkflowDecisionV1(
-      buildEscalationDecisionV1(kind, stage, reason, {
-        canonicalId: normalizePath(folderUri.fsPath),
-        taskFolderPath: folderUri.fsPath,
-        taskName: progressHint?.displayName,
-      }),
-      {
-        canonicalId: normalizePath(folderUri.fsPath),
-        taskFolderPath: folderUri.fsPath,
-        stage,
-        taskName: progressHint?.displayName,
-      }
-    );
+    // question. Captured in its own variable (rather than built inline
+    // inside the postWorkflowDecisionV1 call) so the no-context fallback
+    // below can reuse the SAME options/labels rather than re-deriving a
+    // second, potentially drifting enumeration of the same four choices.
+    const genericDecisionInput = buildEscalationDecisionV1(kind, stage, reason, {
+      canonicalId: normalizePath(folderUri.fsPath),
+      taskFolderPath: folderUri.fsPath,
+      taskName: progressHint?.displayName,
+    });
+    const genericDecision = await postWorkflowDecisionV1(genericDecisionInput, {
+      canonicalId: normalizePath(folderUri.fsPath),
+      taskFolderPath: folderUri.fsPath,
+      stage,
+      taskName: progressHint?.displayName,
+    });
     if (genericDecision !== undefined) {
       return true;
     }
@@ -965,23 +1068,43 @@ export async function escalateReviewToHuman(
     // Both the chat question text and blockedReason below state the real,
     // conditional truth instead of a claim that isPaused's ride-through
     // branch may falsify immediately.
-    const question = {
-      canonicalId: normalizePath(folderUri.fsPath),
-      taskFolderPath: folderUri.fsPath,
-      stage,
-      taskName: progressHint?.displayName,
-      question:
-        kind === "plateau"
-          ? `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
-            "How would you like to proceed — keep iterating (resume the task and I'll try again), make manual changes yourself, " +
-            "reconsider the requirement itself (check the plan's non-goals and prior decisions — it may be asking " +
-            "for something no implementation can satisfy as written), or accept the current state and advance anyway?"
-          : `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
-            "If a Fast Forward run is active with 'survive escalation' enabled, it may continue iterating to the " +
-            "end of its current attempt budget before this pause takes effect (you'll see a follow-up notification " +
-            "if so). Once the pause holds, how would you like to proceed — keep iterating (resume the task and " +
-            "I'll try again), make manual changes yourself, reconsider the requirement itself (check the plan's " +
-            "non-goals and prior decisions), or accept the current state and advance anyway?",
+    // Bound-answer fallback (Part 10 items 13d/13e, 2026-08-30 review
+    // blocker): reached only when NO extension context is available at all
+    // (postWorkflowDecisionV1's own best-effort no-op — see its doc comment),
+    // which in production cannot happen once activate() has run
+    // (setExtensionContextV1 and initReviewEscalationChat are both called
+    // from there, in that order, and nothing ever clears it — see
+    // extensionContextV1.ts). Reachable today only from a harness that wires
+    // a chat target without an activating context. Even here the four
+    // choices are never concatenated into prose: they are posted as a real
+    // `StructuredQuestionV1` `singleChoice` interaction through
+    // `askInteraction` — the SAME bound-questionId channel every other
+    // question in the product uses, not a separate app-only mechanism — with
+    // `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` since there is no
+    // coordinator operation behind this escalation (see that constant's doc
+    // comment for how it settles).
+    const promptText =
+      kind === "plateau"
+        ? `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
+          "Choose how to proceed below."
+        : `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
+          "If a Fast Forward run is active with 'survive escalation' enabled, it may continue iterating to the " +
+          "end of its current attempt budget before this pause takes effect (you'll see a follow-up notification " +
+          "if so). Once the pause holds, choose how to proceed below.";
+    const options: QuestionOptionV1[] = genericDecisionInput.options.map((option) => ({
+      optionId: option.optionId,
+      label: option.label,
+      description: option.consequence,
+    }));
+    const optionEffects: Record<string, WorkflowDecisionOptionEffectV1> = Object.fromEntries(
+      genericDecisionInput.options.map((option) => [option.optionId, option.effect])
+    );
+    const interactionQuestion: StructuredQuestionV1 = {
+      questionId: allocateHex128IdV1(),
+      kind: "singleChoice",
+      prompt: promptText,
+      required: true,
+      options,
     };
 
     const blockedReason =
@@ -991,31 +1114,41 @@ export async function escalateReviewToHuman(
           "'survive escalation' enabled, it may continue iterating to the end of its current attempt budget " +
           "before this pause takes effect (you'll see a follow-up notification if so) — otherwise, resume it " +
           "once you've decided how to proceed.";
+    const canonicalId = normalizePath(folderUri.fsPath);
     if (chatTarget) {
-      // "vs-code-ai-helper.postStageQuestion" (registered in chatWithStage.ts)
-      // routes straight to chatViewProvider.ask(question) — this task's own
-      // conversation, not the unrelated Global Assistant. ask() raises the
-      // error notification itself (centralized there — see chatView.ts) with
-      // that same command as its action button; it only force-opens the
-      // panel when nothing else is already open or this task's chat is
-      // already the one showing (ask()'s own no-steal-focus rule), and this
-      // call already force-opens it once at escalation time, so the button
-      // mainly matters for a user who dismissed that and comes back later.
-      await chatTarget.ask(question, true, { blocking: true, blockedReason });
+      // No coordinator operation exists behind this escalation, so there is
+      // no pre-derived binding to supply — `askInteraction` resolves the
+      // task's Chat document identity itself (`resolveOrPrepareChatDocumentIdentityV1`)
+      // when `binding` is omitted.
+      //
+      // "vs-code-ai-helper.postStageQuestion" pointed at a free-text
+      // StageChatQuestion, which this structured interaction is not — omitted
+      // here exactly as `askInteraction`'s own notification path omits it for
+      // every other structured question (there is no generic "reopen this
+      // interaction" command; the notification's own "Open Chat" affordance
+      // still opens the panel via `forceOpen: true` below at escalation time).
+      await chatTarget.askInteraction(
+        {
+          canonicalId,
+          taskFolderPath: folderUri.fsPath,
+          stage,
+          taskName: progressHint?.displayName,
+          interactionId: allocateHex128IdV1(),
+          operationId: allocateHex128IdV1(),
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: allocateHex128IdV1(),
+          questions: [interactionQuestion],
+          optionEffects,
+        },
+        true,
+        { blocking: true, blockedReason }
+      );
     } else {
       // No chat surface wired up (e.g. escalation running outside a full
       // extension host) — fall back to a standalone notification so the
       // escalation is still never silent.
       NotificationRouter.showError(
-        `Can't proceed without user feedback — ${question.taskName ?? question.taskFolderPath}: ${blockedReason}`,
-        undefined,
-        undefined,
-        undefined,
-        {
-          command: "vs-code-ai-helper.postStageQuestion",
-          title: "Open Chat",
-          args: [question],
-        }
+        `Can't proceed without user feedback — ${progressHint?.displayName ?? folderUri.fsPath}: ${blockedReason}`
       );
     }
     return true;

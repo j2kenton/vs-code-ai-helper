@@ -13,12 +13,14 @@ import {
   ChatDocumentInteractionV1,
   ChatHistoryRecoveryErrorV1,
   ChatMessage,
+  LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
   loadTranscriptWithMigration,
   onDidChangeChatHistoryV1,
   readChatDocumentIdentityV1,
   readChatInteractions,
   recordChatInteractionAnswers,
   resetChatHistoryV1,
+  resolveOrPrepareChatDocumentIdentityV1,
   settleChatInteraction,
 } from "../utils/chatHistoryStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
@@ -26,10 +28,12 @@ import { formatTimestampForDisplay } from "../utils/timeFormat";
 import {
   decodeStructuredAnswersArrayV1,
   DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
+  QuestionOptionV1,
   StructuredAnswerV1,
   StructuredQuestionV1,
+  validateStructuredAnswersV1,
 } from "../types/structuredQuestionV1";
-import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { WorkflowDecisionOptionEffectV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
@@ -255,9 +259,14 @@ export interface StageChatQuestion extends ChatTarget {
 /**
  * A structured-question interaction to raise in Chat With AI (plan §6.1),
  * as opposed to StageChatQuestion's free-text legacy `role: "question"`
- * record. Nothing in production posts one of these yet — no registry row
- * has migrated to the structured-question flow — but the surface is
- * production-ready for whichever action migrates first.
+ * record. Two kinds of caller post one: a real coordinator-tracked action
+ * whose provider returned `questions` (Resume settles it through
+ * `ChatInteractionServicesV1`), and a caller with no backing operation at
+ * all — `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` (2026-08-30 review
+ * blocker on Part 10's no-context escalation fallback, `reviewEscalation.ts`)
+ * — which settles entirely within `chatView.ts` (see
+ * `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`'s doc comment) and supplies
+ * `optionEffects` for the command each option should run.
  */
 export interface StructuredChatQuestion extends ChatTarget {
   interactionId: string;
@@ -269,16 +278,22 @@ export interface StructuredChatQuestion extends ChatTarget {
   /**
    * The operation's authoritative, coordinator-derived binding (plan §3.1),
    * passed straight through to `appendChatInteraction`'s required `binding`
-   * param. REQUIRED (plan §3.1 / AC-ID-03): posting a structured-question
-   * interaction must always carry the complete task/document binding so the
+   * param — every real coordinator-tracked caller already has this in hand
+   * (`record.correlation`) and MUST supply it (plan §3.1 / AC-ID-03), so the
    * durable transaction and the task-local mirror can never disagree about
    * which task/document they belong to (see chatHistoryStore.ts's module
-   * header and `appendChatInteraction`'s own binding checks).
+   * header and `appendChatInteraction`'s own binding checks). Omitted only by
+   * a caller with no coordinator operation to derive it from
+   * (`actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`), in which case
+   * `askInteraction` resolves it itself via
+   * `resolveOrPrepareChatDocumentIdentityV1`.
    */
-  binding: {
+  binding?: {
     readonly taskBindingId: string;
     readonly chatDocumentId: string;
   };
+  /** See `ChatDocumentInteractionV1.optionEffects` — set only alongside `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`. */
+  optionEffects?: Readonly<Record<string, WorkflowDecisionOptionEffectV1>>;
 }
 
 function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined): boolean {
@@ -853,8 +868,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (forceOpen || !this.target || sameIdentity(this.target, question)) {
       await this.open(question);
     }
-    await this.runQueued(question.taskFolderPath, () =>
-      appendChatInteraction(question.taskFolderPath, question.canonicalId, {
+    await this.runQueued(question.taskFolderPath, async () => {
+      let binding = question.binding;
+      if (!binding) {
+        const identity = await resolveOrPrepareChatDocumentIdentityV1(question.taskFolderPath, question.canonicalId);
+        binding = { taskBindingId: identity.taskBindingId, chatDocumentId: identity.documentId };
+      }
+      await appendChatInteraction(question.taskFolderPath, question.canonicalId, {
         interactionId: question.interactionId,
         operationId: question.operationId,
         actionKey: question.actionKey,
@@ -862,9 +882,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         stage: question.stage,
         questions: question.questions,
         postedAt: new Date().toISOString(),
-        binding: question.binding,
-      })
-    );
+        binding,
+        ...(question.optionEffects !== undefined ? { optionEffects: question.optionEffects } : {}),
+      });
+    });
     if (sameIdentity(this.target, question)) {
       await this.render();
     }
@@ -954,6 +975,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * question whose key matches this new message's `answersQuestionAt`, so an
    * ordinary `append("user", ...)` (the shared send box's path) never settles
    * anything.
+   *
+   * Genuinely open-ended free text only — an enumerated choice with its own
+   * bound options now goes through `askInteraction`'s `singleChoice`
+   * interaction (see `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`), not this
+   * method, so there is no option/effect lookup here to race.
    */
   async answerQuestion(
     identity: ChatIdentity | undefined,
@@ -964,17 +990,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (!identity) return;
     const trimmed = text.trim();
     if (!trimmed) return;
-    const message: ChatMessage = {
-      role: "user",
-      text: trimmed,
-      stage,
-      at: new Date().toISOString(),
-      answersQuestionAt: questionAt,
-    };
-    await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
+
+    const outcome = await this.runQueued(identity.taskFolderPath, async () => {
+      const transcript = await loadTranscriptWithMigration(
+        identity.taskFolderPath,
+        identity.canonicalId,
+        this.state
+      );
+      const alreadyAnswered = transcript.some(
+        (m) => m.role === "user" && m.answersQuestionAt === questionAt
+      );
+      if (alreadyAnswered) {
+        return { kind: "alreadyAnswered" as const };
+      }
+      const message: ChatMessage = {
+        role: "user",
+        text: trimmed,
+        stage,
+        at: new Date().toISOString(),
+        answersQuestionAt: questionAt,
+      };
+      await this.persistAppend(identity, message);
+      return { kind: "answered" as const };
+    });
+
+    if (outcome.kind === "alreadyAnswered") {
+      NotificationRouter.showInformation("This question was already answered.");
+    }
 
     if (sameIdentity(this.target, identity)) {
       await this.render();
+    }
+  }
+
+  /**
+   * Run the host-owned effect associated with an already validated structured
+   * option and acknowledge the outcome in the transcript. The option remains
+   * a plain `QuestionOptionV1`: effects are host routing metadata attached to
+   * the local-only interaction, not a third question/answer protocol.
+   */
+  private async runLocalInteractionOptionEffectV1(
+    identity: ChatIdentity,
+    stage: TaskStage,
+    option: QuestionOptionV1,
+    effect: WorkflowDecisionOptionEffectV1
+  ): Promise<void> {
+    const detail = option.description ? ` ${option.description}` : "";
+    if (effect.kind === "doNothing") {
+      await this.append("assistant", `Recorded: "${option.label}" — this does nothing further.${detail}`, stage, identity);
+      return;
+    }
+    await this.append("assistant", `Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
+    try {
+      const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
+      if (result === false) {
+        await this.append(
+          "assistant",
+          `"${option.label}" did not complete — see the notification for why. The task may still be in its previous state.`,
+          stage,
+          identity
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      NotificationRouter.showWarning(`"${option.label}" could not be completed. (${message})`);
+      await this.append("assistant", `"${option.label}" could not be completed. (${message})`, stage, identity);
     }
   }
 
@@ -1085,6 +1165,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     clientRef: ChatInteractionClientRefV1,
     answers: readonly StructuredAnswerV1[]
   ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
+    const interactions = await readChatInteractions(identity.taskFolderPath, identity.canonicalId);
+    const localRecord = interactions.find(
+      (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
+    );
+    if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
+      return this.settleLocalOnlyInteractionAnswersV1(identity, localRecord, answers);
+    }
     if (this.interactionServices) {
       const ref = await this.resolveInteractionRef(identity, clientRef);
       if (!ref) {
@@ -1130,6 +1217,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * Settle a `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` interaction entirely
+   * within chatView.ts (2026-08-30 review blocker): there is no coordinator
+   * operation behind it, so `ChatInteractionServicesV1` is never consulted —
+   * validate the answers against the interaction's OWN persisted question set
+   * (never trust the client's claim that they match), record them, settle the
+   * interaction as `resumed` (there is no separate Resume step; see
+   * `resumeInteraction`'s matching short-circuit), and — for a `singleChoice`
+   * answer whose `selectedOptionId` has a recorded `optionEffects` entry — run
+   * that effect through the exact command-execution + acknowledgement path a
+   * `WorkflowDecisionV1` option's effect runs.
+   *
+   * Runs inside the SAME `runQueued` callback `doSubmitInteractionAnswers` is
+   * invoked from, and checks `record.state` (fresh, from the caller's own
+   * lookup) before doing anything — a second submission for an already-
+   * resolved interaction (a stale render still showing an enabled Confirm
+   * button, or a double-click) is a no-op rather than re-recording the
+   * answer and re-running the option's effect a second time (the same
+   * double-submission defect a review found and fixed in the legacy
+   * mechanism this replaces).
+   */
+  private async settleLocalOnlyInteractionAnswersV1(
+    identity: ChatIdentity,
+    record: ChatDocumentInteractionV1,
+    answers: readonly StructuredAnswerV1[]
+  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
+    if (record.state !== "unresolved") {
+      return { ok: true };
+    }
+    const validation = validateStructuredAnswersV1(record.questions, answers);
+    if (!validation.ok) {
+      const message = `Could not submit your answers: ${validation.reason}`;
+      NotificationRouter.showWarning(message);
+      return { ok: false, message };
+    }
+    try {
+      await recordChatInteractionAnswers(identity.taskFolderPath, identity.canonicalId, record.interactionId, answers);
+      await settleChatInteraction(identity.taskFolderPath, identity.canonicalId, record.interactionId, "resumed");
+    } catch (error) {
+      const message = `Could not save your answers. (${error instanceof Error ? error.message : String(error)})`;
+      NotificationRouter.showWarning(message);
+      return { ok: false, message };
+    }
+    const singleChoiceAnswer = answers.find(
+      (a): a is Extract<StructuredAnswerV1, { kind: "singleChoice"; state: "answered" }> =>
+        a.kind === "singleChoice" && a.state === "answered"
+    );
+    if (singleChoiceAnswer) {
+      const effect = record.optionEffects?.[singleChoiceAnswer.selectedOptionId];
+      const question = record.questions.find(
+        (q): q is Extract<StructuredQuestionV1, { kind: "singleChoice" }> => q.kind === "singleChoice"
+      );
+      const option = question?.options.find((o) => o.optionId === singleChoiceAnswer.selectedOptionId);
+      if (effect && option) {
+        await this.runLocalInteractionOptionEffectV1(identity, record.stage, option, effect);
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
    * Cancel the current target's unresolved interaction (plan §6.1's Cancel
    * control). Never invokes a provider. Every outcome — success or a decline
    * (no matching question, the service refusing, or an unexpected error) —
@@ -1145,7 +1292,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let declineMessage: string | undefined;
     await this.runQueued(identity.taskFolderPath, async () => {
       try {
-        if (this.interactionServices) {
+        const interactions = await readChatInteractions(identity.taskFolderPath, identity.canonicalId);
+        const record = interactions.find(
+          (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
+        );
+        const isLocalOnly = record?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1;
+        if (this.interactionServices && !isLocalOnly) {
           const ref = await this.resolveInteractionRef(identity, clientRef);
           if (!ref) {
             declineMessage = "Could not cancel: no matching question exists in this task's chat.";
@@ -1206,6 +1358,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   ): Promise<void> {
     if (!this.target) return;
     const unavailableIdentity = this.target;
+    const interactions = await readChatInteractions(unavailableIdentity.taskFolderPath, unavailableIdentity.canonicalId);
+    const localRecord = interactions.find(
+      (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
+    );
+    if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
+      // Fully settled inside `settleLocalOnlyInteractionAnswersV1` — there is
+      // no coordinator action to resume, and no second acknowledgement to add.
+      return;
+    }
     if (!this.interactionServices?.resume) {
       NotificationRouter.showWarning(
         "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow."
@@ -2512,6 +2673,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           // stable id (falling back to its at/timestamp value only for a
           // question persisted before the id field existed).
           if(x.role==='question'&&x.awaitingAnswer){
+            // Part 10 item 13e: a pending legacy question's OWN bound
+            // free-text reply control — never the shared send box below,
+            // which must not be interpreted as an answer. An enumerated
+            // choice now goes through a singleChoice interaction
+            // (renderInteraction below), not this free-text-only control.
             const replyWrap=document.createElement('div');replyWrap.className='question-reply';
             const replyTitle=document.createElement('div');replyTitle.className='interaction-title';replyTitle.textContent='Needs your reply';
             replyWrap.appendChild(replyTitle);

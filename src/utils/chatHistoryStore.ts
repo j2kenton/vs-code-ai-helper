@@ -21,9 +21,11 @@ import { ChatInteractionTransactionV1 } from "../types/chatInteractionTransactio
 import {
   decodeStructuredAnswersArrayV1,
   decodeStructuredQuestionsV1,
+  QuestionOptionV1,
   StructuredAnswerV1,
   StructuredQuestionV1,
 } from "../types/structuredQuestionV1";
+import { WorkflowDecisionOptionEffectV1 } from "../types/workflowDecisionV1";
 
 export { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME };
 export { GLOBAL_ASSISTANT_CANONICAL_ID };
@@ -328,6 +330,27 @@ export type ChatDocumentInteractionStateV1 =
    */
   | "orphanedTransaction";
 
+/**
+ * Sentinel `actionKey` for a structured-question interaction that has no
+ * backing coordinator operation — e.g. `reviewEscalation.ts`'s no-context
+ * escalation fallback, which raises a question outside any provider-invoking
+ * action (Part 10 items 13d/13e, 2026-08-30 review blocker: the fallback
+ * previously used a separate, app-only `ChatMessage.options` mechanism
+ * instead of the same `StructuredQuestionV1`/`askInteraction` channel every
+ * other question uses).
+ *
+ * An interaction carrying this actionKey is answered ENTIRELY within
+ * `chatView.ts`: `readChatInteractionsLockedV1` never reconciles it against
+ * the durable transaction store (there is no transaction to reconcile
+ * against — reconciling anyway would immediately downgrade it to
+ * `missingTransaction`), and `doSubmitInteractionAnswers`/`resumeInteraction`/
+ * `cancelInteraction` settle it directly instead of calling into
+ * `ChatInteractionServicesV1`, whose `resume` requires a real action-registry
+ * `actionKey` (`extension.ts`'s Resume switch has no case for a non-action).
+ * Its `optionEffects` (below) carries what to run once answered.
+ */
+export const LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 = "chat.localOnlyQuestion.v1";
+
 /** One structured-question interaction as mirrored into task-local Chat for display (plan §5.1/§5.5). */
 export interface ChatDocumentInteractionV1 {
   readonly interactionId: string;
@@ -345,6 +368,17 @@ export interface ChatDocumentInteractionV1 {
   readonly state: ChatDocumentInteractionStateV1;
   readonly answers?: readonly StructuredAnswerV1[];
   readonly postedAt: string;
+  /**
+   * App-only, `actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` map of a
+   * `singleChoice`/`multipleChoice` question's `optionId` to the effect
+   * choosing it runs (the same `WorkflowDecisionOptionEffectV1` shape a
+   * `WorkflowDecisionV1` option carries). Deliberately kept OFF the strict
+   * `StructuredQuestionV1`/`QuestionOptionV1` wire contract (verified against
+   * a JSON Schema fixture set a model's own output must satisfy) and held
+   * here instead. The structured question remains the sole answer contract;
+   * this map only supplies host-owned routing after that answer is validated.
+   */
+  readonly optionEffects?: Readonly<Record<string, WorkflowDecisionOptionEffectV1>>;
 }
 
 /** The input a caller posts a new unresolved interaction with (plan §5.1/§6.1). */
@@ -372,6 +406,8 @@ export interface NewChatDocumentInteractionV1 {
     readonly taskBindingId: string;
     readonly chatDocumentId: string;
   };
+  /** See `ChatDocumentInteractionV1.optionEffects`. */
+  readonly optionEffects?: Readonly<Record<string, WorkflowDecisionOptionEffectV1>>;
 }
 
 /** Provenance of the document's stored `taskBindingId` (see the module header). */
@@ -637,6 +673,37 @@ const INTERACTION_STATES = new Set<string>([
   "orphanedTransaction",
 ]);
 
+/**
+ * Decode one `ChatDocumentInteractionV1.optionEffects` entry's effect from
+ * raw persisted JSON. Mirrors `WorkflowDecisionOptionV1`'s own effect shape
+ * (`workflowDecisionV1.ts`'s `validateOption`) rather than reusing it
+ * directly, since that validator takes a fully-typed option, not raw
+ * `unknown` — this is the untrusted-file decode boundary `chat-v1.json`
+ * requires. Returns `null` for "absent" (legal) and `undefined` for "present
+ * but malformed" (rejects the message/record), distinguishable so the caller
+ * doesn't have to re-inspect the raw value.
+ */
+function decodeOptionEffectV1(raw: unknown): WorkflowDecisionOptionEffectV1 | undefined | null {
+  if (raw === undefined) return null;
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const eff = raw as Record<string, unknown>;
+  if (eff.kind === "doNothing") {
+    return Object.keys(eff).length === 1 ? { kind: "doNothing" } : undefined;
+  }
+  if (eff.kind === "command") {
+    if (typeof eff.command !== "string" || eff.command.length === 0) return undefined;
+    if (eff.args !== undefined && !Array.isArray(eff.args)) return undefined;
+    const allowedKeys = new Set(["kind", "command", "args"]);
+    for (const key of Object.keys(eff)) {
+      if (!allowedKeys.has(key)) return undefined;
+    }
+    return eff.args !== undefined
+      ? { kind: "command", command: eff.command, args: eff.args as readonly unknown[] }
+      : { kind: "command", command: eff.command };
+  }
+  return undefined;
+}
+
 function validateMessages(raw: unknown): ChatMessage[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const messages: ChatMessage[] = [];
@@ -777,6 +844,24 @@ function validateInteractions(raw: unknown): ChatDocumentInteractionV1[] | undef
       if (!decodedAnswers.ok) return undefined;
       answers = decodedAnswers.answers;
     }
+    let optionEffects: Record<string, WorkflowDecisionOptionEffectV1> | undefined;
+    if (e.optionEffects !== undefined) {
+      if (typeof e.optionEffects !== "object" || e.optionEffects === null || Array.isArray(e.optionEffects)) {
+        return undefined;
+      }
+      const allOptionIds = new Set(
+        decodedQuestions.questions.flatMap((q) => (q.kind === "text" ? [] : q.options.map((o) => o.optionId)))
+      );
+      const rawEffects = e.optionEffects as Record<string, unknown>;
+      const decoded: Record<string, WorkflowDecisionOptionEffectV1> = {};
+      for (const [optionId, rawEffect] of Object.entries(rawEffects)) {
+        if (!allOptionIds.has(optionId)) return undefined;
+        const effect = decodeOptionEffectV1(rawEffect);
+        if (effect === undefined || effect === null) return undefined;
+        decoded[optionId] = effect;
+      }
+      optionEffects = decoded;
+    }
     interactions.push({
       interactionId: e.interactionId,
       operationId: e.operationId,
@@ -787,6 +872,7 @@ function validateInteractions(raw: unknown): ChatDocumentInteractionV1[] | undef
       state: e.state as ChatDocumentInteractionStateV1,
       ...(answers !== undefined ? { answers } : {}),
       postedAt: e.postedAt,
+      ...(optionEffects !== undefined ? { optionEffects } : {}),
     });
   }
   return interactions;
@@ -989,6 +1075,30 @@ export async function readChatDocumentIdentityV1(
     return undefined;
   }
   return { documentId: document.documentId, taskBindingId: document.taskBindingId };
+}
+
+/**
+ * Resolve the binding a caller needs to post a NEW `askInteraction` when it
+ * cannot assume a Chat document already exists for this identity — e.g.
+ * `reviewEscalation.ts`'s no-context fallback, which may fire before any
+ * chat activity for the task. Returns the EXISTING document's identity when
+ * one exists (identical to `readChatDocumentIdentityV1`), or the identity a
+ * FRESH document would be created with — the same `resolveDefaultTaskBindingV1`
+ * derivation `appendChatMessageV1` uses for its own first write — when none
+ * exists yet, so `appendChatInteraction`'s own document-creation path
+ * (`emptyDocumentForInteractionV1`) adopts exactly this same identity rather
+ * than disagreeing with it.
+ */
+export async function resolveOrPrepareChatDocumentIdentityV1(
+  taskFolderPath: string,
+  canonicalId: string
+): Promise<ChatDocumentIdentityV1> {
+  const existing = await readChatDocumentIdentityV1(taskFolderPath, canonicalId);
+  if (existing) {
+    return existing;
+  }
+  const defaultBinding = resolveDefaultTaskBindingV1(taskFolderPath, canonicalId);
+  return { documentId: newDocumentId(), taskBindingId: defaultBinding.taskBindingId };
 }
 
 
@@ -1608,6 +1718,18 @@ export async function appendChatInteraction(
   if (!Array.isArray(input.questions) || input.questions.length === 0) {
     throw new Error("questions must be a non-empty array");
   }
+  if (input.optionEffects !== undefined) {
+    const allOptionIds = new Set(
+      input.questions.flatMap((q: StructuredQuestionV1) =>
+        q.kind === "text" ? [] : q.options.map((o: QuestionOptionV1) => o.optionId)
+      )
+    );
+    for (const optionId of Object.keys(input.optionEffects)) {
+      if (!allOptionIds.has(optionId)) {
+        throw new Error(`optionEffects references an unknown optionId: ${optionId}`);
+      }
+    }
+  }
   if (
     !input.binding ||
     typeof input.binding.taskBindingId !== "string" ||
@@ -1663,6 +1785,7 @@ export async function appendChatInteraction(
       questions: input.questions,
       state: "unresolved",
       postedAt: input.postedAt,
+      ...(input.optionEffects !== undefined ? { optionEffects: input.optionEffects } : {}),
     };
 
     const next: ChatDocumentV1 = { ...base, interactions: [...base.interactions, interaction] };
@@ -1736,7 +1859,16 @@ async function readChatInteractionsLockedV1(
   let changed = false;
   const reconciled: ChatDocumentInteractionV1[] = [];
   for (const interaction of document.interactions) {
-    if (interaction.state !== "unresolved" || !store) {
+    // A local-only interaction (see `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`)
+    // never had a coordinator transaction to begin with — reconciling it
+    // against the transaction store would find nothing and immediately
+    // downgrade it to `missingTransaction`, even though `chatView.ts` fully
+    // settles it on its own.
+    if (
+      interaction.state !== "unresolved" ||
+      !store ||
+      interaction.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1
+    ) {
       reconciled.push(interaction);
       continue;
     }

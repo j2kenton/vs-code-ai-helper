@@ -15,6 +15,7 @@ import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -401,6 +402,65 @@ export async function resumeAndSetTaskStageV1(
 }
 
 /**
+ * Resume the task ONLY IF it is currently paused, then move it to
+ * `reviewStage` and run Apply Review there via `goToReviewAndApplyV1`.
+ *
+ * Review blocker (2026-08-30, wf "stage chat as a record of work" item 14 /
+ * Part 12 step 34): "Go to Review & Apply" is offered from three places —
+ * `sterileRoundRouting`, `preImplementationRouting`, and Fast Forward's
+ * closing notice — none of which pause the task themselves
+ * (`gating.holdsTaskPaused: false`), so at the moment the card or toast is
+ * posted the task is normally active. But a card can sit unanswered for a
+ * while, and an unrelated escalation (or another race) can pause the task
+ * before the user clicks it. Dispatching the plain `goToReviewAndApply`
+ * command in that state hit `setTaskStage`'s `{ allowPaused: false }`
+ * resolution and failed with "The task could not be found" — a confusing
+ * error for a task that plainly exists and is simply paused (the same
+ * defect `resumeAndSetTaskStageV1` above already fixed for escalation
+ * cards' "Advance" option). Choosing "Go to Review & Apply" is an
+ * unambiguous statement that the user wants the review stage regardless —
+ * resuming is part of getting there, not a separate decision.
+ *
+ * Unlike `resumeAndRerunReviewV1` / `resumeAndDispatchImplementationV1` /
+ * `resumeAndSetTaskStageV1` above — each invoked ONLY from an escalation
+ * card that itself guarantees the task is paused — this command's callers do
+ * NOT guarantee that, so it checks status first and calls `resumePausedTask`
+ * only when the task is actually paused. Calling `resumePausedTask`
+ * unconditionally would show a spurious "Task is not paused." notification
+ * on every ordinary (non-paused) click, which is the common case here.
+ */
+export async function resumeIfPausedThenGoToReviewAndApplyV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg: (ResumeTaskArg & { reviewStage?: TaskStage }) | undefined
+): Promise<boolean> {
+  const resolverArg = normalizeResumeTaskArg(explicitArg);
+  const target = await resolveTaskContext(
+    inventory,
+    resolverArg,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!target || !explicitArg?.reviewStage) {
+    return false;
+  }
+  if (target.progress.status === "paused") {
+    await resumePausedTask(inventory, currentTaskStore, explicitArg);
+    // Re-read straight off disk for the same reason resumeAndRerunReviewV1
+    // does: `inventory` is an in-memory cache not guaranteed to reflect the
+    // write resumePausedTask (via activateTask) just made.
+    const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+    if (!reread.ok || reread.decoded.progress.status === "paused") {
+      return false;
+    }
+  }
+  return goToReviewAndApplyV1({
+    taskFolderPath: target.taskFolderPath,
+    reviewStage: explicitArg.reviewStage,
+  });
+}
+
+/**
  * Register the resumeTask command
  */
 export function registerResumeTaskCommand(
@@ -435,4 +495,15 @@ export function registerResumeTaskCommand(
       resumeAndSetTaskStageV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndSetTaskStage);
+
+  // Not contributed to package.json's `commands`: like goToReviewAndApplyV1
+  // itself, this is a wiring detail behind decision-card options and
+  // notification action buttons, not something to offer in the command
+  // palette.
+  const resumeIfPausedThenGoToReviewAndApply = vscode.commands.registerCommand(
+    "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
+    (arg?: ResumeTaskArg & { reviewStage?: TaskStage }) =>
+      resumeIfPausedThenGoToReviewAndApplyV1(inventory, currentTaskStore, arg)
+  );
+  context.subscriptions.push(resumeIfPausedThenGoToReviewAndApply);
 }

@@ -619,8 +619,10 @@ void describe("resumeCommitPushMetadataInteractionV1 — production Resume deleg
       askedRefs.push({
         operationId: question.operationId,
         interactionId: question.interactionId,
-        taskBindingId: question.binding.taskBindingId,
-        chatDocumentId: question.binding.chatDocumentId,
+        // This coordinator-tracked caller always supplies a real binding;
+        // only the no-coordinator local-only fallback omits it.
+        taskBindingId: question.binding!.taskBindingId,
+        chatDocumentId: question.binding!.chatDocumentId,
         sourceAttemptId: question.sourceAttemptId,
       });
       return originalAskInteraction(question);

@@ -29,7 +29,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
-import { escalateReviewToHuman } from "../utils/reviewEscalation";
+import {
+  EscalationChatTarget,
+  escalateReviewToHuman,
+  initReviewEscalationChat,
+  __reviewEscalationChatTestOnly,
+} from "../utils/reviewEscalation";
 import { handleReviewRoutingOutcome } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { TaskProgress } from "../types/taskProgress";
@@ -457,6 +462,120 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("no-context fallback: posts a bound singleChoice interaction through askInteraction, never prose", async () => {
+    // Part 10 items 13d/13e, review blocker (2026-08-30): reached only when
+    // NO extension context is available at all — deliberately NOT calling
+    // __extensionContextV1TestOnly.set here, so postWorkflowDecisionV1 is a
+    // no-op for both the generic decision card AND (had this been a
+    // review-stage plateau) the richer reviewPlateauEscalation card, forcing
+    // escalateReviewToHuman all the way down to chatTarget.askInteraction() —
+    // the one branch this test exists to cover. In production this path
+    // cannot be reached once activate() has run (see reviewEscalation.ts's
+    // comment on this branch); it exists only for a harness like this one.
+    //
+    // This also proves the fallback no longer uses a separate, app-only
+    // `ask()`/`AnswerableQuestionOptionV1` mechanism (the prior blocker): the
+    // mock below implements ONLY `askInteraction`, the same
+    // `StructuredQuestionV1`/`askInteraction` channel every other question in
+    // the product uses.
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const asked: {
+      actionKey: string;
+      questions: readonly {
+        questionId: string;
+        kind: string;
+        prompt: string;
+        required: boolean;
+        options?: readonly { optionId: string; label: string; description?: string }[];
+      }[];
+      optionEffects?: Readonly<Record<string, { kind: string; command?: string; args?: readonly unknown[] }>>;
+      binding?: unknown;
+    }[] = [];
+    const chatTarget: EscalationChatTarget = {
+      askInteraction(question) {
+        asked.push({
+          actionKey: question.actionKey,
+          questions: question.questions,
+          optionEffects: question.optionEffects,
+          binding: question.binding,
+        });
+        return Promise.resolve();
+      },
+    };
+    initReviewEscalationChat(chatTarget);
+    const folderUri = makeTaskFolderUri("environmental-no-context-fallback");
+    seedProgress(store, folderUri, baseProgress({ reviewAttemptId: "attempt-1" }));
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "environmental",
+        "The configured provider is unavailable",
+        "attempt-1"
+      );
+      assert.equal(escalated, true);
+      assert.equal(asked.length, 1, "exactly one interaction must be posted through the fallback");
+      const posted = asked[0]!;
+      assert.equal(
+        posted.binding,
+        undefined,
+        "the no-coordinator fallback has no pre-derived binding to supply — askInteraction resolves it itself"
+      );
+      assert.equal(
+        posted.actionKey,
+        "chat.localOnlyQuestion.v1",
+        "must post with the sentinel actionKey chatView.ts settles without a coordinator operation"
+      );
+      assert.equal(posted.questions.length, 1);
+      const question = posted.questions[0]!;
+      assert.equal(question.kind, "singleChoice");
+      assert.equal(question.required, true);
+      assert.doesNotMatch(
+        question.prompt,
+        /keep iterating \(resume the task/i,
+        "the choices must not be re-enumerated as prose once a structured option set exists"
+      );
+      const options = question.options ?? [];
+      const optionIds = options.map((o) => o.optionId).sort();
+      assert.deepEqual(
+        optionIds,
+        ["advance", "handleMyself", "keepIterating", "reconsiderRequirement"].sort(),
+        "must reuse the exact same enumerated choices the decision card would have posted"
+      );
+      const keepIterating = options.find((o) => o.optionId === "keepIterating");
+      assert.equal(keepIterating?.label, "Switch this stage's model");
+      assert.ok(
+        keepIterating?.description && keepIterating.description.length > 0,
+        "each option carries its consequence as a description, not folded into the question text"
+      );
+      // Review blocker (2026-08-30): the fallback used to drop the effect
+      // entirely, so a button click only ever recorded its label as chat
+      // text — every option here must carry the SAME effect the decision
+      // card would have run, so the choice actually dispatches something.
+      const optionEffects = posted.optionEffects ?? {};
+      for (const optionId of optionIds) {
+        assert.ok(optionEffects[optionId], `option "${optionId}" must carry a bound effect, not just a label`);
+      }
+      assert.deepEqual(
+        optionEffects.keepIterating,
+        { kind: "command", command: "vs-code-ai-helper.openAiModels" },
+        "the fallback's option effect must match the environmental decision card's own effect exactly"
+      );
+      assert.deepEqual(
+        optionEffects.handleMyself,
+        { kind: "command", command: "vs-code-ai-helper.openPlanFinal", args: [{ taskFolderPath: folderUri.fsPath }] },
+        "a command-effect option must carry its args too, not just the command id"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __reviewEscalationChatTestOnly.reset();
     }
   });
 });
