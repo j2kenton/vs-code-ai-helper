@@ -5,7 +5,7 @@ import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskCon
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearEscalation } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
-import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 
@@ -348,6 +348,59 @@ export async function resumeAndDispatchImplementationV1(
 }
 
 /**
+ * Resume a paused task and immediately set its stage — the
+ * `WorkflowDecisionOptionEffectV1` shape only carries one command, so the
+ * escalation cards' "Advance to <stage>" option (`reviewEscalation.ts`'s
+ * `buildAdvanceOptionV1`) cannot resume AND advance without a small combined
+ * command like this one, mirroring `resumeAndRerunReviewV1` /
+ * `resumeAndDispatchImplementationV1` above.
+ *
+ * Review blocker (2026-08-30): every escalation pauses the task as part of
+ * raising it, and the plain `setTaskStage` command resolves with
+ * `{ allowPaused: false }` — so an Advance option that invoked it directly
+ * always failed with "The task could not be found", a confusing error for a
+ * task that plainly exists and is simply paused. Choosing "Advance" from an
+ * escalation card is an unambiguous statement that the user wants to move
+ * past the pause, so — per the same "do the whole thing" resolution already
+ * used for "Keep iterating" — this resumes first.
+ *
+ * `resumePausedTask` handles (and reports) its own failure modes via
+ * `NotificationRouter`; this only proceeds to the stage change when the task
+ * actually reached "active", so a failed/declined resume does not also throw
+ * a confusing "task is paused" message on top of whatever `resumePausedTask`
+ * already told the user.
+ */
+export async function resumeAndSetTaskStageV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg: (ResumeTaskArg & { stage?: TaskStage }) | undefined
+): Promise<void> {
+  const resolverArg = normalizeResumeTaskArg(explicitArg);
+  const target = await resolveTaskContext(
+    inventory,
+    resolverArg,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!target || !explicitArg?.stage) {
+    return;
+  }
+  const stage = explicitArg.stage;
+  await resumePausedTask(inventory, currentTaskStore, explicitArg);
+  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
+  // does: `inventory` is an in-memory cache not guaranteed to reflect the
+  // write resumePausedTask (via activateTask) just made.
+  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  if (!reread.ok || reread.decoded.progress.status === "paused") {
+    return;
+  }
+  await vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
+    taskFolderPath: target.taskFolderPath,
+    stage,
+  });
+}
+
+/**
  * Register the resumeTask command
  */
 export function registerResumeTaskCommand(
@@ -375,4 +428,11 @@ export function registerResumeTaskCommand(
       resumeAndDispatchImplementationV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndDispatchImplementation);
+
+  const resumeAndSetTaskStage = vscode.commands.registerCommand(
+    "vs-code-ai-helper.resumeAndSetTaskStage",
+    (arg?: ResumeTaskArg & { stage?: TaskStage }) =>
+      resumeAndSetTaskStageV1(inventory, currentTaskStore, arg)
+  );
+  context.subscriptions.push(resumeAndSetTaskStage);
 }

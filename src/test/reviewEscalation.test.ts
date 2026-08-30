@@ -334,7 +334,17 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       const switchModel = decision.options.find((option) => option.optionId === "keepIterating");
       assert.equal(switchModel?.label, "Switch this stage's model");
       assert.deepEqual(switchModel?.effect, { kind: "command", command: "vs-code-ai-helper.openAiModels" });
-      assert.ok(decision.options.some((option) => option.optionId === "advance"));
+      // Review blocker (2026-08-30): every escalation pauses the task, and
+      // plain `setTaskStage` resolves with `{ allowPaused: false }` — an
+      // Advance option that dispatched it directly always failed with "The
+      // task could not be found" on a still-paused task. Must dispatch the
+      // resume-and-advance command instead.
+      const advance = decision.options.find((option) => option.optionId === "advance");
+      assert.deepEqual(advance?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-low-review" }],
+      });
       // Item 13d / review blocker: "Leave it paused — I'll fix it" must
       // actually open plan-final.md rather than silently doing nothing —
       // distinct from "Change the plan instead" below, which jumps to the
@@ -414,7 +424,15 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
         command: "vs-code-ai-helper.resumeAndDispatchImplementation",
         args: [{ taskFolderPath: folderUri.fsPath }],
       });
-      assert.ok(decision.options.some((option) => option.optionId === "advance"));
+      // Review blocker (2026-08-30): see the environmental case above — the
+      // Advance option must resume the still-paused task as part of
+      // advancing, not dispatch plain `setTaskStage` against it.
+      const advance = decision.options.find((option) => option.optionId === "advance");
+      assert.deepEqual(advance?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-high-review" }],
+      });
       // Item 13d / review blocker: "Leave it paused — I'll fix it" must
       // actually open plan-final.md rather than silently doing nothing —
       // distinct from "Change the plan instead" below, which jumps to the
@@ -496,6 +514,16 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         decision.options.some((o) => o.optionId === "advance" && o.label === "Advance to Low-Level Code Review"),
         "must offer advancing to the next stage in STAGE_ORDER, named by its display name"
       );
+      // Review blocker (2026-08-30): the richer plateau card shares
+      // `buildAdvanceOptionV1` with the generic card above — it must dispatch
+      // the resume-and-advance command too, not plain `setTaskStage`, since
+      // this decision also pauses the task as part of raising it.
+      const advance = decision.options.find((o) => o.optionId === "advance");
+      assert.deepEqual(advance?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-low-review" }],
+      });
       assert.ok(decision.gating?.holdsTaskPaused, "a plateau decision genuinely holds the task paused");
 
       // Review-narrowed blocker 57e9485f-…-1: "what clears this" must derive

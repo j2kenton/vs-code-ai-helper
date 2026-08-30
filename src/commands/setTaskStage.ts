@@ -16,6 +16,8 @@ import { scheduleAutomationChain } from "../utils/automationChain";
 import { cancelRunningOperationsForTask } from "../utils/taskOperations";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
+import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -266,6 +268,27 @@ export async function setTaskStage(
       `Could not read or update task progress for ${task.folderName}.`
     );
     return;
+  }
+
+  // Review blocker (2026-08-30, Part 11 item 13c): `TaskProgress.escalation`
+  // is already cleared by the stage-transition field policy on every advance
+  // ("a stage transition resolves the departing stage's stuck iteration" —
+  // taskProgressFieldPolicyV1.ts), but that clears the FIELD, not any
+  // decision CARD already posted for it — those live in the separate
+  // WorkflowDecisionStoreV1 and are otherwise only withdrawn by
+  // resumePausedTask. A stage change reachable without going through resume
+  // (this command resolves with allowPaused: false so it cannot itself act on
+  // a paused task, but the invariant "escalation only exists while paused" is
+  // not something this call site should have to rely on to stay correct) must
+  // not leave a stale escalation card naming a stage the task has since left.
+  // Best-effort and unconditional: withdraw is already a no-op when nothing
+  // pending matches the key.
+  for (const decisionKey of ESCALATION_DECISION_KEYS_V1) {
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath: task.taskFolderPath, canonicalId: task.canonicalId },
+      decisionKey,
+      `the task's stage changed to ${STAGE_DISPLAY_NAMES[newStage]}, ending the pause any escalation for the prior stage was holding`
+    );
   }
 
   // Refresh the inventory so the new stage is visible immediately

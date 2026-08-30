@@ -186,14 +186,24 @@ export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
 /**
  * Shared "advance" option shape between `buildEscalationDecisionV1` (below)
  * and `postReviewPlateauDecisionV1`'s richer, evidence-led card — both name
- * the same option id, the same label, and the same `setTaskStage` effect; the
- * only thing that legitimately differs per caller is the consequence text
- * (the plateau card's is evidence-conditioned on whether `nextStage` has
- * already run once). Review blocker (2026-08-30): the two functions used to
- * construct this object independently at each call site, which is exactly
- * the "still independently builds its options" defect the review named —
- * this is the part of that duplication that was genuinely identical and
- * therefore safe to share without altering either card's rendered text.
+ * the same option id, the same label, and the same effect; the only thing
+ * that legitimately differs per caller is the consequence text (the plateau
+ * card's is evidence-conditioned on whether `nextStage` has already run
+ * once). Review blocker (2026-08-30): the two functions used to construct
+ * this object independently at each call site, which is exactly the "still
+ * independently builds its options" defect the review named — this is the
+ * part of that duplication that was genuinely identical and therefore safe
+ * to share without altering either card's rendered text.
+ *
+ * Dispatches `resumeAndSetTaskStage`, not plain `setTaskStage` (review
+ * blocker, 2026-08-30): every escalation pauses the task as part of raising
+ * it, and `setTaskStage` resolves its target with `{ allowPaused: false }`,
+ * so choosing this option against a still-paused task always failed with
+ * "The task could not be found" — a real defect confirmed by direct reading
+ * of `setTaskStage.ts`'s resolver call, not a hypothetical. Choosing Advance
+ * is an unambiguous statement that the user wants to move past the pause, so
+ * — per the same "do the whole thing" resolution `keepIterating` already
+ * uses — this resumes first.
  */
 function buildAdvanceOptionV1(
   nextStage: TaskStage,
@@ -206,7 +216,7 @@ function buildAdvanceOptionV1(
     consequence,
     effect: {
       kind: "command",
-      command: "vs-code-ai-helper.setTaskStage",
+      command: "vs-code-ai-helper.resumeAndSetTaskStage",
       args: [{ taskFolderPath, stage: nextStage }],
     },
   };

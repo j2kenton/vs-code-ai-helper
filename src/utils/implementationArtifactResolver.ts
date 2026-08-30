@@ -46,6 +46,8 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { markChecklistChangeProposalAdoptedV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
+import { withdrawWorkflowDecisionsByKeyV1 } from "./workflowDecisionDispatchV1";
+import { normalizePath } from "./taskRoot";
 
 export interface ResolvedImplementationArtifact {
   /** The URI to use for reading/opening */
@@ -1467,6 +1469,20 @@ export async function preparePlanPromotion(
           new TextEncoder().encode(finalContent)
         );
         if (planRevision !== undefined) {
+          // Review blocker (2026-08-30, Part 11 item 13c): this re-finalization
+          // just replaced plan-final.md's checklist item set/ticks wholesale
+          // (the revision's whole point) — the exact same "plan-final.md's
+          // checklist ticks changed" condition that withdraws a pending
+          // `applyReviewerVerifiedTicks` card at every other in-process writer
+          // of that state (reviewActions.ts, applyReviewerVerifiedTicks.ts,
+          // reconcilePlanChecklist.ts). This was the one remaining writer
+          // without the call, so a card claiming ticks against the
+          // pre-revision plan could survive a revision that invalidated it.
+          await withdrawWorkflowDecisionsByKeyV1(
+            { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
+            "applyReviewerVerifiedTicks",
+            "the plan was revised, replacing plan-final.md's checklist item set and ticks"
+          );
           const oldTotal = priorContent !== undefined ? countChecklistProgressV1(priorContent)?.total : undefined;
           const newTotal = countChecklistProgressV1(finalContent)?.total;
           if (deferAdoptionWrite) {
