@@ -22,6 +22,7 @@ import {
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
+import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -630,6 +631,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ));
   registerViewArtifactCommands(context);
   registerOpenRetainedPromptCommand(context);
+  registerOpenPlanNonGoalsCommand(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerGoToReviewAndApplyCommandV1(context);

@@ -763,6 +763,53 @@ void describe("Context Tokens Emission", () => {
     );
   });
 
+  void it("buildTaskContextValue emits the restorableRound token only when a rejected round is actually restorable", () => {
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl", hasRestorableImplRound: true }),
+      "task-active-restorableRound"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl", hasRestorableImplRound: false }),
+      "task-active"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl" }),
+      "task-active",
+      "absent hasRestorableImplRound must not emit the token"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "paused",
+        currentStage: "impl",
+        hasRestorableImplRound: true,
+        isPinned: true,
+      }),
+      "task-paused-restorableRound-pinned",
+      "restorableRound must sit before the trailing pinned token"
+    );
+  });
+
+  void it("gates the Discard Last Round menu entry on the restorableRound token", () => {
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8")
+    ) as {
+      contributes?: {
+        menus?: Record<string, Array<{ command: string; when?: string }>>;
+      };
+    };
+    const contextMenus = packageJson.contributes?.menus?.["view/item/context"] ?? [];
+    const entries = contextMenus.filter(
+      (entry) => entry.command === "vs-code-ai-helper.restoreRejectedImplementationRound"
+    );
+    assert.ok(entries.length > 0, "Expected menu entries for restoreRejectedImplementationRound");
+    for (const entry of entries) {
+      assert.ok(
+        (entry.when ?? "").includes("viewItem =~ /-restorableRound/"),
+        `Discard Last Round menu entry must be gated on the restorableRound token: ${entry.when}`
+      );
+    }
+  });
+
   void it("gates the reconcilePlanChecklist menu entry on the checklistUnreliable token", () => {
     // Same package.json-reading contract pattern as stage3ActionMatrix /
     // stageRevertContract: the menu contribution is the whole point of the

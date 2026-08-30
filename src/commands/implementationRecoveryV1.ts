@@ -338,12 +338,22 @@ export interface ImplementationRecoveryInputV1 {
   readonly parentOperation?: Pick<TaskOperationHandle, "id">;
   /**
    * True when a `_prev` backup pair actually exists to restore from — a
-   * completed round whose own summary was rejected (`incompleteRound ===
-   * undefined` at the call site), never a detected deferred/cut-short round,
-   * which never finished long enough to leave one. When true, `finishDispatch`
-   * posts a `WorkflowDecisionV1` (case 3 — "Restore Prior Round" — module
-   * doc comment) offering to discard this round's work and restore the prior
-   * state, alongside the do-nothing/let-the-continuation-run option.
+   * completed round (`incompleteRound === undefined` at the call site), never
+   * a detected deferred/cut-short round, which never finished long enough to
+   * leave one. When true AND `trigger !== "summaryRejected"`, `finishDispatch`
+   * posts a `WorkflowDecisionV1` (case 3 — "Revert this round's changes" —
+   * module doc comment) offering to discard this round's work and restore the
+   * prior state, alongside the do-nothing/keep-this-round's-changes option.
+   *
+   * Item 10 / 13c: `trigger === "summaryRejected"` (a round that completed
+   * with known-good work and only had its REPORT rejected) is deliberately
+   * excluded from that decision even when this flag is true — see the
+   * `trigger` check at the `finishDispatch` call site. Offering a destructive
+   * revert against work already known to be intact is exactly the
+   * "already-known-wrong option" item 10 prohibits. The only case this flag
+   * can still be true WITHOUT posting the decision is a genuinely
+   * externally-terminated round (a plain timeout) that also had no detected
+   * `incompleteRound` marker — that case is not known-good and keeps it.
    */
   readonly offerRestoreOption?: boolean;
   /**
@@ -555,7 +565,23 @@ export async function beginImplementationRecoveryV1(
     // continuation (or, once the budget is exhausted, reviewing the round
     // themselves). Only offered when a `_prev` pair actually exists to
     // restore from (see `offerRestoreOption`'s doc comment).
-    if (input.offerRestoreOption === true) {
+    //
+    // Item 10 / 13c: `trigger === "summaryRejected"` means the round's WORK
+    // is known-good — it completed normally and only its report was rejected
+    // (the doc comment on `offerRestoreOption` names this the ONLY case that
+    // sets the flag together with a completed round). Offering "Restore Prior
+    // Round" here dangles a destructive, irreversible option against a
+    // situation with no defensible reason to choose it: the files are
+    // intact, only the paperwork failed, and a continuation is already
+    // scheduled to re-report the SAME work — never to redo it. The round's
+    // own ledger outcome (terminalizeRoundV1, Part 4) already states this as
+    // status ("ended without a usable report; a continuation is owed"), so
+    // nothing here needs to ask the user to choose between two options when
+    // only one was ever defensible. `offerRestoreOption` can also be true for
+    // a genuinely externally-terminated round with no detected incomplete
+    // marker (a plain timeout with `incompleteRound === undefined`) — that
+    // case is NOT known-good and keeps the decision.
+    if (input.offerRestoreOption === true && input.trigger !== "summaryRejected") {
       const filesClause =
         quarantinedPaths.length > 0
           ? `${quarantinedPaths.length} changed file(s)`
@@ -581,7 +607,11 @@ export async function beginImplementationRecoveryV1(
           options: [
             {
               optionId: "keep",
-              label: capReached ? "Leave paused for review" : "Let the continuation run",
+              // Item 13b: name the outcome, not the mechanism — "the
+              // continuation" is an internal term the user has no reason to
+              // know. Paired with "Revert this round's changes" below as an
+              // opposed keep/revert pair.
+              label: capReached ? "Leave paused for review" : "Keep this round's changes",
               consequence: capReached
                 ? "Does nothing — the task stays paused with the unreported edits preserved in " +
                   "pendingImplReviewFiles until you review or rerun the round yourself."
@@ -592,7 +622,11 @@ export async function beginImplementationRecoveryV1(
             },
             {
               optionId: "restore",
-              label: "Restore Prior Round",
+              // Item 13b: "Revert this round's changes" — the opposed
+              // outcome to "Keep this round's changes" above, in the user's
+              // vocabulary rather than the internal "restore the _prev
+              // backups" mechanism.
+              label: "Revert this round's changes",
               destructive: true,
               consequence:
                 `Overwrites the current implementation summary and review with their _prev backups, ` +

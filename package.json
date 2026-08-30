@@ -135,6 +135,12 @@
         "icon": "$(history)"
       },
       {
+        "command": "vs-code-ai-helper.restoreRejectedImplementationRound",
+        "title": "Discard Last Round",
+        "category": "Ensemble",
+        "icon": "$(discard)"
+      },
+      {
         "command": "vs-code-ai-helper.archiveTask",
         "title": "Archive Task",
         "category": "Ensemble",
@@ -834,6 +840,11 @@
           "command": "vs-code-ai-helper.cancelScheduledTaskAction",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-scheduled/",
           "group": "task@4"
+        },
+        {
+          "command": "vs-code-ai-helper.restoreRejectedImplementationRound",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem =~ /^task-active/ || viewItem =~ /^task-paused/) && viewItem =~ /-restorableRound/",
+          "group": "task@5"
         },
         {
           "command": "vs-code-ai-helper.reconcilePlanChecklist",

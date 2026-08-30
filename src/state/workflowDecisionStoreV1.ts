@@ -92,6 +92,11 @@ export type DismissWorkflowDecisionResultV1 =
   | { readonly kind: "alreadySettled"; readonly decision: WorkflowDecisionV1 }
   | { readonly kind: "missing" };
 
+export type WithdrawWorkflowDecisionResultV1 =
+  | { readonly kind: "withdrawn"; readonly decision: WorkflowDecisionV1 }
+  | { readonly kind: "alreadySettled"; readonly decision: WorkflowDecisionV1 }
+  | { readonly kind: "missing" };
+
 /**
  * Persistent store for `WorkflowDecisionV1` records (task: "Replace hidden
  * notification decision buttons with explained, selectable decisions").
@@ -245,6 +250,36 @@ export class WorkflowDecisionStoreV1 {
     next[index] = dismissed;
     await this.saveAll(next);
     return { kind: "dismissed", decision: dismissed };
+  }
+
+  /**
+   * Withdraw a pending decision because the SYSTEM determined its triggering
+   * condition no longer holds (item 13c) — e.g. the restore card's quarantined
+   * files were already cleared, or the plan's item set changed since a
+   * `checklistChangeProposed` card was posted. Distinct from `dismiss`
+   * (a user declining to answer, no reason recorded): `withdraw` records
+   * `reason` on the settled record so the transcript can state why the card
+   * vanished ("Withdrawn: <reason>") rather than leaving a silent gap where a
+   * decision used to be. Idempotent in effect — withdrawing an
+   * already-settled decision reports `alreadySettled` rather than
+   * overwriting whatever state it already reached (resolved, dismissed, or a
+   * second withdrawal), exactly like `dismiss`.
+   */
+  async withdraw(decisionId: string, reason: string): Promise<WithdrawWorkflowDecisionResultV1> {
+    const existing = this.all();
+    const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+    if (index === -1) {
+      return { kind: "missing" };
+    }
+    const decision = existing[index]!;
+    if (decision.state !== "pending") {
+      return { kind: "alreadySettled", decision };
+    }
+    const withdrawn: WorkflowDecisionV1 = { ...decision, state: "withdrawn", withdrawnReason: reason };
+    const next = [...existing];
+    next[index] = withdrawn;
+    await this.saveAll(next);
+    return { kind: "withdrawn", decision: withdrawn };
   }
 
   /**

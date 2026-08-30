@@ -821,7 +821,11 @@ void describe("resumeTaskArgHasExplicitTask", () => {
 // ---------------------------------------------------------------------------
 
 import { pauseTask } from "../commands/pauseTask";
-import { resumePausedTask, resumeAndRerunReviewV1 } from "../commands/resumeTask";
+import {
+  resumePausedTask,
+  resumeAndRerunReviewV1,
+  resumeAndDispatchImplementationV1,
+} from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import type { TaskProgress } from "../types/taskProgress";
@@ -1116,6 +1120,111 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
         reviewDispatch,
         undefined,
         "must not dispatch a review for a resume that never actually succeeded"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resumeAndDispatchImplementationV1 — the implementation-side plateau card's
+// "Keep iterating" button must actually resume AND re-dispatch, not just
+// resume (mirrors resumeAndRerunReviewV1 above; review blocker 2026-08-29:
+// this path previously dispatched plain resumeTask, which only cleared the
+// pause and left the task active-but-idle).
+// ---------------------------------------------------------------------------
+
+void describe("resumeAndDispatchImplementationV1 (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumes a paused task and then dispatches runImplementationWithAI for it", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-dispatch-impl");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-dispatch-impl",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "active",
+        "the task must actually be resumed, not just have implementation dispatched"
+      );
+
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.ok(
+        implDispatch !== undefined,
+        "must dispatch vs-code-ai-helper.runImplementationWithAI after resuming — the whole point of " +
+          "this command over plain resumeTask"
+      );
+      assert.deepEqual(implDispatch.arg, { taskFolderPath: folderPath });
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("does not dispatch implementation when the task could not be found (resume itself failed)", async () => {
+    const inv = makeEmptyInventoryStub();
+    const currentStore = makeCurrentTaskStoreStub(undefined);
+    const msgs = installMessageCapture();
+    const execCmd = installExecuteCommandStub();
+    try {
+      await resumeAndDispatchImplementationV1(inv, currentStore, {
+        taskFolderPath: "/fake-workspace/deleted-paused-task",
+      });
+
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "must not dispatch implementation for a resume that never actually succeeded"
       );
     } finally {
       execCmd.restore();

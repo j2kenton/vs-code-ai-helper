@@ -37,6 +37,20 @@ export interface TaskContextInput {
    * actually owe the user a decision.
    */
   hasPendingDecision?: boolean;
+  /**
+   * A restorable rejected implementation round exists — the EXACT `_prev`-pair
+   * condition `restoreRejectedImplementationRoundV1` (reviewActions.ts) itself
+   * checks before it will do anything, resolved via
+   * `hasRestorableImplRoundV1` (implementationArtifactResolver.ts) rather than
+   * the `implRecovery`/`pendingImplReviewFiles` proxy this used to derive from
+   * (review-narrowed: that proxy tracks a different recovery record and can
+   * diverge from whether a `_prev` pair actually exists to restore). Gates
+   * the "Discard Last Round" context-menu entry (package.json matches
+   * /-restorableRound/) so it is not offered on every active/paused task
+   * regardless of whether anything is actually restorable — item 10's rule
+   * against rendering an option already known to be wrong.
+   */
+  hasRestorableImplRound?: boolean;
   /** Present only when `status === "creating"` and a classification has published. */
   creationFootprint?: TaskCreationContextInput;
 }
@@ -171,6 +185,13 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // /-pinned$/ clauses keep matching.
   if (input.hasPendingDecision) {
     tokens.push("decisionPending");
+  }
+
+  // Restorable rejected round: gates the "Discard Last Round" menu entry
+  // (menus match /-restorableRound/). Kept before the trailing pinned token
+  // so /-pinned$/ clauses keep matching.
+  if (input.hasRestorableImplRound) {
+    tokens.push("restorableRound");
   }
 
   // Pinned marker last so menu `when` clauses can match /-pinned$/ without

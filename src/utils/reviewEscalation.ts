@@ -165,6 +165,78 @@ function nextStageInOrderV1(stage: TaskStage): TaskStage | undefined {
 }
 
 /**
+ * Every `decisionKey` an escalation card can be posted under — the generic
+ * `buildEscalationDecisionV1` card (`reviewEscalation:<kind>`, one per
+ * {@link EscalationKind}) and the richer, evidence-led
+ * `reviewPlateauEscalation` card `postReviewPlateauDecisionV1` posts for a
+ * review-stage plateau with fresh blocker evidence in hand. Every escalation
+ * pauses the task as part of raising it (`updateTaskStatus(..., "paused")`
+ * above), so resuming the task is always the transition that ends whatever an
+ * escalation card was asking — see `resumeTask.ts`'s `resumePausedTask`,
+ * which clears `escalation` on resume and withdraws every one of these keys
+ * in the same step (Part 11 item 13c, event-driven half).
+ */
+export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
+  "reviewEscalation:plateau",
+  "reviewEscalation:spec-defect",
+  "reviewEscalation:environmental",
+  "reviewPlateauEscalation",
+];
+
+/**
+ * Shared "advance" option shape between `buildEscalationDecisionV1` (below)
+ * and `postReviewPlateauDecisionV1`'s richer, evidence-led card — both name
+ * the same option id, the same label, and the same `setTaskStage` effect; the
+ * only thing that legitimately differs per caller is the consequence text
+ * (the plateau card's is evidence-conditioned on whether `nextStage` has
+ * already run once). Review blocker (2026-08-30): the two functions used to
+ * construct this object independently at each call site, which is exactly
+ * the "still independently builds its options" defect the review named —
+ * this is the part of that duplication that was genuinely identical and
+ * therefore safe to share without altering either card's rendered text.
+ */
+function buildAdvanceOptionV1(
+  nextStage: TaskStage,
+  taskFolderPath: string,
+  consequence: string
+): WorkflowDecisionOptionV1 {
+  return {
+    optionId: "advance",
+    label: `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`,
+    consequence,
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.setTaskStage",
+      args: [{ taskFolderPath, stage: nextStage }],
+    },
+  };
+}
+
+/**
+ * Shared "reconsiderRequirement" option shape — same rationale as
+ * {@link buildAdvanceOptionV1}: both callers open plan-final.md's Accepted
+ * Non-Goals section for the same reason (the requirement itself, not the
+ * implementation, may need to change) and differ only in how specifically
+ * the consequence text can name evidence for that (the plateau card knows
+ * whether a `spec-defect`-classified blocker is actually present this round).
+ */
+function buildReconsiderRequirementOptionV1(
+  taskFolderPath: string,
+  consequence: string
+): WorkflowDecisionOptionV1 {
+  return {
+    optionId: "reconsiderRequirement",
+    label: "Change the plan instead",
+    consequence,
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.openPlanNonGoals",
+      args: [{ taskFolderPath }],
+    },
+  };
+}
+
+/**
  * The bounded, durable escalation shape used when a caller does not have a
  * freshly-published review's blocker evidence. Review-stage plateaus retain
  * their richer, evidence-led card below; implementation-side and
@@ -193,41 +265,47 @@ function buildEscalationDecisionV1(
         label: "Keep iterating",
         consequence: IMPL_REVIEW_STAGES.includes(stage)
           ? `Resumes the task and reruns ${stageName}.`
-          : "Resumes the task so its owed continuation or next implementation action can proceed.",
+          : "Resumes the task and dispatches its owed continuation or next implementation action.",
         effect: {
           kind: "command",
+          // Not plain resumeTask: that only clears the pause, leaving
+          // nothing running until some other trigger (auto-advance, a
+          // scheduling sweep) happens to pick the task back up — on a
+          // manually-answered plateau card that can silently strand the
+          // task active-but-idle. resumeAndDispatchImplementationV1 resumes
+          // AND dispatches runImplementationWithAI, which itself resolves
+          // continuation vs Apply Review vs fresh Implementation.
           command: IMPL_REVIEW_STAGES.includes(stage)
             ? "vs-code-ai-helper.resumeAndRerunReview"
-            : "vs-code-ai-helper.resumeTask",
+            : "vs-code-ai-helper.resumeAndDispatchImplementation",
           args: [{ taskFolderPath: target.taskFolderPath }],
         },
       };
   const options: WorkflowDecisionOptionV1[] = [
     ...(nextStage
-      ? [{
-          optionId: "advance",
-          label: `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`,
-          consequence: `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`,
-          effect: {
-            kind: "command" as const,
-            command: "vs-code-ai-helper.setTaskStage",
-            args: [{ taskFolderPath: target.taskFolderPath, stage: nextStage }],
-          },
-        }]
+      ? [
+          buildAdvanceOptionV1(
+            nextStage,
+            target.taskFolderPath,
+            `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`
+          ),
+        ]
       : []),
     keepIterating,
     {
       optionId: "handleMyself",
-      label: "I'll handle it myself",
-      consequence: "Leaves the task paused while you make the needed change yourself.",
-      effect: { kind: "doNothing" },
+      label: "Leave it paused — I'll fix it",
+      consequence: "Leaves the task paused and opens plan-final.md so you can review the plan and make the needed change yourself.",
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanFinal",
+        args: [{ taskFolderPath: target.taskFolderPath }],
+      },
     },
-    {
-      optionId: "reconsiderRequirement",
-      label: "Reconsider the requirement itself",
-      consequence: "Leaves the task paused while you review the plan's non-goals and prior decisions.",
-      effect: { kind: "doNothing" },
-    },
+    buildReconsiderRequirementOptionV1(
+      target.taskFolderPath,
+      "Opens plan-final.md's Accepted Non-Goals section. The task stays paused while you review it."
+    ),
   ];
   const recommendation: WorkflowDecisionRecommendationV1 = environmental
     ? {
@@ -446,7 +524,7 @@ function describeResolverClearingActionV1(
       );
     case "spec-defect":
       return (
-        'a change to the requirement itself, not the implementation — see "Reconsider the requirement itself" ' +
+        'a change to the requirement itself, not the implementation — see "Change the plan instead" ' +
         "below; the acceptance criterion as written may not be satisfiable."
       );
     case "needs-toolchain":
@@ -548,20 +626,15 @@ async function postReviewPlateauDecisionV1(
   const options: WorkflowDecisionOptionV1[] = [
     ...(nextStage
       ? [
-          {
-            optionId: "advance",
-            label: `Advance to ${nextStageName}`,
-            consequence: nextStageHasRun
+          buildAdvanceOptionV1(
+            nextStage,
+            folderUri.fsPath,
+            nextStageHasRun
               ? `Moves the task to ${nextStageName}, which has already run once for this task — this accepts the ` +
                 "current state as good enough to proceed rather than re-reviewing it here."
               : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
-                `not necessarily re-find this same blocker the way another ${stageName} round would.`,
-            effect: {
-              kind: "command" as const,
-              command: "vs-code-ai-helper.setTaskStage",
-              args: [{ taskFolderPath: folderUri.fsPath, stage: nextStage }],
-            },
-          },
+                `not necessarily re-find this same blocker the way another ${stageName} round would.`
+          ),
         ]
       : []),
     {
@@ -586,26 +659,25 @@ async function postReviewPlateauDecisionV1(
     },
     {
       optionId: "handleMyself",
-      label: "I'll handle it myself",
+      label: "Leave it paused — I'll fix it",
       consequence:
-        "Leaves the task paused, exactly like \"Reconsider the requirement itself\" below — nothing is dispatched. " +
+        "Leaves the task paused, exactly like \"Change the plan instead\" below — nothing is dispatched. " +
         "Choose this if you disagree the blocker is outside automation's control, or want to make a fix (or a " +
         "decision only you can make) yourself before resuming.",
       effect: { kind: "doNothing" },
     },
-    {
-      optionId: "reconsiderRequirement",
-      label: "Reconsider the requirement itself",
-      consequence: hasSpecDefect
-        ? "Leaves the task paused, exactly like \"I'll handle it myself\" above — nothing is dispatched. At least " +
-          "one remaining blocker here is classified spec-defect — check the plan's non-goals and prior decisions; " +
-          "it may be asking for something no implementation can satisfy as written."
-        : "Leaves the task paused, exactly like \"I'll handle it myself\" above — nothing is dispatched. No " +
-          "remaining blocker this round is classified spec-defect, so there is no specific evidence the " +
-          "requirement itself is unsound in this instance — pick this only if you have reason to believe " +
-          "otherwise despite that.",
-      effect: { kind: "doNothing" },
-    },
+    buildReconsiderRequirementOptionV1(
+      folderUri.fsPath,
+      hasSpecDefect
+        ? "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
+          "dispatched. At least one remaining blocker here is classified spec-defect — check the plan's " +
+          "non-goals and prior decisions; it may be asking for something no implementation can satisfy as " +
+          "written."
+        : "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
+          "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
+          "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
+          "believe otherwise despite that."
+    ),
   ];
 
   const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
@@ -692,8 +764,8 @@ async function postReviewPlateauDecisionV1(
         unblocksProgress: true,
         detail:
           "This decision is what is holding the task paused — resolving it with \"Advance\" or \"Keep iterating\" " +
-          "resumes or advances the task immediately; \"I'll handle it myself\" and \"Reconsider the requirement " +
-          "itself\" both leave it paused and dispatch nothing.",
+          "resumes or advances the task immediately; \"Leave it paused — I'll fix it\" and \"Change the plan " +
+          "instead\" both leave it paused and dispatch nothing.",
       },
     },
     target

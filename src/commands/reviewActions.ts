@@ -222,7 +222,7 @@ import {
   runAutomaticChecklistReconciliationV1,
   AutomaticChecklistReconciliationOutcomeV1,
 } from "./reconcilePlanChecklist";
-import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -2739,6 +2739,26 @@ export async function handleReviewRoutingOutcome(options: {
     if (!updated) {
       return { escalated: false };
     }
+    // Part 11 item 13c (event-driven half, "a fresh review landing"): a
+    // `sterileRoundRouting`/`preImplementationRouting` card recommends
+    // "Go to Review & Apply" from a snapshot of `decidePostReviewActionV1`
+    // taken when the round that posted it finished. This review round just
+    // published a new `reviewScoreHistory` entry — the exact input that
+    // recommendation was computed from — so any such card for this task is
+    // now describing a situation that may have already changed. Withdraw
+    // eagerly here rather than leaving `hasPendingDecision` true until the
+    // chat panel's render-time safety net (`withdrawStaleDecisionsV1`) next
+    // re-derives it; that predicate remains the fail-closed net beneath this.
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+      "sterileRoundRouting",
+      "a new review has landed for this stage, superseding the routing recommendation this card was based on"
+    );
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+      "preImplementationRouting",
+      "a new review has landed for this stage, superseding the routing recommendation this card was based on"
+    );
     // wf10 continuation item 18: "when a review re-raises a blocker the plan
     // declares out of scope, say so" — the run log above already records it,
     // but a run log is not somewhere the user is looking. `terminalizeRoundV1`
@@ -9202,6 +9222,18 @@ async function executeImplementationRun(
             );
           } else {
             effectivePlanChecklist = mergeResult.content;
+            // Part 11 item 13c (event-driven half): an `applyReviewerVerifiedTicks`
+            // card is only defensible while `deriveApplicableVerifiedTicksV1`
+            // still finds unapplied reviewer-verified ticks against the
+            // CURRENT plan-final.md (chatView.ts's render-time safety net
+            // predicate). This round's own merge just changed plan-final.md's
+            // tick state, so any such card for this task may already be
+            // stale — withdraw here rather than waiting for the next render.
+            await withdrawWorkflowDecisionsByKeyV1(
+              { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+              "applyReviewerVerifiedTicks",
+              "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
+            );
             // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
             // round verified as already complete rather than built itself —
             // recorded in the run log, next to the rest of the round's
@@ -9470,6 +9502,25 @@ async function executeImplementationRun(
       folderUri.fsPath,
       owedContinuationSourceV1(persistedAfterRun?.implRecovery, persistedAfterRun?.pendingImplReviewFiles ?? [])
     );
+
+    // Part 11 item 13c (event-driven half): a "Keep this round's changes" /
+    // "Revert this round's changes" card is only defensible while
+    // `implRecovery` is still set AND `pendingImplReviewFiles` is non-empty
+    // (the same condition chatView.ts's render-time safety net re-derives).
+    // `promotePendingImplReviewFiles` above just cleared both the instant a
+    // usable summary landed — withdraw the stale card here rather than
+    // leaving `hasPendingDecision` true until the chat panel next renders.
+    if (
+      persistedAfterRun !== undefined &&
+      (persistedAfterRun.implRecovery === undefined ||
+        (persistedAfterRun.pendingImplReviewFiles ?? []).length === 0)
+    ) {
+      await withdrawWorkflowDecisionsByKeyV1(
+        { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+        "restoreRejectedImplementationRound",
+        "the round's quarantined changes have already been resolved (reviewed, continued, or restored)"
+      );
+    }
 
     // Visibility for the excluded remainder (finding 2's acceptance
     // criterion): paths that changed in the workspace during the round
@@ -10216,7 +10267,10 @@ export async function runImplementationWithAI(
             },
             {
               optionId: "letItRun",
-              label: "Let Implementation Run",
+              // Part 11 item 13b's audit target verbatim: "Let Implementation
+              // Run" named the mechanism (the Implementation round already in
+              // flight) rather than the outcome for the user.
+              label: "Keep running Implementation",
               consequence: letItRunConsequence,
               effect: { kind: "doNothing" },
             },
@@ -10232,7 +10286,7 @@ export async function runImplementationWithAI(
             detail:
               "This does not pause or resume the task. \"Go to Review & Apply\" requests the Implementation " +
               "round already running to cancel first, since moving stages always stops whatever the outgoing " +
-              "stage was doing; \"Let Implementation Run\" leaves the current run going untouched.",
+              "stage was doing; \"Keep running Implementation\" leaves the current run going untouched.",
           },
         },
         target
@@ -10755,10 +10809,33 @@ export function registerReviewActionCommands(
       "vs-code-ai-helper.viewReview",
       (arg?: ReviewCommandArg) => viewReview(context, arg)
     ),
+    // Item 13c / 10: registered as a contributed command ("Discard Last
+    // Round") so it is reachable independent of the decision card that used
+    // to be its only entry point (`WorkflowDecisionOptionEffectV1`'s
+    // `args: [folderUri.fsPath, stage]`) — a user wanting to discard a
+    // round's edits is a standing intention, not something that should only
+    // be reachable while a report-format failure happens to have raised a
+    // card for it. Accepts EITHER that original two-positional-string shape
+    // (still used by `implementationRecoveryV1.ts`'s decision option) or a
+    // task-row context-menu invocation, which VS Code passes as a single
+    // `{ task: IncompleteTask }`-shaped node instead.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.restoreRejectedImplementationRound",
-      (taskFolderPath: string, stage: TaskStage) =>
-        restoreRejectedImplementationRoundV1(taskFolderPath, stage)
+      (arg: string | TaskNodeArg | undefined, stage?: TaskStage) => {
+        if (typeof arg === "string") {
+          if (!stage) {
+            NotificationRouter.showWarning("Could not discard the last round: no stage was supplied.");
+            return undefined;
+          }
+          return restoreRejectedImplementationRoundV1(arg, stage);
+        }
+        const task = arg?.task;
+        if (!task) {
+          NotificationRouter.showWarning("Select a task first.");
+          return undefined;
+        }
+        return restoreRejectedImplementationRoundV1(task.folderUri.fsPath, task.progress.currentStage);
+      }
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",

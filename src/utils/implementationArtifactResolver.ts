@@ -8,12 +8,14 @@ import {
   ChecklistChangeProposalV1,
   IMPLEMENTATION_FILENAME,
   IMPLEMENTATION_SUMMARY_FILENAME,
+  isReviewStage,
   LEGACY_IMPLEMENTATION_FILENAME,
   PlanRevisionStateV1,
+  STAGE_ARTIFACT_FILENAMES,
   TaskStage,
 } from "../types/taskProgress";
 import { readNonEmptyText, resolveCurrentPlanUri, statIfExists, withPlanFileWriteLockV1 } from "./fileUtils";
-import { backupArtifactBeforeWrite } from "./artifactBackups";
+import { backupArtifactBeforeWrite, hasPreviousVersion } from "./artifactBackups";
 import {
   requirementsForStageActionV1,
   stageActionRequirementMessageV1,
@@ -856,6 +858,43 @@ export function getImplementationSummaryUri(
   taskFolderUri: vscode.Uri
 ): vscode.Uri {
   return vscode.Uri.joinPath(taskFolderUri, IMPLEMENTATION_SUMMARY_FILENAME);
+}
+
+/**
+ * The EXACT restorability condition `restoreRejectedImplementationRoundV1`
+ * (reviewActions.ts) itself checks before it will do anything — current
+ * impl-summary.md is the rejection stamp AND at least one of its own or its
+ * stage's review artifact's `_prev` backup exists — rather than the
+ * `implRecovery`/`pendingImplReviewFiles` proxy the "Discard Last Round" menu
+ * previously gated on (review-narrowed: that proxy tracks a DIFFERENT
+ * recovery record and can diverge from whether a `_prev` pair actually
+ * exists to restore). Read-only: performs no restore, and never throws — a
+ * transient read failure renders as "not restorable" rather than surfacing
+ * an error on every tree refresh.
+ */
+export async function hasRestorableImplRoundV1(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<boolean> {
+  try {
+    const summaryUri = getImplementationSummaryUri(taskFolderUri);
+    const currentSummary = await readTextIfExists(summaryUri);
+    if (currentSummary === undefined || !isUnusableImplementationSummaryV1(currentSummary)) {
+      return false;
+    }
+    if (await hasPreviousVersion(summaryUri)) {
+      return true;
+    }
+    if (isReviewStage(stage)) {
+      const reviewName = STAGE_ARTIFACT_FILENAMES[stage];
+      if (reviewName) {
+        return hasPreviousVersion(vscode.Uri.joinPath(taskFolderUri, reviewName));
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**

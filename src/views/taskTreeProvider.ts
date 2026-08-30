@@ -18,7 +18,11 @@ import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../ut
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
-import { firstUnmetStagePrerequisiteV1, resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
+import {
+  firstUnmetStagePrerequisiteV1,
+  hasRestorableImplRoundV1,
+  resolveImplementationArtifact,
+} from "../utils/implementationArtifactResolver";
 import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
 import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
 import {
@@ -464,7 +468,16 @@ export class TaskNode extends vscode.TreeItem {
     /** This task's always-present scheduling posture (task "Actionable
      * Hand-offs", PART 6), or `undefined` when no Memento was available to
      * build the ledger store. */
-    schedulingPosture?: SchedulingPostureV1
+    schedulingPosture?: SchedulingPostureV1,
+    /**
+     * The EXACT `_prev`-pair restorability condition
+     * (`hasRestorableImplRoundV1`, resolved by the caller — this constructor
+     * itself must stay synchronous), not the `implRecovery`/
+     * `pendingImplReviewFiles` proxy this used to derive inline. See
+     * `contextTokens.ts`'s `TaskContextInput.hasRestorableImplRound` doc
+     * comment.
+     */
+    hasRestorableImplRound: boolean = false
   ) {
     // An interrupted creation (plan §4.7 recovery row) has no stages to show
     // — getStageNodes() is never called for it (see getChildren) — so it
@@ -607,6 +620,9 @@ export class TaskNode extends vscode.TreeItem {
       checklistProgressUnreliable: task.progress.checklistProgressUnreliable === true,
       isPinned: task.progress.pinnedAt !== undefined,
       hasPendingDecision: sortedPendingDecisions.length > 0,
+      // The exact `_prev`-pair condition, resolved by the caller and passed
+      // in — see contextTokens.ts's TaskContextInput doc comment.
+      hasRestorableImplRound,
       creationFootprint
     });
   }
@@ -1449,6 +1465,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             : undefined;
         const pendingDecisions = this.workflowDecisionStore?.listPending(taskId) ?? [];
         const schedulingPosture = await this.computeSchedulingPosture(task, taskId);
+        const hasRestorableImplRound = await hasRestorableImplRoundV1(
+          task.folderUri,
+          task.progress.currentStage
+        );
         return new TaskNode(
           task,
           shouldExpand(task),
@@ -1458,7 +1478,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           this.collapseEpoch,
           creationFootprint,
           pendingDecisions,
-          schedulingPosture
+          schedulingPosture,
+          hasRestorableImplRound
         );
       }
     ));

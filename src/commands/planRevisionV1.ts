@@ -9,7 +9,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { applyPlanRevisionPolicyV1 } from "../services/taskProgressFieldPolicyV1";
 import { markChecklistChangeProposalDiscardedV1 } from "../utils/taskProgressTransforms";
 import { snapshotPlanForRevisionV1 } from "../utils/implementationArtifactResolver";
-import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 
 /**
@@ -238,6 +238,15 @@ export async function reviseChecklistChangeProposalConfirmedV1(
   }
 
   await inventory.refresh();
+  // Event-driven half of Part 11 item 13c: the proposal just left "pending"
+  // (moved to "revising"), so the card offering it is stale the instant this
+  // patch lands — withdraw it now rather than leaving `hasPendingDecision`
+  // true until the chat panel's own render-time safety net happens to run.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: resolved.taskFolderPath, canonicalId: resolved.canonicalId },
+    "checklistChangeProposed",
+    "this checklist-change proposal has already been revised or discarded"
+  );
   NotificationRouter.showInformation(
     "Moved to Plan for revision. Generate the plan again to incorporate the discovered change — Implementation " +
       "and later reviews will re-run once the revised plan is finalized."
@@ -282,6 +291,13 @@ export async function discardChecklistChangeProposalConfirmedV1(
     markChecklistChangeProposalDiscardedV1(current, proposalAt)
   );
   await inventory.refresh();
+  // Event-driven half of Part 11 item 13c — see the matching call in
+  // reviseChecklistChangeProposalConfirmedV1 above.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: resolved.taskFolderPath, canonicalId: resolved.canonicalId },
+    "checklistChangeProposed",
+    "this checklist-change proposal has already been revised or discarded"
+  );
   NotificationRouter.showInformation("Discarded the proposed checklist change. plan-final.md is unchanged.");
 }
 

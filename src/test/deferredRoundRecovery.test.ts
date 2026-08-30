@@ -3647,26 +3647,23 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
     assert.match(logs[0]!, /- src\/rejected\.ts/);
 
-    // Continuation scheduled; the restore option is now offered as an
-    // explained WorkflowDecisionV1 rather than a bare notification button
-    // (task: "Replace hidden notification decision buttons with explained,
-    // selectable decisions").
+    // Continuation scheduled. Item 10 / 13c: a `summaryRejected` round's WORK
+    // is known-good (only its report was rejected), so — unlike the detected
+    // deferred/cut-short class below — this path must NOT dangle the
+    // destructive "Revert this round's changes" option against a situation
+    // with no defensible reason to choose it. The plain warning notification
+    // still announces the outcome; the round's own ledger outcome line
+    // (Part 4) is the durable record of "work intact, continuation owed".
     assert.equal(
       run.dispatches.some((d) => d.chainId === "impl-continuation"),
       true
     );
     const decision = run.pendingDecisions?.find((d) => d.decisionKey === "restoreRejectedImplementationRound");
-    assert.ok(decision, "the rejected-summary path keeps its restore decision");
-    assert.match(decision.whatHappened, /continuation implementation round \(1 of 3, unconstrained\)/);
-    const restoreOption = decision.options.find((o) => o.optionId === "restore");
-    assert.ok(restoreOption?.destructive, "the restore option must be flagged destructive");
-    assert.match(restoreOption.consequence, /discard/i);
-    // Task "Actionable Hand-offs" PART 5: the continuation is already
-    // scheduled regardless of this decision, so resolving it never itself
-    // unblocks the task.
-    assert.equal(decision.gating?.holdsTaskPaused, false);
-    assert.equal(decision.gating?.unblocksProgress, false);
-    assert.match(decision.gating?.detail ?? "", /scheduled continuation/i);
+    assert.equal(decision, undefined, "a summaryRejected round's work is known-good — no restore decision is offered");
+    assert.ok(
+      run.notifications.some((n) => /continuation implementation round \(1 of 3, unconstrained\)/.test(n.message)),
+      "the outcome is still announced, just not as a decision with a destructive option"
+    );
   });
 
   void it("cap exhaustion on the rejected-summary path escalates to human instead of looping", async () => {

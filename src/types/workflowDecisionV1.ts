@@ -57,7 +57,7 @@ export interface WorkflowDecisionEvidenceItemV1 {
   readonly detail: string;
 }
 
-export type WorkflowDecisionStateV1 = "pending" | "resolved" | "dismissed" | "superseded";
+export type WorkflowDecisionStateV1 = "pending" | "resolved" | "dismissed" | "superseded" | "withdrawn";
 
 export interface WorkflowDecisionV1 {
   readonly decisionId: string;
@@ -98,6 +98,16 @@ export interface WorkflowDecisionV1 {
   readonly state: WorkflowDecisionStateV1;
   readonly resolvedOptionId?: string;
   readonly resolvedAt?: string;
+  /**
+   * Set only when `state === "withdrawn"` — the SYSTEM's own reason the
+   * card's triggering condition no longer holds (e.g. "the restored files
+   * were already cleared" or "the plan's item set changed since this was
+   * posted"), distinct from a user `dismiss` (which carries no reason at
+   * all: the user simply declined to answer). Rendered verbatim as
+   * "Withdrawn: <reason>" in the transcript (item 13c) so a card vanishing
+   * from the panel is legible as "no longer applicable", not silence.
+   */
+  readonly withdrawnReason?: string;
 }
 
 export type CreateWorkflowDecisionResultV1 =

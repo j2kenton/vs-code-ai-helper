@@ -32,6 +32,8 @@ import {
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
+import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
+import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import {
   deriveOwedContinuationRecordV1,
@@ -158,6 +160,28 @@ function isReadyMessage(value: unknown): boolean {
   return (value as Record<string, unknown>).type === "ready";
 }
 
+/**
+ * The webview's bound reply control for ONE pending legacy question (Part 10
+ * item 13e) — distinct from `SendMessage`, whose target is the shared,
+ * general-purpose chat box that must never be interpreted as an answer.
+ */
+interface AnswerQuestionMessage {
+  type: "answerQuestion";
+  questionAt: string;
+  text: string;
+}
+
+function isAnswerQuestionMessage(value: unknown): value is AnswerQuestionMessage {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.type === "answerQuestion" &&
+    typeof v.questionAt === "string" &&
+    v.questionAt.length > 0 &&
+    typeof v.text === "string"
+  );
+}
+
 interface InteractionActionMessage {
   /**
    * `confirmInteraction` is the single commit path behind the Confirm button:
@@ -267,41 +291,43 @@ function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined):
  * genuinely awaiting an answer (Part 4 of "Actionable Hand-offs"). A
  * question's persisted `pending` flag is never rewritten once set (module
  * comment on `ChatMessage.pending`), and settlement is defined as "the user
- * sends a follow-up message" — NOT "any later entry exists". Checking only
- * the transcript's last entry (as an earlier version of this function did)
- * falsely settles a question the moment ANY later entry is appended, even an
- * unrelated assistant/system message the user never answered — recreating
- * the exact stale-pending defect this function exists to fix, just inverted
- * (false-settled instead of stuck-pending). Scanning forward and treating
- * only a `role: "user"` entry as a settling event is what the module comment
- * actually specifies.
+ * answers THAT question through its own bound reply control" — not "any
+ * later entry exists" and, per Part 10 item 13e, not "any later `user`
+ * entry exists" either.
  *
- * Correlation (review-flagged, 2026-08-22): when more than one question is
- * still unanswered when a `user` entry arrives — `ask()` has no lock
- * preventing a second question from stacking before the first is answered —
- * a single reply settles only the MOST RECENT of them, never all of them at
- * once. Settling every earlier stacked question off one reply had no
- * correlation to which question the reply actually addressed, and silently
- * dropped the older one(s) as answered forever with no record of what (if
- * anything) actually answered them.
+ * **Revised, wf "stage chat as a record of work" Part 10 item 13e (review
+ * blocker, 2026-08-29).** An earlier version of this function settled the
+ * MOST RECENT unanswered question on the arrival of ANY `role: "user"` entry
+ * — including a plain message typed into the shared chat-send box that had
+ * nothing to do with the question. That let an ordinary chat turn be
+ * silently interpreted as an answer, and made two simultaneously pending
+ * questions ambiguous about which one a reply addressed. A question is now
+ * settled only by a `role: "user"` entry carrying `answersQuestionAt` equal
+ * to the question's own `at` — set exclusively by
+ * `ChatViewProvider.answerQuestion`, the question's dedicated bound control
+ * (webview `renderInteractions`'s per-question reply form), never by the
+ * shared send box. A message with no `answersQuestionAt` therefore settles
+ * nothing, however many questions are pending.
  */
 function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): ReadonlySet<number> {
   const awaiting = new Set<number>();
+  // Keyed by the question's stable `id` when it has one (every question
+  // created after the 2026-08-29 fix), falling back to `at` only for
+  // questions persisted before `id` existed — see `ChatMessage.id`'s doc
+  // comment for why `at` alone is collision-prone.
+  const pendingIndexByKey = new Map<string, number>();
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
     if (entry.role === "question" && entry.pending === true) {
       awaiting.add(i);
+      pendingIndexByKey.set(entry.id ?? entry.at, i);
       continue;
     }
-    if (entry.role === "user" && awaiting.size > 0) {
-      // Settle only the nearest still-unanswered question — the one this
-      // reply most plausibly addresses — leaving any older stacked question
-      // genuinely awaiting until its own later reply arrives.
-      let nearest = -1;
-      for (const index of awaiting) {
-        if (index > nearest) nearest = index;
+    if (entry.role === "user" && entry.answersQuestionAt !== undefined) {
+      const index = pendingIndexByKey.get(entry.answersQuestionAt);
+      if (index !== undefined) {
+        awaiting.delete(index);
       }
-      awaiting.delete(nearest);
     }
   }
   return awaiting;
@@ -555,6 +581,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       if (isResolveWorkflowDecisionMessage(message)) {
         await this.resolveWorkflowDecision(message.decisionId, message.optionId);
+        return;
+      }
+      if (isAnswerQuestionMessage(message)) {
+        if (this.target) {
+          await this.answerQuestion(this.target, message.questionAt, message.text, this.target.stage);
+        }
         return;
       }
       if (isInteractionActionMessage(message)) {
@@ -892,7 +924,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     pending = false
   ): Promise<void> {
     if (!identity) return;
-    const message: ChatMessage = { role, text, stage, at: new Date().toISOString(), pending };
+    const message: ChatMessage = {
+      role,
+      text,
+      stage,
+      at: new Date().toISOString(),
+      pending,
+      // A question gets a stable id at creation so a reply can bind to THIS
+      // question even if another one shares the same millisecond `at` (see
+      // `ChatMessage.id`) — every other role has no reply channel to bind.
+      ...(role === "question" ? { id: crypto.randomBytes(16).toString("hex") } : {}),
+    };
+    await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
+
+    if (sameIdentity(this.target, identity)) {
+      await this.render();
+    }
+  }
+
+  /**
+   * Reply to ONE specific pending legacy free-text question — the bound
+   * answer channel Part 10 item 13e requires: a question's own reply control
+   * (never the shared chat-send box) is the only thing that can settle it.
+   * `questionAt` is the target question message's own stable `id` (falling
+   * back to its `at` value only for a question persisted before `id`
+   * existed), exactly as rendered back by the webview; the parameter name is
+   * kept for wire compatibility even though it may now carry an id rather
+   * than a timestamp. `computeAwaitingQuestionIndices` settles ONLY the
+   * question whose key matches this new message's `answersQuestionAt`, so an
+   * ordinary `append("user", ...)` (the shared send box's path) never settles
+   * anything.
+   */
+  async answerQuestion(
+    identity: ChatIdentity | undefined,
+    questionAt: string,
+    text: string,
+    stage: TaskStage
+  ): Promise<void> {
+    if (!identity) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const message: ChatMessage = {
+      role: "user",
+      text: trimmed,
+      stage,
+      at: new Date().toISOString(),
+      answersQuestionAt: questionAt,
+    };
     await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
 
     if (sameIdentity(this.target, identity)) {
@@ -1202,53 +1280,169 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
-   * Item 6d (wf10 step 7): the "Apply N Reviewer-Verified Ticks" card's claim
-   * is a snapshot taken when it was posted — if every item it names gets
-   * ticked some other way before the user answers (a later round's own echo,
-   * a hand edit, a differently-sourced reconcile), the card is a silent no-op
-   * that still reads as pending and actionable. `listPending` above already
-   * re-reads the STORE fresh on every render (so a decision resolved
-   * elsewhere disappears), but that only re-checks the record's `state`, not
-   * whether its underlying claim is still true — a `"pending"` record stays
-   * `"pending"` even after its target items are ticked out from under it.
+   * Item 6d (wf10 step 7) generalized into item 13c: a decision card's claim
+   * is a snapshot taken when it was posted — if the state it describes
+   * changes before the user answers (a later round's own echo, a hand edit, a
+   * differently-sourced reconcile), the card is a silent no-op that still
+   * reads as pending and actionable. `listPending` above already re-reads the
+   * STORE fresh on every render (so a decision resolved elsewhere
+   * disappears), but that only re-checks the record's `state`, not whether
+   * its underlying claim is still true — a `"pending"` record stays
+   * `"pending"` even after the fact it describes stops holding.
    *
-   * Re-derives applicability fresh against the CURRENT plan-final.md on every
-   * render, via the exact same `deriveApplicableVerifiedTicksV1` the "Apply"
-   * command itself re-runs at accept-time (module doc comment there) — so
-   * this can never disagree with what actually happens if the user clicks
-   * Apply. Any decision whose derivation is no longer `"ok"` (every item
-   * already ticked, the review file is gone, the stage changed) is withdrawn
-   * (`dismiss`ed) rather than left presenting as an open question.
-   *
-   * Scoped to this one `decisionKey` for now, per the task's worked example;
-   * other decision kinds have no equivalent cheap, side-effect-free
-   * "is this still true?" re-derivation to call here. A derivation failure
-   * (I/O error) fails closed — the card stays pending rather than being
-   * withdrawn on inconclusive evidence.
+   * Keyed by `decisionKey` → a side-effect-free "is this still true?"
+   * predicate, so each card kind owns its own staleness check without this
+   * function knowing their internals. A key with no registered predicate is
+   * left alone (fresh) — this is the render-time SAFETY NET beneath the
+   * event-driven `withdraw` calls at each invalidating transition (item 13,
+   * Part 11's second bullet), not a replacement for them: those fire the
+   * instant the transition happens; this catches whatever they miss (a
+   * transition that predates this task, a race, a bug) on the next render.
+   * Withdraws (never `dismiss`es — item 13c: a system-determined staleness
+   * gets a recorded reason, distinct from a user declining to answer) via the
+   * store, which also lets a caller distinguish the two in the record. A
+   * derivation failure (I/O error) fails closed — the card stays pending
+   * rather than being withdrawn on inconclusive evidence.
    */
-  private async withdrawStaleApplyReviewerVerifiedTicksDecisionsV1(
-    target: ChatTarget,
-    decisions: readonly WorkflowDecisionV1[]
-  ): Promise<readonly WorkflowDecisionV1[]> {
-    const fresh: WorkflowDecisionV1[] = [];
-    const stale: WorkflowDecisionV1[] = [];
-    for (const decision of decisions) {
-      if (decision.decisionKey !== "applyReviewerVerifiedTicks") {
-        fresh.push(decision);
-        continue;
-      }
+  private readonly staleDecisionPredicates: Record<
+    string,
+    (target: ChatTarget, decision: WorkflowDecisionV1) => Promise<{ readonly stale: true; readonly reason: string } | { readonly stale: false }>
+  > = {
+    // Re-derives applicability fresh against the CURRENT plan-final.md on
+    // every render, via the exact same `deriveApplicableVerifiedTicksV1` the
+    // "Apply" command itself re-runs at accept-time (module doc comment
+    // there) — so this can never disagree with what actually happens if the
+    // user clicks Apply.
+    applyReviewerVerifiedTicks: async (target, decision) => {
       const derived = await deriveApplicableVerifiedTicksV1(
         vscode.Uri.file(target.taskFolderPath),
         decision.stage
       ).catch(() => undefined);
       if (derived === undefined || derived.kind === "ok") {
-        fresh.push(decision);
+        return { stale: false };
+      }
+      return { stale: true, reason: derived.message };
+    },
+    // Part 11 (transition-driven withdrawal, safety-net half): a "Keep this
+    // round's changes" / "Revert this round's changes" card is only
+    // defensible while there is still something restorable — see
+    // `implementationRecoveryV1.ts`'s `offerRestoreOption` doc comment. If
+    // `implRecovery` has since been cleared (the continuation landed, the
+    // round was reviewed) or `pendingImplReviewFiles` is now empty, the
+    // choice the card offers no longer applies to anything.
+    restoreRejectedImplementationRound: async (target) => {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath)).catch(
+        () => undefined
+      );
+      if (!read || !read.ok) {
+        return { stale: false };
+      }
+      const progress = read.decoded.progress;
+      if (!progress.implRecovery || (progress.pendingImplReviewFiles ?? []).length === 0) {
+        return {
+          stale: true,
+          reason: "the round's quarantined changes have already been resolved (reviewed, continued, or restored)",
+        };
+      }
+      return { stale: false };
+    },
+    // Part 11: a checklist-mutation proposal card is only answerable while
+    // its own row is still `"pending"` — once the user (or the render-time
+    // net elsewhere) has already discarded or adopted it, choosing an option
+    // on a stale copy of the card would act on a proposal that no longer
+    // exists in that state.
+    checklistChangeProposed: async (target, decision) => {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath)).catch(
+        () => undefined
+      );
+      if (!read || !read.ok) {
+        return { stale: false };
+      }
+      const stillPending = (read.decoded.progress.checklistChangeProposals ?? []).some(
+        (proposal) => proposal.stage === decision.stage && proposal.status === "pending"
+      );
+      if (!stillPending) {
+        return { stale: true, reason: "this checklist-change proposal has already been revised or discarded" };
+      }
+      return { stale: false };
+    },
+    // Part 11 (transition-driven withdrawal, "a fresh review landing"):
+    // `sterileRoundRouting` and `preImplementationRouting` both recommend
+    // "Go to Review & Apply" from a snapshot of `decidePostReviewActionV1`
+    // taken when the round that posted them finished. If a later review has
+    // since cleared the blockers, ticked the checklist, or a continuation is
+    // now owed, that recommendation no longer describes the current state —
+    // re-running the SAME decision function fresh is the only way this can
+    // never disagree with what actually happens if the user clicks through.
+    sterileRoundRouting: async (target, decision) => this.staleReviewRoutingDecisionV1Impl(target, decision),
+    preImplementationRouting: async (target, decision) => this.staleReviewRoutingDecisionV1Impl(target, decision),
+  };
+
+  /** Shared staleness check for `sterileRoundRouting`/`preImplementationRouting` — see their predicates above. */
+  private async staleReviewRoutingDecisionV1Impl(
+    target: ChatTarget,
+    _decision: WorkflowDecisionV1
+  ): Promise<{ readonly stale: true; readonly reason: string } | { readonly stale: false }> {
+    const folderUri = vscode.Uri.file(target.taskFolderPath);
+    const read = await readTaskProgressStrictV1(folderUri).catch(() => undefined);
+    if (!read || !read.ok) {
+      return { stale: false };
+    }
+    const progress = read.decoded.progress;
+    const remainingChecklistProgress = await readEffectivePlanChecklistProgressV1(folderUri).catch(
+      () => undefined
+    );
+    const fresh = decidePostReviewActionV1({
+      history: progress.reviewScoreHistory,
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: (remainingChecklistProgress?.remaining ?? 0) > 0,
+      continuationOwed: progress.implRecovery !== undefined,
+      pendingImplReviewFilesCount: progress.pendingImplReviewFiles?.length ?? 0,
+    });
+    if (fresh.action !== "apply-review" && fresh.action !== "both") {
+      return {
+        stale: true,
+        reason: "the situation that prompted this recommendation has since changed — " + fresh.reason,
+      };
+    }
+    return { stale: false };
+  }
+
+  private async withdrawStaleDecisionsV1(
+    target: ChatTarget,
+    decisions: readonly WorkflowDecisionV1[]
+  ): Promise<readonly WorkflowDecisionV1[]> {
+    const fresh: WorkflowDecisionV1[] = [];
+    const stale: { decision: WorkflowDecisionV1; reason: string }[] = [];
+    for (const decision of decisions) {
+      const predicate = this.staleDecisionPredicates[decision.decisionKey];
+      const result = predicate ? await predicate(target, decision) : { stale: false as const };
+      if (result.stale) {
+        stale.push({ decision, reason: result.reason });
       } else {
-        stale.push(decision);
+        fresh.push(decision);
       }
     }
-    for (const decision of stale) {
-      await this.workflowDecisionStore.dismiss(decision.decisionId).catch(() => undefined);
+    for (const { decision, reason } of stale) {
+      const result = await this.workflowDecisionStore.withdraw(decision.decisionId, reason).catch(() => undefined);
+      if (result?.kind === "withdrawn") {
+        // NOT `this.append()`: that also triggers `this.render()`, and this
+        // whole method runs FROM WITHIN `render()` — a nested render call
+        // here would be reentrant. `persistAppend` is the same write with no
+        // render side effect; the new message simply appears on the NEXT
+        // render (this pass already captured `entries` before calling here),
+        // exactly like a decision resolved elsewhere mid-render would.
+        const identity: ChatIdentity = { canonicalId: decision.taskCanonicalId, taskFolderPath: target.taskFolderPath };
+        await this.runQueued(identity.taskFolderPath, () =>
+          this.persistAppend(identity, {
+            role: "assistant",
+            text: `Withdrawn: ${reason}`,
+            stage: decision.stage,
+            at: new Date().toISOString(),
+            pending: false,
+          })
+        ).catch(() => undefined);
+      }
     }
     return fresh;
   }
@@ -1506,7 +1700,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // control lingering in the panel.
     const pendingDecisions: readonly WorkflowDecisionV1[] =
       target && target.kind !== "global"
-        ? await this.withdrawStaleApplyReviewerVerifiedTicksDecisionsV1(
+        ? await this.withdrawStaleDecisionsV1(
             target,
             this.workflowDecisionStore.listPending(target.canonicalId).filter((d) => d.stage === target.stage)
           )
@@ -1984,6 +2178,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           background-color: transparent; color: var(--vscode-foreground);
           border: var(--ensemble-border-width) solid var(--vscode-widget-border);
         }
+        /* Part 10 item 13e: a pending legacy question's own bound reply
+           control, rendered inline under the question message it answers —
+           same "needs a response" left-border treatment as #interaction
+           above, so it reads as distinct from the shared send box below. */
+        .question-reply {
+          margin: var(--ensemble-space-2) 0 var(--ensemble-space-3);
+          padding: var(--ensemble-space-3);
+          border: var(--ensemble-border-width) solid var(--vscode-panel-border);
+          border-left: 3px solid var(--vscode-inputValidation-warningBorder);
+          border-radius: var(--ensemble-radius);
+          background-color: var(--vscode-sideBar-background);
+        }
+        .question-reply textarea {
+          width: 100%; box-sizing: border-box; font-family: inherit; font-size: inherit;
+          background-color: var(--vscode-input-background, var(--vscode-editor-background));
+          color: var(--vscode-input-foreground, var(--vscode-foreground));
+          border: var(--ensemble-border-width) solid var(--vscode-input-border, var(--vscode-widget-border));
+          padding: var(--ensemble-space-2); border-radius: var(--ensemble-radius);
+          margin-bottom: var(--ensemble-space-2);
+        }
         #decisions { display: none; }
         .decision-card { margin: 0 0 var(--ensemble-space-3); }
         .decision-why { margin-bottom: var(--ensemble-space-2); }
@@ -2291,6 +2505,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           meta.appendChild(copyBtn);meta.appendChild(time);
           const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+'] '+x.text+(x.endingPendingReconciliation?' — ending pending reconciliation':'');
           row.appendChild(d);row.appendChild(meta);
+          // Part 10 item 13e: a pending legacy question's OWN bound reply
+          // control — never the shared send box below, which must not be
+          // interpreted as an answer. Two simultaneously pending questions
+          // each render their own control here, scoped by the question's own
+          // stable id (falling back to its at/timestamp value only for a
+          // question persisted before the id field existed).
+          if(x.role==='question'&&x.awaitingAnswer){
+            const replyWrap=document.createElement('div');replyWrap.className='question-reply';
+            const replyTitle=document.createElement('div');replyTitle.className='interaction-title';replyTitle.textContent='Needs your reply';
+            replyWrap.appendChild(replyTitle);
+            const replyErr=document.createElement('div');replyErr.className='interaction-error';replyWrap.appendChild(replyErr);
+            const ta=document.createElement('textarea');ta.rows=2;ta.setAttribute('aria-label','Reply to: '+x.text);
+            replyWrap.appendChild(ta);
+            const actions=document.createElement('div');actions.className='interaction-actions';
+            const sendBtn=document.createElement('button');sendBtn.type='button';sendBtn.textContent='Reply';
+            sendBtn.addEventListener('click',()=>{
+              const val=ta.value.trim();
+              if(!val){ replyErr.textContent='Please enter a reply.'; replyErr.style.display='block'; return; }
+              replyErr.style.display='none';
+              sendBtn.disabled=true;sendBtn.textContent='Sent';ta.disabled=true;
+              v.postMessage({type:'answerQuestion',questionAt:x.id??x.at,text:val});
+            });
+            actions.appendChild(sendBtn);replyWrap.appendChild(actions);
+            row.appendChild(replyWrap);
+          }
           return row;
         }
         m.replaceChildren();

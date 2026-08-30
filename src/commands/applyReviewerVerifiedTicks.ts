@@ -17,8 +17,9 @@ import {
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
-import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
+import { normalizePath } from "../utils/taskRoot";
 
 type ApplyArg =
   | { task?: IncompleteTask }
@@ -378,6 +379,19 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
     );
     return;
   }
+  // Part 11 item 13c (event-driven half): the normal path here is the
+  // decision option's own effect command, which the resolve flow already
+  // takes off "pending" before this runs — but this command is ALSO
+  // independently registered (e.g. reachable from the Command Palette
+  // without ever clicking the card), so a pending `applyReviewerVerifiedTicks`
+  // card for this task may still exist and now describes a tick state that
+  // no longer holds. Best-effort withdraw covers that path; it is a no-op
+  // when the decision was already resolved by the normal click.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+    "applyReviewerVerifiedTicks",
+    "plan-final.md's checklist ticks changed, superseding the pending tick-application card"
+  );
   await inventory.refresh();
   NotificationRouter.showInformation(
     `Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`

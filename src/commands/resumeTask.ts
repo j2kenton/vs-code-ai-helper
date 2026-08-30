@@ -6,6 +6,8 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearEscalation } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
+import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
@@ -158,6 +160,23 @@ export async function resumePausedTask(
           vscode.Uri.file(resolvedTask.taskFolderPath),
           (current) => clearEscalation(current, { preserveFreshness: true })
         );
+        // Part 11 item 13c (event-driven half, "stage advance/resume
+        // invalidates escalation cards"): every escalation card exists to
+        // hold this exact pause open pending a decision — the clear above
+        // just ended that, through whatever route the user actually took
+        // (not necessarily the card's own "keep iterating"/"handle myself"
+        // options), so any escalation card still pending for this task now
+        // describes a pause that no longer holds. Withdraw all of them
+        // rather than leaving `hasPendingDecision` true until the chat
+        // panel's render-time safety net next runs (none is currently
+        // registered for escalation keys there, so this is the only path).
+        for (const decisionKey of ESCALATION_DECISION_KEYS_V1) {
+          await withdrawWorkflowDecisionsByKeyV1(
+            { taskFolderPath: resolvedTask.taskFolderPath, canonicalId: resolvedTask.canonicalId },
+            decisionKey,
+            "the task was resumed, ending the pause this escalation was holding"
+          );
+        }
       }
     );
   } catch (error) {
@@ -278,6 +297,57 @@ export async function resumeAndRerunReviewV1(
 }
 
 /**
+ * Resume a paused task and immediately re-dispatch Implementation — the
+ * `WorkflowDecisionOptionEffectV1` shape only carries one command, so a
+ * single-command "keep iterating" option on an implementation-side plateau
+ * (continuation-budget-exhausted, or the no-progress breaker — see
+ * `reviewEscalation.ts`'s `buildEscalationDecisionV1`) cannot resume AND
+ * dispatch without a small combined command like this one, mirroring
+ * `resumeAndRerunReviewV1` above for the review-stage case.
+ *
+ * Deliberately dispatches `runImplementationWithAI` rather than a specific
+ * "continuation" vs "fresh implementation" command: that routing decision
+ * (owed continuation vs Apply Review vs Implementation) already lives inside
+ * `runImplementationWithAI` itself (`chooseAutomaticImplementationDispatchV1`
+ * / the manual pre-run decision), so resuming and calling it once is
+ * sufficient to reach whichever action the escalation's reason actually
+ * names — a second copy of that routing logic here would drift from it.
+ *
+ * `resumePausedTask` handles (and reports) its own failure modes via
+ * `NotificationRouter`; this only proceeds to the implementation dispatch
+ * when the task actually reached "active", so a failed/declined resume does
+ * not also throw a confusing "task is paused" message on top of whatever
+ * resumePausedTask already told the user.
+ */
+export async function resumeAndDispatchImplementationV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: ResumeTaskArg
+): Promise<void> {
+  const resolverArg = normalizeResumeTaskArg(explicitArg);
+  const target = await resolveTaskContext(
+    inventory,
+    resolverArg,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!target) {
+    return;
+  }
+  await resumePausedTask(inventory, currentTaskStore, explicitArg);
+  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
+  // does: `inventory` is an in-memory cache not guaranteed to reflect the
+  // write resumePausedTask (via activateTask) just made.
+  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  if (!reread.ok || reread.decoded.progress.status === "paused") {
+    return;
+  }
+  await vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
+    taskFolderPath: target.taskFolderPath,
+  });
+}
+
+/**
  * Register the resumeTask command
  */
 export function registerResumeTaskCommand(
@@ -298,4 +368,11 @@ export function registerResumeTaskCommand(
       resumeAndRerunReviewV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndRerunReview);
+
+  const resumeAndDispatchImplementation = vscode.commands.registerCommand(
+    "vs-code-ai-helper.resumeAndDispatchImplementation",
+    (arg?: ResumeTaskArg) =>
+      resumeAndDispatchImplementationV1(inventory, currentTaskStore, arg)
+  );
+  context.subscriptions.push(resumeAndDispatchImplementation);
 }

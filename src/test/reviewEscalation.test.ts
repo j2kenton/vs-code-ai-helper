@@ -335,8 +335,26 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       assert.equal(switchModel?.label, "Switch this stage's model");
       assert.deepEqual(switchModel?.effect, { kind: "command", command: "vs-code-ai-helper.openAiModels" });
       assert.ok(decision.options.some((option) => option.optionId === "advance"));
-      assert.ok(decision.options.some((option) => option.optionId === "handleMyself"));
-      assert.ok(decision.options.some((option) => option.optionId === "reconsiderRequirement"));
+      // Item 13d / review blocker: "Leave it paused — I'll fix it" must
+      // actually open plan-final.md rather than silently doing nothing —
+      // distinct from "Change the plan instead" below, which jumps to the
+      // non-goals section specifically.
+      const handleMyself = decision.options.find((option) => option.optionId === "handleMyself");
+      assert.deepEqual(handleMyself?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanFinal",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
+      // Item 13d: "Change the plan instead" must actually take the
+      // user to the plan's non-goals rather than silently doing nothing —
+      // the option is otherwise indistinguishable from "Leave it paused —
+      // I'll fix it" above.
+      const reconsiderRequirement = decision.options.find((option) => option.optionId === "reconsiderRequirement");
+      assert.deepEqual(reconsiderRequirement?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanNonGoals",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
       assert.equal(
         surface.entries.some((entry) => entry.message.includes("Automated review iteration is stuck")),
         false,
@@ -386,14 +404,33 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       }
       const keepIterating = decision.options.find((option) => option.optionId === "keepIterating");
       assert.equal(keepIterating?.label, "Keep iterating");
+      // Not plain resumeTask: that only clears the pause and dispatches
+      // nothing, silently stranding the task active-but-idle until some
+      // other trigger picks it back up. resumeAndDispatchImplementation
+      // resumes AND dispatches runImplementationWithAI, which itself
+      // resolves continuation vs Apply Review vs fresh Implementation.
       assert.deepEqual(keepIterating?.effect, {
         kind: "command",
-        command: "vs-code-ai-helper.resumeTask",
+        command: "vs-code-ai-helper.resumeAndDispatchImplementation",
         args: [{ taskFolderPath: folderUri.fsPath }],
       });
       assert.ok(decision.options.some((option) => option.optionId === "advance"));
-      assert.ok(decision.options.some((option) => option.optionId === "handleMyself"));
-      assert.ok(decision.options.some((option) => option.optionId === "reconsiderRequirement"));
+      // Item 13d / review blocker: "Leave it paused — I'll fix it" must
+      // actually open plan-final.md rather than silently doing nothing —
+      // distinct from "Change the plan instead" below, which jumps to the
+      // non-goals section specifically.
+      const handleMyself = decision.options.find((option) => option.optionId === "handleMyself");
+      assert.deepEqual(handleMyself?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanFinal",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
+      const reconsiderRequirement = decision.options.find((option) => option.optionId === "reconsiderRequirement");
+      assert.deepEqual(reconsiderRequirement?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanNonGoals",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
       assert.equal(
         surface.entries.some((entry) => entry.message.includes("Automated review iteration is stuck")),
         false,
@@ -670,17 +707,24 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         args: [{ taskFolderPath: folderUri.fsPath }],
       });
 
-      // Regression: gating.detail previously said every option except "I'll
-      // handle it myself" resumes or advances immediately — false for
-      // "Reconsider the requirement itself", which is also doNothing. The
-      // detail must name BOTH paused-and-dispatch-nothing options, not
-      // imply only one exists.
-      assert.match(decision.gating!.detail, /I'll handle it myself/);
-      assert.match(decision.gating!.detail, /Reconsider the requirement itself/);
+      // Regression: gating.detail previously said every option except "Leave
+      // it paused — I'll fix it" resumes or advances immediately — false for
+      // "Change the plan instead", which also leaves the task paused. The
+      // detail must name BOTH paused options, not imply only one exists.
+      assert.match(decision.gating!.detail, /Leave it paused — I'll fix it/);
+      assert.match(decision.gating!.detail, /Change the plan instead/);
       assert.match(decision.gating!.detail, /leave|leaves/);
+      // Part 10 mapped-effects fix: "Change the plan instead" opens
+      // plan-final.md's Accepted Non-Goals section rather than doing
+      // nothing, matching the same option's effect on the generic
+      // no-evidence escalation card (buildEscalationDecisionV1).
       const reconsiderRequirement = decision.options.find((o) => o.optionId === "reconsiderRequirement");
       assert.ok(reconsiderRequirement);
-      assert.deepEqual(reconsiderRequirement.effect, { kind: "doNothing" });
+      assert.deepEqual(reconsiderRequirement.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanNonGoals",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
 
       // Item 7b rule 5: name what would clear the blocker.
       assert.ok(

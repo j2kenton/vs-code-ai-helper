@@ -59,7 +59,7 @@ import {
   notifyPendingWorkflowDecision,
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
-import { makeOwnedTaskFolder, bindingIdForOwnedFolder } from "./taskFolderFixture";
+import { makeOwnedTaskFolder, bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { readChatDocumentIdentityV1, readChatHistory, writeChatHistory } from "../utils/chatHistoryStore";
 import { taskOperations } from "../utils/taskOperations";
@@ -795,7 +795,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
    * described did not actually happen. This is the two-choice shape of the
    * pre-Implementation routing decision (`preImplementationRouting`):
    * "Go to Review & Apply" (a command effect that can resolve `false`) next
-   * to "Let Implementation Run" (a `doNothing` no-op) — both choices must be
+   * to "Keep running Implementation" (a `doNothing` no-op) — both choices must be
    * acknowledged, and a `false` resolution must be visibly distinct from a
    * successful "applying now".
    */
@@ -817,7 +817,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
             },
             {
               optionId: "letItRun",
-              label: "Let Implementation Run",
+              label: "Keep running Implementation",
               consequence: "Does nothing further.",
               effect: { kind: "doNothing" },
             },
@@ -868,7 +868,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
             },
             {
               optionId: "letItRun",
-              label: "Let Implementation Run",
+              label: "Keep running Implementation",
               consequence: "Does nothing further.",
               effect: { kind: "doNothing" },
             },
@@ -885,7 +885,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       assert.equal(cmds.calls.length, 0, "a doNothing option must never dispatch a command");
       const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
-      const ack = entries.find((e) => e.text.includes("Let Implementation Run"));
+      const ack = entries.find((e) => e.text.includes("Keep running Implementation"));
       assert.ok(ack, "expected a transcript entry acknowledging the resolved decision");
       assert.match(ack.text, /does nothing further/i);
       assert.doesNotMatch(ack.text, /did not complete/i);
@@ -911,13 +911,22 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await provider.ask({ ...target, question: "Which approach should I take?" }, true, false);
 
-      let entries = (lastState(fake)?.entries as Array<{ role: string; awaitingAnswer?: boolean }> | undefined) ?? [];
+      let entries =
+        (lastState(fake)?.entries as
+          | Array<{ role: string; at: string; id?: string; awaitingAnswer?: boolean }>
+          | undefined) ?? [];
       assert.equal(entries.length, 1);
       assert.equal(entries[0]!.awaitingAnswer, true, "an unanswered question must render as awaiting");
 
-      await provider.append("user", "Use approach B.", "impl", target);
+      // Bound reply channel (Part 10 item 13e), not the shared send box —
+      // an ordinary append("user", ...) no longer settles anything (see the
+      // dedicated regression test below).
+      await provider.answerQuestion(target, entries[0]!.id ?? entries[0]!.at, "Use approach B.", "impl");
 
-      entries = (lastState(fake)?.entries as Array<{ role: string; awaitingAnswer?: boolean }> | undefined) ?? [];
+      entries =
+        (lastState(fake)?.entries as
+          | Array<{ role: string; at: string; id?: string; awaitingAnswer?: boolean }>
+          | undefined) ?? [];
       assert.equal(entries.length, 2);
       assert.equal(
         entries[0]!.awaitingAnswer,
@@ -930,6 +939,46 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       // and proves the fix is in rendering, not in silently mutating history.
       const persisted = await readChatHistory(folder);
       assert.equal(persisted[0]!.pending, true, "the persisted flag itself is untouched by design");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("an ordinary chat send is never silently interpreted as an answer to a pending question", async () => {
+    // Review blocker, 2026-08-29 (wf "stage chat as a record of work" Part 10
+    // item 13e): a plain `role: "user"` message posted through the shared
+    // chat-send box (i.e. no `answersQuestionAt` correlation) must never
+    // settle a pending question, however many are outstanding. Only a reply
+    // through that specific question's own bound control
+    // (`ChatViewProvider.answerQuestion`) may settle it.
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+
+      await provider.ask({ ...target, question: "Which approach should I take?" }, true, false);
+
+      // An ordinary chat turn — same shape a user typing into the shared
+      // send box would produce — carries no `answersQuestionAt`.
+      await provider.append("user", "Just a general remark, not an answer.", "impl", target);
+
+      const entries =
+        (lastState(fake)?.entries as Array<{ role: string; awaitingAnswer?: boolean }> | undefined) ?? [];
+      assert.equal(entries.length, 2);
+      assert.equal(
+        entries[0]!.awaitingAnswer,
+        true,
+        "an ordinary chat send must not settle a pending question it does not explicitly answer"
+      );
     } finally {
       notify.restore();
       cmds.restore();
@@ -1268,12 +1317,15 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("a stacked second pending question settles only the nearest reply, not the older unanswered one too", async () => {
+  void it("a stacked second pending question is settled by its own bound reply, not the older unanswered one too", async () => {
     // Regression coverage for the review-flagged correlation defect:
     // settling every earlier pending question off a single later reply had
     // no correlation to which question the reply actually addressed. `ask()`
     // has no lock preventing a second question from stacking before the
-    // first is answered, so this is a real, reachable state.
+    // first is answered, so this is a real, reachable state. Each question's
+    // bound reply control (Part 10 item 13e) names exactly which question it
+    // answers via `answersQuestionAt`, so this is now settled by explicit
+    // correlation rather than "the nearest one".
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -1287,7 +1339,12 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await provider.ask({ ...target, question: "First question?" }, true, false);
       await provider.ask({ ...target, question: "Second question?" }, true, false);
-      await provider.append("user", "answering the second one", "impl", target);
+      const beforeReply =
+        (lastState(fake)?.entries as Array<{ role: string; text: string; at: string; id?: string }> | undefined) ??
+        [];
+      const secondQuestion = beforeReply.find((e) => e.text.includes("Second question?"));
+      assert.ok(secondQuestion, "expected the second question to be in the transcript");
+      await provider.answerQuestion(target, secondQuestion.id ?? secondQuestion.at, "answering the second one", "impl");
 
       const entries =
         (lastState(fake)?.entries as Array<{ role: string; text: string; awaitingAnswer?: boolean }> | undefined) ??
@@ -1308,6 +1365,62 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         false,
         "no live task operation is registered — the still-unanswered older question renders its content (awaitingAnswer above) but must not assert the active waiting posture on its own"
       );
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("two questions sharing the same `at` timestamp are still settled independently by their own id", async () => {
+    // Regression coverage for the review-flagged collision defect: before
+    // `ChatMessage.id` existed, correlation was keyed solely by `entry.at`,
+    // so two questions posted within the same millisecond (a real,
+    // reachable case for two escalations raised back-to-back) would share a
+    // map key and a reply to either one would settle whichever question
+    // happened to occupy that key last. This seeds two `role: "question"`
+    // entries with an IDENTICAL `at` value but distinct `id`s directly via
+    // `writeChatHistory` (bypassing `ask()`'s own clock) to force the
+    // collision, then proves a reply naming one `id` settles only that one.
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      const sharedAt = new Date().toISOString();
+      await writeChatHistory(
+        folder,
+        [
+          { role: "question", text: "First question?", stage: "impl", at: sharedAt, pending: true, id: "question-one" },
+          { role: "question", text: "Second question?", stage: "impl", at: sharedAt, pending: true, id: "question-two" },
+        ],
+        folder
+      );
+
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForState(fake, (s) => (s.entries as unknown[] | undefined)?.length === 2);
+
+      let entries =
+        (lastState(fake)?.entries as Array<{ text: string; id?: string; awaitingAnswer?: boolean }> | undefined) ??
+        [];
+      assert.equal(entries[0]!.awaitingAnswer, true);
+      assert.equal(entries[1]!.awaitingAnswer, true);
+
+      await provider.answerQuestion(target, "question-two", "answering only the second one", "impl");
+
+      entries =
+        (lastState(fake)?.entries as Array<{ text: string; id?: string; awaitingAnswer?: boolean }> | undefined) ??
+        [];
+      assert.equal(
+        entries[0]!.awaitingAnswer,
+        true,
+        "the first question shares the second's `at` but a different `id`, and must stay awaiting"
+      );
+      assert.equal(entries[1]!.awaitingAnswer, false, "the second question is the one the reply named by id");
     } finally {
       notify.restore();
       cmds.restore();
@@ -1438,8 +1551,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       );
       assert.equal(lastState(fake)?.waitingForUserSource, undefined);
       const questionEntries =
-        (lastState(fake)?.entries as Array<{ role: string; text: string; awaitingAnswer?: boolean }> | undefined) ??
-        [];
+        (lastState(fake)?.entries as
+          | Array<{ role: string; text: string; at: string; id?: string; awaitingAnswer?: boolean }>
+          | undefined) ?? [];
       const askedEntry = questionEntries.find((e) => e.text.includes("Which way?"));
       assert.ok(askedEntry, "the question's content must still exist in the rendered transcript");
       assert.equal(askedEntry.awaitingAnswer, true, "the content must still show as awaiting an answer");
@@ -1448,7 +1562,8 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         undefined,
         "a persisted-only pending question must not light the view badge either"
       );
-      await provider.append("user", "This way.", "impl", target);
+      // Bound reply channel (Part 10 item 13e), not the shared send box.
+      await provider.answerQuestion(target, askedEntry.id ?? askedEntry.at, "This way.", "impl");
       await waitForState(fake, (s) => (s.entries as Array<{ awaitingAnswer?: boolean }> | undefined)?.[0]?.awaitingAnswer === false);
       assert.equal(lastState(fake)?.waitingForUser, false);
       assert.equal(lastState(fake)?.waitingForUserSource, undefined);
@@ -1799,10 +1914,11 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
  * own echo, a hand edit, a differently-sourced reconcile), the stored record
  * still reads "pending" — `listPending`'s fresh store read (PART 4, above)
  * only re-checks `state`, not whether the underlying claim is still true.
- * `withdrawStaleApplyReviewerVerifiedTicksDecisionsV1` (chatView.ts) re-derives
- * applicability against the CURRENT plan-final.md on every render and
- * withdraws (dismisses) a decision whose target items are already ticked,
- * rather than leaving a stale, now-no-op control in the panel.
+ * `withdrawStaleDecisionsV1` (chatView.ts) re-derives applicability against
+ * the CURRENT plan-final.md on every render and withdraws (item 13c: a
+ * system-determined `state: "withdrawn"`, distinct from a user `dismiss`) a
+ * decision whose target items are already ticked, rather than leaving a
+ * stale, now-no-op control in the panel.
  */
 void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision is re-checked against disk on render (wf10 item 6d)", () => {
   const REVIEW_WITH_VERIFIED_ITEM = [
@@ -1887,7 +2003,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
     }
   });
 
-  void it("is withdrawn (dismissed) on render once the named item is already ticked in plan-final.md", async () => {
+  void it("is withdrawn on render once the named item is already ticked in plan-final.md", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -1915,11 +2031,429 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
         !decisions.some((d) => d.decisionId === "decision-1"),
         "a decision whose target item is already ticked must not render as an actionable pending card"
       );
+      const stored = provider.workflowDecisionStore.get("decision-1");
       assert.equal(
-        provider.workflowDecisionStore.get("decision-1")?.state,
-        "dismissed",
+        stored?.state,
+        "withdrawn",
         "the stale decision must be withdrawn in the store, not just hidden from this one render"
       );
+      assert.ok(
+        stored?.withdrawnReason && stored.withdrawnReason.length > 0,
+        "a withdrawal must record why, distinct from a user dismiss which carries no reason"
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("posts a 'Withdrawn: ...' transcript line, visible on the NEXT render", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [x] Wire the completeness gate", ""].join("\n")
+      );
+      fs.writeFileSync(`${folder}/impl-high-review.md`, REVIEW_WITH_VERIFIED_ITEM);
+      const posted = await provider.workflowDecisionStore.post(applyTicksDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+      // The withdrawal write happens inside the render pass above, after
+      // `entries` for THAT pass was already captured — a second render picks
+      // up the freshly-appended message, exactly like any other transcript
+      // write that lands mid-render.
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForState(fake, (s) => {
+        const entries = (s.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+        return entries.some((e) => e.role === "assistant" && e.text.startsWith("Withdrawn: "));
+      });
+
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      assert.ok(
+        entries.some((e) => e.role === "assistant" && e.text.startsWith("Withdrawn: ")),
+        "expected a transcript line recording why the card was withdrawn"
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+/** Writes a minimal, strictly-decodable task-progress.json for `folder`,
+ * merging in `extra` on top of the same ownership-backed base
+ * `writeOwnershipBackedTaskProgress` (taskFolderFixture.ts) writes — reused
+ * here (rather than called directly) so a caller can also set `implRecovery`,
+ * `pendingImplReviewFiles` or `checklistChangeProposals`, none of which that
+ * shared helper's minimal shape carries. */
+function writeTaskProgressWithExtra(folder: string, extra: Record<string, unknown>): void {
+  const progress = {
+    taskFolder: folder.replace(/\\/g, "/").split("/").pop(),
+    currentStage: "impl-high-review",
+    status: "active",
+    createdAt: "2026-07-01T10:00:00.000Z",
+    updatedAt: "2026-07-02T11:30:00.000Z",
+    ownership: fixtureOwnershipFor(folder),
+    ...extra,
+  };
+  fs.writeFileSync(`${folder}/task-progress.json`, JSON.stringify(progress, null, 2), "utf8");
+}
+
+/**
+ * Part 11's transition-driven withdrawal for `restoreRejectedImplementationRound`:
+ * a "Keep this round's changes" / "Revert this round's changes" card is only
+ * defensible while there is still something restorable
+ * (`implementationRecoveryV1.ts`'s `offerRestoreOption` doc comment). If
+ * `implRecovery` has since been cleared or `pendingImplReviewFiles` is now
+ * empty, the choice the card offers no longer applies to anything, and
+ * `withdrawStaleDecisionsV1` (chatView.ts) re-checks this on every render.
+ */
+void describe("Chat With AI — a pending 'restoreRejectedImplementationRound' decision is re-checked against disk on render (Part 11)", () => {
+  function restoreDecisionInput(folder: string): CreateWorkflowDecisionInputV1 {
+    return decisionInput(folder, {
+      decisionKey: "restoreRejectedImplementationRound",
+      stage: "impl-high-review",
+      options: [
+        { optionId: "keep", label: "Keep this round's changes", consequence: "Does nothing.", effect: { kind: "doNothing" } },
+        {
+          optionId: "restore",
+          label: "Revert this round's changes",
+          consequence: "Restores the prior round's files.",
+          effect: { kind: "command", command: "vs-code-ai-helper.restoreRejectedImplementationRound", args: ["a", "b"] },
+        },
+      ],
+      recommendation: { kind: "option", optionId: "keep", reasoning: "The work is intact." },
+    });
+  }
+
+  void it("stays pending while implRecovery and pendingImplReviewFiles still name something restorable", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      writeTaskProgressWithExtra(folder, {
+        implRecovery: {
+          sourceAttemptId: "attempt-1",
+          reason: "test",
+          trigger: "roundIncomplete",
+          mode: "inspect-and-complete",
+          dispatch: "pending",
+          at: "2026-08-01T00:00:00.000Z",
+        },
+        pendingImplReviewFiles: ["src/example.ts"],
+      });
+      const posted = await provider.workflowDecisionStore.post(restoreDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "the decision must still render — there is genuinely something to restore"
+      );
+      assert.equal(provider.workflowDecisionStore.get("decision-1")?.state, "pending");
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("is withdrawn once implRecovery is cleared and pendingImplReviewFiles is empty", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      // No implRecovery, no pendingImplReviewFiles — simulates the
+      // continuation having already landed (or the round already reviewed)
+      // after this decision was posted.
+      writeTaskProgressWithExtra(folder, {});
+      const posted = await provider.workflowDecisionStore.post(restoreDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        !lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "a decision with nothing left to restore must not render as an actionable pending card"
+      );
+      const stored = provider.workflowDecisionStore.get("decision-1");
+      assert.equal(stored?.state, "withdrawn");
+      assert.ok(stored?.withdrawnReason && stored.withdrawnReason.length > 0);
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Part 11's transition-driven withdrawal for `checklistChangeProposed`: the
+ * card is only answerable while its own proposal row is still `"pending"` —
+ * once it has been discarded or adopted some other way, choosing an option on
+ * a stale copy of the card would act on a proposal that no longer exists in
+ * that state.
+ */
+void describe("Chat With AI — a pending 'checklistChangeProposed' decision is re-checked against disk on render (Part 11)", () => {
+  function proposalDecisionInput(folder: string): CreateWorkflowDecisionInputV1 {
+    return decisionInput(folder, {
+      decisionKey: "checklistChangeProposed",
+      stage: "impl",
+      options: [
+        {
+          optionId: "revise",
+          label: "Revise the plan",
+          consequence: "Starts a plan revision.",
+          effect: { kind: "command", command: "vs-code-ai-helper.reviseChecklistChangeProposalConfirmed", args: ["a"] },
+        },
+        {
+          optionId: "discard",
+          label: "Discard the proposal",
+          consequence: "Leaves the plan untouched.",
+          effect: { kind: "command", command: "vs-code-ai-helper.discardChecklistChangeProposalConfirmed", args: ["a"] },
+        },
+      ],
+      recommendation: { kind: "option", optionId: "revise", reasoning: "New work was discovered." },
+    });
+  }
+
+  void it("stays pending while its proposal row is still 'pending'", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      writeTaskProgressWithExtra(folder, {
+        currentStage: "impl",
+        checklistChangeProposals: [
+          {
+            at: "2026-08-01T00:00:00.000Z",
+            roundId: "round-1",
+            stage: "impl",
+            kind: "added",
+            proposedItems: ["- [ ] New step"],
+            removedItems: [],
+            status: "pending",
+          },
+        ],
+      });
+      const posted = await provider.workflowDecisionStore.post(proposalDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "the decision must still render — the proposal is genuinely still pending"
+      );
+      assert.equal(provider.workflowDecisionStore.get("decision-1")?.state, "pending");
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("is withdrawn once its proposal row is no longer 'pending' (discarded)", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      writeTaskProgressWithExtra(folder, {
+        currentStage: "impl",
+        checklistChangeProposals: [
+          {
+            at: "2026-08-01T00:00:00.000Z",
+            roundId: "round-1",
+            stage: "impl",
+            kind: "added",
+            proposedItems: ["- [ ] New step"],
+            removedItems: [],
+            status: "discarded",
+          },
+        ],
+      });
+      const posted = await provider.workflowDecisionStore.post(proposalDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        !lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "a decision whose proposal is already discarded must not render as an actionable pending card"
+      );
+      const stored = provider.workflowDecisionStore.get("decision-1");
+      assert.equal(stored?.state, "withdrawn");
+      assert.ok(stored?.withdrawnReason && stored.withdrawnReason.length > 0);
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Part 11's transition-driven withdrawal for `sterileRoundRouting` /
+ * `preImplementationRouting`: both recommend "Go to Review & Apply" from a
+ * snapshot of `decidePostReviewActionV1` taken when the round that posted
+ * them finished. If a LATER review clears the task-fixable blockers (or the
+ * checklist is completed, or a continuation becomes owed), the recommendation
+ * no longer describes the current tree — `withdrawStaleDecisionsV1` re-runs
+ * the same decision function fresh on every render rather than trusting the
+ * card's own frozen claim.
+ */
+void describe("Chat With AI — a pending 'sterileRoundRouting' decision is re-checked against disk on render (Part 11)", () => {
+  function sterileDecisionInput(folder: string): CreateWorkflowDecisionInputV1 {
+    return decisionInput(folder, {
+      decisionKey: "sterileRoundRouting",
+      stage: "impl-high-review",
+      options: [
+        {
+          optionId: "goToReviewAndApply",
+          label: "Go to Review & Apply",
+          consequence: "Moves the task to review and opens Apply Review.",
+          effect: {
+            kind: "command",
+            command: "vs-code-ai-helper.goToReviewAndApply",
+            args: [{ taskFolderPath: folder, reviewStage: "impl-high-review" }],
+          },
+        },
+        { optionId: "notNow", label: "Not now", consequence: "Does nothing.", effect: { kind: "doNothing" } },
+      ],
+      recommendation: { kind: "option", optionId: "goToReviewAndApply", reasoning: "Only Apply Review can fix this." },
+    });
+  }
+
+  void it("stays pending while the newest review still reports task-fixable blockers", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      writeTaskProgressWithExtra(folder, {
+        currentStage: "impl-high-review",
+        reviewScoreHistory: [
+          {
+            stage: "impl-high-review",
+            score: 6,
+            attemptId: "attempt-1",
+            at: "2026-08-01T00:00:00.000Z",
+            blockerCount: 2,
+            taskFixableCount: 2,
+          },
+        ],
+      });
+      const posted = await provider.workflowDecisionStore.post(sterileDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "the recommendation is still correct — the newest review still carries the blockers it was posted about"
+      );
+      assert.equal(provider.workflowDecisionStore.get("decision-1")?.state, "pending");
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("is withdrawn once a fresh review clears the task-fixable blockers it was posted about", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      writeTaskProgressWithExtra(folder, {
+        currentStage: "impl-high-review",
+        reviewScoreHistory: [
+          {
+            stage: "impl-high-review",
+            score: 6,
+            attemptId: "attempt-1",
+            at: "2026-08-01T00:00:00.000Z",
+            blockerCount: 2,
+            taskFixableCount: 2,
+          },
+          // A LATER round's review, landed after the decision was posted,
+          // clearing every task-fixable blocker.
+          {
+            stage: "impl-high-review",
+            score: 9,
+            attemptId: "attempt-2",
+            at: "2026-08-02T00:00:00.000Z",
+            blockerCount: 0,
+            taskFixableCount: 0,
+          },
+        ],
+      });
+      const posted = await provider.workflowDecisionStore.post(sterileDecisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      assert.ok(
+        !lastDecisions(fake).some((d) => d.decisionId === "decision-1"),
+        "a fresh review clearing the blockers must withdraw the now-stale recommendation"
+      );
+      const stored = provider.workflowDecisionStore.get("decision-1");
+      assert.equal(stored?.state, "withdrawn");
+      assert.ok(stored?.withdrawnReason && stored.withdrawnReason.length > 0);
     } finally {
       realFs.restore();
       notify.restore();

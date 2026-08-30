@@ -310,6 +310,53 @@ const AWAIT_ANSWER_DECISION_KEYS: ReadonlySet<string> = new Set([
   "quotaExhaustedDuringRun",
 ]);
 
+/**
+ * Withdraw every still-pending decision matching `decisionKey` for one task
+ * (Part 11, event-driven half of item 13c). The render-time safety net
+ * (`withdrawStaleDecisionsV1`, chatView.ts) re-derives and withdraws staleness
+ * on every render regardless of this call — this is the earlier signal,
+ * called from the exact mutation site that made a card stale, so the tree's
+ * `hasPendingDecision` token (and any other consumer of `listPending` that
+ * never opens the chat panel) does not keep reporting a decision as pending
+ * until the next render happens to run.
+ *
+ * Best-effort, matching `postWorkflowDecisionV1`'s own contract: if no
+ * extension context is available (e.g. a unit test), this is a silent no-op
+ * rather than a throw, and a rejected individual withdraw write is caught so
+ * one failure cannot abort withdrawing the rest of the matches.
+ */
+export async function withdrawWorkflowDecisionsByKeyV1(
+  target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
+  decisionKey: string,
+  reason: string
+): Promise<void> {
+  const context = getExtensionContextV1();
+  if (!context) {
+    return;
+  }
+  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const matches = store.listPending(target.canonicalId).filter((d) => d.decisionKey === decisionKey);
+  for (const decision of matches) {
+    try {
+      const result = await store.withdraw(decision.decisionId, reason);
+      if (result.kind === "withdrawn") {
+        // Same "Withdrawn: <reason>" acknowledgement the render-time safety
+        // net writes (chatView.ts's withdrawStaleDecisionsV1) — a card
+        // vanishing must never be a silent gap in the transcript regardless
+        // of which of the two paths caught the staleness first.
+        await appendChatMessageV1(target.taskFolderPath, {
+          role: "assistant",
+          text: `Withdrawn: ${reason}`,
+          stage: decision.stage,
+          at: new Date().toISOString(),
+        }, target.canonicalId).catch(() => undefined);
+      }
+    } catch (err) {
+      console.error(`Failed to withdraw workflow decision "${decision.decisionId}"`, err);
+    }
+  }
+}
+
 export async function dismissOrphanedAwaitedDecisionsV1(state: import("vscode").Memento): Promise<number> {
   const store = new WorkflowDecisionStoreV1(state);
   const orphaned = store.listPending().filter((decision) => AWAIT_ANSWER_DECISION_KEYS.has(decision.decisionKey));

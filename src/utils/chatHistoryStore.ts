@@ -279,6 +279,29 @@ export interface ChatMessage {
   /** The `WorkflowDecisionV1` id this message anchors, set together with
    * `kind: "decision"`. */
   decisionId?: string;
+  /**
+   * Set on a `role: "user"` message submitted through a pending question's
+   * OWN bound reply control (see `ChatViewProvider.answerQuestion`), never on
+   * a message sent through the shared chat-send box. Carries the target
+   * question's own `at` value — the correlation `computeAwaitingQuestionIndices`
+   * (chatView.ts) requires to settle that SPECIFIC question. An ordinary chat
+   * send has this field absent and therefore settles nothing: a plain
+   * follow-up message must never be silently interpreted as an answer to a
+   * pending question (wf "stage chat as a record of work" Part 10 item 13e).
+   */
+  answersQuestionAt?: string;
+  /**
+   * A stable, unique identifier assigned to a `role: "question"` message at
+   * creation time (review-flagged 2026-08-29: `answersQuestionAt` used to
+   * correlate solely by the question's own `at` ISO-timestamp, which two
+   * questions raised within the same millisecond — e.g. two escalations
+   * posted back-to-back — could share, silently binding a reply to the wrong
+   * pending question). When present, `answersQuestionAt` carries THIS value
+   * rather than `at`; absent only on questions persisted before this field
+   * existed, which keep resolving by `at` as before (never a regression,
+   * since that was already the only mechanism available to them).
+   */
+  id?: string;
 }
 
 /** The display-mirror states a structured-question interaction can be in (plan §5.1/§5.5). */
@@ -684,6 +707,20 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
     if (e.decisionId !== undefined && (typeof e.decisionId !== "string" || e.decisionId.length === 0)) {
       return undefined;
     }
+    if (
+      e.answersQuestionAt !== undefined &&
+      (typeof e.answersQuestionAt !== "string" || e.answersQuestionAt.length === 0)
+    ) {
+      // Was once required to parse as the target question's `at` ISO
+      // timestamp; it now also carries the question's stable `id` (see
+      // `ChatMessage.id`), which is not a date string, so only non-emptiness
+      // is checked — the actual match-or-no-match happens by equality in
+      // `computeAwaitingQuestionIndices`, never here.
+      return undefined;
+    }
+    if (e.id !== undefined && (typeof e.id !== "string" || e.id.length === 0)) {
+      return undefined;
+    }
     messages.push({
       role: e.role,
       text: e.text,
@@ -710,6 +747,8 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
       ...(typeof e.roundId === "string" ? { roundId: e.roundId } : {}),
       ...(typeof e.intentId === "string" ? { intentId: e.intentId } : {}),
       ...(typeof e.decisionId === "string" ? { decisionId: e.decisionId } : {}),
+      ...(typeof e.answersQuestionAt === "string" ? { answersQuestionAt: e.answersQuestionAt } : {}),
+      ...(typeof e.id === "string" ? { id: e.id } : {}),
     });
   }
   return messages;

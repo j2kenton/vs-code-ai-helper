@@ -27,7 +27,8 @@ import {
   STAGE_DISPLAY_NAMES,
   TaskStage,
 } from "../types/taskProgress";
-import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { normalizePath } from "../utils/taskRoot";
 import { WorkflowDecisionEvidenceItemV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
@@ -1986,6 +1987,17 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     );
     return;
   }
+  // Part 11 item 13c (event-driven half): this write is a second producer of
+  // exactly the tick-state change `applyReviewerVerifiedTicks`'s render-time
+  // safety net (`chatView.ts`'s `deriveApplicableVerifiedTicksV1` predicate)
+  // watches for — see `executeImplementationRun`'s own withdraw call at its
+  // merge-write site in `reviewActions.ts` for the sibling mutation this
+  // mirrors. Withdraw here rather than waiting for the next chat render.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+    "applyReviewerVerifiedTicks",
+    "plan-final.md's checklist ticks changed via reconciliation, superseding the pending tick-application card"
+  );
   await inventory.refresh();
   NotificationRouter.showInformation(
     `Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
