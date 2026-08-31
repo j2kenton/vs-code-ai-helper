@@ -1,3 +1,4 @@
+import * as vscode from "vscode";
 import { getExtensionContextV1 } from "./extensionContextV1";
 import {
   WorkflowDecisionStoreV1,
@@ -8,6 +9,67 @@ import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/work
 import { HandoffGatingV1 } from "../types/handoffGuidanceV1";
 import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
 import { appendChatMessageV1 } from "./chatHistoryStore";
+import { recommendationPreconditionsV1 } from "./recommendationPreconditionsV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+
+/**
+ * Apply `recommendationPreconditionsV1` to every option of a decision about
+ * to be posted, best-effort (task "stage chat as a record of work" item 14 /
+ * Part 12 step 34). A caller-supplied `disabled: true` is never overridden.
+ * If the read of `TaskProgress` fails (folder missing, decode failure — the
+ * same class of best-effort courtesy failure `postWorkflowDecisionV1` already
+ * tolerates for the chat-message projection), every option is left exactly
+ * as the caller supplied it: a courtesy check must never itself withhold an
+ * option that would in fact have worked.
+ */
+async function applyRecommendationPreconditionsV1(
+  input: PostWorkflowDecisionInputV1,
+  target: ChatTarget
+): Promise<PostWorkflowDecisionInputV1> {
+  let status: string | undefined;
+  try {
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+    if (read.ok) {
+      status = read.decoded.progress.status;
+    }
+  } catch {
+    // Best-effort: leave options exactly as supplied.
+  }
+  if (status === undefined) {
+    return input;
+  }
+  const options = input.options.map((option) => {
+    if (option.disabled === true) {
+      return option;
+    }
+    const result = recommendationPreconditionsV1(option.effect, { status });
+    if (!result.blocked) {
+      return option;
+    }
+    return { ...option, disabled: true, disabledReason: result.reason };
+  });
+  // A recommendation that now points at an option this pass just disabled
+  // (the caller chose it before this state was known) is downgraded to an
+  // explicit "no recommendation" rather than posted — the same
+  // "never recommend a known-wrong option" rule item 10 established,
+  // applied here to an option disabled by state rather than one that was
+  // always wrong.
+  if (input.recommendation.kind === "option") {
+    const recommendedOptionId = input.recommendation.optionId;
+    const stillRecommendable = options.find((o) => o.optionId === recommendedOptionId);
+    if (stillRecommendable?.disabled === true) {
+      return {
+        ...input,
+        options,
+        recommendation: {
+          kind: "none",
+          reasoning: `The recommended option is currently unavailable — ${stillRecommendable.disabledReason}.`,
+        },
+      };
+    }
+  }
+  return { ...input, options };
+}
 
 /**
  * Backoff schedule for `retryOrphanDismissV1`'s background retries of a
@@ -123,10 +185,11 @@ export async function postWorkflowDecisionV1(
   if (!context) {
     return undefined;
   }
+  const preconditioned = await applyRecommendationPreconditionsV1(input, target);
   const store = new WorkflowDecisionStoreV1(context.workspaceState);
   const result = await store.post({
-    ...input,
-    decisionId: input.decisionId ?? crypto.randomUUID(),
+    ...preconditioned,
+    decisionId: preconditioned.decisionId ?? crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   });
   if (!result.ok) {

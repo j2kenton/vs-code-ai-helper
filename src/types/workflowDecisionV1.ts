@@ -44,6 +44,22 @@ export interface WorkflowDecisionOptionV1 {
   /** True when this option discards work or is otherwise hard to reverse. */
   readonly destructive?: boolean;
   readonly effect: WorkflowDecisionOptionEffectV1;
+  /**
+   * Set when the system already knows, at creation time, that this option's
+   * effect will refuse if chosen right now (task "stage chat as a record of
+   * work" item 14 / Part 12: "never render an option the system already
+   * knows is wrong for the situation at hand" — the same rule item 10
+   * established for options that can never help, extended here to options
+   * that CAN help but cannot currently run). A disabled option is still
+   * shown (so the user can see it exists and why it is unavailable) but
+   * cannot be selected and — enforced below — can never be the
+   * recommendation. `recommendationPreconditionsV1`
+   * (`src/utils/recommendationPreconditionsV1.ts`) is the shared precondition
+   * check `postWorkflowDecisionV1` runs against every option before posting.
+   */
+  readonly disabled?: boolean;
+  /** Required when `disabled` is true — why, e.g. "resume the task first". */
+  readonly disabledReason?: string;
 }
 
 /** Either a specific recommended option with its reasoning, or an explicit "no basis to recommend". */
@@ -170,6 +186,9 @@ function validateOption(option: WorkflowDecisionOptionV1, index: number): string
   if (option.effect.kind === "command" && !isNonEmptyString(option.effect.command)) {
     return `option "${option.optionId}" has a "command" effect missing a non-empty command id`;
   }
+  if (option.disabled === true && !isNonEmptyString(option.disabledReason)) {
+    return `disabled option "${option.optionId}" must state a non-empty "disabledReason"`;
+  }
   return undefined;
 }
 
@@ -217,6 +236,13 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       return {
         ok: false,
         reason: `recommendation references unknown option "${recommendation.optionId}"`,
+      };
+    }
+    const recommendedOption = input.options.find((o) => o.optionId === recommendation.optionId);
+    if (recommendedOption?.disabled === true) {
+      return {
+        ok: false,
+        reason: `recommendation references disabled option "${recommendation.optionId}" — a known-unavailable option can never be recommended`,
       };
     }
     if (!isNonEmptyString(recommendation.reasoning)) {

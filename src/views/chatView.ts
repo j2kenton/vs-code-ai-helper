@@ -2372,6 +2372,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-option { display: block; margin: var(--ensemble-space-2) 0; }
         .decision-option-consequence { margin: 0 0 0 1.5em; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
         .decision-option-destructive { color: var(--vscode-inputValidation-errorForeground); font-weight: bold; }
+        .decision-option-disabled { opacity: 0.6; cursor: not-allowed; }
+        .decision-option-disabled-reason { margin: 0 0 0 1.5em; font-size: 0.9em; font-style: italic; color: var(--vscode-inputValidation-warningForeground, var(--vscode-descriptionForeground)); }
         .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--vscode-descriptionForeground); }
         .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--vscode-descriptionForeground); }
         .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
@@ -2579,11 +2581,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const groupName='decision-'+dcs.decisionId;
           const radios=[];
           for(const opt of dcs.options){
-            const optWrap=document.createElement('label'); optWrap.className='decision-option';
+            const optWrap=document.createElement('label'); optWrap.className='decision-option'+(opt.disabled?' decision-option-disabled':'');
             const radio=document.createElement('input'); radio.type='radio'; radio.name=groupName; radio.value=opt.optionId;
+            if(opt.disabled){ radio.disabled=true; }
             radios.push(radio);
             optWrap.appendChild(radio);
-            const isRecommended=dcs.recommendation.kind==='option' && dcs.recommendation.optionId===opt.optionId;
+            // A disabled option is never the recommendation — enforced at
+            // creation time (createWorkflowDecisionV1) — so this branch is
+            // unreachable for a disabled option, kept as belt-and-suspenders.
+            const isRecommended=!opt.disabled && dcs.recommendation.kind==='option' && dcs.recommendation.optionId===opt.optionId;
             const labelText=document.createElement('span');
             labelText.textContent=' '+opt.label+(isRecommended?' (Recommended)':'');
             if(opt.destructive){ labelText.appendChild(document.createTextNode(' ')); const warn=document.createElement('span'); warn.className='decision-option-destructive'; warn.textContent='⚠ irreversible'; labelText.appendChild(warn); }
@@ -2591,6 +2597,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const consequence=document.createElement('div'); consequence.className='decision-option-consequence';
             consequence.textContent=opt.consequence;
             optWrap.appendChild(consequence);
+            if(opt.disabled){
+              const why=document.createElement('div'); why.className='decision-option-disabled-reason';
+              why.textContent='Unavailable — '+(opt.disabledReason||'this option cannot run right now')+'.';
+              optWrap.appendChild(why);
+            }
             card.appendChild(optWrap);
           }
           const rec=document.createElement('div'); rec.className='decision-recommendation';

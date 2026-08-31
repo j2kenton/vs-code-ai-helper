@@ -1,0 +1,72 @@
+{
+  "$schema": "n/a — read by scripts/verifyToastAllowlistV1.mjs",
+  "mode": "enforcing",
+  "note": "Every vscode.window.showInformationMessage/showWarningMessage call under src/ that offers MORE THAN ONE button must either be converted to a WorkflowDecisionV1/StructuredQuestionV1 posted in the chat, or be listed here with a reason it genuinely is NOT a workflow decision (task 'stage chat as a record of work', item 13 / Part 12 step 35e). A single-button call never needs an entry — the lint only flags calls that ask the user to choose between options. Entries are keyed by file:line, so a line-number drift on an untouched call is expected to surface as a stale entry on the next run — update the line, do not delete the entry, unless the call itself was removed or reduced to one button.",
+  "entries": [
+    {
+      "file": "src/commands/commitAndPushTask.ts",
+      "line": 293,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision."
+    },
+    {
+      "file": "src/commands/commitAndPushTask.ts",
+      "line": 1744,
+      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round."
+    },
+    {
+      "file": "src/commands/commitAndPushTask.ts",
+      "line": 2138,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push."
+    },
+    {
+      "file": "src/commands/reviewActions.ts",
+      "line": 6543,
+      "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round."
+    },
+    {
+      "file": "src/commands/reviewActions.ts",
+      "line": 7690,
+      "reason": "Pre-run safety check synchronously inline in the user-invoked 'Run Implementation' command (unrelated uncommitted changes in the workspace) — a git-safety confirmation, not a review/round outcome."
+    },
+    {
+      "file": "src/commands/runLintingFixes.ts",
+      "line": 472,
+      "reason": "Pre-run safety check synchronously inline in the user-invoked 'AI final fixes' command, mirroring reviewActions.ts:7690 for the same git-safety concern in a different entry point."
+    },
+    {
+      "file": "src/extension.ts",
+      "line": 1026,
+      "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision."
+    },
+    {
+      "file": "src/utils/aiConsent.ts",
+      "line": 50,
+      "reason": "The one-time legal/usage disclaimer gate shown before the very first AI command of a session — modal by design, and 'View Disclaimer' loops back rather than branching workflow state. Not a task decision."
+    },
+    {
+      "file": "src/utils/metaResourcesMigration.ts",
+      "line": 365,
+      "reason": "One-time workspace housekeeping offer (move a legacy resource folder to .ensemble) shown at most once per workspace, unrelated to any task's review/round workflow."
+    },
+    {
+      "file": "src/utils/promptSizeGuard.ts",
+      "line": 72,
+      "reason": "Direct synchronous pre-dispatch size warning inline in whichever command is about to send an oversized prompt — a cost/quota guard on the calling command's own flow, not a review/round outcome to record in chat."
+    },
+    {
+      "file": "src/runners/copilotImplementationRunner.ts",
+      "line": 794,
+      "reason": "Fallback of the already-migrated round-limit gate (see the awaitWorkflowDecisionAnswerV1 call a few lines above) for the one case with no task to attribute a chat decision to (no taskFolderUri/stage in scope). The task-scoped path never reaches this line."
+    },
+    {
+      "file": "src/config/settings.ts",
+      "line": 327,
+      "reason": "Activation-time notice that workspace and user settings values differ, offering to reconcile them — a settings-hygiene notice unrelated to any task's review/round workflow, and not gating task progress."
+    },
+    {
+      "file": "src/views/settingsView.ts",
+      "line": 619,
+      "reason": "Settings-view notice about leftover per-task model overrides from a superseded configuration shape, offering to clear them — settings hygiene, not a task workflow decision."
+    }
+  ]
+}

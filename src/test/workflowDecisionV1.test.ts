@@ -111,6 +111,42 @@ void describe("createWorkflowDecisionV1", () => {
     if (!result.ok) {assert.match(result.reason, /duplicate option id/);}
   });
 
+  void it("rejects a disabled option with no disabledReason", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({ options: [option({ disabled: true })] })
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {assert.match(result.reason, /disabledReason/);}
+  });
+
+  void it("accepts a disabled option that states its disabledReason, alongside an enabled recommended option", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({
+        options: [
+          option(),
+          option({ optionId: "other", disabled: true, disabledReason: "resume the task first" }),
+        ],
+      })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      const disabledOption = result.decision.options.find((o) => o.optionId === "other");
+      assert.equal(disabledOption?.disabled, true);
+      assert.equal(disabledOption?.disabledReason, "resume the task first");
+    }
+  });
+
+  void it("rejects a recommendation that references a disabled option", () => {
+    const result = createWorkflowDecisionV1(
+      validInput({
+        options: [option({ disabled: true, disabledReason: "resume the task first" })],
+        recommendation: { kind: "option", optionId: "doIt", reasoning: "It is the only option." },
+      })
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {assert.match(result.reason, /disabled option/);}
+  });
+
   void it("rejects a recommendation that references an unknown option", () => {
     const result = createWorkflowDecisionV1(
       validInput({ recommendation: { kind: "option", optionId: "doesNotExist", reasoning: "n/a" } })
