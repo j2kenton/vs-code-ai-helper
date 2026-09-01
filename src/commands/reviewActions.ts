@@ -10065,7 +10065,23 @@ export async function runImplementationWithAI(
     );
     return;
   }
-  const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
+  // Review blocker 2026-09-01 (Part 15 / Step 40 narrowed): a claimed
+  // continuation (an owed `implRecovery` record — including the dirty-tree
+  // `providerFailedMidRound` hand-off, which records the selected backup as
+  // this stage's sticky fallback via `recordActiveFallbackModel` just before
+  // scheduling this exact dispatch) is not "a fresh user-invoked run".
+  // `resolveFreshModelForStage`'s own doc comment says it always resets to
+  // the primary and clears any active fallback reservation — calling it here
+  // unconditionally silently discarded the hand-off's backup selection and
+  // retried the same primary the hand-off exists to get away from. Mirrors
+  // the identical `preserveActiveFallback` ternary used by
+  // `applyImplementationReviewWithAI` (`resolveModelForStage` honors
+  // `fallbackActive`/`fallbackModelId`; `resolveFreshModelForStage` does not).
+  // A fresh manual run (no owed continuation) is unaffected.
+  const continuationOwedAtEntry = resolved.progress.implRecovery !== undefined;
+  const model = continuationOwedAtEntry
+    ? await resolveModelForStage(resolved.folderUri, "impl")
+    : await resolveFreshModelForStage(resolved.folderUri, "impl");
   const editAvailability = await checkEditActionAvailabilityV1({
     workspaceFsPath: workspaceRoot.uri.fsPath,
     stageModelId: model.modelId,

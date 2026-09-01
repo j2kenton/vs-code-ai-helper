@@ -474,6 +474,12 @@ interface HarnessRun {
   /** Prompts the fake provider boundary was invoked with. */
   prompts: string[];
   /**
+   * The `modelId` the fake provider boundary (`runImplementationOrSealedV1`)
+   * was actually invoked with, one entry per edit-mode dispatch — the direct
+   * proof of which model a continuation resolved to (Part 15 / Step 40).
+   */
+  dispatchedModelIds: string[];
+  /**
    * Prompts the fake TEXT-MODE continuation dispatch
    * (`runSummaryOnlyContinuationV1`) was invoked with — a summary-only
    * continuation must land here, never in `prompts` (the edit path).
@@ -550,6 +556,19 @@ interface HarnessOptions {
    * exercised against the real production write path.
    */
   mutatePlanFinalDuringRound?: string;
+  /**
+   * Review blocker 2026-09-01 (Part 15 / Step 40, narrowed): by default this
+   * harness stubs `resolveFreshModelForStage` to a fixed "cli:test-model" so
+   * every OTHER test here is indifferent to real model-settings/fallback
+   * state. That stub also silently absorbed the exact defect under test — a
+   * claimed continuation calling `resolveFreshModelForStage` (which always
+   * resets to the primary) instead of `resolveModelForStage` (which honors a
+   * sticky `fallbackActive`/`fallbackModelId` reservation) — because the stub
+   * returned the same id either way. Setting this lets a test leave BOTH
+   * functions real, so the actual model-settings/task-progress state on disk
+   * decides which model is dispatched.
+   */
+  preserveRealModelResolution?: boolean;
 }
 
 async function runHarnessed(
@@ -570,6 +589,7 @@ async function runHarnessed(
   const run: HarnessRun = {
     dispatches: [],
     prompts: [],
+    dispatchedModelIds: [],
     textPrompts: [],
     pendingAtRunLogWrite: [],
     recoveryAtRunLogWrite: [],
@@ -605,8 +625,11 @@ async function runHarnessed(
     }),
     patch(runEditActionModule, "checkEditActionProviderPathGateV1", () => Promise.resolve({ ok: true })),
     patch(runEditActionModule, "checkEditActionAvailabilityV1", () => Promise.resolve({ ok: true })),
-    patch(runEditActionModule, "runImplementationOrSealedV1", (options: { prompt: string }) => {
+    patch(runEditActionModule, "runImplementationOrSealedV1", (options: { prompt: string; modelId?: string }) => {
       run.prompts.push(options.prompt);
+      if (options.modelId !== undefined) {
+        run.dispatchedModelIds.push(options.modelId);
+      }
       if (harnessOptions.mutatePlanFinalDuringRound !== undefined) {
         fs.writeFileSync(path.join(folderPath, "plan-final.md"), harnessOptions.mutatePlanFinalDuringRound, "utf8");
       }
@@ -630,8 +653,12 @@ async function runHarnessed(
         return Promise.resolve(harnessOptions.textResult);
       }
     ),
-    patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-      Promise.resolve({ modelId: "cli:test-model", source: "task" })),
+    ...(harnessOptions.preserveRealModelResolution
+      ? []
+      : [
+          patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+            Promise.resolve({ modelId: "cli:test-model", source: "task" })),
+        ]),
     patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
       Promise.resolve({ availability: { available: true }, providerLabel: "Test CLI" })),
     patch(contextPackModule, "generateContextPack", () => Promise.resolve("ctx")),
@@ -950,6 +977,130 @@ void describe("Apply Review continuation reconstruction (item 17b, fail-closed)"
       run.notifications.some((n) => /could not be reconstructed/.test(n.message)),
       `expected a reconstruction-failure warning; got: ${JSON.stringify(run.notifications)}`
     );
+  });
+});
+
+/**
+ * Review blocker 2026-09-01 (Part 15 / Step 40, narrowed): `runnerRegistry.ts`'s
+ * dirty-tree hand-off records the selected backup as this stage's sticky
+ * fallback (`fallbackActive`/`fallbackModelId`) and schedules a claimed
+ * continuation via the SAME `vs-code-ai-helper.runImplementationWithAI`
+ * command every other continuation uses — but that command resolved its model
+ * through `resolveFreshModelForStage`, which always resets to the configured
+ * primary and clears any active fallback reservation. The hand-off's backup
+ * selection was therefore recorded durably and then silently discarded the
+ * moment the continuation actually ran, so the continuation retried the same
+ * primary the hand-off exists to get away from.
+ *
+ * This drives the REAL `runImplementationWithAI` → model-resolution path
+ * (both `resolveFreshModelForStage` and `resolveModelForStage` left
+ * unstubbed, via `preserveRealModelResolution`) against a task whose
+ * persisted state is exactly what the dirty-tree hand-off writes — an owed
+ * `implRecovery` continuation plus a sticky `fallbackActive`/`fallbackModelId`
+ * reservation naming the backup — and asserts the dispatched model is the
+ * recorded backup, not the stage's configured primary.
+ */
+void describe("Part 15 / Step 40: a claimed dirty-tree hand-off continuation resolves to the recorded backup", () => {
+  void it("runImplementationWithAI honors a sticky fallbackActive/fallbackModelId reservation instead of resetting to the primary", async () => {
+    const { folderPath, progress } = makeTaskFolder(
+      "dirty_tree_handoff_continuation_resolves_backup",
+      {
+        pendingImplReviewFiles: ["src/mutated-by-partial-run.ts"],
+        implRecovery: {
+          sourceAttemptId: "impl-recovery-dirty-tree-handoff",
+          reason: "service temporarily unavailable",
+          trigger: "providerFailedMidRound",
+          mode: "inspect-and-complete",
+          dispatch: "pending",
+          at: "2026-01-02T00:00:00.000Z",
+        },
+        fallbackActive: { impl: true },
+        fallbackModelId: { impl: "claude-cli:sonnet" },
+      }
+    );
+
+    const modelSettings = installModelSettingsOverrideV1({
+      impl: {
+        primary: "codex-cli:gpt-5.6",
+        backups: ["claude-cli:sonnet"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const run = await runHarnessed(
+        folderPath,
+        progress,
+        {
+          status: "completed",
+          filesChanged: ["src/mutated-by-partial-run.ts"],
+          filesChangedUnknown: false,
+          summary: GOOD_SUMMARY,
+          runnerId: "claude-cli",
+          providerLabel: "Claude Code",
+          storedModelId: "claude-cli:sonnet",
+        },
+        { preserveRealModelResolution: true }
+      );
+
+      assert.equal(run.prompts.length, 1, "the continuation must actually dispatch");
+      assert.deepEqual(
+        run.dispatchedModelIds,
+        ["claude-cli:sonnet"],
+        "the claimed continuation must dispatch the sticky backup the dirty-tree hand-off recorded, " +
+          `not reset to the stage's configured primary; got ${JSON.stringify(run.dispatchedModelIds)}`
+      );
+    } finally {
+      modelSettings.restore();
+    }
+  });
+
+  void it("a fresh (non-continuation) manual run still resets to the configured primary, ignoring a stale fallback reservation", async () => {
+    // Control case: no `implRecovery` present, so `continuationOwedAtEntry`
+    // is false and the pre-existing `resolveFreshModelForStage` behavior
+    // (always reset to primary, clearing any stale reservation) must be
+    // unaffected by this fix — a plain "click Run Implementation" must never
+    // be redirected to a leftover fallback from an earlier, unrelated round.
+    const { folderPath, progress } = makeTaskFolder(
+      "fresh_manual_run_ignores_stale_fallback",
+      {
+        currentStage: "impl",
+        fallbackActive: { impl: true },
+        fallbackModelId: { impl: "claude-cli:sonnet" },
+      }
+    );
+
+    const modelSettings = installModelSettingsOverrideV1({
+      impl: {
+        primary: "codex-cli:gpt-5.6",
+        backups: ["claude-cli:sonnet"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const run = await runHarnessed(
+        folderPath,
+        progress,
+        {
+          status: "completed",
+          filesChanged: ["src/new-work.ts"],
+          filesChangedUnknown: false,
+          summary: GOOD_SUMMARY,
+          runnerId: "codex-cli",
+          providerLabel: "Codex",
+          storedModelId: "codex-cli:gpt-5.6",
+        },
+        { preserveRealModelResolution: true }
+      );
+
+      assert.equal(run.prompts.length, 1, "the fresh run must actually dispatch");
+      assert.deepEqual(
+        run.dispatchedModelIds,
+        ["codex-cli:gpt-5.6"],
+        `a fresh manual run with no owed continuation must reset to the configured primary; got ${JSON.stringify(run.dispatchedModelIds)}`
+      );
+    } finally {
+      modelSettings.restore();
+    }
   });
 });
 

@@ -88,7 +88,7 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10145,
+      "line": 10161,
       "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision."
     },
     {
