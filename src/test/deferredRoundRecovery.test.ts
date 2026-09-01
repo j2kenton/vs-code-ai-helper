@@ -49,6 +49,7 @@ import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   MAX_ROUND_OUTCOMES,
   REVIEW_STAGES,
+  RoundLedgerEntryV1,
   TaskProgress,
   TaskStage,
 } from "../types/taskProgress";
@@ -1097,6 +1098,111 @@ void describe("Part 15 / Step 40: a claimed dirty-tree hand-off continuation res
         run.dispatchedModelIds,
         ["codex-cli:gpt-5.6"],
         `a fresh manual run with no owed continuation must reset to the configured primary; got ${JSON.stringify(run.dispatchedModelIds)}`
+      );
+    } finally {
+      modelSettings.restore();
+    }
+  });
+
+  /**
+   * Review blocker 2026-09-01 (Part 15 / Step 40, narrowed further): the two
+   * tests above prove the continuation DISPATCHES the recorded backup, but
+   * neither asserts the durable round-ledger linkage the plan's own test
+   * bullet requires — that the claimed continuation's `roundLedger` row
+   * carries `mode: "continuation"` with `continuationOf` pointing back at the
+   * source round, and that the source round's own row still names the mode it
+   * was actually dispatched under (the "source mode"). Seeds a task whose
+   * `roundLedger` already holds a TERMINAL source row exactly as
+   * `beginImplementationRecoveryV1` would have written it for the dirty-tree
+   * hand-off (state "failed", `outcome.continuationOwed: true`, `mode:
+   * "implementation"`), with `implRecovery.sourceRoundId` naming that row —
+   * then drives the same real `runImplementationWithAI` claim path
+   * (`claimImplRecoveryDispatchV1`) used above and inspects the persisted
+   * ledger afterward.
+   */
+  void it("the claimed continuation's round-ledger row links back to the terminal source round and preserves its mode", async () => {
+    const sourceRoundId = "impl-recovery-dirty-tree-handoff-source";
+    const sourceLedgerRow: RoundLedgerEntryV1 = {
+      roundId: sourceRoundId,
+      attemptIds: [sourceRoundId],
+      stage: "impl",
+      mode: "implementation",
+      startedAt: "2026-01-01T23:55:00.000Z",
+      state: "failed",
+      endedAt: "2026-01-02T00:00:00.000Z",
+      outcome: {
+        filesChanged: ["src/mutated-by-partial-run.ts"],
+        rejectionReason: "service temporarily unavailable",
+        continuationOwed: true,
+      },
+    };
+    const { folderPath, progress } = makeTaskFolder(
+      "dirty_tree_handoff_ledger_linkage",
+      {
+        roundLedger: [sourceLedgerRow],
+        pendingImplReviewFiles: ["src/mutated-by-partial-run.ts"],
+        implRecovery: {
+          sourceAttemptId: sourceRoundId,
+          sourceRoundId,
+          reason: "service temporarily unavailable",
+          trigger: "providerFailedMidRound",
+          mode: "inspect-and-complete",
+          dispatch: "pending",
+          at: "2026-01-02T00:00:00.000Z",
+        },
+        fallbackActive: { impl: true },
+        fallbackModelId: { impl: "claude-cli:sonnet" },
+      }
+    );
+
+    const modelSettings = installModelSettingsOverrideV1({
+      impl: {
+        primary: "codex-cli:gpt-5.6",
+        backups: ["claude-cli:sonnet"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      await runHarnessed(
+        folderPath,
+        progress,
+        {
+          status: "completed",
+          filesChanged: ["src/mutated-by-partial-run.ts"],
+          filesChangedUnknown: false,
+          summary: GOOD_SUMMARY,
+          runnerId: "claude-cli",
+          providerLabel: "Claude Code",
+          storedModelId: "claude-cli:sonnet",
+        },
+        { preserveRealModelResolution: true }
+      );
+
+      const persisted = readProgress(folderPath);
+      const ledger = persisted?.roundLedger ?? [];
+
+      const stillHasSourceRow = ledger.find((row) => row.roundId === sourceRoundId);
+      assert.ok(stillHasSourceRow, "the terminal source row must survive the continuation claim");
+      assert.equal(
+        stillHasSourceRow?.mode,
+        "implementation",
+        "the source row's own mode — what it was actually dispatched as — must never be overwritten " +
+          "by the continuation that claims it"
+      );
+      assert.equal(stillHasSourceRow?.state, "failed");
+
+      const continuationRow = ledger.find(
+        (row) => row.roundId !== sourceRoundId && row.continuationOf === sourceRoundId
+      );
+      assert.ok(
+        continuationRow,
+        `expected a ledger row linked back to the source round via continuationOf; got ${JSON.stringify(ledger)}`
+      );
+      assert.equal(
+        continuationRow?.mode,
+        "continuation",
+        "the claimed continuation's own row must be recorded as mode: continuation, distinct from the " +
+          "source round's own dispatch mode"
       );
     } finally {
       modelSettings.restore();

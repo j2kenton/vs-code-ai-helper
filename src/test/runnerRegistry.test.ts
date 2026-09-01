@@ -2515,6 +2515,320 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // Review blocker 2026-09-01 (Part 15 / Step 40, narrowed): the two hand-off
+  // tests above only ever fail the PRIMARY. Neither proves what happens when
+  // the BACKUP a hand-off just dispatched into (as its own scheduled
+  // `inspect-and-complete` continuation) itself later fails mid-round on a
+  // dirty tree — the plan's own test bullet requires that case to "fall to
+  // the next chain entry or stop with the never-switch sentence", not loop or
+  // dispatch a stale identity. `runImplementationForModel`'s hand-off branch
+  // is generic over `options.modelId` (it excludes only that one id from the
+  // backup search, never accumulating a "already tried" set beyond it), so
+  // calling it directly with `modelId` set to the FIRST backup reproduces
+  // exactly the shape a claimed continuation would present when it fails
+  // again: this test proves that case hands off a SECOND time to the next
+  // configured backup, never invoking it inline against the now-doubly-dirty
+  // tree, and never getting stuck retrying the same identity.
+  void it("hands off to the NEXT configured backup when a backup itself fails mid-round on a dirty tree", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-second-handoff-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-backup-one.txt");
+    let codexInvokedWithRealWork = false;
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5559 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        // Both "cline" (the model under test here) and "codex" (the next
+        // configured backup) report as installed, so the hand-off's
+        // availability check finds codex a real, selectable candidate.
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      if (command === "cline") {
+        // This model is itself already running as a claimed continuation
+        // (a prior hand-off's backup) — it writes a real file, then reports
+        // its own cascade-eligible failure.
+        process.nextTick(() => {
+          fs.writeFileSync(mutatedFile, "partial edit from a backup that itself then failed");
+          child.stdout?.emit(
+            "data",
+            Buffer.from(
+              `${JSON.stringify({ type: "error", message: "service temporarily unavailable" })}\n`
+            )
+          );
+          child.emit("close", 1);
+        });
+        return child;
+      }
+
+      // "codex" must never be dispatched to do real work here — only its
+      // availability (`which`/`where.exe`) may be probed, handled above.
+      codexInvokedWithRealWork = true;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          // This model is already the stage's active sticky fallback, as a
+          // prior hand-off would have left it — the exact starting state a
+          // claimed continuation for "cline-cli:default" actually runs under.
+          fallbackActive: { impl: true },
+          fallbackModelId: { impl: "cline-cli:default" },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const chainPatch = patchModule(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> =>
+      Promise.resolve(true)
+    );
+    const routerPatch = installNoopNotificationRouterV1();
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backups: ["cline-cli:default", "codex-cli:default"],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          codexInvokedWithRealWork,
+          false,
+          "the next backup must never be invoked INLINE against the tree the failing backup already edited"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.ok(
+          result.filesChanged.includes("mutated-by-backup-one.txt"),
+          "expected the failing backup's own file write to survive in the reported filesChanged list"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /handed the work to (OpenAI Codex|Codex)/,
+          "expected the failure message to name the NEXT backup in the chain, not stop or repeat the same one"
+        );
+
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          pendingImplReviewFiles?: string[];
+          implRecovery?: { trigger?: string; mode?: string; dispatch?: string };
+        };
+        assert.strictEqual(
+          progress.fallbackActive?.impl,
+          true,
+          "the second hand-off must keep the stage's sticky fallback active"
+        );
+        assert.strictEqual(
+          progress.fallbackModelId?.impl,
+          "codex-cli:default",
+          "the sticky fallback must move on to the NEXT chain entry, not stay pinned on the backup that just failed"
+        );
+        assert.ok(
+          progress.pendingImplReviewFiles?.includes("mutated-by-backup-one.txt"),
+          "expected the failing backup's own edits to be quarantined for the next continuation round"
+        );
+        assert.strictEqual(progress.implRecovery?.trigger, "providerFailedMidRound");
+        assert.strictEqual(progress.implRecovery?.mode, "inspect-and-complete");
+        assert.strictEqual(progress.implRecovery?.dispatch, "pending");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      routerPatch.restore();
+      chainPatch.restore();
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Sibling of the two hand-off tests above: when a backup fails mid-round on
+  // a dirty tree and NO further backup remains in the chain, the mechanism
+  // must stop with the same never-switch/withheld-switch sentence the
+  // primary-with-no-backup case uses — never loop, never silently drop the
+  // failure. Single-backup chain, so once "cline" (the model under test,
+  // itself already a claimed continuation) fails dirty there is nothing left
+  // to hand off to.
+  void it("stops with the withheld-switch sentence when a backup fails mid-round on a dirty tree with no further backup configured", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-second-handoff-exhausted-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-backup-one.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5560 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a backup that itself then failed");
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({ type: "error", message: "service temporarily unavailable" })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          fallbackActive: { impl: true },
+          fallbackModelId: { impl: "cline-cli:default" },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backups: ["cline-cli:default"],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.match(
+          result.errorMessage ?? "",
+          /withheld the automatic switch/,
+          "with no further chain entry available, the second failure must stop with the same " +
+            "withheld-switch sentence the no-backup case uses"
+        );
+
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          implRecovery?: unknown;
+        };
+        assert.strictEqual(
+          progress.implRecovery,
+          undefined,
+          "no further backup was available, so no second recovery continuation should be recorded"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
   // Plan Part 14 (item 8, "stage chat as a record of work"): the withheld-
   // switch explanation used to be attached only inside the non-auth branches
   // of this same guard, so an authentication failure that ALSO classifies
