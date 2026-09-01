@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -126,14 +126,36 @@ void test("capImplReviewFilesV1 keeps only the newest N files over the cap", () 
   assert.deepEqual(capped, files.slice(0, 40));
 });
 
-void test("capImplReviewFilesV1 preserves a blocker-named path outside the recency window", () => {
+void test("capImplReviewFilesV1 preserves a blocker-named path outside the recency window without exceeding the cap", () => {
   const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
   const capped = capImplReviewFilesV1(files, new Set(["f44.ts"]), 40);
   // f44.ts is the OLDEST file (last in the most-recent-first list) and would
-  // normally be evicted — it survives because a blocker names it, which can
-  // leave the result over the nominal cap.
-  assert.equal(capped.length, 41);
+  // normally be evicted — it survives because a blocker names it, DISPLACING
+  // a recency-only entry rather than growing the result past the cap
+  // (2026-08-29 review, completion blocker: "eviction can exceed 40
+  // entries").
+  assert.equal(capped.length, 40);
   assert.ok(capped.includes("f44.ts"));
+  // f44 takes one of the 40 slots as a preserved path, so only 39 of the
+  // remaining 44 recency-only entries (f0..f38) survive — f39 is the first
+  // one displaced to make room.
+  assert.ok(!capped.includes("f39.ts"));
+});
+
+void test("capImplReviewFilesV1 preserves original most-recent-first order for kept entries", () => {
+  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
+  const capped = capImplReviewFilesV1(files, new Set(["f44.ts", "f10.ts"]), 40);
+  assert.equal(capped.length, 40);
+  // f10.ts (preserved, mid-list) still appears BEFORE f44.ts (preserved,
+  // last) — preservation must not reorder the recency-first list.
+  assert.ok(capped.indexOf("f10.ts") < capped.indexOf("f44.ts"));
+});
+
+void test("capImplReviewFilesV1 hard-caps even when preserved paths alone exceed maxEntries", () => {
+  const files = Array.from({ length: 50 }, (_, i) => `f${i}.ts`);
+  const allPreserved = new Set(files);
+  const capped = capImplReviewFilesV1(files, allPreserved, 40);
+  assert.equal(capped.length, 40);
 });
 
 void test("updateImplReviewFiles caps the accumulated set at IMPL_REVIEW_FILES_MAX_ENTRIES_V1", () => {
@@ -219,6 +241,32 @@ void test("clearImplReviewFiles removes the tracked set entirely", () => {
   const cleared = clearImplReviewFiles(progress);
   assert.equal(cleared.implReviewFiles, undefined);
   assert.ok(!("implReviewFiles" in cleared));
+});
+
+// ---------------------------------------------------------------------------
+// recordTaskMdSizeBandAnnouncedV1 (item 9, Part 16 step 44): durable,
+// monotonic "once per band" marker — must survive bounded chat-history
+// compaction, unlike the prior chat-scan approach.
+// ---------------------------------------------------------------------------
+
+void test("recordTaskMdSizeBandAnnouncedV1 records a fresh band from unset", () => {
+  const progress = makeProgress(undefined);
+  const updated = recordTaskMdSizeBandAnnouncedV1(progress, 2);
+  assert.equal(updated.taskMdSizeBandAnnounced, 2);
+});
+
+void test("recordTaskMdSizeBandAnnouncedV1 is a no-op for a band no higher than the recorded one", () => {
+  const progress: TaskProgress = { ...makeProgress(undefined), taskMdSizeBandAnnounced: 3 };
+  const same = recordTaskMdSizeBandAnnouncedV1(progress, 3);
+  assert.strictEqual(same, progress);
+  const lower = recordTaskMdSizeBandAnnouncedV1(progress, 1);
+  assert.strictEqual(lower, progress);
+});
+
+void test("recordTaskMdSizeBandAnnouncedV1 advances to a strictly higher band", () => {
+  const progress: TaskProgress = { ...makeProgress(undefined), taskMdSizeBandAnnounced: 1 };
+  const updated = recordTaskMdSizeBandAnnouncedV1(progress, 3);
+  assert.equal(updated.taskMdSizeBandAnnounced, 3);
 });
 
 void test("clearStageFallbackReservation removes only the requested stage", () => {

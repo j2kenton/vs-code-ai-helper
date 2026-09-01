@@ -290,15 +290,20 @@ export const IMPL_REVIEW_FILES_MAX_ENTRIES_V1 = 40;
 
 /**
  * Apply the eviction policy to an already-unioned, most-recent-first
- * `implReviewFiles` list: keep the newest `maxEntries` unconditionally, and
- * ALSO keep any path named in `preserveRelPaths` (typically the paths an
- * outstanding review blocker names — see `extractBlockerNamedPathsV1`) even
- * when it falls outside that window, so a standing blocker's file is never
- * evicted out from under the review that needs to re-check it. A blocker
- * naming an old file can therefore leave the result slightly over
- * `maxEntries` — that is the deliberate priority order the plan text
- * describes ("retain files changed since the last clearing review PLUS files
- * named by outstanding blockers"), not a bug in the cap.
+ * `implReviewFiles` list: a blocker-named path in `preserveRelPaths`
+ * (typically the paths an outstanding review blocker names — see
+ * `extractBlockerNamedPathsV1`) is never evicted, but it DISPLACES a
+ * non-priority entry rather than being added on top — the result is capped
+ * at `maxEntries` unconditionally (2026-08-29 review, completion blocker:
+ * "eviction can exceed 40 entries" — a prior version kept the newest
+ * `maxEntries` entries and then re-added every preserved path outside that
+ * window, so a task with even a handful of blocker-named old files could
+ * grow past the nominal cap on every round). Preserved paths keep their
+ * original position in the returned, most-recent-first order; recency-only
+ * entries are dropped, oldest first, to make room for them. If more than
+ * `maxEntries` distinct paths are preserved (pathological — a review naming
+ * more files than the whole cap), only the most recent `maxEntries` of the
+ * preserved paths survive, so the hard cap holds unconditionally.
  */
 export function capImplReviewFilesV1(
   files: readonly string[],
@@ -308,7 +313,28 @@ export function capImplReviewFilesV1(
   if (files.length <= maxEntries) {
     return [...files];
   }
-  return files.filter((file, index) => index < maxEntries || preserveRelPaths.has(file));
+  const keep = new Set<string>();
+  for (const file of files) {
+    if (preserveRelPaths.has(file)) {
+      keep.add(file);
+      if (keep.size >= maxEntries) {
+        break;
+      }
+    }
+  }
+  const remainingSlots = Math.max(0, maxEntries - keep.size);
+  let nonPriorityKept = 0;
+  for (const file of files) {
+    if (keep.has(file)) {
+      continue;
+    }
+    if (nonPriorityKept >= remainingSlots) {
+      continue;
+    }
+    keep.add(file);
+    nonPriorityKept++;
+  }
+  return files.filter((file) => keep.has(file));
 }
 
 const BLOCKER_NAMED_PATH_RE_V1 = /`([\w./-]+\.[\w]+)(?::\d+(?:-\d+)?)?`/g;
@@ -522,6 +548,28 @@ export function clearImplReviewFiles(progress: TaskProgress): TaskProgress {
   const { implReviewFiles: _unused, ...rest } = progress;
   return {
     ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Record the highest `task.md` size band already announced to the user
+ * (item 9, Part 16 step 44 — see `TaskProgress.taskMdSizeBandAnnounced`'s own
+ * doc comment for why this must be durable rather than a marker scanned out
+ * of bounded chat history). Monotonic: a caller passing a band no higher than
+ * the one already recorded is a no-op, since "already announced" can never
+ * become false again for a band task.md has already crossed.
+ */
+export function recordTaskMdSizeBandAnnouncedV1(
+  progress: TaskProgress,
+  band: number
+): TaskProgress {
+  if ((progress.taskMdSizeBandAnnounced ?? 0) >= band) {
+    return progress;
+  }
+  return {
+    ...progress,
+    taskMdSizeBandAnnounced: band,
     updatedAt: new Date().toISOString(),
   };
 }

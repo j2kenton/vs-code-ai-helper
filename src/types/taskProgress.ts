@@ -248,6 +248,20 @@ export interface TaskProgress {
    */
   implReviewFiles?: string[];
   /**
+   * The highest `sizeBandV1` quarter (0-4) of `task.md`'s byte size against
+   * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` already announced to the user
+   * (wf "make the stage chat a record of work", Part 16 step 44 — "a
+   * one-time-per-size-band nudge"). Durable so the "once per band" guarantee
+   * survives chat-history compaction (`CHAT_HISTORY_MAX_MESSAGES`, 200
+   * settled messages, oldest dropped first) — a marker that lived only inside
+   * the bounded transcript would re-fire the same nudge once the announcing
+   * message aged out, which is exactly the silent-recurrence defect this
+   * field exists to close. Set only when a fresh band is crossed; never
+   * decreases even if task.md later shrinks, since the point is "have we told
+   * the user about this band", not "is task.md currently in this band".
+   */
+  taskMdSizeBandAnnounced?: number;
+  /**
    * Workspace-relative paths changed by an implementation round that was
    * detected as INCOMPLETE (deferred or cut short — see
    * `describeIncompleteImplementationRoundV1`), quarantined here instead of

@@ -136,6 +136,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "updatedAt",
   "progressVersion",
   "implReviewFiles",
+  "taskMdSizeBandAnnounced",
   "lintPayload",
   "scheduledRun",
   "scheduledResumeTime",
@@ -2145,6 +2146,16 @@ export function decodeTaskProgressTextV1(
           files.push(entry);
         }
         draft.implReviewFiles = files;
+        break;
+      }
+      case "taskMdSizeBandAnnounced": {
+        if (!isNonNegativeInteger(value) || value > 4) {
+          return recovery(
+            "invalidFieldValue",
+            "taskMdSizeBandAnnounced must be an integer between 0 and 4"
+          );
+        }
+        draft.taskMdSizeBandAnnounced = value;
         break;
       }
       case "pendingImplReviewFiles": {

@@ -7,8 +7,11 @@ import * as vscode from "vscode";
 import { createHash } from "crypto";
 import {
   buildPromptManifestV1,
+  measureCanonicalActionInputBytesV1,
   measureCanonicalInputBytesV1,
+  type OversizedInputAbortRecordV1,
   sizeBandV1,
+  writeOversizedInputAbortRecordV1,
   writePromptManifestV1,
 } from "../utils/promptManifestV1";
 import { canonicalJsonByteLengthV1 } from "../types/structuredQuestionV1";
@@ -58,6 +61,45 @@ void test("measureCanonicalInputBytesV1 grows with the prompt's own length", () 
   const short = measureCanonicalInputBytesV1("t.md", "x");
   const long = measureCanonicalInputBytesV1("t.md", "x".repeat(10_000));
   assert.ok(long > short);
+});
+
+// ---------------------------------------------------------------------------
+// measureCanonicalActionInputBytesV1 (item 9 — Part 16 step 41, 2026-08-29
+// review, completion blocker: "measures a synthetic prompt object rather
+// than the actual validated transaction input")
+// ---------------------------------------------------------------------------
+
+void test("measureCanonicalActionInputBytesV1 matches canonicalJsonByteLengthV1 of the exact object given", () => {
+  const actionInput = {
+    prompt: "some assembled prompt text",
+    targetLocator: { rootId: "root-1", relativePath: "impl-high-review.md" },
+    baselineRevision: "rev-abc",
+  };
+  assert.equal(
+    measureCanonicalActionInputBytesV1(actionInput),
+    canonicalJsonByteLengthV1(actionInput)
+  );
+});
+
+void test("measureCanonicalActionInputBytesV1 differs from wrapping in { templateName, prompt } — the defect this closes", () => {
+  const prompt = "x".repeat(1000);
+  const realShape = {
+    prompt,
+    targetLocator: { rootId: "root-1", relativePath: "impl-high-review.md" },
+    publishFreshnessGuard: {
+      taskFolderPath: "/tasks/t1",
+      scopeFolderPath: "/tasks/t1",
+      runId: "run-1",
+      verifiedCommitSha: "deadbeef",
+    },
+  };
+  const realBytes = measureCanonicalActionInputBytesV1(realShape);
+  const syntheticBytes = measureCanonicalInputBytesV1("review-impl-high.md", prompt);
+  // The real dispatched object carries targetLocator/publishFreshnessGuard
+  // overhead the synthetic { templateName, prompt } wrapper has no way to
+  // see — a probe measured the old way would silently under-report the size
+  // the transaction store actually checks.
+  assert.ok(realBytes > syntheticBytes);
 });
 
 void test("sizeBandV1 classifies below-25% as band 0", () => {
@@ -320,6 +362,92 @@ void describe("writePromptManifestV1 (Part 2 step 7 — filename identity)", () 
         fs.readFileSync(writtenLast.promptUri.fsPath, "utf8"),
         "secondary prompt"
       );
+    } finally {
+      bridge.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// writeOversizedInputAbortRecordV1 (item 9, Part 16 step 41 — 2026-08-29
+// review, completion blocker: "... and persist exact drivers/dropped
+// content"). A round that never dispatches has no `roundId` to key a prompt
+// manifest to, so the exact driver breakdown shown in the transient error
+// notification is persisted as a standalone record instead.
+// ---------------------------------------------------------------------------
+
+void describe("writeOversizedInputAbortRecordV1 (Part 16 step 41 — persisted abort diagnostics)", () => {
+  void it("persists the driver breakdown to a file under the runs directory", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "oversized_abort_basic"));
+      const uri = await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl-high-review",
+        path: "review",
+        assembledCanonicalBytes: 300000,
+        limitCanonicalBytes: 262144,
+        driverBytes: { "task.md": 60900, "plan.md": 24500 },
+        reductionApplied: { "context pack char budget": 2000 },
+      });
+      assert.ok(fs.existsSync(uri.fsPath));
+      const persisted = JSON.parse(fs.readFileSync(uri.fsPath, "utf8")) as OversizedInputAbortRecordV1;
+      assert.equal(persisted.stage, "impl-high-review");
+      assert.equal(persisted.path, "review");
+      assert.equal(persisted.assembledCanonicalBytes, 300000);
+      assert.equal(persisted.limitCanonicalBytes, 262144);
+      assert.deepEqual(persisted.driverBytes, { "task.md": 60900, "plan.md": 24500 });
+      assert.deepEqual(persisted.reductionApplied, { "context pack char budget": 2000 });
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("creates the runs/ directory when it does not already exist", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "oversized_abort_fresh_dir"));
+      assert.ok(!fs.existsSync(runsDirUri.fsPath));
+      await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl",
+        path: "apply-review",
+        assembledCanonicalBytes: 400000,
+        limitCanonicalBytes: 262144,
+        driverBytes: { review: 200000 },
+        reductionApplied: { "review char budget": 2000, "implementation notes char budget": 4000 },
+      });
+      assert.ok(fs.existsSync(runsDirUri.fsPath));
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("names repeated aborts on the same task uniquely so they never overwrite each other", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "oversized_abort_repeated"));
+      const first = await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl-high-review",
+        path: "review",
+        assembledCanonicalBytes: 300000,
+        limitCanonicalBytes: 262144,
+        driverBytes: {},
+        reductionApplied: {},
+      });
+      const second = await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:05:00.000Z",
+        stage: "impl-high-review",
+        path: "review",
+        assembledCanonicalBytes: 310000,
+        limitCanonicalBytes: 262144,
+        driverBytes: {},
+        reductionApplied: {},
+      });
+      assert.notEqual(first.fsPath, second.fsPath);
+      assert.ok(fs.existsSync(first.fsPath));
+      assert.ok(fs.existsSync(second.fsPath));
     } finally {
       bridge.restore();
     }

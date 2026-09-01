@@ -254,6 +254,30 @@ export function measureCanonicalInputBytesV1(templateName: string, prompt: strin
 }
 
 /**
+ * Canonical JSON byte length of the EXACT action input object a caller is
+ * about to hand to `TaskActionCoordinatorV1.executeAction` as `rawInput`
+ * (e.g. a `ReviewActionInputV1`: `{ prompt, targetLocator, baselineRevision?,
+ * publishFreshnessGuard? }`) — the same value the action row's own
+ * `validateInput` reconstructs byte-for-byte as `validatedInput`, which
+ * `ChatInteractionTransactionStoreV1.buildInputSnapshot` then canonicalizes
+ * and checks against `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1`
+ * (`chatInteractionTransactionStoreV1.ts`).
+ *
+ * Distinct from `measureCanonicalInputBytesV1` above (2026-08-29 review,
+ * completion blocker: "Step 41 measures a synthetic prompt object rather
+ * than the actual validated transaction input"): that function wraps only
+ * `{ templateName, prompt }`, which omits `targetLocator` and any
+ * `baselineRevision`/`publishFreshnessGuard` the real dispatch carries — a
+ * probe measured that way can read under the limit while the actual
+ * `rawInput` is over it, letting a round be dispatched knowing it will be
+ * rejected. Callers building a pre-dispatch shrink guard must measure THIS,
+ * not that.
+ */
+export function measureCanonicalActionInputBytesV1(actionInput: unknown): number {
+  return canonicalJsonByteLengthV1(actionInput);
+}
+
+/**
  * Which quarter of `limitBytes` `bytes` falls into: `0` below 25%, `1`
  * (25-50%), `2` (50-75%), `3` (75-100%), `4` at or above the limit itself.
  * Item 9 (Part 16 step 44): "the same growth pressure applies to task.md
@@ -360,4 +384,57 @@ export async function writePromptManifestV1(
   );
   await vscode.workspace.fs.writeFile(promptUri, new TextEncoder().encode(dispatchedPrompt));
   return { manifestUri, promptUri };
+}
+
+/**
+ * Record of a round that never dispatched because its assembled input stayed
+ * over `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` even after the pre-dispatch
+ * shrink loop ran to its floor (item 9, Part 16 step 41 — 2026-08-29 review,
+ * completion blocker: "... and persist exact drivers/dropped content").
+ *
+ * Deliberately NOT a `PromptManifestV1`: that type is keyed by `roundId`, an
+ * identity `executeImplementationRun` allocates only once a round actually
+ * dispatches (see this module's header, "Per-attempt cardinality"). An abort
+ * this early in assembly has no round to key a manifest to — this is a
+ * smaller, standalone record of the abort event itself, so the exact driver
+ * breakdown a user saw in the error notification is still recoverable from
+ * disk afterward rather than existing only in a transient toast.
+ */
+export interface OversizedInputAbortRecordV1 {
+  /** ISO timestamp of the abort. */
+  readonly at: string;
+  readonly stage: string;
+  /** Which prompt-assembly path aborted. */
+  readonly path: "review" | "apply-review";
+  /** Canonical byte size actually measured, after shrinking to the floor. */
+  readonly assembledCanonicalBytes: number;
+  readonly limitCanonicalBytes: number;
+  /** Named size drivers in bytes, e.g. `{ "task.md": 60900, "plan.md": 24500 }`. */
+  readonly driverBytes: Readonly<Record<string, number>>;
+  /**
+   * What the shrink loop actually reduced before giving up, e.g.
+   * `{ "context pack char budget": 2000 }` (review path, floored) or
+   * `{ "review char budget": 2000, "implementation notes char budget": 4000 }`
+   * (apply-review path, both floored) — the "dropped content" half of the
+   * completion blocker this record closes, distinct from `driverBytes`
+   * (which names what is big) by naming what was actually cut and to what
+   * floor, even though the result still did not fit.
+   */
+  readonly reductionApplied: Readonly<Record<string, number>>;
+}
+
+/**
+ * Write `record` beside the task's run logs, one file per abort, named by
+ * timestamp so repeated aborts on the same task never collide or overwrite
+ * each other's evidence.
+ */
+export async function writeOversizedInputAbortRecordV1(
+  runsDirUri: vscode.Uri,
+  record: OversizedInputAbortRecordV1
+): Promise<vscode.Uri> {
+  await vscode.workspace.fs.createDirectory(runsDirUri);
+  const safeAt = record.at.replace(/[:.]/g, "-");
+  const uri = vscode.Uri.joinPath(runsDirUri, `${safeAt}.oversized-input-abort.json`);
+  await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(record, null, 2)));
+  return uri;
 }

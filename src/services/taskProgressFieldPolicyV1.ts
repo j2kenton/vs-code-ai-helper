@@ -160,6 +160,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     reopen:
       "Preserve only when its owner stage (impl) is strictly before selected stage; otherwise [].",
   },
+  taskMdSizeBandAnnounced: {
+    migration: "Validate an integer 0-4/current optionality; absent on new tasks.",
+    nextStage: "Preserve (durable once-per-band nudge marker; task.md size is task-wide, not stage-scoped).",
+    markTaskDone: "Preserve.",
+    reopen: "Preserve — reopening a task does not shrink task.md or un-announce a band already surfaced.",
+  },
   pendingImplReviewFiles: {
     migration: "Validate bounded task-local paths (same bounds as implReviewFiles); absent on new tasks.",
     nextStage: "Preserve — quarantined edits from an incomplete round must survive until a successful round promotes them.",
@@ -497,6 +503,7 @@ export function applyNextStagePolicyV1(
       input.artifactOverride
     ),
     implReviewFiles: progress.implReviewFiles,
+    taskMdSizeBandAnnounced: progress.taskMdSizeBandAnnounced,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: progress.reviewInvalidatedByRound,
     incompleteRoundContinuations: undefined,
@@ -570,6 +577,7 @@ export function applyMarkTaskDonePolicyV1(
       input.artifactOverride
     ),
     implReviewFiles: progress.implReviewFiles,
+    taskMdSizeBandAnnounced: progress.taskMdSizeBandAnnounced,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
     incompleteRoundContinuations: undefined,
@@ -672,6 +680,7 @@ export function applyReopenPolicyV1(
     completedStages: retainedStages,
     completedWithMissingArtifacts: progress.completedWithMissingArtifacts,
     implReviewFiles,
+    taskMdSizeBandAnnounced: progress.taskMdSizeBandAnnounced,
     pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
     incompleteRoundContinuations: undefined,
@@ -783,6 +792,7 @@ export function applyPlanRevisionPolicyV1(
     // — a plan revision does not discard the accumulated implementation
     // review surface or score history (Part 6 item 4's own requirement).
     implReviewFiles: progress.implReviewFiles,
+    taskMdSizeBandAnnounced: progress.taskMdSizeBandAnnounced,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     // Cleared, unlike implReviewFiles/reviewScoreHistory above — a plan
     // revision invalidates whatever review-tracking state pointed at the

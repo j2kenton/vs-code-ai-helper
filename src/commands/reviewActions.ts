@@ -50,6 +50,7 @@ import {
   appendReviewRejection,
   appendReviewScoreHistory,
   clearImplementationTypeCheckFailure,
+  clearImplReviewFiles,
   clearReviewInvalidatedByRound,
   promotePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
@@ -57,6 +58,7 @@ import {
   setZeroChangeImplRounds,
   latestReviewBlockerNamedPathsV1,
   pauseTaskWithReason,
+  recordTaskMdSizeBandAnnouncedV1,
   updateImplReviewFiles,
   updateLintPayload,
   updateTaskStatus,
@@ -71,8 +73,9 @@ import {
 } from "../utils/implementationDispatchModeV1";
 import {
   buildPromptManifestV1,
-  measureCanonicalInputBytesV1,
+  measureCanonicalActionInputBytesV1,
   sizeBandV1,
+  writeOversizedInputAbortRecordV1,
   writePromptManifestV1,
 } from "../utils/promptManifestV1";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
@@ -154,6 +157,7 @@ import {
   checkEditActionAvailabilityV1,
   checkEditActionHostGateV1,
   checkEditActionProviderPathGateV1,
+  computeEditRequestDigestV1,
   runImplementationOrSealedV1,
 } from "./runEditActionV1";
 import {
@@ -194,11 +198,13 @@ import {
   previousVersionUri,
 } from "../utils/artifactBackups";
 import {
+  computeWorkspaceRootBindingIdV1,
   ensureWorkflowTaskFolderRootV1,
+  ensureWorkflowWorkspaceRootV1,
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
-import { appendChatMessageV1, readChatDocumentIdentityV1, readChatHistory } from "../utils/chatHistoryStore";
+import { appendChatMessageV1, readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -2731,10 +2737,25 @@ export async function handleReviewRoutingOutcome(options: {
       // cleared. Only while nothing is still quarantined: a review that ran
       // while `pendingImplReviewFiles` exist has not seen the unreported
       // round's edits, so the marker must survive it.
-      return withHistory.reviewInvalidatedByRound?.stage === targetStage &&
+      withHistory = withHistory.reviewInvalidatedByRound?.stage === targetStage &&
         (withHistory.pendingImplReviewFiles?.length ?? 0) === 0
         ? clearReviewInvalidatedByRound(withHistory)
         : withHistory;
+      // Item 9's eviction policy (Part 16 step 42 — 2026-08-29 review,
+      // completion blocker: "does not retain scope relative to the last
+      // clearing review"): a review that reports ZERO task-fixable blockers
+      // has cleared the standing review surface — nothing outstanding still
+      // needs the files already banked into `implReviewFiles` to stay in
+      // scope. Resetting it here means the next union (`updateImplReviewFiles`)
+      // starts fresh, so the accumulated set going forward genuinely tracks
+      // "changed since the last clearing review" rather than growing
+      // unboundedly across the task's entire history. Scoped to impl-review
+      // stages only — `implReviewFiles` has no meaning for plan/publish
+      // reviews.
+      if (IMPL_REVIEW_STAGES_V1.includes(targetStage) && historyEntry.taskFixableCount === 0) {
+        withHistory = clearImplReviewFiles(withHistory);
+      }
+      return withHistory;
     });
     if (!updated) {
       return { escalated: false };
@@ -4437,6 +4458,42 @@ export async function runReviewForFolder(
     }
   }
 
+  // Hoisted ahead of the shrink loop below (2026-08-29 review, completion
+  // blocker: "Step 41 measures a synthetic prompt object rather than the
+  // actual validated transaction input") — the loop must probe an object
+  // shaped like the one the coordinator will canonicalize and check against
+  // the 256 KB transport limit (`ReviewActionInputV1`: `{ prompt,
+  // targetLocator, baselineRevision?, publishFreshnessGuard? }`), not
+  // `{ templateName, prompt }`. `rootId`/`targetLocator` depend only on the
+  // folder/artifact path, so they are safe to compute once here and reuse
+  // for the real dispatch below.
+  //
+  // `baselineRevision` is deliberately NOT hoisted with them (self-correction
+  // within this same round — an earlier draft of this fix hoisted the stat()
+  // read too and broke `deferredRoundRecovery.test.ts`'s literal-publish
+  // latch-exit test): the review file's revision changes when
+  // `beginInProgressReviewMarkingV1` below overwrites it with the in-progress
+  // placeholder, and the REAL dispatch's `baselineRevision` must be read
+  // AFTER that write so the coordinator's CAS-guarded promotion write is
+  // checked against the file state it is actually about to replace — reading
+  // it here instead would silently stamp a stale baseline that the later CAS
+  // check rejects, so the round would run and then fail to promote, and the
+  // stage would never advance. The probe below uses a throwaway same-shaped
+  // revision string purely to account for its (negligible, ~tens-of-bytes)
+  // contribution to the canonical byte count; the real dispatch still reads
+  // its own baseline at its original position, after marking.
+  const relativePath =
+    path.relative(folderUri.fsPath, reviewUri.fsPath) ||
+    STAGE_ARTIFACT_FILENAMES[targetStage] ||
+    "review.md";
+  const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
+  const targetLocator = { rootId, relativePath };
+  const probeStatResult = await getWorkflowFileStoreV1().stat(targetLocator);
+  const probeBaselineRevision =
+    probeStatResult.kind === "ok" && probeStatResult.value.kind === "file"
+      ? probeStatResult.value.revision
+      : undefined;
+
   let contextPackContent: string;
   if (isPlanReview) {
     const contextPackUri = await writeContextPack(folderUri, workspaceRoot.uri, false);
@@ -4500,7 +4557,13 @@ export async function runReviewForFolder(
       );
       variables.contextPack = contextPackContent;
       const probePrompt = await renderPromptTemplate(extensionUri, templateFile, variables);
-      lastCanonicalBytes = measureCanonicalInputBytesV1(templateFile, probePrompt);
+      const probeActionInput: ReviewActionInputV1 = {
+        prompt: probePrompt,
+        targetLocator,
+        ...(probeBaselineRevision !== undefined ? { baselineRevision: probeBaselineRevision } : {}),
+        ...(publishFreshnessGuard !== undefined ? { publishFreshnessGuard } : {}),
+      };
+      lastCanonicalBytes = measureCanonicalActionInputBytesV1(probeActionInput);
       if (lastCanonicalBytes <= MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) {
         break;
       }
@@ -4520,11 +4583,51 @@ export async function runReviewForFolder(
     if (oversizedAfterShrink) {
       const kb = Math.round(lastCanonicalBytes / 1024);
       const limitKb = Math.round(MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 / 1024);
+      // Exact per-driver sizes (2026-08-29 review, completion blocker: "Exact
+      // driver sizes ... are absent" — the generic "task.md, plan.md/
+      // plan-final.md, and the previous review" list named categories without
+      // saying which one actually dominates, or by how much).
+      const taskMdBytes = Buffer.byteLength(
+        (await readTextIfExists(vscode.Uri.joinPath(folderUri, TASK_FILENAME))) ?? "",
+        "utf8"
+      );
+      const planBytes = Buffer.byteLength(variables.plan ?? "", "utf8");
+      const reviewBytes = Buffer.byteLength(previousReview ?? "", "utf8");
+      const taskMdKb = Math.round(taskMdBytes / 1024);
+      const planKb = Math.round(planBytes / 1024);
+      const reviewKb = Math.round(reviewBytes / 1024);
+      const fileCount = taskProgress?.implReviewFiles?.length ?? 0;
       NotificationRouter.showError(
         `This review's assembled input is ${kb} KB even after shrinking embedded file content to its floor — ` +
-          `over the ${limitKb} KB limit the transaction store enforces. Likely drivers: task.md, plan.md/` +
-          "plan-final.md, and the previous review, none of which this shrink reduces. Consider splitting the task."
+          `over the ${limitKb} KB limit the transaction store enforces. Size drivers: task.md ${taskMdKb} KB, ` +
+          `plan.md ${planKb} KB, previous review ${reviewKb} KB, ${fileCount} tracked file(s), none of which ` +
+          "this shrink reduces. Consider splitting the task."
       );
+      // Persist the exact driver breakdown (2026-08-29 review, completion
+      // blocker: "... and persist exact drivers/dropped content") — this
+      // round never dispatches, so it has no `roundId` to key a prompt
+      // manifest to (see `OversizedInputAbortRecordV1`'s doc comment); this
+      // is the standalone record of the abort itself, so the breakdown
+      // survives after the transient error notification is dismissed.
+      try {
+        await writeOversizedInputAbortRecordV1(vscode.Uri.joinPath(folderUri, RUNS_DIRNAME), {
+          at: new Date().toISOString(),
+          stage: targetStage,
+          path: "review",
+          assembledCanonicalBytes: lastCanonicalBytes,
+          limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+          driverBytes: {
+            "task.md": taskMdBytes,
+            "plan.md": planBytes,
+            "previous review": reviewBytes,
+          },
+          reductionApplied: {
+            "context pack char budget": maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS,
+          },
+        });
+      } catch {
+        // Best-effort diagnostic only — never blocks the abort it is recording.
+      }
       return;
     }
     if (isFallback) {
@@ -4543,28 +4646,38 @@ export async function runReviewForFolder(
   // threaten its own reviews is a signal the task wants splitting, and the
   // assembler is the only thing positioned to notice." Best-effort:
   // observability only, never blocks the review it is warning about.
+  //
+  // "Once per band" is enforced durably via `TaskProgress.taskMdSizeBandAnnounced`
+  // (2026-08-29 review, completion blocker: "records its size-band warning in
+  // the chat projection rather than the durable ledger") — scanning bounded
+  // chat history for a prior announcement was not actually "once ever": that
+  // transcript compacts at `CHAT_HISTORY_MAX_MESSAGES` (200 settled messages,
+  // oldest dropped first), so an old task whose announcing message aged out
+  // of the window would silently re-announce the same band on a later round.
   try {
     const taskMdBytes = Buffer.byteLength(
       (await readTextIfExists(vscode.Uri.joinPath(folderUri, TASK_FILENAME))) ?? "",
       "utf8"
     );
     const band = sizeBandV1(taskMdBytes, MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1);
-    if (band > 0) {
-      const bandMarker = `task.md size band ${band}`;
-      const history = await readChatHistory(folderUri.fsPath, folderUri.fsPath);
-      const alreadyAnnounced = history.some(
-        (m) => m.kind === "activity" && m.text.includes(bandMarker)
+    const priorProgress = await readTaskProgressAdvisoryV1(folderUri);
+    if (band > 0 && (priorProgress?.taskMdSizeBandAnnounced ?? 0) < band) {
+      const kb = Math.round(taskMdBytes / 1024);
+      const pct = Math.round((taskMdBytes / MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) * 100);
+      const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
+        recordTaskMdSizeBandAnnouncedV1(current, band)
       );
-      if (!alreadyAnnounced) {
-        const kb = Math.round(taskMdBytes / 1024);
-        const pct = Math.round((taskMdBytes / MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) * 100);
+      // Only announce in chat once the durable marker is actually persisted —
+      // a CAS loss here (another writer beat us to a higher/equal band) means
+      // this round's own announcement would be redundant.
+      if (updated && (updated.taskMdSizeBandAnnounced ?? 0) === band) {
         await appendChatMessageV1(
           folderUri.fsPath,
           {
             role: "assistant",
             text:
               `task.md is ${kb} KB — ${pct}% of the review-input limit. This task may want splitting. ` +
-              `(${bandMarker})`,
+              `(task.md size band ${band})`,
             stage: targetStage,
             at: new Date().toISOString(),
             kind: "activity",
@@ -4610,7 +4723,13 @@ export async function runReviewForFolder(
     // `promptBytes`.
     const promptByteLength = Buffer.byteLength(prompt, "utf8");
 
-    const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
+    // `rootId`/`targetLocator` are hoisted above the shrink loop (see that
+    // comment) so the pre-dispatch size probe measures an object shaped like
+    // the one dispatched below; `reviewBaselineRevision` is read fresh here,
+    // AFTER `beginInProgressReviewMarkingV1` has already overwritten the
+    // review file with its in-progress placeholder — see the hoisted
+    // comment for why reusing an earlier-read revision here would silently
+    // fail the coordinator's CAS-guarded promotion write.
     const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
     if (!verifiedBindingId) {
       throw new Error("Task ownership binding could not be verified.");
@@ -4742,10 +4861,7 @@ export async function runReviewForFolder(
       resolveStagePrimaryModel: () => ({ modelId: dispatchModelId, stage: targetStage }),
     });
 
-    const relativePath = path.relative(folderUri.fsPath, reviewUri.fsPath) || STAGE_ARTIFACT_FILENAMES[targetStage] || "review.md";
-    const targetLocator = { rootId, relativePath };
-    const reviewFileStore = getWorkflowFileStoreV1();
-    const reviewStatResult = await reviewFileStore.stat(targetLocator);
+    const reviewStatResult = await getWorkflowFileStoreV1().stat(targetLocator);
     const reviewBaselineRevision =
       reviewStatResult.kind === "ok" && reviewStatResult.value.kind === "file"
         ? reviewStatResult.value.revision
@@ -6515,11 +6631,40 @@ export async function fastForwardReviewWithAI(
  * warns "a bug to fix, not a toggle to offer" in a different context, but
  * the same class of silent mode loss.
  */
+/**
+ * Deterministic head-truncation for a prose input this dispatch cannot
+ * otherwise shrink (item 9, Part 16 step 41 — 2026-08-29 review, completion
+ * blocker: "the Apply Review path still assembles independently ... with no
+ * canonical-limit reduction"). Keeps the START of `text` — a review's
+ * verdict and blocker list, and a plan's earliest/most-foundational parts,
+ * sit at the top — and appends a visible marker naming what was dropped, so
+ * a truncated round is never silently missing content without saying so.
+ */
+function truncateTextToBudgetV1(text: string, maxChars: number, whatWasTrimmed: string): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  const droppedChars = text.length - maxChars;
+  return (
+    `${text.slice(0, maxChars)}\n\n_[truncated ${droppedChars} characters of ${whatWasTrimmed} ` +
+    "to fit the review-input size limit]_"
+  );
+}
+
 async function buildApplyReviewPromptPartsV1(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
   contextPackContent: string,
-  reviewContent: string
+  reviewContent: string,
+  /**
+   * Item 9's pre-dispatch shrink guard (Part 16 step 41). When supplied,
+   * `reviewContent` and/or the implementation notes are deterministically
+   * truncated so a caller's shrink loop can rebuild a smaller candidate
+   * without re-reading any files. Undefined means "use the full text",
+   * preserving this function's original behaviour for every existing caller.
+   */
+  maxReviewChars?: number,
+  maxImplementationChars?: number
 ): Promise<{ prompt: string; templateVariables: Record<string, string> } | { error: string }> {
   let canonicalUri: vscode.Uri;
   try {
@@ -6534,10 +6679,18 @@ async function buildApplyReviewPromptPartsV1(
   }
 
   const latestSummary = await readNonEmptyText(getImplementationSummaryUri(folderUri));
-  const implementationNotes =
+  const implementationNotesFull =
     latestSummary && !isUnusableImplementationSummaryV1(latestSummary)
       ? `${planOfRecordNotes}\n\n---\n\n## Latest implementation round summary\n\n${latestSummary}`
       : planOfRecordNotes;
+  const implementationNotes =
+    maxImplementationChars !== undefined
+      ? truncateTextToBudgetV1(implementationNotesFull, maxImplementationChars, "the implementation notes")
+      : implementationNotesFull;
+  const reviewContentCapped =
+    maxReviewChars !== undefined
+      ? truncateTextToBudgetV1(reviewContent, maxReviewChars, "the review")
+      : reviewContent;
 
   let approvedPlan: string | undefined;
   let planName = "plan.md";
@@ -6559,7 +6712,7 @@ async function buildApplyReviewPromptPartsV1(
     contextPack: contextPackContent,
     approvedPlan,
     implementation: implementationNotes,
-    review: reviewContent,
+    review: reviewContentCapped,
   };
   const prompt = await renderPromptTemplate(
     extensionUri,
@@ -6636,14 +6789,142 @@ async function applyImplementationReviewWithAI(
   // checklist first so the echo instruction reads naturally. A summary
   // stamped unusable is omitted rather than presented as notes — there is
   // nothing reviewable in a rejection stamp.
-  const parts = await buildApplyReviewPromptPartsV1(
-    extensionUri,
-    folderUri,
-    contextPackContent,
-    reviewContent
-  );
-  if ("error" in parts) {
-    NotificationRouter.showWarning(parts.error);
+  // Item 9's canonical-limit guarantee (Part 16 step 41). `checkAndConfirmPromptSize`
+  // below guards a DIFFERENT, larger ceiling (`PROMPT_TOTAL_MAX_BYTES`,
+  // 600 KB) aimed at quota/token cost — it does not protect against the
+  // 256 KB `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` the transaction store
+  // actually enforces, so a prompt between the two ceilings would pass it and
+  // still be rejected by `chatTransactionRejected` after the round is claimed.
+  // Only a Copilot-resolved model's edit dispatches through that
+  // coordinator-checked transaction path (`runTwoPhaseEditActionV1`'s
+  // preflight, `EditPreflightActionInputV1: { prompt, rootId, rootBindingId,
+  // requestDigest }`) — a CLI-resolved model edits the workspace directly and
+  // never reaches it (see `PromptManifestV1.promptCaptureComplete`'s doc
+  // comment). `rootId`/`rootBindingId` are read via the SAME functions
+  // `checkEditActionAvailabilityV1` uses internally, so this measures the
+  // exact object that will be canonicalized, not an approximation.
+  //
+  // 2026-08-29 review, completion blocker: "the Apply Review path still
+  // assembles independently ... with no canonical-limit reduction" — unlike
+  // the review path's context pack, this template embeds no file contents
+  // (`generateContextPack` here carries none), so the reducible content is
+  // the review artifact and the implementation notes prose instead of file
+  // excerpts. The loop below shrinks those deterministically (head kept,
+  // see `truncateTextToBudgetV1`), review content first since item 9's own
+  // evidence names accumulated review history as the dominant growth driver,
+  // then the implementation notes, before giving up.
+  let editRootId: string | undefined;
+  let rootBindingId: string | undefined;
+  if (usesCopilotModel) {
+    try {
+      editRootId = ensureWorkflowWorkspaceRootV1(workspaceRoot.uri.fsPath);
+      rootBindingId = computeWorkspaceRootBindingIdV1(editRootId, workspaceRoot.uri.fsPath);
+    } catch {
+      // Best-effort guard only — if root resolution fails here, the same
+      // resolution will fail (with a clearer, dedicated message) inside
+      // runTwoPhaseEditActionV1's own availability check moments later.
+    }
+  }
+  const reviewCharFloor = 2000;
+  const implementationCharFloor = 4000;
+  let maxReviewChars: number | undefined;
+  let maxImplementationChars: number | undefined;
+  let parts: { prompt: string; templateVariables: Record<string, string> } | { error: string } | undefined;
+  let oversizedAfterShrink = false;
+  let lastCanonicalBytes = 0;
+  for (let attempt = 0; ; attempt++) {
+    parts = await buildApplyReviewPromptPartsV1(
+      extensionUri,
+      folderUri,
+      contextPackContent,
+      reviewContent,
+      maxReviewChars,
+      maxImplementationChars
+    );
+    if ("error" in parts) {
+      break;
+    }
+    if (editRootId === undefined || rootBindingId === undefined) {
+      break;
+    }
+    let canonicalBytes: number;
+    try {
+      canonicalBytes = measureCanonicalActionInputBytesV1({
+        prompt: parts.prompt,
+        rootId: editRootId,
+        rootBindingId,
+        requestDigest: computeEditRequestDigestV1(parts.prompt),
+      });
+    } catch {
+      // Best-effort guard only — see the try/catch above.
+      break;
+    }
+    lastCanonicalBytes = canonicalBytes;
+    if (canonicalBytes <= MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) {
+      break;
+    }
+    const reviewAtFloor = maxReviewChars !== undefined && maxReviewChars <= reviewCharFloor;
+    const implAtFloor = maxImplementationChars !== undefined && maxImplementationChars <= implementationCharFloor;
+    if (attempt >= 6 || (reviewAtFloor && implAtFloor)) {
+      oversizedAfterShrink = true;
+      break;
+    }
+    if (!reviewAtFloor) {
+      const currentReviewLength = (parts.templateVariables.review ?? "").length;
+      maxReviewChars = Math.max(reviewCharFloor, Math.floor((maxReviewChars ?? currentReviewLength) / 2));
+    } else if (!implAtFloor) {
+      const currentImplLength = (parts.templateVariables.implementation ?? "").length;
+      maxImplementationChars = Math.max(
+        implementationCharFloor,
+        Math.floor((maxImplementationChars ?? currentImplLength) / 2)
+      );
+    }
+  }
+  if (parts === undefined || "error" in parts) {
+    NotificationRouter.showWarning(parts === undefined ? "Unable to assemble the apply-review prompt." : parts.error);
+    return false;
+  }
+  if (oversizedAfterShrink) {
+    const kb = Math.round(lastCanonicalBytes / 1024);
+    const limitKb = Math.round(MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 / 1024);
+    const planBytes = Buffer.byteLength(parts.templateVariables.approvedPlan ?? "", "utf8");
+    const implBytes = Buffer.byteLength(parts.templateVariables.implementation ?? "", "utf8");
+    const reviewBytes = Buffer.byteLength(reviewContent, "utf8");
+    const planKb = Math.round(planBytes / 1024);
+    const implKb = Math.round(implBytes / 1024);
+    const reviewKb = Math.round(reviewBytes / 1024);
+    NotificationRouter.showError(
+      `Applying this review would assemble a ${kb} KB input even after shrinking the review and implementation ` +
+        `notes to their floor — over the ${limitKb} KB limit the transaction store enforces. Size drivers: ` +
+        `plan ${planKb} KB, implementation notes ${implKb} KB, review ${reviewKb} KB. Consider splitting the ` +
+        "task or applying the review manually against a narrower scope."
+    );
+    // Persist the exact driver breakdown (2026-08-29 review, completion
+    // blocker: "... and persist exact drivers/dropped content") — see the
+    // review-path abort above and `OversizedInputAbortRecordV1`'s doc
+    // comment for why this is a standalone record rather than a prompt
+    // manifest.
+    try {
+      await writeOversizedInputAbortRecordV1(vscode.Uri.joinPath(folderUri, RUNS_DIRNAME), {
+        at: new Date().toISOString(),
+        stage,
+        path: "apply-review",
+        assembledCanonicalBytes: lastCanonicalBytes,
+        limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+        driverBytes: {
+          "plan (approved plan / plan-final.md)": planBytes,
+          "implementation notes": implBytes,
+          review: reviewBytes,
+        },
+        reductionApplied: {
+          "review char budget": maxReviewChars ?? (parts.templateVariables.review ?? "").length,
+          "implementation notes char budget":
+            maxImplementationChars ?? (parts.templateVariables.implementation ?? "").length,
+        },
+      });
+    } catch {
+      // Best-effort diagnostic only — never blocks the abort it is recording.
+    }
     return false;
   }
   const prompt = parts.prompt;
