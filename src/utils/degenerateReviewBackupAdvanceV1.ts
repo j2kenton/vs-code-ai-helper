@@ -5,15 +5,14 @@
  * nothing usable) — so it is invisible to `switch-to-backup`'s existing
  * runner-level failure handling. This module decides, from durable state
  * alone, what should happen next: automatically advance to the next
- * configured backup, offer it as a one-click manual retry, or report the
- * chain exhausted.
+ * configured backup or report the chain exhausted.
  */
 import { FallbackStrategy } from "./modelFallback";
 import { RoundOutcomeEntryV1, TaskStage } from "../types/taskProgress";
 
 export type DegenerateReviewBackupAdvanceDecisionV1 =
   | { kind: "advance"; nextModelId: string }
-  | { kind: "manual"; nextModelId: string }
+  | { kind: "stop"; nextModelId: string }
   | { kind: "exhausted" };
 
 /**
@@ -83,12 +82,10 @@ export function decideDegenerateReviewBackupAdvanceV1(input: {
   if (!next) {
     return { kind: "exhausted" };
   }
-  // Only genuinely automatic when the user has actually opted into
-  // switch-to-backup for this stage — a user on "pause-and-resume" or
-  // "alert-and-wait" made a deliberate choice not to have Ensemble silently
-  // change which model runs; a degenerate-content rejection is not a reason
-  // to override that, even though a runner-level failure wouldn't either.
+  // Only automatically advance when the user opted into backup fallback. A
+  // never-switch stage may still expose the selected next model as diagnostic
+  // information, but never silently changes which model runs.
   return input.strategy === "switch-to-backup"
     ? { kind: "advance", nextModelId: next }
-    : { kind: "manual", nextModelId: next };
+    : { kind: "stop", nextModelId: next };
 }

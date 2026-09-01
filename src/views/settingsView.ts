@@ -905,17 +905,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .model-row.skipped .model-combobox {
             opacity: 0.55;
           }
-          /* The fallback-strategy dropdown sits in the same [checkbox]
-             [combo] [×] row shape as the model rows: invisible spacers in
-             the checkbox and × columns keep its left/right edges flush
-             with the combo boxes above and below, and the compact font/
-             padding match the combo inputs' height. */
-          .model-row .strategy-select {
+          /* Fallback is a boolean, so it uses the checkbox column the row
+             layout has always reserved instead of making the user open a
+             dropdown to choose between two values. */
+          .model-row .fallback-enabled {
+            margin: var(--ensemble-space-half) 0 0;
+          }
+          .model-row .fallback-label {
             flex: 1;
-            width: auto;
-            min-width: 0;
+            margin: 0;
+            padding: var(--ensemble-space-half) 0;
             font-size: var(--ensemble-small-font-size);
-            padding: var(--ensemble-space-half) var(--ensemble-space-1);
           }
           .model-row .strategy-spacer {
             visibility: hidden;
@@ -1820,7 +1820,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             tbody.innerHTML = '';
 
             stagesList.forEach(stage => {
-              const setting = currentSettings[stage] || { strategy: 'alert-and-wait' };
+              const setting = currentSettings[stage] || { strategy: 'never-switch' };
               const row = document.createElement('div');
               row.id = 'row-' + stage;
               row.className = 'stage-row';
@@ -1840,14 +1840,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   modelRowHtml('primary', stage, setting.primary || '', setting.primaryEnabled !== false) +
                 '</div>' +
                 '<div class="form-row">' +
-                  '<label for="strategy-' + escapeHtml(stage) + '" class="field-label">Fallback strategy:</label>' +
                   '<div class="model-row">' +
-                    '<input type="checkbox" class="strategy-spacer" disabled aria-hidden="true" tabindex="-1">' +
-                    '<select id="strategy-' + escapeHtml(stage) + '" class="strategy-select">' +
-                      '<option value="switch-to-backup"' + (setting.strategy === 'switch-to-backup' ? ' selected' : '') + '>Switch to Backup</option>' +
-                      '<option value="pause-and-resume"' + (setting.strategy === 'pause-and-resume' ? ' selected' : '') + '>Pause until available</option>' +
-                      '<option value="alert-and-wait"' + (setting.strategy === 'alert-and-wait' ? ' selected' : '') + '>Alert and wait</option>' +
-                    '</select>' +
+                    '<input id="fallback-enabled-' + escapeHtml(stage) + '" type="checkbox" class="fallback-enabled"' + (setting.strategy === 'switch-to-backup' ? ' checked' : '') + '>' +
+                    '<label for="fallback-enabled-' + escapeHtml(stage) + '" class="fallback-label">Fall back to backup models</label>' +
                     '<button type="button" class="secondary remove-backup strategy-spacer" disabled aria-hidden="true" tabindex="-1">×</button>' +
                   '</div>' +
                 '</div>' +
@@ -1879,7 +1874,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             stagesList.forEach(stage => {
               const row = document.getElementById('row-' + stage);
-              const strategy = document.getElementById('strategy-' + stage).value;
+              const fallbackEnabled = document.getElementById('fallback-enabled-' + stage).checked;
+              const strategy = fallbackEnabled ? 'switch-to-backup' : 'never-switch';
               const stageName = stageDisplayNames[stage] || stage;
 
               const primaryRow = row.querySelector('.primary-container .model-row');

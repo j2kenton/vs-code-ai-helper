@@ -168,14 +168,80 @@ function loadAllowlist() {
     }
     byKey.set(`${entry.file}:${entry.line}`, entry);
   }
-  return { raw, byKey };
+  const directActionByKey = new Map();
+  for (const entry of raw.directActionEntries ?? []) {
+    if (!entry.file || !entry.line || !entry.reason) {
+      throw new Error(`toastAllowlistV1.json directActionEntries entry missing file/line/reason: ${JSON.stringify(entry)}`);
+    }
+    directActionByKey.set(`${entry.file}:${entry.line}`, entry);
+  }
+  return { raw, byKey, directActionByKey };
+}
+
+/**
+ * Second, narrower check (review blocker 2026-08-31, extending item 13/35):
+ * a `NotificationRouter.show(Information|Warning|Error)` call whose 5th
+ * argument is an `actionCommand` object is a single-button toast that
+ * DISPATCHES A WORKFLOW COMMAND DIRECTLY rather than pointing at a chat-bound
+ * decision — the same "notification is the only place the action appears"
+ * defect the multi-button check above catches, just at button-count 1 instead
+ * of 2+. The one legitimate `actionCommand` is the chat-pointer
+ * `notifyPendingWorkflowDecision` already uses
+ * (`vs-code-ai-helper.openWorkflowDecision`); any other command name is a
+ * direct-dispatch toast.
+ *
+ * Now enforcing, same as the multi-button check (review blocker 2026-08-31,
+ * round 2): the initial scan's 34 candidates have all been triaged into
+ * `directActionEntries` below, each with its own documented reason — every
+ * one is either a synchronous gate/nudge inline in the user-invoked command
+ * it belongs to (pointing at a command already reachable from the Command
+ * Palette or another button, never a background round's only record of its
+ * outcome), or a best-effort fallback for when a `WorkflowDecisionV1` could
+ * not be posted to chat (no activating extension context) and degrades to a
+ * single pointer at the same option the decision would have recommended. A
+ * new finding not in `directActionEntries` now fails the build, exactly like
+ * an un-triaged multi-button toast.
+ */
+const CHAT_POINTER_COMMAND = "vs-code-ai-helper.openWorkflowDecision";
+const ROUTER_CALL_PATTERN = /NotificationRouter\.show(Information|Warning|Error)\(/g;
+
+function findDirectActionCommandCalls(filePath) {
+  const text = readFileSync(filePath, "utf8");
+  const findings = [];
+  let match;
+  ROUTER_CALL_PATTERN.lastIndex = 0;
+  while ((match = ROUTER_CALL_PATTERN.exec(text)) !== null) {
+    const callStart = match.index;
+    const lineStart = text.lastIndexOf("\n", callStart) + 1;
+    const lineEnd = text.indexOf("\n", callStart);
+    const lineText = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
+    if (isCommentContext(lineText)) continue;
+
+    const argsStart = callStart + match[0].length;
+    const { args } = splitTopLevelArgs(text.slice(argsStart));
+    if (args.length < 5) continue; // no actionCommand argument at all
+    const actionArg = args[4].trim();
+    if (actionArg === "" || actionArg === "undefined") continue;
+    const commandMatch = actionArg.match(/command:\s*["']([^"']+)["']/);
+    if (!commandMatch) continue; // not a recognizable { command: ... } literal
+    const command = commandMatch[1];
+    if (command === CHAT_POINTER_COMMAND) continue;
+    findings.push({
+      line: lineNumberAt(text, callStart),
+      method: `show${match[1]}`,
+      command,
+    });
+  }
+  return findings;
 }
 
 function main() {
-  const { raw, byKey } = loadAllowlist();
+  const { raw, byKey, directActionByKey } = loadAllowlist();
   const files = collectTsFiles(srcRoot);
   const violations = [];
   const usedKeys = new Set();
+  const directActionViolations = [];
+  const usedDirectActionKeys = new Set();
 
   for (const file of files) {
     const relPath = path.relative(repoRoot, file).split(path.sep).join("/");
@@ -187,9 +253,18 @@ function main() {
       }
       violations.push({ ...finding, file: relPath });
     }
+    for (const finding of findDirectActionCommandCalls(file)) {
+      const key = `${relPath}:${finding.line}`;
+      if (directActionByKey.has(key)) {
+        usedDirectActionKeys.add(key);
+        continue;
+      }
+      directActionViolations.push({ ...finding, file: relPath });
+    }
   }
 
   const staleEntries = [...byKey.keys()].filter((k) => !usedKeys.has(k));
+  const staleDirectActionEntries = [...directActionByKey.keys()].filter((k) => !usedDirectActionKeys.has(k));
 
   if (violations.length > 0) {
     console.warn(`toastAllowlistV1: ${violations.length} multi-button toast call(s) are not in the allow-list:`);
@@ -208,17 +283,38 @@ function main() {
       console.warn(`  ${key}`);
     }
   }
+  if (directActionViolations.length > 0) {
+    console.warn(`toastAllowlistV1: ${directActionViolations.length} NotificationRouter call(s) attach a workflow command directly and are not in directActionEntries:`);
+    for (const f of directActionViolations) {
+      console.warn(`  ${f.file}:${f.line} — ${f.method}(...) dispatches "${f.command}" directly`);
+    }
+    console.warn(
+      "Each one is either a hidden workflow decision (post it as a WorkflowDecisionV1 in the chat " +
+      "instead) or a genuine synchronous gate/fallback (add it to directActionEntries in " +
+      "scripts/toastAllowlistV1.json with a reason)."
+    );
+  }
+  if (staleDirectActionEntries.length > 0) {
+    console.warn(`toastAllowlistV1: ${staleDirectActionEntries.length} directActionEntries entr${staleDirectActionEntries.length === 1 ? "y is" : "ies are"} stale (no longer matches a direct-action call — the site moved, was fixed, or the line drifted):`);
+    for (const key of staleDirectActionEntries) {
+      console.warn(`  ${key}`);
+    }
+  }
+
+  const anyViolation =
+    violations.length > 0 || staleEntries.length > 0 ||
+    directActionViolations.length > 0 || staleDirectActionEntries.length > 0;
 
   const enforcing = raw.mode === "enforcing";
-  if ((violations.length > 0 || staleEntries.length > 0) && enforcing) {
+  if (anyViolation && enforcing) {
     console.error(`toastAllowlistV1: failing — mode is "enforcing" (see scripts/toastAllowlistV1.json).`);
     process.exit(1);
   }
-  if (violations.length > 0 || staleEntries.length > 0) {
+  if (anyViolation) {
     console.warn(`toastAllowlistV1: warn-only mode — not failing the build. Set "mode": "enforcing" in scripts/toastAllowlistV1.json once triage is complete.`);
     process.exit(0);
   }
-  console.log(`toastAllowlistV1: no un-triaged multi-button toasts found (${usedKeys.size} allow-listed).`);
+  console.log(`toastAllowlistV1: no un-triaged multi-button or direct-action toasts found (${usedKeys.size} multi-button, ${usedDirectActionKeys.size} direct-action allow-listed).`);
   process.exit(0);
 }
 

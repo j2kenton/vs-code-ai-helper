@@ -110,24 +110,14 @@ void test("advances automatically to the first untried backup under switch-to-ba
   assert.deepEqual(decision, { kind: "advance", nextModelId: "grok-4.6" });
 });
 
-void test("offers a manual retry (not automatic) under pause-and-resume", () => {
+void test("stops without trying the chain under never-switch", () => {
   const decision = decideDegenerateReviewBackupAdvanceV1({
     chainBackups: ["codex-cli:gpt"],
-    strategy: "pause-and-resume",
+    strategy: "never-switch",
     currentModelId: "kimi-code:k3",
     episodeTriedModelIds: [],
   });
-  assert.deepEqual(decision, { kind: "manual", nextModelId: "codex-cli:gpt" });
-});
-
-void test("offers a manual retry under alert-and-wait", () => {
-  const decision = decideDegenerateReviewBackupAdvanceV1({
-    chainBackups: ["codex-cli:gpt"],
-    strategy: "alert-and-wait",
-    currentModelId: "kimi-code:k3",
-    episodeTriedModelIds: [],
-  });
-  assert.deepEqual(decision, { kind: "manual", nextModelId: "codex-cli:gpt" });
+  assert.deepEqual(decision, { kind: "stop", nextModelId: "codex-cli:gpt" });
 });
 
 void test("reports exhausted once every configured backup has been tried this episode", () => {

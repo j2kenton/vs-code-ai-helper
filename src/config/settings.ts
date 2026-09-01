@@ -1129,15 +1129,18 @@ export function getModelSettings(): ModelSettings {
         )
       : undefined;
     const backups = chain?.backups;
-    let strategy: FallbackStrategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
-      ? entry.strategy : "alert-and-wait";
-    // Back-compat: the old UI could save strategy: "switch-to-backup" with
-    // fallbackEnabled: false (checkbox unchecked, strategy left untouched).
-    // That combination meant "don't use backup" — downgrade it on read so
-    // removing the checkbox doesn't silently turn fallback on for those
-    // workspaces.
+    // Legacy three-way values collapsed onto the one fallback axis. Both
+    // former non-switch values deliberately mean the same thing here:
+    // preserve the user's no-backup choice while the failure classifier owns
+    // the later pause-versus-alert behaviour.
+    let strategy: FallbackStrategy = entry.strategy === "switch-to-backup"
+      ? "switch-to-backup"
+      : "never-switch";
+    // Back-compat: the previous checkbox could save strategy:
+    // "switch-to-backup" with fallbackEnabled: false. That combination meant
+    // "don't use backup" — preserve it on read.
     if (strategy === "switch-to-backup" && entry.fallbackEnabled === false) {
-      strategy = "alert-and-wait";
+      strategy = "never-switch";
     }
     result[stage] = {
       primary,
@@ -1157,7 +1160,7 @@ export function getModelSettings(): ModelSettings {
   for (const stage of AI_MODEL_STAGES) {
     if (!result[stage]) {
       const legacy = getAiModelDefault(stage);
-      if (legacy) result[stage] = { primary: legacy, strategy: "alert-and-wait" };
+      if (legacy) result[stage] = { primary: legacy, strategy: "never-switch" };
     }
   }
   return result;
@@ -1183,7 +1186,12 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
         : typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
       // Preserve a configured backup even if strategy isn't switch-to-backup —
       // switching strategy back later shouldn't lose the user's backup choice.
-      const entry: StageModelSetting = { ...setting, primary, backup, backups };
+      // Always emit the two-value canonical representation, including when a
+      // caller supplied an untyped legacy payload at runtime.
+      const strategy: FallbackStrategy = setting.strategy === "switch-to-backup"
+        ? "switch-to-backup"
+        : "never-switch";
+      const entry: StageModelSetting = { ...setting, primary, backup, backups, strategy };
       delete entry.backupsEnabled;
       if (chain?.backupsEnabled) entry.backupsEnabled = chain.backupsEnabled;
       // Skip flags are stored only when they say something (absent = enabled).

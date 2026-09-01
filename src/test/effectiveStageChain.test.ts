@@ -367,7 +367,7 @@ void describe("getModelSettings / setModelSettings — extended shape round trip
           primary: "codex-cli:gpt-5",
           backups: ["a-cli:one"],
           backupsEnabled: [true],
-          strategy: "alert-and-wait",
+          strategy: "never-switch",
         },
       });
       const written = stub.updates.find((u) => u.key === "modelSettings")?.value as Record<
@@ -388,7 +388,7 @@ void describe("getModelSettings / setModelSettings — extended shape round trip
     const stub = installConfig({ modelSettings: {} });
     try {
       await setModelSettings({
-        impl: { primary: undefined, backup: undefined, backups: [], strategy: "alert-and-wait" },
+        impl: { primary: undefined, backup: undefined, backups: [], strategy: "never-switch" },
       });
       const written = stub.updates.find((u) => u.key === "modelSettings")?.value as Record<string, unknown>;
       assert.ok(

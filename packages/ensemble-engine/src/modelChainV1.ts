@@ -135,8 +135,8 @@ export function filterEnabledBackupModelsV1(
  * Configured backup models for a stage, excluding `modelId` itself and any
  * provider currently disabled — but ONLY when the stage's effective fallback
  * strategy is "switch-to-backup" (the quota-triggered automatic switch-over
- * opt-in). A stage configured with "pause-and-resume" or "alert-and-wait"
- * returns nothing here, by design: those strategies mean the user explicitly
+ * opt-in). A stage configured with "never-switch" returns nothing here, by
+ * design: that strategy means the user explicitly
  * does NOT want an automatic provider swap on quota failure.
  */
 export function backupModelsForStageV1(

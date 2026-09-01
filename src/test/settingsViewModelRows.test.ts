@@ -440,11 +440,20 @@ void describe("AI Models view — combo labelling and type-to-select", () => {
 });
 
 void describe("AI Models view — save path (skip/clear semantics)", () => {
+  void it("renders the two-state fallback setting as a labelled checkbox", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(initMessage({ settings: { impl: { strategy: "switch-to-backup" } } }));
+    const rowHtml = session.tbodyRows()[0]!.innerHTML;
+    assert.match(rowHtml, /fallback-enabled-impl[^>]* checked/);
+    assert.match(rowHtml, /Fall back to backup models/);
+    assert.doesNotMatch(rowHtml, /strategy-select|Pause until available|Alert and wait/);
+  });
+
   void it("saves with fully-unconfigured stages: no errors, explicit stage entries written", async () => {
     const session = runWebviewSession(extractWebviewScript());
     await session.deliver(initMessage({ stages: ["impl", "publish"] }));
-    session.byId("strategy-impl").value = "alert-and-wait";
-    session.byId("strategy-publish").value = "alert-and-wait";
+    session.byId("fallback-enabled-impl").checked = false;
+    session.byId("fallback-enabled-publish").checked = false;
     await session.byId("save-btn").dispatch("click");
     assert.ok(
       !session.posted.some((message) => message.type === "validationError"),
@@ -464,7 +473,7 @@ void describe("AI Models view — save path (skip/clear semantics)", () => {
   void it("no longer raises the 'switch-to-backup requires a backup' error", async () => {
     const session = runWebviewSession(extractWebviewScript());
     await session.deliver(initMessage());
-    session.byId("strategy-impl").value = "switch-to-backup";
+    session.byId("fallback-enabled-impl").checked = true;
     await session.byId("save-btn").dispatch("click");
     assert.ok(!session.posted.some((message) => message.type === "validationError"));
     assert.ok(session.posted.some((message) => message.type === "saveSettings"));
@@ -475,7 +484,7 @@ void describe("AI Models view — save path (skip/clear semantics)", () => {
     await session.deliver(initMessage());
     const collectRow = session.byId("row-impl");
     collectRow.querySelector(".primary-container .model-row").querySelector(".row-enabled").checked = false;
-    session.byId("strategy-impl").value = "alert-and-wait";
+    session.byId("fallback-enabled-impl").checked = false;
     session.byId("primary-input-impl").value = "typo that matches nothing";
     session.byId("primary-impl").value = "";
     session.byId("primary-impl").dataset.lastValid = "claude-cli:sonnet";
@@ -496,7 +505,7 @@ void describe("AI Models view — save path (skip/clear semantics)", () => {
     await session.deliver(initMessage());
     const collectRow = session.byId("row-impl");
     collectRow.querySelector(".primary-container .model-row").querySelector(".row-enabled").checked = true;
-    session.byId("strategy-impl").value = "alert-and-wait";
+    session.byId("fallback-enabled-impl").checked = false;
     session.byId("primary-input-impl").value = "typo that matches nothing";
     session.byId("primary-impl").value = "";
     await session.byId("save-btn").dispatch("click");

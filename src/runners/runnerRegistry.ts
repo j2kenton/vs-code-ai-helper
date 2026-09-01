@@ -58,6 +58,7 @@ import {
   recordQuotaObservation,
 } from "../utils/quota";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
+import { chooseStopBehaviourV1, describeMidRoundOutcomeV1 } from "../utils/stopBehaviourV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   clearQuotaParkV1,
@@ -69,6 +70,7 @@ import { createCopilotLmToolSessionTransportV1 } from "../services/languageModel
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { RoundOutcomeEntryV1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import {
   ProviderChainCandidateStatusV1,
   ProviderChainExhaustionV1,
@@ -218,8 +220,8 @@ function filterEnabledBackupModels(models: readonly string[]): string[] {
  * Configured backup models for a stage, excluding `modelId` itself and any
  * provider currently disabled — but ONLY when the stage's fallback strategy
  * is "switch-to-backup" (the quota-triggered automatic switch-over opt-in).
- * A stage configured with "pause-and-resume" or "alert-and-wait" returns
- * nothing here, by design: those strategies mean the user explicitly does
+ * A stage configured with "never-switch" returns nothing here, by design:
+ * that strategy means the user explicitly does
  * NOT want an automatic provider swap on quota failure.
  *
  * Do not reuse this for a different question than "should a quota failure
@@ -263,7 +265,7 @@ export function backupModelsForStage(
  *
  * Deliberately does NOT gate on `strategy === "switch-to-backup"` the way
  * backupModelsForStage does: a user who configured backups under
- * "pause-and-resume" or "alert-and-wait" has explicitly opted OUT of
+ * "never-switch" has explicitly opted OUT of
  * automatic quota switch-over, but still has models genuinely available —
  * gating a plateau-triggered second opinion on that unrelated setting would
  * silently make the mechanism inert (always "no alternate model was
@@ -1335,6 +1337,25 @@ export async function runImplementationForModel(options: {
             : undefined)
         : undefined;
     const remedyText = buildQuotaRemedyTextV1(knownResetAt);
+    // Review completion blocker (2026-09-01): `chooseStopBehaviourV1` used to
+    // be consulted only in the final fallthrough further below, purely to
+    // pick explanation TEXT — the actual park-record persistence and
+    // "Rerun after reset" offer just below were decided by their own ad hoc
+    // conditions and never called this function at all, so it was not
+    // actually the behaviour authority Part 14 requires it to be. Both
+    // decisions now route through it: `knownNearResetAt` narrows `knownResetAt`
+    // to the same "near" window `isQuotaResetBeyondThresholdV1` already gated
+    // the reset-offer on, so the classifier's "park-and-schedule" vs "park"
+    // split lines up exactly with the pre-existing near/far distinction.
+    const knownNearResetAt =
+      knownResetAt !== undefined && !isQuotaResetBeyondThresholdV1(knownResetAt)
+        ? knownResetAt
+        : undefined;
+    const stopBehaviour = chooseStopBehaviourV1({
+      failureKind: result.failureKind,
+      authFailure,
+      knownNearResetAt,
+    });
     // Part 5 step 3b / workflow 3 continuation first item: a "far" outage
     // (beyond the near-reset threshold) is never just this one stage's
     // problem — every OTHER configurable stage whose effective primary
@@ -1351,12 +1372,13 @@ export async function runImplementationForModel(options: {
       affectedStageDescriptions.length > 0
         ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
         : "";
-    const withheldMessage =
-      `Hit ${limitLabel} on ${primaryProviderLabel}` +
-      (result.errorMessage ? ` (${result.errorMessage})` : "") +
-      `. This round already changed ${result.filesChanged.length} file(s), so Ensemble withheld the ` +
-      "automatic switch to this stage's backup model — switching mid-round on a dirty working tree " +
-      `risks mixing two models' edits in one round. ${remedyText}${affectedStagesClause}`;
+    const withheldMessage = describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+      kind: "cascadeWithheldDirtyTree",
+      limitLabel,
+      filesChangedCount: result.filesChanged.length,
+      remedyText,
+      affectedStagesClause,
+    });
     options.onProgress(withheldMessage);
     // Part 5 step 1: surface a "Rerun after reset" action alongside the
     // withheld-cascade notice whenever a concrete, NEAR reset time is known
@@ -1372,16 +1394,73 @@ export async function runImplementationForModel(options: {
     // rerun there contradicts remedyText's own switch-model-only advice for
     // a multi-day outage. Gated on the same threshold check that drives
     // affectedStagesClause so the action and the remedy text never disagree.
-    if (
-      options.taskFolderUri &&
-      knownResetAt !== undefined &&
-      !isQuotaResetBeyondThresholdV1(knownResetAt)
-    ) {
-      NotificationRouter.showWarning(withheldMessage, undefined, undefined, undefined, {
-        command: "vs-code-ai-helper.scheduleQuotaResumeV1",
-        title: "Rerun after reset",
-        args: [{ taskFolderPath: options.taskFolderUri.fsPath, resetAtIso: knownResetAt }],
-      });
+    if (options.taskFolderUri && stopBehaviour === "park-and-schedule") {
+      // Review blocker 2026-08-31 (item 13/35): "Rerun after reset" used to
+      // be the toast's own action button — the only place it appeared. Post
+      // it as a chat decision first so it has a durable, bound control, and
+      // let `postWorkflowDecisionV1` reduce the toast to the single "Review
+      // decision in Chat" pointer. Falls back to the direct-action toast only
+      // when there is no extension context to post through (e.g. a test).
+      const quotaTaskFolderUri = options.taskFolderUri;
+      const quotaStage = options.stage;
+      const posted = quotaStage
+        ? await postWorkflowDecisionV1(
+            {
+              decisionKey: "quotaWithheldCascadeResetKnown",
+              taskCanonicalId: quotaTaskFolderUri.fsPath,
+              stage: quotaStage,
+              whatHappened: withheldMessage,
+              whyUserNeeded:
+                "The system withheld the automatic switch to a backup model rather than risk mixing two " +
+                "models' edits — you decide whether to wait for the reset or act sooner yourself.",
+              options: [
+                {
+                  optionId: "rerunAfterReset",
+                  label: "Rerun after reset",
+                  consequence: `Schedules an automatic rerun of this stage at ${knownResetAt}.`,
+                  effect: {
+                    kind: "command",
+                    command: "vs-code-ai-helper.scheduleQuotaResumeV1",
+                    args: [{ taskFolderPath: quotaTaskFolderUri.fsPath, resetAtIso: knownResetAt }],
+                  },
+                },
+                {
+                  optionId: "notNow",
+                  label: "Not now",
+                  consequence: "Does nothing. No rerun is scheduled.",
+                  effect: { kind: "doNothing" },
+                },
+              ],
+              recommendation: {
+                kind: "option",
+                optionId: "rerunAfterReset",
+                reasoning: `The reset time (${knownResetAt}) is known and near, so scheduling a rerun is likely to succeed without further action.`,
+              },
+              gating: {
+                holdsTaskPaused: false,
+                unblocksProgress: false,
+                detail:
+                  "This round already ended; nothing is paused on this decision. Scheduling the rerun is " +
+                  "a convenience, not a requirement — the stage can also be rerun manually at any time.",
+              },
+            },
+            {
+              canonicalId: quotaTaskFolderUri.fsPath,
+              taskFolderPath: quotaTaskFolderUri.fsPath,
+              stage: quotaStage,
+            }
+          )
+        : undefined;
+      if (!posted) {
+        // No extension context to post a decision through (e.g. a unit
+        // test) — matches `providerChainExhausted`'s own fallback
+        // (`reviewActions.ts`): report the fact, but never attach a direct-
+        // dispatch action button here, since there is no chat for it to
+        // point at and re-adding one would reintroduce exactly the
+        // "notification is the only place the action appears" defect this
+        // migration exists to remove.
+        NotificationRouter.showWarning(withheldMessage);
+      }
     }
     // Persist a durable record of the block — the same transaction that
     // withholds the backup switch — so a host restart or a later
@@ -1393,6 +1472,12 @@ export async function runImplementationForModel(options: {
     // unrecorded here.
     if (
       options.taskFolderUri &&
+      (stopBehaviour === "park-and-schedule" || stopBehaviour === "park") &&
+      // Narrows `result.failureKind` for `QuotaParkRecordV1.failureKind`
+      // below (TS can't narrow it through the `stopBehaviour` check alone).
+      // `chooseStopBehaviourV1` only returns a park outcome for these two
+      // kinds, so this can never be false when the check above is true —
+      // it exists for the type, not to change which failures are parked.
       (result.failureKind === "quota" || result.failureKind === "model-entitlement")
     ) {
       const record = {
@@ -1413,31 +1498,105 @@ export async function runImplementationForModel(options: {
       options.modelId
     );
   }
-  // Part 7 diagnostic: neither cascade branch above fired, so this cascade-
-  // eligible failure falls straight through with no explanation of WHY no
-  // backup was attempted. Two distinct reasons land here and were previously
-  // indistinguishable in the run record: no backup is even CONFIGURED for
-  // this stage/chain (`chainWantsBackup` false), versus a backup IS
-  // configured but the working tree's state is UNKNOWN
-  // (`filesChangedUnknown` — git unavailable or not a repository — which the
-  // withheld-cascade branch above only explains for the KNOWN-dirty case).
-  if (
-    !authFailure &&
-    result.status === "failed" &&
-    isCascadeEligibleFailureKind(result.failureKind) &&
-    options.stage
-  ) {
-    if (!chainWantsBackup) {
-      options.onProgress(
-        `${primaryProviderLabel} hit ${result.failureKind ?? "a"} failure; no backup model is ` +
-          "configured for this stage/chain, so no automatic fallback was attempted."
-      );
-    } else if (result.filesChangedUnknown === true) {
-      options.onProgress(
-        `${primaryProviderLabel} hit ${result.failureKind ?? "a"} failure with the working ` +
-          "tree state unknown (git unavailable or not a repository); Ensemble withheld the " +
-          "automatic switch to this stage's backup model because a dirty-vs-clean tree could " +
-          "not be confirmed."
+  // Part 7 diagnostic, extended by plan Part 14 (item 8): neither cascade
+  // branch above fired, so this failure falls straight through with no
+  // explanation of WHY no backup was attempted. Four distinct reasons land
+  // here and were previously indistinguishable in the run record: no backup
+  // is even CONFIGURED for this stage/chain (`chainWantsBackup` false with a
+  // strategy of `switch-to-backup` and an empty/unusable chain), the stage is
+  // explicitly set to `never-switch` (a DIFFERENT reason not to cascade than
+  // "nothing is configured"), a backup IS configured but the working tree's
+  // state is UNKNOWN (`filesChangedUnknown` — git unavailable or not a
+  // repository — which the withheld-cascade branch above only explains for
+  // the KNOWN-dirty case), or the failure was an AUTHENTICATION failure
+  // (`authFailure`), which every branch above excludes from cascading
+  // outright.
+  //
+  // Review completion blocker (2026-09-01, round 1): this gate used to
+  // require `isCascadeEligibleFailureKind(result.failureKind)`, which a PURE
+  // auth failure (no quota/outage vocabulary in its message) never satisfies —
+  // `classifyFailure` (quota.ts) puts such a message in "generic", and
+  // "generic" is deliberately excluded from cascade eligibility. So an
+  // ordinary 403/sign-in failure fell straight through this whole block with
+  // no explanation at all, silently reproducing the exact defect item 8 was
+  // written to close — only a message that ALSO happened to carry quota
+  // wording (classifyFailure's quota check is auth-independent) reached the
+  // `authFailureBackupWithheld` branch below. `authFailure` is therefore
+  // checked here as its own admission path, independent of failureKind.
+  //
+  // Review completion blocker (2026-09-01, round 2): the SAME narrowing
+  // still excluded a non-authentication `"generic"` (or `undefined`)
+  // failure, since neither `authFailure` nor `isCascadeEligibleFailureKind`
+  // holds for it — reproducing item 8's exact defect a second time for a
+  // different failure kind. Step 39 requires the explanation for EVERY
+  // failure kind, so the gate now only requires the run to have failed; the
+  // `notCascadeEligible` branch below covers the case neither the auth nor
+  // the cascade-eligible kinds explain — a failure kind that is simply never
+  // retried against a backup model, regardless of tree state or chain
+  // configuration (branches above this one both gate on
+  // `isCascadeEligibleFailureKind`, so a generic failure never even attempts
+  // a cascade to explain the absence of).
+  if (result.status === "failed" && options.stage) {
+    // Routed through the classifier rather than an ad hoc `if (authFailure)`
+    // so this decision point is what a future caller extends. Only
+    // "alert-and-stop" (auth) branches differently here — a park-vs-alert
+    // split is not needed at THIS call site: this fallthrough is reached
+    // precisely when no dirty-tree cascade was attempted at all (no chain
+    // configured, `never-switch`, or an unknown tree state), so there is no
+    // reset to have parsed here — `knownNearResetAt` is omitted (equivalent
+    // to explicit `undefined`) rather than reparsed, since no branch below
+    // reads a "park-and-schedule"-vs-"park" distinction; only the
+    // auth-vs-everything-else split selects which explanation to build.
+    const stopBehaviour = chooseStopBehaviourV1({ failureKind: result.failureKind, authFailure });
+    // Review completion blocker (2026-09-01): `chainWantsBackup` is false
+    // both when the stage has no usable backup chain at all AND when the
+    // stage is deliberately configured `never-switch` — these are different
+    // facts ("nothing to switch to" vs "switching is turned off") and were
+    // rendered with the same "no backup model is configured" sentence,
+    // which is simply false for a `never-switch` stage that DOES have a
+    // configured chain. Distinguish them from the resolved chain directly.
+    const neverSwitchConfigured = chain !== undefined && chain.strategy === "never-switch";
+    // Item 8: the explanation belongs on the returned/recorded failure
+    // itself (as the dirty-tree branch above already does by rewriting
+    // `errorMessage`), not only on the transient `onProgress` stream — a run
+    // log or chat entry built from the returned result must carry it too.
+    const explanation =
+      stopBehaviour === "alert-and-stop"
+        ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+            kind: "authFailureBackupWithheld",
+            dirtyTree: result.filesChangedUnknown !== true && result.filesChanged.length > 0,
+            filesChangedCount: result.filesChangedUnknown === true ? undefined : result.filesChanged.length,
+          })
+        : !isCascadeEligibleFailureKind(result.failureKind)
+          ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+              kind: "notCascadeEligible",
+              failureKind: result.failureKind,
+              dirtyTree: result.filesChangedUnknown !== true && result.filesChanged.length > 0,
+              filesChangedCount:
+                result.filesChangedUnknown === true ? undefined : result.filesChanged.length,
+            })
+          : neverSwitchConfigured
+          ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+              kind: "neverSwitchConfigured",
+              failureKind: result.failureKind,
+            })
+          : !chainWantsBackup
+            ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+                kind: "noBackupConfigured",
+                failureKind: result.failureKind,
+              })
+            : result.filesChangedUnknown === true
+              ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+                  kind: "treeStateUnknown",
+                  failureKind: result.failureKind,
+                })
+              : undefined;
+    if (explanation !== undefined) {
+      options.onProgress(explanation);
+      return withActualIdentity(
+        { ...result, errorMessage: explanation },
+        primaryProviderLabel,
+        options.modelId
       );
     }
   }

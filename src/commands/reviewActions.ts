@@ -2568,8 +2568,8 @@ export async function handleReviewRoutingOutcome(options: {
       // candidate failure for backup-selection purposes, invisible to
       // switch-to-backup's own runner-level failure handling (the runner
       // succeeded; only the parser found nothing usable) — decide whether
-      // the stage's next configured backup should be tried, offered as a
-      // manual retry, or reported exhausted. The caller (routeReviewOutcomeV1)
+      // the stage's next configured backup should be tried or stop. The
+      // caller (routeReviewOutcomeV1)
       // owns actually dispatching the automatic case; this function only
       // decides and reports, matching its existing "never throws, never
       // dispatches" contract.
@@ -2599,27 +2599,18 @@ export async function handleReviewRoutingOutcome(options: {
         currentModelId: degenerateModelId,
         episodeTriedModelIds,
       });
-      if (degenerateBackupAdvance.kind === "manual") {
+      if (degenerateBackupAdvance.kind === "stop") {
         NotificationRouter.showWarning(
-          `${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) has not been tried this episode.`,
-          undefined,
-          undefined,
-          undefined,
-          {
-            command: "vs-code-ai-helper.retryReviewWithBackupV1",
-            title: `Retry with ${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}`,
-            args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage, modelId: degenerateBackupAdvance.nextModelId }],
-          }
+          `${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) was not tried because this stage is set to Never switch.`
         );
       } else if (degenerateBackupAdvance.kind === "exhausted") {
         // wf10 review fix (Part 5 step 15): with every configured backup
         // already tried this episode, there is no "next model" to name — but
         // the round may still have been a one-off flake, and the user had no
         // one-click way to just try again. Offer a retry with the SAME model
-        // that just produced degenerate output, via the exact same manual
-        // affordance the "manual" branch above uses (recordActiveFallbackModel
-        // + preserveActiveFallback re-dispatch), rather than leaving this
-        // warning as a dead end.
+        // that just produced degenerate output. This is a same-model retry,
+        // not a fallback-chain switch, so it remains available regardless of
+        // the Never switch setting.
         NotificationRouter.showWarning(
           `${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`,
           undefined,
@@ -3318,7 +3309,7 @@ async function notifyReviewerVerifiedTicksV1(
  * Review fix: the inline version silently did nothing when
  * `getWorkspaceFolder` could not resolve a `vscode.WorkspaceFolder` for the
  * task's workspace — the chain the user configured just stopped, with no
- * warning and no retry affordance, unlike the sibling "manual"/"exhausted"
+ * warning and no retry affordance, unlike the sibling "stop"/"exhausted"
  * branches which always offer one. This now falls back to the same
  * one-click "Retry with <model>" notification those branches use.
  */
@@ -3513,6 +3504,19 @@ async function routeReviewOutcomeV1(
         // toward the manual action, regardless of how the review was
         // triggered.
         if (!escalated && targetStage === "publish") {
+          // Review blocker 2026-08-31 (item 13/35, round 3): this used to
+          // attach commitAndPushTask directly to the toast — a background
+          // review-completion outcome dispatching a workflow command straight
+          // from a notification, exactly what the notification-ownership rule
+          // forbids. Point at the chat instead (the round's own outcome is
+          // already recorded there via the round-ledger projection); Publish
+          // itself stays reachable from the task tree / Command Palette, same
+          // as every other manual-only command.
+          const publishNudgeTarget: ChatTarget = {
+            canonicalId: folderUri.fsPath,
+            taskFolderPath: folderUri.fsPath,
+            stage: targetStage,
+          };
           if (meetsThreshold) {
             NotificationRouter.showWarning(
               `Review score ${score}/10 reached the auto-advance threshold. Publish manually when you're ready.`,
@@ -3520,9 +3524,9 @@ async function routeReviewOutcomeV1(
               undefined,
               undefined,
               {
-                command: "vs-code-ai-helper.commitAndPushTask",
-                title: "Publish",
-                args: [{ taskFolderPath: folderUri.fsPath }],
+                command: "vs-code-ai-helper.openWorkflowDecision",
+                title: "Open in Chat",
+                args: [publishNudgeTarget],
               }
             );
           } else {
@@ -3533,9 +3537,9 @@ async function routeReviewOutcomeV1(
               undefined,
               undefined,
               {
-                command: "vs-code-ai-helper.commitAndPushTask",
-                title: "Publish Anyway",
-                args: [{ taskFolderPath: folderUri.fsPath }],
+                command: "vs-code-ai-helper.openWorkflowDecision",
+                title: "Open in Chat",
+                args: [publishNudgeTarget],
               }
             );
           }
@@ -3822,6 +3826,9 @@ async function routeReviewOutcomeV1(
                         dropReason === "automation-disabled"
                           ? "auto-advance was turned off before the review could start"
                           : "another review is already in progress for this task";
+                      // Review blocker 2026-08-31 (item 13/35, round 3): open
+                      // in chat rather than dispatching commitAndPushTask
+                      // directly from a background auto-advance outcome.
                       NotificationRouter.showWarning(
                         `${folderUri.fsPath}: the follow-up Publish review could not be started automatically because ${reasonText}. ` +
                           "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.",
@@ -3829,9 +3836,9 @@ async function routeReviewOutcomeV1(
                         undefined,
                         undefined,
                         {
-                          command: "vs-code-ai-helper.commitAndPushTask",
-                          title: "Publish Anyway",
-                          args: [{ taskFolderPath: folderUri.fsPath }],
+                          command: "vs-code-ai-helper.openWorkflowDecision",
+                          title: "Open in Chat",
+                          args: [{ canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: next } satisfies ChatTarget],
                         }
                       );
                     }
@@ -3870,6 +3877,8 @@ async function routeReviewOutcomeV1(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const isPublishReview = targetStage === "publish";
+        // Review blocker 2026-08-31 (item 13/35, round 3): open in chat
+        // rather than dispatching commitAndPushTask directly.
         NotificationRouter.showWarning(
           `Review was published, but auto-advancing past the score threshold failed: ${message}. ` +
             "Advance the stage manually." +
@@ -3879,9 +3888,9 @@ async function routeReviewOutcomeV1(
           undefined,
           isPublishReview
             ? {
-                command: "vs-code-ai-helper.commitAndPushTask",
-                title: "Publish Anyway",
-                args: [{ taskFolderPath: folderUri.fsPath }],
+                command: "vs-code-ai-helper.openWorkflowDecision",
+                title: "Open in Chat",
+                args: [{ canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
               }
             : undefined
         );
@@ -3945,6 +3954,9 @@ async function routeReviewOutcomeV1(
     // The Publish review failed, was cancelled, or was stalled. Give the
     // user a one-click path to publish anyway instead of only a dead-end
     // error.
+    // Review blocker 2026-08-31 (item 13/35, round 3): open in chat rather
+    // than dispatching commitAndPushTask directly from this background
+    // review-completion outcome.
     NotificationRouter.showWarning(
       `${folderUri.fsPath}: the Publish review did not complete successfully. ` +
         "Publish manually once you're satisfied, or use Publish Anyway from Commit and Push.",
@@ -3952,9 +3964,9 @@ async function routeReviewOutcomeV1(
       undefined,
       undefined,
       {
-        command: "vs-code-ai-helper.commitAndPushTask",
-        title: "Publish Anyway",
-        args: [{ taskFolderPath: folderUri.fsPath }],
+        command: "vs-code-ai-helper.openWorkflowDecision",
+        title: "Open in Chat",
+        args: [{ canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
       }
     );
   } else if (outcome.kind === "cancelled") {
@@ -6086,6 +6098,12 @@ export async function fastForwardReviewWithAI(
     // The run is over (cancelled or failed) — if it rode through its own
     // escalation, the pause that escalation asserted must come back now.
     await reassertDeferredEscalationPause();
+    // Review blocker 2026-08-31 (item 13/35, round 3): every "Publish
+    // Anyway" affordance in this Fast Forward loop now opens the chat
+    // (`vs-code-ai-helper.openWorkflowDecision`) instead of dispatching
+    // commitAndPushTask directly from a background-run outcome — the same
+    // fix already applied a few lines below at the sibling-blockers
+    // decision (`fastForwardStoppedWithSiblingBlockers`).
     if (error instanceof vscode.CancellationError) {
       if (targetStage === "publish") {
         NotificationRouter.showWarning(
@@ -6095,9 +6113,9 @@ export async function fastForwardReviewWithAI(
           undefined,
           undefined,
           {
-            command: "vs-code-ai-helper.commitAndPushTask",
-            title: "Publish Anyway",
-            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+            command: "vs-code-ai-helper.openWorkflowDecision",
+            title: "Open in Chat",
+            args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
           }
         );
       } else {
@@ -6120,9 +6138,9 @@ export async function fastForwardReviewWithAI(
         undefined,
         undefined,
         {
-          command: "vs-code-ai-helper.commitAndPushTask",
-          title: "Publish Anyway",
-          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+          command: "vs-code-ai-helper.openWorkflowDecision",
+          title: "Open in Chat",
+          args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
         }
       );
     }
@@ -6195,32 +6213,84 @@ export async function fastForwardReviewWithAI(
     const siblingBlockers = siblingHistoryEntry?.taskFixableCount ?? 0;
     const stageName = STAGE_DISPLAY_NAMES[targetStage];
     if (siblingImplStage && siblingBlockers > 0) {
-      NotificationRouter.showWarning(
-        `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
-          `${stageName} rounds found nothing left to fix (last score ${outcome.score}/10). ` +
-          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} still lists ` +
-          `${describeTaskFixableBlockersV1(siblingBlockers, siblingHistoryEntry?.blockers)}. ` +
-          "Use Apply Review to fix those.",
-        undefined,
-        undefined,
-        undefined,
+      // Review blocker 2026-08-31 (item 13/35): this used to attach the
+      // workflow action directly to the toast (`actionCommand` below), which
+      // made the notification the ONLY place the action appeared — exactly
+      // what the notification-ownership rule forbids. Post it as a chat
+      // decision first (durable, bound control) and let `postWorkflowDecisionV1`
+      // demote the toast itself to the single "Review decision in Chat"
+      // pointer. Falls back to the old direct-action toast only when there is
+      // no extension context to post a decision through (e.g. a unit test),
+      // matching every other `postWorkflowDecisionV1` call site's fallback.
+      const siblingTarget: ChatTarget = {
+        canonicalId: resolved.folderUri.fsPath,
+        taskFolderPath: resolved.folderUri.fsPath,
+        stage: siblingImplStage,
+        taskName: resolved.progress.displayName,
+      };
+      const whatHappened =
+        `Fast Forward Review stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
+        `${stageName} rounds found nothing left to fix (last score ${outcome.score}/10). ` +
+        `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} still lists ` +
+        `${describeTaskFixableBlockersV1(siblingBlockers, siblingHistoryEntry?.blockers)}.`;
+      const posted = await postWorkflowDecisionV1(
         {
-          // The task is at the stage Fast Forward targeted, so the SIBLING
-          // stage's apply command is out of stage — move first. Resumes the
-          // task first if it has since been paused (review blocker
-          // 2026-08-30, item 14) rather than the plain goToReviewAndApply,
-          // which fails with a confusing "task could not be found" on a
-          // paused task.
-          command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
-          title: "Go to Review & Apply",
-          args: [
+          decisionKey: "fastForwardStoppedWithSiblingBlockers",
+          taskCanonicalId: resolved.folderUri.fsPath,
+          stage: siblingImplStage,
+          whatHappened,
+          whyUserNeeded:
+            "Implementation cannot fix these blockers on its own — only Apply Review, against the " +
+            `${STAGE_DISPLAY_NAMES[siblingImplStage]} findings, can.`,
+          options: [
             {
-              taskFolderPath: resolved.folderUri.fsPath,
-              reviewStage: siblingImplStage,
+              optionId: "goToReviewAndApply",
+              label: "Go to Review & Apply",
+              consequence:
+                `Moves the task to ${STAGE_DISPLAY_NAMES[siblingImplStage]} and opens Apply Review. ` +
+                "Resumes the task first if it has since been paused.",
+              effect: {
+                // The task is at the stage Fast Forward targeted, so the
+                // SIBLING stage's apply command is out of stage — move
+                // first. Resumes the task first if it has since been paused
+                // (review blocker 2026-08-30, item 14) rather than the plain
+                // goToReviewAndApply, which fails with a confusing "task
+                // could not be found" on a paused task.
+                kind: "command",
+                command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
+                args: [
+                  {
+                    taskFolderPath: resolved.folderUri.fsPath,
+                    reviewStage: siblingImplStage,
+                  },
+                ],
+              },
+            },
+            {
+              optionId: "notNow",
+              label: "Not now",
+              consequence: "Does nothing. The blockers remain and nothing changes.",
+              effect: { kind: "doNothing" },
             },
           ],
-        }
+          recommendation: {
+            kind: "option",
+            optionId: "goToReviewAndApply",
+            reasoning: "Apply Review is the only action that can fix what the newest review still reports.",
+          },
+          gating: {
+            holdsTaskPaused: false,
+            unblocksProgress: true,
+            detail:
+              "The task is not paused by this decision, but the sibling stage's blockers stay unresolved " +
+              "until you go fix them — choosing \"Go to Review & Apply\" is what moves that forward.",
+          },
+        },
+        siblingTarget
       );
+      if (!posted) {
+        NotificationRouter.showWarning(`${whatHappened} Use Apply Review to fix those.`);
+      }
     } else {
       NotificationRouter.showInformation(
         `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
@@ -6248,9 +6318,11 @@ export async function fastForwardReviewWithAI(
       undefined,
       targetStage === "publish"
         ? {
-            command: "vs-code-ai-helper.commitAndPushTask",
-            title: "Publish Anyway",
-            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+            // Review blocker 2026-08-31 (item 13/35, round 3): open in chat
+            // rather than dispatching commitAndPushTask directly.
+            command: "vs-code-ai-helper.openWorkflowDecision",
+            title: "Open in Chat",
+            args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
           }
         : undefined
     );
@@ -6264,9 +6336,11 @@ export async function fastForwardReviewWithAI(
       undefined,
       targetStage === "publish"
         ? {
-            command: "vs-code-ai-helper.commitAndPushTask",
-            title: "Publish Anyway",
-            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+            // Review blocker 2026-08-31 (item 13/35, round 3): open in chat
+            // rather than dispatching commitAndPushTask directly.
+            command: "vs-code-ai-helper.openWorkflowDecision",
+            title: "Open in Chat",
+            args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
           }
         : undefined
     );
@@ -6302,9 +6376,11 @@ export async function fastForwardReviewWithAI(
       undefined,
       targetStage === "publish"
         ? {
-            command: "vs-code-ai-helper.commitAndPushTask",
-            title: "Publish Anyway",
-            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+            // Review blocker 2026-08-31 (item 13/35, round 3): open in chat
+            // rather than dispatching commitAndPushTask directly.
+            command: "vs-code-ai-helper.openWorkflowDecision",
+            title: "Open in Chat",
+            args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
           }
         : undefined
     );
@@ -8890,20 +8966,16 @@ async function executeImplementationRun(
           target
         );
         if (!sterileDecisionPosted) {
+          // No decision was persisted (missing extension context) — no
+          // "Open in Chat" button: that would point at a chat with nothing
+          // bound (review blocker). State the choice in the text instead,
+          // same as preImplementationRouting's fallback below.
           NotificationRouter.showWarning(
             `Implementation changed no files. ${sterileRoundDecision.reason} ` +
               (sterileBothValid
                 ? "The plan checklist still has unticked items, so running Implementation again is also " +
                   "valid — but Go to Review & Apply can fix what the newest review reports right now."
-                : "Running Implementation again will give the same result — use Go to Review & Apply instead."),
-            undefined,
-            undefined,
-            undefined,
-            {
-              command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
-              title: "Go to Review & Apply",
-              args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetReviewStage }]
-            }
+                : "Running Implementation again will give the same result — use Go to Review & Apply instead.")
           );
         }
       } else {

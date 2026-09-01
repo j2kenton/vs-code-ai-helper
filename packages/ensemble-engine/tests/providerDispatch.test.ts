@@ -360,7 +360,7 @@ const SETTINGS: ModelSettings = {
   desc: {
     primary: "openai:gpt-5.4",
     backups: ["google:gemini-3.1-pro"],
-    strategy: "alert-and-wait",
+    strategy: "never-switch",
   },
 };
 
@@ -387,7 +387,7 @@ test("effective chain: a blank stage inherits the general model's chain AND stra
   assert.equal(chain.source, "general");
   assert.equal(chain.originStage, "desc");
   assert.equal(chain.primary, "openai:gpt-5.4");
-  assert.equal(chain.strategy, "alert-and-wait");
+  assert.equal(chain.strategy, "never-switch");
 });
 
 test("backupModelsForStage: strategy-gated, deduped by normalized id, primary and disabled providers excluded", () => {
@@ -654,12 +654,12 @@ test("dispatch: a model-entitlement failure with no configured backup reports mo
   assert.deepEqual(result, { kind: "failed", code: "modelEntitlementBlocked", retryable: true });
 });
 
-test("dispatch: a non-switch-to-backup strategy never cascades on quota", async () => {
+test("dispatch: never-switch never cascades on quota", async () => {
   const settings: ModelSettings = {
     impl: {
       primary: "anthropic:claude-sonnet-5",
       backups: ["openai:gpt-5.4"],
-      strategy: "pause-and-resume",
+      strategy: "never-switch",
     },
   };
   const anthropic = scriptedAdapter("anthropic", () => ({ kind: "quota" }));

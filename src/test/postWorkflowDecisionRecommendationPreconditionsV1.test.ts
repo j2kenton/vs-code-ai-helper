@@ -61,6 +61,63 @@ function setStatus(folder: string, status: "active" | "paused"): void {
   fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
 }
 
+function setReviewInvalidatedByRound(folder: string, stage: string): void {
+  const progressPath = path.join(folder, TASK_PROGRESS_FILENAME);
+  const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+  progress.reviewInvalidatedByRound = { stage, at: new Date().toISOString() };
+  fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
+}
+
+function setImplRecovery(folder: string): void {
+  const progressPath = path.join(folder, TASK_PROGRESS_FILENAME);
+  const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+  progress.implRecovery = {
+    sourceAttemptId: "attempt-1",
+    reason: "the round ended without a usable report",
+    trigger: "summaryRejected",
+    mode: "inspect-and-complete",
+    dispatch: "pending",
+    at: new Date().toISOString(),
+  };
+  fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
+}
+
+function stageArgDecisionInput(taskFolderPath: string, reviewStage: string): CreateWorkflowDecisionInputV1 {
+  return {
+    decisionId: "goToReviewDecisionStageArg",
+    decisionKey: "exampleReviewRoutingStageArg",
+    taskCanonicalId: taskFolderPath,
+    stage: "impl",
+    whatHappened: "The newest review still reports task-fixable blockers.",
+    whyUserNeeded: "Implementation cannot see the blockers; Apply Review can.",
+    options: [
+      {
+        optionId: "goToReviewAndApply",
+        label: "Go to Review & Apply",
+        consequence: "Moves the task to review and runs Apply Review.",
+        effect: {
+          kind: "command",
+          command: "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
+          args: [{ taskFolderPath, reviewStage }],
+        },
+      },
+      {
+        optionId: "doNothing",
+        label: "Do nothing",
+        consequence: "Leaves the task exactly as it is.",
+        effect: { kind: "doNothing" },
+      },
+    ],
+    recommendation: {
+      kind: "option",
+      optionId: "goToReviewAndApply",
+      reasoning: "Apply Review is the only action that can fix what the review still reports.",
+    },
+    gating: { holdsTaskPaused: false, unblocksProgress: true, detail: "Moves the task toward review." },
+    createdAt: new Date().toISOString(),
+  };
+}
+
 function decisionInput(taskFolderPath: string): CreateWorkflowDecisionInputV1 {
   return {
     decisionId: "goToReviewDecision",
@@ -159,5 +216,89 @@ void describe("postWorkflowDecisionV1 — recommendationPreconditionsV1 integrat
     if (posted.recommendation.kind === "option") {
       assert.equal(posted.recommendation.optionId, "goToReviewAndApply");
     }
+  });
+
+  // Review-invalidation axis (review blocker 2026-08-31, extending Part 12
+  // step 34): the same resume-safe wrapper the paused-status axis never
+  // blocks IS blocked here, because nothing "does the whole thing" for a
+  // stale review — the review genuinely must be regenerated first.
+  void it("disables the resume-safe apply-review option when its target stage's review is invalidated", async () => {
+    const fixture = makeOwnedTaskFolder("recPrecond-invalidated-");
+    setStatus(fixture.folder, "active");
+    setReviewInvalidatedByRound(fixture.folder, "impl-high-review");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const realFs = installRealFs();
+
+    let posted;
+    try {
+      posted = await postWorkflowDecisionV1(
+        stageArgDecisionInput(fixture.folder, "impl-high-review"),
+        { taskFolderPath: fixture.folder, canonicalId: fixture.folder, stage: "impl" }
+      );
+    } finally {
+      realFs.restore();
+    }
+
+    assert.ok(posted);
+    const goToReview = posted.options.find((o) => o.optionId === "goToReviewAndApply");
+    assert.equal(goToReview?.disabled, true);
+    assert.match(goToReview?.disabledReason ?? "", /run the review again/);
+    assert.equal(posted.recommendation.kind, "none");
+  });
+
+  void it("leaves the resume-safe apply-review option enabled when a DIFFERENT stage's review is invalidated", async () => {
+    const fixture = makeOwnedTaskFolder("recPrecond-invalidated-other-");
+    setStatus(fixture.folder, "active");
+    setReviewInvalidatedByRound(fixture.folder, "impl-low-review");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const realFs = installRealFs();
+
+    let posted;
+    try {
+      posted = await postWorkflowDecisionV1(
+        stageArgDecisionInput(fixture.folder, "impl-high-review"),
+        { taskFolderPath: fixture.folder, canonicalId: fixture.folder, stage: "impl" }
+      );
+    } finally {
+      realFs.restore();
+    }
+
+    assert.ok(posted);
+    const goToReview = posted.options.find((o) => o.optionId === "goToReviewAndApply");
+    assert.equal(goToReview?.disabled, undefined);
+    assert.equal(posted.recommendation.kind, "option");
+  });
+
+  // Continuation-owed axis (review blocker 2026-08-31, round 2 — Part 12
+  // step 34 names this as its own precondition, distinct from
+  // review-invalidation).
+  void it("disables the resume-safe apply-review option when a continuation is owed", async () => {
+    const fixture = makeOwnedTaskFolder("recPrecond-continuationOwed-");
+    setStatus(fixture.folder, "active");
+    setImplRecovery(fixture.folder);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const realFs = installRealFs();
+
+    let posted;
+    try {
+      posted = await postWorkflowDecisionV1(
+        stageArgDecisionInput(fixture.folder, "impl-high-review"),
+        { taskFolderPath: fixture.folder, canonicalId: fixture.folder, stage: "impl" }
+      );
+    } finally {
+      realFs.restore();
+    }
+
+    assert.ok(posted);
+    const goToReview = posted.options.find((o) => o.optionId === "goToReviewAndApply");
+    assert.equal(goToReview?.disabled, true);
+    assert.match(goToReview?.disabledReason ?? "", /continuation from an earlier round/);
+    assert.equal(posted.recommendation.kind, "none");
   });
 });

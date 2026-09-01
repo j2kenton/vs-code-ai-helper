@@ -132,4 +132,25 @@ void describe("WorkflowDecisionV1 creation-site inventory — gating field", () 
     assert.match(slice, /holdsTaskPaused:\s*true/);
     assert.match(slice, /unblocksProgress:\s*true/);
   });
+
+  // Review blocker 2026-08-31 (item 13/35): these two used to attach their
+  // workflow action directly to a `NotificationRouter` toast — the only place
+  // the action appeared — instead of posting a chat decision first. Migrated
+  // to `postWorkflowDecisionV1` so the notification demotes to the single
+  // "Review decision in Chat" pointer like every other migrated site.
+  void it("reviewActions.ts's fastForwardStoppedWithSiblingBlockers decision supplies gating", async () => {
+    const source = await readSrc("commands/reviewActions.ts");
+    const slice = sliceAroundDecisionKey(source, "fastForwardStoppedWithSiblingBlockers");
+    assert.match(slice, /gating:\s*\{/, "the fastForwardStoppedWithSiblingBlockers decision must supply gating");
+    assert.match(slice, /holdsTaskPaused:\s*false/);
+    assert.match(slice, /unblocksProgress:\s*true/);
+  });
+
+  void it("runnerRegistry.ts's quotaWithheldCascadeResetKnown decision supplies gating", async () => {
+    const source = await readSrc("runners/runnerRegistry.ts");
+    const slice = sliceAroundDecisionKey(source, "quotaWithheldCascadeResetKnown");
+    assert.match(slice, /gating:\s*\{/, "the quotaWithheldCascadeResetKnown decision must supply gating");
+    assert.match(slice, /holdsTaskPaused:\s*false/);
+    assert.match(slice, /unblocksProgress:\s*false/);
+  });
 });

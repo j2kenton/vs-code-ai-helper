@@ -6,7 +6,7 @@
  * The task's selection becomes the GENERAL model chain's primary (the stage
  * every other stage inherits from), so one selection drives every round of
  * the run — matching the client's single "model" setting. The strategy is
- * deliberately `alert-and-wait`: an explicit user selection must never be
+ * deliberately `never-switch`: an explicit user selection must never be
  * silently routed around by the quota fallback cascade; a failure surfaces
  * instead. A task with no selection falls through to the host's configured
  * defaults unchanged.
@@ -24,6 +24,6 @@ export function taskModelSettingsV1(
   }
   return {
     ...(hostDefaults ?? {}),
-    [GENERAL_MODEL_STAGE_V1]: { primary: task.modelId, strategy: "alert-and-wait" },
+    [GENERAL_MODEL_STAGE_V1]: { primary: task.modelId, strategy: "never-switch" },
   };
 }

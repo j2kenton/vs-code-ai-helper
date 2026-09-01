@@ -2320,6 +2320,648 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // Plan Part 14 (item 8, "stage chat as a record of work"): the withheld-
+  // switch explanation used to be attached only inside the non-auth branches
+  // of this same guard, so an authentication failure that ALSO classifies
+  // into a cascade-eligible failureKind (e.g. its message also carries quota
+  // wording — classifyFailure's quota check is deliberately auth-independent,
+  // see quota.ts) left the dirty-tree-withheld round with NO explanation at
+  // all: the switch was withheld exactly as for the quota case, but only the
+  // quota case said so. This pins the fix: the same "changed N file(s), so
+  // Ensemble withheld the automatic switch" sentence must appear for an auth
+  // failure too, worded for authentication rather than a resettable limit.
+  void it("explains the withheld backup switch for an authentication failure that left the working tree dirty, not just for quota", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-auth-withheld-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5556 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then failed authentication");
+        // Deliberately carries BOTH a QUOTA_MARKERS phrase ("rate limit" —
+        // classifyFailure's quota check is unconditional/auth-independent)
+        // AND an auth-regex match ("403"/"sign in"), so this reproduces the
+        // exact real-world combination: a cascade-eligible failureKind that
+        // is ALSO an authentication failure.
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "rate limit exceeded — 403 unauthorized, please sign in again",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("the backup must never run on an authentication failure"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const progressMessages: string[] = [];
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "a backup must never be dispatched at a tree an authentication failure already edited"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.authFailure, true);
+        assert.ok(
+          result.filesChanged.includes("mutated-by-partial-run.txt"),
+          "expected the primary run's own file write to survive in the reported filesChanged list"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /Hit an authentication failure/,
+          "expected the failure message to explain this was an authentication failure"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /changed 1 file\(s\)/,
+          "expected the failure message to name how many files the interrupted round left behind"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /withheld the automatic switch to this stage's backup model/,
+          "expected the same withheld-switch sentence the quota path already carries"
+        );
+        assert.ok(
+          progressMessages.some((message) => message.includes("Hit an authentication failure")),
+          "expected an explicit progress notification, not just the returned error"
+        );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.strictEqual(
+          progress.quotaParkRecord,
+          undefined,
+          "an authentication failure must never record a durable quota-park block — there is no reset time to wait out"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Review completion blocker (2026-09-01, plan Part 14 item 8 revisited):
+  // the test above deliberately combines "rate limit exceeded" (a
+  // QUOTA_MARKERS phrase) with the 403/sign-in wording, which makes
+  // classifyFailure land on failureKind "quota" regardless of the auth
+  // verdict — that failureKind alone was already enough to satisfy the old
+  // gate (`isCascadeEligibleFailureKind`), so it never actually exercised the
+  // case the gate excluded. This test uses the exact wf10 run-042 message —
+  // "403 Unable to verify organization membership" — which carries NO quota
+  // or temporary-outage vocabulary at all, so classifyFailure puts it in
+  // "generic" (cascade-ineligible). Before this fix, `authFailure` alone
+  // could not open the explanation block, and this exact real-world failure
+  // fell straight through with no explanation whatsoever — the precise
+  // defect item 8 was written to close, reproduced here without borrowing
+  // quota wording to get in the door.
+  void it("explains the withheld backup switch for a pure authentication failure with no quota/outage wording at all", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-pure-auth-withheld-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5557 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then failed authentication");
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "403 Unable to verify organization membership",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("the backup must never run on an authentication failure"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const progressMessages: string[] = [];
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "a backup must never be dispatched at a tree an authentication failure already edited"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.authFailure, true);
+        assert.ok(
+          result.filesChanged.includes("mutated-by-partial-run.txt"),
+          "expected the primary run's own file write to survive in the reported filesChanged list"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /Hit an authentication failure/,
+          "a PURE auth failure (no quota/outage wording) must still get the explanation, not fall through silently"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /changed 1 file\(s\)/,
+          "expected the failure message to name how many files the interrupted round left behind"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /withheld the automatic switch to this stage's backup model/,
+          "expected the same withheld-switch sentence the quota path already carries"
+        );
+        assert.ok(
+          progressMessages.some((message) => message.includes("Hit an authentication failure")),
+          "expected an explicit progress notification, not just the returned error"
+        );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.strictEqual(
+          progress.quotaParkRecord,
+          undefined,
+          "an authentication failure must never record a durable quota-park block — there is no reset time to wait out"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Review completion blocker (2026-09-01, plan Part 14 item 8 revisited):
+  // `chainWantsBackup` is false both when no backup is configured at all AND
+  // when the stage's strategy is `never-switch` — before this fix both cases
+  // rendered the same "no backup model is configured" sentence, which is
+  // simply false when a chain IS configured but the setting says never to
+  // use it. This test configures a real backup chain under `never-switch`
+  // and asserts the explanation names the setting, not an absent chain.
+  void it("names the Never switch setting (not 'no backup configured') when a chain exists but the stage never switches", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-never-switch-withheld-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5558 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "monthly limit reached, resets in 8d 19h, please try again later",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("never-switch must never dispatch the backup"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "never-switch",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(backupAttempted, false, "never-switch must never dispatch the configured backup");
+        assert.strictEqual(result.status, "failed");
+        assert.match(
+          result.errorMessage ?? "",
+          /Never switch/,
+          "expected the explanation to name the Never switch setting, not claim nothing is configured"
+        );
+        assert.doesNotMatch(
+          result.errorMessage ?? "",
+          /no backup model is configured/,
+          "a chain IS configured here — only the setting withholds it, which is a different fact"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Review completion blocker (2026-09-01, round 2, plan Part 14 item 8
+  // revisited a second time): the final fallthrough's own gate used to
+  // require `authFailure || isCascadeEligibleFailureKind(result.failureKind)`
+  // — which excludes a non-authentication "generic" failure just as
+  // completely as it once excluded a pure auth failure (the round-1 fix
+  // above). A malformed/unexplained failure with NO quota, outage, entitlement
+  // or auth wording at all — one that changed files, with a real backup chain
+  // configured and a clean-tree cascade never even attempted because
+  // `isCascadeEligibleFailureKind` excludes "generic" outright — used to fall
+  // straight through with the raw, unexplained provider error and no
+  // indication that a backup exists but was never going to be tried for this
+  // kind of failure. This is the direct regression test for that gap.
+  void it("explains that a non-cascade-eligible generic failure is never retried against a backup, even with a chain configured and files changed", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-generic-not-cascade-eligible-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5559 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then failed for an unclassified reason");
+        // Deliberately carries none of the quota/temporary/transport/
+        // entitlement/auth markers, so classifyFailure lands on "generic".
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "Unexpected malformed tool-call output from the model",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("a non-cascade-eligible failure must never dispatch the backup"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "a generic (non-cascade-eligible) failure must never dispatch the configured backup"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "generic");
+        assert.match(
+          result.errorMessage ?? "",
+          /does not automatically retry this kind of failure against a backup model/,
+          "a generic failure must no longer fall through with the raw, unexplained provider error"
+        );
+        assert.doesNotMatch(
+          result.errorMessage ?? "",
+          /no backup model is configured/,
+          "a chain IS configured here — the reason is the failure kind, not an absent chain"
+        );
+        // Review completion blocker (2026-09-01, round 3): the test's own
+        // spawn stub writes `mutated-by-partial-run.txt` before failing, so
+        // this run's tree IS dirty — item 8's guard sentence ("this round
+        // changed N file(s), so the switch was withheld") must still appear
+        // alongside the failure-kind explanation, per item 8's rule that ANY
+        // round which changed files and then failed carries the sentence.
+        assert.match(
+          result.errorMessage ?? "",
+          /This round already changed 1 file\(s\), so Ensemble withheld the automatic switch/,
+          "a dirty-tree generic failure must still carry the item 8 withheld-switch guard sentence"
+        );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.strictEqual(
+          progress.quotaParkRecord,
+          undefined,
+          "a generic failure has no resettable block and must never record a durable quota-park"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
   // Workflow 3 continuation, first item: replays the real "monthly ...
   // limit ... resets in 8d 19h, please try again later" Cline message —
   // which classifies as "temporarily-unavailable" (its "try again later"

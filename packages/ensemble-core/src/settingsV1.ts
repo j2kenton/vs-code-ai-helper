@@ -69,7 +69,7 @@ export type AutoRunKind =
   | "completeAndMoveOn";
 
 /** What happens when a stage's primary model is unavailable. */
-export type FallbackStrategy = "switch-to-backup" | "pause-and-resume" | "alert-and-wait";
+export type FallbackStrategy = "switch-to-backup" | "never-switch";
 
 /** Per-stage model configuration (see `src/utils/modelFallback.ts`). */
 export interface StageModelSetting {

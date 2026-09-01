@@ -839,10 +839,12 @@ void describe("Publish auto-run ownership matrix — dropped auto-review chain w
       // review was dispatched in the first place.
       const publishAnywayWarning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(publishAnywayWarning, "expected a Publish Anyway warning once the follow-up review chain was dropped");
-      assert.equal(publishAnywayWarning.actionCommand?.title, "Publish Anyway");
-      assert.deepEqual(publishAnywayWarning.actionCommand?.args, [{ taskFolderPath: taskFolderUri.fsPath }]);
+      assert.equal(publishAnywayWarning.actionCommand?.title, "Open in Chat");
+      assert.deepEqual(publishAnywayWarning.actionCommand?.args, [
+        { canonicalId: taskFolderUri.fsPath, taskFolderPath: taskFolderUri.fsPath, stage: "publish" },
+      ]);
       assert.match(
         publishAnywayWarning.message,
         /could not be started automatically/,
@@ -882,10 +884,12 @@ void describe("Publish review — failure/below-threshold outcomes still offer a
       assert.equal(dispatches.length, 0, "a below-threshold score must never schedule the publish chain");
       const warning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(warning, "expected a Notifications entry offering the manual publish action");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
-      assert.deepEqual(warning?.actionCommand?.args, [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath }]);
+      assert.equal(warning?.actionCommand?.title, "Open in Chat");
+      assert.deepEqual(warning?.actionCommand?.args, [
+        { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
+      ]);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -921,9 +925,9 @@ void describe("Publish review — failure/below-threshold outcomes still offer a
       assert.equal(dispatches.length, 0, "an unusable review output must never schedule the publish chain");
       const warning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(warning, "expected a Notifications entry offering the manual publish action");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
+      assert.equal(warning?.actionCommand?.title, "Open in Chat");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1023,10 +1027,12 @@ void describe("Publish review — genuine provider failure and cancellation outc
       assert.equal(dispatches.length, 0, "a genuine provider failure must never schedule the publish chain");
       const warning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(warning, "expected a Notifications entry offering the manual publish action");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
-      assert.deepEqual(warning?.actionCommand?.args, [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath }]);
+      assert.equal(warning?.actionCommand?.title, "Open in Chat");
+      assert.deepEqual(warning?.actionCommand?.args, [
+        { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
+      ]);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1058,10 +1064,12 @@ void describe("Publish review — genuine provider failure and cancellation outc
       assert.equal(dispatches.length, 0, "a cancelled review must never schedule the publish chain");
       const warning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(warning, "expected a Notifications entry offering the manual publish action");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
-      assert.deepEqual(warning?.actionCommand?.args, [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath }]);
+      assert.equal(warning?.actionCommand?.title, "Open in Chat");
+      assert.deepEqual(warning?.actionCommand?.args, [
+        { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
+      ]);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1483,10 +1491,12 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       assert.equal(dispatches.length, 0, "a passing Publish review must never schedule the publish chain — only the user's own click may");
       const nudge = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(nudge, "expected a Notifications entry offering the manual publish action");
-      assert.equal(nudge?.actionCommand?.title, "Publish");
-      assert.deepEqual(nudge?.actionCommand?.args, [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath }]);
+      assert.equal(nudge?.actionCommand?.title, "Open in Chat");
+      assert.deepEqual(nudge?.actionCommand?.args, [
+        { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
+      ]);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();

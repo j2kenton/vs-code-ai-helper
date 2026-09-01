@@ -1,6 +1,11 @@
 import type { TaskStage } from "../types/taskProgress";
 
-export type FallbackStrategy = "switch-to-backup" | "pause-and-resume" | "alert-and-wait";
+/**
+ * Whether a stage may continue on its configured backup chain after its
+ * primary fails. Legacy three-way values are normalized at the settings
+ * boundary; code past that boundary only sees this two-state contract.
+ */
+export type FallbackStrategy = "switch-to-backup" | "never-switch";
 
 export interface StageModelSetting {
   primary?: string;
@@ -73,9 +78,6 @@ export function getBackupModels(setting: StageModelSetting | undefined): string[
   return [...new Set(values.filter((value): value is string => typeof value === "string" && value.trim().length > 0).map(value => value.trim()))];
 }
 
-export function chooseFallback(setting: StageModelSetting | undefined): "backup" | "pause" | "alert" {
-  if (!setting || !canUseBackup(setting)) return "alert";
-  if (setting.strategy === "switch-to-backup") return "backup";
-  if (setting.strategy === "pause-and-resume") return "pause";
-  return "alert";
+export function chooseFallback(setting: StageModelSetting | undefined): "backup" | "stop" {
+  return setting && canUseBackup(setting) ? "backup" : "stop";
 }

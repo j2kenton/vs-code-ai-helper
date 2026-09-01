@@ -587,7 +587,7 @@ test("Part 4b dispatch integration: the real provider runner drives a round/ques
   };
 
   const settings: ModelSettings = {
-    impl: { primary: "anthropic:claude-sonnet-5", strategy: "alert-and-wait" },
+    impl: { primary: "anthropic:claude-sonnet-5", strategy: "never-switch" },
   };
   const provider = createEngineProviderRunnerV1({
     getModelSettings: () => settings,

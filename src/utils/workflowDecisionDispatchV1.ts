@@ -27,10 +27,16 @@ async function applyRecommendationPreconditionsV1(
   target: ChatTarget
 ): Promise<PostWorkflowDecisionInputV1> {
   let status: string | undefined;
+  let currentStage: string | undefined;
+  let reviewInvalidatedByRoundStage: string | undefined;
+  let continuationOwed: boolean | undefined;
   try {
     const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
     if (read.ok) {
       status = read.decoded.progress.status;
+      currentStage = read.decoded.progress.currentStage;
+      reviewInvalidatedByRoundStage = read.decoded.progress.reviewInvalidatedByRound?.stage;
+      continuationOwed = read.decoded.progress.implRecovery !== undefined;
     }
   } catch {
     // Best-effort: leave options exactly as supplied.
@@ -42,7 +48,12 @@ async function applyRecommendationPreconditionsV1(
     if (option.disabled === true) {
       return option;
     }
-    const result = recommendationPreconditionsV1(option.effect, { status });
+    const result = recommendationPreconditionsV1(option.effect, {
+      status,
+      currentStage,
+      reviewInvalidatedByRoundStage,
+      continuationOwed,
+    });
     if (!result.blocked) {
       return option;
     }

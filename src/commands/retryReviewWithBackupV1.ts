@@ -2,7 +2,7 @@
  * wf10 item 7d / Part 5 step 15: the manual affordance behind the "Retry
  * with <model>" button a degenerate-review rejection offers when automatic
  * backup advance did not apply — the stage's strategy is not
- * switch-to-backup (a deliberate pause-and-resume/alert-and-wait choice, see
+ * switch-to-backup (a deliberate never-switch choice, see
  * decideDegenerateReviewBackupAdvanceV1's doc comment), so Ensemble does not
  * silently change which model runs, but the user can still choose to on this
  * one round.
