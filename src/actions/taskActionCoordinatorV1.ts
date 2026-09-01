@@ -192,6 +192,7 @@ import type { StructuredAnswerV1 } from "../types/structuredQuestionV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "./rows/editExecutionRowV1";
 import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
+import { isInputSnapshotSizeRejectionReasonV1 } from "../types/chatInteractionTransactionV1";
 
 export class TaskActionCoordinatorErrorV1 extends Error {
   constructor(message: string) {
@@ -1750,7 +1751,11 @@ export function createTaskActionCoordinatorV1(
                 kind: "failed",
                 correlation,
                 code: chatTransactionFailureCodeV1(admitted.code, admitted.reason),
-                retryable: true,
+                // Item 9 (Part 16 step 43): a size-driven rejection cannot
+                // decode differently on an unchanged prompt, so it must not
+                // be reported retryable — see
+                // isInputSnapshotSizeRejectionReasonV1's doc comment.
+                retryable: !isInputSnapshotSizeRejectionReasonV1(admitted.reason),
               };
         }
       }
@@ -2626,7 +2631,10 @@ export function createTaskActionCoordinatorV1(
                   kind: "failed",
                   correlation,
                   code: chatTransactionFailureCodeV1(admitted.code, admitted.reason),
-                  retryable: true,
+                  // See the matching comment at the other admitInvocation
+                  // call site above: a size-driven rejection is deterministic
+                  // and must not be reported retryable.
+                  retryable: !isInputSnapshotSizeRejectionReasonV1(admitted.reason),
                 },
             metrics
           ),

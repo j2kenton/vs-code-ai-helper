@@ -277,6 +277,82 @@ export function clearStageFallbackReservation(
 }
 
 /**
+ * Soft cap on the persisted `implReviewFiles` set (item 9's eviction policy,
+ * "make the stage chat a record of work" Part 16 step 42). Unbounded growth
+ * here — observed at 52 entries after ~53 rounds on a real task, effectively
+ * the task's entire touched-file history — guarantees any long-running task
+ * eventually produces a review input the transport limit rejects, regardless
+ * of how well the context pack's own per-render budget is tuned. A review
+ * does not need the whole historical surface; it needs what changed recently
+ * plus what the outstanding blockers name.
+ */
+export const IMPL_REVIEW_FILES_MAX_ENTRIES_V1 = 40;
+
+/**
+ * Apply the eviction policy to an already-unioned, most-recent-first
+ * `implReviewFiles` list: keep the newest `maxEntries` unconditionally, and
+ * ALSO keep any path named in `preserveRelPaths` (typically the paths an
+ * outstanding review blocker names — see `extractBlockerNamedPathsV1`) even
+ * when it falls outside that window, so a standing blocker's file is never
+ * evicted out from under the review that needs to re-check it. A blocker
+ * naming an old file can therefore leave the result slightly over
+ * `maxEntries` — that is the deliberate priority order the plan text
+ * describes ("retain files changed since the last clearing review PLUS files
+ * named by outstanding blockers"), not a bug in the cap.
+ */
+export function capImplReviewFilesV1(
+  files: readonly string[],
+  preserveRelPaths: ReadonlySet<string>,
+  maxEntries = IMPL_REVIEW_FILES_MAX_ENTRIES_V1
+): string[] {
+  if (files.length <= maxEntries) {
+    return [...files];
+  }
+  return files.filter((file, index) => index < maxEntries || preserveRelPaths.has(file));
+}
+
+const BLOCKER_NAMED_PATH_RE_V1 = /`([\w./-]+\.[\w]+)(?::\d+(?:-\d+)?)?`/g;
+
+/**
+ * File-path-shaped tokens named inside the single most recent
+ * `reviewScoreHistory` entry's blocker descriptions, across every stage —
+ * the `preserveRelPaths` input `updateImplReviewFiles`'s eviction policy
+ * needs. Deliberately duplicates `extractBlockerNamedPathsV1`
+ * (reviewReadiness.ts)'s matching rule rather than importing it: that
+ * function works on freshly-parsed `ReviewBlocker[]` with required fields,
+ * while this reads the already-persisted, looser `ReviewBlockerIdentity[]`
+ * shape, and this module is deliberately kept free of reviewReadiness.ts's
+ * heavier dependency surface (see the module header).
+ *
+ * Not filtered to one stage: `implReviewFiles` is shared review scope across
+ * every impl-review stage a task passes through, so the most recently
+ * published review — whichever stage it was — is the one whose named files
+ * matter right now.
+ */
+export function latestReviewBlockerNamedPathsV1(progress: TaskProgress): Set<string> {
+  const history = progress.reviewScoreHistory ?? [];
+  let latest: ReviewScoreHistoryEntry | undefined;
+  for (const entry of history) {
+    if (!latest || entry.at > latest.at) {
+      latest = entry;
+    }
+  }
+  const paths = new Set<string>();
+  for (const blocker of latest?.blockers ?? []) {
+    if (!blocker.description) {
+      continue;
+    }
+    for (const match of blocker.description.matchAll(BLOCKER_NAMED_PATH_RE_V1)) {
+      const path = match[1];
+      if (path) {
+        paths.add(path.replace(/\\/g, "/"));
+      }
+    }
+  }
+  return paths;
+}
+
+/**
  * Record the workspace-relative paths changed by an AI implementation run,
  * so implementation reviews can use them as the review scope instead of
  * relying on open editors.
@@ -297,10 +373,16 @@ export function clearStageFallbackReservation(
  * accumulated set exceeds the budget the omissions fall on the oldest —
  * already reviewed in earlier rounds — files, never on the current round's
  * work the reviewer has not seen yet.
+ *
+ * `preserveRelPaths` (optional — see `capImplReviewFilesV1`) is applied to
+ * the union AFTER it is computed, so a blocker-named file from outside the
+ * most-recent window survives eviction even though this call's own `files`
+ * had nothing to do with it.
  */
 export function updateImplReviewFiles(
   progress: TaskProgress,
-  files: string[]
+  files: string[],
+  preserveRelPaths?: ReadonlySet<string>
 ): TaskProgress {
   const existing = progress.implReviewFiles ?? [];
   // Excludes generated workflow-safety inventories, lockfiles, and minified
@@ -314,9 +396,10 @@ export function updateImplReviewFiles(
   // the 2026-08-06 failure this exists to prevent.
   const reviewable = files.filter((file) => !isMachineMaintainedArtifactPathV1(file));
   const union = new Set([...reviewable, ...existing]);
+  const capped = capImplReviewFilesV1([...union], preserveRelPaths ?? new Set());
   return {
     ...progress,
-    implReviewFiles: [...union],
+    implReviewFiles: capped,
     updatedAt: new Date().toISOString(),
   };
 }

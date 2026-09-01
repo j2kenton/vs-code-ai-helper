@@ -750,9 +750,31 @@ export class StageNode extends vscode.TreeItem {
                 ? `${formatChecklistPercentV1(readiness.progress.complete, readiness.progress.total)}% · ${readiness.label}`
                 : readiness.label) + staleSuffix
             : undefined;
-          this.description = readinessLabel
-            ? (escalated ? `${readinessLabel} · escalated` : readinessLabel)
-            : (escalated ? "escalated" : undefined);
+          // Item 11 (Part 17 step 45, second bullet): the owed-continuation
+          // indicator was only ever rendered on the TASK row — the current
+          // STAGE row (where the continuation would actually resume) showed
+          // nothing distinguishing it from any other in-progress stage. Same
+          // "nothing currently running against the task" gate the task row
+          // uses (describeOwedContinuationRowIndicatorV1's own contract), so
+          // this never fires while a round is genuinely in flight — `isRunning`/
+          // `isWaitingForUser` above already cover THIS stage's own operations,
+          // but a continuation can be owed with no live operation anywhere.
+          const owedIndicator = taskOperations.getTaskOperations(tKey).length > 0
+            ? undefined
+            : describeOwedContinuationRowIndicatorV1(
+                task.progress.implRecovery,
+                task.progress.incompleteRoundContinuations ?? 0
+              );
+          if (owedIndicator) {
+            this.iconPath = new vscode.ThemeIcon(owedIndicator.iconId, new vscode.ThemeColor(owedIndicator.colorId));
+            this.description = readinessLabel
+              ? `${owedIndicator.description} · ${readinessLabel}`
+              : owedIndicator.description;
+          } else {
+            this.description = readinessLabel
+              ? (escalated ? `${readinessLabel} · escalated` : readinessLabel)
+              : (escalated ? "escalated" : undefined);
+          }
           break;
         }
         case "outstanding":

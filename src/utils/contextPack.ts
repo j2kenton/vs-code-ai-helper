@@ -641,7 +641,17 @@ export async function generateImplReviewContextPack(
   workspaceUri: vscode.Uri,
   implReviewFiles: string[] | undefined,
   priorityRelPaths?: ReadonlySet<string>,
-  baselineSha?: string
+  baselineSha?: string,
+  /**
+   * Override for the total embedded-content char budget (item 9's
+   * pre-dispatch shrink guarantee, "make the stage chat a record of work"
+   * Part 16 step 41): the caller measures the FULL assembled prompt against
+   * the transport's canonical byte limit and, when it is still over,
+   * rebuilds the pack with a smaller value here rather than dispatching a
+   * prompt the transaction store will reject. Defaults to
+   * `IMPL_REVIEW_MAX_TOTAL_CHARS` when omitted.
+   */
+  maxTotalChars?: number
 ): Promise<{ content: string; isFallback: boolean }> {
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const taskContent = await readTextFileIfExists(taskFileUri);
@@ -843,7 +853,10 @@ export async function generateImplReviewContextPack(
     lines.push("");
 
     const inputsWithRanges = await attachChangedRangesV1(repoRoot, fileInputs, baselineSha);
-    const results = applyContentCapsWithRegionsV1(inputsWithRanges);
+    const results = applyContentCapsWithRegionsV1(
+      inputsWithRanges,
+      maxTotalChars !== undefined ? { maxTotalChars } : undefined
+    );
 
     const included = results.filter(
       (r): r is (typeof r) & { content: string | undefined } => r.content !== null
@@ -1047,14 +1060,17 @@ export async function writeImplReviewContextPack(
   workspaceUri: vscode.Uri,
   implReviewFiles: string[] | undefined,
   priorityRelPaths?: ReadonlySet<string>,
-  baselineSha?: string
+  baselineSha?: string,
+  /** See `generateImplReviewContextPack`'s matching parameter. */
+  maxTotalChars?: number
 ): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
   const { content, isFallback } = await generateImplReviewContextPack(
     taskFolderUri,
     workspaceUri,
     implReviewFiles,
     priorityRelPaths,
-    baselineSha
+    baselineSha,
+    maxTotalChars
   );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback };

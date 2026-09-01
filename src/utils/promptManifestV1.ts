@@ -194,8 +194,10 @@ export interface PromptManifestV1 {
    * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` (256 KB; item 9's transport
    * limit). Distinct from `totalPromptBytes` only in encoding (this is
    * canonical-JSON-wrapped, that is the raw UTF-8 length): both now measure
-   * the same underlying text, and Part 16's `measureCanonicalInputBytesV1`
-   * is expected to reuse this measure.
+   * the same underlying text. Computed via this module's own
+   * `measureCanonicalInputBytesV1`, which Part 16's pre-dispatch shrink guard
+   * (review assembly) also calls directly as a probe measurement taken
+   * BEFORE dispatch, not only recorded here after the fact.
    */
   readonly totalCanonicalBytes: number;
   readonly planSections: {
@@ -230,6 +232,43 @@ function byteLengthUtf8(text: string): number {
 
 function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/**
+ * Canonical JSON byte length of `{ templateName, prompt }` — the SAME shape
+ * and encoder `PromptManifestV1.totalCanonicalBytes` measures a round's
+ * dispatched prompt with (see that field's doc comment for why this
+ * encoding, not raw UTF-8 length, is the figure that matters: it is what
+ * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` — the transaction store's actual
+ * transport limit — is enforced against).
+ *
+ * Item 9 ("make the stage chat a record of work", Part 16 step 41): exported
+ * so an assembler can call this BEFORE dispatch — measuring a probe render of
+ * the full prompt against the canonical limit and rebuilding with a smaller
+ * content budget when it doesn't fit — instead of discovering the overage
+ * only after `buildPromptManifestV1` runs post-execution, by which point the
+ * round has already been rejected by the transaction store.
+ */
+export function measureCanonicalInputBytesV1(templateName: string, prompt: string): number {
+  return canonicalJsonByteLengthV1({ templateName, prompt });
+}
+
+/**
+ * Which quarter of `limitBytes` `bytes` falls into: `0` below 25%, `1`
+ * (25-50%), `2` (50-75%), `3` (75-100%), `4` at or above the limit itself.
+ * Item 9 (Part 16 step 44): "the same growth pressure applies to task.md
+ * itself... a task file large enough to threaten its own reviews is a signal
+ * the task wants splitting, and the assembler is the only thing positioned
+ * to notice." Callers use this to fire a one-time-per-band nudge rather than
+ * repeating the same observation every round once a band is crossed.
+ */
+export function sizeBandV1(bytes: number, limitBytes: number): 0 | 1 | 2 | 3 | 4 {
+  const ratio = limitBytes > 0 ? bytes / limitBytes : 0;
+  if (ratio < 0.25) return 0;
+  if (ratio < 0.5) return 1;
+  if (ratio < 0.75) return 2;
+  if (ratio < 1) return 3;
+  return 4;
 }
 
 const ACCEPTED_NON_GOALS_HEADING = /^##\s+Accepted Non-Goals\s*$/m;
@@ -274,7 +313,7 @@ export function buildPromptManifestV1(
     templateName,
     variables: variableEntries,
     totalPromptBytes: byteLengthUtf8(dispatchedPrompt),
-    totalCanonicalBytes: canonicalJsonByteLengthV1({ templateName, prompt: dispatchedPrompt }),
+    totalCanonicalBytes: measureCanonicalInputBytesV1(templateName, dispatchedPrompt),
     planSections: {
       acceptedNonGoals: ACCEPTED_NON_GOALS_HEADING.test(combinedVariableText),
       humanVerificationHandoffs: HUMAN_VERIFICATION_HANDOFFS_HEADING.test(combinedVariableText),

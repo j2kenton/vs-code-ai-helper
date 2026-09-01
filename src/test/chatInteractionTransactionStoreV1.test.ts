@@ -45,6 +45,7 @@ import {
   CHAT_TRANSACTION_FILENAME_V1,
   CHAT_TRANSACTION_RESUME_INVOCATION_CLAIM_FILENAME_V1,
   decodeChatInteractionTransactionV1,
+  isInputSnapshotSizeRejectionReasonV1,
 } from "../types/chatInteractionTransactionV1";
 import {
   BeginChatTransactionInputV1,
@@ -780,12 +781,61 @@ void describe("chatInteractionTransactionStoreV1", () => {
 
   void it("rejects content the strict decoder could never re-read", async () => {
     const oversizedInput = beginInput({ validatedInput: { blob: "x".repeat(300 * 1024) } });
-    assert.equal((await store.begin(oversizedInput)).kind, "rejected");
+    const oversized = await store.begin(oversizedInput);
+    assert.equal(oversized.kind, "rejected");
+    // Item 9 (Part 16 step 43): this specific rejection must be recognizable
+    // by isInputSnapshotSizeRejectionReasonV1 so the coordinator can report
+    // it non-retryable — an unchanged prompt cannot decode differently.
+    if (oversized.kind === "rejected") {
+      assert.equal(isInputSnapshotSizeRejectionReasonV1(oversized.reason), true);
+    }
 
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
-    assert.equal((await store.begin(beginInput({ validatedInput: cyclic }))).kind, "rejected");
+    const cyclicResult = await store.begin(beginInput({ validatedInput: cyclic }));
+    assert.equal(cyclicResult.kind, "rejected");
+    // A non-size rejection must NOT be misclassified as the deterministic
+    // size limit — that would wrongly mark a possibly-retryable failure
+    // non-retryable.
+    if (cyclicResult.kind === "rejected") {
+      assert.equal(isInputSnapshotSizeRejectionReasonV1(cyclicResult.reason), false);
+    }
 
     assert.equal((await store.begin(beginInput({ questions: [] }))).kind, "rejected");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isInputSnapshotSizeRejectionReasonV1 (item 9 — Part 16 step 43)
+// ---------------------------------------------------------------------------
+
+void describe("isInputSnapshotSizeRejectionReasonV1", () => {
+  void it("recognizes the exact message decodeInputSnapshot produces", () => {
+    assert.equal(
+      isInputSnapshotSizeRejectionReasonV1(
+        "inputSnapshot exceeds the 262144-byte canonical limit"
+      ),
+      true
+    );
+  });
+
+  void it("recognizes the message even wrapped with an outer decode-failure prefix", () => {
+    assert.equal(
+      isInputSnapshotSizeRejectionReasonV1(
+        "transaction record would not decode: inputSnapshot exceeds the 262144-byte canonical limit"
+      ),
+      true
+    );
+  });
+
+  void it("does not recognize an unrelated rejection reason", () => {
+    assert.equal(
+      isInputSnapshotSizeRejectionReasonV1("inputSnapshot \"canonicalJson\" is not valid JSON"),
+      false
+    );
+    assert.equal(
+      isInputSnapshotSizeRejectionReasonV1("correlation tuple does not match"),
+      false
+    );
   });
 });

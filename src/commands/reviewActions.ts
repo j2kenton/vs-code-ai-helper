@@ -29,6 +29,7 @@ import {
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
+  TASK_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
 import {
@@ -54,6 +55,7 @@ import {
   recordImplementationTypeCheckFailure,
   resolveRoundV1,
   setZeroChangeImplRounds,
+  latestReviewBlockerNamedPathsV1,
   pauseTaskWithReason,
   updateImplReviewFiles,
   updateLintPayload,
@@ -67,7 +69,13 @@ import {
   formatRunLogModeHeaderV1,
   shouldContinueAsApplyReviewV1,
 } from "../utils/implementationDispatchModeV1";
-import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
+import {
+  buildPromptManifestV1,
+  measureCanonicalInputBytesV1,
+  sizeBandV1,
+  writePromptManifestV1,
+} from "../utils/promptManifestV1";
+import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 import {
   attachCoordinatorIdentityToRoundV1,
   claimImplementationRoundLedgerV1,
@@ -190,7 +198,7 @@ import {
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
-import { appendChatMessageV1, readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { appendChatMessageV1, readChatDocumentIdentityV1, readChatHistory } from "../utils/chatHistoryStore";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -223,6 +231,7 @@ import {
   AutomaticChecklistReconciliationOutcomeV1,
 } from "./reconcilePlanChecklist";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { IMPL_REVIEW_MAX_TOTAL_CHARS } from "../utils/implReviewFileSelection";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -4458,13 +4467,66 @@ export async function runReviewForFolder(
     const baselineSha =
       (previousReview !== undefined ? parseReviewedCommitSha(previousReview) : undefined) ??
       (await readTaskImplementationBaselineShaV1(folderUri));
-    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
-      folderUri,
-      workspaceRoot.uri,
-      taskProgress?.implReviewFiles,
-      priorityRelPaths,
-      baselineSha
-    );
+
+    // Item 9's pre-dispatch guarantee (Part 16 steps 41/43): the assembled
+    // input is measured against the transport's ACTUAL canonical limit
+    // before dispatch and shrunk deterministically until it fits, rather
+    // than discovered too big only after a `chatTransactionRejected`
+    // failure. Every other prompt variable is already final by this point
+    // (see the reads above), so a probe render with a candidate context pack
+    // measures the real total, not an estimate. Halving is a deterministic,
+    // bounded reduction of the same "oldest/lowest-priority content first"
+    // budget `applyContentCaps` already spends in list order — a full
+    // re-derivation of "which specific files to drop" is left to a future
+    // round; this closes the guarantee that a round can never be sent
+    // knowing it will be rejected.
+    let maxTotalChars: number | undefined;
+    let isFallback = false;
+    let oversizedAfterShrink = false;
+    let lastCanonicalBytes = 0;
+    const shrinkFloorChars = 2000;
+    for (let attempt = 0; ; attempt++) {
+      const written = await writeImplReviewContextPack(
+        folderUri,
+        workspaceRoot.uri,
+        taskProgress?.implReviewFiles,
+        priorityRelPaths,
+        baselineSha,
+        maxTotalChars
+      );
+      isFallback = written.isFallback;
+      contextPackContent = new TextDecoder().decode(
+        await vscode.workspace.fs.readFile(written.contextPackUri)
+      );
+      variables.contextPack = contextPackContent;
+      const probePrompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+      lastCanonicalBytes = measureCanonicalInputBytesV1(templateFile, probePrompt);
+      if (lastCanonicalBytes <= MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) {
+        break;
+      }
+      if (maxTotalChars !== undefined && maxTotalChars <= shrinkFloorChars) {
+        oversizedAfterShrink = true;
+        break;
+      }
+      if (attempt >= 6) {
+        oversizedAfterShrink = true;
+        break;
+      }
+      maxTotalChars = Math.max(
+        shrinkFloorChars,
+        Math.floor((maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS) / 2)
+      );
+    }
+    if (oversizedAfterShrink) {
+      const kb = Math.round(lastCanonicalBytes / 1024);
+      const limitKb = Math.round(MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 / 1024);
+      NotificationRouter.showError(
+        `This review's assembled input is ${kb} KB even after shrinking embedded file content to its floor — ` +
+          `over the ${limitKb} KB limit the transaction store enforces. Likely drivers: task.md, plan.md/` +
+          "plan-final.md, and the previous review, none of which this shrink reduces. Consider splitting the task."
+      );
+      return;
+    }
     if (isFallback) {
       NotificationRouter.showWarning(
         "No tracked implementation file set found for this task. " +
@@ -4472,11 +4534,48 @@ export async function runReviewForFolder(
           "For best results, open the files you changed before running the review."
       );
     }
-    contextPackContent = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
   }
   variables.contextPack = contextPackContent;
+
+  // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
+  // itself is eating a large share of the review-input limit — "the same
+  // growth pressure applies to task.md itself... a task file large enough to
+  // threaten its own reviews is a signal the task wants splitting, and the
+  // assembler is the only thing positioned to notice." Best-effort:
+  // observability only, never blocks the review it is warning about.
+  try {
+    const taskMdBytes = Buffer.byteLength(
+      (await readTextIfExists(vscode.Uri.joinPath(folderUri, TASK_FILENAME))) ?? "",
+      "utf8"
+    );
+    const band = sizeBandV1(taskMdBytes, MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1);
+    if (band > 0) {
+      const bandMarker = `task.md size band ${band}`;
+      const history = await readChatHistory(folderUri.fsPath, folderUri.fsPath);
+      const alreadyAnnounced = history.some(
+        (m) => m.kind === "activity" && m.text.includes(bandMarker)
+      );
+      if (!alreadyAnnounced) {
+        const kb = Math.round(taskMdBytes / 1024);
+        const pct = Math.round((taskMdBytes / MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) * 100);
+        await appendChatMessageV1(
+          folderUri.fsPath,
+          {
+            role: "assistant",
+            text:
+              `task.md is ${kb} KB — ${pct}% of the review-input limit. This task may want splitting. ` +
+              `(${bandMarker})`,
+            stage: targetStage,
+            at: new Date().toISOString(),
+            kind: "activity",
+          },
+          folderUri.fsPath
+        );
+      }
+    }
+  } catch {
+    // Best-effort only — see the comment above.
+  }
 
   // Claim the stage before starting the provider call. The token is checked
   // again by the transition CAS, so a late result can never advance a newer
@@ -9567,7 +9666,16 @@ async function executeImplementationRun(
         !result!.filesChangedUnknown &&
         attributedFilesChanged.length > 0
       ) {
-        return updateImplReviewFiles(promotedBase, attributedFilesChanged);
+        // Item 9's eviction policy (Part 16 step 42): the accumulated set is
+        // capped, but a path an outstanding review blocker names is kept
+        // even if it would otherwise fall outside the most-recent window —
+        // see `capImplReviewFilesV1`'s doc comment for why that can leave
+        // the result slightly over the cap.
+        return updateImplReviewFiles(
+          promotedBase,
+          attributedFilesChanged,
+          latestReviewBlockerNamedPathsV1(promotedBase)
+        );
       }
       return promotedBase;
     });

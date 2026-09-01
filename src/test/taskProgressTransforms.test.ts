@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -106,6 +106,108 @@ void test("machine-maintained paths already in the prior tracked set are not ret
   const progress = makeProgress(["workflow-inventories/workflow-route-live-v1.json"]);
   const updated = updateImplReviewFiles(progress, ["a.ts"]);
   assert.deepEqual(updated.implReviewFiles, ["a.ts", "workflow-inventories/workflow-route-live-v1.json"]);
+});
+
+// ---------------------------------------------------------------------------
+// capImplReviewFilesV1 / updateImplReviewFiles eviction (item 9, Part 16 step
+// 42): the persisted set is soft-capped, but a path a standing review
+// blocker names survives eviction even outside the most-recent window.
+// ---------------------------------------------------------------------------
+
+void test("capImplReviewFilesV1 is a no-op under the cap", () => {
+  const files = ["a.ts", "b.ts", "c.ts"];
+  assert.deepEqual(capImplReviewFilesV1(files, new Set(), 40), files);
+});
+
+void test("capImplReviewFilesV1 keeps only the newest N files over the cap", () => {
+  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
+  const capped = capImplReviewFilesV1(files, new Set(), 40);
+  assert.equal(capped.length, 40);
+  assert.deepEqual(capped, files.slice(0, 40));
+});
+
+void test("capImplReviewFilesV1 preserves a blocker-named path outside the recency window", () => {
+  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
+  const capped = capImplReviewFilesV1(files, new Set(["f44.ts"]), 40);
+  // f44.ts is the OLDEST file (last in the most-recent-first list) and would
+  // normally be evicted — it survives because a blocker names it, which can
+  // leave the result over the nominal cap.
+  assert.equal(capped.length, 41);
+  assert.ok(capped.includes("f44.ts"));
+});
+
+void test("updateImplReviewFiles caps the accumulated set at IMPL_REVIEW_FILES_MAX_ENTRIES_V1", () => {
+  const existing = Array.from({ length: IMPL_REVIEW_FILES_MAX_ENTRIES_V1 }, (_, i) => `f${i}.ts`);
+  const progress = makeProgress(existing);
+  const updated = updateImplReviewFiles(progress, ["new.ts"]);
+  assert.equal(updated.implReviewFiles?.length, IMPL_REVIEW_FILES_MAX_ENTRIES_V1);
+  assert.equal(updated.implReviewFiles?.[0], "new.ts");
+  // The single oldest file is the one evicted to make room for the new one.
+  assert.ok(!updated.implReviewFiles?.includes(`f${IMPL_REVIEW_FILES_MAX_ENTRIES_V1 - 1}.ts`));
+});
+
+void test("updateImplReviewFiles preserves a blocker-named path when eviction would otherwise drop it", () => {
+  const existing = Array.from({ length: IMPL_REVIEW_FILES_MAX_ENTRIES_V1 }, (_, i) => `f${i}.ts`);
+  const oldestPath = `f${IMPL_REVIEW_FILES_MAX_ENTRIES_V1 - 1}.ts`;
+  const progress = makeProgress(existing);
+  const updated = updateImplReviewFiles(progress, ["new.ts"], new Set([oldestPath]));
+  assert.ok(updated.implReviewFiles?.includes(oldestPath));
+});
+
+// ---------------------------------------------------------------------------
+// latestReviewBlockerNamedPathsV1 (item 9, Part 16 step 42)
+// ---------------------------------------------------------------------------
+
+void test("latestReviewBlockerNamedPathsV1 returns an empty set with no review history", () => {
+  const progress = makeProgress(undefined);
+  assert.deepEqual(latestReviewBlockerNamedPathsV1(progress), new Set());
+});
+
+void test("latestReviewBlockerNamedPathsV1 extracts backtick-quoted paths from the most recent entry's blockers", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(undefined),
+    reviewScoreHistory: [
+      {
+        stage: "impl-high-review",
+        score: 6,
+        attemptId: "a1",
+        at: "2026-08-20T00:00:00.000Z",
+        blockerCount: 1,
+        taskFixableCount: 1,
+        blockers: [
+          {
+            category: "completion",
+            resolver: "task-fixable",
+            subject: "old.ts",
+            description: "the guard in `src/old.ts` is wrong",
+          },
+        ],
+      },
+      {
+        stage: "impl-high-review",
+        score: 6,
+        attemptId: "a2",
+        at: "2026-08-21T00:00:00.000Z",
+        blockerCount: 2,
+        taskFixableCount: 2,
+        blockers: [
+          {
+            category: "completion",
+            resolver: "task-fixable",
+            subject: "new.ts",
+            description: "see `src/new.ts:42` for the missing guard",
+          },
+          {
+            category: "completion",
+            resolver: "task-fixable",
+            subject: "prose-only",
+            description: "no path named here at all",
+          },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(latestReviewBlockerNamedPathsV1(progress), new Set(["src/new.ts"]));
 });
 
 // ---------------------------------------------------------------------------

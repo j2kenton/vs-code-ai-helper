@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { describe, it, test } from "node:test";
 import * as vscode from "vscode";
 import { createHash } from "crypto";
-import { buildPromptManifestV1, writePromptManifestV1 } from "../utils/promptManifestV1";
+import {
+  buildPromptManifestV1,
+  measureCanonicalInputBytesV1,
+  sizeBandV1,
+  writePromptManifestV1,
+} from "../utils/promptManifestV1";
 import { canonicalJsonByteLengthV1 } from "../types/structuredQuestionV1";
 
 // ---------------------------------------------------------------------------
@@ -34,6 +39,44 @@ void test("records templateName, per-variable byte size and sha256, and total pr
   const planEntry = manifest.variables.find((v) => v.name === "plan");
   assert.ok(planEntry);
   assert.equal(planEntry.bytes, Buffer.byteLength("world", "utf8"));
+});
+
+// ---------------------------------------------------------------------------
+// measureCanonicalInputBytesV1 / sizeBandV1 (item 9 — Part 16 steps 41/44)
+// ---------------------------------------------------------------------------
+
+void test("measureCanonicalInputBytesV1 matches the same encoder totalCanonicalBytes uses", () => {
+  const templateName = "review-impl-high.md";
+  const prompt = "some assembled prompt text";
+  assert.equal(
+    measureCanonicalInputBytesV1(templateName, prompt),
+    canonicalJsonByteLengthV1({ templateName, prompt })
+  );
+});
+
+void test("measureCanonicalInputBytesV1 grows with the prompt's own length", () => {
+  const short = measureCanonicalInputBytesV1("t.md", "x");
+  const long = measureCanonicalInputBytesV1("t.md", "x".repeat(10_000));
+  assert.ok(long > short);
+});
+
+void test("sizeBandV1 classifies below-25% as band 0", () => {
+  assert.equal(sizeBandV1(0, 1000), 0);
+  assert.equal(sizeBandV1(249, 1000), 0);
+});
+
+void test("sizeBandV1 classifies each quarter boundary", () => {
+  assert.equal(sizeBandV1(250, 1000), 1);
+  assert.equal(sizeBandV1(499, 1000), 1);
+  assert.equal(sizeBandV1(500, 1000), 2);
+  assert.equal(sizeBandV1(749, 1000), 2);
+  assert.equal(sizeBandV1(750, 1000), 3);
+  assert.equal(sizeBandV1(999, 1000), 3);
+});
+
+void test("sizeBandV1 classifies at-or-over the limit as band 4", () => {
+  assert.equal(sizeBandV1(1000, 1000), 4);
+  assert.equal(sizeBandV1(5000, 1000), 4);
 });
 
 void test("records the caller-allocated roundId verbatim", () => {

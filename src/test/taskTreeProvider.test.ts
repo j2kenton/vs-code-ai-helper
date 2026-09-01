@@ -1794,4 +1794,87 @@ void describe("TaskNode — owed-continuation indicator suppression under a live
   });
 });
 
+// ---------------------------------------------------------------------------
+// Item 11 (Part 17 step 45, second bullet — "make the stage chat a record of
+// work"): the owed-continuation indicator was only ever rendered on the TASK
+// row. The current STAGE row — where the continuation would actually
+// resume — showed only its ordinary readiness label, indistinguishable from
+// any other in-progress stage, so a user looking at the expanded stage list
+// (rather than the collapsed task row) still saw no sign anything was owed.
+// ---------------------------------------------------------------------------
+void describe("StageNode — owed-continuation indicator on the current stage row", () => {
+  function owedTaskAtStage(stage: TaskStage): IncompleteTask {
+    return {
+      folderUri: vscode.Uri.file("/workspace/tasks/owed-stage-task"),
+      folderName: "owed-stage-task",
+      canonicalId: "/workspace/tasks/owed-stage-task",
+      progress: {
+        currentStage: stage,
+        status: "active",
+        taskFolder: "owed-stage-task",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+        implRecovery: {
+          sourceAttemptId: "impl-recovery-stage-1",
+          reason: "the provider's final response was cut short",
+          trigger: "roundIncomplete",
+          mode: "unconstrained",
+          dispatch: "pending",
+          at: "2026-08-25T00:00:00.000Z",
+          leaseUntil: "2026-08-25T00:25:00.000Z",
+        },
+      },
+    } as unknown as IncompleteTask;
+  }
+
+  void it("shows the owed indicator on the CURRENT stage row when nothing is running", () => {
+    const task = owedTaskAtStage("impl-high-review");
+    const node = new StageNode(task, "impl-high-review", "current", undefined);
+    assert.match(String(node.description ?? ""), /Continuation owed/);
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "history");
+  });
+
+  void it("appends the readiness label after the owed indicator rather than replacing it", () => {
+    const task = owedTaskAtStage("impl-high-review");
+    const readiness = { label: "6/10" };
+    const node = new StageNode(task, "impl-high-review", "current", undefined, readiness);
+    const description = String(node.description ?? "");
+    assert.match(description, /Continuation owed/);
+    assert.match(description, /6\/10/);
+  });
+
+  void it("does not show the owed indicator on a stage that is not current", () => {
+    const task = owedTaskAtStage("impl-high-review");
+    const node = new StageNode(task, "impl", "done", undefined);
+    assert.doesNotMatch(String(node.description ?? ""), /Continuation owed/);
+  });
+
+  void it("suppresses the owed indicator on the current stage row while any operation for the task is running", () => {
+    const task = owedTaskAtStage("impl-high-review");
+    // A TASK-LEVEL op (stage: undefined, e.g. commit/push) deliberately, not
+    // one scoped to "impl-high-review" itself — a same-stage op would already
+    // take the pre-existing `isRunning` branch above the "current" switch
+    // case, never reaching the code this test exists to cover. This proves
+    // the broader "any operation anywhere for the task" gate
+    // (describeOwedContinuationRowIndicatorV1's own contract, mirrored from
+    // the task row) also applies here.
+    const handle = taskOperations.begin(task.folderUri.fsPath, {
+      label: "Committing and pushing",
+      exclusive: true,
+    });
+    assert.ok(handle);
+    try {
+      const node = new StageNode(task, "impl-high-review", "current", undefined);
+      assert.doesNotMatch(
+        String(node.description ?? ""),
+        /Continuation owed/,
+        "must not show 'Continuation owed' while any operation is running for this task"
+      );
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+});
+
 
