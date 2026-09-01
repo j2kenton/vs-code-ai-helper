@@ -369,6 +369,18 @@ export interface ImplementationRecoveryInputV1 {
    * rather than silently terminalizing nothing).
    */
   readonly sourceRoundIdHint?: string;
+  /**
+   * Force the persisted recovery mode rather than deriving it from
+   * `selectImplRecoveryModeV1`'s evidence — used only by the dirty-tree
+   * mid-round hand-off (Part 15 / item 7b, `trigger: "providerFailedMidRound"`):
+   * that recovery is always `"inspect-and-complete"` by construction (a known,
+   * non-empty change set from a round that failed before finishing, handed to
+   * a DIFFERENT model to verify and complete), and the evidence rule's
+   * high-review-history checks reason about the SAME model's own prior
+   * review record — meaningless for a hand-off to a model that has never run
+   * this stage before.
+   */
+  readonly forceMode?: ImplRecoveryModeV1;
 }
 
 export interface BegunImplementationRecoveryV1 {
@@ -480,18 +492,20 @@ export async function beginImplementationRecoveryV1(
       mode: input.sourceDispatchMode ?? "implementation",
     }),
     extraPatch: (current) => {
-      selectedMode = selectImplRecoveryModeV1({
-        terminatedExternally: input.terminatedExternally,
-        filesChangedUnknown: input.filesChangedUnknown,
-        changedFileCount: quarantinedPaths.length,
-        latestHighReviewPassedZeroBlockers: latestHighReviewPassedZeroBlockersV1(current),
-        latestHighReviewDescribesPreRoundTree: highReviewDescribesPreRoundTree,
-        preRoundBoundaryClean:
-          (current.pendingImplReviewFiles?.length ?? 0) === 0 &&
-          current.reviewInvalidatedByRound === undefined,
-        summaryOnlyDispatchAvailable: isSummaryOnlyDispatchAvailableV1(),
-        escalatedFromSummaryOnly: input.escalatedFromSummaryOnly === true,
-      });
+      selectedMode =
+        input.forceMode ??
+        selectImplRecoveryModeV1({
+          terminatedExternally: input.terminatedExternally,
+          filesChangedUnknown: input.filesChangedUnknown,
+          changedFileCount: quarantinedPaths.length,
+          latestHighReviewPassedZeroBlockers: latestHighReviewPassedZeroBlockersV1(current),
+          latestHighReviewDescribesPreRoundTree: highReviewDescribesPreRoundTree,
+          preRoundBoundaryClean:
+            (current.pendingImplReviewFiles?.length ?? 0) === 0 &&
+            current.reviewInvalidatedByRound === undefined,
+          summaryOnlyDispatchAvailable: isSummaryOnlyDispatchAvailableV1(),
+          escalatedFromSummaryOnly: input.escalatedFromSummaryOnly === true,
+        });
       continuations = (current.incompleteRoundContinuations ?? 0) + 1;
       let next = setIncompleteRoundContinuations(current, continuations);
       if (quarantinedPaths.length > 0) {

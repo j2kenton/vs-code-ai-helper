@@ -1543,6 +1543,7 @@ const IMPL_RECOVERY_TRIGGERS: ReadonlySet<string> = new Set([
   "roundIncomplete",
   "summaryRejected",
   "externallyTerminated",
+  "providerFailedMidRound",
 ]);
 const IMPL_RECOVERY_MODES: ReadonlySet<string> = new Set([
   "summary-only",

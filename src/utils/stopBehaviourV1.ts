@@ -146,6 +146,17 @@ export function chooseStopBehaviourV1(
  * failure changed files and then failed, so it carries the sentence too,
  * alongside (not instead of) the failure-kind reason, exactly as
  * `authFailureBackupWithheld` already does for the auth case.
+ *
+ * `handedToBackup` (Part 15 / item 7b, review completion blocker 2026-09-01)
+ * is the seventh case, and the one where the switch is NOT withheld: a
+ * cascade-eligible dirty-tree failure with a usable backup available no
+ * longer stops here — `runnerRegistry.ts` quarantines the primary's edits,
+ * terminalizes the source round with a continuation owed, and hands the work
+ * to the backup as a fresh, bounded `inspect-and-complete` continuation round
+ * rather than invoking it inline against the tree the primary already
+ * edited. `cascadeWithheldDirtyTree` remains the outcome only when no usable
+ * backup exists for the hand-off (or the stage is `never-switch`, excluded
+ * from reaching this branch at all).
  */
 export type MidRoundStopOutcomeV1 =
   | {
@@ -154,6 +165,12 @@ export type MidRoundStopOutcomeV1 =
       readonly filesChangedCount: number;
       readonly remedyText: string;
       readonly affectedStagesClause: string;
+    }
+  | {
+      readonly kind: "handedToBackup";
+      readonly limitLabel: string;
+      readonly filesChangedCount: number;
+      readonly backupLabel: string;
     }
   | {
       readonly kind: "notCascadeEligible";
@@ -192,6 +209,15 @@ export function describeMidRoundOutcomeV1(
         `. This round already changed ${outcome.filesChangedCount} file(s), so Ensemble withheld the ` +
         "automatic switch to this stage's backup model — switching mid-round on a dirty working tree " +
         `risks mixing two models' edits in one round. ${outcome.remedyText}${outcome.affectedStagesClause}`
+      );
+    case "handedToBackup":
+      return (
+        `Hit ${outcome.limitLabel} on ${primaryProviderLabel}` +
+        (errorMessage ? ` (${errorMessage})` : "") +
+        `. This round already changed ${outcome.filesChangedCount} file(s), so Ensemble handed the work ` +
+        `to ${outcome.backupLabel} in inspect-and-complete mode — the primary's own edits are kept and ` +
+        "quarantined, and the backup inspects what landed and finishes the round from there, rather than " +
+        "starting over on a half-edited tree."
       );
     case "notCascadeEligible":
       return (

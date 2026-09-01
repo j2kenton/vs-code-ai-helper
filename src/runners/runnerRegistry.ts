@@ -59,6 +59,8 @@ import {
 } from "../utils/quota";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { chooseStopBehaviourV1, describeMidRoundOutcomeV1 } from "../utils/stopBehaviourV1";
+import { beginImplementationRecoveryV1 } from "../commands/implementationRecoveryV1";
+import { deriveNextRecoverySourceV1 } from "../utils/implementationDispatchModeV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   clearQuotaParkV1,
@@ -1268,20 +1270,24 @@ export async function runImplementationForModel(options: {
   } else if (
     // (2e / plan step 17) Quota-or-outage failure that left the working tree
     // DIRTY: the clean-tree cascade above intentionally never fires here
-    // because `primaryLeftTreeClean` is false, and no backup is EVER invoked
-    // in this state. The zero-changed-files requirement is the cascade's
-    // explicit safety boundary — dispatching a second model at a tree the
-    // failed primary already half-edited risks mixing two models' edits in
-    // one round, which is strictly worse than failing. What the bare
-    // fall-through used to omit is any explanation: the user saw only the
-    // primary's raw quota/outage error, with no way to tell that a
-    // configured backup exists but was deliberately withheld (versus not
-    // being configured at all). Enrich the primary's own outcome with that
-    // explanation and the two real choices — rerun the stage, or switch the
-    // stage's model — and return it. Only a KNOWN, non-empty change set
-    // takes this branch: `filesChangedUnknown` keeps the plain fall-through
-    // below, since a message claiming "N file(s) changed" cannot be written
-    // about a tree whose state could not be determined.
+    // because `primaryLeftTreeClean` is false. Plan Part 15 (item 7b, review
+    // completion blocker 2026-09-01): a second model is no longer dispatched
+    // INLINE against this half-edited tree — that hazard is real and stays
+    // closed — but it is no longer true that "no backup is ever invoked in
+    // this state" either. The failed primary's own edits are quarantined into
+    // `pendingImplReviewFiles` via the same recovery-record path every other
+    // unusable-report case uses, the source round is terminalized `failed`
+    // with a continuation owed, and the first enabled, currently-available
+    // backup is recorded as the stage's sticky fallback so the SCHEDULED
+    // continuation — a fresh, bounded `inspect-and-complete` round, never this
+    // failed attempt resumed — inspects what landed and finishes it. Only when
+    // no such backup exists (or the stage is `never-switch`, filtered out of
+    // `chainWantsBackup` already) does this fall through to the withheld-
+    // switch explanation below, unchanged. Only a KNOWN, non-empty change set
+    // reaches this branch at all: `filesChangedUnknown` keeps the plain
+    // fall-through further below, since neither a hand-off nor a "N file(s)
+    // changed" message can be built about a tree whose state could not be
+    // determined.
     !authFailure &&
     result.filesChangedUnknown !== true &&
     result.filesChanged.length > 0 &&
@@ -1289,12 +1295,109 @@ export async function runImplementationForModel(options: {
     options.stage &&
     chainWantsBackup
   ) {
+    const dirtyTreeStage = options.stage;
     const limitLabel =
       result.failureKind === "quota"
         ? "a quota/rate limit"
         : result.failureKind === "model-entitlement"
           ? "a model-entitlement block"
           : "the provider being temporarily unavailable";
+    // Part 15 / item 7b: resolve (never dispatch) the first enabled backup
+    // that is currently available, applying the SAME skip rules the clean-
+    // tree cascade loop above applies (recent zero-file breaker, cross-
+    // provider-kind exclusion) so a candidate accepted here is one that loop
+    // would also have accepted — the only difference is this candidate is
+    // handed a fresh continuation round to run in, never invoked inline
+    // against the tree the primary already edited.
+    if (options.taskFolderUri) {
+      const breakerRounds = getResilienceSettings().fallbackProviderBreakerRounds;
+      let roundOutcomesForHandoffHealthCheck: RoundOutcomeEntryV1[] | undefined;
+      if (breakerRounds > 0) {
+        try {
+          const progressRead = await readTaskProgressStrictV1(options.taskFolderUri);
+          roundOutcomesForHandoffHealthCheck = progressRead.ok
+            ? progressRead.decoded.progress.roundOutcomes
+            : undefined;
+        } catch {
+          roundOutcomesForHandoffHealthCheck = undefined;
+        }
+      }
+      let handoffCandidate: { modelId: string; providerLabel: string } | undefined;
+      for (const backupModel of filterEnabledBackupModels(chain.backups)) {
+        if (backupModel === options.modelId) {
+          continue;
+        }
+        let backupKind: "cli" | "copilot" | undefined;
+        let backupProviderId: string | undefined;
+        try {
+          const backupEffective = resolveEffectiveProvider(backupModel);
+          backupKind = backupEffective.kind;
+          backupProviderId = backupEffective.kind === "cli" ? backupEffective.def.id : "copilot-lm";
+        } catch {
+          continue;
+        }
+        if (!options.allowCrossProviderBackups && backupKind !== effective.kind) {
+          continue;
+        }
+        if (
+          breakerRounds > 0 &&
+          candidateHasRecentZeroFileFailuresV1(
+            roundOutcomesForHandoffHealthCheck,
+            dirtyTreeStage,
+            backupModel,
+            breakerRounds,
+            backupProviderId
+          )
+        ) {
+          continue;
+        }
+        const fallbackAvailability = await checkImplementationAvailabilityForModel(backupModel);
+        if (fallbackAvailability.availability.available) {
+          handoffCandidate = { modelId: backupModel, providerLabel: fallbackAvailability.providerLabel };
+          break;
+        }
+      }
+      if (handoffCandidate) {
+        const { sourceDispatchMode, sourceReviewStage } = deriveNextRecoverySourceV1(
+          options.correlation.actionKey,
+          dirtyTreeStage,
+          undefined
+        );
+        const recovery = await beginImplementationRecoveryV1(options.taskFolderUri, {
+          trigger: "providerFailedMidRound",
+          reason:
+            `${primaryProviderLabel} failed mid-round (${limitLabel})` +
+            (result.errorMessage ? `: ${result.errorMessage}` : "") +
+            ` after changing ${result.filesChanged.length} file(s).`,
+          forceMode: "inspect-and-complete",
+          terminatedExternally: false,
+          filesChanged: result.filesChanged,
+          filesChangedUnknown: false,
+          postRunReviewStage: dirtyTreeStage,
+          sourceDispatchMode,
+          sourceReviewStage,
+          offerRestoreOption: false,
+        });
+        // Sticky fallback recorded BEFORE the continuation is scheduled below,
+        // so the continuation's own model resolution (which honors
+        // `fallbackActive`/`fallbackModelId`) already sees the backup as this
+        // stage's active route the moment it dispatches.
+        await recordActiveFallbackModel(options.taskFolderUri, dirtyTreeStage, handoffCandidate.modelId);
+        const handoffMessage = describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+          kind: "handedToBackup",
+          limitLabel,
+          filesChangedCount: result.filesChanged.length,
+          backupLabel: handoffCandidate.providerLabel,
+        });
+        options.onProgress(handoffMessage);
+        await recovery.finishDispatch();
+        return withActualIdentity(
+          { ...result, errorMessage: handoffMessage },
+          primaryProviderLabel,
+          options.modelId
+        );
+      }
+    }
     const parkProviderId = primaryProviderId;
     const parkAccountKey = primaryAccountKey;
     const extensionContext = getExtensionContextV1();

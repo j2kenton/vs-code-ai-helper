@@ -27,6 +27,7 @@ import {
 import { resolveQuotaAccountKeyV1 } from "../config/settings";
 import { parseModelSelection, providerAccountIdForModelId } from "../runners/providers";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 
 /** Minimal in-memory Memento-backed ExtensionContext stub — mirrors the
  * pattern in quota.test.ts's `createFakeExtensionContext`. */
@@ -55,6 +56,34 @@ function createFakeExtensionContextV1(
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
+
+// Same monkey-patch pattern deferredRoundRecovery.test.ts / implRecoveryDispatch.test.ts
+// use for the chain-dispatch boundary: `beginImplementationRecoveryV1`'s
+// `finishDispatch()` fires `scheduleAutomationChain` with the default deps
+// (real `vscode.commands.executeCommand`), and no command handler for
+// `vs-code-ai-helper.runImplementationWithAI` is registered in this unit-test
+// harness — patched to a no-op for the dirty-tree hand-off tests below so the
+// (production-correct) continuation scheduling doesn't reject against an
+// unregistered command.
+const automationChainModule = requireModule("../utils/automationChain") as Record<string, unknown>;
+interface PatchedV1 { restore: () => void }
+function patchModule(module: Record<string, unknown>, name: string, replacement: unknown): PatchedV1 {
+  const orig = module[name];
+  module[name] = replacement;
+  return { restore: (): void => { module[name] = orig; } };
+}
+
+/**
+ * The dirty-tree hand-off's `finishDispatch()` (`implementationRecoveryV1.ts`)
+ * unconditionally calls `NotificationRouter.showWarning` — safe in production
+ * (initialized once at activation), but this suite never activates the
+ * extension, so it must be initialized around the hand-off tests below or
+ * that call throws "NotificationRouter is not initialized".
+ */
+function installNoopNotificationRouterV1(): PatchedV1 {
+  initNotificationRouter({ addEntry: () => undefined });
+  return { restore: (): void => deactivateNotificationRouter() };
+}
 
 type LmStub = {
   selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
@@ -2138,21 +2167,21 @@ void describe("runImplementationForModel", () => {
     }
   });
 
-  // (2e / plan step 17) A quota-or-outage failure that left the working tree
-  // DIRTY must never invoke a backup — the zero-changed-files requirement is
-  // the cascade's explicit safety boundary (a second model dispatched at a
-  // half-edited tree risks mixing two models' edits in one round). An earlier
-  // round replaced this with a "handoff" that deliberately ran the backup
-  // against the dirty tree; the implementation review rejected that as a
-  // reversal of the plan's contract, so this test pins the required shape:
-  // the configured, AVAILABLE backup stays uninvoked, and the primary's own
-  // failure comes back enriched with an explanation naming the withheld
-  // switch and the two real choices (rerun the stage / switch the stage's
-  // model). Especially reachable for Cline/Antigravity, whose edit mode
-  // keeps every tool auto-approved right up to a timeout/kill, but the gate
-  // applies to every provider uniformly (filesChanged is computed the same
-  // way for all of them).
-  void it("withholds the backup switch and explains why when the primary run already left the working tree dirty", async () => {
+  // (2e / plan step 17, superseded by Plan Part 15 / item 7b, review
+  // completion blocker 2026-09-01) A quota-or-outage failure that left the
+  // working tree DIRTY must never invoke a backup INLINE against that
+  // half-edited tree — that hazard stays closed, and this test still pins
+  // `backupAttempted === false` for exactly that reason. What changed: the
+  // AVAILABLE backup no longer stays withheld outright. The primary's edits
+  // are quarantined, the source round is terminalized with a continuation
+  // owed, and the backup is recorded as this stage's sticky fallback so a
+  // FRESH, bounded `inspect-and-complete` continuation round — never this
+  // failed attempt resumed, and never the backup invoked synchronously here
+  // — finishes the work. Especially reachable for Cline/Antigravity, whose
+  // edit mode keeps every tool auto-approved right up to a timeout/kill, but
+  // the gate applies to every provider uniformly (filesChanged is computed
+  // the same way for all of them).
+  void it("hands a dirty-tree cascade-eligible failure to the backup as an inspect-and-complete continuation, never invoked inline", async () => {
     const originalSpawn = childProcess.spawn;
 
     const metaRoot = fs.mkdtempSync(
@@ -2245,6 +2274,10 @@ void describe("runImplementationForModel", () => {
     );
 
     const progressMessages: string[] = [];
+    const chainPatch = patchModule(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> =>
+      Promise.resolve(true)
+    );
+    const routerPatch = installNoopNotificationRouterV1();
     try {
       const settings = installModelSettings({
         impl: {
@@ -2271,8 +2304,170 @@ void describe("runImplementationForModel", () => {
         assert.strictEqual(
           backupAttempted,
           false,
-          "an available backup must never be dispatched at a tree the failed primary already edited"
+          "an available backup must never be invoked INLINE at a tree the failed primary already edited"
         );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.ok(
+          result.filesChanged.includes("mutated-by-partial-run.txt"),
+          "expected the primary run's own file write to survive in the reported filesChanged list — the " +
+            "hand-off must never revert the primary's edits"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /handed the work to Copilot in inspect-and-complete mode/,
+          "expected the failure message to name the backup and the inspect-and-complete mode"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /changed 1 file\(s\)/,
+          "expected the failure message to name how many files the interrupted round left behind"
+        );
+        assert.ok(
+          progressMessages.some((message) => message.includes("handed the work to Copilot")),
+          "expected an explicit progress notification about the hand-off, not just the returned error"
+        );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          pendingImplReviewFiles?: string[];
+          implRecovery?: {
+            trigger?: string;
+            mode?: string;
+            dispatch?: string;
+          };
+        };
+        assert.strictEqual(
+          progress.fallbackActive?.impl,
+          true,
+          "the hand-off must record an active sticky fallback for the stage so the scheduled " +
+            "continuation resolves to the backup"
+        );
+        assert.strictEqual(progress.fallbackModelId?.impl, "auto");
+        assert.ok(
+          progress.pendingImplReviewFiles?.includes("mutated-by-partial-run.txt"),
+          "expected the primary's edits to be quarantined for the continuation round"
+        );
+        assert.strictEqual(progress.implRecovery?.trigger, "providerFailedMidRound");
+        assert.strictEqual(progress.implRecovery?.mode, "inspect-and-complete");
+        assert.strictEqual(progress.implRecovery?.dispatch, "pending");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      routerPatch.restore();
+      chainPatch.restore();
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // (2e / plan step 17, Part 15 / item 7b) The withheld-switch explanation
+  // stays reachable when a backup IS configured (`chainWantsBackup` true, so
+  // the hand-off resolution loop runs) but nothing in it is actually
+  // AVAILABLE — the default `lm.selectChatModels` stub returns `[]` (no
+  // override installed below), so the bare/legacy "auto" backup resolves to
+  // Copilot with zero models and `checkImplementationAvailabilityForModel`
+  // reports it unavailable. The hand-off loop finds no candidate and falls
+  // through to the pre-existing withheld-cascade branch unchanged.
+  void it("still withholds the switch and explains why when a dirty-tree failure has no backup available to hand off to", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-no-backup-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5558 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then failed");
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "service temporarily unavailable",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const progressMessages: string[] = [];
+    try {
+      // A backup IS configured (`chainWantsBackup` true) but never made
+      // available — no `lm.selectChatModels` override is installed for this
+      // test, so the default stub's `[]` makes "auto" resolve unavailable.
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
         assert.strictEqual(result.status, "failed");
         assert.strictEqual(result.failureKind, "temporarily-unavailable");
         assert.ok(
@@ -2286,11 +2481,6 @@ void describe("runImplementationForModel", () => {
         );
         assert.match(
           result.errorMessage ?? "",
-          /changed 1 file\(s\)/,
-          "expected the failure message to name how many files the interrupted round left behind"
-        );
-        assert.match(
-          result.errorMessage ?? "",
           /Rerun this stage.*switch the stage's model/,
           "expected the failure message to offer the two real choices: rerun or switch the model"
         );
@@ -2301,6 +2491,7 @@ void describe("runImplementationForModel", () => {
         const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
           fallbackActive?: Partial<Record<string, boolean>>;
           fallbackModelId?: Partial<Record<string, string>>;
+          implRecovery?: unknown;
         };
         assert.notStrictEqual(
           progress.fallbackActive?.impl,
@@ -2308,12 +2499,16 @@ void describe("runImplementationForModel", () => {
           "a withheld switch must not record an active fallback for the stage"
         );
         assert.strictEqual(progress.fallbackModelId?.impl, undefined);
+        assert.strictEqual(
+          progress.implRecovery,
+          undefined,
+          "no backup was available to hand off to, so no recovery continuation should be recorded"
+        );
       } finally {
         settings.restore();
       }
     } finally {
       childProcess.spawn = originalSpawn;
-      lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
       fs.rmSync(metaRoot, { recursive: true, force: true });
@@ -3240,7 +3435,7 @@ void describe("runImplementationForModel", () => {
   // same dirty-tree safety boundary applies — a second model must never be
   // dispatched at a tree the failed primary already edited, regardless of
   // WHY the primary failed.
-  void it("withholds the backup switch on a model-entitlement failure that left the working tree dirty", async () => {
+  void it("hands a model-entitlement dirty-tree failure to the backup as an inspect-and-complete continuation", async () => {
     const originalSpawn = childProcess.spawn;
     const metaRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "ensemble-impl-entitlement-dirty-tree-")
@@ -3324,6 +3519,10 @@ void describe("runImplementationForModel", () => {
     );
 
     const progressMessages: string[] = [];
+    const chainPatch = patchModule(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> =>
+      Promise.resolve(true)
+    );
+    const routerPatch = installNoopNotificationRouterV1();
     try {
       const settings = installModelSettings({
         impl: {
@@ -3350,28 +3549,34 @@ void describe("runImplementationForModel", () => {
         assert.strictEqual(
           backupAttempted,
           false,
-          "an available backup must never be dispatched at a tree the failed primary already edited"
+          "an available backup must never be invoked INLINE at a tree the failed primary already edited"
         );
         assert.strictEqual(result.status, "failed");
         assert.strictEqual(result.failureKind, "model-entitlement");
         assert.match(
           result.errorMessage ?? "",
-          /withheld the automatic switch/,
-          "expected the failure message to say the backup switch was deliberately withheld"
-        );
-        assert.match(
-          result.errorMessage ?? "",
-          /a model-entitlement block/,
-          "expected the withheld message to name a model-entitlement block, not a generic quota/outage label"
+          /handed the work to Copilot in inspect-and-complete mode/,
+          "expected the failure message to name the backup and the inspect-and-complete mode"
         );
         assert.ok(
-          progressMessages.some((message) => message.includes("withheld the automatic switch")),
-          "expected an explicit progress notification about the withheld backup"
+          progressMessages.some((message) => message.includes("handed the work to Copilot")),
+          "expected an explicit progress notification about the hand-off"
         );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          implRecovery?: { trigger?: string; mode?: string };
+        };
+        assert.strictEqual(progress.fallbackActive?.impl, true);
+        assert.strictEqual(progress.fallbackModelId?.impl, "auto");
+        assert.strictEqual(progress.implRecovery?.trigger, "providerFailedMidRound");
+        assert.strictEqual(progress.implRecovery?.mode, "inspect-and-complete");
       } finally {
         settings.restore();
       }
     } finally {
+      routerPatch.restore();
+      chainPatch.restore();
       childProcess.spawn = originalSpawn;
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;

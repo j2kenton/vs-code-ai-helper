@@ -628,7 +628,16 @@ export type ImplRecoveryTriggerV1 =
   // stopped from outside rather than returning any final response at all,
   // unlike the other three triggers which all have SOME provider reply
   // (however unusable) to classify.
-  | "externallyTerminated";
+  | "externallyTerminated"
+  // Plan Part 15 (item 7b): a cascade-eligible provider failure (quota,
+  // model-entitlement, or outage) that left the working tree dirty. The
+  // primary DID return a final response (unlike `externallyTerminated`) but
+  // its own edits are unverified, so the recorded recovery is always forced
+  // to `"inspect-and-complete"` mode (see `beginImplementationRecoveryV1`'s
+  // `forceMode`) rather than derived from the SAME-model review-history
+  // evidence the other triggers use — that evidence is meaningless for a
+  // hand-off to a DIFFERENT model that has never run this stage before.
+  | "providerFailedMidRound";
 
 /**
  * The continuation constraint recovery was begun under. Part 1 records
