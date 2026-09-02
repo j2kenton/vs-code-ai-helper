@@ -1257,6 +1257,25 @@ export interface RoundLedgerOutcomeV1 {
    * lineage id too).
    */
   reviewerChallengedNonGoal?: readonly string[];
+  /**
+   * Set when THIS round newly crossed a `task.md` size band (Part 16 step
+   * 44) — the durable ledger record of the nudge, alongside the standalone
+   * `TaskMdSizeBandAnnouncementRecordV1` sidecar (`promptManifestV1.ts`) that
+   * carries the same facts on disk. Attached in the SAME
+   * `patchTaskProgressStrictV1` transaction `terminalizeRoundV1` uses to
+   * close this round (2026-09-02 review, completion blocker: "the ledger
+   * still does not durably retain the size-band event and a failed chat
+   * append is permanently suppressed") — rendered into this round's own
+   * `_Ended: …_` outcome message by `formatRoundOutcomeMessageV1` rather than
+   * via a second, separately-fragile `appendChatMessageV1` call, so the fact
+   * inherits the reconciliation sweep's pass-(b) repair of a missing outcome
+   * message for free instead of having its own bespoke, unrepaired write.
+   */
+  taskMdSizeBand?: {
+    readonly band: number;
+    readonly taskMdBytes: number;
+    readonly percentOfLimit: number;
+  };
 }
 
 /**

@@ -424,6 +424,12 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
     if (outcome.continuationOwed) {
       parts.push("a continuation is owed");
     }
+    if (outcome.taskMdSizeBand) {
+      const kb = Math.round(outcome.taskMdSizeBand.taskMdBytes / 1024);
+      parts.push(
+        `task.md is ${kb} KB — ${outcome.taskMdSizeBand.percentOfLimit}% of the review-input limit; this task may want splitting`
+      );
+    }
   }
   // The dispatch mode is part of the terminal record, not merely metadata in
   // task-progress.json.  A reader needs it to distinguish checklist-driven

@@ -492,11 +492,17 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
     }
   });
 
-  void it("offers a manual retry (does not automatically advance) under pause-and-resume", async () => {
+  void it("does not automatically advance under never-switch (migrated from pause-and-resume)", async () => {
     const store = new Map<string, string>();
     installMemStore(store);
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
+    // Part 13/14's fallback-strategy collapse (`FallbackStrategy = "switch-to-backup" | "never-switch"`)
+    // migrates the legacy `"pause-and-resume"` value to `"never-switch"` on
+    // read (`getModelSettings`), which `resolveEffectiveStageChainV1` (used
+    // by `handleReviewRoutingOutcome`) then resolves through. Kept as
+    // `"pause-and-resume"` here deliberately, so this test also exercises
+    // that migration rather than only the post-migration value.
     const settings = installModelSettingsV1({
       "impl-high-review": {
         primary: "codex-cli:gpt-5.6",
@@ -536,13 +542,13 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
         reviewer: { providerLabel: "Codex", storedModelId: "codex-cli:gpt-5.6" },
       });
       assert.deepStrictEqual(degenerateBackupAdvance, {
-        kind: "manual",
+        kind: "stop",
         nextModelId: "claude-cli:sonnet",
       });
       const retryWarning = surface.entries.find(
-        (e) => e.level === "warning" && e.message.includes("has not been tried this episode")
+        (e) => e.level === "warning" && e.message.includes("set to Never switch")
       );
-      assert.ok(retryWarning, "the manual-retry affordance must be surfaced to the user");
+      assert.ok(retryWarning, "the withheld-switch reason must be surfaced to the user");
     } finally {
       settings.restore();
       deactivateNotificationRouter();

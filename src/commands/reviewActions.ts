@@ -38,6 +38,7 @@ import {
   ReviewBlockerIdentity,
   ReviewScoreHistoryEntry,
   RoundLedgerEntryV1,
+  RoundLedgerOutcomeV1,
   RoundOutcomeClassificationV1,
   TaskEscalation,
   TaskProgress,
@@ -2389,6 +2390,11 @@ export async function handleReviewRoutingOutcome(options: {
    * correlation, an item-14 same-candidate retry, ...) — see
    * `TerminalizeRoundOptionsV1.extraAttemptIds`. */
   coordinatorExtraAttemptIds?: readonly string[];
+  /** Part 16 step 44: see `ReviewOutcomeContextV1.taskMdSizeBand`'s doc
+   * comment — forwarded onto both `terminalizeRoundV1` outcome branches below
+   * so the fact lands in the SAME durable transaction that closes this
+   * round, whichever branch it takes. */
+  taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
   const {
     folderUri,
@@ -2403,6 +2409,7 @@ export async function handleReviewRoutingOutcome(options: {
     coordinatorOperationId,
     coordinatorAttemptId,
     coordinatorExtraAttemptIds,
+    taskMdSizeBand,
   } = options;
   try {
     const resilience = getResilienceSettings();
@@ -2512,7 +2519,7 @@ export async function handleReviewRoutingOutcome(options: {
       await terminalizeRoundV1(
         reviewAttemptId,
         "rejected",
-        { rejectionReason },
+        { rejectionReason, ...(taskMdSizeBand ? { taskMdSizeBand } : {}) },
         {
           taskFolderUri: folderUri,
           ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
@@ -2809,6 +2816,7 @@ export async function handleReviewRoutingOutcome(options: {
         reviewerBlockers: blockerSplit.reviewerBlockers,
         mechanicalBlockers: blockerSplit.mechanicalBlockers,
         ...(reviewerChallengedNonGoalHeadings ? { reviewerChallengedNonGoal: reviewerChallengedNonGoalHeadings } : {}),
+        ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
       },
       {
         taskFolderUri: folderUri,
@@ -3052,6 +3060,14 @@ export interface ReviewOutcomeContextV1 {
    * `terminalizeRoundV1`'s `extraAttemptIds` so the round-ledger row is
    * findable by any attempt it actually made, not only the last. */
   extraCoordinatorAttemptIds?: readonly string[];
+  /** Part 16 step 44: THIS round's newly-crossed `task.md` size band, when
+   * one was detected right after `claimReviewAttempt` opened this round's
+   * ledger row — carried through to whichever terminal path this round
+   * takes so `terminalizeRoundV1` can attach it to `outcome.taskMdSizeBand`
+   * in the same durable transaction that closes the round, rather than a
+   * second, separately-fragile chat append. See `RoundLedgerOutcomeV1.taskMdSizeBand`'s
+   * own doc comment. */
+  taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
 }
 
 /**
@@ -3129,7 +3145,7 @@ async function terminalizeUnclosedReviewRoundV1(
     await terminalizeRoundV1(
       ctx.reviewAttemptId,
       terminalStateForUnclosedReviewOutcomeV1(outcome),
-      undefined,
+      ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : undefined,
       {
         taskFolderUri: ctx.folderUri,
         ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
@@ -3501,6 +3517,7 @@ async function routeReviewOutcomeV1(
           ...(ctx.extraCoordinatorAttemptIds?.length
             ? { coordinatorExtraAttemptIds: ctx.extraCoordinatorAttemptIds }
             : {}),
+          ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -4658,6 +4675,16 @@ export async function runReviewForFolder(
   }
   variables.contextPack = contextPackContent;
 
+  // Claim the stage before starting the provider call. The token is checked
+  // again by the transition CAS, so a late result can never advance a newer
+  // run — passed through to runAiToFile as reviewAttemptId as well, which
+  // additionally re-checks it between content-validation backup retries so a
+  // superseded attempt stops spending quota on backups well before it would
+  // eventually lose that final CAS anyway.
+  const reviewAttemptId = crypto.randomUUID();
+  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
+  if (!claimed) return;
+
   // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
   // itself is eating a large share of the review-input limit — "the same
   // growth pressure applies to task.md itself... a task file large enough to
@@ -4673,13 +4700,47 @@ export async function runReviewForFolder(
   // oldest dropped first), so an old task whose announcing message aged out
   // of the window would silently re-announce the same band on a later round.
   //
-  // 2026-08-29 review, completion blocker (round 2): the integer marker alone
+  // 2026-08-29 review round 2, completion blocker: the integer marker alone
   // proves "we already told them" but not WHAT was told — see
-  // `writeTaskMdSizeBandAnnouncementRecordV1`'s doc comment for why the
-  // descriptive record is a standalone disk artifact rather than a
-  // `TaskProgress.roundLedger` row (this check runs during prompt assembly,
-  // before a round dispatches, with no coordinator round identity in scope —
-  // the same constraint `PromptManifestV1`'s own header documents).
+  // `writeTaskMdSizeBandAnnouncementRecordV1`'s doc comment for the standalone
+  // disk record that answers that.
+  //
+  // 2026-09-02 review, completion blocker ("still deliberately avoids
+  // `TaskProgress.roundLedger`... the ledger requirement"): moved from before
+  // `claimReviewAttempt` to right after it, so `reviewAttemptId` — this
+  // review's own live `roundLedger` row (`claimReviewAttempt` just opened it,
+  // `mode: "review"`, `state: "open"`) — is in scope to attach to the
+  // announcement's chat message as `roundId`. That is what makes the
+  // announcement "ledger-backed" rather than a free-floating activity line:
+  // `ChatMessage.roundId`'s own doc comment ("set together with `kind:
+  // 'activity'`... where known") is exactly this case. A genuinely new
+  // `RoundLedgerEntryV1` row for this nudge alone was rejected — the type has
+  // no free-text "activities" list, and this nudge is not itself a round with
+  // its own lifecycle; anchoring it to the round it was assembled for via
+  // `roundId` is the existing, minimal mechanism the schema provides.
+  //
+  // 2026-09-02 review round 2, completion blocker ("the ledger still does
+  // not durably retain the size-band event and a failed chat append is
+  // permanently suppressed"): this no longer writes its own chat message at
+  // all. Instead it captures the fact in `taskMdSizeBandForOutcome`, which
+  // every terminal path below (the "no model configured" early return, and
+  // both branches `handleReviewOutcomeV1` can take) forwards as
+  // `ReviewOutcomeContextV1.taskMdSizeBand` — `terminalizeRoundV1` then
+  // attaches it to `outcome.taskMdSizeBand` in the SAME `patchTaskProgressStrictV1`
+  // transaction that closes this round, and `formatRoundOutcomeMessageV1`
+  // renders it into that round's own `_Ended: …_` message. That message is
+  // no longer a second, separately-fragile write: it is the one the
+  // reconciliation sweep's pass (b) already guarantees a repair for on any
+  // terminal round missing one, so a failure appending it is no longer a
+  // permanent loss — the sweep re-derives and re-appends it from the durable
+  // `outcome` the transaction above already committed.
+  //
+  // The descriptive sidecar (`writeTaskMdSizeBandAnnouncementRecordV1`) is
+  // written BEFORE the durable dedup marker advances, same as before: a CAS
+  // loss on the marker write after a successful sidecar write leaves one
+  // harmless extra sidecar file rather than losing the sidecar to a marker
+  // that already blocks the retry that would have produced it.
+  let taskMdSizeBandForOutcome: RoundLedgerOutcomeV1["taskMdSizeBand"];
   try {
     const taskMdBytes = Buffer.byteLength(
       (await readTextIfExists(vscode.Uri.joinPath(folderUri, TASK_FILENAME))) ?? "",
@@ -4688,56 +4749,30 @@ export async function runReviewForFolder(
     const band = sizeBandV1(taskMdBytes, MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1);
     const priorProgress = await readTaskProgressAdvisoryV1(folderUri);
     if (band > 0 && (priorProgress?.taskMdSizeBandAnnounced ?? 0) < band) {
-      const kb = Math.round(taskMdBytes / 1024);
       const pct = Math.round((taskMdBytes / MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) * 100);
+      const announcedAt = new Date().toISOString();
+      await writeTaskMdSizeBandAnnouncementRecordV1(vscode.Uri.joinPath(folderUri, RUNS_DIRNAME), {
+        at: announcedAt,
+        stage: targetStage,
+        band,
+        taskMdBytes,
+        limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+        percentOfLimit: pct,
+      });
       const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
         recordTaskMdSizeBandAnnouncedV1(current, band)
       );
-      // Only announce once the durable marker is actually persisted — a CAS
-      // loss here (another writer beat us to a higher/equal band) means this
-      // round's own announcement would be redundant.
+      // Only carry it forward once the durable marker is actually persisted
+      // — a CAS loss here (another writer beat us to a higher/equal band)
+      // means this round's own outcome would be a redundant re-announcement
+      // (the sidecar record above is harmless to leave behind either way).
       if (updated && (updated.taskMdSizeBandAnnounced ?? 0) === band) {
-        const announcedAt = new Date().toISOString();
-        try {
-          await writeTaskMdSizeBandAnnouncementRecordV1(vscode.Uri.joinPath(folderUri, RUNS_DIRNAME), {
-            at: announcedAt,
-            stage: targetStage,
-            band,
-            taskMdBytes,
-            limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
-            percentOfLimit: pct,
-          });
-        } catch {
-          // Best-effort diagnostic only — never blocks the chat projection below.
-        }
-        await appendChatMessageV1(
-          folderUri.fsPath,
-          {
-            role: "assistant",
-            text:
-              `task.md is ${kb} KB — ${pct}% of the review-input limit. This task may want splitting. ` +
-              `(task.md size band ${band})`,
-            stage: targetStage,
-            at: announcedAt,
-            kind: "activity",
-          },
-          folderUri.fsPath
-        );
+        taskMdSizeBandForOutcome = { band, taskMdBytes, percentOfLimit: pct };
       }
     }
   } catch {
     // Best-effort only — see the comment above.
   }
-
-  // Claim the stage before starting the provider call. The token is checked
-  // again by the transition CAS, so a late result can never advance a newer
-  // run — passed through to runAiToFile as reviewAttemptId as well, which
-  // additionally re-checks it between content-validation backup retries so a
-  // superseded attempt stops spending quota on backups well before it would
-  // eventually lose that final CAS anyway.
-  const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
-  if (!claimed) return;
 
   // Part 2 (review status messaging): mark the artifact "in progress" now
   // that this attempt has genuinely won the claim, and before the provider
@@ -4800,7 +4835,12 @@ export async function runReviewForFolder(
       // "open" until the still-unbuilt reconciliation sweep exists at all.
       // No coordinator correlation exists yet either, so this closes the row
       // under its own `reviewAttemptId` alone.
-      await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: folderUri });
+      await terminalizeRoundV1(
+        reviewAttemptId,
+        "failed",
+        taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : undefined,
+        { taskFolderUri: folderUri }
+      );
       return;
     }
 
@@ -4890,6 +4930,7 @@ export async function runReviewForFolder(
           modelId,
           promptLength: promptByteLength,
           providerId: dispatchProviderId,
+          ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
         }
       );
       return;
@@ -4975,6 +5016,7 @@ export async function runReviewForFolder(
       ...(observedCoordinatorAttemptIds.length
         ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
         : {}),
+      ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
     });
   } finally {
     if (!reviewSucceeded) {

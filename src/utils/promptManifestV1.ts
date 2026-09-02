@@ -459,15 +459,24 @@ export async function writeOversizedInputAbortRecordV1(
  * implementation substituted a durable numeric marker plus a bounded chat
  * projection... not the durable descriptive record").
  *
- * Deliberately NOT attached to `TaskProgress.roundLedger`: this nudge fires
- * during prompt ASSEMBLY, before the round dispatches, at a point in
- * `runReviewForFolder` that — like `PromptManifestV1`'s own documented
- * constraint above — has no coordinator `operationId`/`attemptId` in scope to
- * key a ledger row to (`TaskOperationHandle.id`, the only identity available
- * here, is a locally-allocated `op-N` counter unrelated to the round
- * ledger's identity space). Same reasoning the Accepted Non-Goal for Part 2
- * step 7 already records for this exact class of constraint; this is a
- * standalone disk record for the same reason, not a lesser substitute.
+ * This is a standalone disk record, not a `TaskProgress.roundLedger` row of
+ * its own — `RoundLedgerEntryV1` has no free-text "activities" list, and this
+ * nudge is not itself a round with a lifecycle to terminalize. It IS
+ * ledger-backed, though (2026-09-02 review round 2, completion blocker: "the
+ * ledger still does not durably retain the size-band event and a failed chat
+ * append is permanently suppressed"): `runReviewForFolder` fires this check
+ * right after `claimReviewAttempt` opens this review's own `roundLedger` row
+ * (`mode: "review"`), and — rather than a second, separately-fragile
+ * `appendChatMessageV1` call — carries the detected band forward as
+ * `ReviewOutcomeContextV1.taskMdSizeBand` to whichever terminal path THIS
+ * round takes, so `terminalizeRoundV1` attaches it to
+ * `RoundLedgerOutcomeV1.taskMdSizeBand` in the SAME durable transaction that
+ * closes the round. `formatRoundOutcomeMessageV1` then renders it into that
+ * round's own `_Ended: …_` outcome message, which inherits the reconciliation
+ * sweep's pass-(b) repair of a missing outcome message instead of risking a
+ * standalone, unrepaired write. Only the standalone JSON file itself (the
+ * WHAT-was-told detail, keyed by timestamp so repeated announcements never
+ * collide) has no ledger row of its own to live on.
  */
 export interface TaskMdSizeBandAnnouncementRecordV1 {
   /** ISO timestamp of the announcement. */

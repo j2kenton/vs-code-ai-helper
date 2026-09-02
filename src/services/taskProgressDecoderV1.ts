@@ -1264,6 +1264,7 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
     "runLogPath",
     "roundOutcomeAttemptId",
     "reviewerChallengedNonGoal",
+    "taskMdSizeBand",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1339,6 +1340,40 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
       if (typeof heading !== "string" || heading.length === 0 || heading.length > 200) {
         return "roundLedger entry outcome reviewerChallengedNonGoal entries must be bounded non-empty strings";
       }
+    }
+  }
+  if (value["taskMdSizeBand"] !== undefined) {
+    const band = value["taskMdSizeBand"];
+    if (!isPlainObject(band)) {
+      return "roundLedger entry outcome taskMdSizeBand must be an object";
+    }
+    const allowedBandKeys = new Set(["band", "taskMdBytes", "percentOfLimit"]);
+    for (const key of Object.keys(band)) {
+      if (!allowedBandKeys.has(key)) {
+        return `roundLedger entry outcome taskMdSizeBand has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (
+      typeof band["band"] !== "number" ||
+      !Number.isInteger(band["band"]) ||
+      band["band"] < 1 ||
+      band["band"] > 4
+    ) {
+      return "roundLedger entry outcome taskMdSizeBand.band must be an integer between 1 and 4";
+    }
+    if (
+      typeof band["taskMdBytes"] !== "number" ||
+      !Number.isInteger(band["taskMdBytes"]) ||
+      band["taskMdBytes"] < 0
+    ) {
+      return "roundLedger entry outcome taskMdSizeBand.taskMdBytes must be a non-negative integer";
+    }
+    if (
+      typeof band["percentOfLimit"] !== "number" ||
+      !Number.isInteger(band["percentOfLimit"]) ||
+      band["percentOfLimit"] < 0
+    ) {
+      return "roundLedger entry outcome taskMdSizeBand.percentOfLimit must be a non-negative integer";
     }
   }
   return undefined;

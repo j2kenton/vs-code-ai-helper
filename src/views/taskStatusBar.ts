@@ -4,6 +4,16 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
 import { describeOwedContinuationRowIndicatorV1 } from "./taskTreeProvider";
+import { getExtensionContextV1 } from "../utils/extensionContextV1";
+import {
+  SchedulingIntentStoreV1,
+  SchedulingPostureV1,
+  deriveOwedContinuationRecordV1,
+  deriveSchedulingPostureV1,
+  describeSchedulingPostureShortLabelV1,
+  describeSchedulingPostureV1,
+} from "../state/schedulingIntentV1";
+import { renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -127,16 +137,38 @@ export class TaskStatusBar implements vscode.Disposable {
     // Quarantined files behind the owed continuation, if any — mirrors the
     // tree tooltip's "What happens next" line (`describeSchedulingPostureV1`'s
     // `owedWillNotRetry` case), which already names these via the scheduling
-    // posture ledger. The status bar has no ledger access, so this reads
-    // `pendingImplReviewFiles` directly rather than pulling in that mechanism.
+    // posture ledger.
     const quarantinedFiles = taskToShow.progress.pendingImplReviewFiles ?? [];
     const quarantinedFilesLine =
       owedIndicator && quarantinedFiles.length > 0
         ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${quarantinedFiles.join(", ")}`
         : undefined;
 
-    // Text: Checklist, folderName, stage display name, status
-    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}${owedIndicator ? ` — ${owedIndicator.description}` : ""}`;
+    // General scheduling posture (task item 11's five-value vocabulary:
+    // running / scheduled / owed-but-will-not-retry / waiting-for-you /
+    // unknown) — the same shared contract the task-tree tooltip's own "What
+    // happens next" line uses (`TaskTreeProvider.computeSchedulingPosture` +
+    // `describeSchedulingPostureV1`), so the status bar stops being a
+    // verification blind spot for state the tree already renders (wf10 H4,
+    // this task's item 11 hand-off). `owedIndicator` above already covers the
+    // owed-continuation case with lease-time precision the ledger read below
+    // cannot beat, so this is computed only when it adds new information —
+    // i.e. whenever the owed row indicator is absent.
+    //
+    // 2026-09-02 review, completion blocker ("only the owed-continuation
+    // posture reaches visible `item.text`; the other four postures are
+    // tooltip-only and untested"): `shortLabel` now goes into the VISIBLE
+    // text, not only the tooltip — the exact "a tooltip is not a surface for
+    // state the user must act on" rule item 11 already established for the
+    // tree row (nobody hovers to find out whether something is alive). The
+    // full sentence (`detail`) stays in the tooltip for elaboration.
+    const posture = owedIndicator ? undefined : this.derivePostureFields(taskToShow);
+
+    // Text: Checklist, folderName, stage display name, status, posture
+    this.item.text =
+      `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}` +
+      `${owedIndicator ? ` — ${owedIndicator.description}` : ""}` +
+      `${posture ? ` — ${posture.shortLabel}` : ""}`;
     this.item.tooltip = new vscode.MarkdownString(
       [
         `**Ensemble — ${statusLabel} task**`,
@@ -145,6 +177,7 @@ export class TaskStatusBar implements vscode.Disposable {
         `Stage: **${STAGE_DISPLAY_NAMES[stage]}**`,
         ...(owedIndicator ? [`$(watch) ${owedIndicator.description}`] : []),
         ...(quarantinedFilesLine ? [quarantinedFilesLine] : []),
+        ...(posture ? [`$(watch) **What happens next** — ${posture.detail}`] : []),
         `Last updated: ${new Date(
           taskToShow.progress.updatedAt
         ).toLocaleString()}`,
@@ -153,6 +186,59 @@ export class TaskStatusBar implements vscode.Disposable {
       ].join("\n")
     );
     this.item.show();
+  }
+
+  /**
+   * Read-only derivation of `SchedulingPostureV1` for `task`, as both a
+   * status-bar-length `shortLabel` (visible text) and the full "What happens
+   * next" sentence (`detail`, tooltip only) — or `undefined` when no
+   * scheduling-intent store is reachable (no active `vscode.ExtensionContext`
+   * — e.g. under unit tests that stub `vscode.window`/`vscode.workspace`
+   * without activating the extension).
+   *
+   * Deliberately does NOT await the ledger self-heal write
+   * (`SchedulingIntentStoreV1.recordOwedContinuation`) the way
+   * `TaskTreeProvider.computeSchedulingPosture` does — `update()` must stay
+   * synchronous (it runs from a plain `taskOperations.onDidChange`
+   * callback with no async caller to await it). The write is instead fired
+   * best-effort, matching every other fire-and-forget ledger writer in
+   * `schedulingIntentV1.ts`'s own documented "escape hatch" pattern for
+   * callers with no natural async entry point: a render before the first
+   * self-heal lands may under-report (read `unknown`/stale instead of the
+   * freshly-owed fact), and self-corrects on the next update.
+   */
+  private derivePostureFields(
+    task: IncompleteTask
+  ): { shortLabel: string; detail: string } | undefined {
+    const context = getExtensionContextV1();
+    if (!context) {
+      return undefined;
+    }
+    const taskId = task.canonicalId ?? task.folderUri.fsPath;
+    const store = new SchedulingIntentStoreV1(context.workspaceState);
+    const owedSource = task.progress.implRecovery
+      ? {
+          reason: task.progress.implRecovery.reason,
+          at: task.progress.implRecovery.at,
+          leaseUntil: task.progress.implRecovery.leaseUntil,
+          quarantinedFiles: task.progress.pendingImplReviewFiles ?? [],
+          dispatch: task.progress.implRecovery.dispatch,
+        }
+      : undefined;
+    store.recordOwedContinuation(taskId, owedSource).then(undefined, () => {
+      // Best-effort self-heal only — never blocks or fails this render.
+    });
+    const posture: SchedulingPostureV1 = deriveSchedulingPostureV1({
+      entries: store.listForTask(taskId),
+      owedContinuation: deriveOwedContinuationRecordV1(taskId, store.getOwedContinuation(taskId)),
+      hasCoverage: store.hasCoverage(taskId),
+      inFlight: taskOperations.rootOperationIdFor(taskId) !== undefined,
+    });
+    const rendered = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture));
+    return {
+      shortLabel: describeSchedulingPostureShortLabelV1(posture),
+      detail: rendered.map((line) => line.text).join(" "),
+    };
   }
 
   /**

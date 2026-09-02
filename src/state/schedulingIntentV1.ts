@@ -505,6 +505,35 @@ export function describeSchedulingPostureV1(posture: SchedulingPostureV1): Hando
   }
 }
 
+/**
+ * A short, status-bar-length label for `posture` — the same five-value
+ * vocabulary `describeSchedulingPostureV1` renders as a full sentence, but
+ * compact enough for a `vscode.StatusBarItem`'s visible TEXT rather than its
+ * tooltip. (Task "make the stage chat a record of work", item 11 / Part 17
+ * step 46, 2026-09-02 review, completion blocker: the status bar rendered
+ * every posture except the owed-continuation case only inside its tooltip —
+ * "nobody reads tooltips" is the exact defect item 11 already fixed for the
+ * tree row; this closes the same gap for the status bar.) Callers that need
+ * the owed-continuation case specifically already have a richer,
+ * lease-aware renderer (`describeOwedContinuationRowIndicatorV1`) and should
+ * prefer that; this covers the other four values, and `owedWillNotRetry` for
+ * completeness where no richer renderer is in scope.
+ */
+export function describeSchedulingPostureShortLabelV1(posture: SchedulingPostureV1): string {
+  switch (posture.kind) {
+    case "running":
+      return "running now";
+    case "scheduled":
+      return "scheduled";
+    case "owedWillNotRetry":
+      return "continuation owed — won't auto-retry";
+    case "waitingForYou":
+      return "waiting for you";
+    case "unknown":
+      return "posture unknown";
+  }
+}
+
 const ENTRIES_KEY = "schedulingIntentEntriesV1";
 const COVERAGE_KEY = "schedulingIntentCoverageV1";
 const OWED_CONTINUATION_KEY = "schedulingIntentOwedContinuationV1";

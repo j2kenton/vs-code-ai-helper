@@ -17,6 +17,8 @@ import { TaskStage } from "../types/taskProgress";
 import { StatusTreeProvider } from "../views/statusView";
 import { TaskStatusBar } from "../views/taskStatusBar";
 import { IncompleteTask } from "../types/incompleteTask";
+import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -376,6 +378,147 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       assert.ok(!item.text.includes("[paused]"));
       assert.ok(item.text.includes("task-a"));
       bar.dispose();
+    });
+  });
+
+  // 2026-09-02 review, completion blocker: the five-value scheduling posture
+  // (running / scheduled / owed-but-will-not-retry / waiting-for-you /
+  // unknown) previously reached only the tooltip, never `item.text` — the
+  // same "nobody reads tooltips" defect item 11 already fixed for the tree
+  // row. These assert the posture's SHORT label lands in the VISIBLE text.
+  void describe("TaskStatusBar scheduling posture (visible text)", () => {
+    class FakeMementoV1 {
+      private readonly values = new Map<string, unknown>();
+      get<T>(key: string, defaultValue: T): T {
+        return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+      }
+      update(key: string, value: unknown): Promise<void> {
+        this.values.set(key, value);
+        return Promise.resolve();
+      }
+    }
+
+    // Deliberately `async` (not a plain sync function returning `T`): a
+    // sync `try { return run(store); } finally { reset(); }` fires `finally`
+    // the instant `run(store)` returns its PROMISE, not once that promise
+    // settles — resetting the extension context back to `undefined` before
+    // an `async run` callback's own `await`s (and the assertions after them)
+    // ever execute. `await`ing here inside the `try` is what makes `finally`
+    // wait for the real completion.
+    async function withFakeExtensionContext<T>(
+      run: (store: SchedulingIntentStoreV1) => T | Promise<T>
+    ): Promise<T> {
+      const memento = new FakeMementoV1() as unknown as vscode.Memento;
+      const context = { workspaceState: memento } as unknown as vscode.ExtensionContext;
+      __extensionContextV1TestOnly.set(context);
+      try {
+        return await run(new SchedulingIntentStoreV1(memento));
+      } finally {
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+
+    void it("shows 'running now' when a scheduling-intent entry for this task is running", async () => {
+      await withFakeExtensionContext(async (store) => {
+        const taskId = "/workspace/task-running";
+        const entry = await store.recordScheduled({
+          taskCanonicalId: taskId,
+          command: "x.review",
+          chainId: "auto-review",
+          trigger: "auto-review after plan completes",
+          willRetry: false,
+        });
+        await store.recordRunning(entry.intentId);
+
+        const bar = new TaskStatusBar(makeStoreStub(taskId));
+        bar.update([makeTask(taskId, "task-running", "impl", "active", taskId)], taskId);
+        const item = getStatusBarItem(bar);
+        assert.ok(item.text.includes("running now"), item.text);
+        bar.dispose();
+      });
+    });
+
+    void it("shows 'scheduled' when a scheduling-intent entry for this task is scheduled but not yet running", async () => {
+      await withFakeExtensionContext(async (store) => {
+        // Folder/task name deliberately does NOT contain "scheduled" — an
+        // earlier version of this test named the task "task-scheduled" and
+        // passed even when the posture suffix was entirely absent, because
+        // the assertion's substring happened to match the task's own name.
+        const taskId = "/workspace/task-b";
+        await store.recordScheduled({
+          taskCanonicalId: taskId,
+          command: "x.review",
+          chainId: "auto-review",
+          trigger: "auto-review after plan completes",
+          willRetry: false,
+        });
+
+        const bar = new TaskStatusBar(makeStoreStub(taskId));
+        bar.update([makeTask(taskId, "task-b", "impl", "active", taskId)], taskId);
+        const item = getStatusBarItem(bar);
+        assert.ok(item.text.includes("scheduled"), item.text);
+        bar.dispose();
+      });
+    });
+
+    void it("shows 'waiting for you' when the task has coverage but no live/owed activity", async () => {
+      await withFakeExtensionContext(async (store) => {
+        const taskId = "/workspace/task-waiting";
+        // markCoverage is private; recordScheduled + recordTerminal leaves
+        // coverage set with no live entries, which is the same end state.
+        const entry = await store.recordScheduled({
+          taskCanonicalId: taskId,
+          command: "x.review",
+          chainId: "auto-review",
+          trigger: "auto-review after plan completes",
+          willRetry: false,
+        });
+        await store.recordTerminal(entry.intentId, "completed");
+
+        const bar = new TaskStatusBar(makeStoreStub(taskId));
+        bar.update([makeTask(taskId, "task-waiting", "impl", "active", taskId)], taskId);
+        const item = getStatusBarItem(bar);
+        assert.ok(item.text.includes("waiting for you"), item.text);
+        bar.dispose();
+      });
+    });
+
+    void it("shows 'posture unknown' for a task never observed by the scheduling ledger", async () => {
+      await withFakeExtensionContext(() => {
+        const taskId = "/workspace/task-unobserved";
+        const bar = new TaskStatusBar(makeStoreStub(taskId));
+        bar.update([makeTask(taskId, "task-unobserved", "impl", "active", taskId)], taskId);
+        const item = getStatusBarItem(bar);
+        assert.ok(item.text.includes("posture unknown"), item.text);
+        bar.dispose();
+      });
+    });
+
+    void it("shows the owed-but-will-not-retry label for a task whose implRecovery is dispatched (claimed, will not re-fire)", async () => {
+      await withFakeExtensionContext(() => {
+        const taskId = "/workspace/task-owed-stale";
+        const task = makeTask(taskId, "task-owed-stale", "impl", "active", taskId);
+        // `dispatch: "dispatched"` (not "pending") is deliberate: the row's
+        // own `describeOwedContinuationRowIndicatorV1` only renders text for
+        // a `"pending"` record, so a `"dispatched"` one reaches
+        // `derivePostureFields`'s general five-value posture instead — the
+        // `owedWillNotRetry` posture's own reason for existing (a claimed
+        // continuation is "owed" but the system will never re-fire it itself).
+        task.progress.implRecovery = {
+          sourceAttemptId: "attempt-1",
+          reason: "a prior round's report was unusable",
+          trigger: "summaryRejected",
+          mode: "unconstrained",
+          dispatch: "dispatched",
+          at: new Date().toISOString(),
+        };
+
+        const bar = new TaskStatusBar(makeStoreStub(taskId));
+        bar.update([task], taskId);
+        const item = getStatusBarItem(bar);
+        assert.ok(item.text.includes("won't auto-retry"), item.text);
+        bar.dispose();
+      });
     });
   });
 
