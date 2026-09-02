@@ -421,6 +421,14 @@ export interface OversizedInputAbortRecordV1 {
    * floor, even though the result still did not fit.
    */
   readonly reductionApplied: Readonly<Record<string, number>>;
+  /**
+   * Relative paths of tracked/open files omitted entirely from the context
+   * pack because the content-size budget ran out before they were reached —
+   * the exact "what was dropped" evidence (2026-08-29 review, completion
+   * blocker: the review path reported only a file COUNT, not which files).
+   * Absent on the apply-review path, which embeds no file content to drop.
+   */
+  readonly droppedFiles?: readonly string[];
 }
 
 /**
@@ -435,6 +443,55 @@ export async function writeOversizedInputAbortRecordV1(
   await vscode.workspace.fs.createDirectory(runsDirUri);
   const safeAt = record.at.replace(/[:.]/g, "-");
   const uri = vscode.Uri.joinPath(runsDirUri, `${safeAt}.oversized-input-abort.json`);
+  await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(record, null, 2)));
+  return uri;
+}
+
+/**
+ * The durable, descriptive record of a "task.md is eating a large share of
+ * the review-input limit" nudge (Part 16 step 44) — one file per newly
+ * crossed size band, so the fact survives indefinitely on disk rather than
+ * existing only as a `TaskProgress.taskMdSizeBandAnnounced` integer (which
+ * proves "we already told them", but not WHAT was told) and a `kind:
+ * "activity"` chat message (which is real but bounded by
+ * `CHAT_HISTORY_MAX_MESSAGES` and is dropped, oldest first, once the
+ * transcript compacts — 2026-08-29 review, completion blocker: "the
+ * implementation substituted a durable numeric marker plus a bounded chat
+ * projection... not the durable descriptive record").
+ *
+ * Deliberately NOT attached to `TaskProgress.roundLedger`: this nudge fires
+ * during prompt ASSEMBLY, before the round dispatches, at a point in
+ * `runReviewForFolder` that — like `PromptManifestV1`'s own documented
+ * constraint above — has no coordinator `operationId`/`attemptId` in scope to
+ * key a ledger row to (`TaskOperationHandle.id`, the only identity available
+ * here, is a locally-allocated `op-N` counter unrelated to the round
+ * ledger's identity space). Same reasoning the Accepted Non-Goal for Part 2
+ * step 7 already records for this exact class of constraint; this is a
+ * standalone disk record for the same reason, not a lesser substitute.
+ */
+export interface TaskMdSizeBandAnnouncementRecordV1 {
+  /** ISO timestamp of the announcement. */
+  readonly at: string;
+  readonly stage: string;
+  /** The `sizeBandV1` quarter (1-4) newly crossed. */
+  readonly band: number;
+  readonly taskMdBytes: number;
+  readonly limitCanonicalBytes: number;
+  /** Rounded percentage of the canonical limit `taskMdBytes` represents. */
+  readonly percentOfLimit: number;
+}
+
+/**
+ * Write `record` beside the task's run logs, one file per newly crossed
+ * band, named by timestamp so repeated announcements never collide.
+ */
+export async function writeTaskMdSizeBandAnnouncementRecordV1(
+  runsDirUri: vscode.Uri,
+  record: TaskMdSizeBandAnnouncementRecordV1
+): Promise<vscode.Uri> {
+  await vscode.workspace.fs.createDirectory(runsDirUri);
+  const safeAt = record.at.replace(/[:.]/g, "-");
+  const uri = vscode.Uri.joinPath(runsDirUri, `${safeAt}.task-md-size-band.json`);
   await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(record, null, 2)));
   return uri;
 }

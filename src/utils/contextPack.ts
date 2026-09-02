@@ -652,7 +652,20 @@ export async function generateImplReviewContextPack(
    * `IMPL_REVIEW_MAX_TOTAL_CHARS` when omitted.
    */
   maxTotalChars?: number
-): Promise<{ content: string; isFallback: boolean }> {
+): Promise<{
+  content: string;
+  isFallback: boolean;
+  /**
+   * Total UTF-8 bytes of embedded file content actually written into
+   * `content` (the "Implementation Review File Contents" / "Open Editor
+   * Contents" section) — the real file-content size driver a caller can
+   * report on an oversized-input abort, rather than a bare file count
+   * (2026-08-29 review, completion blocker on Part 16 step 41's diagnostics).
+   */
+  embeddedContentBytes: number;
+  /** Relative paths omitted entirely because the content-size budget ran out. */
+  omittedRelPaths: readonly string[];
+}> {
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const taskContent = await readTextFileIfExists(taskFileUri);
 
@@ -703,7 +716,7 @@ export async function generateImplReviewContextPack(
       lines.push("- Do not refactor unrelated files.");
       lines.push("- Keep changes scoped to the request above.");
       lines.push("");
-      return { content: lines.join("\n"), isFallback: false };
+      return { content: lines.join("\n"), isFallback: false, embeddedContentBytes: 0, omittedRelPaths: [] };
     }
 
     lines.push(
@@ -932,7 +945,16 @@ export async function generateImplReviewContextPack(
     lines.push("- Keep changes scoped to the request above.");
     lines.push("");
 
-    return { content: lines.join("\n"), isFallback: false };
+    const embeddedContentBytes = included.reduce(
+      (sum, r) => sum + (r.content !== undefined ? Buffer.byteLength(r.content, "utf8") : 0),
+      0
+    );
+    return {
+      content: lines.join("\n"),
+      isFallback: false,
+      embeddedContentBytes,
+      omittedRelPaths: omitted.map((o) => o.relPath),
+    };
   }
 
   // ---------------------------------------------------------------------- //
@@ -979,6 +1001,8 @@ export async function generateImplReviewContextPack(
   }
   lines.push("");
 
+  let fallbackEmbeddedContentBytes = 0;
+  let fallbackOmittedRelPaths: string[] = [];
   if (uniqueDocs.length > 0) {
     lines.push("## Open Editor Contents (Fallback)");
     lines.push("");
@@ -999,6 +1023,11 @@ export async function generateImplReviewContextPack(
       (r): r is (typeof r) & { content: string | undefined } => r.content !== null
     );
     const omitted = results.filter((r) => r.content === null);
+    fallbackEmbeddedContentBytes = included.reduce(
+      (sum, r) => sum + (r.content !== undefined ? Buffer.byteLength(r.content, "utf8") : 0),
+      0
+    );
+    fallbackOmittedRelPaths = omitted.map((o) => o.relPath);
 
     for (const result of included) {
       if (result.content !== undefined) {
@@ -1048,7 +1077,12 @@ export async function generateImplReviewContextPack(
   lines.push("- Keep changes scoped to the request above.");
   lines.push("");
 
-  return { content: lines.join("\n"), isFallback: true };
+  return {
+    content: lines.join("\n"),
+    isFallback: true,
+    embeddedContentBytes: fallbackEmbeddedContentBytes,
+    omittedRelPaths: fallbackOmittedRelPaths,
+  };
 }
 
 /**
@@ -1063,15 +1097,22 @@ export async function writeImplReviewContextPack(
   baselineSha?: string,
   /** See `generateImplReviewContextPack`'s matching parameter. */
   maxTotalChars?: number
-): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
-  const { content, isFallback } = await generateImplReviewContextPack(
-    taskFolderUri,
-    workspaceUri,
-    implReviewFiles,
-    priorityRelPaths,
-    baselineSha,
-    maxTotalChars
-  );
+): Promise<{
+  contextPackUri: vscode.Uri;
+  isFallback: boolean;
+  /** See `generateImplReviewContextPack`'s matching field. */
+  embeddedContentBytes: number;
+  omittedRelPaths: readonly string[];
+}> {
+  const { content, isFallback, embeddedContentBytes, omittedRelPaths } =
+    await generateImplReviewContextPack(
+      taskFolderUri,
+      workspaceUri,
+      implReviewFiles,
+      priorityRelPaths,
+      baselineSha,
+      maxTotalChars
+    );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
-  return { contextPackUri, isFallback };
+  return { contextPackUri, isFallback, embeddedContentBytes, omittedRelPaths };
 }

@@ -160,6 +160,14 @@ export interface TaskProgress {
   progressVersion?: number;
   /** Workspace-relative paths changed across all AI implementation runs. */
   implReviewFiles?: string[];
+  /**
+   * The highest `sizeBandV1` quarter (0-4) of `task.md`'s byte size against
+   * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` already announced to the user.
+   * Mirrors `src/types/taskProgress.ts` exactly — durable so the "once per
+   * band" guarantee survives chat-history compaction. Set only when a fresh
+   * band is crossed; never decreases even if task.md later shrinks.
+   */
+  taskMdSizeBandAnnounced?: number;
   /** Persisted lint state for this task. */
   lintPayload?: LintPayload;
   /** Persisted one-shot current-stage action schedule. */

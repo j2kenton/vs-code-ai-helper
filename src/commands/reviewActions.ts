@@ -77,6 +77,7 @@ import {
   sizeBandV1,
   writeOversizedInputAbortRecordV1,
   writePromptManifestV1,
+  writeTaskMdSizeBandAnnouncementRecordV1,
 } from "../utils/promptManifestV1";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 import {
@@ -4541,7 +4542,18 @@ export async function runReviewForFolder(
     let isFallback = false;
     let oversizedAfterShrink = false;
     let lastCanonicalBytes = 0;
+    let lastEmbeddedContentBytes = 0;
+    let lastOmittedRelPaths: readonly string[] = [];
     const shrinkFloorChars = 2000;
+    // Safety ceiling only — the floor check below (`maxTotalChars <=
+    // shrinkFloorChars`) is what actually stops the loop in the normal case.
+    // A single halving variable converges from IMPL_REVIEW_MAX_TOTAL_CHARS
+    // (15000) to the 2000 floor in ~3 iterations; this bound exists only to
+    // guarantee termination if that convergence assumption is ever violated,
+    // never to cut the reduction short (2026-08-29 review, completion
+    // blocker: an equivalent fixed ceiling on the apply-review path below
+    // aborted before its floors were reached).
+    const maxShrinkAttempts = 64;
     for (let attempt = 0; ; attempt++) {
       const written = await writeImplReviewContextPack(
         folderUri,
@@ -4552,6 +4564,8 @@ export async function runReviewForFolder(
         maxTotalChars
       );
       isFallback = written.isFallback;
+      lastEmbeddedContentBytes = written.embeddedContentBytes;
+      lastOmittedRelPaths = written.omittedRelPaths;
       contextPackContent = new TextDecoder().decode(
         await vscode.workspace.fs.readFile(written.contextPackUri)
       );
@@ -4571,7 +4585,7 @@ export async function runReviewForFolder(
         oversizedAfterShrink = true;
         break;
       }
-      if (attempt >= 6) {
+      if (attempt >= maxShrinkAttempts) {
         oversizedAfterShrink = true;
         break;
       }
@@ -4596,12 +4610,14 @@ export async function runReviewForFolder(
       const taskMdKb = Math.round(taskMdBytes / 1024);
       const planKb = Math.round(planBytes / 1024);
       const reviewKb = Math.round(reviewBytes / 1024);
+      const trackedFileContentKb = Math.round(lastEmbeddedContentBytes / 1024);
       const fileCount = taskProgress?.implReviewFiles?.length ?? 0;
       NotificationRouter.showError(
         `This review's assembled input is ${kb} KB even after shrinking embedded file content to its floor — ` +
           `over the ${limitKb} KB limit the transaction store enforces. Size drivers: task.md ${taskMdKb} KB, ` +
-          `plan.md ${planKb} KB, previous review ${reviewKb} KB, ${fileCount} tracked file(s), none of which ` +
-          "this shrink reduces. Consider splitting the task."
+          `plan.md ${planKb} KB, previous review ${reviewKb} KB, tracked file content ${trackedFileContentKb} KB ` +
+          `(${fileCount} tracked file(s), ${lastOmittedRelPaths.length} already dropped), none of which this ` +
+          "shrink reduces further. Consider splitting the task."
       );
       // Persist the exact driver breakdown (2026-08-29 review, completion
       // blocker: "... and persist exact drivers/dropped content") — this
@@ -4620,10 +4636,12 @@ export async function runReviewForFolder(
             "task.md": taskMdBytes,
             "plan.md": planBytes,
             "previous review": reviewBytes,
+            "tracked file content (context pack)": lastEmbeddedContentBytes,
           },
           reductionApplied: {
             "context pack char budget": maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS,
           },
+          ...(lastOmittedRelPaths.length > 0 ? { droppedFiles: lastOmittedRelPaths } : {}),
         });
       } catch {
         // Best-effort diagnostic only — never blocks the abort it is recording.
@@ -4654,6 +4672,14 @@ export async function runReviewForFolder(
   // transcript compacts at `CHAT_HISTORY_MAX_MESSAGES` (200 settled messages,
   // oldest dropped first), so an old task whose announcing message aged out
   // of the window would silently re-announce the same band on a later round.
+  //
+  // 2026-08-29 review, completion blocker (round 2): the integer marker alone
+  // proves "we already told them" but not WHAT was told — see
+  // `writeTaskMdSizeBandAnnouncementRecordV1`'s doc comment for why the
+  // descriptive record is a standalone disk artifact rather than a
+  // `TaskProgress.roundLedger` row (this check runs during prompt assembly,
+  // before a round dispatches, with no coordinator round identity in scope —
+  // the same constraint `PromptManifestV1`'s own header documents).
   try {
     const taskMdBytes = Buffer.byteLength(
       (await readTextIfExists(vscode.Uri.joinPath(folderUri, TASK_FILENAME))) ?? "",
@@ -4667,10 +4693,23 @@ export async function runReviewForFolder(
       const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
         recordTaskMdSizeBandAnnouncedV1(current, band)
       );
-      // Only announce in chat once the durable marker is actually persisted —
-      // a CAS loss here (another writer beat us to a higher/equal band) means
-      // this round's own announcement would be redundant.
+      // Only announce once the durable marker is actually persisted — a CAS
+      // loss here (another writer beat us to a higher/equal band) means this
+      // round's own announcement would be redundant.
       if (updated && (updated.taskMdSizeBandAnnounced ?? 0) === band) {
+        const announcedAt = new Date().toISOString();
+        try {
+          await writeTaskMdSizeBandAnnouncementRecordV1(vscode.Uri.joinPath(folderUri, RUNS_DIRNAME), {
+            at: announcedAt,
+            stage: targetStage,
+            band,
+            taskMdBytes,
+            limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+            percentOfLimit: pct,
+          });
+        } catch {
+          // Best-effort diagnostic only — never blocks the chat projection below.
+        }
         await appendChatMessageV1(
           folderUri.fsPath,
           {
@@ -4679,7 +4718,7 @@ export async function runReviewForFolder(
               `task.md is ${kb} KB — ${pct}% of the review-input limit. This task may want splitting. ` +
               `(task.md size band ${band})`,
             stage: targetStage,
-            at: new Date().toISOString(),
+            at: announcedAt,
             kind: "activity",
           },
           folderUri.fsPath
@@ -6832,6 +6871,13 @@ async function applyImplementationReviewWithAI(
   let parts: { prompt: string; templateVariables: Record<string, string> } | { error: string } | undefined;
   let oversizedAfterShrink = false;
   let lastCanonicalBytes = 0;
+  // Safety ceiling only, not the intended stop condition — see the identical
+  // note on the review path's shrink loop above. TWO variables are halved in
+  // sequence here (review first, then implementation notes), so a small fixed
+  // ceiling can fire before either reaches its floor when the starting
+  // content is large (2026-08-29 review, completion blocker: this loop's
+  // prior `attempt >= 6` ceiling did exactly that).
+  const maxShrinkAttempts = 64;
   for (let attempt = 0; ; attempt++) {
     parts = await buildApplyReviewPromptPartsV1(
       extensionUri,
@@ -6865,7 +6911,7 @@ async function applyImplementationReviewWithAI(
     }
     const reviewAtFloor = maxReviewChars !== undefined && maxReviewChars <= reviewCharFloor;
     const implAtFloor = maxImplementationChars !== undefined && maxImplementationChars <= implementationCharFloor;
-    if (attempt >= 6 || (reviewAtFloor && implAtFloor)) {
+    if (attempt >= maxShrinkAttempts || (reviewAtFloor && implAtFloor)) {
       oversizedAfterShrink = true;
       break;
     }

@@ -11,8 +11,10 @@ import {
   measureCanonicalInputBytesV1,
   type OversizedInputAbortRecordV1,
   sizeBandV1,
+  type TaskMdSizeBandAnnouncementRecordV1,
   writeOversizedInputAbortRecordV1,
   writePromptManifestV1,
+  writeTaskMdSizeBandAnnouncementRecordV1,
 } from "../utils/promptManifestV1";
 import { canonicalJsonByteLengthV1 } from "../types/structuredQuestionV1";
 
@@ -444,6 +446,127 @@ void describe("writeOversizedInputAbortRecordV1 (Part 16 step 41 — persisted a
         limitCanonicalBytes: 262144,
         driverBytes: {},
         reductionApplied: {},
+      });
+      assert.notEqual(first.fsPath, second.fsPath);
+      assert.ok(fs.existsSync(first.fsPath));
+      assert.ok(fs.existsSync(second.fsPath));
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("persists which tracked files were dropped, when the caller supplies them", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "oversized_abort_dropped_files"));
+      const uri = await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl-high-review",
+        path: "review",
+        assembledCanonicalBytes: 300000,
+        limitCanonicalBytes: 262144,
+        driverBytes: { "tracked file content (context pack)": 90000 },
+        reductionApplied: { "context pack char budget": 2000 },
+        droppedFiles: ["src/a.ts", "src/b.ts"],
+      });
+      const persisted = JSON.parse(fs.readFileSync(uri.fsPath, "utf8")) as OversizedInputAbortRecordV1;
+      assert.deepEqual(persisted.droppedFiles, ["src/a.ts", "src/b.ts"]);
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("omits droppedFiles entirely when the caller supplies none (e.g. the apply-review path)", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "oversized_abort_no_dropped_files"));
+      const uri = await writeOversizedInputAbortRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl",
+        path: "apply-review",
+        assembledCanonicalBytes: 400000,
+        limitCanonicalBytes: 262144,
+        driverBytes: { review: 200000 },
+        reductionApplied: { "review char budget": 2000 },
+      });
+      const persisted = JSON.parse(fs.readFileSync(uri.fsPath, "utf8")) as OversizedInputAbortRecordV1;
+      assert.equal("droppedFiles" in persisted, false);
+    } finally {
+      bridge.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// writeTaskMdSizeBandAnnouncementRecordV1 (Part 16 step 44 — 2026-08-29
+// review, completion blocker (round 2): "the implementation substituted a
+// durable numeric marker plus a bounded chat projection... not the durable
+// descriptive record"). One standalone disk record per newly crossed band.
+// ---------------------------------------------------------------------------
+
+void describe("writeTaskMdSizeBandAnnouncementRecordV1 (Part 16 step 44 — durable size-band record)", () => {
+  void it("persists the announcement details to a file under the runs directory", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "size_band_basic"));
+      const uri = await writeTaskMdSizeBandAnnouncementRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl-high-review",
+        band: 2,
+        taskMdBytes: 65536,
+        limitCanonicalBytes: 262144,
+        percentOfLimit: 25,
+      });
+      assert.ok(fs.existsSync(uri.fsPath));
+      const persisted = JSON.parse(fs.readFileSync(uri.fsPath, "utf8")) as TaskMdSizeBandAnnouncementRecordV1;
+      assert.equal(persisted.stage, "impl-high-review");
+      assert.equal(persisted.band, 2);
+      assert.equal(persisted.taskMdBytes, 65536);
+      assert.equal(persisted.limitCanonicalBytes, 262144);
+      assert.equal(persisted.percentOfLimit, 25);
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("creates the runs/ directory when it does not already exist", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "size_band_fresh_dir"));
+      assert.ok(!fs.existsSync(runsDirUri.fsPath));
+      await writeTaskMdSizeBandAnnouncementRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl",
+        band: 1,
+        taskMdBytes: 32768,
+        limitCanonicalBytes: 262144,
+        percentOfLimit: 12,
+      });
+      assert.ok(fs.existsSync(runsDirUri.fsPath));
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  void it("names repeated band announcements on the same task uniquely so they never overwrite each other", async () => {
+    const bridge = installFsBridge();
+    try {
+      const runsDirUri = vscode.Uri.file(path.join(REAL_ROOT, "size_band_repeated"));
+      const first = await writeTaskMdSizeBandAnnouncementRecordV1(runsDirUri, {
+        at: "2026-08-29T12:00:00.000Z",
+        stage: "impl-high-review",
+        band: 2,
+        taskMdBytes: 65536,
+        limitCanonicalBytes: 262144,
+        percentOfLimit: 25,
+      });
+      const second = await writeTaskMdSizeBandAnnouncementRecordV1(runsDirUri, {
+        at: "2026-08-29T13:00:00.000Z",
+        stage: "impl-high-review",
+        band: 3,
+        taskMdBytes: 98304,
+        limitCanonicalBytes: 262144,
+        percentOfLimit: 37,
       });
       assert.notEqual(first.fsPath, second.fsPath);
       assert.ok(fs.existsSync(first.fsPath));
