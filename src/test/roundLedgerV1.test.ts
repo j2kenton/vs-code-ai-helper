@@ -32,6 +32,7 @@ import {
 } from "../types/taskProgress";
 import {
   findRoundOutcomesMissingLedgerRowV1,
+  recordTaskMdSizeBandAnnouncedV1,
   resolveRoundV1,
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
@@ -487,6 +488,87 @@ void describe("terminalizeRoundV1 (Part 4 step 12/13/47)", () => {
       // real `terminalizeRoundV1` write path never produces the drift this
       // check exists to catch.
       assert.deepEqual(findRoundOutcomesMissingLedgerRowV1(raw), []);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  // Part 16 step 44, 2026-09-02 review round 3 fix: the task.md size-band
+  // dedup marker (`TaskProgress.taskMdSizeBandAnnounced`) must advance in the
+  // SAME `patchTaskProgressStrictV1` transaction as the round's terminal
+  // ledger write — via `postTerminalizePatch` — never in an earlier, separate
+  // patch. Previously the marker was advanced eagerly before the round ever
+  // reached its terminal write, so a crash or thrown error in between left
+  // "already announced" durably recorded with no ledger event to show for
+  // it. These tests exercise the generic `postTerminalizePatch` mechanism
+  // `reviewActions.ts` now relies on at every one of its size-band call
+  // sites, proving the two facts can never land independently.
+  void it("postTerminalizePatch lands atomically with the terminal ledger write", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_ledger_size_band_atomic");
+      const result = await terminalizeRoundV1(
+        "round-open-1",
+        "completed",
+        { taskMdSizeBand: { band: 2, taskMdBytes: 65536, percentOfLimit: 25 } },
+        {
+          taskFolderUri: folderUri,
+          postTerminalizePatch: (current) => recordTaskMdSizeBandAnnouncedV1(current, 2),
+        }
+      );
+      assert.equal(result.ok, true);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      // Both facts — the ledger row's terminal state/outcome AND the durable
+      // dedup marker — must be present after exactly one write.
+      assert.equal(raw.roundLedger?.[0]?.state, "completed");
+      assert.equal(raw.roundLedger?.[0]?.outcome?.taskMdSizeBand?.band, 2);
+      assert.equal(raw.taskMdSizeBandAnnounced, 2);
+
+      const messages = await readChatHistory(folderPath, folderPath);
+      const outcomeMessages = messages.filter((m) => m.kind === "outcome");
+      assert.equal(outcomeMessages.length, 1);
+      assert.ok(outcomeMessages[0]?.text.includes("task.md is"));
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("postTerminalizePatch does NOT run when the row is already terminal — no marker advance on a no-op call", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_ledger_size_band_noop");
+      // First call terminalizes the row for real, with no size-band outcome
+      // — mirroring a round that ends before this round's own size-band
+      // detection would ever apply `postTerminalizePatch`.
+      const first = await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      assert.equal(first.ok, true);
+
+      // A second call for the SAME already-terminal row, this time carrying
+      // a size-band postTerminalizePatch — this is the idempotent safety-net
+      // shape `terminalizeUnclosedReviewRoundV1` uses. Since the row is
+      // already terminal, the patcher function returns before
+      // `postTerminalizePatch` is ever invoked, so the marker must NOT
+      // advance from this second, no-op call.
+      const second = await terminalizeRoundV1(
+        "round-open-1",
+        "failed",
+        { taskMdSizeBand: { band: 3, taskMdBytes: 98304, percentOfLimit: 38 } },
+        {
+          taskFolderUri: folderUri,
+          postTerminalizePatch: (current) => recordTaskMdSizeBandAnnouncedV1(current, 3),
+        }
+      );
+      assert.equal(second.ok, true);
+      if (!second.ok) throw new Error("unreachable");
+      assert.equal(second.alreadyTerminal, true);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.taskMdSizeBandAnnounced, undefined);
     } finally {
       wsStub.restore();
       fsBridge.restore();

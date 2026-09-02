@@ -2537,6 +2537,12 @@ export async function handleReviewRoutingOutcome(options: {
             attemptId: reviewAttemptId,
             ...(degenerateModelId ? { modelId: degenerateModelId } : {}),
           },
+          ...(taskMdSizeBand
+            ? {
+                postTerminalizePatch: (current) =>
+                  recordTaskMdSizeBandAnnouncedV1(current, taskMdSizeBand.band),
+              }
+            : {}),
         }
       );
       const persistedRejection = await readTaskProgressAdvisoryV1(folderUri);
@@ -2823,6 +2829,12 @@ export async function handleReviewRoutingOutcome(options: {
         ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
         ...(coordinatorAttemptId ? { attemptId: coordinatorAttemptId } : {}),
         ...(coordinatorExtraAttemptIds?.length ? { extraAttemptIds: coordinatorExtraAttemptIds } : {}),
+        ...(taskMdSizeBand
+          ? {
+              postTerminalizePatch: (current) =>
+                recordTaskMdSizeBandAnnouncedV1(current, taskMdSizeBand.band),
+            }
+          : {}),
       }
     );
 
@@ -3151,6 +3163,12 @@ async function terminalizeUnclosedReviewRoundV1(
         ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
         ...(ctx.extraCoordinatorAttemptIds?.length
           ? { extraAttemptIds: ctx.extraCoordinatorAttemptIds }
+          : {}),
+        ...(ctx.taskMdSizeBand
+          ? {
+              postTerminalizePatch: (current) =>
+                recordTaskMdSizeBandAnnouncedV1(current, ctx.taskMdSizeBand!.band),
+            }
           : {}),
       }
     );
@@ -4735,11 +4753,30 @@ export async function runReviewForFolder(
   // permanent loss — the sweep re-derives and re-appends it from the durable
   // `outcome` the transaction above already committed.
   //
+  // 2026-09-02 review round 3, completion blocker ("the dedup marker is
+  // advanced in a separate, earlier transaction than the round's terminal
+  // write, so a crash or thrown error between the two durably records
+  // 'already announced' with no ledger event to show for it"): the marker
+  // patch (`recordTaskMdSizeBandAnnouncedV1`) no longer runs here at all.
+  // This block now only DETECTS the band and captures the candidate fact in
+  // `taskMdSizeBandForOutcome` — nothing durable is written for the marker
+  // yet. Every terminal call site below threads that candidate into
+  // `terminalizeRoundV1`'s `postTerminalizePatch`, which runs the marker
+  // advance INSIDE the same `patchTaskProgressStrictV1` transaction that
+  // writes the round's terminal ledger state — the two facts can therefore
+  // never observably disagree: either both land, or (a write failure)
+  // neither does, and the next review's fresh detection simply tries again.
+  // `recordTaskMdSizeBandAnnouncedV1` is itself idempotent/monotonic (a
+  // no-op once the recorded band is already `>=` the candidate), so a stale
+  // candidate computed from `priorProgress` below being re-applied at
+  // terminalization time is always safe.
+  //
   // The descriptive sidecar (`writeTaskMdSizeBandAnnouncementRecordV1`) is
-  // written BEFORE the durable dedup marker advances, same as before: a CAS
-  // loss on the marker write after a successful sidecar write leaves one
-  // harmless extra sidecar file rather than losing the sidecar to a marker
-  // that already blocks the retry that would have produced it.
+  // still written eagerly here, before the durable dedup marker advances at
+  // terminalization: a lost race there (another writer's terminal write beat
+  // this one to the marker) leaves one harmless extra sidecar file rather
+  // than losing the sidecar to a marker that already blocks the retry that
+  // would have produced it.
   let taskMdSizeBandForOutcome: RoundLedgerOutcomeV1["taskMdSizeBand"];
   try {
     const taskMdBytes = Buffer.byteLength(
@@ -4759,16 +4796,7 @@ export async function runReviewForFolder(
         limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
         percentOfLimit: pct,
       });
-      const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
-        recordTaskMdSizeBandAnnouncedV1(current, band)
-      );
-      // Only carry it forward once the durable marker is actually persisted
-      // — a CAS loss here (another writer beat us to a higher/equal band)
-      // means this round's own outcome would be a redundant re-announcement
-      // (the sidecar record above is harmless to leave behind either way).
-      if (updated && (updated.taskMdSizeBandAnnounced ?? 0) === band) {
-        taskMdSizeBandForOutcome = { band, taskMdBytes, percentOfLimit: pct };
-      }
+      taskMdSizeBandForOutcome = { band, taskMdBytes, percentOfLimit: pct };
     }
   } catch {
     // Best-effort only — see the comment above.
@@ -4839,7 +4867,15 @@ export async function runReviewForFolder(
         reviewAttemptId,
         "failed",
         taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : undefined,
-        { taskFolderUri: folderUri }
+        {
+          taskFolderUri: folderUri,
+          ...(taskMdSizeBandForOutcome
+            ? {
+                postTerminalizePatch: (current) =>
+                  recordTaskMdSizeBandAnnouncedV1(current, taskMdSizeBandForOutcome.band),
+              }
+            : {}),
+        }
       );
       return;
     }
