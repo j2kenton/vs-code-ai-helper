@@ -68,6 +68,7 @@ import {
   readChatInteractions,
   writeChatHistory,
 } from "../utils/chatHistoryStore";
+import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 
@@ -1166,16 +1167,59 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
    * `queueActiveFolders` bypass in `ChatViewProvider`'s `runQueued` that could
    * not distinguish a genuinely nested call from an unrelated concurrent
    * caller for the same folder — a second `confirmInteraction` arriving while
-   * the first was still awaiting I/O (never resolved sequentially, unlike the
-   * test above) would see the folder "active" and run outside the queue
-   * entirely, reading the pre-settlement `"unresolved"` record and re-running
-   * the command effect a second time. Fixed by moving the effect's execution
-   * out of the queued write (`settleLocalOnlyInteractionAnswersV1` now only
-   * returns the pending effect; the caller runs it after the queued call
-   * resolves) so `runQueued` could go back to being a plain FIFO with no
-   * reentrancy case — this test fires both confirmations without awaiting
-   * the first, so their real async I/O genuinely interleaves, and would have
-   * caught the bypass this fix removed.
+   * the first was still awaiting I/O would see the folder "active" and run
+   * outside the queue entirely, reading the pre-settlement `"unresolved"`
+   * record and re-running the command effect a second time. Fixed by moving
+   * the effect's execution out of the queued write
+   * (`settleLocalOnlyInteractionAnswersV1` now only returns the pending
+   * effect; the caller runs it after the queued call resolves) so `runQueued`
+   * could go back to being a plain FIFO with no reentrancy case.
+   *
+   * Review blocker (2026-09-03): an earlier version of this test fired both
+   * confirmations back-to-back inside one `Promise.all` without awaiting the
+   * first, on the theory that their real fs I/O would "genuinely interleave".
+   * Nothing forces that: `Promise.all([a(), b()])` calls `a()` and `b()`
+   * synchronously in order, and each call's own synchronous prefix (up to its
+   * first `await`) already runs to completion before the next expression is
+   * evaluated — so whether the second confirmation's queued callback actually
+   * becomes active while the first's is still running depends on incidental
+   * timing, not anything the test controls. A pass there does not prove the
+   * former bypass is unreachable.
+   *
+   * Review blocker (2026-09-02, second pass): a prior version of this test
+   * gated the FIRST call to `readChatInteractions` — before it had even run
+   * — and released it only after asserting nothing had dispatched. That
+   * proves too little: the first callback had not yet captured the
+   * pre-settlement `"unresolved"` record at the point the assertion ran, so
+   * an implementation that let the second confirmation's read happen first
+   * (settling before the first ever read the record) would also pass. The
+   * scenario this test exists to rule out is specifically a SECOND read
+   * observing the STILL-STALE `"unresolved"` record while the first
+   * callback is genuinely suspended mid-settlement — which requires the
+   * gate to sit AFTER the first callback's own read (so it has already
+   * captured `"unresolved"`) and AT the first persistence write
+   * (`recordChatInteractionAnswers`, called only once validation of that
+   * captured record passes), not before the read.
+   *
+   * This version gates `recordChatInteractionAnswers` instead, and counts
+   * calls to both it and `readChatInteractions` for two complementary
+   * checks. First, WHILE the first callback sits suspended (having already
+   * read the stale `"unresolved"` record), nothing else may call
+   * `readChatInteractions` — under strict FIFO (`runQueued`) the second
+   * callback cannot begin until the first's whole callback, including this
+   * persistence write, has resolved, so that count must stay at 1
+   * throughout the gated window; under the removed folder-wide reentrancy
+   * bypass it would start immediately (this test's gate deliberately makes
+   * the first "active"), firing its own read and observing the same stale
+   * record. Second, and decisively, after both confirmations finish,
+   * `recordChatInteractionAnswers` must have been called exactly ONCE
+   * total: `settleLocalOnlyInteractionAnswersV1` only reaches that call when
+   * its own fresh read still shows `"unresolved"`, so a second callback
+   * that correctly observes the first's `"resumed"` settlement short-
+   * circuits without calling it again, while one that (as under the removed
+   * bypass) reads the stale `"unresolved"` record calls it a second time and
+   * re-runs the option's effect — the exact double-dispatch this test
+   * exists to catch.
    */
   void it("two concurrent confirmations of the same local-only interaction dispatch the command exactly once", async () => {
     const folder = makeFolder();
@@ -1183,6 +1227,10 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     const fake = makeFakeWebviewView();
     const notify = installNotificationRouterCapture();
     const cmds = installExecuteCommandCapture();
+    const originalReadChatInteractions = chatHistoryStoreModule.readChatInteractions;
+    const originalRecordChatInteractionAnswers = chatHistoryStoreModule.recordChatInteractionAnswers;
+    // Declared outside the `try` so `finally` can release it unconditionally.
+    let releaseFirst: () => void = () => undefined;
     try {
       provider.resolveWebviewView(fake.view);
       const interactionId = "1".repeat(32);
@@ -1205,23 +1253,131 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       );
       cmds.calls.length = 0; // drop any focus-command call askInteraction may issue
 
-      // Deliberately NOT awaited between sends: both handler invocations are
-      // in flight at once, exercising the true race the sequential test
-      // above cannot reach.
-      await Promise.all([
-        fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS }),
-        fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS }),
-      ]);
+      // Count every `readChatInteractions` call (never gated) so the
+      // assertion below can prove the second confirmation's queued callback
+      // has not even reached its own read while the first is held.
+      let readCallCount = 0;
+      (
+        chatHistoryStoreModule as unknown as { readChatInteractions: typeof originalReadChatInteractions }
+      ).readChatInteractions = async (
+        ...args: Parameters<typeof originalReadChatInteractions>
+      ): ReturnType<typeof originalReadChatInteractions> => {
+        readCallCount += 1;
+        return originalReadChatInteractions(...args);
+      };
 
+      // Gate the FIRST call to `recordChatInteractionAnswers`, and count
+      // every call to it: by the time `doSubmitInteractionAnswers` reaches
+      // it, the callback has already read `readChatInteractions`, found the
+      // record `"unresolved"`, and validated the answers — so blocking here
+      // suspends the callback strictly AFTER it holds the stale
+      // pre-settlement state, immediately before the write that would
+      // resolve that staleness. `settleLocalOnlyInteractionAnswersV1` only
+      // reaches this call when its freshly-read `record.state ===
+      // "unresolved"`, so the call COUNT is the real correctness signal: a
+      // second callback that (correctly) observes the first's settlement
+      // must short-circuit without ever calling this, while one that
+      // (incorrectly) re-reads the stale `"unresolved"` record — the
+      // removed folder-wide bypass's failure mode — calls it a second time
+      // and re-runs the option's effect.
+      let recordCallCount = 0;
+      const firstIsBlockedAfterStaleRead = new Promise<void>((resolveActive) => {
+        let gated = false;
+        (
+          chatHistoryStoreModule as unknown as {
+            recordChatInteractionAnswers: typeof originalRecordChatInteractionAnswers;
+          }
+        ).recordChatInteractionAnswers = async (
+          ...args: Parameters<typeof originalRecordChatInteractionAnswers>
+        ): ReturnType<typeof originalRecordChatInteractionAnswers> => {
+          recordCallCount += 1;
+          if (!gated) {
+            gated = true;
+            resolveActive();
+            await new Promise<void>((resolveRelease) => {
+              releaseFirst = resolveRelease;
+            });
+          }
+          return originalRecordChatInteractionAnswers(...args);
+        };
+      });
+
+      const firstSend = fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+      await firstIsBlockedAfterStaleRead; // the first confirmation has read the stale record and is now suspended at persistence
+      assert.equal(
+        readCallCount,
+        1,
+        "only the first confirmation's own read should have happened by the time it reaches persistence"
+      );
+
+      const secondSend = fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
+      // Safety margin only (the second send's synchronous handler prefix —
+      // up to its own `runQueued` enqueue — has already run by the time the
+      // `fake.send` call above returns): flush a couple of microtask turns
+      // before checking that nothing has fired yet.
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(
+        readCallCount,
+        1,
+        "strict FIFO must not let the second confirmation's queued callback begin — and re-read the still-stale " +
+          "record — while the first is suspended mid-settlement; a folder-wide reentrancy bypass would let this read fire early"
+      );
+      assert.deepEqual(
+        cmds.calls,
+        [],
+        "the command must not dispatch while the first confirmation's settlement is still suspended"
+      );
+
+      releaseFirst();
+      await Promise.all([firstSend, secondSend]);
+
+      // The decisive assertion: `recordChatInteractionAnswers` must have
+      // been called exactly ONCE across both confirmations. Note this is
+      // NOT the same claim as "`readChatInteractions` was called exactly
+      // twice" — `render()` and other post-settlement bookkeeping also call
+      // `readChatInteractions` incidentally once each confirmation's queued
+      // op resolves, so that count is not a reliable signal by itself and is
+      // only asserted above, during the suspended window, where it IS
+      // meaningful (nothing else reads while the first is genuinely
+      // blocked). Once released, the second confirmation's callback finally
+      // gets to read — and under the fix it observes `"resumed"`, takes the
+      // `record.state !== "unresolved"` short-circuit in
+      // `settleLocalOnlyInteractionAnswersV1`, and never reaches this call a
+      // second time. Under the removed folder-wide bypass, the second
+      // callback would instead have read the still-stale `"unresolved"`
+      // record already (while the first was suspended, which the assertion
+      // above independently rules out) or upon release would still validate
+      // and persist again, driving this count to 2.
+      assert.equal(
+        recordCallCount,
+        1,
+        "the second confirmation must never re-persist the answers — it must observe the first's settlement " +
+          "(\"resumed\") and short-circuit, not the stale \"unresolved\" record"
+      );
       assert.deepEqual(
         cmds.calls,
         [{ id: "vs-code-ai-helper.openAiModels", args: [] }],
         "the option's bound command must be dispatched exactly once, however the two confirmations interleave"
       );
-      const interactions = await readChatInteractions(folder, folder);
+      const interactions = await originalReadChatInteractions(folder, folder);
       const settled = interactions.find((i) => i.interactionId === interactionId);
       assert.equal(settled?.state, "resumed", "the interaction settles exactly once");
     } finally {
+      // Release unconditionally: an assertion failure above (or the "await
+      // firstIsBlockedAfterStaleRead" step itself throwing) must not leave
+      // the first confirmation's queued callback suspended forever, which
+      // would otherwise hang this task's `runQueued` chain for the rest of
+      // the test run.
+      releaseFirst();
+      (
+        chatHistoryStoreModule as unknown as { readChatInteractions: typeof originalReadChatInteractions }
+      ).readChatInteractions = originalReadChatInteractions;
+      (
+        chatHistoryStoreModule as unknown as {
+          recordChatInteractionAnswers: typeof originalRecordChatInteractionAnswers;
+        }
+      ).recordChatInteractionAnswers = originalRecordChatInteractionAnswers;
       notify.restore();
       cmds.restore();
       provider.dispose();
