@@ -1160,6 +1160,75 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
+  /**
+   * Review blocker (2026-09-02): the previous fix for the reentrancy
+   * deadlock at the top of this describe block introduced a folder-wide
+   * `queueActiveFolders` bypass in `ChatViewProvider`'s `runQueued` that could
+   * not distinguish a genuinely nested call from an unrelated concurrent
+   * caller for the same folder — a second `confirmInteraction` arriving while
+   * the first was still awaiting I/O (never resolved sequentially, unlike the
+   * test above) would see the folder "active" and run outside the queue
+   * entirely, reading the pre-settlement `"unresolved"` record and re-running
+   * the command effect a second time. Fixed by moving the effect's execution
+   * out of the queued write (`settleLocalOnlyInteractionAnswersV1` now only
+   * returns the pending effect; the caller runs it after the queued call
+   * resolves) so `runQueued` could go back to being a plain FIFO with no
+   * reentrancy case — this test fires both confirmations without awaiting
+   * the first, so their real async I/O genuinely interleaves, and would have
+   * caught the bypass this fix removed.
+   */
+  void it("two concurrent confirmations of the same local-only interaction dispatch the command exactly once", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const interactionId = "1".repeat(32);
+      const operationId = "2".repeat(32);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId,
+          operationId,
+          actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+          optionEffects: { plan: { kind: "command", command: "vs-code-ai-helper.openAiModels" }, task: { kind: "doNothing" } },
+        },
+        true,
+        false
+      );
+      cmds.calls.length = 0; // drop any focus-command call askInteraction may issue
+
+      // Deliberately NOT awaited between sends: both handler invocations are
+      // in flight at once, exercising the true race the sequential test
+      // above cannot reach.
+      await Promise.all([
+        fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS }),
+        fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS }),
+      ]);
+
+      assert.deepEqual(
+        cmds.calls,
+        [{ id: "vs-code-ai-helper.openAiModels", args: [] }],
+        "the option's bound command must be dispatched exactly once, however the two confirmations interleave"
+      );
+      const interactions = await readChatInteractions(folder, folder);
+      const settled = interactions.find((i) => i.interactionId === interactionId);
+      assert.equal(settled?.state, "resumed", "the interaction settles exactly once");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
   void it("an ordinary chat send is never silently interpreted as an answer to a pending question", async () => {
     // Review blocker, 2026-08-29 (wf "stage chat as a record of work" Part 10
     // item 13e): a plain `role: "user"` message posted through the shared

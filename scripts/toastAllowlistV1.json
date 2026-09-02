@@ -183,7 +183,7 @@
     },
     {
       "file": "src/views/chatView.ts",
-      "line": 1837,
+      "line": 1903,
       "reason": "Chat-history recovery notice (plan §5.1) — a corrupted local chat-v1.json needs 'Reset Chat History' or manual inspection via 'Ensemble: Open Chat Data'; a data-recovery affordance, not a task review/round workflow decision."
     }
   ]

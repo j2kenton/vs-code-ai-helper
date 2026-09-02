@@ -211,6 +211,16 @@ interface InteractionActionMessage {
   answers?: unknown;
 }
 
+/** A local-only interaction's option/effect pair, resolved while settling the
+ * answer but deliberately not yet run — see
+ * `settleLocalOnlyInteractionAnswersV1`'s doc comment for why running it must
+ * wait until the settling `runQueued` call has fully resolved. */
+interface LocalInteractionPendingEffectV1 {
+  readonly stage: TaskStage;
+  readonly option: QuestionOptionV1;
+  readonly effect: WorkflowDecisionOptionEffectV1;
+}
+
 function isInteractionActionMessage(value: unknown): value is InteractionActionMessage {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
@@ -490,6 +500,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * one task can never stall or lose a message for another. Reads
    * (transcript/render) are chained through the same queue as writes so a
    * lazy migration can never race a concurrent append for the same task.
+   *
+   * Strictly FIFO, with no reentrancy shortcut (2026-09-02 review blocker): a
+   * folder-wide "is a queued op currently executing" flag was tried here to
+   * let a call nested inside a running `op()` (e.g. `append()`, reached via
+   * `runLocalInteractionOptionEffectV1`) skip the queue and avoid
+   * deadlocking against its own not-yet-resolved outer entry. That flag could
+   * not tell a genuinely nested call apart from an unrelated, independently
+   * arriving call for the same folder while `op()` was merely suspended on an
+   * `await` — both saw the folder "active" and both bypassed the queue,
+   * letting two concurrent operations run truly concurrently against the same
+   * folder's state (observed: two overlapping interaction confirmations both
+   * reading the pre-settlement record and both running a command effect).
+   * The actual nested call this existed for
+   * (`settleLocalOnlyInteractionAnswersV1` → the option effect) has instead
+   * been restructured to run its effect AFTER its queued call resolves,
+   * removing the only genuine nesting case — so `runQueued` no longer needs,
+   * and must not regain, a reentrancy bypass.
    */
   private queues = new Map<string, Promise<void>>();
   /** Tracks which tasks already showed the "could not save" warning, so a
@@ -1028,6 +1055,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * option and acknowledge the outcome in the transcript. The option remains
    * a plain `QuestionOptionV1`: effects are host routing metadata attached to
    * the local-only interaction, not a third question/answer protocol.
+   *
+   * Must be called AFTER the `runQueued` call that settled the interaction
+   * has resolved (see `settleLocalOnlyInteractionAnswersV1`'s doc comment) —
+   * never from inside that queued callback. Its own `append()` calls re-enter
+   * `runQueued` for the same folder and must queue normally, not reentrantly.
    */
   private async runLocalInteractionOptionEffectV1(
     identity: ChatIdentity,
@@ -1153,6 +1185,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.append("assistant", result.message, identity.stage, identity);
     } else {
       await this.append("assistant", successMessage, identity.stage, identity);
+      // Run OUTSIDE the queued call above (see
+      // `settleLocalOnlyInteractionAnswersV1`'s doc comment): by this point
+      // the interaction's "resumed" settlement has already landed, so a
+      // concurrent duplicate submit queued behind it will see it is no
+      // longer `"unresolved"` and skip re-running the effect.
+      if (result.effectToRun) {
+        await this.runLocalInteractionOptionEffectV1(
+          identity,
+          result.effectToRun.stage,
+          result.effectToRun.option,
+          result.effectToRun.effect
+        );
+      }
     }
     if (sameIdentity(this.target, identity)) {
       await this.render();
@@ -1164,7 +1209,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     identity: ChatIdentity,
     clientRef: ChatInteractionClientRefV1,
     answers: readonly StructuredAnswerV1[]
-  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
+  ): Promise<
+    | { readonly ok: true; readonly effectToRun?: LocalInteractionPendingEffectV1 }
+    | { readonly ok: false; readonly message: string }
+  > {
     const interactions = await readChatInteractions(identity.taskFolderPath, identity.canonicalId);
     const localRecord = interactions.find(
       (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
@@ -1224,24 +1272,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * (never trust the client's claim that they match), record them, settle the
    * interaction as `resumed` (there is no separate Resume step; see
    * `resumeInteraction`'s matching short-circuit), and — for a `singleChoice`
-   * answer whose `selectedOptionId` has a recorded `optionEffects` entry — run
-   * that effect through the exact command-execution + acknowledgement path a
-   * `WorkflowDecisionV1` option's effect runs.
+   * answer whose `selectedOptionId` has a recorded `optionEffects` entry —
+   * return that option/effect pair for the caller to run.
    *
    * Runs inside the SAME `runQueued` callback `doSubmitInteractionAnswers` is
    * invoked from, and checks `record.state` (fresh, from the caller's own
    * lookup) before doing anything — a second submission for an already-
    * resolved interaction (a stale render still showing an enabled Confirm
-   * button, or a double-click) is a no-op rather than re-recording the
-   * answer and re-running the option's effect a second time (the same
-   * double-submission defect a review found and fixed in the legacy
-   * mechanism this replaces).
+   * button, or a double-click, including one arriving concurrently while this
+   * call is still awaiting its own writes) is a no-op rather than
+   * re-recording the answer and re-running the option's effect a second time.
+   *
+   * Deliberately does NOT run the effect itself (2026-09-02 review blocker):
+   * `runLocalInteractionOptionEffectV1` calls `append()`, which re-enters
+   * `runQueued` for this same folder. An earlier version ran the effect here,
+   * which required a folder-wide reentrancy bypass in `runQueued` to avoid
+   * deadlocking — but that bypass could not distinguish a genuinely nested
+   * call (this one) from an unrelated concurrent submit for the same folder,
+   * letting two overlapping confirmations both pass this method's `state !==
+   * "unresolved"` check before either had written its settlement, and both
+   * run the command effect. Returning the pending effect instead lets the
+   * caller run it only AFTER this queued write (including the `"resumed"`
+   * settlement) has fully landed, so `runQueued` can go back to being a
+   * strict per-folder FIFO with no reentrancy case to get wrong.
    */
   private async settleLocalOnlyInteractionAnswersV1(
     identity: ChatIdentity,
     record: ChatDocumentInteractionV1,
     answers: readonly StructuredAnswerV1[]
-  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
+  ): Promise<
+    | { readonly ok: true; readonly effectToRun?: LocalInteractionPendingEffectV1 }
+    | { readonly ok: false; readonly message: string }
+  > {
     if (record.state !== "unresolved") {
       return { ok: true };
     }
@@ -1270,7 +1332,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       );
       const option = question?.options.find((o) => o.optionId === singleChoiceAnswer.selectedOptionId);
       if (effect && option) {
-        await this.runLocalInteractionOptionEffectV1(identity, record.stage, option, effect);
+        return { ok: true, effectToRun: { stage: record.stage, option, effect } };
       }
     }
     return { ok: true };
@@ -1742,7 +1804,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Chain `op` onto this task's queue so operations on one task's transcript
    * (writes and reads alike) never interleave with one another, while a
    * different task's queue is unaffected. A failed prior operation cannot
-   * poison the queue for subsequent ones. */
+   * poison the queue for subsequent ones. Strictly FIFO — see the `queues`
+   * field's doc comment for why a reentrancy bypass must not be reintroduced
+   * here; every caller must run any operation nested inside `op()` (e.g. an
+   * `append()` triggered by `op()`'s own result) AFTER this call's returned
+   * promise resolves, never from within `op()` itself. */
   private runQueued<T>(taskFolderPath: string, op: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(taskFolderPath) ?? Promise.resolve();
     let result!: T;
