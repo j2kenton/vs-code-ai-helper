@@ -235,9 +235,30 @@ export async function generatePlanWithAI(
   );
 
   const lockKey = taskFolderUri.fsPath;
+  // This is a workflow root (carries a `stage`) — the Notifications row must
+  // show the task's real name, never a raw basename(taskPath) computed here
+  // in the caller (that would silently reproduce the exact "wf10" vs
+  // "2026-07-17_task_1" regression this task exists to prevent, and would
+  // bypass taskOperations.begin's own workflow-root guard since it only
+  // catches an OMITTED taskName, not an explicitly-supplied one). If the
+  // inventory hasn't indexed this task yet (e.g. a race right after
+  // creation), refresh once and fail safely rather than falling through to
+  // a synthesized name.
+  let resolvedForDisplay = inventory.getTaskByPath(lockKey);
+  if (!resolvedForDisplay) {
+    await inventory.refresh();
+    resolvedForDisplay = inventory.getTaskByPath(lockKey);
+  }
+  if (!resolvedForDisplay) {
+    NotificationRouter.showError(
+      `Task at "${lockKey}" could not be resolved. It may have been deleted or moved.`
+    );
+    return;
+  }
+  const taskName = resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName;
   const result = await runTrackedOperation(
     lockKey,
-    { label: "Generate Plan", stage: "plan", kind: "generate-plan", cancellable: true },
+    { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true },
     (op) =>
       generatePlanWithAIForResolvedTask(
         context, inventory, chatViewProvider, taskFolderUri, op, effectiveReviewMode

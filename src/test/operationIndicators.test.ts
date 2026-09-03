@@ -40,7 +40,7 @@ void describe("operationIndicators", () => {
     for (const op of taskOperations.getAll()) {
       // getAll() returns readonly snapshots; end() only needs the id/key pair
       // a real TaskOperationHandle carries, so build a minimal one for cleanup.
-      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {}, setWaitingForUser: () => {}, setResultTargetUri: () => {} };
+      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {}, setWaitingForUser: () => {}, setResultTargetUri: () => {}, reportActivity: () => {} };
       taskOperations.end(handle);
     }
   });
@@ -288,6 +288,60 @@ void describe("operationIndicators", () => {
         );
       } finally {
         taskOperations.end(op);
+      }
+    });
+
+    void it("never persists activity/activityStartedAt, and an activity-only report never triggers a running-operations state.update (in-flight status is ephemeral)", async () => {
+      let runningOperationsWrites = 0;
+      const memento = makeMementoStub();
+      const trackedMemento: vscode.Memento = {
+        ...memento,
+        update: (key: string, value: unknown): Thenable<void> => {
+          if (key === "ensemble.runningOperations") {runningOperationsWrites++;}
+          return memento.update(key, value);
+        },
+      } as unknown as vscode.Memento;
+
+      const freshProvider = new StatusTreeProvider(trackedMemento);
+      const op = taskOperations.begin("/dev/task_activity", {
+        label: "Running Implementation",
+        stage: "impl",
+        taskName: "task_activity",
+      });
+      assert.ok(op);
+
+      try {
+        // begin() is a lifecycle event — it must still persist, exactly as
+        // before this task's changes.
+        await new Promise((r) => setImmediate(r));
+        const writesAfterBegin = runningOperationsWrites;
+        assert.ok(writesAfterBegin > 0, "begin() must still trigger a running-operations persist");
+
+        op.reportActivity("reading context (129 KB)", { resetElapsedOrigin: true });
+        await new Promise((r) => setImmediate(r));
+        assert.equal(
+          runningOperationsWrites,
+          writesAfterBegin,
+          "an activity-only report must never trigger a running-operations state.update"
+        );
+
+        const persisted = memento.get<Array<Record<string, unknown>>>("ensemble.runningOperations", []);
+        assert.ok(persisted.length > 0, "expected the root operation to have been persisted by begin()");
+        for (const entry of persisted) {
+          assert.ok(!("activity" in entry), `persisted snapshot must never carry activity; got: ${JSON.stringify(entry)}`);
+          assert.ok(
+            !("activityStartedAt" in entry),
+            `persisted snapshot must never carry activityStartedAt; got: ${JSON.stringify(entry)}`
+          );
+        }
+
+        // A genuinely persistence-relevant change afterward must still write.
+        op.setModel?.("claude-cli:sonnet@high");
+        await new Promise((r) => setImmediate(r));
+        assert.ok(runningOperationsWrites > writesAfterBegin, "setModel must still trigger a running-operations persist");
+      } finally {
+        taskOperations.end(op);
+        freshProvider.dispose();
       }
     });
   });

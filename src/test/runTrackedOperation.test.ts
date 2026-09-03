@@ -310,4 +310,172 @@ void describe("runTrackedOperation", () => {
       "no task-progress read may precede begin() on the admission path"
     );
   });
+
+  void describe("workflow root taskName guard", () => {
+    void it("throws when a stage-bearing root omits taskName and the basename default looks like the task-folder pattern", () => {
+      const taskPath = "/workspace/tasks/2026-07-17_task_9";
+      assert.throws(
+        () => taskOperations.begin(taskPath, { label: "Run Implementation", stage: "impl" }),
+        /taskName/,
+        "a workflow root with no taskName must never silently fall back to basename(taskPath)"
+      );
+      // The refused/failed call must not have registered anything.
+      assert.deepEqual(taskOperations.getTaskOperations(taskPath), []);
+    });
+
+    void it("does not throw for a stage-bearing root whose basename default does not look like the folder pattern", () => {
+      const taskPath = `/tmp/rto-guard-safe-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Run Implementation", stage: "impl" });
+      assert.ok(op);
+      taskOperations.end(op);
+    });
+
+    void it("does not throw when a caller explicitly resolves taskName, even when that value equals the folder-pattern string (an un-renamed task's real displayName)", () => {
+      const taskPath = `/tmp/rto-guard-explicit-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, {
+        label: "Run Implementation",
+        stage: "impl",
+        taskName: "2026-07-17_task_9",
+      });
+      assert.ok(op);
+      assert.equal(taskOperations.getTaskOperations(taskPath)[0]?.taskName, "2026-07-17_task_9");
+      taskOperations.end(op);
+    });
+
+    void it("does not throw for a non-stage (task-level) operation whose basename default looks like the folder pattern", () => {
+      const taskPath = "/workspace/tasks/2026-07-17_task_9";
+      const op = taskOperations.begin(taskPath, { label: "Commit and Push" });
+      assert.ok(op);
+      assert.equal(taskOperations.getTaskOperations(taskPath)[0]?.taskName, "2026-07-17_task_9");
+      taskOperations.end(op);
+    });
+
+    void it("does not throw for a child operation, even when its own basename default looks like the folder pattern", async () => {
+      const taskPath = "/workspace/tasks/2026-07-17_task_9";
+      await runTrackedOperation(taskPath, { label: "Root", taskName: "wf9", stage: "impl-low-review" }, (root) => {
+        const child = taskOperations.begin(taskPath, { parent: root, label: "Child", stage: "impl" });
+        assert.ok(child, "children are exempt from the workflow-root taskName guard");
+        taskOperations.end(child);
+        return Promise.resolve();
+      });
+    });
+  });
+
+  void describe("reportActivity (in-flight Notifications status)", () => {
+    void it("sets activity and an elapsed-time origin, resetting the origin only when asked", async () => {
+      const taskPath = `/tmp/rto-activity-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      try {
+        op.reportActivity("running", { resetElapsedOrigin: true });
+        const first = taskOperations.getTaskOperations(taskPath)[0];
+        assert.equal(first?.activity, "running");
+        const firstOrigin = first?.activityStartedAt;
+        assert.ok(typeof firstOrigin === "number");
+
+        await new Promise((r) => setTimeout(r, 5));
+        op.reportActivity("3 files changed"); // no resetElapsedOrigin — same activity span
+        const second = taskOperations.getTaskOperations(taskPath)[0];
+        assert.equal(second?.activity, "3 files changed");
+        assert.equal(second?.activityStartedAt, firstOrigin, "the elapsed origin must not move on a routine repaint");
+
+        op.reportActivity("running", { resetElapsedOrigin: true }); // a genuine stage transition
+        const third = taskOperations.getTaskOperations(taskPath)[0];
+        assert.ok(
+          typeof third?.activityStartedAt === "number" && third.activityStartedAt >= firstOrigin,
+          "resetElapsedOrigin must restart the timer"
+        );
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("routes a child's activity report onto the root row, mirroring setResultTargetUri", async () => {
+      const taskPath = `/tmp/rto-activity-child-${Math.random()}`;
+      await runTrackedOperation(taskPath, { label: "Root" }, async (root) => {
+        await runTrackedOperation(taskPath, { parent: root, label: "Child" }, (child) => {
+          child.reportActivity("running", { resetElapsedOrigin: true });
+          const rootRow = taskOperations.getRootOperations().find((op) => op.id === root.id);
+          assert.equal(rootRow?.activity, "running");
+          return Promise.resolve();
+        });
+      });
+    });
+
+    void it("is a no-op once the operation has ended — a delayed callback cannot resurrect a completed row", () => {
+      const taskPath = `/tmp/rto-activity-ended-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      taskOperations.end(op);
+
+      assert.doesNotThrow(() => op.reportActivity("running", { resetElapsedOrigin: true }));
+      assert.deepEqual(taskOperations.getTaskOperations(taskPath), []);
+    });
+  });
+
+  void describe("onDidChange persistenceRelevant flagging", () => {
+    void it("flags begin/end/report/setModel/setWaitingForUser as persistence-relevant, and reportActivity as not", async () => {
+      const taskPath = `/tmp/rto-flag-${Math.random()}`;
+      const seen: boolean[] = [];
+      const sub = taskOperations.onDidChange((event) => seen.push(event.persistenceRelevant));
+
+      try {
+        const op = taskOperations.begin(taskPath, { label: "Root", cancellable: true });
+        assert.ok(op);
+        await Promise.resolve();
+        assert.deepEqual(seen, [true], "begin() must flag persistence-relevant");
+
+        seen.length = 0;
+        op.report("halfway there");
+        await Promise.resolve();
+        assert.deepEqual(seen, [true]);
+
+        seen.length = 0;
+        op.setModel?.("claude-cli:sonnet@high");
+        await Promise.resolve();
+        assert.deepEqual(seen, [true]);
+
+        seen.length = 0;
+        op.setWaitingForUser(true);
+        await Promise.resolve();
+        assert.deepEqual(seen, [true]);
+        op.setWaitingForUser(false);
+        await Promise.resolve();
+
+        seen.length = 0;
+        op.reportActivity("running", { resetElapsedOrigin: true });
+        await Promise.resolve();
+        assert.deepEqual(seen, [false], "an activity-only report must never flag persistence-relevant");
+
+        seen.length = 0;
+        taskOperations.end(op);
+        await Promise.resolve();
+        assert.deepEqual(seen, [true], "end() must flag persistence-relevant");
+      } finally {
+        sub.dispose();
+      }
+    });
+
+    void it("coalesces a persistence-relevant change and an activity-only change in the same microtask as relevant", async () => {
+      const taskPath = `/tmp/rto-flag-coalesce-${Math.random()}`;
+      const seen: boolean[] = [];
+      const sub = taskOperations.onDidChange((event) => seen.push(event.persistenceRelevant));
+      try {
+        const op = taskOperations.begin(taskPath, { label: "Root" });
+        assert.ok(op);
+        await Promise.resolve();
+        seen.length = 0;
+
+        // Both fired synchronously, before the coalesced microtask flushes.
+        op.reportActivity("running", { resetElapsedOrigin: true });
+        op.report("halfway there");
+        await Promise.resolve();
+        assert.deepEqual(seen, [true], "a persistence-relevant change in the batch must not be masked by an activity-only one");
+
+        taskOperations.end(op);
+      } finally {
+        sub.dispose();
+      }
+    });
+  });
 });

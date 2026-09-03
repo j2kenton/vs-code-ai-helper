@@ -98,6 +98,22 @@ export interface TaskOperationHandle {
    * operation has already ended by the time this is called.
    */
   setResultTargetUri(uri: vscode.Uri): void;
+  /**
+   * Report the current in-flight activity for a live task-status surface
+   * (Notifications), e.g. "running", "reading context (129 KB)", "3 files
+   * changed". Distinct from `report` (composite sub-status text surfaced
+   * from descendants) — this is the direct current-activity signal a stage
+   * instrumentation site sets on itself. Always resolves to the ROOT
+   * operation, same as `setResultTargetUri`, and is a no-op once the
+   * operation has ended (a delayed child update can never resurrect a
+   * completed row).
+   *
+   * `resetElapsedOrigin: true` restarts the live elapsed-time origin — use
+   * it on a genuine stage transition. Omitted or `false` preserves the
+   * existing origin (a model/count/label update within the same activity),
+   * so the displayed timer never jumps backwards on a routine repaint.
+   */
+  reportActivity(activity: string | undefined, options?: { resetElapsedOrigin?: boolean }): void;
 }
 
 export interface TaskOperationSnapshot {
@@ -110,6 +126,21 @@ export interface TaskOperationSnapshot {
   readonly detail?: string;
   /** The resolved provider/model identity, when the operation has one. */
   readonly modelId?: string;
+  /**
+   * Current-activity label for in-flight display (e.g. "reading context
+   * (129 KB)", "running", "3 files changed") — see
+   * TaskOperationHandle.reportActivity. Ephemeral: never persisted (not
+   * part of SerializedOperation), since in-flight state has no meaning
+   * after a reload.
+   */
+  readonly activity?: string;
+  /**
+   * Elapsed-time origin for the current `activity`, distinct from
+   * `startedAt` so a stage/activity transition can reset the visible timer
+   * without losing the operation's true start time. Ephemeral, like
+   * `activity`.
+   */
+  readonly activityStartedAt?: number;
   readonly exclusive: boolean;
   readonly kind?: OperationKind;
   readonly parentId?: string;
@@ -145,6 +176,8 @@ interface MutableOperation {
   startedAt: number;
   detail?: string;
   modelId?: string;
+  activity?: string;
+  activityStartedAt?: number;
   exclusive: boolean;
   kind?: OperationKind;
   parentId?: string;
@@ -218,9 +251,33 @@ export function formatTaskNameForDisplay(taskName: string): string {
   return `"${taskName}"`;
 }
 
+/**
+ * Default task-folder naming scheme (`YYYY-MM-DD_task_N`) — the exact
+ * shape produced when a task is never explicitly renamed, so it is also a
+ * perfectly legitimate real `taskName` (every unrenamed task's `displayName
+ * ?? folderName` idiom resolves to it). The registry guard below therefore
+ * never inspects the resolved taskName string itself — only whether a
+ * WORKFLOW ROOT's `begin()` call omitted `taskName` and let this file's own
+ * `path.basename(taskPath)` default stand in for it, which is the actual
+ * bug this exists to catch (see TaskOperationSpec.taskName).
+ */
+const WORKFLOW_ROOT_FOLDER_NAME_PATTERN = /^\d{4}-\d{2}-\d{2}_task_\d+$/;
+
+export interface TaskOperationChangeEvent {
+  /**
+   * True when this change affects state Notifications persists across a
+   * reload (lifecycle transitions, `detail`, `modelId`, `waitingForUser`,
+   * `resultTargetUri`) and StatusTreeProvider should rewrite its persisted
+   * running-operations snapshot. False for the ephemeral, presentation-only
+   * `reportActivity` path — in-flight activity has no meaning after reload
+   * and must never trigger a `state.update`.
+   */
+  readonly persistenceRelevant: boolean;
+}
+
 export class TaskOperationRegistry implements vscode.Disposable {
-  private readonly _onDidChange = new vscode.EventEmitter<void>();
-  readonly onDidChange: vscode.Event<void> = this._onDidChange.event;
+  private readonly _onDidChange = new vscode.EventEmitter<TaskOperationChangeEvent>();
+  readonly onDidChange: vscode.Event<TaskOperationChangeEvent> = this._onDidChange.event;
 
   /**
    * Fires the terminal snapshot (state `succeeded`/`failed`/`cancelled`)
@@ -238,13 +295,20 @@ export class TaskOperationRegistry implements vscode.Disposable {
   private readonly tokenSources = new Map<string, vscode.CancellationTokenSource>();
   private operationSeq = 0;
   private pendingChange = false;
+  // Coalesced with OR across every change batched into the same microtask,
+  // so a persistence-relevant change is never masked by a later
+  // activity-only one firing before the microtask flushes.
+  private pendingPersistenceRelevant = false;
 
-  private triggerChange(): void {
+  private triggerChange(persistenceRelevant: boolean): void {
+    this.pendingPersistenceRelevant = this.pendingPersistenceRelevant || persistenceRelevant;
     if (this.pendingChange) {return;}
     this.pendingChange = true;
     queueMicrotask(() => {
       this.pendingChange = false;
-      this._onDidChange.fire();
+      const relevant = this.pendingPersistenceRelevant;
+      this.pendingPersistenceRelevant = false;
+      this._onDidChange.fire({ persistenceRelevant: relevant });
     });
   }
 
@@ -275,6 +339,24 @@ export class TaskOperationRegistry implements vscode.Disposable {
             return null; // Refused
           }
         }
+      }
+    }
+
+    // Workflow roots (operations carrying a `stage`) must be given the
+    // task's real displayName by the caller — falling through to this
+    // file's own basename default is exactly the "wf10" vs
+    // "2026-07-17_task_1" regression this task exists to prevent (see
+    // WORKFLOW_ROOT_FOLDER_NAME_PATTERN). This checks whether `taskName`
+    // was OMITTED, never the resolved string itself: a caller that
+    // explicitly resolves `displayName ?? folderName` and gets the
+    // folder-pattern string back (a task the user never renamed) is making
+    // an informed choice, not hitting the bug.
+    if (!isChild && spec.stage !== undefined && spec.taskName === undefined) {
+      const fallback = path.basename(taskPath);
+      if (WORKFLOW_ROOT_FOLDER_NAME_PATTERN.test(fallback)) {
+        throw new Error(
+          `TaskOperationRegistry.begin: workflow root "${spec.label}" (stage "${spec.stage}") was registered without a resolved taskName — pass the task's real displayName (or displayName ?? folderName) explicitly instead of relying on the basename(taskPath) default.`
+        );
       }
     }
 
@@ -323,23 +405,58 @@ export class TaskOperationRegistry implements vscode.Disposable {
       token,
       report: (d: string | undefined) => {
         operation.detail = d;
-        this.triggerChange();
+        this.triggerChange(true);
       },
       setModel: (modelId: string | undefined) => {
         operation.modelId = modelId;
-        this.triggerChange();
+        this.triggerChange(true);
       },
       setWaitingForUser: (waiting: boolean) => {
         operation.waitingForUser = waiting;
-        this.triggerChange();
+        this.triggerChange(true);
       },
       setResultTargetUri: (uri: vscode.Uri) => {
         this.setResultTargetUri(id, uri);
-      }
+      },
+      reportActivity: (activity: string | undefined, options?: { resetElapsedOrigin?: boolean }) => {
+        this.reportActivity(id, activity, options);
+      },
     };
 
-    this.triggerChange();
+    this.triggerChange(true);
     return handle;
+  }
+
+  /**
+   * Set the current in-flight activity + elapsed-time origin for `id`'s
+   * ROOT operation (resolved by walking parentId, same as
+   * setResultTargetUri), so a child stage's activity report still surfaces
+   * on the one Notifications row a composite renders. A no-op once `id` no
+   * longer resolves — including because the operation (or its whole
+   * composite) has already ended: `end()` removes the operation from the
+   * map before any later reportActivity for it can find it, so a delayed
+   * child update can never resurrect a completed row.
+   *
+   * Fires the change as NOT persistence-relevant (see
+   * TaskOperationChangeEvent) — in-flight activity is ephemeral and must
+   * never trigger a `state.update`.
+   */
+  reportActivity(id: string, activity: string | undefined, options?: { resetElapsedOrigin?: boolean }): void {
+    for (const keyMap of this.operations.values()) {
+      let op = keyMap.get(id);
+      if (!op) {continue;}
+      while (op.parentId !== undefined) {
+        const parent = keyMap.get(op.parentId);
+        if (!parent) {break;}
+        op = parent;
+      }
+      op.activity = activity;
+      if (options?.resetElapsedOrigin || op.activityStartedAt === undefined) {
+        op.activityStartedAt = Date.now();
+      }
+      this.triggerChange(false);
+      return;
+    }
   }
 
   /**
@@ -355,7 +472,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
     if (!exclusiveOp) {return;}
     exclusiveOp.detail = detail;
-    this.triggerChange();
+    this.triggerChange(true);
   }
 
   /**
@@ -369,7 +486,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
     if (!exclusiveOp) {return;}
     exclusiveOp.waitingForUser = waiting;
-    this.triggerChange();
+    this.triggerChange(true);
   }
 
   /**
@@ -390,7 +507,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
         op = parent;
       }
       op.resultTargetUri = uri.toString();
-      this.triggerChange();
+      this.triggerChange(true);
       return true;
     }
     return false;
@@ -408,7 +525,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
     if (!exclusiveOp) {return false;}
     exclusiveOp.resultTargetUri = uri.toString();
-    this.triggerChange();
+    this.triggerChange(true);
     return true;
   }
 
@@ -456,7 +573,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       const op = keyMap.get(id);
       if (op) {
         const requested = this.cancelSubtree(keyMap, op);
-        if (requested) {this.triggerChange();}
+        if (requested) {this.triggerChange(true);}
         return requested;
       }
     }
@@ -501,7 +618,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       cts.dispose();
     }
     this._onDidEnd.fire(op);
-    this.triggerChange();
+    this.triggerChange(true);
   }
 
   getTaskOperations(taskPath: string): readonly TaskOperationSnapshot[] {

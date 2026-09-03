@@ -53,6 +53,7 @@ function endAllOperations(): void {
       report: () => {},
       setWaitingForUser: () => {},
       setResultTargetUri: () => {},
+      reportActivity: () => {},
     };
     taskOperations.end(handle);
   }

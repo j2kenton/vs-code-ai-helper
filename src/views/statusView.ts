@@ -5,6 +5,7 @@ import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -51,6 +52,27 @@ export interface StatusOperationNode {
   readonly cancellable: boolean;
   /** See TaskOperationHandle.setWaitingForUser — swaps the spinner for a non-spinning "waiting" icon. */
   readonly waitingForUser: boolean;
+  readonly stage?: TaskStage;
+  /** The resolved provider/model identity, when the operation has one (see TaskOperationHandle.setModel). */
+  readonly modelId?: string;
+  /** See TaskOperationHandle.reportActivity. */
+  readonly activity?: string;
+  /** Elapsed-time origin for `activity`; falls back to `startedAt` when absent. */
+  readonly activityStartedAt?: number;
+  readonly startedAt: number;
+}
+
+/** Live elapsed-time display: seconds below one minute, `Xm Ys` below one
+ * hour, `Xh Ym` from then on — matches the in-flight-activity worked
+ * example ("2m 48s", "17m 42s"). `now` is injectable for tests. */
+export function formatElapsedForDisplay(originMs: number, now: number = Date.now()): string {
+  const totalSeconds = Math.max(0, Math.floor((now - originMs) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {return `${hours}h ${minutes}m`;}
+  if (minutes > 0) {return `${minutes}m ${seconds}s`;}
+  return `${seconds}s`;
 }
 
 export type StatusTreeNode = StatusEntry | StatusOperationNode;
@@ -75,6 +97,14 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   private readonly operationsSub: vscode.Disposable;
   /** Which notification levels are shown; all by default. */
   private levelFilter: Set<StatusEntry["level"]>;
+  /**
+   * Drives the live elapsed-time counter on running-operation rows. Runs
+   * only while at least one root operation is live, and is unref'd so it
+   * can never keep the extension host process alive on its own — a tick
+   * only calls `refresh()` (a presentation repaint): it never touches the
+   * registry or persistence.
+   */
+  private tickTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly state?: vscode.Memento) {
     const savedFilter = state?.get<string[]>(LEVEL_FILTER_STATE_KEY);
@@ -119,14 +149,42 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose or it will fire into a dead emitter.
-    this.operationsSub = taskOperations.onDidChange(() => {
-      this.persistRunningOperations();
+    this.operationsSub = taskOperations.onDidChange((event) => {
+      // Persisting is skipped for activity-only updates (persistenceRelevant:
+      // false) — SerializedOperation never carries activity/activityStartedAt
+      // anyway, so there is nothing new to persist, and every lifecycle/
+      // detail/model/waiting-for-user change that DOES need persisting still
+      // flags itself relevant exactly as before this event carried a payload.
+      if (event.persistenceRelevant) {
+        this.persistRunningOperations();
+      }
       this.refresh();
+      this.ensureTicking();
     });
+  }
+
+  /** Starts the 1s elapsed-time tick while any root operation is live, and
+   * stops it once none remain — see `tickTimer`. */
+  private ensureTicking(): void {
+    const hasLiveRoot = taskOperations.getRootOperations().length > 0;
+    if (hasLiveRoot && !this.tickTimer) {
+      this.tickTimer = setInterval(() => this.refresh(), 1000);
+      // Node-only API (absent from the browser typings vscode's own lib
+      // pulls in for webviews) — never let this timer keep the extension
+      // host process alive on its own.
+      (this.tickTimer as unknown as { unref?: () => void }).unref?.();
+    } else if (!hasLiveRoot && this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = undefined;
+    }
   }
 
   dispose(): void {
     this.operationsSub.dispose();
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = undefined;
+    }
   }
 
   /**
@@ -230,7 +288,22 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       const label = `${element.label} — ${formatTaskNameForDisplay(element.taskName)}`;
       const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
       item.id = `running:${element.id}`;
-      item.description = element.detail ?? (element.waitingForUser ? "waiting for you" : "running");
+
+      // In-flight status line: stage · activity · provider/model · elapsed,
+      // omitting any absent segment. `detail` (composite sub-status text
+      // surfaced from a descendant, e.g. "waiting for your answer",
+      // "cancelling…") takes precedence over the new `activity` signal when
+      // both are present — it is more specific, real-time information that
+      // predates this field and must keep showing exactly as before.
+      const stageLabel = element.stage ? STAGE_DISPLAY_NAMES[element.stage] : undefined;
+      const activitySegment =
+        element.detail ?? element.activity ?? (element.waitingForUser ? "waiting for you" : "running");
+      const elapsedOrigin = element.activityStartedAt ?? element.startedAt;
+      const elapsedSegment = formatElapsedForDisplay(elapsedOrigin);
+      item.description = [stageLabel, activitySegment, element.modelId, elapsedSegment]
+        .filter((segment): segment is string => segment !== undefined && segment.length > 0)
+        .join(" · ");
+
       item.iconPath = element.waitingForUser
         ? new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"))
         : new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
@@ -364,6 +437,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         detail: op.detail,
         cancellable: op.cancellable,
         waitingForUser: op.waitingForUser,
+        stage: op.stage,
+        modelId: op.modelId,
+        activity: op.activity,
+        activityStartedAt: op.activityStartedAt,
+        startedAt: op.startedAt,
       }));
       return [...runningNodes, ...this.entries.filter((entry) => this.levelFilter.has(entry.level))];
     }

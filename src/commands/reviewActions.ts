@@ -360,6 +360,29 @@ function isSameWorkspacePath(a: string, b: string): boolean {
 }
 
 /**
+ * Notifications in-flight visibility (see reportActivity's doc comment):
+ * marks a model-backed workflow stage as beginning. Records the resolved
+ * provider/model (when known) and resets the row's elapsed-time origin to
+ * now — this is a genuine stage transition, not a repaint of an
+ * already-running activity, so the displayed timer must restart here rather
+ * than keep counting from whenever the root operation itself began.
+ */
+function reportStageStartingV1(op: TaskOperationHandle | undefined, modelId: string | undefined): void {
+  op?.setModel?.(modelId);
+  op?.reportActivity("starting", { resetElapsedOrigin: true });
+}
+
+/**
+ * Marks a model-backed stage's provider dispatch as actually underway, once
+ * the long-running await is about to be issued. Preserves the elapsed origin
+ * `reportStageStartingV1` set, so the visible timer keeps counting from the
+ * stage transition rather than restarting again here.
+ */
+function reportStageRunningV1(op: TaskOperationHandle | undefined): void {
+  op?.reportActivity("running");
+}
+
+/**
  * Select the configured root that directly owns a task folder. Nested
  * metadata-root configurations can both contain a task, so only the deepest
  * direct parent is valid for ownership repair.
@@ -4923,7 +4946,7 @@ export async function runReviewForFolder(
     // exceeded AND a configured backup's is not; the stored configuration is
     // never written to.
     const dispatchModelId = ceilingPreferredModelId ?? modelId;
-    options.operation?.setModel?.(dispatchModelId);
+    reportStageStartingV1(options.operation, dispatchModelId);
     if (dispatchCeilingAdvisory !== undefined) {
       NotificationRouter.showWarning(
         `${STAGE_DISPLAY_NAMES[targetStage]}: ${dispatchCeilingAdvisory}` +
@@ -4995,6 +5018,7 @@ export async function runReviewForFolder(
     // item-14 same-candidate retry), not just the final one carried on
     // `outcome.correlation` — see `ReviewOutcomeContextV1.extraCoordinatorAttemptIds`.
     const observedCoordinatorAttemptIds: string[] = [];
+    reportStageRunningV1(options.operation);
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -8501,6 +8525,19 @@ async function executeImplementationRun(
     return false;
   }
 
+  // Notifications in-flight visibility: the quarantine machinery above just
+  // computed the round's changed-file count from the git-snapshot diff — the
+  // only point in this run where that count is known — so report it here.
+  // Unknown/zero counts leave the row's existing "running" activity in place
+  // rather than overwrite it with a label carrying no information; the
+  // origin is preserved (no `resetElapsedOrigin`) so the stage's elapsed
+  // timer keeps counting through this update.
+  if (!result.filesChangedUnknown && result.filesChanged.length > 0) {
+    options.parentOperation?.reportActivity(
+      `${result.filesChanged.length} file${result.filesChanged.length === 1 ? "" : "s"} changed`
+    );
+  }
+
   // 2026-08-28 review fix, blocker "coordinator allocation sites still do not
   // synchronously attach durable round identities before pre-prompt failures
   // can return": the sealed pipeline's `allocatedAttemptIds` (every
@@ -10624,6 +10661,7 @@ export async function runImplementationWithAI(
     lockKey,
     { label: "Run Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "run-implementation", cancellable: true },
     async (op) => {
+    reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
     try {
@@ -11087,6 +11125,7 @@ export async function runImplementationWithAI(
       ? resolved.progress.currentStage
       : "impl";
 
+    reportStageRunningV1(op);
     await executeImplementationRun(
       extensionUri,
       resolved.folderUri,
