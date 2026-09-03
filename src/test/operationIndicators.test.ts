@@ -138,6 +138,52 @@ void describe("operationIndicators", () => {
       }
     });
 
+    void it("translates a running review's stage to the review target it produces, not the pre-review stage it was launched from", () => {
+      // `kind: "review"` operations register with the task's CURRENT
+      // (pre-review) stage — e.g. "impl" — because a rerun can be launched
+      // before the task has advanced onto its review stage (see
+      // reviewReadiness.ts's REVIEW_TARGETS doc comment). The row must still
+      // show "High-Level Code Review", not "Implementation", while it runs.
+      const reviewOp = taskOperations.begin("/dev/task_3", {
+        label: "Review",
+        stage: "impl",
+        taskName: "task_3",
+        kind: "review",
+      });
+      // A non-review operation at the same pre-review stage must keep
+      // showing the plain stage name (no translation) — translation is
+      // scoped strictly to `kind: "review"`.
+      const implOp = taskOperations.begin("/dev/task_4", {
+        label: "Run Implementation",
+        stage: "impl",
+        taskName: "task_4",
+        kind: "run-implementation",
+      });
+      assert.ok(reviewOp && implOp);
+
+      try {
+        const children = provider.getChildren() as StatusTreeNode[];
+        const opNodes = children.filter((n) => "kind" in n && n.kind === "operation");
+        const reviewNode = opNodes.find((n) => "id" in n && n.id === reviewOp.id);
+        const implNode = opNodes.find((n) => "id" in n && n.id === implOp.id);
+        assert.ok(reviewNode && implNode);
+
+        const reviewDescription = String(provider.getTreeItem(reviewNode).description);
+        const implDescription = String(provider.getTreeItem(implNode).description);
+        assert.ok(
+          reviewDescription.startsWith("High-Level Code Review"),
+          `expected the review row's stage segment to read "High-Level Code Review", got: ${reviewDescription}`
+        );
+        assert.ok(
+          implDescription.startsWith("Implementation"),
+          `expected the non-review row's stage segment to stay "Implementation", got: ${implDescription}`
+        );
+      } finally {
+        taskOperations.end(reviewOp);
+        taskOperations.end(implOp);
+      }
+    });
+
     void it("shows the inline cancel action on a history entry only while its sourceOperationId is still a live cancellable root operation (D10)", () => {
       const op = taskOperations.begin("/dev/task_1", {
         label: "Fast Forward",

@@ -4315,6 +4315,14 @@ export async function runReviewForFolder(
     return;
   }
 
+  // Notifications in-flight visibility: report the stage transition here, at
+  // the top of the function before any awaited work, not once the dispatch
+  // model happens to be known ~600 lines down. The model itself is not
+  // resolved yet at this point, so this call carries none — `setModel` is
+  // called on its own, without touching activity or the elapsed origin this
+  // sets, once `dispatchModelId` is actually resolved below.
+  options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
+
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
   // Captured (publish stage only) when the entry-point freshness gate below
@@ -4946,7 +4954,9 @@ export async function runReviewForFolder(
     // exceeded AND a configured backup's is not; the stored configuration is
     // never written to.
     const dispatchModelId = ceilingPreferredModelId ?? modelId;
-    reportStageStartingV1(options.operation, dispatchModelId);
+    // Activity/origin were already reported at function entry, before any
+    // await — only the model identity is new information here.
+    options.operation?.setModel?.(dispatchModelId);
     if (dispatchCeilingAdvisory !== undefined) {
       NotificationRouter.showWarning(
         `${STAGE_DISPLAY_NAMES[targetStage]}: ${dispatchCeilingAdvisory}` +

@@ -48,29 +48,43 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     );
   });
 
-  void it("reports 'starting' before dispatching a High-Level Code Review round, and 'running' right before the coordinator await", () => {
-    const startingCalls = indexOfAll("reportStageStartingV1(options.operation");
-    const runningCalls = indexOfAll("reportStageRunningV1(options.operation");
-    assert.ok(startingCalls.length >= 1, "runReviewForFolder must report a starting activity");
-    assert.ok(runningCalls.length >= 1, "runReviewForFolder must report a running activity");
+  void it("reports 'starting' at the top of runReviewForFolder (before its first await), resolves the model once known, and reports 'running' right before the coordinator await", () => {
+    const fnStart = source.indexOf("export async function runReviewForFolder(");
+    assert.ok(fnStart >= 0, "runReviewForFolder must exist");
+    const fnBodyStart = source.indexOf("): Promise<void> {", fnStart);
+    assert.ok(fnBodyStart >= 0);
 
-    const executeActionCalls = indexOfAll("coordinator.executeAction({");
-    // The review-round coordinator call (not the Apply Review one at a
-    // different call site) is the nearest one after the running report.
-    const startingIdx = startingCalls[0]!;
-    const runningIdx = runningCalls[0]!;
-    const nextExecuteAction = executeActionCalls.find((idx) => idx > runningIdx);
-    assert.ok(nextExecuteAction !== undefined, "expected a coordinator.executeAction call after the running report");
+    const startingCall = source.indexOf('options.operation?.reportActivity("starting", { resetElapsedOrigin: true });', fnBodyStart);
+    assert.ok(startingCall >= 0, "runReviewForFolder must report a starting activity");
+
+    // Nothing between the function body's opening brace and the starting
+    // report may await — it must run before ANY awaited setup (context
+    // reads, freshness gates, prompt rendering), not once dispatchModelId
+    // happens to be known ~600 lines down (the defect this guards against).
+    const admissionSlice = source.slice(fnBodyStart, startingCall);
     assert.ok(
-      startingIdx < runningIdx && runningIdx < nextExecuteAction,
-      "expected order: reportStageStartingV1 -> reportStageRunningV1 -> coordinator.executeAction"
+      !admissionSlice.includes("await "),
+      "the starting report must be reachable before any await in runReviewForFolder"
     );
 
-    // The starting report must be paired with resolving dispatchModelId
-    // (the ceiling-preferred candidate, not just the stage's raw configured
-    // model), so setModel reflects what actually gets dispatched.
-    const dispatchModelIdDecl = source.indexOf("const dispatchModelId = ceilingPreferredModelId ?? modelId;");
-    assert.ok(dispatchModelIdDecl >= 0 && dispatchModelIdDecl < startingIdx);
+    // Once dispatchModelId is actually resolved, only the model identity is
+    // new information — activity/origin were already reported above, so
+    // this call must not re-report 'starting' or reset the origin again.
+    const dispatchModelIdDecl = source.indexOf("const dispatchModelId = ceilingPreferredModelId ?? modelId;", startingCall);
+    assert.ok(dispatchModelIdDecl >= 0 && dispatchModelIdDecl > startingCall);
+    const setModelCall = source.indexOf("options.operation?.setModel?.(dispatchModelId);", dispatchModelIdDecl);
+    assert.ok(setModelCall >= 0, "expected setModel to be called once dispatchModelId is resolved");
+
+    const runningCall = source.indexOf("reportStageRunningV1(options.operation);", setModelCall);
+    assert.ok(runningCall >= 0, "runReviewForFolder must report a running activity");
+
+    const executeActionCalls = indexOfAll("coordinator.executeAction({");
+    const nextExecuteAction = executeActionCalls.find((idx) => idx > runningCall);
+    assert.ok(nextExecuteAction !== undefined, "expected a coordinator.executeAction call after the running report");
+    assert.ok(
+      startingCall < setModelCall && setModelCall < runningCall && runningCall < nextExecuteAction,
+      "expected order: starting report (pre-await) -> setModel(dispatchModelId) -> reportStageRunningV1 -> coordinator.executeAction"
+    );
   });
 
   void it("reports 'starting' at the top of the Run Implementation operation, and 'running' right before executeImplementationRun", () => {

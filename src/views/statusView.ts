@@ -2,10 +2,12 @@ import * as vscode from "vscode";
 import { StatusSurface } from "../utils/notificationRouter";
 import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
+import { OperationKind } from "../utils/operationTaxonomy";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { REVIEW_TARGETS } from "../utils/reviewReadiness";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -53,6 +55,15 @@ export interface StatusOperationNode {
   /** See TaskOperationHandle.setWaitingForUser — swaps the spinner for a non-spinning "waiting" icon. */
   readonly waitingForUser: boolean;
   readonly stage?: TaskStage;
+  /**
+   * `TaskOperationSnapshot.kind`, carried through for display translation
+   * only (see the `stageLabel` computation in `getTreeItem`) — a
+   * `kind: "review"` root's `stage` is legitimately still the pre-review
+   * stage while the review runs (REVIEW_TARGETS, reviewReadiness.ts's doc
+   * comment), so the row must translate it the same way
+   * `hasActiveOperationTargetingStage` already does for other readers.
+   */
+  readonly operationKind?: OperationKind;
   /** The resolved provider/model identity, when the operation has one (see TaskOperationHandle.setModel). */
   readonly modelId?: string;
   /** See TaskOperationHandle.reportActivity. */
@@ -295,7 +306,17 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       // "cancelling…") takes precedence over the new `activity` signal when
       // both are present — it is more specific, real-time information that
       // predates this field and must keep showing exactly as before.
-      const stageLabel = element.stage ? STAGE_DISPLAY_NAMES[element.stage] : undefined;
+      // `kind: "review"` roots register with the pre-review stage
+      // (resolved.progress.currentStage) because a rerun can be launched
+      // before the task has advanced onto its review stage — the same
+      // convention `hasActiveOperationTargetingStage` accounts for via
+      // REVIEW_TARGETS. Translate here too, so a running High-Level Code
+      // Review shows "High-Level Code Review", not "Implementation".
+      const displayStage =
+        element.stage && element.operationKind === "review"
+          ? REVIEW_TARGETS[element.stage] ?? element.stage
+          : element.stage;
+      const stageLabel = displayStage ? STAGE_DISPLAY_NAMES[displayStage] : undefined;
       const activitySegment =
         element.detail ?? element.activity ?? (element.waitingForUser ? "waiting for you" : "running");
       const elapsedOrigin = element.activityStartedAt ?? element.startedAt;
@@ -438,6 +459,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         cancellable: op.cancellable,
         waitingForUser: op.waitingForUser,
         stage: op.stage,
+        operationKind: op.kind,
         modelId: op.modelId,
         activity: op.activity,
         activityStartedAt: op.activityStartedAt,
