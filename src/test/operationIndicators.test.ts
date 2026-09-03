@@ -40,7 +40,7 @@ void describe("operationIndicators", () => {
     for (const op of taskOperations.getAll()) {
       // getAll() returns readonly snapshots; end() only needs the id/key pair
       // a real TaskOperationHandle carries, so build a minimal one for cleanup.
-      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {}, setWaitingForUser: () => {}, setResultTargetUri: () => {}, reportActivity: () => {} };
+      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {}, setWaitingForUser: () => {}, setResultTargetUri: () => {}, reportActivity: () => undefined };
       taskOperations.end(handle);
     }
   });

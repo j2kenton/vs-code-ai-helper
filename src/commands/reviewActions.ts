@@ -366,20 +366,32 @@ function isSameWorkspacePath(a: string, b: string): boolean {
  * now — this is a genuine stage transition, not a repaint of an
  * already-running activity, so the displayed timer must restart here rather
  * than keep counting from whenever the root operation itself began.
+ *
+ * Returns the resulting stage-generation token (or `undefined` if `op` is
+ * absent/already ended). A caller that kicks off async work spanning this
+ * stage (context-size checks, count/summary reports) should hold onto this
+ * and pass it as `stageToken` to its own later `reportActivity` calls, so a
+ * report that resolves after a NEWER stage has already begun on the same
+ * root is dropped instead of clobbering the newer stage's row.
  */
-function reportStageStartingV1(op: TaskOperationHandle | undefined, modelId: string | undefined): void {
+function reportStageStartingV1(
+  op: TaskOperationHandle | undefined,
+  modelId: string | undefined
+): number | undefined {
   op?.setModel?.(modelId);
-  op?.reportActivity("starting", { resetElapsedOrigin: true });
+  return op?.reportActivity("starting", { resetElapsedOrigin: true });
 }
 
 /**
  * Marks a model-backed stage's provider dispatch as actually underway, once
  * the long-running await is about to be issued. Preserves the elapsed origin
  * `reportStageStartingV1` set, so the visible timer keeps counting from the
- * stage transition rather than restarting again here.
+ * stage transition rather than restarting again here. `stageToken`, when
+ * passed, guards against this call itself landing late (see
+ * `reportStageStartingV1`'s doc comment).
  */
-function reportStageRunningV1(op: TaskOperationHandle | undefined): void {
-  op?.reportActivity("running");
+function reportStageRunningV1(op: TaskOperationHandle | undefined, stageToken?: number): void {
+  op?.reportActivity("running", { stageToken });
 }
 
 /**
@@ -748,6 +760,15 @@ interface ExecuteImplementationRunOptions {
    * re-review runs.
    */
   parentOperation?: TaskOperationHandle;
+  /**
+   * The stage-generation token `reportStageStartingV1` returned for
+   * `parentOperation`'s current stage, when the caller captured one. Passed
+   * through to every `reportActivity` call this run makes on `parentOperation`
+   * (the changed-file count, the "writing summary" label) so a report that
+   * resolves after the caller's root has moved on to a newer stage is
+   * dropped instead of overwriting that newer stage's row.
+   */
+  stageToken?: number;
   /**
    * Chained fast-forward request carried from "Complete & Move On triggers
    * AI: auto-fast-forward". When set, a successful implementation run always
@@ -4320,8 +4341,11 @@ export async function runReviewForFolder(
   // model happens to be known ~600 lines down. The model itself is not
   // resolved yet at this point, so this call carries none — `setModel` is
   // called on its own, without touching activity or the elapsed origin this
-  // sets, once `dispatchModelId` is actually resolved below.
-  options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
+  // sets, once `dispatchModelId` is actually resolved below. The returned
+  // token guards the "running" report far below (reportStageRunningV1) so a
+  // late resolution here can never overwrite a stage this same root has
+  // since moved on to.
+  const stageToken = options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
 
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
@@ -5028,7 +5052,7 @@ export async function runReviewForFolder(
     // item-14 same-candidate retry), not just the final one carried on
     // `outcome.correlation` — see `ReviewOutcomeContextV1.extraCoordinatorAttemptIds`.
     const observedCoordinatorAttemptIds: string[] = [];
-    reportStageRunningV1(options.operation);
+    reportStageRunningV1(options.operation, stageToken);
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -5653,7 +5677,7 @@ export async function applyReviewWithAI(
     // Notifications in-flight visibility (Step 5 audit): this dispatch path
     // never reported its stage/model before — the row sat on whatever the
     // caller last set (or nothing, for a standalone Apply Review with AI).
-    reportStageStartingV1(op, modelId);
+    const stageToken = reportStageStartingV1(op, modelId);
 
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceRoot.uri.fsPath,
@@ -5673,7 +5697,7 @@ export async function applyReviewWithAI(
       ...(applyReviewBaselineRevision !== undefined ? { baselineRevision: applyReviewBaselineRevision } : {}),
     };
 
-    reportStageRunningV1(op);
+    reportStageRunningV1(op, stageToken);
     const outcome = await coordinator.executeAction({
       actionKey: APPLY_REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -6936,7 +6960,7 @@ async function applyImplementationReviewWithAI(
   // applyReviewEditWithAI's own root and via Fast Forward's composite root)
   // — neither caller reported stage/model before this fix, so the row
   // carried whatever the previous stage last set, or nothing at all.
-  reportStageStartingV1(options.parentOperation, model.modelId);
+  const stageToken = reportStageStartingV1(options.parentOperation, model.modelId);
 
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
 
@@ -7099,7 +7123,7 @@ async function applyImplementationReviewWithAI(
   const prompt = parts.prompt;
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, options.parentOperation, stageToken);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
@@ -7121,6 +7145,7 @@ async function applyImplementationReviewWithAI(
       ...options,
       suppressAutoReviewDispatch: true,
       editActionKey: "applyReviewEdit.v1",
+      stageToken,
       onBusyDetail: options.parentOperation ? (d) => options.parentOperation!.report(d) : undefined,
       onWaitingForUser: options.parentOperation
         ? (w) => options.parentOperation!.setWaitingForUser(w)
@@ -8035,14 +8060,14 @@ export async function generateImplementationWithAI(
       // Notifications in-flight visibility (Step 5 audit): the standalone
       // "Generate Implementation" command never reported its model/stage —
       // the row sat blank for the whole checklist-generation provider call.
-      reportStageStartingV1(op, model.modelId);
+      const stageToken = reportStageStartingV1(op, model.modelId);
 
-      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, op, stageToken);
       if (sizeCheck === "abort" || sizeCheck === "declined") {
         return;
       }
 
-      reportStageRunningV1(op);
+      reportStageRunningV1(op, stageToken);
       const cancellationToken = op?.token ?? new vscode.CancellationTokenSource().token;
       const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
         folderUri: resolved.folderUri,
@@ -8457,7 +8482,7 @@ async function executeImplementationRun(
       // Edit path, which previously never did) — reporting it here once
       // covers every caller uniformly. Redundant with the direct caller's own
       // report, which is harmless: reportActivity replaces, never appends.
-      reportStageRunningV1(options.parentOperation);
+      reportStageRunningV1(options.parentOperation, options.stageToken);
       // A claimed summary-only continuation dispatches in TEXT mode — edit
       // permissions actually withheld (Part 2 item 4), never an edit run
       // carrying only a no-edits instruction. The re-probe against the model
@@ -8568,7 +8593,8 @@ async function executeImplementationRun(
   // timer keeps counting through this update.
   if (!result.filesChangedUnknown && result.filesChanged.length > 0) {
     options.parentOperation?.reportActivity(
-      `${result.filesChanged.length} file${result.filesChanged.length === 1 ? "" : "s"} changed`
+      `${result.filesChanged.length} file${result.filesChanged.length === 1 ? "" : "s"} changed`,
+      { stageToken: options.stageToken }
     );
   }
 
@@ -9836,6 +9862,12 @@ async function executeImplementationRun(
             result.storedModelId ? attributionModelLabel(result.storedModelId) : undefined
           )
         : summaryText;
+      // Coarse label at an explicit boundary: the round's provider call has
+      // already returned by this point, so "running" no longer describes
+      // what's happening — this write (plus the checklist-merge and
+      // artifact bookkeeping below) is the last visible activity before the
+      // stage ends and the terminal notification takes over.
+      options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
       await writeTextFile(summaryUri, `${signedSummary}\n`);
 
       // Carry this round's checkbox progress back into the plan of record.
@@ -10695,7 +10727,7 @@ export async function runImplementationWithAI(
     lockKey,
     { label: "Run Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "run-implementation", cancellable: true },
     async (op) => {
-    reportStageStartingV1(op, model.modelId);
+    const stageToken = reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
     try {
@@ -10732,7 +10764,7 @@ export async function runImplementationWithAI(
       // (6392c9ff…-1, narrowed): without this, the row sat on "starting"
       // with the Implementation model for the whole checklist-generation
       // provider call below, which has its own resolved model and duration.
-      op.reportActivity("generating implementation checklist");
+      op.reportActivity("generating implementation checklist", { stageToken });
       const checklistWorkspace = resolveOwnerWorkspace(resolved.progress);
       if (!checklistWorkspace) {
         NotificationRouter.showError(
@@ -10768,7 +10800,7 @@ export async function runImplementationWithAI(
         );
         return;
       }
-      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);
+      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel, 0, op, stageToken);
       if (checklistSizeCheck === "abort" || checklistSizeCheck === "declined") {
         return;
       }
@@ -10789,14 +10821,19 @@ export async function runImplementationWithAI(
         async (checklistOp) => {
           // `setModel`/`reportActivity` are addressed to `op` (the root),
           // not `checklistOp` (a child) — only root operations render a row
-          // (statusView.ts `getRootOperations`), and `setModel` does not
-          // bubble to the root the way `reportActivity`/`report` do. Without
-          // this, the checklist provider's own resolved model (which can
-          // differ from the main implementation model when a fallback is
-          // active — see the `continuationOwedAtEntry` comment above) never
-          // reached the visible row.
+          // (statusView.ts `getRootOperations`). `setModel` now bubbles a
+          // child's call up to its root the same way `reportActivity`/`report`
+          // already do (TaskOperationRegistry.setModel), but this call site
+          // still addresses `op` directly since it already holds the root
+          // handle — bubbling exists as a safety net for callers that only
+          // have a child handle in scope, not license to add indirection
+          // here. Without reporting the checklist provider's own resolved
+          // model at all (which can differ from the main implementation
+          // model when a fallback is active — see the
+          // `continuationOwedAtEntry` comment above), it never reached the
+          // visible row.
           op.setModel?.(checklistModelId);
-          op.reportActivity("running");
+          op.reportActivity("running", { stageToken });
           const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
             folderUri: resolved.folderUri,
             workspaceUri: checklistWorkspace.uri,
@@ -11168,7 +11205,7 @@ export async function runImplementationWithAI(
     });
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
-    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, op, stageToken);
     if (sizeCheck === "abort" || sizeCheck === "declined") {
       return;
     }
@@ -11177,7 +11214,7 @@ export async function runImplementationWithAI(
       ? resolved.progress.currentStage
       : "impl";
 
-    reportStageRunningV1(op);
+    reportStageRunningV1(op, stageToken);
     await executeImplementationRun(
       extensionUri,
       resolved.folderUri,
@@ -11190,6 +11227,7 @@ export async function runImplementationWithAI(
         onBusyDetail: (d) => op.report(d),
         onWaitingForUser: (w) => op.setWaitingForUser(w),
         parentOperation: op,
+        stageToken,
         followUpReviewMode,
         chatViewProvider,
         templateName: dispatchedTemplateName,

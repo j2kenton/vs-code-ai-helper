@@ -10,6 +10,7 @@ import {
   setLargeTokenRequestWarningEnabled,
 } from "../config/settings";
 import { NotificationRouter } from "./notificationRouter";
+import { TaskOperationHandle } from "./taskOperations";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -33,13 +34,26 @@ import { NotificationRouter } from "./notificationRouter";
  * failure), discloses that in the confirmation text — the dialog otherwise
  * names only `providerLabel`, which is misleading once the same prompt can
  * silently fan out to other providers' quotas afterward.
+ *
+ * `operation`, when supplied, reports "reading context (N KB)" on the
+ * caller's Notifications row using the byte size this function already
+ * computes for its own threshold checks — no new size computation is
+ * introduced. Preserves whatever elapsed origin the stage's own
+ * `reportStageStartingV1` set; this is a coarse label, not a stage
+ * transition. `stageToken`, when supplied (the value `reportStageStartingV1`
+ * returned for this stage), guards the report against landing after a newer
+ * stage has already superseded it — see
+ * `TaskOperationHandle.reportActivity`'s doc comment.
  */
 export async function checkAndConfirmPromptSize(
   prompt: string,
   providerLabel: string,
-  backupProviderCount = 0
+  backupProviderCount = 0,
+  operation?: TaskOperationHandle,
+  stageToken?: number
 ): Promise<"ok" | "confirmed" | "declined" | "abort"> {
   const bytes = measurePromptBytes(prompt);
+  operation?.reportActivity(`reading context (${Math.round(bytes / 1024)} KB)`, { stageToken });
 
   // Hard ceiling — no override
   if (bytes > PROMPT_TOTAL_MAX_BYTES) {

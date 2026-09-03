@@ -38,13 +38,13 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   void it("defines reportStageStartingV1 and reportStageRunningV1 as thin reportActivity wrappers", () => {
     assert.match(
       source,
-      /function reportStageStartingV1\(op: TaskOperationHandle \| undefined, modelId: string \| undefined\): void \{\s*op\?\.setModel\?\.\(modelId\);\s*op\?\.reportActivity\("starting", \{ resetElapsedOrigin: true \}\);/,
-      "reportStageStartingV1 must set the model and reset the elapsed origin on every stage start"
+      /function reportStageStartingV1\(\s*op: TaskOperationHandle \| undefined,\s*modelId: string \| undefined\s*\): number \| undefined \{\s*op\?\.setModel\?\.\(modelId\);\s*return op\?\.reportActivity\("starting", \{ resetElapsedOrigin: true \}\);/,
+      "reportStageStartingV1 must set the model, reset the elapsed origin, and return the resulting stage token on every stage start"
     );
     assert.match(
       source,
-      /function reportStageRunningV1\(op: TaskOperationHandle \| undefined\): void \{\s*op\?\.reportActivity\("running"\);/,
-      "reportStageRunningV1 must report a bare 'running' activity, preserving the origin reportStageStartingV1 set"
+      /function reportStageRunningV1\(op: TaskOperationHandle \| undefined, stageToken\?: number\): void \{\s*op\?\.reportActivity\("running", \{ stageToken \}\);/,
+      "reportStageRunningV1 must report a bare 'running' activity guarded by stageToken, preserving the origin reportStageStartingV1 set"
     );
   });
 
@@ -75,7 +75,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const setModelCall = source.indexOf("options.operation?.setModel?.(dispatchModelId);", dispatchModelIdDecl);
     assert.ok(setModelCall >= 0, "expected setModel to be called once dispatchModelId is resolved");
 
-    const runningCall = source.indexOf("reportStageRunningV1(options.operation);", setModelCall);
+    const runningCall = source.indexOf("reportStageRunningV1(options.operation, stageToken);", setModelCall);
     assert.ok(runningCall >= 0, "runReviewForFolder must report a running activity");
 
     const executeActionCalls = indexOfAll("coordinator.executeAction({");
@@ -94,7 +94,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", runImplLabel);
     assert.ok(startingIdx >= 0, "Run Implementation must report a starting activity with the resolved model");
 
-    const runningIdx = source.indexOf("reportStageRunningV1(op);", startingIdx);
+    const runningIdx = source.indexOf("reportStageRunningV1(op, stageToken);", startingIdx);
     assert.ok(runningIdx >= 0, "Run Implementation must report a running activity before dispatch");
 
     const executeRunIdx = source.indexOf("await executeImplementationRun(", runningIdx);
@@ -142,13 +142,16 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     // Review blocker 6392c9ff…-1 (narrowed): the checklist-generation
     // provider call has its own resolved model and can run for real time,
     // but only root operations render a Notifications row (StatusTreeProvider
-    // reads `getRootOperations()`) and `setModel` does not bubble to the
-    // root the way `reportActivity`/`report` do — so the checklist phase
-    // must address `op` (the root), never `checklistOp` (its child).
+    // reads `getRootOperations()`). `setModel` now bubbles a child's call up
+    // to its root (TaskOperationRegistry.setModel), same as `reportActivity`;
+    // this test still pins the more direct convention of addressing `op`
+    // (the root) explicitly here, since bubbling is a safety net for other
+    // callers, not license to add indirection at a call site that already
+    // holds the root handle.
     const needsChecklistIdx = source.indexOf("if (needsChecklist) {");
     assert.ok(needsChecklistIdx >= 0, "expected the needsChecklist branch");
 
-    const coarseLabelIdx = source.indexOf('op.reportActivity("generating implementation checklist");', needsChecklistIdx);
+    const coarseLabelIdx = source.indexOf('op.reportActivity("generating implementation checklist", { stageToken });', needsChecklistIdx);
     assert.ok(coarseLabelIdx >= 0, "expected a coarse-label activity report at the top of the checklist branch");
 
     const checklistOpCallbackIdx = source.indexOf("async (checklistOp) => {", coarseLabelIdx);
@@ -157,7 +160,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
 
     const setModelIdx = source.indexOf("op.setModel?.(checklistModelId);", checklistOpCallbackIdx);
     assert.ok(setModelIdx >= 0, "expected the checklist model to be reported via the root operation handle");
-    const runningIdx = source.indexOf('op.reportActivity("running");', setModelIdx);
+    const runningIdx = source.indexOf('op.reportActivity("running", { stageToken });', setModelIdx);
     assert.ok(runningIdx >= 0, "expected a running activity report once the checklist model is known");
 
     const invokeIdx = source.indexOf("await invokeGenerateImplementationActionV1({", runningIdx);
@@ -189,7 +192,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const startingIdx = source.indexOf("reportStageStartingV1(op, modelId);", modelIdDecl);
     assert.ok(startingIdx >= 0, "expected a starting report once the plan-stage model is resolved");
 
-    const runningIdx = source.indexOf("reportStageRunningV1(op);", startingIdx);
+    const runningIdx = source.indexOf("reportStageRunningV1(op, stageToken);", startingIdx);
     assert.ok(runningIdx >= 0, "expected a running report before dispatch");
 
     const executeActionIdx = source.indexOf("await coordinator.executeAction({", runningIdx);
@@ -213,7 +216,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", modelDecl);
     assert.ok(startingIdx >= 0, "expected a starting report once the model is resolved");
 
-    const runningIdx = source.indexOf("reportStageRunningV1(op);", startingIdx);
+    const runningIdx = source.indexOf("reportStageRunningV1(op, stageToken);", startingIdx);
     assert.ok(runningIdx >= 0, "expected a running report before dispatch");
 
     const invokeIdx = source.indexOf("await invokeGenerateImplementationActionV1({", runningIdx);
@@ -263,7 +266,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const tryIdx = source.indexOf("try {", fnStart);
     assert.ok(tryIdx >= 0, "expected the dispatch try block inside withProgress");
 
-    const runningIdx = source.indexOf("reportStageRunningV1(options.parentOperation);", tryIdx);
+    const runningIdx = source.indexOf("reportStageRunningV1(options.parentOperation, options.stageToken);", tryIdx);
     assert.ok(runningIdx >= 0, "expected a running report addressed to options.parentOperation");
 
     const dispatchIdx = source.indexOf("result = await runImplementationOrSealedV1({", runningIdx);

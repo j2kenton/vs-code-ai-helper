@@ -469,7 +469,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         detail: op.detail,
         cancellable: op.cancellable,
         waitingForUser: op.waitingForUser,
-        stage: op.stage,
+        // Display-only: tracks whichever nested sub-stage (e.g. the
+        // Implementation edit inside a running Apply Review Edit) is
+        // actually running, without touching the root's own persisted
+        // `stage` field — see TaskOperationRegistry.getDisplayStage's doc
+        // comment for why this must stay a separate call from
+        // getRootOperations() above.
+        stage: taskOperations.getDisplayStage(op.id),
         operationKind: op.kind,
         modelId: op.modelId,
         activity: op.activity,

@@ -411,6 +411,158 @@ void describe("runTrackedOperation", () => {
       assert.doesNotThrow(() => op.reportActivity("running", { resetElapsedOrigin: true }));
       assert.deepEqual(taskOperations.getTaskOperations(taskPath), []);
     });
+
+    void it("returns an incrementing stage-generation token on every resetElapsedOrigin call, unchanged by a plain repaint", () => {
+      const taskPath = `/tmp/rto-stagegen-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      try {
+        const startToken = op.reportActivity("starting", { resetElapsedOrigin: true });
+        assert.equal(typeof startToken, "number");
+
+        const repaintToken = op.reportActivity("reading context (12 KB)");
+        assert.equal(repaintToken, startToken, "a coarse label update must not bump the stage generation");
+
+        const nextStageToken = op.reportActivity("running", { resetElapsedOrigin: true });
+        assert.notEqual(nextStageToken, startToken, "a genuine stage transition must bump the generation");
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("stageToken guards a stale report from overwriting a newer stage on the same root", () => {
+      // Plan Part II: "late context, provider, count, or check callbacks
+      // cannot overwrite a newer stage" — simulates a slow context-size
+      // check whose reportActivity call resolves AFTER the root has already
+      // moved on to a subsequent stage.
+      const taskPath = `/tmp/rto-stagegen-stale-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      try {
+        const implementationToken = op.reportActivity("starting", { resetElapsedOrigin: true });
+
+        // A newer stage begins before the late callback below fires.
+        const runningToken = op.reportActivity("running", { resetElapsedOrigin: true });
+        assert.notEqual(runningToken, implementationToken);
+
+        // The stale Implementation-stage callback finally resolves, carrying
+        // the token it captured before the transition above.
+        const staleReturn = op.reportActivity("reading context (500 KB)", {
+          stageToken: implementationToken,
+        });
+
+        const after = taskOperations.getTaskOperations(taskPath)[0];
+        assert.equal(after?.activity, "running", "the stale report must not overwrite the newer stage's row");
+        assert.equal(staleReturn, runningToken, "a dropped stale call still reports the current generation");
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("stageToken matching the current generation still applies the report", () => {
+      const taskPath = `/tmp/rto-stagegen-current-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      try {
+        const token = op.reportActivity("starting", { resetElapsedOrigin: true });
+        op.reportActivity("reading context (12 KB)", { stageToken: token });
+        assert.equal(taskOperations.getTaskOperations(taskPath)[0]?.activity, "reading context (12 KB)");
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("repeated and overlapping reportActivity calls (including clearing to undefined) are idempotent", () => {
+      // Plan Part II: "confirm clear/removal of activity state remains
+      // idempotent under repeated or overlapping calls" — reportActivity is a
+      // pure overwrite of op.activity/op.activityStartedAt, so calling it
+      // twice with the same arguments (or clearing with undefined) must never
+      // throw, duplicate state, or leave the row in a different place than a
+      // single call would.
+      const taskPath = `/tmp/rto-activity-idempotent-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root" });
+      assert.ok(op);
+      try {
+        op.reportActivity("running", { resetElapsedOrigin: true });
+        op.reportActivity("running", { resetElapsedOrigin: false });
+        op.reportActivity("running");
+        const repeated = taskOperations.getTaskOperations(taskPath)[0];
+        assert.equal(repeated?.activity, "running");
+        assert.equal(taskOperations.getTaskOperations(taskPath).length, 1, "no duplicate rows from repeated reports");
+
+        // Clearing is itself idempotent.
+        op.reportActivity(undefined);
+        op.reportActivity(undefined);
+        const cleared = taskOperations.getTaskOperations(taskPath)[0];
+        assert.equal(cleared?.activity, undefined);
+        assert.equal(taskOperations.getTaskOperations(taskPath).length, 1);
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("routes a child's setModel call onto the root row, mirroring reportActivity/setResultTargetUri", async () => {
+      // Review blocker (2026-09-03): applyImplementationReviewWithAI is
+      // dispatched through a CHILD of Apply Review Edit's root (the
+      // "Applying implementation review" runTrackedOperation), and calls
+      // setModel on that child handle. Before this fix, setModel mutated
+      // only the child's own snapshot, which getRootOperations() never
+      // surfaces (StatusOperationNode.modelId is read from the root row
+      // only) — the model silently never appeared in Notifications.
+      const taskPath = `/tmp/rto-setmodel-child-${Math.random()}`;
+      await runTrackedOperation(taskPath, { label: "Root" }, async (root) => {
+        await runTrackedOperation(taskPath, { parent: root, label: "Child" }, (child) => {
+          child.setModel?.("claude-cli:sonnet@high");
+          const rootRow = taskOperations.getRootOperations().find((op) => op.id === root.id);
+          assert.equal(rootRow?.modelId, "claude-cli:sonnet@high");
+          return Promise.resolve();
+        });
+      });
+    });
+  });
+
+  void describe("getDisplayStage (in-flight Notifications stage)", () => {
+    void it("falls back to the root's own stage when no descendant declares one", () => {
+      const taskPath = `/tmp/rto-display-stage-root-${Math.random()}`;
+      const op = taskOperations.begin(taskPath, { label: "Root", stage: "impl-high-review" });
+      assert.ok(op);
+      try {
+        assert.equal(taskOperations.getDisplayStage(op.id), "impl-high-review");
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("surfaces a running descendant's stage on the root row, without changing the root's own persisted stage", async () => {
+      // Review blocker (2026-09-03): Apply Review Edit's root registers with
+      // the review-target stage (e.g. "impl-high-review") and never changes
+      // it, even while an internal child actually runs the "impl" edit —
+      // so the Notifications row read "High-Level Code Review" the whole
+      // time an Implementation edit was in flight. getDisplayStage must
+      // reflect the active child's stage for DISPLAY while getRootOperations
+      // (and therefore the persisted SerializedOperation) keeps the root's
+      // own stage untouched.
+      const taskPath = `/tmp/rto-display-stage-child-${Math.random()}`;
+      await runTrackedOperation(
+        taskPath,
+        { label: "Apply Review", stage: "impl-high-review" },
+        async (root) => {
+          await runTrackedOperation(
+            taskPath,
+            { parent: root, label: "Applying implementation review", stage: "impl" },
+            (child) => {
+              assert.equal(taskOperations.getDisplayStage(root.id), "impl");
+              const rootRow = taskOperations.getRootOperations().find((op) => op.id === root.id);
+              assert.equal(rootRow?.stage, "impl-high-review", "the persisted/root stage must stay untouched");
+              assert.ok(child, "child registered");
+              return Promise.resolve();
+            }
+          );
+          // Once the child ends, display falls back to the root's own stage again.
+          assert.equal(taskOperations.getDisplayStage(root.id), "impl-high-review");
+        }
+      );
+    });
   });
 
   void describe("onDidChange persistenceRelevant flagging", () => {

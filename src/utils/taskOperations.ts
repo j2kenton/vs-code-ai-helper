@@ -76,7 +76,12 @@ export interface TaskOperationHandle {
   /** Present when the operation was registered with `cancellable: true`. */
   readonly token?: vscode.CancellationToken;
   report(detail: string | undefined): void;   // live-row sub-text, e.g. "waiting for your answer"
-  /** Records the resolved model for live task-status surfaces when known. */
+  /**
+   * Records the resolved model for live task-status surfaces when known.
+   * Always resolves to the ROOT operation, same as setResultTargetUri and
+   * reportActivity, so a model reported from a child handle still surfaces
+   * on the one Notifications row a composite renders.
+   */
   setModel?(modelId: string | undefined): void;
   /**
    * Mark this operation as blocked on the user, not doing background work —
@@ -112,8 +117,25 @@ export interface TaskOperationHandle {
    * it on a genuine stage transition. Omitted or `false` preserves the
    * existing origin (a model/count/label update within the same activity),
    * so the displayed timer never jumps backwards on a routine repaint.
+   *
+   * Returns the root's current stage generation (bumped by every
+   * `resetElapsedOrigin: true` call, including this one), or `undefined` if
+   * the operation no longer resolves. Callers that kick off async work
+   * BEFORE a stage transition (e.g. a prompt-size dialog, a file-count
+   * computation) can capture this and pass it back as `stageToken` on their
+   * own later `reportActivity` call — see that option's doc comment.
+   *
+   * `stageToken`, when supplied, makes this call a no-op (no mutation, no
+   * change event) if the root has since moved to a NEWER stage generation
+   * than the one the caller captured — guarding against a late callback
+   * from a stage that has already been superseded overwriting the row with
+   * stale text. Irrelevant to genuine stage transitions themselves, which
+   * always win (never pass `stageToken` alongside `resetElapsedOrigin`).
    */
-  reportActivity(activity: string | undefined, options?: { resetElapsedOrigin?: boolean }): void;
+  reportActivity(
+    activity: string | undefined,
+    options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+  ): number | undefined;
 }
 
 export interface TaskOperationSnapshot {
@@ -178,6 +200,8 @@ interface MutableOperation {
   modelId?: string;
   activity?: string;
   activityStartedAt?: number;
+  /** See TaskOperationHandle.reportActivity's `stageToken` doc comment. */
+  stageGeneration: number;
   exclusive: boolean;
   kind?: OperationKind;
   parentId?: string;
@@ -372,6 +396,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       stage: spec.stage,
       taskName,
       startedAt,
+      stageGeneration: 0,
       exclusive,
       detail: undefined,
       kind: spec.kind,
@@ -408,8 +433,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
         this.triggerChange(true);
       },
       setModel: (modelId: string | undefined) => {
-        operation.modelId = modelId;
-        this.triggerChange(true);
+        this.setModel(id, modelId);
       },
       setWaitingForUser: (waiting: boolean) => {
         operation.waitingForUser = waiting;
@@ -418,13 +442,44 @@ export class TaskOperationRegistry implements vscode.Disposable {
       setResultTargetUri: (uri: vscode.Uri) => {
         this.setResultTargetUri(id, uri);
       },
-      reportActivity: (activity: string | undefined, options?: { resetElapsedOrigin?: boolean }) => {
-        this.reportActivity(id, activity, options);
-      },
+      reportActivity: (
+        activity: string | undefined,
+        options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+      ) => this.reportActivity(id, activity, options),
     };
 
     this.triggerChange(true);
     return handle;
+  }
+
+  /**
+   * Record the resolved model for `id`'s ROOT operation (resolved by walking
+   * parentId, same as setResultTargetUri/reportActivity), so a model
+   * reported from a nested child stage (e.g. applyImplementationReviewWithAI,
+   * dispatched through a child of Apply Review Edit's root) still surfaces on
+   * the one Notifications row a composite renders, instead of being written
+   * to a child snapshot the tree view never reads (StatusOperationNode.modelId
+   * comes from getRootOperations() only). A no-op once `id` no longer
+   * resolves, same as reportActivity.
+   *
+   * Fires the change as persistence-relevant, matching every existing
+   * `setModel` call site (all of which already addressed a root directly) —
+   * `modelId` is part of the recovery snapshot's contract (see
+   * TaskOperationChangeEvent's doc comment) unlike the ephemeral `activity`.
+   */
+  setModel(id: string, modelId: string | undefined): void {
+    for (const keyMap of this.operations.values()) {
+      let op = keyMap.get(id);
+      if (!op) {continue;}
+      while (op.parentId !== undefined) {
+        const parent = keyMap.get(op.parentId);
+        if (!parent) {break;}
+        op = parent;
+      }
+      op.modelId = modelId;
+      this.triggerChange(true);
+      return;
+    }
   }
 
   /**
@@ -440,8 +495,19 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * Fires the change as NOT persistence-relevant (see
    * TaskOperationChangeEvent) — in-flight activity is ephemeral and must
    * never trigger a `state.update`.
+   *
+   * `stageToken`, when supplied and stale (does not match the root's
+   * current `stageGeneration`), makes this call a complete no-op — no
+   * mutation, no change event, not even a return-value update beyond
+   * reporting the current generation — since a newer stage transition has
+   * already superseded whatever this late callback learned. See
+   * TaskOperationHandle.reportActivity's doc comment for the full contract.
    */
-  reportActivity(id: string, activity: string | undefined, options?: { resetElapsedOrigin?: boolean }): void {
+  reportActivity(
+    id: string,
+    activity: string | undefined,
+    options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+  ): number | undefined {
     for (const keyMap of this.operations.values()) {
       let op = keyMap.get(id);
       if (!op) {continue;}
@@ -450,13 +516,20 @@ export class TaskOperationRegistry implements vscode.Disposable {
         if (!parent) {break;}
         op = parent;
       }
+      if (options?.stageToken !== undefined && options.stageToken !== op.stageGeneration) {
+        return op.stageGeneration; // Stale — a newer stage already superseded this report.
+      }
+      if (options?.resetElapsedOrigin) {
+        op.stageGeneration += 1;
+      }
       op.activity = activity;
       if (options?.resetElapsedOrigin || op.activityStartedAt === undefined) {
         op.activityStartedAt = Date.now();
       }
       this.triggerChange(false);
-      return;
+      return op.stageGeneration;
     }
+    return undefined;
   }
 
   /**
@@ -673,6 +746,40 @@ export class TaskOperationRegistry implements vscode.Disposable {
       }
     }
     return best?.detail;
+  }
+
+  /**
+   * Display-only stage for `rootId`'s Notifications row: the `stage` of the
+   * newest running descendant that declares one, falling back to the root's
+   * own `stage` when no descendant does. Mirrors `newestDescendantDetail`'s
+   * walk, but is deliberately a SEPARATE method from `getRootOperations()` —
+   * it must never be folded into the snapshot that `serializeOperation`
+   * persists, since the recovery/interrupted-restore contract requires the
+   * persisted `stage` to stay the composite's own registered value, not a
+   * transient child's (see StatusTreeProvider's interrupted-restore tests).
+   * Callers needing this for display (StatusTreeProvider.getChildren) must
+   * call it separately from getRootOperations().
+   */
+  getDisplayStage(rootId: string): TaskStage | undefined {
+    for (const keyMap of this.operations.values()) {
+      const root = keyMap.get(rootId);
+      if (!root) {continue;}
+      const ops = Array.from(keyMap.values());
+      let best: MutableOperation | undefined;
+      const frontier = [rootId];
+      while (frontier.length > 0) {
+        const parentId = frontier.pop()!;
+        for (const op of ops) {
+          if (op.parentId !== parentId) {continue;}
+          if (op.stage !== undefined && (!best || op.startedAt >= best.startedAt)) {
+            best = op;
+          }
+          frontier.push(op.id);
+        }
+      }
+      return best?.stage ?? root.stage;
+    }
+    return undefined;
   }
 
   /**
