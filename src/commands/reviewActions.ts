@@ -15,6 +15,7 @@ import {
   hasActiveOperationTargetingStage,
   reportStageStartingV1,
   reportStageRunningV1,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import {
   EscalationKind,
@@ -5470,7 +5471,7 @@ export async function runReviewWithAI(
     {
       label: "Review",
       stage: resolved.progress.currentStage,
-      taskName: resolved.progress.displayName,
+      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
       kind: "review",
       cancellable: true,
     },
@@ -5745,7 +5746,7 @@ export async function applyReviewWithAI(
   } else {
     await runTrackedOperation(
       lockKey,
-      { label: "Apply Review", stage, taskName: resolved.progress.displayName, kind: "apply-review", cancellable: true },
+      { label: "Apply Review", stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true },
       runApply
     );
   }
@@ -5985,7 +5986,7 @@ export async function fastForwardReviewWithAI(
     {
       label: "Fast Forward Review",
       stage: resolved.progress.currentStage,
-      taskName: resolved.progress.displayName,
+      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
       kind: "fast-forward",
       cancellable: true,
     },
@@ -7984,8 +7985,18 @@ export async function generateImplementationWithAI(
   const lockKey = resolved.folderUri.fsPath;
   const opResult = await runTrackedOperation(
     lockKey,
-    { label: "Generate Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "generate-implementation", cancellable: true },
+    { label: "Generate Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "generate-implementation", cancellable: true },
     async (op) => {
+      // Notifications in-flight visibility (Step 5/6 audit, review defect):
+      // publish "starting" immediately, before ANY await — including plan
+      // reads and, critically, model resolution and
+      // checkImplementationAvailabilityForModel below, which can run real
+      // Copilot/CLI-existence probes and are not fast. Leaving the row blank
+      // until those finish reintroduces exactly the ambiguity this task
+      // exists to remove. The model attaches separately via setModel once
+      // resolved (see below), which never resets the origin this call sets.
+      const stageToken = op?.reportActivity("starting", { resetElapsedOrigin: true });
+
       const implementationUri = getCanonicalImplementationUri(resolved.folderUri);
       let planFinalContent = await readNonEmptyText(implementationUri);
       if (!planFinalContent) {
@@ -8011,17 +8022,6 @@ export async function generateImplementationWithAI(
         return;
       }
 
-      const contextPackContent = await generateContextPack(
-        resolved.folderUri,
-        workspaceRoot.uri
-      );
-
-      const prompt = await renderPromptTemplate(
-        extensionUri,
-        "create-implementation.md",
-        { contextPack: contextPackContent, plan: planFinalContent }
-      );
-
       const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
       if (!model.modelId) {
         NotificationRouter.showError("No model configured for Implementation stage.");
@@ -8037,16 +8037,29 @@ export async function generateImplementationWithAI(
         );
         return;
       }
-      // Notifications in-flight visibility (Step 5 audit): the standalone
-      // "Generate Implementation" command never reported its model/stage —
-      // the row sat blank for the whole checklist-generation provider call.
-      const stageToken = reportStageStartingV1(op, model.modelId);
+      // Attach the resolved model now that it (and its availability) are
+      // known. Uses setModel alone, not reportStageStartingV1, so the
+      // elapsed origin the "starting" report set above is never reset —
+      // the row has been counting since this operation began, through the
+      // model/availability probes above, not just from this point.
+      op?.setModel?.(model.modelId);
+
+      const contextPackContent = await generateContextPack(
+        resolved.folderUri,
+        workspaceRoot.uri
+      );
       // Sized from the context pack actually assembled above — not the
       // rendered prompt below, which mixes in template boilerplate and (at
       // other call sites) shrinkable review/implementation-notes content.
       op?.reportActivity(
         `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,
         { stageToken }
+      );
+
+      const prompt = await renderPromptTemplate(
+        extensionUri,
+        "create-implementation.md",
+        { contextPack: contextPackContent, plan: planFinalContent }
       );
 
       const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
@@ -10712,7 +10725,7 @@ export async function runImplementationWithAI(
   let redirectAfterOperationV1: { reviewStage: TaskStage; reason: string } | undefined;
   await runTrackedOperation(
     lockKey,
-    { label: "Run Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "run-implementation", cancellable: true },
+    { label: "Run Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "run-implementation", cancellable: true },
     async (op) => {
     const stageToken = reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
@@ -11510,7 +11523,7 @@ export async function applyReviewEditWithAI(
     {
       label: "Apply Review",
       stage,
-      taskName: resolved.progress.displayName,
+      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
       kind: "apply-review",
       cancellable: true,
     },
@@ -12316,7 +12329,7 @@ export async function resumeApplyReviewInteractionV1(
     if (workspaceFolder) {
       await runTrackedOperation(
         taskFolderUri.fsPath,
-        { label: "Re-running review", stage, taskName: ownedTask.progress.displayName, kind: "review" },
+        { label: "Re-running review", stage, taskName: resolveWorkflowRootTaskName(ownedTask.progress.displayName, taskFolderUri.fsPath), kind: "review" },
         (op) =>
           runReviewForFolder(
             extensionUri,

@@ -6,7 +6,7 @@ import { previousVersionUri, hasPreviousVersion } from "../utils/artifactBackups
 import { performJournaledRevertSwap, RevertArtifactMutatedError, revertJournalUri } from "../utils/artifactRevertJournal";
 import { resolveCurrentPlanUri, withPlanFileWriteLockV1, markOwnSaveInFlightV1, clearOwnSaveInFlightV1 } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runTrackedOperation } from "../utils/taskOperations";
+import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
 import {
   readRedoSidecar,
   isRedoAvailableFromRecord,
@@ -102,7 +102,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
     {
       label: kind === "revert" ? "Revert Stage Changes" : "Redo Stage Changes",
       stage: node.stage,
-      taskName: node.task.progress?.displayName ?? node.task.folderName,
+      taskName: resolveWorkflowRootTaskName(node.task.progress?.displayName, node.task.folderUri.fsPath),
     },
     async () => {
       const artifactName = artifact.path.split("/").pop() ?? artifact.fsPath;
@@ -355,7 +355,14 @@ export function registerViewStageChangesCommands(context: vscode.ExtensionContex
     // the row's has-backup context token).
     await runTrackedOperation(
       node.task.folderUri.fsPath,
-      { label: "Delete Previous Version", stage: node.stage, taskName: node.task.progress?.displayName ?? node.task.folderName },
+      {
+        label: "Delete Previous Version",
+        stage: node.stage,
+        taskName: resolveWorkflowRootTaskName(
+          node.task.progress?.displayName ?? node.task.folderName,
+          node.task.folderUri.fsPath
+        ),
+      },
       async () => {
         await vscode.workspace.fs.delete(previousVersionUri(artifact), { useTrash: true });
         await deleteRedoSidecar(artifact);

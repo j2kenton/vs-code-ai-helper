@@ -306,16 +306,34 @@ export function formatTaskNameForDisplay(taskName: string): string {
 }
 
 /**
- * Default task-folder naming scheme (`YYYY-MM-DD_task_N`) — the exact
- * shape produced when a task is never explicitly renamed, so it is also a
- * perfectly legitimate real `taskName` (every unrenamed task's `displayName
- * ?? folderName` idiom resolves to it). The registry guard below therefore
- * never inspects the resolved taskName string itself — only whether a
- * WORKFLOW ROOT's `begin()` call omitted `taskName` and let this file's own
- * `path.basename(taskPath)` default stand in for it, which is the actual
- * bug this exists to catch (see TaskOperationSpec.taskName).
+ * Default task-folder naming scheme (`YYYY-MM-DD_task_N`) — the exact shape
+ * produced when a task is never explicitly renamed (see startNewTask.ts's
+ * `nameIsDefault: true` default, which stores `displayName` as the literal
+ * folder name). That raw string is never an acceptable Notifications label:
+ * `begin()` rejects ANY workflow-root `taskName` matching it, whether it was
+ * omitted (falling through to this file's own `path.basename(taskPath)`
+ * default) or explicitly supplied by a caller that forwarded an un-renamed
+ * task's `displayName` verbatim. Callers with an un-renamed task must route
+ * the value through `resolveWorkflowRootTaskName` first, which reformats it
+ * into something that can never match this pattern.
  */
-const WORKFLOW_ROOT_FOLDER_NAME_PATTERN = /^\d{4}-\d{2}-\d{2}_task_\d+$/;
+const WORKFLOW_ROOT_FOLDER_NAME_PATTERN = /^(\d{4}-\d{2}-\d{2})_task_(\d+)$/;
+
+/**
+ * Turn a workflow root's resolved `displayName` into a Notifications-safe
+ * label that never matches `WORKFLOW_ROOT_FOLDER_NAME_PATTERN` — so
+ * `begin()`'s guard never refuses a legitimate, deliberately-resolved call
+ * for a task the user simply has not renamed yet (see the pattern's doc
+ * comment). Already-renamed tasks pass through unchanged.
+ */
+export function resolveWorkflowRootTaskName(
+  displayName: string | undefined,
+  taskFolderPath: string
+): string {
+  const name = displayName ?? path.basename(taskFolderPath);
+  const match = WORKFLOW_ROOT_FOLDER_NAME_PATTERN.exec(name);
+  return match ? `Task ${match[2]} (${match[1]})` : name;
+}
 
 export interface TaskOperationChangeEvent {
   /**
@@ -396,20 +414,20 @@ export class TaskOperationRegistry implements vscode.Disposable {
       }
     }
 
-    // Workflow roots (operations carrying a `stage`) must be given the
-    // task's real displayName by the caller — falling through to this
-    // file's own basename default is exactly the "wf10" vs
+    // Workflow roots (operations carrying a `stage`) must never surface a
+    // raw task-folder name in Notifications — that is the "wf10" vs
     // "2026-07-17_task_1" regression this task exists to prevent (see
-    // WORKFLOW_ROOT_FOLDER_NAME_PATTERN). This checks whether `taskName`
-    // was OMITTED, never the resolved string itself: a caller that
-    // explicitly resolves `displayName ?? folderName` and gets the
-    // folder-pattern string back (a task the user never renamed) is making
-    // an informed choice, not hitting the bug.
-    if (!isChild && spec.stage !== undefined && spec.taskName === undefined) {
-      const fallback = path.basename(taskPath);
-      if (WORKFLOW_ROOT_FOLDER_NAME_PATTERN.test(fallback)) {
+    // WORKFLOW_ROOT_FOLDER_NAME_PATTERN). This checks the RESOLVED name
+    // regardless of whether the caller omitted `taskName` (falling through
+    // to this file's own basename default) or explicitly forwarded an
+    // un-renamed task's `displayName` verbatim — both produce the same
+    // user-visible defect. Callers with an un-renamed task must resolve
+    // through `resolveWorkflowRootTaskName` first.
+    if (!isChild && spec.stage !== undefined) {
+      const resolvedName = spec.taskName ?? path.basename(taskPath);
+      if (WORKFLOW_ROOT_FOLDER_NAME_PATTERN.test(resolvedName)) {
         throw new Error(
-          `TaskOperationRegistry.begin: workflow root "${spec.label}" (stage "${spec.stage}") was registered without a resolved taskName — pass the task's real displayName (or displayName ?? folderName) explicitly instead of relying on the basename(taskPath) default.`
+          `TaskOperationRegistry.begin: workflow root "${spec.label}" (stage "${spec.stage}") was registered with a taskName ("${resolvedName}") that looks like a raw task-folder name — pass the result of resolveWorkflowRootTaskName(displayName, taskPath) instead.`
         );
       }
     }

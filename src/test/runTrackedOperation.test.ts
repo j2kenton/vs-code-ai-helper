@@ -16,6 +16,7 @@ import {
   showTaskBusyWarning,
   linkCancellationTokens,
   TaskOperationSnapshot,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import {
   deactivateNotificationRouter,
@@ -330,15 +331,32 @@ void describe("runTrackedOperation", () => {
       taskOperations.end(op);
     });
 
-    void it("does not throw when a caller explicitly resolves taskName, even when that value equals the folder-pattern string (an un-renamed task's real displayName)", () => {
+    void it("throws when a caller explicitly forwards an un-renamed task's displayName verbatim, even though taskName was supplied", () => {
       const taskPath = `/tmp/rto-guard-explicit-${Math.random()}`;
+      assert.throws(
+        () =>
+          taskOperations.begin(taskPath, {
+            label: "Run Implementation",
+            stage: "impl",
+            taskName: "2026-07-17_task_9",
+          }),
+        /taskName/,
+        "an explicitly-supplied taskName that still looks like a folder name must be rejected too"
+      );
+      assert.deepEqual(taskOperations.getTaskOperations(taskPath), []);
+    });
+
+    void it("does not throw when the caller routes an un-renamed task's displayName through resolveWorkflowRootTaskName first", () => {
+      const taskPath = `/tmp/rto-guard-resolved-${Math.random()}`;
+      const resolvedName = resolveWorkflowRootTaskName("2026-07-17_task_9", taskPath);
+      assert.equal(resolvedName, "Task 9 (2026-07-17)");
       const op = taskOperations.begin(taskPath, {
         label: "Run Implementation",
         stage: "impl",
-        taskName: "2026-07-17_task_9",
+        taskName: resolvedName,
       });
       assert.ok(op);
-      assert.equal(taskOperations.getTaskOperations(taskPath)[0]?.taskName, "2026-07-17_task_9");
+      assert.equal(taskOperations.getTaskOperations(taskPath)[0]?.taskName, "Task 9 (2026-07-17)");
       taskOperations.end(op);
     });
 

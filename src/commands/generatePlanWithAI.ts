@@ -41,6 +41,7 @@ import {
   TaskOperationHandle,
   reportStageStartingV1,
   reportStageRunningV1,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import {
   ensureWorkflowTaskFolderRootV1,
@@ -240,12 +241,14 @@ export async function generatePlanWithAI(
   // This is a workflow root (carries a `stage`) — the Notifications row must
   // show the task's real name, never a raw basename(taskPath) computed here
   // in the caller (that would silently reproduce the exact "wf10" vs
-  // "2026-07-17_task_1" regression this task exists to prevent, and would
-  // bypass taskOperations.begin's own workflow-root guard since it only
-  // catches an OMITTED taskName, not an explicitly-supplied one). If the
-  // inventory hasn't indexed this task yet (e.g. a race right after
-  // creation), refresh once and fail safely rather than falling through to
-  // a synthesized name.
+  // "2026-07-17_task_1" regression this task exists to prevent). An
+  // un-renamed task's displayName IS the raw folder name, which
+  // taskOperations.begin's workflow-root guard now rejects unconditionally
+  // (explicit or not) — resolveWorkflowRootTaskName reformats it so the
+  // guard never refuses a legitimate, un-renamed task. If the inventory
+  // hasn't indexed this task yet (e.g. a race right after creation),
+  // refresh once and fail safely rather than falling through to a
+  // synthesized name.
   let resolvedForDisplay = inventory.getTaskByPath(lockKey);
   if (!resolvedForDisplay) {
     await inventory.refresh();
@@ -257,7 +260,10 @@ export async function generatePlanWithAI(
     );
     return;
   }
-  const taskName = resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName;
+  const taskName = resolveWorkflowRootTaskName(
+    resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName,
+    lockKey
+  );
   const result = await runTrackedOperation(
     lockKey,
     { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true },

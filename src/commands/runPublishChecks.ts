@@ -14,6 +14,7 @@ import {
   runTrackedOperation,
   taskOperations,
   TaskOperationHandle,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { normalizePath } from "../utils/taskRoot";
@@ -152,7 +153,10 @@ export async function runPublishChecks(
       {
         label: "Publish Checks",
         stage: "publish",
-        taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
+        taskName: resolveWorkflowRootTaskName(
+          resolvedTask.progress.displayName ?? resolvedTask.folderName,
+          resolvedTask.taskFolderPath
+        ),
         kind: "completion-checks",
         parent: parentOperation,
       },

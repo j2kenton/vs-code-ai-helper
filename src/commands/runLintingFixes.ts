@@ -35,6 +35,7 @@ import {
   runTrackedOperation,
   taskOperations,
   TaskOperationHandle,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 
 /**
@@ -263,7 +264,16 @@ export async function runLintingFixes(
 
   await runTrackedOperation(
     lockKey,
-    { label: "Linting Fixes", stage: "publish", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "lint-fixes", parent: parentOperation },
+    {
+      label: "Linting Fixes",
+      stage: "publish",
+      taskName: resolveWorkflowRootTaskName(
+        resolvedTask.progress.displayName ?? resolvedTask.folderName,
+        resolvedTask.taskFolderPath
+      ),
+      kind: "lint-fixes",
+      parent: parentOperation,
+    },
     async () => {
       await vscode.window.withProgress(
         {

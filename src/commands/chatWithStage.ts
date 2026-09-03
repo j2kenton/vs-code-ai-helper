@@ -18,7 +18,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runTrackedOperation } from "../utils/taskOperations";
+import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
 import {
   readTextIfExists,
   statIfExists,
@@ -403,7 +403,7 @@ export async function chatWithStage(
     await runTrackedOperation(lockKey, {
       label: "Chat",
       stage: targetStage,
-      taskName: task.progress.displayName ?? task.folderName,
+      taskName: resolveWorkflowRootTaskName(task.progress.displayName ?? task.folderName, task.taskFolderPath),
       exclusive: false,
       kind: "chat-send",
       cancellable: true,

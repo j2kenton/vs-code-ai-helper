@@ -58,7 +58,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     );
     assert.match(
       source,
-      /reportStageStartingV1,\s*reportStageRunningV1,?\s*\}\s*from\s*"\.\.\/utils\/taskOperations"/,
+      /reportStageStartingV1,\s*reportStageRunningV1,[\s\S]{0,80}\}\s*from\s*"\.\.\/utils\/taskOperations"/,
       "reviewActions.ts must import both helpers from taskOperations.ts rather than redefine them"
     );
   });
@@ -218,27 +218,58 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     );
   });
 
-  void it("reports 'starting'/'running' for the standalone Generate Implementation command", () => {
+  void it("reports 'starting'/model/'running' for the standalone Generate Implementation command", () => {
     // Step 5 audit gap: generateImplementationWithAI resolves its own model
     // and dispatches via invokeGenerateImplementationActionV1, but previously
     // never reported it, leaving the row blank for the whole provider call.
+    //
+    // Review defect (new, 2026-09-04): the fix first landed with the
+    // "starting" report AFTER resolveFreshModelForStage and
+    // checkImplementationAvailabilityForModel — both real async probes
+    // (Copilot/CLI-existence checks) — so the row stayed blank through
+    // exactly the work this task exists to surface. "starting" must now be
+    // the first statement in the operation callback, before any await; the
+    // model attaches separately via setModel once resolved, which must not
+    // reset the elapsed origin the initial report set.
     const fnStart = source.indexOf("export async function generateImplementationWithAI(");
     assert.ok(fnStart >= 0, "expected generateImplementationWithAI");
 
+    const startingIdx = source.indexOf('op?.reportActivity("starting", { resetElapsedOrigin: true });', fnStart);
+    assert.ok(startingIdx >= 0, "expected an immediate starting report at the top of the operation callback");
+
     const modelDecl = source.indexOf('const model = await resolveFreshModelForStage(resolved.folderUri, "impl");', fnStart);
     assert.ok(modelDecl >= 0, "expected the impl-stage model resolution");
+    assert.ok(startingIdx < modelDecl, "the starting report must precede model resolution, not follow it");
 
-    const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", modelDecl);
-    assert.ok(startingIdx >= 0, "expected a starting report once the model is resolved");
+    const availabilityCheckIdx = source.indexOf(
+      "await checkImplementationAvailabilityForModel(",
+      modelDecl
+    );
+    assert.ok(availabilityCheckIdx >= 0, "expected the impl-stage availability check");
 
-    const runningIdx = source.indexOf("reportStageRunningV1(op, stageToken);", startingIdx);
+    const setModelIdx = source.indexOf("op?.setModel?.(model.modelId);", availabilityCheckIdx);
+    assert.ok(setModelIdx >= 0, "expected the model to attach via setModel once resolved and available");
+    assert.ok(
+      availabilityCheckIdx < setModelIdx,
+      "the model must attach only after the availability check has passed"
+    );
+    assert.ok(
+      !source.slice(setModelIdx, setModelIdx + 200).includes("resetElapsedOrigin"),
+      "attaching the model after availability resolves must not reset the elapsed origin the initial starting report set"
+    );
+
+    const runningIdx = source.indexOf("reportStageRunningV1(op, stageToken);", setModelIdx);
     assert.ok(runningIdx >= 0, "expected a running report before dispatch");
 
     const invokeIdx = source.indexOf("await invokeGenerateImplementationActionV1({", runningIdx);
     assert.ok(invokeIdx >= 0, "expected the checklist provider dispatch after the running report");
     assert.ok(
-      startingIdx < runningIdx && runningIdx < invokeIdx,
-      "expected order: reportStageStartingV1(op, model.modelId) -> reportStageRunningV1(op) -> invokeGenerateImplementationActionV1"
+      startingIdx < modelDecl &&
+        modelDecl < availabilityCheckIdx &&
+        availabilityCheckIdx < setModelIdx &&
+        setModelIdx < runningIdx &&
+        runningIdx < invokeIdx,
+      "expected order: starting report -> model resolution -> availability check -> setModel -> reportStageRunningV1(op) -> invokeGenerateImplementationActionV1"
     );
   });
 
@@ -340,6 +371,58 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(sizeCheckIdx >= 0);
       assert.ok(contextIdx < reportIdx && reportIdx < sizeCheckIdx);
+    });
+
+    void it("the standalone Generate Implementation command resolves model/availability BEFORE context assembly, not after", () => {
+      // Review blocker (675820ed…-3, narrowed): the report used to sit
+      // right after generateContextPack in source order too, but only
+      // because checkAndConfirmPromptSize's own report was the boundary
+      // being tested for — model resolution, prompt rendering, and the
+      // availability check all still ran BETWEEN context assembly and the
+      // report, so the row could describe "reading context" while that
+      // later work was actually in flight. Now model/availability resolve
+      // first, so nothing but the report itself sits between context
+      // assembly finishing and the model already being attached to the row.
+      const fnStart = source.indexOf("export async function generateImplementationWithAI(");
+      assert.ok(fnStart >= 0);
+      const modelDecl = indexOfFlexible(
+        'const model = await resolveFreshModelForStage(resolved.folderUri, "impl");',
+        fnStart
+      );
+      assert.ok(modelDecl >= 0);
+      const contextIdx = indexOfFlexible(
+        "const contextPackContent = await generateContextPack( resolved.folderUri, workspaceRoot.uri );",
+        fnStart
+      );
+      assert.ok(contextIdx >= 0);
+      const promptRenderIdx = indexOfFlexible(
+        'const prompt = await renderPromptTemplate(',
+        fnStart
+      );
+      assert.ok(promptRenderIdx >= 0);
+      assert.ok(
+        modelDecl < contextIdx,
+        "model resolution must now precede context-pack assembly, not follow it"
+      );
+      assert.ok(
+        contextIdx < promptRenderIdx,
+        "prompt rendering must still follow context assembly"
+      );
+      // The reading-context report must be the very next statement after
+      // context assembly — no prompt render, model resolution, or
+      // availability check may fall between them.
+      const reportIdx = indexOfFlexible(
+        'op?.reportActivity( `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,',
+        contextIdx
+      );
+      assert.ok(reportIdx >= 0);
+      const betweenSlice = source.slice(contextIdx, reportIdx);
+      assert.ok(
+        !betweenSlice.includes("resolveFreshModelForStage") &&
+        !betweenSlice.includes("renderPromptTemplate") &&
+        !betweenSlice.includes("checkImplementationAvailabilityForModel"),
+        "no model resolution, prompt rendering, or availability check may fall between context assembly and its report"
+      );
     });
 
     void it("the implementation-checklist generation branch reports it right after its context pack resolves", () => {

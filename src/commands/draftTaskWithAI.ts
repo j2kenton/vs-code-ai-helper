@@ -20,6 +20,7 @@ import {
   taskOperations,
   TaskOperationHandle,
   TASK_NAME_WRITE_CONFLICT_KEY,
+  resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import {
   ensureWorkflowTaskFolderRootV1,
@@ -548,7 +549,7 @@ export async function draftTaskWithAI(
     // but it runs under the name captured here, so it must never overlap a
     // (non-exclusive) rename — the shared key makes begin() refuse whichever
     // side arrives second, atomically.
-    { label: "Draft Task with AI", stage: "desc", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
+    { label: "Draft Task with AI", stage: "desc", taskName: resolveWorkflowRootTaskName(resolvedTask.progress.displayName ?? resolvedTask.folderName, resolvedTask.taskFolderPath), kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
     (op) => draftTaskWithAIForResolvedTask(context, chatViewProvider, resolvedTask, op)
   );
   return result?.succeeded || undefined;
