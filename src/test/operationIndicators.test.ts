@@ -184,6 +184,40 @@ void describe("operationIndicators", () => {
       }
     });
 
+    void it("translates a running Fast Forward Review's stage the same way as a review-kind root, since it registers with the identical pre-review-stage convention", () => {
+      // Review blocker 6392c9ff…-1 (narrowed): runFastForwardReviewWithAI
+      // registers its root as `kind: "fast-forward"` with `stage:
+      // resolved.progress.currentStage` (reviewActions.ts:5987), and
+      // runReviewForFolder's initial-review dispatch reports activity
+      // straight through that root whenever no usable review exists yet
+      // (reviewActions.ts:6090) — before any nested `kind: "review"` child
+      // operation exists. Without translating "fast-forward" the same way as
+      // "review", that row showed the pre-review stage for the whole initial
+      // dispatch instead of the review actually running.
+      const fastForwardOp = taskOperations.begin("/dev/task_5", {
+        label: "Fast Forward Review",
+        stage: "impl",
+        taskName: "task_5",
+        kind: "fast-forward",
+      });
+      assert.ok(fastForwardOp);
+
+      try {
+        const children = provider.getChildren() as StatusTreeNode[];
+        const opNodes = children.filter((n) => "kind" in n && n.kind === "operation");
+        const ffNode = opNodes.find((n) => "id" in n && n.id === fastForwardOp.id);
+        assert.ok(ffNode);
+
+        const ffDescription = String(provider.getTreeItem(ffNode).description);
+        assert.ok(
+          ffDescription.startsWith("High-Level Code Review"),
+          `expected the Fast Forward row's stage segment to read "High-Level Code Review", got: ${ffDescription}`
+        );
+      } finally {
+        taskOperations.end(fastForwardOp);
+      }
+    });
+
     void it("shows the inline cancel action on a history entry only while its sourceOperationId is still a live cancellable root operation (D10)", () => {
       const op = taskOperations.begin("/dev/task_1", {
         label: "Fast Forward",

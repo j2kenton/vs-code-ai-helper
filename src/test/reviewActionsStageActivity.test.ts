@@ -137,4 +137,42 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       "the changed-file-count report must not reset the stage's elapsed origin"
     );
   });
+
+  void it("reports the checklist-generation sub-phase (coarse label, model, running) through the root operation, not the invisible checklist child operation", () => {
+    // Review blocker 6392c9ff…-1 (narrowed): the checklist-generation
+    // provider call has its own resolved model and can run for real time,
+    // but only root operations render a Notifications row (StatusTreeProvider
+    // reads `getRootOperations()`) and `setModel` does not bubble to the
+    // root the way `reportActivity`/`report` do — so the checklist phase
+    // must address `op` (the root), never `checklistOp` (its child).
+    const needsChecklistIdx = source.indexOf("if (needsChecklist) {");
+    assert.ok(needsChecklistIdx >= 0, "expected the needsChecklist branch");
+
+    const coarseLabelIdx = source.indexOf('op.reportActivity("generating implementation checklist");', needsChecklistIdx);
+    assert.ok(coarseLabelIdx >= 0, "expected a coarse-label activity report at the top of the checklist branch");
+
+    const checklistOpCallbackIdx = source.indexOf("async (checklistOp) => {", coarseLabelIdx);
+    assert.ok(checklistOpCallbackIdx >= 0, "expected the checklist runTrackedOperation callback");
+    assert.ok(coarseLabelIdx < checklistOpCallbackIdx, "the coarse label must be reported before the checklist child operation begins");
+
+    const setModelIdx = source.indexOf("op.setModel?.(checklistModelId);", checklistOpCallbackIdx);
+    assert.ok(setModelIdx >= 0, "expected the checklist model to be reported via the root operation handle");
+    const runningIdx = source.indexOf('op.reportActivity("running");', setModelIdx);
+    assert.ok(runningIdx >= 0, "expected a running activity report once the checklist model is known");
+
+    const invokeIdx = source.indexOf("await invokeGenerateImplementationActionV1({", runningIdx);
+    assert.ok(invokeIdx >= 0, "expected the checklist provider dispatch");
+    assert.ok(
+      setModelIdx < runningIdx && runningIdx < invokeIdx,
+      "expected order: setModel(checklistModelId) -> reportActivity('running') -> invokeGenerateImplementationActionV1"
+    );
+
+    // Both calls must address `op` (the root), never `checklistOp` — a
+    // child operation's setModel/reportActivity would be invisible, since
+    // only root operations render a row.
+    const setModelLine = source.slice(setModelIdx, source.indexOf("\n", setModelIdx));
+    const runningLine = source.slice(runningIdx, source.indexOf("\n", runningIdx));
+    assert.ok(!setModelLine.includes("checklistOp."), "setModel must be called on op, not checklistOp");
+    assert.ok(!runningLine.includes("checklistOp."), "reportActivity('running') must be called on op, not checklistOp");
+  });
 });

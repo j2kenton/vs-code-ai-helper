@@ -10701,6 +10701,14 @@ export async function runImplementationWithAI(
       resolved.progress.currentStage === "impl" &&
       (resolved.progress.implReviewFiles?.length ?? 0) === 0;
     if (needsChecklist) {
+      // Coarse label at an explicit boundary (this branch is only entered
+      // once the checklist requirement is known) — preserves the elapsed
+      // origin `reportStageStartingV1` set above, per reportActivity's
+      // "coarse labels preserve origin" contract. Review blocker
+      // (6392c9ff…-1, narrowed): without this, the row sat on "starting"
+      // with the Implementation model for the whole checklist-generation
+      // provider call below, which has its own resolved model and duration.
+      op.reportActivity("generating implementation checklist");
       const checklistWorkspace = resolveOwnerWorkspace(resolved.progress);
       if (!checklistWorkspace) {
         NotificationRouter.showError(
@@ -10755,6 +10763,16 @@ export async function runImplementationWithAI(
         resolved.folderUri.fsPath,
         { parent: op, label: "Generating implementation checklist", stage: "impl", kind: "generate-implementation" },
         async (checklistOp) => {
+          // `setModel`/`reportActivity` are addressed to `op` (the root),
+          // not `checklistOp` (a child) — only root operations render a row
+          // (statusView.ts `getRootOperations`), and `setModel` does not
+          // bubble to the root the way `reportActivity`/`report` do. Without
+          // this, the checklist provider's own resolved model (which can
+          // differ from the main implementation model when a fallback is
+          // active — see the `continuationOwedAtEntry` comment above) never
+          // reached the visible row.
+          op.setModel?.(checklistModelId);
+          op.reportActivity("running");
           const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
             folderUri: resolved.folderUri,
             workspaceUri: checklistWorkspace.uri,

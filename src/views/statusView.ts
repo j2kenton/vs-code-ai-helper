@@ -312,8 +312,19 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       // convention `hasActiveOperationTargetingStage` accounts for via
       // REVIEW_TARGETS. Translate here too, so a running High-Level Code
       // Review shows "High-Level Code Review", not "Implementation".
+      // `kind: "fast-forward"` roots use the identical convention
+      // (runFastForwardReviewWithAI registers with `stage:
+      // resolved.progress.currentStage`, reviewActions.ts:5987) and
+      // `runReviewForFolder`'s initial dispatch reports activity directly
+      // through this root (reviewActions.ts:6090) whenever no usable review
+      // exists yet — review blocker 6392c9ff…-1: without this, that row
+      // showed the pre-review stage for the whole initial-review dispatch
+      // instead of the review actually running. This is display-only and
+      // does not affect `isReviewActivelyRerunningV1`, which deliberately
+      // excludes "fast-forward" for an unrelated reason (avoiding
+      // double-counting against its own nested "review"-kind child ops).
       const displayStage =
-        element.stage && element.operationKind === "review"
+        element.stage && (element.operationKind === "review" || element.operationKind === "fast-forward")
           ? REVIEW_TARGETS[element.stage] ?? element.stage
           : element.stage;
       const stageLabel = displayStage ? STAGE_DISPLAY_NAMES[displayStage] : undefined;
