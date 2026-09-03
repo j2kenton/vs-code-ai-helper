@@ -39,6 +39,8 @@ import {
   runTrackedOperation,
   taskOperations,
   TaskOperationHandle,
+  reportStageStartingV1,
+  reportStageRunningV1,
 } from "../utils/taskOperations";
 import {
   ensureWorkflowTaskFolderRootV1,
@@ -317,6 +319,13 @@ interface ResolvedGeneratePlanCoordinatorV1 {
   readonly providerLabel: string;
   /** (2m) Native model id for the run-log attribution header; undefined for providers without one. */
   readonly modelLabel: string | undefined;
+  /**
+   * The provider-qualified stored model id (e.g. "claude-cli:sonnet@high"),
+   * as passed to `reportStageStartingV1`/`TaskOperationHandle.setModel` —
+   * distinct from `modelLabel` (the native id used for the run-log
+   * attribution header only).
+   */
+  readonly modelId: string;
 }
 
 type ResolveGeneratePlanCoordinatorFailureV1 =
@@ -359,7 +368,7 @@ async function resolveGeneratePlanCoordinatorV1(
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "plan" as TaskStage }),
   });
-  return { ok: true, value: { coordinator, providerLabel, modelLabel: nativeModelId } };
+  return { ok: true, value: { coordinator, providerLabel, modelLabel: nativeModelId, modelId } };
 }
 
 /** Minimal task identity `handleGeneratePlanOutcomeV1` needs — never a raw filesystem path beyond the task's own folder. */
@@ -541,7 +550,16 @@ async function generatePlanWithAIForResolvedTask(
     }
     return { succeeded: false, triggerAutoReview: false };
   }
-  const { coordinator, providerLabel, modelLabel } = resolved.value;
+  const { coordinator, providerLabel, modelLabel, modelId } = resolved.value;
+
+  // Notifications in-flight visibility (Part II audit gap): Generate Plan
+  // resolves its own "plan"-stage model and dispatches through
+  // coordinator.executeAction below, but previously never reported either —
+  // the row stayed silent for the whole run. Report the stage transition as
+  // soon as the model is known; `stageToken` guards the later "running"
+  // report (issued right before the dispatch await) against a stage
+  // transition on this same root that supersedes it in the meantime.
+  const stageToken = reportStageStartingV1(op, modelId);
 
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   let taskContent: string;
@@ -678,6 +696,8 @@ async function generatePlanWithAIForResolvedTask(
         );
 
         progress.report({ message: `Waiting for ${providerLabel} response...` });
+
+        reportStageRunningV1(op, stageToken);
 
         // Cancellable from either surface: the native progress toast and the
         // Notifications-row cancel button both abort the same provider run.

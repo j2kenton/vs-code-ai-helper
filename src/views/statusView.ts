@@ -56,6 +56,19 @@ export interface StatusOperationNode {
   readonly waitingForUser: boolean;
   readonly stage?: TaskStage;
   /**
+   * The root operation's OWN persisted `stage` (never a descendant's),
+   * i.e. what `getRootOperations()` reports — as opposed to `stage` above,
+   * which is `getDisplayStage`'s result and may be overridden by an active
+   * descendant. `getTreeItem` compares the two: REVIEW_TARGETS translation
+   * is a stand-in for "no descendant is currently reporting a more specific
+   * stage," so it must only apply when `stage === rootStage`. Applying it
+   * unconditionally re-translates an already-correct descendant stage (e.g.
+   * a Fast Forward root's nested "impl" Apply Review Edit child) back into
+   * the review stage, showing "High-Level Code Review" while Implementation
+   * is actually running.
+   */
+  readonly rootStage?: TaskStage;
+  /**
    * `TaskOperationSnapshot.kind`, carried through for display translation
    * only (see the `stageLabel` computation in `getTreeItem`) — a
    * `kind: "review"` root's `stage` is legitimately still the pre-review
@@ -323,8 +336,21 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       // does not affect `isReviewActivelyRerunningV1`, which deliberately
       // excludes "fast-forward" for an unrelated reason (avoiding
       // double-counting against its own nested "review"-kind child ops).
+      //
+      // Gated on `element.stage === element.rootStage`: `element.stage` is
+      // `getDisplayStage`'s result, which is overridden by an active
+      // descendant's own stage (e.g. a Fast Forward root's nested "impl"
+      // Apply Review Edit child). When that override is in effect the
+      // stage is already the real, current one and must NOT be translated
+      // again — doing so turned a running "impl" child back into "High-
+      // Level Code Review" (review blocker 476befdc…-1). Translation only
+      // belongs to the fallback case, where no descendant is reporting a
+      // more specific stage and `element.stage` is still the root's own
+      // pre-review value.
       const displayStage =
-        element.stage && (element.operationKind === "review" || element.operationKind === "fast-forward")
+        element.stage &&
+        element.stage === element.rootStage &&
+        (element.operationKind === "review" || element.operationKind === "fast-forward")
           ? REVIEW_TARGETS[element.stage] ?? element.stage
           : element.stage;
       const stageLabel = displayStage ? STAGE_DISPLAY_NAMES[displayStage] : undefined;
@@ -476,6 +502,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         // comment for why this must stay a separate call from
         // getRootOperations() above.
         stage: taskOperations.getDisplayStage(op.id),
+        rootStage: op.stage,
         operationKind: op.kind,
         modelId: op.modelId,
         activity: op.activity,

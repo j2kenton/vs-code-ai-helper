@@ -13,6 +13,8 @@ import {
   TaskOperationHandle,
   cancelRunningOperationsForTask,
   hasActiveOperationTargetingStage,
+  reportStageStartingV1,
+  reportStageRunningV1,
 } from "../utils/taskOperations";
 import {
   EscalationKind,
@@ -359,40 +361,9 @@ function isSameWorkspacePath(a: string, b: string): boolean {
     : resolvedA === resolvedB;
 }
 
-/**
- * Notifications in-flight visibility (see reportActivity's doc comment):
- * marks a model-backed workflow stage as beginning. Records the resolved
- * provider/model (when known) and resets the row's elapsed-time origin to
- * now — this is a genuine stage transition, not a repaint of an
- * already-running activity, so the displayed timer must restart here rather
- * than keep counting from whenever the root operation itself began.
- *
- * Returns the resulting stage-generation token (or `undefined` if `op` is
- * absent/already ended). A caller that kicks off async work spanning this
- * stage (context-size checks, count/summary reports) should hold onto this
- * and pass it as `stageToken` to its own later `reportActivity` calls, so a
- * report that resolves after a NEWER stage has already begun on the same
- * root is dropped instead of clobbering the newer stage's row.
- */
-function reportStageStartingV1(
-  op: TaskOperationHandle | undefined,
-  modelId: string | undefined
-): number | undefined {
-  op?.setModel?.(modelId);
-  return op?.reportActivity("starting", { resetElapsedOrigin: true });
-}
-
-/**
- * Marks a model-backed stage's provider dispatch as actually underway, once
- * the long-running await is about to be issued. Preserves the elapsed origin
- * `reportStageStartingV1` set, so the visible timer keeps counting from the
- * stage transition rather than restarting again here. `stageToken`, when
- * passed, guards against this call itself landing late (see
- * `reportStageStartingV1`'s doc comment).
- */
-function reportStageRunningV1(op: TaskOperationHandle | undefined, stageToken?: number): void {
-  op?.reportActivity("running", { stageToken });
-}
+// Notifications in-flight visibility: reportStageStartingV1/reportStageRunningV1
+// now live in taskOperations.ts (shared by every model-backed dispatch site,
+// including generatePlanWithAI.ts) — imported above.
 
 /**
  * Select the configured root that directly owns a task folder. Nested
@@ -6963,6 +6934,15 @@ async function applyImplementationReviewWithAI(
   const stageToken = reportStageStartingV1(options.parentOperation, model.modelId);
 
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
+  // Notifications in-flight visibility: report "reading context" right at
+  // the boundary where context assembly actually finishes, sized from the
+  // context pack itself — NOT later, at the prompt-size guard, which by
+  // then is measuring the fully assembled (and possibly shrunk) prompt, a
+  // stretch of time in which context reading is long since over.
+  options.parentOperation?.reportActivity(
+    `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,
+    { stageToken }
+  );
 
   // {{implementation}} carries BOTH the plan of record and the latest
   // implementation summary, because this prompt needs both and they now live
@@ -7123,7 +7103,7 @@ async function applyImplementationReviewWithAI(
   const prompt = parts.prompt;
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, options.parentOperation, stageToken);
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
@@ -8061,8 +8041,15 @@ export async function generateImplementationWithAI(
       // "Generate Implementation" command never reported its model/stage —
       // the row sat blank for the whole checklist-generation provider call.
       const stageToken = reportStageStartingV1(op, model.modelId);
+      // Sized from the context pack actually assembled above — not the
+      // rendered prompt below, which mixes in template boilerplate and (at
+      // other call sites) shrinkable review/implementation-notes content.
+      op?.reportActivity(
+        `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,
+        { stageToken }
+      );
 
-      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, op, stageToken);
+      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
       if (sizeCheck === "abort" || sizeCheck === "declined") {
         return;
       }
@@ -10776,6 +10763,13 @@ export async function runImplementationWithAI(
         resolved.folderUri,
         checklistWorkspace.uri
       );
+      // Sized from the context pack itself, at the moment assembly actually
+      // finishes — not later, at the prompt-size guard, which measures the
+      // fully rendered prompt instead.
+      op.reportActivity(
+        `reading context (${Math.round(Buffer.byteLength(checklistContextPack, "utf8") / 1024)} KB)`,
+        { stageToken }
+      );
       const checklistPrompt = await renderPromptTemplate(
         extensionUri,
         "create-implementation.md",
@@ -10800,7 +10794,7 @@ export async function runImplementationWithAI(
         );
         return;
       }
-      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel, 0, op, stageToken);
+      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);
       if (checklistSizeCheck === "abort" || checklistSizeCheck === "declined") {
         return;
       }
@@ -11089,6 +11083,13 @@ export async function runImplementationWithAI(
       resolved.folderUri,
       workspaceRoot.uri
     );
+    // Sized from the context pack itself, at the moment assembly actually
+    // finishes — not later, at the prompt-size guard, which measures the
+    // fully rendered (and possibly continuation-augmented) prompt instead.
+    op.reportActivity(
+      `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,
+      { stageToken }
+    );
 
     // Continuation of a failed/unreported round: a prior round changed the
     // quarantined files but ended without a usable report (deferred, cut
@@ -11205,7 +11206,7 @@ export async function runImplementationWithAI(
     });
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
-    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, op, stageToken);
+    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
     if (sizeCheck === "abort" || sizeCheck === "declined") {
       return;
     }

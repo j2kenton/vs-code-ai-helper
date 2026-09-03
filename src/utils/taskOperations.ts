@@ -138,6 +138,36 @@ export interface TaskOperationHandle {
   ): number | undefined;
 }
 
+/**
+ * Marks a model-backed workflow stage's transition as underway: records the
+ * resolved model and resets the elapsed-time origin, then reports "starting"
+ * as the initial activity. Shared by every model-backed dispatch site
+ * (Implementation, High-Level Code Review, Generate Plan, ...) so a stage
+ * transition is reported identically everywhere instead of being
+ * reimplemented per call site. Returns the stage-generation token so the
+ * caller can guard later async callbacks against a stage transition that
+ * supersedes them before they land — see `reportActivity`'s doc comment.
+ */
+export function reportStageStartingV1(
+  op: TaskOperationHandle | undefined,
+  modelId: string | undefined
+): number | undefined {
+  op?.setModel?.(modelId);
+  return op?.reportActivity("starting", { resetElapsedOrigin: true });
+}
+
+/**
+ * Marks a model-backed stage's provider dispatch as actually underway, once
+ * the long-running await is about to be issued. Preserves the elapsed origin
+ * `reportStageStartingV1` set, so the visible timer keeps counting from the
+ * stage transition rather than restarting again here. `stageToken`, when
+ * passed, guards against this call itself landing late (see
+ * `reportStageStartingV1`'s doc comment).
+ */
+export function reportStageRunningV1(op: TaskOperationHandle | undefined, stageToken?: number): void {
+  op?.reportActivity("running", { stageToken });
+}
+
 export interface TaskOperationSnapshot {
   readonly id: string;
   readonly key: string;

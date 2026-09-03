@@ -218,6 +218,45 @@ void describe("operationIndicators", () => {
       }
     });
 
+    void it("does not re-translate a Fast Forward root's stage once an active descendant is reporting the real current stage (review blocker 476befdc…-1)", () => {
+      // Once Apply Review Edit's nested "impl" child is actually running,
+      // getDisplayStage already returns "impl" for the root row (see
+      // TaskOperationRegistry's getDisplayStage tests) — that value is
+      // already correct and must not be run back through REVIEW_TARGETS,
+      // or the row falsely reads "High-Level Code Review" while
+      // Implementation is what's actually executing.
+      const fastForwardOp = taskOperations.begin("/dev/task_6", {
+        label: "Fast Forward Review",
+        stage: "impl-high-review",
+        taskName: "task_6",
+        kind: "fast-forward",
+      });
+      assert.ok(fastForwardOp);
+      const implChild = taskOperations.begin("/dev/task_6", {
+        parent: fastForwardOp,
+        label: "Applying implementation review",
+        stage: "impl",
+        kind: "run-implementation",
+      });
+      assert.ok(implChild);
+
+      try {
+        const children = provider.getChildren() as StatusTreeNode[];
+        const opNodes = children.filter((n) => "kind" in n && n.kind === "operation");
+        const ffNode = opNodes.find((n) => "id" in n && n.id === fastForwardOp.id);
+        assert.ok(ffNode);
+
+        const ffDescription = String(provider.getTreeItem(ffNode).description);
+        assert.ok(
+          ffDescription.startsWith("Implementation"),
+          `expected the Fast Forward row to reflect its active "impl" child, got: ${ffDescription}`
+        );
+      } finally {
+        taskOperations.end(implChild);
+        taskOperations.end(fastForwardOp);
+      }
+    });
+
     void it("shows the inline cancel action on a history entry only while its sourceOperationId is still a live cancellable root operation (D10)", () => {
       const op = taskOperations.begin("/dev/task_1", {
         label: "Fast Forward",

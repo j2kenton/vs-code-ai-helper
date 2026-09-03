@@ -22,6 +22,11 @@ const source = fs.readFileSync(
   "utf8"
 );
 
+const taskOperationsSource = fs.readFileSync(
+  path.join(process.cwd(), "src", "utils", "taskOperations.ts"),
+  "utf8"
+);
+
 function indexOfAll(needle: string): number[] {
   const indices: number[] = [];
   let from = 0;
@@ -35,16 +40,26 @@ function indexOfAll(needle: string): number[] {
 }
 
 void describe("reviewActions.ts stage-activity instrumentation", () => {
-  void it("defines reportStageStartingV1 and reportStageRunningV1 as thin reportActivity wrappers", () => {
+  void it("defines reportStageStartingV1 and reportStageRunningV1 as thin reportActivity wrappers, shared from taskOperations.ts", () => {
+    // Moved out of reviewActions.ts into taskOperations.ts so
+    // generatePlanWithAI.ts (a separate command module, also a model-backed
+    // workflow root) can reuse the identical stage/model/elapsed-origin
+    // reporting convention instead of reimplementing it — see Part II's
+    // "extract a narrow shared helper" checklist item.
     assert.match(
-      source,
-      /function reportStageStartingV1\(\s*op: TaskOperationHandle \| undefined,\s*modelId: string \| undefined\s*\): number \| undefined \{\s*op\?\.setModel\?\.\(modelId\);\s*return op\?\.reportActivity\("starting", \{ resetElapsedOrigin: true \}\);/,
+      taskOperationsSource,
+      /export function reportStageStartingV1\(\s*op: TaskOperationHandle \| undefined,\s*modelId: string \| undefined\s*\): number \| undefined \{\s*op\?\.setModel\?\.\(modelId\);\s*return op\?\.reportActivity\("starting", \{ resetElapsedOrigin: true \}\);/,
       "reportStageStartingV1 must set the model, reset the elapsed origin, and return the resulting stage token on every stage start"
     );
     assert.match(
-      source,
-      /function reportStageRunningV1\(op: TaskOperationHandle \| undefined, stageToken\?: number\): void \{\s*op\?\.reportActivity\("running", \{ stageToken \}\);/,
+      taskOperationsSource,
+      /export function reportStageRunningV1\(op: TaskOperationHandle \| undefined, stageToken\?: number\): void \{\s*op\?\.reportActivity\("running", \{ stageToken \}\);/,
       "reportStageRunningV1 must report a bare 'running' activity guarded by stageToken, preserving the origin reportStageStartingV1 set"
+    );
+    assert.match(
+      source,
+      /reportStageStartingV1,\s*reportStageRunningV1,?\s*\}\s*from\s*"\.\.\/utils\/taskOperations"/,
+      "reviewActions.ts must import both helpers from taskOperations.ts rather than redefine them"
     );
   });
 
@@ -252,6 +267,124 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     );
     assert.ok(contextPackIdx >= 0, "expected the context pack assembly to follow");
     assert.ok(startingIdx < contextPackIdx, "the starting report must precede prompt assembly");
+  });
+
+  void describe("'reading context (N KB)' is sized from the context pack at its real assembly boundary, not the final prompt", () => {
+    // Review blocker (new, 2026-09-03): checkAndConfirmPromptSize used to
+    // report "reading context (N KB)" itself, measuring the FINAL, already
+    // rendered (and at some call sites already shrunk) prompt — by which
+    // point context reading was long over. checkAndConfirmPromptSize no
+    // longer reports activity at all; each call site instead reports right
+    // after its own `generateContextPack` call resolves, sized from that
+    // context pack's own bytes.
+
+    void it("no longer reports activity from inside checkAndConfirmPromptSize", () => {
+      const promptSizeGuardSource = fs.readFileSync(
+        path.join(process.cwd(), "src", "utils", "promptSizeGuard.ts"),
+        "utf8"
+      );
+      assert.ok(
+        !promptSizeGuardSource.includes("reportActivity"),
+        "checkAndConfirmPromptSize must not report Notifications activity itself — it can no longer see a real context-assembly boundary"
+      );
+    });
+
+    /**
+     * Finds `needle` after `fromIdx` regardless of the file's line-ending
+     * style (`\s+` tolerates both `\n` and `\r\n` between tokens) — plain
+     * `String.indexOf` on a literal multi-line string is brittle against
+     * that, and IS the line-ending mismatch that broke this test's first
+     * draft.
+     */
+    function indexOfFlexible(needle: string, fromIdx = 0): number {
+      const pattern = needle
+        .split(/\s+/)
+        .filter((token) => token.length > 0)
+        .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("\\s+");
+      const match = new RegExp(pattern).exec(source.slice(fromIdx));
+      return match ? fromIdx + match.index : -1;
+    }
+
+    void it("Apply Review Edit / apply-review-code dispatch reports it right after its context pack resolves", () => {
+      const contextIdx = source.indexOf(
+        "const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);"
+      );
+      assert.ok(contextIdx >= 0);
+      const reportIdx = indexOfFlexible(
+        'options.parentOperation?.reportActivity( `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,',
+        contextIdx
+      );
+      assert.ok(reportIdx >= 0, "expected a reading-context report sized from contextPackContent right after assembly");
+      const sizeCheckIdx = source.indexOf(
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        reportIdx
+      );
+      assert.ok(sizeCheckIdx >= 0);
+      assert.ok(contextIdx < reportIdx && reportIdx < sizeCheckIdx);
+    });
+
+    void it("the standalone Generate Implementation command reports it right after its context pack resolves", () => {
+      const contextIdx = indexOfFlexible(
+        "const contextPackContent = await generateContextPack( resolved.folderUri, workspaceRoot.uri );"
+      );
+      assert.ok(contextIdx >= 0);
+      const reportIdx = indexOfFlexible(
+        'op?.reportActivity( `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,',
+        contextIdx
+      );
+      assert.ok(reportIdx >= 0);
+      const sizeCheckIdx = source.indexOf(
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        reportIdx
+      );
+      assert.ok(sizeCheckIdx >= 0);
+      assert.ok(contextIdx < reportIdx && reportIdx < sizeCheckIdx);
+    });
+
+    void it("the implementation-checklist generation branch reports it right after its context pack resolves", () => {
+      const contextIdx = indexOfFlexible(
+        "const checklistContextPack = await generateContextPack( resolved.folderUri, checklistWorkspace.uri );"
+      );
+      assert.ok(contextIdx >= 0);
+      const reportIdx = indexOfFlexible(
+        'op.reportActivity( `reading context (${Math.round(Buffer.byteLength(checklistContextPack, "utf8") / 1024)} KB)`,',
+        contextIdx
+      );
+      assert.ok(reportIdx >= 0);
+      const sizeCheckIdx = source.indexOf(
+        "const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);",
+        reportIdx
+      );
+      assert.ok(sizeCheckIdx >= 0);
+      assert.ok(contextIdx < reportIdx && reportIdx < sizeCheckIdx);
+    });
+
+    void it("the Run Implementation continuation path reports it right after its context pack resolves", () => {
+      // Anchored from the Run Implementation operation's own label — the
+      // standalone Generate Implementation command (tested above) shares
+      // the identical `generateContextPack(resolved.folderUri,
+      // workspaceRoot.uri)` call shape but lives earlier in the file, so an
+      // unanchored search would match that occurrence instead of this one.
+      const runImplLabel = source.indexOf('{ label: "Run Implementation", stage: "impl"');
+      assert.ok(runImplLabel >= 0, "expected the Run Implementation runTrackedOperation call");
+      const contextIdx = indexOfFlexible(
+        "const contextPackContent = await generateContextPack( resolved.folderUri, workspaceRoot.uri );",
+        runImplLabel
+      );
+      assert.ok(contextIdx >= 0);
+      const reportIdx = indexOfFlexible(
+        'op.reportActivity( `reading context (${Math.round(Buffer.byteLength(contextPackContent, "utf8") / 1024)} KB)`,',
+        contextIdx
+      );
+      assert.ok(reportIdx >= 0);
+      const sizeCheckIdx = source.indexOf(
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        reportIdx
+      );
+      assert.ok(sizeCheckIdx >= 0);
+      assert.ok(contextIdx < reportIdx && reportIdx < sizeCheckIdx);
+    });
   });
 
   void it("reports 'running' once inside executeImplementationRun, covering every caller uniformly", () => {
