@@ -5650,6 +5650,10 @@ export async function applyReviewWithAI(
       NotificationRouter.showWarning("No model is configured for plan stage.");
       return;
     }
+    // Notifications in-flight visibility (Step 5 audit): this dispatch path
+    // never reported its stage/model before — the row sat on whatever the
+    // caller last set (or nothing, for a standalone Apply Review with AI).
+    reportStageStartingV1(op, modelId);
 
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceRoot.uri.fsPath,
@@ -5669,6 +5673,7 @@ export async function applyReviewWithAI(
       ...(applyReviewBaselineRevision !== undefined ? { baselineRevision: applyReviewBaselineRevision } : {}),
     };
 
+    reportStageRunningV1(op);
     const outcome = await coordinator.executeAction({
       actionKey: APPLY_REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -6926,6 +6931,12 @@ async function applyImplementationReviewWithAI(
     );
     return false;
   }
+  // Notifications in-flight visibility (Step 5 audit): this is the shared
+  // Apply Review Edit / apply-review-code dispatch path (reached both via
+  // applyReviewEditWithAI's own root and via Fast Forward's composite root)
+  // — neither caller reported stage/model before this fix, so the row
+  // carried whatever the previous stage last set, or nothing at all.
+  reportStageStartingV1(options.parentOperation, model.modelId);
 
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
 
@@ -8021,12 +8032,17 @@ export async function generateImplementationWithAI(
         );
         return;
       }
+      // Notifications in-flight visibility (Step 5 audit): the standalone
+      // "Generate Implementation" command never reported its model/stage —
+      // the row sat blank for the whole checklist-generation provider call.
+      reportStageStartingV1(op, model.modelId);
 
       const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
       if (sizeCheck === "abort" || sizeCheck === "declined") {
         return;
       }
 
+      reportStageRunningV1(op);
       const cancellationToken = op?.token ?? new vscode.CancellationTokenSource().token;
       const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
         folderUri: resolved.folderUri,
@@ -8434,6 +8450,14 @@ async function executeImplementationRun(
         taskOperations.tokenFor(folderUri.fsPath)
       );
       try {
+      // Notifications in-flight visibility: this is the shared dispatch
+      // boundary for BOTH executeImplementationRun callers (runImplementationWithAI's
+      // own direct call, which already reports "running" just before invoking
+      // this function, and applyImplementationReviewWithAI's Apply Review
+      // Edit path, which previously never did) — reporting it here once
+      // covers every caller uniformly. Redundant with the direct caller's own
+      // report, which is harmless: reportActivity replaces, never appends.
+      reportStageRunningV1(options.parentOperation);
       // A claimed summary-only continuation dispatches in TEXT mode — edit
       // permissions actually withheld (Part 2 item 4), never an edit run
       // carrying only a no-edits instruction. The re-probe against the model

@@ -175,4 +175,109 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     assert.ok(!setModelLine.includes("checklistOp."), "setModel must be called on op, not checklistOp");
     assert.ok(!runningLine.includes("checklistOp."), "reportActivity('running') must be called on op, not checklistOp");
   });
+
+  void it("reports 'starting'/'running' for the plan-review Apply Review dispatch (applyReviewWithAI's runApply)", () => {
+    // Step 5 audit gap: this path resolves its own "plan" stage model and
+    // dispatches through coordinator.executeAction, but previously never
+    // reported it — the row carried whatever a prior stage last set.
+    const runApplyIdx = source.indexOf("const runApply = async (op: TaskOperationHandle): Promise<void> => {");
+    assert.ok(runApplyIdx >= 0, "expected applyReviewWithAI's runApply closure");
+
+    const modelIdDecl = source.indexOf('await resolveFreshModelForStage(resolved.folderUri, "plan");', runApplyIdx);
+    assert.ok(modelIdDecl >= 0, "expected the plan-stage model resolution");
+
+    const startingIdx = source.indexOf("reportStageStartingV1(op, modelId);", modelIdDecl);
+    assert.ok(startingIdx >= 0, "expected a starting report once the plan-stage model is resolved");
+
+    const runningIdx = source.indexOf("reportStageRunningV1(op);", startingIdx);
+    assert.ok(runningIdx >= 0, "expected a running report before dispatch");
+
+    const executeActionIdx = source.indexOf("await coordinator.executeAction({", runningIdx);
+    assert.ok(executeActionIdx >= 0, "expected the coordinator dispatch after the running report");
+    assert.ok(
+      startingIdx < runningIdx && runningIdx < executeActionIdx,
+      "expected order: reportStageStartingV1(op, modelId) -> reportStageRunningV1(op) -> coordinator.executeAction"
+    );
+  });
+
+  void it("reports 'starting'/'running' for the standalone Generate Implementation command", () => {
+    // Step 5 audit gap: generateImplementationWithAI resolves its own model
+    // and dispatches via invokeGenerateImplementationActionV1, but previously
+    // never reported it, leaving the row blank for the whole provider call.
+    const fnStart = source.indexOf("export async function generateImplementationWithAI(");
+    assert.ok(fnStart >= 0, "expected generateImplementationWithAI");
+
+    const modelDecl = source.indexOf('const model = await resolveFreshModelForStage(resolved.folderUri, "impl");', fnStart);
+    assert.ok(modelDecl >= 0, "expected the impl-stage model resolution");
+
+    const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", modelDecl);
+    assert.ok(startingIdx >= 0, "expected a starting report once the model is resolved");
+
+    const runningIdx = source.indexOf("reportStageRunningV1(op);", startingIdx);
+    assert.ok(runningIdx >= 0, "expected a running report before dispatch");
+
+    const invokeIdx = source.indexOf("await invokeGenerateImplementationActionV1({", runningIdx);
+    assert.ok(invokeIdx >= 0, "expected the checklist provider dispatch after the running report");
+    assert.ok(
+      startingIdx < runningIdx && runningIdx < invokeIdx,
+      "expected order: reportStageStartingV1(op, model.modelId) -> reportStageRunningV1(op) -> invokeGenerateImplementationActionV1"
+    );
+  });
+
+  void it("reports 'starting' at the top of applyImplementationReviewWithAI (Apply Review Edit / Fast Forward's impl-review dispatch)", () => {
+    // Step 5 audit gap: this shared dispatch (reached from both
+    // applyReviewEditWithAI's own root and Fast Forward's composite root)
+    // never reported its stage/model, unlike the sibling plan-review path.
+    const fnStart = source.indexOf("async function applyImplementationReviewWithAI(");
+    assert.ok(fnStart >= 0, "expected applyImplementationReviewWithAI");
+
+    const availabilityCheckIdx = source.indexOf(
+      "await checkImplementationAvailabilityForModel(model.modelId, \"impl\");",
+      fnStart
+    );
+    assert.ok(availabilityCheckIdx >= 0, "expected the re-check-liveness-only availability guard");
+
+    const startingIdx = source.indexOf(
+      "reportStageStartingV1(options.parentOperation, model.modelId);",
+      availabilityCheckIdx
+    );
+    assert.ok(startingIdx >= 0, "expected a starting report addressed to options.parentOperation");
+
+    const contextPackIdx = source.indexOf(
+      "const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);",
+      startingIdx
+    );
+    assert.ok(contextPackIdx >= 0, "expected the context pack assembly to follow");
+    assert.ok(startingIdx < contextPackIdx, "the starting report must precede prompt assembly");
+  });
+
+  void it("reports 'running' once inside executeImplementationRun, covering every caller uniformly", () => {
+    // Both executeImplementationRun callers (runImplementationWithAI's direct
+    // call, and applyImplementationReviewWithAI's Apply Review Edit path)
+    // funnel through this one dispatch boundary — reporting "running" here
+    // once means neither caller has to remember to do it individually, and a
+    // future caller gets it for free.
+    const fnStart = source.indexOf("async function executeImplementationRun(");
+    assert.ok(fnStart >= 0, "expected executeImplementationRun");
+
+    const tryIdx = source.indexOf("try {", fnStart);
+    assert.ok(tryIdx >= 0, "expected the dispatch try block inside withProgress");
+
+    const runningIdx = source.indexOf("reportStageRunningV1(options.parentOperation);", tryIdx);
+    assert.ok(runningIdx >= 0, "expected a running report addressed to options.parentOperation");
+
+    const dispatchIdx = source.indexOf("result = await runImplementationOrSealedV1({", runningIdx);
+    assert.ok(dispatchIdx >= 0, "expected the implementation dispatch after the running report");
+    assert.ok(runningIdx < dispatchIdx, "the running report must precede the dispatch");
+
+    // Nothing between the try block's opening and the running report may
+    // await — it must run before any of the branch-selection logic
+    // (summary-only continuation vs. sealed/direct dispatch), not deep
+    // inside one specific branch.
+    const preRunningSlice = source.slice(tryIdx, runningIdx);
+    assert.ok(
+      !preRunningSlice.includes("await "),
+      "the running report must be reachable before any await inside the dispatch try block"
+    );
+  });
 });
