@@ -21,6 +21,12 @@ import {
 import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
+import { pauseTaskWithReason } from "../utils/taskProgressTransforms";
+import {
+  STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+  describeStalledActiveTaskEscalationV1,
+  isImpossibleActiveStateV1,
+} from "../utils/taskWatchdogV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -155,6 +161,10 @@ export class TaskActionScheduler implements vscode.Disposable {
     await this.reconcileRoundLedgerOrphans();
     await this.retryStuckPlanRevisionAdoptions();
     await this.armPendingImplRecoveries();
+    // Last, so it only ever fires against whatever the passes above could
+    // NOT resolve — an orphaned round is already closed, a reclaimable
+    // continuation is already re-armed, by the time this runs.
+    await this.detectAndRepairStalledActiveTasksV1();
   }
 
   /**
@@ -234,11 +244,19 @@ export class TaskActionScheduler implements vscode.Disposable {
    * transition. A `pending` record with no live lease (and the continuation
    * cap not reached) means the transition committed but the process died
    * before the continuation round began: claim it (lease CAS, same one-window
-   * rule as scheduledRun) and dispatch the chain exactly once. A `dispatched`
-   * record is NEVER re-fired — the round it names already started, and edit
-   * runs give no idempotency guarantee — but once it is clearly dead (lease
-   * long expired) it is surfaced as an actionable state instead of leaving
-   * the task indistinguishable from "review paused, waiting on user".
+   * rule as scheduledRun) and dispatch the chain exactly once.
+   *
+   * A1 (1.0.0 gate), second route: a `dispatched` record whose round never
+   * settled (the dispatch itself was lost — e.g. the provider hit a usage
+   * limit moments after claiming, or the window running it died) used to sit
+   * `dispatched` forever, since nothing ever re-read it — the exact same
+   * silent-stall symptom as the first route, just surviving instead of being
+   * deleted. Once its anchor (`leaseUntil ?? at`) plus `STALE_DISPATCH_GRACE_MS`
+   * has elapsed, the round it named is presumed dead and it is returned to
+   * `pending` so the claim path immediately below re-arms it exactly as a
+   * freshly-persisted pending record would. A record still within the grace
+   * window is left untouched — the round it covers can legitimately run for
+   * the full CLI timeout.
    */
   private async armPendingImplRecoveries(): Promise<void> {
     // A dispatched record's lease dates from the transition, and the round it
@@ -246,24 +264,58 @@ export class TaskActionScheduler implements vscode.Disposable {
     // only well past that is silence evidence of a dead round.
     const STALE_DISPATCH_GRACE_MS = 90 * 60 * 1000;
     for (const task of this.inventory.getTasks()) {
-      const recovery = task.progress.implRecovery;
+      let recovery = task.progress.implRecovery;
       if (!recovery) continue;
       if (task.progress.status !== "active") continue;
       if (recovery.dispatch === "dispatched") {
         const anchor = recovery.leaseUntil ?? recovery.at;
-        if (
-          this.clock.now() > new Date(anchor).getTime() + STALE_DISPATCH_GRACE_MS &&
-          !this.staleRecoveryNotified.has(task.taskFolderPath)
-        ) {
+        const isStale = this.clock.now() > new Date(anchor).getTime() + STALE_DISPATCH_GRACE_MS;
+        if (!isStale) {
+          continue;
+        }
+        // Reclaim: return the stale `dispatched` record to `pending` (CAS —
+        // re-checks staleness inside the patch so a concurrent reclaim from
+        // another window, or a round that finalizes at the last instant,
+        // cannot double-reclaim a record that is no longer stale or no
+        // longer present) so the ordinary pending-claim logic below re-arms
+        // it in this same pass.
+        const reclaimed = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
+          const record = progress.implRecovery;
+          if (!record || record.dispatch !== "dispatched") return progress;
+          const currentAnchor = record.leaseUntil ?? record.at;
+          if (this.clock.now() <= new Date(currentAnchor).getTime() + STALE_DISPATCH_GRACE_MS) {
+            return progress;
+          }
+          return {
+            ...progress,
+            implRecovery: {
+              ...record,
+              dispatch: "pending",
+              attemptId: undefined,
+              leaseOwner: undefined,
+              leaseUntil: undefined,
+            },
+          };
+        });
+        if (reclaimed === undefined || reclaimed.implRecovery === undefined || reclaimed.implRecovery.dispatch !== "pending") {
+          // Another window already reclaimed it, it finalized in the
+          // meantime, or it was no longer stale under the fresh read — no
+          // action needed from this pass.
+          continue;
+        }
+        if (!this.staleRecoveryNotified.has(task.taskFolderPath)) {
           this.staleRecoveryNotified.add(task.taskFolderPath);
           NotificationRouter.showWarning(
-            `⚠️ A recovery continuation for "${task.progress.displayName ?? task.progress.taskFolder}" ` +
-              "was started but never finalized a round (the window running it likely died). " +
-              "It will not be re-run automatically — rerun the implementation manually; the " +
-              "unreported edits are preserved in pendingImplReviewFiles."
+            `⚠️ A stalled recovery continuation for "${task.progress.displayName ?? task.progress.taskFolder}" ` +
+              "was reclaimed and will be re-armed automatically (the round that had claimed it never " +
+              "finalized — the window running it likely died or the provider hit a usage limit). The " +
+              "unreported edits remain preserved in pendingImplReviewFiles."
           );
         }
-        continue;
+        // Fall through into the pending-claim logic below using the
+        // freshly-reclaimed record (its lease fields are now clear, so the
+        // liveness check immediately below passes).
+        recovery = reclaimed.implRecovery;
       }
       // Cap reached: the transition already escalated (paused the task) or
       // surfaced its failure to do so; re-dispatching would burn a round the
@@ -343,6 +395,57 @@ export class TaskActionScheduler implements vscode.Disposable {
             "actually starts (dispatch flips to 'dispatched'), it will not retry again automatically.",
         },
       });
+    }
+  }
+
+  /**
+   * Tasks whose stalled-active state this window has already escalated —
+   * mirrors `staleRecoveryNotified`'s once-per-window dedup. Not strictly
+   * needed for correctness (once paused, `status` is no longer `"active"` and
+   * the predicate stops matching on its own), but avoids a duplicate
+   * notification if the pause write itself is still in flight when the next
+   * sweep starts.
+   */
+  private readonly stalledActiveNotified = new Set<string>();
+
+  /**
+   * A1's watchdog (1.0.0 gate): after every other self-healing pass above has
+   * had its chance, find any task still `status: active` with no live
+   * operation, no owed continuation, and no scheduled intent —
+   * `isImpossibleActiveStateV1` (`taskWatchdogV1.ts`) — and move it to an
+   * explicit `paused` state with an escalation, rather than leaving it to sit
+   * `active` forever with nothing running and no signal that anything is
+   * wrong. Deliberately acts ONLY through a durable state transition
+   * (`pauseTaskWithReason`, the same primitive `pauseTaskForExhaustedChainV1`
+   * uses) — never dispatches work itself — so running this twice over
+   * unchanged state is a no-op: the first run's pause flips `status` away
+   * from `"active"`, which the predicate itself then excludes.
+   */
+  private async detectAndRepairStalledActiveTasksV1(): Promise<void> {
+    for (const task of this.inventory.getTasks()) {
+      if (!isImpossibleActiveStateV1({ progress: task.progress, taskCanonicalId: task.taskFolderPath })) {
+        this.stalledActiveNotified.delete(task.taskFolderPath);
+        continue;
+      }
+      if (this.stalledActiveNotified.has(task.taskFolderPath)) {
+        continue;
+      }
+      const patched = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
+        // Re-check under the task lock against a fresh read — something else
+        // (another window, a command the user just ran) may have resolved
+        // the stall between the snapshot above and this write.
+        if (!isImpossibleActiveStateV1({ progress, taskCanonicalId: task.taskFolderPath })) {
+          return progress;
+        }
+        return pauseTaskWithReason(progress, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+      });
+      if (patched?.status !== "paused" || patched.pausedReason !== STALLED_ACTIVE_TASK_PAUSE_REASON_V1) {
+        continue;
+      }
+      this.stalledActiveNotified.add(task.taskFolderPath);
+      NotificationRouter.showWarning(
+        describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+      );
     }
   }
 

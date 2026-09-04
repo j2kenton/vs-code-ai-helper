@@ -416,6 +416,42 @@ void describe("nextStage.v1 registry row", () => {
     assert.equal(fs.existsSync(artifactPath), true, "publish-review.md must exist the moment this row lands the task on Publish");
   });
 
+  void it("refuses to advance and preserves implRecovery when a continuation is owed (A1, 1.0.0 gate) — exercises the real production auto-advance path", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-owed-continuation-");
+    setProgress(fixture.folder, {
+      status: "active",
+      currentStage: "impl",
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-e2e-1",
+        reason: "summary was stamped unusable",
+        trigger: "summaryRejected",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-07-09T00:00:00.000Z",
+      },
+      pendingImplReviewFiles: ["src/a.ts"],
+    });
+
+    const outcome = await executeNextStageV1(contextFor(fixture.folder, "impl"));
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "nextStage.implRecoveryOwed");
+      assert.equal(outcome.retryable, false);
+    }
+
+    // The bug this fixes: the stage previously moved anyway and
+    // `implRecovery`/`pendingImplReviewFiles` were silently discarded,
+    // leaving the task "active" with nothing running. Confirm neither the
+    // stage moved nor the owed continuation vanished.
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "impl");
+      assert.ok(strict.decoded.progress.implRecovery !== undefined, "implRecovery must survive the refused transition");
+      assert.deepEqual(strict.decoded.progress.pendingImplReviewFiles, ["src/a.ts"]);
+    }
+  });
+
   void it("never runs beforeWrite when the CAS is rejected", async () => {
     const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-beforewrite-rejected-");
     setProgress(fixture.folder, { status: "active", currentStage: "plan-high-review" });

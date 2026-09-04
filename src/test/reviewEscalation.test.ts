@@ -842,15 +842,15 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         assert.strictEqual(decision.recommendation.optionId, "keepIterating");
       }
 
-      // Regression: a review flagged that "Keep iterating" dispatched plain
-      // resumeTask (which only clears the pause) while its consequence text
-      // claimed it "reruns" the stage. It must dispatch the command that
-      // actually does both.
+      // A1 (1.0.0 gate, Part C): "Keep iterating" must dispatch WORK, not a
+      // review — the prior fix (resumeAndRerunReview) still re-ran the review
+      // against an unchanged tree, reproducing the identical verdict by
+      // construction. It must dispatch Apply Review instead.
       const keepIterating = decision.options.find((o) => o.optionId === "keepIterating");
       assert.ok(keepIterating);
       assert.deepEqual(keepIterating.effect, {
         kind: "command",
-        command: "vs-code-ai-helper.resumeAndRerunReview",
+        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
         args: [{ taskFolderPath: folderUri.fsPath }],
       });
 

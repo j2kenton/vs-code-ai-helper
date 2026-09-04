@@ -208,6 +208,85 @@ void describe("taskProgressFieldPolicyV1", () => {
     }
   });
 
+  void it("nextStage refuses to advance while an implementation recovery continuation is owed (A1, 1.0.0 gate)", () => {
+    const owed = applyNextStagePolicyV1(
+      baseProgress({
+        implRecovery: {
+          sourceAttemptId: "impl-recovery-1",
+          reason: "the provider's final response was cut short",
+          trigger: "roundIncomplete",
+          mode: "unconstrained",
+          dispatch: "pending",
+          at: "2026-07-09T00:00:00.000Z",
+        },
+      }),
+      { now: NOW }
+    );
+    assert.equal(owed.ok, false);
+    if (!owed.ok) {
+      assert.equal(owed.code, "implRecoveryOwed");
+    }
+
+    // A dispatched (already-claimed) continuation must refuse the advance
+    // exactly the same as a pending one — the bug this fixes was the stage
+    // discarding the continuation regardless of its dispatch state.
+    const dispatchedOwed = applyNextStagePolicyV1(
+      baseProgress({
+        implRecovery: {
+          sourceAttemptId: "impl-recovery-2",
+          reason: "summary was stamped unusable",
+          trigger: "summaryRejected",
+          mode: "summary-only",
+          dispatch: "dispatched",
+          at: "2026-07-09T00:00:00.000Z",
+          leaseUntil: "2026-07-09T01:00:00.000Z",
+        },
+      }),
+      { now: NOW }
+    );
+    assert.equal(dispatchedOwed.ok, false);
+    if (!dispatchedOwed.ok) {
+      assert.equal(dispatchedOwed.code, "implRecoveryOwed");
+    }
+
+    // No implRecovery at all: the ordinary advance succeeds unaffected.
+    const clean = applyNextStagePolicyV1(baseProgress({}), { now: NOW });
+    assert.equal(clean.ok, true);
+  });
+
+  void it("markTaskDone and reopen still clear an owed implRecovery unconditionally (explicit human decisions, unlike nextStage)", () => {
+    const owedRecord = {
+      sourceAttemptId: "impl-recovery-3",
+      reason: "roundDeferred",
+      trigger: "roundDeferred" as const,
+      mode: "unconstrained" as const,
+      dispatch: "pending" as const,
+      at: "2026-07-09T00:00:00.000Z",
+    };
+    const done = applyMarkTaskDonePolicyV1(
+      baseProgress({ currentStage: "publish", implRecovery: owedRecord }),
+      { now: NOW }
+    );
+    assert.equal(done.ok, true);
+    if (done.ok) {
+      assert.equal(done.progress.implRecovery, undefined);
+    }
+
+    const reopened = applyReopenPolicyV1(
+      baseProgress({
+        status: "completed",
+        currentStage: "publish",
+        completedAt: "2026-07-09T00:00:00.000Z",
+        implRecovery: owedRecord,
+      }),
+      { now: NOW, selectedStage: "impl" }
+    );
+    assert.equal(reopened.ok, true);
+    if (reopened.ok) {
+      assert.equal(reopened.progress.implRecovery, undefined);
+    }
+  });
+
   void it("nextStage honors an explicit targetStage for a configured-review-stage skip", () => {
     // "plan" -> "impl" directly (skipping both plan review stages), as a
     // workspace with no plan-review model configured would request.

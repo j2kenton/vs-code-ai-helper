@@ -825,6 +825,7 @@ import {
   resumePausedTask,
   resumeAndRerunReviewV1,
   resumeAndDispatchImplementationV1,
+  resumeAndApplyCurrentStageActionV1,
   resumeIfPausedThenGoToReviewAndApplyV1,
 } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
@@ -1226,6 +1227,112 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         implDispatch,
         undefined,
         "must not dispatch implementation for a resume that never actually succeeded"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resumeAndApplyCurrentStageActionV1 — the review-stage plateau card's "Keep
+// iterating" button and the providerChainExhausted card's "Retry now" button
+// must both actually resume AND dispatch genuine work (A1, 1.0.0 gate, Part
+// C: neither previously did — "Keep iterating" re-ran the review, which
+// reproduces an unchanged-tree verdict by construction, and "Retry now"
+// dispatched plain resumeTask, which only cleared the pause).
+// ---------------------------------------------------------------------------
+
+void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumes a paused task and then dispatches applyCurrentStageAction for it", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-current-stage");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-apply-current-stage",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndApplyCurrentStageActionV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "active",
+        "the task must actually be resumed, not just have the stage action dispatched"
+      );
+
+      const dispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"
+      );
+      assert.ok(
+        dispatch !== undefined,
+        "must dispatch vs-code-ai-helper.applyCurrentStageAction after resuming — the whole point of " +
+          "this command over plain resumeTask"
+      );
+      assert.deepEqual(dispatch.arg, { taskFolderPath: folderPath });
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("does not dispatch the stage action when the task could not be found (resume itself failed)", async () => {
+    const inv = makeEmptyInventoryStub();
+    const currentStore = makeCurrentTaskStoreStub(undefined);
+    const msgs = installMessageCapture();
+    const execCmd = installExecuteCommandStub();
+    try {
+      await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+        taskFolderPath: "/fake-workspace/deleted-paused-task",
+      });
+
+      const dispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"
+      );
+      assert.strictEqual(
+        dispatch,
+        undefined,
+        "must not dispatch the stage action for a resume that never actually succeeded"
       );
     } finally {
       execCmd.restore();

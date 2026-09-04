@@ -349,6 +349,59 @@ export async function resumeAndDispatchImplementationV1(
 }
 
 /**
+ * Resume a paused task and immediately dispatch `applyCurrentStageAction` —
+ * the generic per-stage primary action (Apply Review for an impl-review
+ * stage, Implementation for `impl`, etc. — see `applyCurrentStageAction.ts`'s
+ * header). Built for the "Keep iterating" option on a review-stage plateau
+ * escalation (Part C, 1.0.0 gate, "every action does what its label
+ * says"): that option previously dispatched `resumeAndRerunReviewV1`, which
+ * re-runs the REVIEW — against an unchanged tree the verdict is identical by
+ * construction, so "another round has real work to act on" (the option's own
+ * rationale) was never true. `applyCurrentStageAction` on an impl-review
+ * stage instead dispatches Apply Review (`applyHighLevelReviewChanges` /
+ * `applyLowLevelReviewChanges`), which edits the workspace against the
+ * review's own blockers and re-reviews inline once it finishes (see
+ * `applyReviewWithAI`'s `suppressAutoReviewDispatch` comment) — genuine work,
+ * then a fresh verdict, in one dispatch.
+ *
+ * Mirrors `resumeAndRerunReviewV1` / `resumeAndDispatchImplementationV1`
+ * exactly: the `WorkflowDecisionOptionEffectV1` shape only carries one
+ * command, so a single-command option cannot resume AND dispatch without a
+ * small combined command like this one. `resumePausedTask` handles (and
+ * reports) its own failure modes via `NotificationRouter`; this only
+ * proceeds to the dispatch when the task actually reached "active", so a
+ * failed/declined resume does not also throw a confusing "task is paused"
+ * message on top of whatever `resumePausedTask` already told the user.
+ */
+export async function resumeAndApplyCurrentStageActionV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: ResumeTaskArg
+): Promise<void> {
+  const resolverArg = normalizeResumeTaskArg(explicitArg);
+  const target = await resolveTaskContext(
+    inventory,
+    resolverArg,
+    { allowPaused: true },
+    currentTaskStore
+  );
+  if (!target) {
+    return;
+  }
+  await resumePausedTask(inventory, currentTaskStore, explicitArg);
+  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
+  // does: `inventory` is an in-memory cache not guaranteed to reflect the
+  // write resumePausedTask (via activateTask) just made.
+  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  if (!reread.ok || reread.decoded.progress.status === "paused") {
+    return;
+  }
+  await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
+    taskFolderPath: target.taskFolderPath,
+  });
+}
+
+/**
  * Resume a paused task and immediately set its stage — the
  * `WorkflowDecisionOptionEffectV1` shape only carries one command, so the
  * escalation cards' "Advance to <stage>" option (`reviewEscalation.ts`'s
@@ -495,6 +548,16 @@ export function registerResumeTaskCommand(
       resumeAndSetTaskStageV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndSetTaskStage);
+
+  // Not contributed to package.json's `commands`: like the three siblings
+  // above, this is a wiring detail behind decision-card options, not
+  // something to offer in the command palette.
+  const resumeAndApplyCurrentStageAction = vscode.commands.registerCommand(
+    "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+    (arg?: ResumeTaskArg) =>
+      resumeAndApplyCurrentStageActionV1(inventory, currentTaskStore, arg)
+  );
+  context.subscriptions.push(resumeAndApplyCurrentStageAction);
 
   // Not contributed to package.json's `commands`: like goToReviewAndApplyV1
   // itself, this is a wiring detail behind decision-card options and

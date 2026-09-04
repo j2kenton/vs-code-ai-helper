@@ -190,7 +190,7 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     migration:
       "Validate exact record shape (source attempt, reason, trigger, mode, dispatch state, optional lease/attempt/sourceDispatchMode/sourceReviewStage/sourceRoundId fields); absent on new tasks.",
     nextStage:
-      "Clear — the owed recovery continuation belongs to the implementation loop of the stage being left (parity with incompleteRoundContinuations).",
+      "Refuse the transition (`implRecoveryOwed`) while present — a round that owes a usable report has not finished, so the stage may not move on and silently discard the continuation (A1, 1.0.0 gate; the prior unconditional clear here is the destructive route that stranded a task `active` with nothing running and no escalation). Cleared only by the SAME stage's recovery loop resolving it — claimed, re-armed, or escalated — never by a stage transition.",
     markTaskDone: "Clear.",
     reopen: "Clear — reopening restarts the cycle the recovery belonged to.",
   },
@@ -457,6 +457,21 @@ export function applyNextStagePolicyV1(
   }
   if (input.completionArtifactsPresent === false && input.artifactOverride !== "user") {
     return failure("missingStageArtifact", "the departing stage's required artifact is absent");
+  }
+  // A1 (1.0.0 gate): a round that owes a usable report has not finished, so
+  // advancing past it must not be allowed to silently discard the owed
+  // continuation the way an unconditional `implRecovery: undefined` here
+  // used to (the destructive route observed 2026-08-27/28 — the stage moved,
+  // implRecovery vanished, and the task sat "active" with nothing running
+  // and no escalation). Refusing here — rather than carrying the record
+  // forward — keeps the invariant simple: a continuation is always resolved
+  // by the SAME stage's implementation loop that owes it (claimed,
+  // re-armed, or escalated), never inherited by a later stage.
+  if (progress.implRecovery !== undefined) {
+    return failure(
+      "implRecoveryOwed",
+      "an implementation recovery continuation is still owed for the current stage"
+    );
   }
   const departing = progress.currentStage;
   const departingIndex = stageIndex(departing);
@@ -797,8 +812,13 @@ export function applyPlanRevisionPolicyV1(
     // Cleared, unlike implReviewFiles/reviewScoreHistory above — a plan
     // revision invalidates whatever review-tracking state pointed at the
     // pre-revision plan, the same as every other later-stage runtime field
-    // this transition clears (implRecovery, quotaParkRecord, pausedReason,
-    // incompleteRoundContinuations). Parity with applyReopenPolicyV1.
+    // THIS transition clears (implRecovery, quotaParkRecord, pausedReason,
+    // incompleteRoundContinuations). Parity with applyReopenPolicyV1 — NOT
+    // with applyNextStagePolicyV1, which (A1, 1.0.0 gate) no longer clears
+    // implRecovery unconditionally; it refuses the transition instead while
+    // a continuation is owed. A plan revision is an explicit human decision
+    // to re-plan, so — like reopen — it is entitled to discard an owed
+    // continuation the way an ordinary stage advance is not.
     reviewInvalidatedByRound: undefined,
     incompleteRoundContinuations: undefined,
     implRecovery: undefined,

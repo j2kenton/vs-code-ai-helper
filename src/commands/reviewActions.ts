@@ -4364,9 +4364,19 @@ export async function pauseTaskForExhaustedChainV1(
       optionId: "retry",
       label: "Retry now",
       consequence:
-        "Unpauses the task. This does not automatically rerun the stage — trigger it again yourself once " +
-        "you believe the provider chain can succeed.",
-      effect: { kind: "command", command: "vs-code-ai-helper.resumeTask", args: [{ taskFolderPath: folderUri.fsPath }] },
+        `Resumes the task and immediately re-attempts ${STAGE_DISPLAY_NAMES[stage]}'s action against the ` +
+        "same provider chain — genuinely retries, not just unpauses.",
+      // A1 (1.0.0 gate, Part C): "Retry now" must retry, or be renamed — a
+      // prior revision dispatched plain resumeTask, which clears the pause
+      // and dispatches nothing, leaving "Retry now" indistinguishable from
+      // "Leave paused" except for its label. resumeAndApplyCurrentStageActionV1
+      // resumes AND dispatches applyCurrentStageAction, which re-attempts
+      // whichever action this stage's provider chain was exhausted running.
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      },
     },
     {
       optionId: "adjustSettings",
@@ -4437,8 +4447,8 @@ export async function pauseTaskForExhaustedChainV1(
         holdsTaskPaused: true,
         unblocksProgress: true,
         detail:
-          "This decision is what is holding the task paused. \"Retry now\" resumes the task immediately (it " +
-          "still will not rerun the stage for you). \"Adjust provider settings\" opens Settings but does not " +
+          "This decision is what is holding the task paused. \"Retry now\" resumes the task and immediately " +
+          "re-attempts the stage's action. \"Adjust provider settings\" opens Settings but does not " +
           "resume the task by itself — pick Retry or Wait for reset afterward." +
           (quotaParkRecord?.resetAt !== undefined
             ? ` "Wait for reset" keeps the task paused but schedules an automatic retry at ${quotaParkRecord.resetAt}.`

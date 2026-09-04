@@ -1,12 +1,21 @@
 /**
- * The `implRecovery.dispatch` state machine's restart half (Part 1):
- * `TaskActionScheduler.armAll` sweeps owed recovery continuations on task
- * load/activation (and every 5 minutes), so a transition that persisted
- * `dispatch: "pending"` and then lost its window is re-armed exactly once —
- * while a `dispatched` record (a continuation that STARTED and died) is
- * never re-fired, only surfaced. Uses the scheduler's injectable inventory /
- * clock / store seams; the chain dispatch boundary is monkey-patched the
- * same way deferredRoundRecovery.test.ts patches it.
+ * The `implRecovery.dispatch` state machine's restart half (Part 1, extended
+ * by A1's stale-dispatch reclaim, 1.0.0 gate): `TaskActionScheduler.armAll`
+ * sweeps owed recovery continuations on task load/activation (and every 5
+ * minutes), so a transition that persisted `dispatch: "pending"` and then
+ * lost its window is re-armed exactly once. A `dispatched` record (a
+ * continuation that STARTED) is left alone while its round could still
+ * plausibly be running — but once its anchor (`leaseUntil ?? at`) plus the
+ * 90-minute stale-dispatch grace has elapsed, the round it named is presumed
+ * dead: the record is reclaimed back to `pending` and re-armed by the same
+ * claim path a freshly-persisted pending record uses. Before this, a
+ * `dispatched` record was surfaced once and never re-fired — the observed
+ * failure this closes (2026-08-29): a continuation dispatched moments before
+ * the provider hit a usage limit sat `dispatched` forever, with every
+ * downstream action refusing on "nothing to review/fast-forward from" and
+ * nothing ever retrying. Uses the scheduler's injectable inventory / clock /
+ * store seams; the chain dispatch boundary is monkey-patched the same way
+ * deferredRoundRecovery.test.ts patches it.
  */
 import * as assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
@@ -182,7 +191,7 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
     assert.equal(harness.progress.implRecovery?.leaseOwner, OWNER);
   });
 
-  void it("never re-fires a dispatched record, and surfaces it once when clearly dead", async () => {
+  void it("leaves a dispatched record alone while still within the stale-dispatch grace window", async () => {
     const harness = makeHarness(
       makeProgress(
         pendingRecord({
@@ -198,17 +207,38 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
     await harness.armAll();
     assert.equal(harness.dispatches.length, 0);
     assert.equal(harness.notifications.length, 0);
+    assert.equal(harness.progress.implRecovery?.dispatch, "dispatched");
+  });
 
-    // Well past the grace window: surfaced as an actionable state — once —
-    // and still never re-dispatched.
+  void it("reclaims a dispatched record once clearly dead (A1, 1.0.0 gate), re-arming it exactly once", async () => {
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "dispatched",
+          attemptId: "impl-continuation-dead",
+          leaseUntil: new Date(BASE_NOW - 60 * 60 * 1000).toISOString(),
+        })
+      )
+    );
+    active = harness;
+
+    // Well past the grace window (lease + 90 min): the round it named is
+    // presumed dead, so the record is reclaimed to "pending" and re-armed by
+    // the same claim path a freshly-persisted pending record uses — surfaced
+    // once as a reclaim, not left to sit dispatched forever.
     harness.advance(2 * 60 * 60 * 1000);
     await harness.armAll();
     await harness.armAll();
-    assert.equal(harness.dispatches.length, 0);
+
+    assert.equal(harness.dispatches.length, 1, "the reclaimed record must be re-armed exactly once");
+    assert.equal(harness.dispatches[0]?.command, "vs-code-ai-helper.runImplementationWithAI");
+    assert.equal(harness.progress.implRecovery?.dispatch, "pending");
+    assert.equal(harness.progress.implRecovery?.leaseOwner, OWNER);
+    assert.equal(harness.progress.implRecovery?.attemptId, undefined, "the reclaimed record must shed the dead dispatch's attemptId");
     const surfaced = harness.notifications.filter((message) =>
-      /started but never finalized a round/.test(message)
+      /reclaimed and will be re-armed automatically/.test(message)
     );
-    assert.equal(surfaced.length, 1);
+    assert.equal(surfaced.length, 1, "the reclaim must be surfaced exactly once, not once per sweep");
   });
 
   void it("does not re-arm once the continuation cap is reached", async () => {

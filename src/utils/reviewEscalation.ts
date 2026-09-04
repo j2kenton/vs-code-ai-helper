@@ -354,18 +354,22 @@ function buildEscalationDecisionV1(
         label: "Keep iterating",
         consequence:
           taskFixableCount > 0
-            ? `Resumes the task and reruns ${stageName} — ${taskFixableCount} of the ${blockersCount} ` +
-              "remaining blocker(s) are task-fixable, so another round has real work to act on."
-            : `Resumes the task and reruns ${stageName} — nothing to act on: 0 of the ${blockersCount} ` +
-              "remaining blocker(s) are task-fixable.",
-        // resumeAndRerunReviewV1, not plain resumeTask: a prior revision
-        // dispatched resumeTask alone (which only clears the pause) while this
-        // consequence text claimed it "reruns" the stage — a review flagged
-        // the button as not doing what it said. This command actually resumes
-        // AND re-dispatches the review, matching the text above.
+            ? `Resumes the task and runs Apply Review against the ${taskFixableCount} task-fixable ` +
+              `${taskFixableCount === 1 ? "blocker" : "blockers"} — it edits the workspace to address ` +
+              `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict.`
+            : `Resumes the task and runs Apply Review — nothing to act on: 0 of the ${blockersCount} ` +
+              "remaining blocker(s) are task-fixable, so this will most likely reproduce the same verdict.",
+        // A1 (1.0.0 gate, Part C): NOT resumeAndRerunReviewV1 — a prior
+        // revision of this option re-ran the REVIEW, which against an
+        // unchanged tree reproduces the identical verdict by construction, so
+        // "another round has real work to act on" (this option's own
+        // rationale) was never actually true. resumeAndApplyCurrentStageActionV1
+        // resumes AND dispatches Apply Review (edits the workspace against
+        // these blockers, then re-reviews inline) — genuine work before the
+        // next verdict, matching the text above.
         effect: {
           kind: "command" as const,
-          command: "vs-code-ai-helper.resumeAndRerunReview",
+          command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
           args: [{ taskFolderPath: target.taskFolderPath }],
         },
       },
@@ -463,8 +467,14 @@ function buildEscalationDecisionV1(
     : {
         optionId: "keepIterating",
         label: "Keep iterating",
+        // A1 (1.0.0 gate, Part C): the review-stage branch previously read
+        // "reruns ${stageName}" and dispatched resumeAndRerunReview — against
+        // an unchanged tree that reproduces the same verdict by construction.
+        // Apply Review edits the workspace against the stage's own findings
+        // first, so this now names the actual work, matching the plateau-
+        // context card's own wording above.
         consequence: IMPL_REVIEW_STAGES.includes(stage)
-          ? `Resumes the task and reruns ${stageName}.`
+          ? `Resumes the task and runs Apply Review against ${stageName}'s findings, then re-reviews.`
           : "Resumes the task and dispatches its owed continuation or next implementation action.",
         effect: {
           kind: "command",
@@ -472,11 +482,12 @@ function buildEscalationDecisionV1(
           // nothing running until some other trigger (auto-advance, a
           // scheduling sweep) happens to pick the task back up — on a
           // manually-answered plateau card that can silently strand the
-          // task active-but-idle. resumeAndDispatchImplementationV1 resumes
-          // AND dispatches runImplementationWithAI, which itself resolves
-          // continuation vs Apply Review vs fresh Implementation.
+          // task active-but-idle. resumeAndApplyCurrentStageActionV1 (review
+          // stages) and resumeAndDispatchImplementationV1 (everywhere else)
+          // both resume AND dispatch genuine work, never just a re-review of
+          // an unchanged tree.
           command: IMPL_REVIEW_STAGES.includes(stage)
-            ? "vs-code-ai-helper.resumeAndRerunReview"
+            ? "vs-code-ai-helper.resumeAndApplyCurrentStageAction"
             : "vs-code-ai-helper.resumeAndDispatchImplementation",
           args: [{ taskFolderPath: target.taskFolderPath }],
         },

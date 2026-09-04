@@ -93,7 +93,8 @@ export type TaskProgressPolicyErrorCodeV1 =
   | "invalidTargetStage"
   | "invalidSelectedStage"
   | "missingStageArtifact"
-  | "checklistChangeProposalNotPending";
+  | "checklistChangeProposalNotPending"
+  | "implRecoveryOwed";
 
 export type TaskProgressPolicyResultV1 =
   | { readonly ok: true; readonly progress: PersistedTaskProgressV1 }

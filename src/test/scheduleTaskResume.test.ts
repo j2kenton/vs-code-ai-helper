@@ -14,6 +14,9 @@ import {
 } from "../commands/scheduleTaskResume";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
+import { resetAutomationChainGuards } from "../utils/automationChain";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
 
 class FakeClock implements SchedulerClock {
   private nextId = 0;
@@ -405,5 +408,261 @@ void test("scheduleQuotaResumeAtV1's fired run goes through the exact same pre-r
     realFs.restore();
     deactivateNotificationRouter();
     folder.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A1 (1.0.0 gate): stale-dispatch reclaim and the "impossible active state"
+// watchdog, both wired into `armAll()`'s periodic sweep.
+// ---------------------------------------------------------------------------
+
+class RecordingSurfaceV1 implements StatusSurface {
+  entries: { message: string; level: "info" | "warning" | "error" }[] = [];
+  addEntry(message: string, level: "info" | "warning" | "error"): void {
+    this.entries.push({ message, level });
+  }
+}
+
+/** `hasLiveSchedulingIntentBestEffortV1` (consulted by both the reclaim
+ * sweep's chain-guard-adjacent checks and the watchdog predicate) fails OPEN
+ * to "live" with no `ExtensionContext` configured — the default in this test
+ * file. Install a minimal one backed by an in-memory Memento so a sweep can
+ * actually observe "nothing scheduled" as `false` rather than "indeterminate". */
+function installFakeExtensionContextV1(): { restore: () => void } {
+  const values = new Map<string, unknown>();
+  const memento = {
+    get<T>(key: string, defaultValue: T): T {
+      return (values.has(key) ? values.get(key) : defaultValue) as T;
+    },
+    update(key: string, value: unknown): Promise<void> {
+      values.set(key, value);
+      return Promise.resolve();
+    },
+  } as unknown as import("vscode").Memento;
+  __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as import("vscode").ExtensionContext);
+  return { restore: (): void => __extensionContextV1TestOnly.reset() };
+}
+
+/** `armPendingImplRecoveries`'s successful claim ends with a fire-and-forget
+ * `scheduleAutomationChain(...)` (`void`, deliberately not awaited by
+ * production code) — let its microtask/macrotask chain settle before a test
+ * restores its `executeCommand` stub, or the dispatch reaches the real
+ * (unstubbed) command registry after the test has already returned. */
+async function flushMicrotasksV1(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function baseStalledProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
+  return {
+    taskFolder: "task",
+    displayName: "stalled task",
+    currentStage: "impl",
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+void test("armAll reclaims a stale dispatched implRecovery and re-arms it as a fresh pending claim (A1, 1.0.0 gate)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress({
+    implRecovery: {
+      sourceAttemptId: "impl-recovery-stale-1",
+      reason: "the provider's final response was cut short",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "dispatched",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "dead-window",
+      // 90-minute STALE_DISPATCH_GRACE_MS past this anchor is 2026-01-01T01:40 — well before "now".
+      leaseUntil: "2026-01-01T00:10:00.000Z",
+    },
+  });
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  commands.executeCommand = (() => Promise.resolve(undefined)) as typeof commands.executeCommand;
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  resetAutomationChainGuards();
+
+  try {
+    await scheduler.armAll();
+
+    const recovered = state.current().implRecovery;
+    assert.ok(recovered, "implRecovery must still be present — reclaimed, not discarded");
+    assert.equal(recovered?.dispatch, "pending", "reclaimed then immediately re-claimed by the pending-claim logic below it");
+    assert.equal(recovered?.leaseOwner, "test-owner", "the fresh claim must be owned by this sweep, not the dead window");
+    assert.notEqual(recovered?.leaseUntil, "2026-01-01T00:10:00.000Z", "the stale lease must be replaced, not reused");
+    assert.equal(recovered?.attemptId, undefined, "the reclaimed record must not carry the old dispatch's attemptId");
+
+    assert.ok(
+      surface.entries.some((e) => /reclaimed and will be re-armed automatically/.test(e.message)),
+      `expected a reclaim notification; got: ${JSON.stringify(surface.entries)}`
+    );
+    await flushMicrotasksV1();
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll leaves a dispatched implRecovery untouched while still within the stale-dispatch grace window", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress({
+    implRecovery: {
+      sourceAttemptId: "impl-recovery-live-1",
+      reason: "still running",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "dispatched",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "live-window",
+      // +90 minutes is 2026-01-01T04:20 — still after "now" (03:00).
+      leaseUntil: "2026-01-01T02:50:00.000Z",
+    },
+  });
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  resetAutomationChainGuards();
+
+  try {
+    await scheduler.armAll();
+
+    const untouched = state.current().implRecovery;
+    assert.equal(untouched?.dispatch, "dispatched");
+    assert.equal(untouched?.leaseOwner, "live-window");
+    assert.equal(untouched?.leaseUntil, "2026-01-01T02:50:00.000Z");
+    assert.ok(
+      !surface.entries.some((e) => /reclaimed/.test(e.message)),
+      `must not reclaim a record still within grace; got: ${JSON.stringify(surface.entries)}`
+    );
+  } finally {
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's watchdog pauses a task that is active with nothing running, owed, or scheduled, and posts an escalation (A1, 1.0.0 gate)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    await scheduler.armAll();
+
+    const after = state.current();
+    assert.equal(after.status, "paused");
+    assert.equal(after.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+    assert.ok(
+      surface.entries.some((e) => e.level === "warning" && /was stalled/.test(e.message)),
+      `expected a stalled-task escalation; got: ${JSON.stringify(surface.entries)}`
+    );
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's watchdog is a no-op once the task is paused (idempotent — no second pause write, no duplicate escalation)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    await scheduler.armAll();
+    assert.equal(state.current().status, "paused");
+    const escalationsAfterFirstSweep = surface.entries.filter((e) => /was stalled/.test(e.message)).length;
+    assert.equal(escalationsAfterFirstSweep, 1);
+
+    await scheduler.armAll();
+    await scheduler.armAll();
+
+    assert.equal(state.current().status, "paused");
+    const escalationsAfterMoreSweeps = surface.entries.filter((e) => /was stalled/.test(e.message)).length;
+    assert.equal(escalationsAfterMoreSweeps, 1, "a task the predicate no longer matches (status is now paused) must not be re-escalated");
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's watchdog does not pause a task with an owed implRecovery, an open round-ledger row, or a scheduledRun", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    for (const overrides of [
+      {
+        implRecovery: {
+          sourceAttemptId: "x",
+          reason: "x",
+          trigger: "roundIncomplete" as const,
+          mode: "unconstrained" as const,
+          dispatch: "pending" as const,
+          at: "2026-01-01T00:00:00.000Z",
+        },
+      },
+      {
+        roundLedger: [
+          {
+            roundId: "round-1",
+            attemptIds: [],
+            stage: "impl" as const,
+            mode: "implementation" as const,
+            startedAt: "2026-01-01T00:00:00.000Z",
+            state: "open" as const,
+          },
+        ],
+      },
+      { scheduledRun: { runAt: "2026-01-01T05:00:00.000Z", stage: "impl" as const } },
+    ]) {
+      const progress = baseStalledProgress(overrides);
+      const state = memoryStore(progress);
+      const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+      const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+      const surface = new RecordingSurfaceV1();
+      initNotificationRouter(surface);
+      const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+      const originalExecute = commands.executeCommand;
+      // The `implRecovery: "pending"` case claims and fire-and-forget
+      // dispatches exactly like the reclaim tests above — stub the same way
+      // so its trailing async activity resolves against a registered command.
+      commands.executeCommand = (() => Promise.resolve(undefined)) as typeof commands.executeCommand;
+      resetAutomationChainGuards();
+      try {
+        await scheduler.armAll();
+        assert.equal(state.current().status, "active", `must not pause: ${JSON.stringify(overrides)}`);
+        await flushMicrotasksV1();
+      } finally {
+        commands.executeCommand = originalExecute;
+        resetAutomationChainGuards();
+        deactivateNotificationRouter();
+        scheduler.dispose();
+      }
+    }
+  } finally {
+    fakeContext.restore();
   }
 });

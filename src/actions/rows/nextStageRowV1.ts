@@ -239,12 +239,14 @@ export async function executeNextStageV1(
     await ensurePublishReviewArtifactExistsV1(taskFolderUri);
   }
 
-  // PART 6.5 (review-flagged 2026-08-23): `applyNextStagePolicyV1` clears
-  // `implRecovery` unconditionally on every successful transition — push that
-  // fact into the scheduling-intent ledger right after the CAS resolves
-  // (never from inside the callback, which may re-run on a retry), so a task
-  // that advances past its owed continuation this way is not left showing a
-  // stale "owed" ledger entry.
+  // PART 6.5 (review-flagged 2026-08-23), updated for A1 (1.0.0 gate):
+  // `applyNextStagePolicyV1` now REFUSES the transition (`implRecoveryOwed`)
+  // while a continuation is owed, rather than clearing it — so a successful
+  // transition here is proof `implRecovery` was already absent going in.
+  // Still push the fact into the scheduling-intent ledger right after the
+  // CAS resolves (never from inside the callback, which may re-run on a
+  // retry), so a task that advances is not left showing a stale "owed"
+  // ledger entry from an unrelated earlier record.
   await syncOwedContinuationLedgerBestEffortV1(input.taskFolderPath, undefined);
 
   return {

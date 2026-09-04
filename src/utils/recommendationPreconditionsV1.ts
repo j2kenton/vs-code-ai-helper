@@ -123,6 +123,7 @@ const RESUME_SAFE_COMMANDS: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.resumeAndRerunReview",
   "vs-code-ai-helper.resumeAndDispatchImplementation",
   "vs-code-ai-helper.resumeAndSetTaskStage",
+  "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
   "vs-code-ai-helper.resumeIfPausedThenGoToReviewAndApply",
 ]);
 
