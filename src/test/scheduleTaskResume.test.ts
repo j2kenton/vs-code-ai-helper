@@ -16,7 +16,10 @@ import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { resetAutomationChainGuards } from "../utils/automationChain";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
-import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
+import {
+  STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+  UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
+} from "../utils/taskWatchdogV1";
 
 class FakeClock implements SchedulerClock {
   private nextId = 0;
@@ -468,6 +471,10 @@ function baseStalledProgress(overrides: Partial<TaskProgress> = {}): TaskProgres
 void test("armAll reclaims a stale dispatched implRecovery and re-arms it as a fresh pending claim (A1, 1.0.0 gate)", async () => {
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
   const progress = baseStalledProgress({
+    // Reconstructable: a source round to link back to, plus a known (if
+    // empty) quarantined file set — the evidence the sweep now REQUIRES
+    // before reclaiming a stale dispatch (2026-09-04 review follow-up).
+    pendingImplReviewFiles: ["src/example.ts"],
     implRecovery: {
       sourceAttemptId: "impl-recovery-stale-1",
       reason: "the provider's final response was cut short",
@@ -478,6 +485,7 @@ void test("armAll reclaims a stale dispatched implRecovery and re-arms it as a f
       leaseOwner: "dead-window",
       // 90-minute STALE_DISPATCH_GRACE_MS past this anchor is 2026-01-01T01:40 — well before "now".
       leaseUntil: "2026-01-01T00:10:00.000Z",
+      sourceRoundId: "round-1",
     },
   });
   const state = memoryStore(progress);
@@ -547,6 +555,61 @@ void test("armAll leaves a dispatched implRecovery untouched while still within 
       `must not reclaim a record still within grace; got: ${JSON.stringify(surface.entries)}`
     );
   } finally {
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll does NOT reclaim a stale dispatched implRecovery that has lost its reconstructability evidence, and the watchdog closes it out instead (A1 second route, 2026-09-04 review follow-up)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress({
+    // No `sourceRoundId`, no `pendingImplReviewFiles` — not reconstructable.
+    // No `attemptId` either, so the watchdog's ledger-terminalization branch
+    // has no live row to act on and falls back to a direct pause+clear —
+    // the common case, since round-ledger reconciliation earlier in the same
+    // sweep would ordinarily have already closed any real continuation row.
+    implRecovery: {
+      sourceAttemptId: "impl-recovery-unrecoverable-1",
+      reason: "the provider hit a usage limit moments after claiming",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "dispatched",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "dead-window",
+      leaseUntil: "2026-01-01T00:10:00.000Z",
+    },
+  });
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+  resetAutomationChainGuards();
+
+  try {
+    await scheduler.armAll();
+
+    const after = state.current();
+    assert.notEqual(
+      after.implRecovery?.dispatch,
+      "pending",
+      "must not be reclaimed — no source round or file set to safely re-arm"
+    );
+    assert.equal(after.status, "paused");
+    assert.equal(after.pausedReason, UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1);
+    assert.equal(after.implRecovery, undefined, "the unrecoverable record must be cleared, or resuming instantly re-traps the task");
+    assert.ok(
+      !surface.entries.some((e) => /reclaimed and will be re-armed/.test(e.message)),
+      `must not post a reclaim notification; got: ${JSON.stringify(surface.entries)}`
+    );
+    assert.ok(
+      surface.entries.some((e) => e.level === "warning" && /could not be reclaimed/.test(e.message)),
+      `expected the unrecoverable-recovery escalation; got: ${JSON.stringify(surface.entries)}`
+    );
+  } finally {
+    fakeContext.restore();
     resetAutomationChainGuards();
     deactivateNotificationRouter();
     scheduler.dispose();
@@ -664,5 +727,89 @@ void test("armAll's watchdog does not pause a task with an owed implRecovery, an
     }
   } finally {
     fakeContext.restore();
+  }
+});
+
+void test("armAll's stale-dispatch reclaim is race-safe across two concurrently-sweeping windows on the same task — exactly one re-dispatch, never two (2026-09-04 review follow-up: watchdog-plus-sweep concurrency)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = {
+    ...readPersistedProgress(folder.progressPath),
+    status: "active",
+    // Reconstructable AND stale — exactly what `armPendingImplRecoveries`
+    // should reclaim to `pending` and re-dispatch. Two independent
+    // `TaskActionScheduler`s (simulating two VS Code windows) both sweep this
+    // SAME real, disk-backed task folder concurrently: the file lock
+    // (`withTaskLock`/`PrimarySessionLock` under `patchTaskProgressStrictV1`)
+    // is what must serialize their competing reclaim/lease-claim CAS writes,
+    // not test sequencing — this is a real concurrency test, not a simulated
+    // one.
+    pendingImplReviewFiles: ["src/example.ts"],
+    implRecovery: {
+      sourceAttemptId: "impl-recovery-race-1",
+      reason: "the provider's final response was cut short",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "dispatched",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "dead-window",
+      // 90-minute STALE_DISPATCH_GRACE_MS past this anchor is well before "now".
+      leaseUntil: "2026-01-01T00:10:00.000Z",
+      sourceRoundId: "round-1",
+    },
+  };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+
+  const inventoryA = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const inventoryB = stubInventory(folder.taskFolderPath, "task-id", progress);
+  // No injected store on either scheduler: both must go through the real,
+  // disk-backed `patchTaskProgressStrictV1`/`withTaskLock` for this to be a
+  // meaningful concurrency test.
+  const schedulerA = new TaskActionScheduler(inventoryA, clock, undefined, "window-A");
+  const schedulerB = new TaskActionScheduler(inventoryB, clock, undefined, "window-B");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  let dispatchCount = 0;
+  commands.executeCommand = ((id: string) => {
+    if (id === "vs-code-ai-helper.runImplementationWithAI") {
+      dispatchCount++;
+    }
+    return Promise.resolve(undefined);
+  }) as typeof commands.executeCommand;
+  resetAutomationChainGuards();
+
+  try {
+    await Promise.all([schedulerA.armAll(), schedulerB.armAll()]);
+    // Fire-and-forget dispatch does real disk I/O before reaching
+    // `executeCommand` (see `scheduleQuotaResumeAtV1`'s fired-run test above
+    // for the same reasoning) — poll rather than assume a fixed flush
+    // suffices, doubly so with two competing schedulers.
+    let after = readPersistedProgress(folder.progressPath);
+    for (let i = 0; i < 100 && after.implRecovery?.leaseOwner === undefined; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      after = readPersistedProgress(folder.progressPath);
+    }
+
+    assert.equal(
+      after.implRecovery?.dispatch,
+      "pending",
+      "must have been reclaimed to pending by exactly one of the two windows"
+    );
+    assert.ok(
+      after.implRecovery?.leaseOwner === "window-A" || after.implRecovery?.leaseOwner === "window-B",
+      `exactly one window must own the re-armed lease; got ${JSON.stringify(after.implRecovery)}`
+    );
+    assert.equal(dispatchCount, 1, `exactly one re-dispatch must have fired; got ${dispatchCount}`);
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    realFs.restore();
+    schedulerA.dispose();
+    schedulerB.dispose();
+    folder.cleanup();
   }
 });

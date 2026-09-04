@@ -2352,3 +2352,132 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     );
   });
 });
+
+/**
+ * A1 (1.0.0 gate) Part C, Step 5, 2026-09-04 review follow-up (completion
+ * blocker, narrowed): the unchanged-tree guard must refuse dispatch AT THE
+ * COMMAND BOUNDARY — actually calling `runReviewForFolder` and observing that
+ * no provider is ever invoked — not merely via its pure predicate
+ * (`isReviewDispatchAgainstUnchangedTreeV1`, covered in reviewFreshness.test.ts).
+ * It also now lives in `runReviewForFolder` itself (a single choke point
+ * every dispatch funnels through), not only in `runReviewWithAI`'s command
+ * handler, so this exercises the Fast Forward/automation shape too — an
+ * `automationDispatch: true` caller with nobody attached to answer a modal.
+ */
+void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the command boundary (A1 1.0.0-gate Part C, Step 5)", () => {
+  function existingReviewAgainstHead(headSha: string, readiness = 7): string {
+    return [
+      "Readiness: " + readiness + "/10",
+      "",
+      "## Summary verdict",
+      "",
+      "On track.",
+      "",
+      "<!-- blockers:start -->",
+      "<!-- blockers:end -->",
+      "",
+      `<!-- reviewed-commit: ${headSha} -->`,
+      "",
+      "<!-- progress: 5/5 -->",
+      "",
+    ].join("\n");
+  }
+
+  async function runGuardedReview(
+    name: string,
+    reviewMarkerSha: string,
+    options: { automationDispatch?: boolean; showWarningResult?: string | undefined }
+  ): Promise<{ invokeCount: number; folderPath: string }> {
+    const { folderPath } = makeTaskFolder(name, "impl-low-review");
+    fs.writeFileSync(
+      path.join(folderPath, "impl-low-review.md"),
+      existingReviewAgainstHead(reviewMarkerSha),
+      "utf8"
+    );
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    let invokeCount = 0;
+    const countingTransport = scriptedMarkdownTransportV1(() => {
+      invokeCount += 1;
+      return "Readiness: 9/10\n\n- Ready.\n";
+    });
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+      stubV1RunnerSelection([countingTransport]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+    ];
+    const windowTarget = vscode.window as unknown as Record<string, unknown>;
+    const origShowWarning = windowTarget.showWarningMessage;
+    windowTarget.showWarningMessage = (): Promise<string | undefined> =>
+      Promise.resolve(options.showWarningResult);
+    try {
+      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl-low-review",
+        true,
+        { automationDispatch: options.automationDispatch }
+      );
+    } finally {
+      windowTarget.showWarningMessage = origShowWarning;
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+    return { invokeCount, folderPath };
+  }
+
+  void it("an automation dispatch against an unchanged tree is silently refused — no modal, no provider call", async () => {
+    const { invokeCount } = await runGuardedReview(
+      `unchanged-auto-${Math.floor(Math.random() * 1e9)}`,
+      REAL_ROOT_HEAD_SHA,
+      { automationDispatch: true, showWarningResult: undefined }
+    );
+    assert.equal(invokeCount, 0, "automation must never dispatch a review against an unchanged tree");
+  });
+
+  void it("an interactive dispatch against an unchanged tree is refused when the modal's bypass is not chosen", async () => {
+    const { invokeCount } = await runGuardedReview(
+      `unchanged-interactive-decline-${Math.floor(Math.random() * 1e9)}`,
+      REAL_ROOT_HEAD_SHA,
+      { automationDispatch: false, showWarningResult: undefined }
+    );
+    assert.equal(invokeCount, 0, "declining the modal must refuse dispatch");
+  });
+
+  void it("an interactive dispatch against an unchanged tree proceeds once the bypass is chosen", async () => {
+    const { invokeCount } = await runGuardedReview(
+      `unchanged-interactive-bypass-${Math.floor(Math.random() * 1e9)}`,
+      REAL_ROOT_HEAD_SHA,
+      { automationDispatch: false, showWarningResult: "I've made changes — re-check" }
+    );
+    assert.equal(invokeCount, 1, "choosing the explicit bypass must dispatch exactly one review");
+  });
+
+  void it("a review behind HEAD (real changes since) dispatches regardless of automationDispatch — the guard never fires", async () => {
+    const behindShaFixture = REAL_ROOT_HEAD_SHA.replace(/.$/, REAL_ROOT_HEAD_SHA.endsWith("0") ? "1" : "0");
+    const automation = await runGuardedReview(
+      `behind-head-auto-${Math.floor(Math.random() * 1e9)}`,
+      behindShaFixture,
+      { automationDispatch: true }
+    );
+    assert.equal(automation.invokeCount, 1, "a real change since the last review must always dispatch");
+  });
+});

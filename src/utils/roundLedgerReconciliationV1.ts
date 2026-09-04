@@ -128,6 +128,17 @@ export interface ReconcileOrphanedRoundLedgerRowsInputV1 {
    * own fail-open contract, rather than being treated as definitely orphaned.
    */
   readonly liveSchedulingIntentIds: readonly string[] | undefined;
+  /**
+   * `roundId`s with a currently-live round-lease entry (`roundLeaseV1.ts`) —
+   * the durable, cross-window liveness signal for a CLI-resolved
+   * implementation round, which carries neither `operationId` nor `intentId`
+   * (see `isRoundLedgerRowProtectedV1`'s doc comment, 2026-09-04 review
+   * follow-up). Optional and defaulted to empty so existing callers/fixtures
+   * that predate this field keep compiling unchanged; a caller that omits it
+   * simply gets the prior (task-wide-fallback-only) protection for an
+   * identity-less row, same as before this field existed.
+   */
+  readonly liveRoundLeaseIds?: readonly string[];
 }
 
 /**
@@ -155,12 +166,24 @@ function isRoundLedgerRowProtectedV1(
   // eliminating, the false-close window: a round dispatched through the
   // scheduling chokepoint (every `scheduleAutomationChain` call site) keeps a
   // live intent entry for its whole run, so cross-window automation rounds
-  // are now safe. A MANUALLY-dispatched round in another window (no
-  // scheduling-intent entry at all) still has no durable liveness signal
-  // anywhere in this codebase and remains an open gap — tracked as
-  // outstanding follow-up work for A1's watchdog, not resolved by this patch.
+  // are now safe.
   if (row.operationId !== undefined) {
     if (input.liveOperationIds.includes(row.operationId)) {
+      return true;
+    }
+    // 2026-09-04 review follow-up (A1 architectural blocker, narrowed but not
+    // closed by the scheduling-intent check below): a MANUALLY-dispatched
+    // review round also attaches an `operationId` once the coordinator starts
+    // (`attachCoordinatorIdentityToRoundV1` in `reviewActions.ts`), but has no
+    // scheduling intent at all — `liveOperationIds` is this window's
+    // process-local registry, so a manual review running live in a DIFFERENT
+    // window was still invisible here. `liveRoundLeaseIds` is the same
+    // durable, cross-window beacon the CLI-implementation branch below
+    // already relies on, keyed by this row's own `roundId` — both
+    // `runReviewForFolder` and `resumeReviewInteractionV1` now mark it live
+    // for the round's whole lifetime regardless of whether it later attaches
+    // an operationId.
+    if ((input.liveRoundLeaseIds ?? []).includes(row.roundId)) {
       return true;
     }
     return input.liveSchedulingIntentIds === undefined
@@ -174,11 +197,21 @@ function isRoundLedgerRowProtectedV1(
   }
   // CLI-resolved implementation rounds never enter the coordinator, so their
   // live ledger row has no operation or scheduling-intent identity to compare
-  // here. Until that dispatch path has a durable identity of its own, retain
-  // the established task-wide protection for this narrow identity-less case.
-  // This is deliberately conservative: closing a live round would make the
-  // terminalizer discard its true ending, whereas a stale row is repaired on
-  // the first sweep with no live task activity.
+  // here. `liveRoundLeaseIds` (2026-09-04 review follow-up, closing the
+  // architectural blocker left open above: "a manually-dispatched round in
+  // another window still has no durable liveness signal") is the durable,
+  // cross-window signal purpose-built for exactly this row shape — a live
+  // entry means SOME window (this one or another) is actively running this
+  // round right now, checked by the row's own `roundId` rather than a
+  // task-wide boolean. Only when no lease entry exists at all (a legacy row
+  // predating this field, or a lease write that failed) does this fall back
+  // to the prior task-wide protection — deliberately conservative either way:
+  // closing a live round would make the terminalizer discard its true ending,
+  // whereas a stale row is repaired on the first sweep with no live task
+  // activity.
+  if ((input.liveRoundLeaseIds ?? []).includes(row.roundId)) {
+    return true;
+  }
   return input.hasLiveOperation || input.hasLiveSchedulingIntent;
 }
 

@@ -250,4 +250,83 @@ void describe("createWorkflowDecisionV1", () => {
     );
     assert.equal(result.ok, true);
   });
+
+  void describe("option ordering (1.0.0 gate, Part C item 7)", () => {
+    void it("moves the recommended option to the front, preserving the relative order of the rest", () => {
+      const result = createWorkflowDecisionV1(
+        validInput({
+          options: [
+            option({ optionId: "a" }),
+            option({ optionId: "b" }),
+            option({ optionId: "c" }),
+          ],
+          recommendation: { kind: "option", optionId: "c", reasoning: "c is the best choice here." },
+        })
+      );
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(
+          result.decision.options.map((o) => o.optionId),
+          ["c", "a", "b"]
+        );
+      }
+    });
+
+    void it("leaves order unchanged when the recommended option is already first", () => {
+      const result = createWorkflowDecisionV1(
+        validInput({
+          options: [option({ optionId: "a" }), option({ optionId: "b" })],
+          recommendation: { kind: "option", optionId: "a", reasoning: "a is the best choice here." },
+        })
+      );
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(
+          result.decision.options.map((o) => o.optionId),
+          ["a", "b"]
+        );
+      }
+    });
+
+    void it("orders least-destructive first when the recommendation is explicit 'none'", () => {
+      const result = createWorkflowDecisionV1(
+        validInput({
+          options: [
+            option({ optionId: "destroy", destructive: true, consequence: "Discards the prior round's work irreversibly." }),
+            option({ optionId: "safe-a" }),
+            option({ optionId: "safe-b" }),
+          ],
+          recommendation: { kind: "none", reasoning: "Only the user can judge which applies." },
+        })
+      );
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(
+          result.decision.options.map((o) => o.optionId),
+          ["safe-a", "safe-b", "destroy"]
+        );
+      }
+    });
+
+    void it("preserves every option (none dropped or duplicated) when reordering", () => {
+      const result = createWorkflowDecisionV1(
+        validInput({
+          options: [
+            option({ optionId: "a" }),
+            option({ optionId: "b", destructive: true, consequence: "Discards work irreversibly." }),
+            option({ optionId: "c" }),
+          ],
+          recommendation: { kind: "none", reasoning: "Only the user can judge which applies." },
+        })
+      );
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(
+          new Set(result.decision.options.map((o) => o.optionId)),
+          new Set(["a", "b", "c"])
+        );
+        assert.equal(result.decision.options.length, 3);
+      }
+    });
+  });
 });

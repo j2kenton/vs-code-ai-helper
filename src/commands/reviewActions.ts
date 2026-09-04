@@ -110,6 +110,7 @@ import {
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
+import { withRoundLeaseV1, markRoundLiveV1, clearRoundLiveV1 } from "../state/roundLeaseV1";
 import {
   isSummaryOnlyDispatchAvailableV1,
   runSummaryOnlyContinuationV1,
@@ -258,6 +259,7 @@ import {
   parseReviewProgress,
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
+  isReviewDispatchAgainstUnchangedTreeV1,
   REVIEWED_COMMIT_STAGES,
   REVIEW_TARGETS,
   IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
@@ -3610,6 +3612,12 @@ export async function dispatchDegenerateReviewBackupAdvanceV1(
     preserveActiveFallback: true,
     operation: input.operation,
     chatViewProvider: input.chatViewProvider,
+    // Deliberately retrying the SAME content (a degenerate result) against a
+    // different backup model — the unchanged-tree guard exists to stop a
+    // verdict-identical re-review, which is the opposite of what this call
+    // is doing, so it must bypass the guard entirely rather than being
+    // silently refused or need a human answer a modal it never shows.
+    skipUnchangedTreeGuard: true,
   });
   return { dispatched: true };
 }
@@ -4482,12 +4490,80 @@ export async function runReviewForFolder(
     operation?: TaskOperationHandle;
     /** Routes `review.v1` structured questions into Chat With AI. */
     chatViewProvider?: ChatViewProvider;
+    /**
+     * Set by a caller acting on behalf of automation (no synchronous human
+     * attached to answer a modal) — the same contract as
+     * `ReviewCommandArg.automationDispatch`. Changes ONLY how the
+     * unchanged-tree guard below responds when it fires: an interactive
+     * caller sees a modal with a bypass; automation is silently refused
+     * (with a notification) instead, since a modal nobody can answer would
+     * hang the chain forever — exactly the silent-stall shape A1 exists to
+     * eliminate.
+     */
+    automationDispatch?: boolean;
+    /**
+     * Bypasses the unchanged-tree guard below entirely. Set ONLY by a
+     * caller deliberately re-running review against unchanged content on
+     * purpose — today, only the degenerate-review backup-model retry
+     * (`dispatchBackupReviewRetryV1`), which must re-dispatch against the
+     * SAME input because the first provider produced a degenerate result
+     * and a different model is being tried against it.
+     */
+    skipUnchangedTreeGuard?: boolean;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
   const reviewUri = targetStage && artifactUri(folderUri, targetStage);
   if (!targetStage || !reviewUri) {
     return;
+  }
+
+  // A1 (1.0.0 gate) Part C, Step 5: never dispatch a review against a tree
+  // that is provably unchanged since the LAST review of this exact stage —
+  // the verdict cannot differ by construction (observed 2026-08-28: a review
+  // visibly started against an unchanged tree). Lives HERE, in the one
+  // function every review dispatch funnels through — `runReviewWithAI` (a
+  // person clicking Review) and the Fast Forward apply-review loop (an
+  // implementation round that may have changed nothing, then re-reviewing)
+  // both call this directly, and a guard placed only in the command handler
+  // never saw the second path (2026-09-04 review follow-up, completion
+  // blocker: "the guard... is explicitly bypassed for every automation
+  // dispatch... An automated review after a no-change implementation round...
+  // can still run unchanged").
+  //
+  // Scoped to a stage that records a reviewed-commit marker
+  // (REVIEWED_COMMIT_STAGES) — a first-ever review has nothing to compare
+  // against, and a plan review's artifact never carries the marker, so both
+  // fall through unaffected without needing a `currentStage === targetStage`
+  // check (deliberately not required: that would wrongly exempt a re-review
+  // reached from a MAPPED SOURCE stage, e.g. cycling
+  // impl -> impl-high-review -> impl -> about to review again, which is
+  // exactly the unchanged-round case above).
+  if (!options.skipUnchangedTreeGuard && REVIEWED_COMMIT_STAGES.has(targetStage)) {
+    const existingReviewContent = await readNonEmptyText(reviewUri);
+    const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
+    if (isReviewDispatchAgainstUnchangedTreeV1(existingReviewContent, headSha)) {
+      if (options.automationDispatch) {
+        // No human is synchronously attached to this dispatch — a modal
+        // here would await a click that never comes and hang the chain.
+        // Refuse silently instead, with a notification naming why, rather
+        // than burning a round on a verdict that cannot differ.
+        NotificationRouter.showInformation(
+          `${STAGE_DISPLAY_NAMES[targetStage] ?? targetStage}: skipped re-review — nothing has changed ` +
+            "in the workspace since the last review of this stage, so it would produce the same verdict."
+        );
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        "This review already assessed the current workspace — nothing has changed since the last review, " +
+          "so running it again would produce the same verdict. If you've made changes since, re-check instead.",
+        { modal: true },
+        "I've made changes — re-check"
+      );
+      if (choice !== "I've made changes — re-check") {
+        return;
+      }
+    }
   }
 
   // Notifications in-flight visibility: report the stage transition here, at
@@ -4917,6 +4993,18 @@ export async function runReviewForFolder(
   const reviewAttemptId = crypto.randomUUID();
   const claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
   if (!claimed) return;
+  // 2026-09-04 review follow-up (A1 architectural blocker): give this round's
+  // ledger row the same cross-window liveness beacon a CLI implementation
+  // round gets (see roundLeaseV1.ts's doc comment). Unlike that path this
+  // review round attaches an `operationId` once the coordinator starts
+  // (`attachCoordinatorIdentityToRoundV1` below), but `liveOperationIds` is
+  // still only this window's process-local registry — a manual review
+  // running in a DIFFERENT window would otherwise be invisible to
+  // reconciliation's `isRoundLedgerRowProtectedV1`, which now also checks
+  // this lease for operationId-bearing rows. Cleared in the `finally` below
+  // regardless of outcome. Fire-and-forget, same reasoning as
+  // `withRoundLeaseV1`: a beacon, not a dependency.
+  void markRoundLiveV1(reviewAttemptId);
 
   // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
   // itself is eating a large share of the review-input limit — "the same
@@ -5276,6 +5364,7 @@ export async function runReviewForFolder(
     if (!reviewSucceeded) {
       await revertInProgressReviewMarkingV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
     }
+    void clearRoundLiveV1(reviewAttemptId);
   }
 }
 
@@ -5653,6 +5742,7 @@ export async function runReviewWithAI(
     );
     return;
   }
+
   const lockKey = resolved.folderUri.fsPath;
   await runTrackedOperation(
     lockKey,
@@ -5670,7 +5760,16 @@ export async function runReviewWithAI(
         workspaceRoot,
         resolved.progress.currentStage,
         true,
-        { operation: op, chatViewProvider }
+        {
+          operation: op,
+          chatViewProvider,
+          // 2026-09-04 review follow-up (completion blocker, narrowed): the
+          // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
+          // itself so it is a single choke point every review dispatch passes
+          // through — not just this command's entry — see that function's own
+          // doc comment for the full rationale and the automation/manual split.
+          automationDispatch: isAutomationDispatchV1(arg),
+        }
       )
   );
 }
@@ -5892,6 +5991,10 @@ export async function applyReviewWithAI(
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
               chatViewProvider: options.chatViewProvider,
+              // Chained continuation of the apply-review edit just above, not
+              // a fresh human click. See runReviewForFolder's own doc comment
+              // on `automationDispatch`.
+              automationDispatch: true,
             }
           )
       );
@@ -8645,7 +8748,18 @@ async function executeImplementationRun(
 
   let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
 
-  await vscode.window.withProgress(
+  // A1 architectural blocker follow-up (2026-09-04 review): this round's own
+  // `implRoundId` never acquires a coordinator `operationId` on the CLI
+  // branch (`runImplementationOrSealedV1`'s header, "Residual gap"), so
+  // reconciliation's identity-less fallback would otherwise have no durable,
+  // cross-window evidence this round is live — see `roundLeaseV1.ts`. Marked
+  // live for the whole dispatch (both the summary-only and edit-mode
+  // branches below), cleared regardless of outcome so a completed/failed/
+  // cancelled round never lingers as "live". `withRoundLeaseV1` (not an
+  // inline `try`/`finally` here) so this line never shadows the dispatch
+  // `try` block just below, which `reviewActionsStageActivity.test.ts`
+  // locates as the FIRST `try` after this function's start.
+  await withRoundLeaseV1(implRoundId, () => vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
       title: progressTitle,
@@ -8766,7 +8880,7 @@ async function executeImplementationRun(
         linked.dispose();
       }
     }
-  );
+  ));
 
   if (!result) {
     return false;
@@ -11687,6 +11801,12 @@ export async function applyReviewEditWithAI(
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
               chatViewProvider: options.chatViewProvider,
+              // This re-review is a chained continuation of the implementation
+              // round just above, not a fresh human click — nobody is
+              // synchronously attached to answer a modal if the round above
+              // happened to change nothing. See runReviewForFolder's own doc
+              // comment on `automationDispatch` for the full rationale.
+              automationDispatch: true,
             }
           )
       );
@@ -12364,92 +12484,101 @@ export async function resumeReviewInteractionV1(
   if (!claimed) {
     return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
   }
+  // 2026-09-04 review follow-up (A1 architectural blocker, same reasoning as
+  // runReviewForFolder's matching lease): this resumed round also attaches an
+  // `operationId` to the same row below, and needs the same cross-window
+  // liveness beacon so reconciliation in another window cannot close it out
+  // from under a live resume. Cleared in the `finally` below on every exit.
+  void markRoundLiveV1(reviewAttemptId);
+  try {
+    // Preflight BEFORE resuming, and fail closed. An interaction can sit waiting
+    // on questions while a later implementation round changes the tree and
+    // stamps its summary unusable; resuming first meant the provider answered
+    // against its original, now-stale prompt and the outcome still went through
+    // handleReviewOutcomeV1 — which can advance the stage. A warning after the
+    // fact does not undo that. Checking first turns it into a refusal.
+    const variablesResult = await buildReviewResumeVariablesV1(
+      taskFolderUri,
+      workspaceFolderUri,
+      targetStage,
+      cancellationToken
+    );
+    if (!variablesResult.ok) {
+      NotificationRouter.showWarning(variablesResult.warning);
+      // 2026-08-27 review, same blocker as the "no configured model" early
+      // return in `runReviewForFolder`: this happens before `coordinator.resumeAction`
+      // is ever called, so `handleReviewOutcomeV1`'s safety net never runs and
+      // the row `claimReviewAttempt` opened above would otherwise stay "open"
+      // until the still-unbuilt reconciliation sweep exists at all.
+      await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: taskFolderUri });
+      return { ok: false, reason: variablesResult.warning };
+    }
 
-  // Preflight BEFORE resuming, and fail closed. An interaction can sit waiting
-  // on questions while a later implementation round changes the tree and
-  // stamps its summary unusable; resuming first meant the provider answered
-  // against its original, now-stale prompt and the outcome still went through
-  // handleReviewOutcomeV1 — which can advance the stage. A warning after the
-  // fact does not undo that. Checking first turns it into a refusal.
-  const variablesResult = await buildReviewResumeVariablesV1(
-    taskFolderUri,
-    workspaceFolderUri,
-    targetStage,
-    cancellationToken
-  );
-  if (!variablesResult.ok) {
-    NotificationRouter.showWarning(variablesResult.warning);
-    // 2026-08-27 review, same blocker as the "no configured model" early
-    // return in `runReviewForFolder`: this happens before `coordinator.resumeAction`
-    // is ever called, so `handleReviewOutcomeV1`'s safety net never runs and
-    // the row `claimReviewAttempt` opened above would otherwise stay "open"
-    // until the still-unbuilt reconciliation sweep exists at all.
-    await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: taskFolderUri });
-    return { ok: false, reason: variablesResult.warning };
+    // 2026-08-27 review, blocker "lifecycle identity", fourth pass: "Resume
+    // execution calls `runProviderRow` without an attempt observer, so
+    // fallback/retry attempts during a resumed review are also absent" — mirror
+    // `runReviewForFolder`'s `observedCoordinatorAttemptIds` collection here now
+    // that `TaskActionResumeRequestV1.onPromptAssembled` exists.
+    const observedCoordinatorAttemptIds: string[] = [];
+    const outcome = await coordinator.resumeAction({
+      interaction: interactionRef,
+      taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+      taskStatus: ownedTask.progress.status ?? "active",
+      taskStage: currentStage,
+      resumeIdempotencyId,
+      cancellationToken,
+      // See `runReviewForFolder`'s matching `onAttemptAllocated` comment: an
+      // in-memory-only (zero-I/O) collection of every attempt id, including one
+      // that fails before `onPromptAssembled` ever fires for it, reaching disk
+      // only through the same already-proven `extraCoordinatorAttemptIds` →
+      // `terminalizeRoundV1` forwarding every id here already takes — AND (see
+      // that same call site's 2026-08-28 review fix) durably attached to the
+      // round ledger before the provider can run.
+      onAttemptAllocated: async (info) => {
+        observedCoordinatorAttemptIds.push(info.attemptId);
+        await attachCoordinatorIdentityToRoundV1({
+          roundId: reviewAttemptId,
+          operationId: info.operationId,
+          attemptId: info.attemptId,
+          taskFolderUri,
+        });
+      },
+      onPromptAssembled: (info) => {
+        observedCoordinatorAttemptIds.push(info.attemptId);
+      },
+    });
+
+    await handleReviewOutcomeV1(outcome, {
+      extensionUri,
+      folderUri: taskFolderUri,
+      workspaceUri: workspaceFolderUri,
+      currentStage,
+      targetStage,
+      reviewUri,
+      variables: variablesResult.variables,
+      reviewAttemptId,
+      chatViewProvider,
+      modelId,
+      ...(observedCoordinatorAttemptIds.length
+        ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
+        : {}),
+    });
+
+    const after = await orchestrator.loadInteraction(interactionRef);
+    const settlement =
+      after.kind === "ok" &&
+      after.record.state === "settled" &&
+      (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+        ? after.record.settlement
+        : undefined;
+
+    if (settlement === undefined) {
+      return { ok: false, reason: "Resume failed to settle the interaction" };
+    }
+    return { ok: true, settlement };
+  } finally {
+    void clearRoundLiveV1(reviewAttemptId);
   }
-
-  // 2026-08-27 review, blocker "lifecycle identity", fourth pass: "Resume
-  // execution calls `runProviderRow` without an attempt observer, so
-  // fallback/retry attempts during a resumed review are also absent" — mirror
-  // `runReviewForFolder`'s `observedCoordinatorAttemptIds` collection here now
-  // that `TaskActionResumeRequestV1.onPromptAssembled` exists.
-  const observedCoordinatorAttemptIds: string[] = [];
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-    // See `runReviewForFolder`'s matching `onAttemptAllocated` comment: an
-    // in-memory-only (zero-I/O) collection of every attempt id, including one
-    // that fails before `onPromptAssembled` ever fires for it, reaching disk
-    // only through the same already-proven `extraCoordinatorAttemptIds` →
-    // `terminalizeRoundV1` forwarding every id here already takes — AND (see
-    // that same call site's 2026-08-28 review fix) durably attached to the
-    // round ledger before the provider can run.
-    onAttemptAllocated: async (info) => {
-      observedCoordinatorAttemptIds.push(info.attemptId);
-      await attachCoordinatorIdentityToRoundV1({
-        roundId: reviewAttemptId,
-        operationId: info.operationId,
-        attemptId: info.attemptId,
-        taskFolderUri,
-      });
-    },
-    onPromptAssembled: (info) => {
-      observedCoordinatorAttemptIds.push(info.attemptId);
-    },
-  });
-
-  await handleReviewOutcomeV1(outcome, {
-    extensionUri,
-    folderUri: taskFolderUri,
-    workspaceUri: workspaceFolderUri,
-    currentStage,
-    targetStage,
-    reviewUri,
-    variables: variablesResult.variables,
-    reviewAttemptId,
-    chatViewProvider,
-    modelId,
-    ...(observedCoordinatorAttemptIds.length
-      ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
-      : {}),
-  });
-
-  const after = await orchestrator.loadInteraction(interactionRef);
-  const settlement =
-    after.kind === "ok" &&
-    after.record.state === "settled" &&
-    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
-      ? after.record.settlement
-      : undefined;
-
-  if (settlement === undefined) {
-    return { ok: false, reason: "Resume failed to settle the interaction" };
-  }
-  return { ok: true, settlement };
 }
 
 /**

@@ -20,12 +20,19 @@ import {
 } from "../state/schedulingIntentV1";
 import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
+import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 import { pauseTaskWithReason } from "../utils/taskProgressTransforms";
+import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+  UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
   describeStalledActiveTaskEscalationV1,
+  describeUnrecoverableRecoveryEscalationV1,
   isImpossibleActiveStateV1,
+  isReconstructableImplRecoveryV1,
+  isStaleDispatchedImplRecoveryV1,
+  isUnrecoverableImplRecoveryV1,
 } from "../utils/taskWatchdogV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
@@ -205,6 +212,12 @@ export class TaskActionScheduler implements vscode.Disposable {
    * independently idempotent and cheap once nothing is outstanding.
    */
   private async reconcileRoundLedgerOrphans(): Promise<void> {
+    // Workspace-wide, computed once per sweep rather than per task: a live
+    // round-lease entry is keyed by its own globally-unique `roundId`, so one
+    // list safely covers every task's rows (2026-09-04 review follow-up,
+    // closing the "manually-dispatched round in another window" architectural
+    // gap — see `roundLeaseV1.ts` and `isRoundLedgerRowProtectedV1`).
+    const liveRoundLeaseIds = listLiveRoundLeaseIdsV1(this.clock.now());
     for (const task of this.inventory.getTasks()) {
       const liveOperations = taskOperations.getTaskOperations(task.taskFolderPath);
       await reconcileRoundLedgerV1({
@@ -213,6 +226,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         hasLiveSchedulingIntent: hasLiveSchedulingIntentBestEffortV1(task.taskFolderPath),
         liveOperationIds: liveOperations.map((op) => op.id),
         liveSchedulingIntentIds: liveSchedulingIntentIdsBestEffortV1(task.taskFolderPath),
+        liveRoundLeaseIds,
       });
     }
   }
@@ -252,40 +266,48 @@ export class TaskActionScheduler implements vscode.Disposable {
    * `dispatched` forever, since nothing ever re-read it — the exact same
    * silent-stall symptom as the first route, just surviving instead of being
    * deleted. Once its anchor (`leaseUntil ?? at`) plus `STALE_DISPATCH_GRACE_MS`
-   * has elapsed, the round it named is presumed dead and it is returned to
-   * `pending` so the claim path immediately below re-arms it exactly as a
-   * freshly-persisted pending record would. A record still within the grace
-   * window is left untouched — the round it covers can legitimately run for
-   * the full CLI timeout.
+   * has elapsed, the round it named is presumed dead and — PROVIDED it is
+   * still `isReconstructableImplRecoveryV1` (a `sourceRoundId` to link back
+   * to and a quarantined file set, explicit-unknown or otherwise) — it is
+   * returned to `pending` so the claim path immediately below re-arms it
+   * exactly as a freshly-persisted pending record would. A record still
+   * within the grace window is left untouched — the round it covers can
+   * legitimately run for the full CLI timeout. A record that IS stale but has
+   * lost its reconstructability evidence is left alone here too — re-arming
+   * it would dispatch a continuation with nothing to continue — and instead
+   * falls to `detectAndRepairStalledActiveTasksV1`, which closes it out
+   * through the round ledger's own terminalization path.
    */
   private async armPendingImplRecoveries(): Promise<void> {
-    // A dispatched record's lease dates from the transition, and the round it
-    // covers can legitimately run for the full CLI timeout (60 minutes) —
-    // only well past that is silence evidence of a dead round.
-    const STALE_DISPATCH_GRACE_MS = 90 * 60 * 1000;
     for (const task of this.inventory.getTasks()) {
       let recovery = task.progress.implRecovery;
       if (!recovery) continue;
       if (task.progress.status !== "active") continue;
       if (recovery.dispatch === "dispatched") {
-        const anchor = recovery.leaseUntil ?? recovery.at;
-        const isStale = this.clock.now() > new Date(anchor).getTime() + STALE_DISPATCH_GRACE_MS;
-        if (!isStale) {
+        if (!isStaleDispatchedImplRecoveryV1(recovery, this.clock.now())) {
+          continue;
+        }
+        if (!isReconstructableImplRecoveryV1(recovery, task.progress)) {
+          // No source round or quarantined file set to hand a fresh
+          // dispatch — reclaiming here would re-dispatch a continuation with
+          // nothing to continue, indistinguishable from starting an
+          // unrelated round under this record's name. Leave it for the
+          // watchdog (`detectAndRepairStalledActiveTasksV1`) to close out
+          // through the ledger's own terminalization path instead.
           continue;
         }
         // Reclaim: return the stale `dispatched` record to `pending` (CAS —
-        // re-checks staleness inside the patch so a concurrent reclaim from
-        // another window, or a round that finalizes at the last instant,
-        // cannot double-reclaim a record that is no longer stale or no
-        // longer present) so the ordinary pending-claim logic below re-arms
-        // it in this same pass.
+        // re-checks staleness AND reconstructability inside the patch so a
+        // concurrent reclaim from another window, or a round that finalizes
+        // at the last instant, cannot double-reclaim a record that is no
+        // longer stale, no longer reconstructable, or no longer present) so
+        // the ordinary pending-claim logic below re-arms it in this same
+        // pass.
         const reclaimed = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
           const record = progress.implRecovery;
           if (!record || record.dispatch !== "dispatched") return progress;
-          const currentAnchor = record.leaseUntil ?? record.at;
-          if (this.clock.now() <= new Date(currentAnchor).getTime() + STALE_DISPATCH_GRACE_MS) {
-            return progress;
-          }
+          if (!isStaleDispatchedImplRecoveryV1(record, this.clock.now())) return progress;
+          if (!isReconstructableImplRecoveryV1(record, progress)) return progress;
           return {
             ...progress,
             implRecovery: {
@@ -299,8 +321,8 @@ export class TaskActionScheduler implements vscode.Disposable {
         });
         if (reclaimed === undefined || reclaimed.implRecovery === undefined || reclaimed.implRecovery.dispatch !== "pending") {
           // Another window already reclaimed it, it finalized in the
-          // meantime, or it was no longer stale under the fresh read — no
-          // action needed from this pass.
+          // meantime, or it was no longer stale/reconstructable under the
+          // fresh read — no action needed from this pass.
           continue;
         }
         if (!this.staleRecoveryNotified.has(task.taskFolderPath)) {
@@ -409,42 +431,110 @@ export class TaskActionScheduler implements vscode.Disposable {
   private readonly stalledActiveNotified = new Set<string>();
 
   /**
+   * A1's watchdog, both routes (2026-09-04 review follow-up, blocker "the
+   * watchdog fallback still calls pauseTaskWithReason directly rather than
+   * through the ledger's single terminalization path" — narrowed by this
+   * revision from two separately-written pause paths, one per route, to this
+   * ONE shared function both routes call): given `attemptId` (the stuck-
+   * `implRecovery` route's continuation row) or `undefined` (the generic
+   * route, which by construction has no open round-ledger row left — see
+   * `isImpossibleActiveStateV1`'s `hasOpenRoundLedgerRowV1` check — so there
+   * is nothing for the ledger to terminalize), always attempts
+   * `terminalizeRoundV1` — the round ledger's sole terminal writer — FIRST
+   * when an `attemptId` exists, folding the pause (and, for the recovery
+   * route, the `implRecovery` clear) into that SAME transaction via
+   * `postTerminalizePatch` so the ledger's ending and the task's paused
+   * status can never observably disagree. `implRecovery` MUST be cleared for
+   * the recovery route, not merely left in place under a paused status:
+   * without this, resuming the task reproduces the identical impossible state
+   * instantly (the same stuck record, nothing changed). The common case for
+   * the recovery route is `alreadyTerminal`/`notFound` — this task's own
+   * round-ledger reconciliation pass, earlier in this same sweep, will
+   * already have closed the continuation's row as orphaned — so this falls
+   * back to the SAME direct pause(+clear) patch primitive
+   * (`patchTaskProgressStrictV1`, reached via `this.store.patch`) whenever
+   * there is no live ledger row left for `terminalizeRoundV1` to act on; the
+   * generic route always takes this fallback, for the reason above. Re-checks
+   * `isImpossibleActiveStateV1` against the FRESH state read inside the patch
+   * (not the snapshot the caller iterated over) either way, so a concurrent
+   * resolution — another window's reclaim of the same `implRecovery` record,
+   * or the user resuming the task by hand — between this call's snapshot and
+   * its write is a safe no-op, never a stale double-pause.
+   */
+  private async closeStalledTaskThroughLedgerV1(
+    task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
+    attemptId: string | undefined,
+    reason: string
+  ): Promise<TaskProgress | undefined> {
+    const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+    const applyPauseAndClear = (current: TaskProgress): TaskProgress => {
+      if (!isImpossibleActiveStateV1({ progress: current, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
+        return current;
+      }
+      const cleared = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 ? { ...current, implRecovery: undefined } : current;
+      return pauseTaskWithReason(cleared, reason);
+    };
+    if (attemptId) {
+      const result = await terminalizeRoundV1(
+        attemptId,
+        "interrupted",
+        {
+          rejectionReason:
+            "the continuation was dispatched but never finalized, and its record lost the evidence " +
+            "needed to safely re-arm it — closed by the watchdog",
+        },
+        { taskFolderUri, postTerminalizePatch: (current) => applyPauseAndClear(current) }
+      );
+      if (result.ok && !result.alreadyTerminal) {
+        return result.progress;
+      }
+      // notFound or alreadyTerminal: no live ledger row left to close (the
+      // normal case). Fall through to the direct pause(+clear) below.
+    }
+    return this.store.patch(taskFolderUri, applyPauseAndClear);
+  }
+
+  /**
    * A1's watchdog (1.0.0 gate): after every other self-healing pass above has
    * had its chance, find any task still `status: active` with no live
    * operation, no owed continuation, and no scheduled intent —
    * `isImpossibleActiveStateV1` (`taskWatchdogV1.ts`) — and move it to an
    * explicit `paused` state with an escalation, rather than leaving it to sit
    * `active` forever with nothing running and no signal that anything is
-   * wrong. Deliberately acts ONLY through a durable state transition
-   * (`pauseTaskWithReason`, the same primitive `pauseTaskForExhaustedChainV1`
-   * uses) — never dispatches work itself — so running this twice over
-   * unchanged state is a no-op: the first run's pause flips `status` away
-   * from `"active"`, which the predicate itself then excludes.
+   * wrong. Deliberately acts ONLY through durable state transitions
+   * (`closeStalledTaskThroughLedgerV1` above, for both routes) — never
+   * dispatches work itself — so running this twice over unchanged state is a
+   * no-op: the first run's pause flips `status` away from `"active"`, which
+   * the predicate itself then excludes.
    */
   private async detectAndRepairStalledActiveTasksV1(): Promise<void> {
     for (const task of this.inventory.getTasks()) {
-      if (!isImpossibleActiveStateV1({ progress: task.progress, taskCanonicalId: task.taskFolderPath })) {
+      if (!isImpossibleActiveStateV1({ progress: task.progress, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
         this.stalledActiveNotified.delete(task.taskFolderPath);
         continue;
       }
       if (this.stalledActiveNotified.has(task.taskFolderPath)) {
         continue;
       }
-      const patched = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
-        // Re-check under the task lock against a fresh read — something else
-        // (another window, a command the user just ran) may have resolved
-        // the stall between the snapshot above and this write.
-        if (!isImpossibleActiveStateV1({ progress, taskCanonicalId: task.taskFolderPath })) {
-          return progress;
-        }
-        return pauseTaskWithReason(progress, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
-      });
-      if (patched?.status !== "paused" || patched.pausedReason !== STALLED_ACTIVE_TASK_PAUSE_REASON_V1) {
+      const recovery = task.progress.implRecovery;
+      const stuckRecovery =
+        recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
+      const expectedReason = stuckRecovery
+        ? UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1
+        : STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
+      const patched = await this.closeStalledTaskThroughLedgerV1(
+        task,
+        stuckRecovery ? recovery?.attemptId : undefined,
+        expectedReason
+      );
+      if (patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
         continue;
       }
       this.stalledActiveNotified.add(task.taskFolderPath);
       NotificationRouter.showWarning(
-        describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+        stuckRecovery
+          ? describeUnrecoverableRecoveryEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+          : describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
       );
     }
   }

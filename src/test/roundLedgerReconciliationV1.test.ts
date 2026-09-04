@@ -203,6 +203,77 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
     }
   });
 
+  void it("does NOT close an identity-less row (no operationId, no intentId) while its own roundId has a live round-lease entry (2026-09-04 review follow-up, architectural blocker: cross-window CLI round liveness)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_live_lease", [
+        {
+          roundId: "cli-round-live-1",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        // Both task-wide booleans false — simulating a DIFFERENT window
+        // running this round, invisible to this window's own in-process
+        // registries, protected only by the durable round-lease entry.
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: ["cli-round-live-1"],
+      });
+      assert.deepEqual(result.closed, []);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "cli-round-live-1")?.state, "open");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes an identity-less row when its roundId is absent from liveRoundLeaseIds and both task-wide booleans are false (no lease is not fail-open)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_expired_lease", [
+        {
+          roundId: "cli-round-dead-1",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        // A different round's lease is live, but not this row's own —
+        // must not protect it.
+        liveRoundLeaseIds: ["some-other-round"],
+      });
+      assert.deepEqual(result.closed, ["cli-round-dead-1"]);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "cli-round-dead-1")?.state, "interrupted");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("is a no-op for a task with no open/scheduled rows", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

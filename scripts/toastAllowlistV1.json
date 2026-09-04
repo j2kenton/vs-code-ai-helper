@@ -20,12 +20,12 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7352,
+      "line": 7402,
       "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8523,
+      "line": 8573,
       "reason": "Pre-run safety check synchronously inline in the user-invoked 'Run Implementation' command (unrelated uncommitted changes in the workspace) — a git-safety confirmation, not a review/round outcome."
     },
     {
@@ -88,7 +88,7 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10971,
+      "line": 11032,
       "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision."
     },
     {
@@ -98,17 +98,17 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7593,
+      "line": 7643,
       "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a required completion artifact is missing — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:182."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7627,
+      "line": 7677,
       "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a plan-review blocker is not recorded as resolved — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:182."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2091,
+      "line": 2093,
       "reason": "Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome."
     },
     {
@@ -123,22 +123,22 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2831,
+      "line": 2833,
       "reason": "Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15)."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7826,
+      "line": 7876,
       "reason": "Publish Anyway nudge pointing at commitAndPushTask when the Complete & Move On Publish review could not be started automatically (another review in progress) — the drop reason is already logged; this only offers the manual alternative."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7852,
+      "line": 7902,
       "reason": "Publish Anyway nudge pointing at commitAndPushTask when the entry-owned publish preflight check failed — the failure reason is named in the message; this only offers the manual alternative."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7867,
+      "line": 7917,
       "reason": "Publish nudge pointing at commitAndPushTask when the entry-owned publish preflight check passed — Commit and Push must only ever run from the user's own click, so this only nudges toward it."
     },
     {
@@ -148,22 +148,22 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9427,
+      "line": 9488,
       "reason": "Nudge to run this stage's review after an Implementation round reported nothing to fix — the round's own outcome is recorded in the run log and chat ledger; this toast only points at the single follow-up command (Run Review) already named in the message text."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9621,
+      "line": 9682,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision (no activating extension context) — the checklist-under-recording case (the checklist still shows unfinished items even though the most recent review already scored full marks with zero blockers)."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9878,
+      "line": 9939,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — same fallback-of-a-migrated-decision pattern as copilotImplementationRunner.ts:794, just for the checklist-reconciliation decision instead of the round-limit gate."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10516,
+      "line": 10577,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — the unverified-step-counts case."
     },
     {

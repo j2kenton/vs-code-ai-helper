@@ -703,6 +703,37 @@ export function computeReviewFreshness(
 }
 
 /**
+ * A1's 1.0.0-gate Part C, Step 5: true only when a manual review re-run would
+ * dispatch against a tree that is provably identical to what the LAST review
+ * of this exact stage already assessed — the reviewed-commit marker names the
+ * same commit as HEAD right now, so the verdict cannot differ by
+ * construction ("I've made changes — re-check" — never a review's default
+ * behavior).
+ *
+ * Deliberately conservative, mirroring every other freshness caller in this
+ * module: an absent artifact, an absent/placeholder review (nothing to
+ * compare against — including the `# Review Stale`/in-progress placeholders,
+ * which carry no reviewed-commit marker and so already read `reviewedSha ===
+ * undefined` via `computeReviewFreshness`), an unreadable `reviewed-commit`
+ * marker, or an unresolved HEAD all report `false` ("cannot determine" must
+ * never read as "unchanged" — blocking a review that might in fact be
+ * warranted is worse than the wasted round this guard exists to prevent).
+ * Scoped by the caller to {@link REVIEWED_COMMIT_STAGES}: a plan review's
+ * artifact never carries the marker, so this is a harmless no-op there
+ * without an explicit stage check here.
+ */
+export function isReviewDispatchAgainstUnchangedTreeV1(
+  existingReviewContent: string | undefined,
+  headSha: string | undefined
+): boolean {
+  if (!existingReviewContent || !headSha) {
+    return false;
+  }
+  const freshness = computeReviewFreshness(existingReviewContent, headSha);
+  return freshness.reviewedSha !== undefined && !freshness.behindHead;
+}
+
+/**
  * Insert, refresh, or remove the single stale banner line that marks a review
  * whose recorded commit is no longer HEAD:
  *

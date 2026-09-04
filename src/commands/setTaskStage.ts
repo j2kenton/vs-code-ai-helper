@@ -349,7 +349,12 @@ export async function setTaskStage(
     // racing auto-advance) is already pending or running for this task.
     await scheduleAutomationChain({
       command: "vs-code-ai-helper.runReviewWithAI",
-      arg: { taskFolderPath: task.taskFolderPath },
+      // No human on this path — see ReviewCommandArg.automationDispatch.
+      // Without this, a task cycling back into a review stage it has
+      // already visited (impl -> impl-high-review -> impl -> back here)
+      // could hit the unchanged-tree guard's modal with nobody attached to
+      // answer it, hanging this chain (A1, 2026-09-04 review follow-up).
+      arg: { taskFolderPath: task.taskFolderPath, automationDispatch: true },
       taskKey: task.taskFolderPath,
       chainId: "auto-review",
       intent: {

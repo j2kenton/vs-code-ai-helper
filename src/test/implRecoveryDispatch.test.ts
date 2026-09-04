@@ -210,13 +210,20 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
     assert.equal(harness.progress.implRecovery?.dispatch, "dispatched");
   });
 
-  void it("reclaims a dispatched record once clearly dead (A1, 1.0.0 gate), re-arming it exactly once", async () => {
+  void it("reclaims a dispatched record once clearly dead AND reconstructable (A1, 1.0.0 gate), re-arming it exactly once", async () => {
     const harness = makeHarness(
       makeProgress(
         pendingRecord({
           dispatch: "dispatched",
           attemptId: "impl-continuation-dead",
           leaseUntil: new Date(BASE_NOW - 60 * 60 * 1000).toISOString(),
+          // Reconstructable: a source round to link back to, plus an
+          // explicit "the file set could not be enumerated" admission — the
+          // evidence the sweep now REQUIRES before reclaiming a stale
+          // dispatch (2026-09-04 review follow-up: reclaiming without it
+          // would re-dispatch a continuation with nothing to continue).
+          sourceRoundId: "round-source-1",
+          filesChangedUnknown: true,
         })
       )
     );
@@ -239,6 +246,31 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
       /reclaimed and will be re-armed automatically/.test(message)
     );
     assert.equal(surfaced.length, 1, "the reclaim must be surfaced exactly once, not once per sweep");
+  });
+
+  void it("does NOT reclaim a dispatched record that is clearly dead but has lost its reconstructability evidence — closed out by the watchdog instead (A1 second route)", async () => {
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "dispatched",
+          attemptId: "impl-continuation-dead-2",
+          leaseUntil: new Date(BASE_NOW - 60 * 60 * 1000).toISOString(),
+          // No sourceRoundId, no filesChangedUnknown, and makeProgress below
+          // sets no pendingImplReviewFiles — nothing to reconstruct from.
+        })
+      )
+    );
+    active = harness;
+
+    harness.advance(2 * 60 * 60 * 1000);
+    await harness.armAll();
+
+    assert.equal(harness.dispatches.length, 0, "must not re-dispatch a continuation with no source round or file set");
+    assert.notEqual(harness.progress.implRecovery?.dispatch, "pending", "must not be reclaimed");
+    assert.ok(
+      !harness.notifications.some((message) => /reclaimed and will be re-armed automatically/.test(message)),
+      "must not post the reclaim notification for an unreconstructable record"
+    );
   });
 
   void it("does not re-arm once the continuation cap is reached", async () => {

@@ -193,6 +193,35 @@ function validateOption(option: WorkflowDecisionOptionV1, index: number): string
 }
 
 /**
+ * 1.0.0 gate, Part C item 7: order a decision's options the same way at the
+ * single place every decision is built, rather than leaving each of the many
+ * call sites (`reviewEscalation.ts` and friends) to remember to do it
+ * themselves — recommended option first (a user should not have to hunt for
+ * the option the system itself is telling them to pick), otherwise
+ * least-destructive first so a card never leads with an irreversible action
+ * by accident of array-literal order. Stable within each group: this only
+ * moves the recommended/least-destructive options to the front, it never
+ * reorders two options of the same kind relative to each other.
+ */
+function orderOptionsV1(
+  options: readonly WorkflowDecisionOptionV1[],
+  recommendation: WorkflowDecisionRecommendationV1
+): readonly WorkflowDecisionOptionV1[] {
+  if (recommendation.kind === "option") {
+    const recommended = options.find((o) => o.optionId === recommendation.optionId);
+    if (!recommended) {
+      return options;
+    }
+    return [recommended, ...options.filter((o) => o.optionId !== recommendation.optionId)];
+  }
+  // No basis to recommend: least-destructive first — never lead with an
+  // option that discards work or is otherwise hard to reverse.
+  const nonDestructive = options.filter((o) => o.destructive !== true);
+  const destructive = options.filter((o) => o.destructive === true);
+  return [...nonDestructive, ...destructive];
+}
+
+/**
  * Validate and construct a `WorkflowDecisionV1`. Fail-closed: rejects a
  * record missing any of the four required elements (what happened, why the
  * user is needed, at least one option with a consequence, a recommendation
@@ -287,7 +316,7 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       stage: input.stage,
       whatHappened: input.whatHappened,
       whyUserNeeded: input.whyUserNeeded,
-      options: input.options,
+      options: orderOptionsV1(input.options, recommendation),
       recommendation,
       ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
       ...(input.gating !== undefined ? { gating: input.gating } : {}),

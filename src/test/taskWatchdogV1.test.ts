@@ -11,10 +11,14 @@
 import * as assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import {
+  STALE_DISPATCH_GRACE_MS,
   hasOpenRoundLedgerRowV1,
   isImpossibleActiveStateV1,
+  isReconstructableImplRecoveryV1,
+  isStaleDispatchedImplRecoveryV1,
+  isUnrecoverableImplRecoveryV1,
 } from "../utils/taskWatchdogV1";
-import { RoundLedgerEntryV1, TaskProgress } from "../types/taskProgress";
+import { ImplRecoveryV1, RoundLedgerEntryV1, TaskProgress } from "../types/taskProgress";
 import { __extensionContextV1TestOnly, getExtensionContextV1 } from "../utils/extensionContextV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 
@@ -101,26 +105,96 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
     );
   });
 
-  void it("is false with an owed implRecovery, pending or dispatched", () => {
-    for (const dispatch of ["pending", "dispatched"] as const) {
-      assert.equal(
-        isImpossibleActiveStateV1({
-          progress: baseProgress({
-            implRecovery: {
-              sourceAttemptId: "x",
-              reason: "x",
-              trigger: "roundIncomplete",
-              mode: "unconstrained",
-              dispatch,
-              at: "2026-01-01T00:00:00.000Z",
-            },
-          }),
-          taskCanonicalId: "task-a",
+  void it("is false with a pending implRecovery, regardless of age", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({
+          implRecovery: {
+            sourceAttemptId: "x",
+            reason: "x",
+            trigger: "roundIncomplete",
+            mode: "unconstrained",
+            dispatch: "pending",
+            at: "2026-01-01T00:00:00.000Z",
+          },
         }),
-        false,
-        `dispatch ${dispatch} must exempt`
-      );
-    }
+        taskCanonicalId: "task-a",
+        now: Date.parse("2026-06-01T00:00:00.000Z"),
+      }),
+      false,
+      "a pending record is owed work about to be armed by the sweep"
+    );
+  });
+
+  void it("is false with a dispatched implRecovery still within the stale-dispatch grace window", () => {
+    const at = "2026-01-01T00:00:00.000Z";
+    const now = Date.parse(at) + STALE_DISPATCH_GRACE_MS - 1000;
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({
+          implRecovery: {
+            sourceAttemptId: "x",
+            reason: "x",
+            trigger: "roundIncomplete",
+            mode: "unconstrained",
+            dispatch: "dispatched",
+            at,
+          },
+        }),
+        taskCanonicalId: "task-a",
+        now,
+      }),
+      false,
+      "a dispatched record still within grace may legitimately be running the full CLI timeout elsewhere"
+    );
+  });
+
+  void it("is false with a stale dispatched implRecovery that is still reconstructable — the sweep will reclaim it next", () => {
+    const at = "2026-01-01T00:00:00.000Z";
+    const now = Date.parse(at) + STALE_DISPATCH_GRACE_MS + 1000;
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({
+          pendingImplReviewFiles: ["src/a.ts"],
+          implRecovery: {
+            sourceAttemptId: "x",
+            reason: "x",
+            trigger: "roundIncomplete",
+            mode: "unconstrained",
+            dispatch: "dispatched",
+            at,
+            sourceRoundId: "round-1",
+          },
+        }),
+        taskCanonicalId: "task-a",
+        now,
+      }),
+      false,
+      "stale-but-reconstructable is about to recover, not stuck"
+    );
+  });
+
+  void it("is TRUE with a stale dispatched implRecovery that has lost its reconstructability evidence — A1's second route", () => {
+    const at = "2026-01-01T00:00:00.000Z";
+    const now = Date.parse(at) + STALE_DISPATCH_GRACE_MS + 1000;
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({
+          implRecovery: {
+            sourceAttemptId: "x",
+            reason: "x",
+            trigger: "roundIncomplete",
+            mode: "unconstrained",
+            dispatch: "dispatched",
+            at,
+          },
+        }),
+        taskCanonicalId: "task-a",
+        now,
+      }),
+      true,
+      "no source round or quarantined file set — nothing can bring this back automatically"
+    );
   });
 
   void it("is false with a scheduledRun or a scheduledResumeTime", () => {
@@ -183,5 +257,79 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
     const second = isImpossibleActiveStateV1({ progress, taskCanonicalId: "task-b" });
     assert.equal(first, second);
     assert.equal(first, true);
+  });
+});
+
+void describe("stale-dispatch + reconstructability evidence — the single definition shared by the sweep and the watchdog", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+  const withinGrace = Date.parse(at) + STALE_DISPATCH_GRACE_MS - 1000;
+  const pastGrace = Date.parse(at) + STALE_DISPATCH_GRACE_MS + 1000;
+
+  function dispatchedRecovery(overrides: Partial<ImplRecoveryV1> = {}): ImplRecoveryV1 {
+    return {
+      sourceAttemptId: "x",
+      reason: "x",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "dispatched",
+      at,
+      ...overrides,
+    };
+  }
+
+  void it("isStaleDispatchedImplRecoveryV1 is false for a pending record regardless of age", () => {
+    const pending: ImplRecoveryV1 = { ...dispatchedRecovery(), dispatch: "pending" };
+    assert.equal(isStaleDispatchedImplRecoveryV1(pending, pastGrace), false);
+  });
+
+  void it("isStaleDispatchedImplRecoveryV1 anchors on leaseUntil when present, else at", () => {
+    assert.equal(isStaleDispatchedImplRecoveryV1(dispatchedRecovery(), withinGrace), false);
+    assert.equal(isStaleDispatchedImplRecoveryV1(dispatchedRecovery(), pastGrace), true);
+    const laterLease = dispatchedRecovery({ leaseUntil: "2026-01-01T05:00:00.000Z" });
+    assert.equal(
+      isStaleDispatchedImplRecoveryV1(laterLease, pastGrace),
+      false,
+      "a later leaseUntil moves the anchor forward, so the same 'now' is no longer past grace"
+    );
+  });
+
+  void it("isReconstructableImplRecoveryV1 requires sourceRoundId AND (pendingImplReviewFiles OR filesChangedUnknown)", () => {
+    const noEvidence = dispatchedRecovery();
+    assert.equal(isReconstructableImplRecoveryV1(noEvidence, baseProgress()), false);
+
+    const roundOnly = dispatchedRecovery({ sourceRoundId: "round-1" });
+    assert.equal(
+      isReconstructableImplRecoveryV1(roundOnly, baseProgress()),
+      false,
+      "a round id alone with no known file set is still not enough to safely re-arm"
+    );
+
+    const roundAndFiles = dispatchedRecovery({ sourceRoundId: "round-1" });
+    assert.equal(
+      isReconstructableImplRecoveryV1(roundAndFiles, baseProgress({ pendingImplReviewFiles: ["a.ts"] })),
+      true
+    );
+
+    const roundAndExplicitUnknown = dispatchedRecovery({ sourceRoundId: "round-1", filesChangedUnknown: true });
+    assert.equal(
+      isReconstructableImplRecoveryV1(roundAndExplicitUnknown, baseProgress()),
+      true,
+      "an explicit 'unknown' admission is still a recorded fact, not silent absence"
+    );
+  });
+
+  void it("isUnrecoverableImplRecoveryV1 — the determinism matrix (stale x reconstructable)", () => {
+    const progressWithFiles = baseProgress({ pendingImplReviewFiles: ["a.ts"] });
+    const reconstructable = dispatchedRecovery({ sourceRoundId: "round-1" });
+    const bare = dispatchedRecovery();
+
+    // not stale, reconstructable -> not unrecoverable
+    assert.equal(isUnrecoverableImplRecoveryV1(reconstructable, progressWithFiles, withinGrace), false);
+    // not stale, not reconstructable -> not unrecoverable (staleness gates first)
+    assert.equal(isUnrecoverableImplRecoveryV1(bare, baseProgress(), withinGrace), false);
+    // stale, reconstructable -> not unrecoverable (the sweep will reclaim it)
+    assert.equal(isUnrecoverableImplRecoveryV1(reconstructable, progressWithFiles, pastGrace), false);
+    // stale, not reconstructable -> unrecoverable, the only true cell
+    assert.equal(isUnrecoverableImplRecoveryV1(bare, baseProgress(), pastGrace), true);
   });
 });

@@ -20,6 +20,7 @@ import * as vscode from "vscode";
 
 import {
   computeReviewFreshness,
+  isReviewDispatchAgainstUnchangedTreeV1,
   isStrictPerfectReview,
   parseReadiness,
   parseReviewBlockersDetailed,
@@ -86,6 +87,27 @@ void describe("computeReviewFreshness", () => {
       reviewedSha: REVIEWED,
       behindHead: false,
     });
+  });
+});
+
+void describe("isReviewDispatchAgainstUnchangedTreeV1 (A1 1.0.0-gate Part C, Step 5)", () => {
+  void it("reports true only when the reviewed commit is exactly HEAD (unchanged tree)", () => {
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(jesterShapedReview(), REVIEWED), true);
+    // Short-form SHA is the same commit.
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(jesterShapedReview(), REVIEWED.slice(0, 7)), true);
+  });
+
+  void it("reports false when the review is behind HEAD (real changes since)", () => {
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(jesterShapedReview(), HEAD), false);
+  });
+
+  void it("reports false when nothing can be determined, never blocking a review it cannot justify", () => {
+    // No existing review artifact at all (first-ever review).
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(undefined, HEAD), false);
+    // No reviewed-commit marker in the content (e.g. a plan review).
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1("Readiness: 8/10\n", HEAD), false);
+    // No HEAD resolved.
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(jesterShapedReview(), undefined), false);
   });
 });
 
