@@ -5,6 +5,11 @@ node_modules/
 dist/
 out/
 out-test/
+
+# pnpm's local package store: a machine-specific runtime cache, never project
+# output. Its index.db-shm/-wal files churn on every install and should never
+# be tracked.
+.pnpm-store/
 # Sanctioned scratch compile output (wf10 item 10): a one-off `tsc --outDir`
 # during an implementation round belongs here, never in a made-up path like
 # .test-out/ — see resources/prompts/run-implementation.md.
