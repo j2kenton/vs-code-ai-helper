@@ -277,6 +277,7 @@ import { SchedulingIntentMetadataV1 } from "../state/schedulingIntentV1";
 import {
   buildVerifiedChecksSection,
   collectCompletionLintPreview,
+  CompletionCheckDescriptor,
   CompletionLintResult,
   resolvePublishScopeFolder,
   synthesizeMechanicalBlockers,
@@ -2101,6 +2102,150 @@ async function requirePublishChecksFreshnessOrWarnV1(
   return { ok: false };
 }
 
+/**
+ * Notifications in-flight visibility (plan Part III): a stage-scoped,
+ * in-memory accumulator that turns `collectCompletionLintPreview`'s per-check
+ * `onCheckEvent` callbacks into ONE aggregate activity report on the
+ * workflow root operation, instead of one Notifications update per check —
+ * root and monorepo-member checks keep running concurrently underneath
+ * (this never touches scheduling), only their DISPLAY is coalesced.
+ *
+ * Owned entirely by `buildVerifiedChecksVariable` for the duration of one
+ * Completion Checks pass; `close()` (called from that function's `finally`)
+ * makes every later callback a no-op so a check that settles after the pass
+ * has already ended can never overwrite a stage the root has since moved
+ * onto (in addition to the `stageToken` guard `reportActivity` itself
+ * applies).
+ *
+ * Rendering: a single active check is shown directly
+ * (`command · N/M complete`); several show a deterministic representative —
+ * the earliest-STARTED active check, ties broken by start order, never by
+ * wall-clock equality — plus a count
+ * (`K checks running · command (+K-1) · N/M complete`). The elapsed origin is
+ * set explicitly to the earliest active check's own start time
+ * (`elapsedOrigin`), so it advances precisely when that check settles and a
+ * later-started check becomes the new oldest, rather than resetting to "now"
+ * on every repaint.
+ *
+ * The denominator (`planned`) is set exactly ONCE, from the explicit
+ * `planned(total)` signal `collectCompletionLint` fires before the very
+ * first `started` call — never accumulated incrementally from `started`
+ * calls or grown later by a batch signal. This is what guarantees the shown
+ * total is the true grand total (root count plus any monorepo member count)
+ * from the first report onward: it can never appear to reach a completed-
+ * looking `N/N` and then silently grow to `N/M`. A pass this accumulator
+ * never sees a `planned` call for (should not happen given the caller always
+ * wires both) simply shows `.../0` rather than crashing.
+ *
+ * Batch transitions are reported ONLY from the explicit `batchBoundary`
+ * signal `collectCompletionLint` fires — never inferred from the active set
+ * emptying out, which happens identically at a real batch boundary AND at
+ * the true end of the whole pass (there is no way to tell those two apart
+ * from the active-check count alone). `batchBoundary()` carries no count —
+ * the total was already correct from `planned` — it exists purely to mark
+ * the real transition-in-time so the row can say `N/M complete · starting
+ * next batch` at the moment that claim is actually true. When the active set
+ * empties WITHOUT a `batchBoundary` call — because the whole pass really is
+ * done, or because this is a mid-pass tick between the last settle and
+ * either `batchBoundary` or `close()` — the row shows a neutral
+ * `N/M complete` with no claim about what happens next, using the
+ * completion-stage's own elapsed origin (`stageElapsedOrigin`, captured once
+ * where the stage itself was reported "starting") rather than the now-stale
+ * last-active-check origin.
+ *
+ * @internal exported for testing
+ */
+export function createCompletionCheckActivityAccumulatorV1(
+  op: TaskOperationHandle | undefined,
+  stageToken: number | undefined,
+  stageElapsedOrigin?: number
+): {
+  onCheckEvent: {
+    planned(total: number): void;
+    started(descriptor: CompletionCheckDescriptor): void;
+    settled(descriptor: CompletionCheckDescriptor): void;
+    batchBoundary(): void;
+  };
+  close(): void;
+} {
+  let planned = 0;
+  let completed = 0;
+  let closed = false;
+  let sequence = 0;
+  const active = new Map<CompletionCheckDescriptor, { seq: number; startedAt: number }>();
+
+  function renderActive(): void {
+    let representative: CompletionCheckDescriptor | undefined;
+    let representativeSeq = Infinity;
+    let earliestStart = Infinity;
+    for (const [descriptor, info] of active) {
+      if (info.seq < representativeSeq) {
+        representativeSeq = info.seq;
+        representative = descriptor;
+      }
+      if (info.startedAt < earliestStart) {
+        earliestStart = info.startedAt;
+      }
+    }
+    const label = active.size === 1
+      ? `${representative!.command} · ${completed}/${planned} complete`
+      : `${active.size} checks running · ${representative!.command} (+${active.size - 1}) · ${completed}/${planned} complete`;
+    op!.reportActivity(label, { stageToken, elapsedOrigin: earliestStart });
+  }
+
+  return {
+    onCheckEvent: {
+      planned(total: number): void {
+        if (closed) {
+          return;
+        }
+        planned = total;
+      },
+      started(descriptor: CompletionCheckDescriptor): void {
+        if (closed) {
+          return;
+        }
+        active.set(descriptor, { seq: sequence++, startedAt: Date.now() });
+        if (op) {
+          renderActive();
+        }
+      },
+      settled(descriptor: CompletionCheckDescriptor): void {
+        if (closed) {
+          return;
+        }
+        active.delete(descriptor);
+        completed += 1;
+        if (!op) {
+          return;
+        }
+        if (active.size > 0) {
+          renderActive();
+        } else {
+          op.reportActivity(`${completed}/${planned} complete`, {
+            stageToken,
+            elapsedOrigin: stageElapsedOrigin,
+          });
+        }
+      },
+      batchBoundary(): void {
+        if (closed) {
+          return;
+        }
+        if (op) {
+          op.reportActivity(`${completed}/${planned} complete · starting next batch`, {
+            stageToken,
+            elapsedOrigin: stageElapsedOrigin,
+          });
+        }
+      },
+    },
+    close(): void {
+      closed = true;
+    },
+  };
+}
+
 async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
@@ -2112,13 +2257,31 @@ async function buildVerifiedChecksVariable(
   // checks actually ran against) instead of leaving the two unconnected.
   // Absent at the resume-interaction call site, which has no reviewedCommitSha
   // in scope — the disclaimer is simply omitted there, same as before.
-  reviewedCommitSha?: string
+  reviewedCommitSha?: string,
+  // Notifications in-flight visibility (plan Part III): when supplied, wires
+  // a per-check accumulator so the workflow root's live row shows which
+  // completion check(s) are running and how many have completed, instead of
+  // going quiet for the whole pass. Absent at the resume-interaction call
+  // site (buildReviewResumeVariablesV1), which has no live operation handle
+  // in scope — that caller simply publishes no activity, same as
+  // checkPublishPreflight and the commit/push caller. `stageElapsedOrigin`
+  // is the timestamp captured where the enclosing review stage itself was
+  // reported "starting" (reportActivity's resetElapsedOrigin call) — the
+  // accumulator restores it between check batches instead of the stale
+  // last-active-check origin.
+  activityOptions?: { operation?: TaskOperationHandle; stageToken?: number; stageElapsedOrigin?: number }
 ): Promise<{ verifiedChecks: string; planItemVerification?: string; mechanicalBlockers: ReviewBlocker[] }> {
+  const checkActivity = createCompletionCheckActivityAccumulatorV1(
+    activityOptions?.operation,
+    activityOptions?.stageToken,
+    activityOptions?.stageElapsedOrigin
+  );
   try {
     const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
       allowScopePrompt: false,
       includeAiPlanVerification: includePlanItemVerification,
       token,
+      onCheckEvent: checkActivity.onCheckEvent,
     });
     if (targetStage === "publish") {
       // Narrow, explicit carve-out from this function's normal
@@ -2165,6 +2328,15 @@ async function buildVerifiedChecksVariable(
       planItemVerification: undefined,
       mechanicalBlockers: [],
     };
+  } finally {
+    // Close BEFORE this function returns, not merely once the accumulator's
+    // own checks settle: `collectCompletionLintPreview` awaits both the
+    // root/explicit and monorepo-member `Promise.all` batches internally, so
+    // every `settled()` this pass will ever fire has already landed by the
+    // time control reaches here. Closing keeps a check spawned by some other
+    // concurrent caller (there is none today, but nothing enforces it) from
+    // ever reporting into a root this pass has released.
+    checkActivity.close();
   }
 }
 
@@ -4318,6 +4490,11 @@ export async function runReviewForFolder(
   // late resolution here can never overwrite a stage this same root has
   // since moved on to.
   const stageToken = options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
+  // Captured alongside stageToken (not read back from the operation, which
+  // exposes no getter for it) so the completion-check accumulator below can
+  // restore this exact origin between check batches instead of the last
+  // active check's now-stale start time.
+  const stageElapsedOrigin = Date.now();
 
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
@@ -4506,7 +4683,8 @@ export async function runReviewForFolder(
       options.operation?.token,
       targetStage === "publish",
       targetStage,
-      variables.reviewedCommitSha
+      variables.reviewedCommitSha,
+      { operation: options.operation, stageToken, stageElapsedOrigin }
     );
     variables.verifiedChecks = checks.verifiedChecks;
     if (checks.planItemVerification !== undefined) {

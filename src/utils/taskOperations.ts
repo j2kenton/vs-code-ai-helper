@@ -131,10 +131,18 @@ export interface TaskOperationHandle {
    * from a stage that has already been superseded overwriting the row with
    * stale text. Irrelevant to genuine stage transitions themselves, which
    * always win (never pass `stageToken` alongside `resetElapsedOrigin`).
+   *
+   * `elapsedOrigin`, when supplied, sets the elapsed-time origin to this
+   * exact timestamp instead of "now" — for a caller (the completion-check
+   * accumulator) that tracks several concurrently-running sub-activities and
+   * wants the displayed elapsed time to reflect the oldest one's real start
+   * time, including advancing to the next-oldest's start once the current
+   * oldest settles. Takes precedence over `resetElapsedOrigin` when both are
+   * supplied; omitted, behavior is unchanged (reset-to-now or preserve).
    */
   reportActivity(
     activity: string | undefined,
-    options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+    options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
   ): number | undefined;
 }
 
@@ -492,7 +500,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       },
       reportActivity: (
         activity: string | undefined,
-        options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+        options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
       ) => this.reportActivity(id, activity, options),
     };
 
@@ -554,7 +562,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
   reportActivity(
     id: string,
     activity: string | undefined,
-    options?: { resetElapsedOrigin?: boolean; stageToken?: number }
+    options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
   ): number | undefined {
     for (const keyMap of this.operations.values()) {
       let op = keyMap.get(id);
@@ -571,7 +579,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
         op.stageGeneration += 1;
       }
       op.activity = activity;
-      if (options?.resetElapsedOrigin || op.activityStartedAt === undefined) {
+      if (options?.elapsedOrigin !== undefined) {
+        op.activityStartedAt = options.elapsedOrigin;
+      } else if (options?.resetElapsedOrigin || op.activityStartedAt === undefined) {
         op.activityStartedAt = Date.now();
       }
       this.triggerChange(false);

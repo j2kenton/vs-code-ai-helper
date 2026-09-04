@@ -1165,6 +1165,18 @@ export function selectVerifyScriptCandidate(
   return [`${manager} run verify`, [manager, "run", "verify"]] as const;
 }
 
+/**
+ * One completion check's display identity, as passed to
+ * {@link CollectCompletionLintOptions.onCheckEvent}. `command` is the same
+ * string later reported in `CompletionLintResult.commandsRun` — already
+ * carrying a monorepo member's `[packageDir] ` prefix when applicable (see
+ * the recursive pass in `collectCompletionLint`), so no separate
+ * `packageDir` field is needed to build a display label.
+ */
+export interface CompletionCheckDescriptor {
+  readonly command: string;
+}
+
 export interface CollectCompletionLintOptions {
   /**
    * Explicitly configured verification command lines. When non-empty these
@@ -1188,6 +1200,50 @@ export interface CollectCompletionLintOptions {
    * caller indefinitely.
    */
   timeoutMs?: number;
+  /**
+   * Opt-in, purely observational per-check lifecycle hooks (Notifications
+   * in-flight visibility, plan Part III). `started` fires just before a
+   * check's process is spawned; `settled` fires once it has resolved
+   * (success, failure, or timeout) via a `finally`, so it always pairs with
+   * a prior `started` even when the check throws. Invoked from inside both
+   * concurrent `Promise.all` batches this function already runs (the root
+   * pass — explicit or conventional — and the monorepo member pass); never
+   * changes scheduling, concurrency, retry behavior, failure handling,
+   * result ordering, or `commandsRun`. Only the workflow completion-stage
+   * caller in reviewActions.ts passes this; `checkPublishPreflight` and the
+   * commit/push caller pass none, so they publish no activity.
+   */
+  onCheckEvent?: {
+    started(descriptor: CompletionCheckDescriptor): void;
+    settled(descriptor: CompletionCheckDescriptor): void;
+    /**
+     * Fires exactly once, synchronously, before the root/explicit batch's
+     * `Promise.all` is kicked off — i.e. before any `started` call — with
+     * the TRUE grand total of checks that will run across every batch this
+     * call will make (root/explicit count plus, when applicable, the
+     * monorepo member-package count, both already known synchronously at
+     * this point from package.json/workspace inspection). An observer uses
+     * this as the fixed denominator for the whole pass so a completed-
+     * looking "N/N" state is never rendered for the root batch alone and
+     * then silently grown once a monorepo member batch is discovered — the
+     * total is correct from the very first `started` report onward and
+     * never changes again.
+     */
+    planned?(total: number): void;
+    /**
+     * Fires exactly once, synchronously, immediately before the monorepo
+     * member-package batch's `Promise.all` is kicked off — and ONLY when
+     * that batch is non-empty, i.e. a further batch is genuinely about to
+     * run. Carries no payload: the true total was already delivered via
+     * `planned` before the root batch even started, so this call exists
+     * purely to mark the real transition point in time — an observer uses
+     * it to render a "starting next batch" hint at the moment that is
+     * actually true, distinguishing "a batch boundary, more work is
+     * (imminently) starting" from "the whole pass is done", never by
+     * inferring either from the active-check set emptying out.
+     */
+    batchBoundary?(): void;
+  };
 }
 
 /** Collect diagnostics after fresh lint/type/test checks have completed. */
@@ -1209,16 +1265,45 @@ export async function collectCompletionLint(
   let checks: Array<{ command: string; code: number; output: string; retryCount: number }>;
   let monorepoDetected = false;
   let monorepoChecks: NonNullable<CompletionLintResult["monorepoChecks"]> = [];
-  if (explicitCommands.length > 0) {
-    // Toolchain resolution order (publish pre-check contract): explicitly
-    // configured verification commands win over conventional npm scripts.
-    checks = await Promise.all(
-      explicitCommands.map(async (command) => ({
-        command,
-        ...(await runWithRetry((extraEnv) => runExplicitCheck(folder, command, guard, extraEnv), guard.token)),
-      }))
-    );
-  } else {
+
+  // Monorepo member-command discovery (packageDir/command/memberFolder/args)
+  // is pure filesystem inspection — it never depends on any check's result —
+  // so, like the root command list resolved just below, it is determined
+  // synchronously before any check runs. This is what lets the TRUE grand
+  // total (root count plus member count) be reported via `planned` before
+  // the first `started` call, so an observer's denominator is correct from
+  // the very start and never has to grow after appearing to reach a
+  // completed-looking "N/N".
+  const memberCommands: Array<{ packageDir: string; command: string; memberFolder: string; args: string[] }> = [];
+  monorepoDetected = isMonorepoWorkspace(folder);
+  if (monorepoDetected && explicitCommands.length === 0) {
+    const memberFolders = discoverWorkspaceMemberFolders(folder);
+    const scriptNames = ["lint", "check-types", "test", "build"] as const;
+    for (const memberFolder of memberFolders) {
+      const memberScripts = readPackageScripts(memberFolder);
+      if (!memberScripts) { continue; }
+      const packageDir = path.relative(folder, memberFolder).replace(/\\/g, "/");
+      for (const scriptName of scriptNames) {
+        // `--if-present` equivalent: only invoke a script that is actually
+        // configured for this member package, so one package missing e.g.
+        // `build` never fails (or is even attempted for) the whole pass.
+        if (!Object.prototype.hasOwnProperty.call(memberScripts, scriptName)) { continue; }
+        memberCommands.push({
+          packageDir,
+          command: `[${packageDir}] ${manager} run ${scriptName}`,
+          memberFolder,
+          args: [manager, "run", scriptName],
+        });
+      }
+    }
+  }
+
+  // Root/explicit command list is likewise resolved synchronously up front
+  // (unchanged selection logic, just hoisted ahead of execution) so its
+  // length is known before `planned` fires below, without altering which
+  // commands actually run or how `missingScripts` is computed.
+  let runnableChecks: Array<readonly [string, string[]]> = [];
+  if (explicitCommands.length === 0) {
     const scripts = readPackageScripts(folder);
     // 1b: a repo's own aggregate `verify` script, when safe, replaces the
     // conventional candidate list outright (see selectVerifyScriptCandidate).
@@ -1240,7 +1325,7 @@ export async function collectCompletionLint(
     // and keeps its existing unconditional-run behavior. A selected `verify`
     // script is always configured (it was only selected because it exists),
     // so it skips this filter entirely.
-    const runnableChecks = verifyCandidate
+    runnableChecks = verifyCandidate
       ? candidateChecks
       : candidateChecks.filter(([, args]) => {
           const scriptName = args[2];
@@ -1249,12 +1334,45 @@ export async function collectCompletionLint(
           if (!configured) missingScripts.push(scriptName);
           return configured;
         });
+  }
 
+  const rootCount = explicitCommands.length > 0 ? explicitCommands.length : runnableChecks.length;
+  // Fires exactly once, before any `started` call — see the option's doc
+  // comment: this is the fixed denominator for the whole pass, correct from
+  // the first report onward.
+  options?.onCheckEvent?.planned?.(rootCount + memberCommands.length);
+
+  if (explicitCommands.length > 0) {
+    // Toolchain resolution order (publish pre-check contract): explicitly
+    // configured verification commands win over conventional npm scripts.
     checks = await Promise.all(
-      runnableChecks.map(async ([command, args]) => ({
-        command,
-        ...(await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token)),
-      }))
+      explicitCommands.map(async (command) => {
+        const descriptor: CompletionCheckDescriptor = { command };
+        options?.onCheckEvent?.started(descriptor);
+        try {
+          return {
+            command,
+            ...(await runWithRetry((extraEnv) => runExplicitCheck(folder, command, guard, extraEnv), guard.token)),
+          };
+        } finally {
+          options?.onCheckEvent?.settled(descriptor);
+        }
+      })
+    );
+  } else {
+    checks = await Promise.all(
+      runnableChecks.map(async ([command, args]) => {
+        const descriptor: CompletionCheckDescriptor = { command };
+        options?.onCheckEvent?.started(descriptor);
+        try {
+          return {
+            command,
+            ...(await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token)),
+          };
+        } finally {
+          options?.onCheckEvent?.settled(descriptor);
+        }
+      })
     );
   }
 
@@ -1272,34 +1390,29 @@ export async function collectCompletionLint(
   // touches `packages/*`/`apps/*` at all, so without this pass a member
   // package's real, currently-failing suite is invisible to a reviewer who
   // is told the Verified Checks result is ground truth.
-  monorepoDetected = isMonorepoWorkspace(folder);
-  if (monorepoDetected && explicitCommands.length === 0) {
-    const memberFolders = discoverWorkspaceMemberFolders(folder);
-    const scriptNames = ["lint", "check-types", "test", "build"] as const;
-    const memberCommands: Array<{ packageDir: string; command: string; memberFolder: string; args: string[] }> = [];
-    for (const memberFolder of memberFolders) {
-      const memberScripts = readPackageScripts(memberFolder);
-      if (!memberScripts) { continue; }
-      const packageDir = path.relative(folder, memberFolder).replace(/\\/g, "/");
-      for (const scriptName of scriptNames) {
-        // `--if-present` equivalent: only invoke a script that is actually
-        // configured for this member package, so one package missing e.g.
-        // `build` never fails (or is even attempted for) the whole pass.
-        if (!Object.prototype.hasOwnProperty.call(memberScripts, scriptName)) { continue; }
-        memberCommands.push({
-          packageDir,
-          command: `[${packageDir}] ${manager} run ${scriptName}`,
-          memberFolder,
-          args: [manager, "run", scriptName],
-        });
-      }
-    }
+  //
+  // `memberCommands` was already resolved above, before the root batch even
+  // started; `planned` already reported the true combined total. This
+  // `batchBoundary` call — still fired here, at the real transition point,
+  // only when a member batch is genuinely about to run — exists purely to
+  // mark the moment in time so an observer can render a "starting next
+  // batch" hint that is actually true, not to correct any count.
+  if (monorepoDetected && explicitCommands.length === 0 && memberCommands.length > 0) {
+    options?.onCheckEvent?.batchBoundary?.();
     const memberResults = await Promise.all(
-      memberCommands.map(async ({ packageDir, command, memberFolder, args }) => ({
-        packageDir,
-        command,
-        ...(await runWithRetry((extraEnv) => runCheck(memberFolder, args, guard, extraEnv), guard.token)),
-      }))
+      memberCommands.map(async ({ packageDir, command, memberFolder, args }) => {
+        const descriptor: CompletionCheckDescriptor = { command };
+        options?.onCheckEvent?.started(descriptor);
+        try {
+          return {
+            packageDir,
+            command,
+            ...(await runWithRetry((extraEnv) => runCheck(memberFolder, args, guard, extraEnv), guard.token)),
+          };
+        } finally {
+          options?.onCheckEvent?.settled(descriptor);
+        }
+      })
     );
     monorepoChecks = memberResults.map(({ packageDir, command, code, retryCount }) => ({
       packageDir,
@@ -2107,6 +2220,8 @@ export async function collectCompletionLintPreview(
     token?: vscode.CancellationToken;
     /** See CollectCompletionLintOptions.timeoutMs. */
     timeoutMs?: number;
+    /** See CollectCompletionLintOptions.onCheckEvent — forwarded unchanged. */
+    onCheckEvent?: CollectCompletionLintOptions["onCheckEvent"];
   }
 ): Promise<CompletionLintResult> {
   const allowScopePrompt = options?.allowScopePrompt ?? true;
@@ -2154,6 +2269,7 @@ export async function collectCompletionLintPreview(
     explicitCommands: getPublishVerificationCommands(),
     token: options?.token,
     timeoutMs: options?.timeoutMs,
+    onCheckEvent: options?.onCheckEvent,
   });
   result.verifiedFolder = scopeFolder;
   if (includeAiPlanVerification) {
