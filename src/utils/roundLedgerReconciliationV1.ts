@@ -144,8 +144,28 @@ function isRoundLedgerRowProtectedV1(
   row: RoundLedgerEntryV1,
   input: ReconcileOrphanedRoundLedgerRowsInputV1
 ): boolean {
+  // 2026-09-04 review follow-up (A1 architectural blocker): `liveOperationIds`
+  // is ONLY ever this window's own process-local `taskOperations` registry —
+  // a round genuinely running in a DIFFERENT VS Code window is invisible to
+  // it. Checking `liveOperationIds` alone therefore lets one window close a
+  // round-ledger row (and the watchdog then pause the task) for a round that
+  // is, in fact, still live in another window. The scheduling-intent store IS
+  // durable/cross-window, so an operationId row is now ALSO protected when
+  // this task still shows a live scheduling intent — narrowing, not
+  // eliminating, the false-close window: a round dispatched through the
+  // scheduling chokepoint (every `scheduleAutomationChain` call site) keeps a
+  // live intent entry for its whole run, so cross-window automation rounds
+  // are now safe. A MANUALLY-dispatched round in another window (no
+  // scheduling-intent entry at all) still has no durable liveness signal
+  // anywhere in this codebase and remains an open gap — tracked as
+  // outstanding follow-up work for A1's watchdog, not resolved by this patch.
   if (row.operationId !== undefined) {
-    return input.liveOperationIds.includes(row.operationId);
+    if (input.liveOperationIds.includes(row.operationId)) {
+      return true;
+    }
+    return input.liveSchedulingIntentIds === undefined
+      ? true
+      : input.liveSchedulingIntentIds.length > 0;
   }
   if (row.intentId !== undefined) {
     return input.liveSchedulingIntentIds === undefined
