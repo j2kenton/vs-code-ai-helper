@@ -36,11 +36,27 @@ import { getExtensionContextV1 } from "../utils/extensionContextV1";
  * margin than the rest of A1 already uses.
  *
  * Best-effort throughout, mirroring `schedulingIntentV1.ts`'s own contract:
- * every write swallows its own failure, and a missing/unreadable store reads
- * as "no live lease" — callers always have `hasLiveOperation`/
- * `hasLiveSchedulingIntent` as a further fallback, so failing closed here
- * only narrows protection back to the pre-existing behavior, never removes
- * it.
+ * every write swallows its own failure internally (never throws), and a
+ * missing/unreadable store reads as "no live lease". Most callers have
+ * `hasLiveOperation`/`hasLiveSchedulingIntent` as a further fallback, so
+ * failing closed here only narrows protection back to the pre-existing
+ * behavior for them, never removes it — those callers may ignore
+ * `markRoundLiveV1`'s return value.
+ *
+ * 2026-09-06 review follow-up (A1 architectural blocker, narrowed a third
+ * time): a review round is different from those callers. Its round-ledger
+ * row can end up with NEITHER an `operationId`/`intentId` match (a
+ * CLI-resolved dispatch never acquires one) NOR a live in-process operation
+ * if it is running in another window — this lease is its ONLY liveness
+ * evidence. `markRoundLiveV1` therefore now RETURNS whether the write
+ * actually persisted, so a caller with no other fallback
+ * (`claimReviewAttemptWithLiveLeaseV1` in `reviewActions.ts`) can at least
+ * LOG that the row it is about to open has no liveness evidence behind it,
+ * rather than staying silent about the gap. It does NOT refuse the claim on
+ * this signal: a prior revision did, and running the full test suite showed
+ * many production call paths (and their tests) legitimately reach this point
+ * with no `ExtensionContext` installed, so refusing turned a diagnostic gap
+ * into a hard failure of ordinary review dispatch.
  */
 
 const ROUND_LEASE_KEY = "ensemble.roundLeaseV1";
@@ -60,20 +76,26 @@ function readAllLeases(): Record<string, RoundLeaseEntryV1> {
 }
 
 /** Mark `roundId` as a live round for `ROUND_LEASE_TTL_MS` from now. Call once
- * at the start of a CLI-resolved round's dispatch. Best-effort: a store
- * failure never blocks the round it is meant to protect. */
-export async function markRoundLiveV1(roundId: string): Promise<void> {
+ * at the start of a CLI-resolved round's dispatch. Never throws — a store
+ * failure never blocks the round it is meant to protect — but returns
+ * whether the lease actually persisted, so a caller with no other liveness
+ * fallback can tell "protected" from "not protected" rather than assuming
+ * the former. `false` covers both "no extension context available" and "the
+ * workspaceState write itself failed". */
+export async function markRoundLiveV1(roundId: string): Promise<boolean> {
   const state = getExtensionContextV1()?.workspaceState;
   if (!state) {
-    return;
+    return false;
   }
   try {
     const map = readAllLeases();
     map[roundId] = { roundId, expiresAt: Date.now() + ROUND_LEASE_TTL_MS };
     await state.update(ROUND_LEASE_KEY, map);
+    return true;
   } catch {
     // Best-effort — reconciliation's task-wide fallback still protects a
     // same-window round even without this entry.
+    return false;
   }
 }
 

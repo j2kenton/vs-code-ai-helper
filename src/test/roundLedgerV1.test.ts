@@ -1423,6 +1423,134 @@ void describe("claimReviewAttemptWithLiveLeaseV1 (A1 architectural blocker, 2026
       fakeContext.restore();
     }
   });
+
+  // 2026-09-06 review follow-up (same A1 architectural blocker, narrowed a
+  // third time): the two tests above only exercised the ordering guarantee
+  // with a WORKING lease store. `markRoundLiveV1` used to return `void`, so
+  // this wrapper could not tell a genuinely-persisted lease from one that
+  // silently failed, and there was no record anywhere that the row it went
+  // on to open was unprotected. An earlier revision of this fix REFUSED the
+  // claim in that case; running the full suite showed dozens of pre-existing
+  // integration tests drive `runReviewForFolder` (and this function) without
+  // installing a fake `ExtensionContext` as their NORMAL path, so refusing
+  // broke ordinary review dispatch across the suite. The corrected behavior
+  // below proceeds exactly as before (no regression) but now surfaces the gap
+  // via `console.warn` instead of staying silent, and confirms no phantom
+  // lease is ever recorded when the write genuinely did not persist.
+  void it("proceeds without a lease (and warns) when no extension context exists to hold it", async () => {
+    __extensionContextV1TestOnly.reset();
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const realWarn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]): void => {
+      warnings.push(args);
+    };
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_no_lease_context");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_no_lease_context",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimReviewAttemptWithLiveLeaseV1(
+        folderUri,
+        "no-lease-context-attempt",
+        "impl-high-review"
+      );
+      assert.equal(claimed?.reviewAttemptId, "no-lease-context-attempt");
+      const row = claimed ? resolveRoundV1(claimed, "no-lease-context-attempt") : undefined;
+      assert.ok(row, "the round-ledger row must still be committed even without a lease");
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), [], "no phantom lease may be recorded");
+      assert.ok(
+        warnings.some((args) => String(args[0]).includes("could not establish a durable cross-window liveness lease")),
+        "the missing lease must be logged, not silent"
+      );
+    } finally {
+      console.warn = realWarn;
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("proceeds without a lease (and warns) when the lease write itself fails (workspaceState.update rejects)", async () => {
+    const memento = {
+      get<T>(_key: string, defaultValue: T): T {
+        return defaultValue;
+      },
+      update(): Promise<void> {
+        return Promise.reject(new Error("simulated workspaceState failure"));
+      },
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const realWarn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]): void => {
+      warnings.push(args);
+    };
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_lease_write_failed");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_lease_write_failed",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimReviewAttemptWithLiveLeaseV1(
+        folderUri,
+        "lease-write-failed-attempt",
+        "impl-high-review"
+      );
+      assert.equal(claimed?.reviewAttemptId, "lease-write-failed-attempt");
+      const row = claimed ? resolveRoundV1(claimed, "lease-write-failed-attempt") : undefined;
+      assert.ok(row, "the round-ledger row must still be committed even without a lease");
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), [], "no phantom lease may be recorded");
+      assert.ok(
+        warnings.some((args) => String(args[0]).includes("could not establish a durable cross-window liveness lease")),
+        "the failed lease write must be logged, not silent"
+      );
+    } finally {
+      console.warn = realWarn;
+      wsStub.restore();
+      fsBridge.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
 });
 
 void describe("roundLedgerModeForCommandV1 (Part 4 step 12)", () => {

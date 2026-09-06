@@ -74,3 +74,39 @@ void test("clearRoundLiveV1 and listLiveRoundLeaseIdsV1 are no-ops with no Exten
   assert.deepEqual(listLiveRoundLeaseIdsV1(), []);
   await clearRoundLiveV1("round-x");
 });
+
+// 2026-09-06 review follow-up (A1 architectural blocker, narrowed a third
+// time): markRoundLiveV1 used to return void, so a caller with no other
+// liveness fallback (claimReviewAttemptWithLiveLeaseV1) could not tell a
+// genuinely-persisted lease from one that silently failed. It now reports
+// whether the write actually persisted.
+void test("markRoundLiveV1 returns true when the lease actually persists", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    assert.equal(await markRoundLiveV1("round-persisted"), true);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("markRoundLiveV1 returns false with no ExtensionContext installed", async () => {
+  __extensionContextV1TestOnly.reset();
+  assert.equal(await markRoundLiveV1("round-no-context"), false);
+});
+
+void test("markRoundLiveV1 returns false when the workspaceState write itself rejects", async () => {
+  const memento = {
+    get<T>(_key: string, defaultValue: T): T {
+      return defaultValue;
+    },
+    update(): Promise<void> {
+      return Promise.reject(new Error("simulated workspaceState failure"));
+    },
+  } as unknown as import("vscode").Memento;
+  __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as import("vscode").ExtensionContext);
+  try {
+    assert.equal(await markRoundLiveV1("round-write-failed"), false);
+  } finally {
+    __extensionContextV1TestOnly.reset();
+  }
+});

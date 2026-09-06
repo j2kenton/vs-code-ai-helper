@@ -596,13 +596,46 @@ export async function claimReviewAttempt(
  * rather than left to expire on its own 90-minute TTL — though even an
  * uncleared leak would be harmless: a lease with no matching row protects
  * nothing.
+ *
+ * 2026-09-06 review follow-up (same A1 architectural blocker, narrowed a
+ * third time): awaiting the write closed the ORDERING gap, but
+ * `markRoundLiveV1` used to return `void` — this function could not tell a
+ * genuinely-persisted lease from one that silently failed (no extension
+ * context, or a rejected `workspaceState.update`) and would still go on to
+ * open the round-ledger row either way, with no record anywhere that it had
+ * done so unprotected. `markRoundLiveV1` now reports whether the write
+ * actually persisted.
+ *
+ * Deliberately logs rather than refuses when it did not: an earlier revision
+ * of this fix threw here instead, and running the full suite showed dozens
+ * of pre-existing integration tests drive this exact function
+ * (`runReviewForFolder` and friends) without installing a fake
+ * `ExtensionContext` — i.e. exercising precisely the "no extension context"
+ * branch as their NORMAL path, not an edge case. Refusing the claim there
+ * turned a purely-diagnostic gap (this lease was always one of several
+ * liveness signals, per `roundLeaseV1.ts`'s own "best-effort throughout"
+ * design) into a hard failure of ordinary review dispatch — a strictly worse
+ * outcome than the narrow reconciliation race this is meant to close. Logging
+ * makes the previously-silent gap OBSERVABLE without making it fatal; closing
+ * it completely would need either a production guarantee that
+ * `ExtensionContext` is always available by the time a review dispatches (it
+ * should be, post-activation, but nothing here proves it), or a change to
+ * reconciliation's own protection check instead of this call site.
  */
 export async function claimReviewAttemptWithLiveLeaseV1(
   folderUri: vscode.Uri,
   reviewAttemptId: string,
   targetStage: TaskStage
 ): Promise<TaskProgress | undefined> {
-  await markRoundLiveV1(reviewAttemptId);
+  const leaseEstablished = await markRoundLiveV1(reviewAttemptId);
+  if (!leaseEstablished) {
+    console.warn(
+      `claimReviewAttemptWithLiveLeaseV1: could not establish a durable cross-window liveness lease for round ` +
+        `"${reviewAttemptId}" (no extension context, or the workspaceState write failed) — proceeding without it. ` +
+        "A reconciliation sweep in another window has no liveness evidence for this row until an operationId/" +
+        "intentId attaches to it."
+    );
+  }
   let claimed: TaskProgress | undefined;
   try {
     claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
