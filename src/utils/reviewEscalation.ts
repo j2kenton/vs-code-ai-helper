@@ -396,7 +396,16 @@ function buildEscalationDecisionV1(
       ),
     ];
 
-    const blockerCountLabel = `${blockersCount} of the remaining ${blockersCount === 1 ? "blocker" : "blockers"}`;
+    // 2026-09-04 review follow-up (completion blocker, new): this label
+    // states HOW MANY of the remaining blockers are task-fixable, so it must
+    // be built from `taskFixableCount` (the same value the option consequence
+    // text above and `postReviewPlateauDecisionV1`'s "what clears this"
+    // evidence already use) — not `blockersCount`, which is the TOTAL. Using
+    // the total here reproduces the exact "3 of 4" vs "4" contradiction Part
+    // C, Step 9 exists to eliminate: one derivation per fact, rendered
+    // everywhere.
+    const taskFixableCountLabel = `${taskFixableCount} of the ${blockersCount} remaining ` +
+      `${blockersCount === 1 ? "blocker" : "blockers"}`;
     const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
       ? {
           kind: "option",
@@ -409,7 +418,7 @@ function buildEscalationDecisionV1(
         ? {
             kind: "option",
             optionId: "keepIterating",
-            reasoning: `${blockerCountLabel} are still task-fixable, so another round has real work to do.`,
+            reasoning: `${taskFixableCountLabel} are still task-fixable, so another round has real work to do.`,
           }
         : nextStage && !nextStageHasRun
           ? {
@@ -823,10 +832,19 @@ async function postReviewPlateauDecisionV1(
   // re-running the review (which "Keep iterating" now genuinely does — see
   // resumeAndRerunReviewV1's doc comment); when nothing is, no command in
   // this product can clear it, only an action outside the task.
+  // 2026-09-04 review follow-up (completion blocker, new): this must describe
+  // the SAME dispatch sequence as the "keepIterating" option's own consequence
+  // text above (`buildEscalationDecisionV1`'s plateau branch) — Apply Review
+  // edits the workspace against the task-fixable blockers FIRST, then
+  // re-reviews. A prior revision said only "re-runs {stageName}", reading as
+  // a review-only dispatch — the exact "review starts against an unchanged
+  // tree" misdescription Part C, Step 4 exists to eliminate.
   const clearingNote =
     evidence.taskFixableCount > 0
-      ? `Clears via: choose "Keep iterating" below — it resumes the task and re-runs ${stageName} against the ` +
-        `${evidence.taskFixableCount} task-fixable ${evidence.taskFixableCount === 1 ? "blocker" : "blockers"}.`
+      ? `Clears via: choose "Keep iterating" below — it resumes the task and runs Apply Review against the ` +
+        `${evidence.taskFixableCount} task-fixable ${evidence.taskFixableCount === 1 ? "blocker" : "blockers"}, ` +
+        `editing the workspace to address ${evidence.taskFixableCount === 1 ? "it" : "them"}, then re-reviews ` +
+        `${stageName} for a fresh verdict.`
       : primaryBlocker
         ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName, evidence.content, planContentForClearingNote)}`
         : "Clears via: an action outside this task — no command in this product can resolve it. Once done, " +

@@ -571,9 +571,15 @@ export const REVIEWED_COMMIT_STAGES: ReadonlySet<TaskStage> = new Set([
   "publish",
 ]);
 
-/** The placeholder a workspace-change staling writes (reviewActions.ts's
- * markReviewArtifactStale). Freshness marking must never touch one: it has
- * no Readiness line and its staleness is already its whole content. */
+/** The LEGACY placeholder a workspace-change staling used to write wholesale
+ * over a review artifact's real content (reviewActions.ts's
+ * markReviewArtifactStale, before the 1.0.0 gate's A3 fix). No longer
+ * written by any code path — {@link buildArtifactChangeStaleBannerV1} below
+ * replaced it with a non-destructive banner line that preserves the review
+ * body — but still recognized on read so an artifact staled by a
+ * pre-upgrade build keeps reading as stale rather than as a malformed
+ * review. Freshness marking must never touch one: it has no Readiness line
+ * and its staleness is already its whole content. */
 const STALE_REVIEW_PLACEHOLDER_PREFIX_V1 = "# Review Stale";
 
 /**
@@ -611,6 +617,120 @@ const STALE_REVIEW_BANNER_RE_V1 = new RegExp(
 );
 
 /**
+ * The 1.0.0 gate's A3 replacement for the destructive `# Review Stale`
+ * placeholder (`markReviewArtifactStale`, reviewActions.ts): a review
+ * invalidated because SOME OTHER task artifact changed (the plan, or the
+ * workspace files an implementation round edited) is no longer safe to trust
+ * as a verdict on the current state, but its content — verdict, score,
+ * blockers, progress marker — is exactly what "where were we up to?" needs,
+ * and is otherwise readable only from `_prev`, which nothing points a reader
+ * at. This banner marks the artifact stale IN PLACE, one line, leaving the
+ * rest of the body untouched, mirroring {@link upsertStaleReviewBanner}'s
+ * non-destructive shape for the (different) commit-drift case.
+ *
+ * Deliberately a distinct marker from {@link STALE_REVIEW_BANNER_TEXT_RE_V1}:
+ * that one is driven by comparing the `reviewed-commit` marker against HEAD
+ * and is refreshed/healed idempotently by `refreshStaleReviewBannerForArtifactV1`
+ * on a schedule unrelated to this one; this one is written once, at the
+ * moment `markReviewArtifactStale` fires, and names WHICH artifact changed
+ * and WHEN rather than a commit SHA. The two can coexist on the same
+ * artifact without conflict — each function's own bannerIndex lookup only
+ * ever searches for its own pattern.
+ */
+const ARTIFACT_CHANGE_STALE_BANNER_TEXT_RE_V1 =
+  /^> ⚠ Stale: superseded by an update to .+ at .+\.[ \t]*\r?$/i;
+
+/** Matches either stale-banner kind (commit-drift or artifact-change) PLUS
+ * the shared in-progress form — used only by {@link markReviewInProgressBannerV1}
+ * to find whichever banner line needs swapping to its transient in-progress
+ * form while a rerun is genuinely in flight. Never used to decide whether to
+ * INSERT or REMOVE a banner (each banner's own upsert keeps its own,
+ * narrower lookup for that), only to find one that already exists. */
+const ANY_STALE_OR_IN_PROGRESS_BANNER_RE_V1 = new RegExp(
+  `(?:${STALE_REVIEW_BANNER_TEXT_RE_V1.source})|(?:${ARTIFACT_CHANGE_STALE_BANNER_TEXT_RE_V1.source})|(?:${IN_PROGRESS_REVIEW_BANNER_RE_V1.source})`,
+  "i"
+);
+
+/**
+ * Build the artifact-change stale banner line for `changedArtifact` (e.g.
+ * `"plan.md"` or `"workspace files"`) at `atIso` (an ISO timestamp — rendered
+ * as-is so the banner's "when" is exact, not relative and therefore stale
+ * itself the moment it is read later).
+ * @internal exported for testing
+ */
+export function buildArtifactChangeStaleBannerV1(changedArtifact: string, atIso: string): string {
+  return `> ⚠ Stale: superseded by an update to ${changedArtifact} at ${atIso}.`;
+}
+
+/**
+ * True when `content` carries the artifact-change stale banner — the
+ * non-destructive replacement for the old `# Review Stale` full-content
+ * placeholder. Used wherever a caller needs to know "does this artifact's
+ * content still describe the current state", now that staling no longer
+ * destroys the content itself.
+ * @internal exported for testing
+ */
+export function hasArtifactChangeStaleBannerV1(content: string): boolean {
+  return content.split("\n").some((line) => ARTIFACT_CHANGE_STALE_BANNER_TEXT_RE_V1.test(line));
+}
+
+/**
+ * The single, shared "is this review artifact stale" predicate (A1, 1.0.0
+ * gate Part A3): true for the legacy `# Review Stale` full-content
+ * placeholder (pre-upgrade data) OR content carrying the artifact-change
+ * stale banner. Every existing consumer of this notion — recovery's
+ * usability check, Apply Review's guard, Fast Forward's baseline check,
+ * re-review prompt selection, backup-before-write — wants the SAME truth
+ * value it always got from the placeholder-prefix check alone; this is that
+ * check, widened to also recognize the non-destructive banner that replaced
+ * the placeholder as the write-side mechanism. Lives here (not in
+ * reviewActions.ts, its original home) so `implementationRecoveryV1.ts` can
+ * read the same definition without a commands → commands import cycle
+ * (reviewActions.ts already imports from implementationRecoveryV1.ts).
+ * reviewActions.ts re-exports this under its established local name.
+ */
+export function isStaleReviewArtifactV1(content: string): boolean {
+  return content.trimStart().startsWith(STALE_REVIEW_PLACEHOLDER_PREFIX_V1) || hasArtifactChangeStaleBannerV1(content);
+}
+
+/**
+ * Insert the artifact-change stale banner into `content` (real review body,
+ * NOT the legacy `# Review Stale` placeholder — callers gate that
+ * separately), immediately after the leading `Readiness: N/10` line so the
+ * review contract's Readiness line stays the first content line (matching
+ * {@link upsertStaleReviewBanner}'s same convention — `isStrictPerfectReview`
+ * and other first-line readers depend on this), or at the very top when no
+ * Readiness line exists. Idempotent: a banner already naming the same
+ * artifact/timestamp is left as-is; a banner naming a DIFFERENT change is
+ * replaced in place (the newest invalidation reason wins) rather than
+ * stacking multiple stale banners from repeated staling events.
+ * @internal exported for testing
+ */
+export function upsertArtifactChangeStaleBannerV1(
+  content: string,
+  changedArtifact: string,
+  atIso: string
+): string {
+  const desired = buildArtifactChangeStaleBannerV1(changedArtifact, atIso);
+  const lines = content.split("\n");
+  const bannerIndex = lines.findIndex((line) => ARTIFACT_CHANGE_STALE_BANNER_TEXT_RE_V1.test(line));
+  if (bannerIndex !== -1) {
+    const existing = lines[bannerIndex]!;
+    const eol = existing.endsWith("\r") ? "\r" : "";
+    if (existing === desired + eol) {
+      return content;
+    }
+    lines[bannerIndex] = desired + eol;
+    return lines.join("\n");
+  }
+  const anchorIndex = lines.findIndex((line) => READINESS_ANCHOR_LINE_RE_V1.test(line));
+  const insertAt = anchorIndex === -1 ? 0 : anchorIndex + 1;
+  const anchorEol = anchorIndex !== -1 && lines[anchorIndex]!.endsWith("\r") ? "\r" : "";
+  lines.splice(insertAt, 0, desired + anchorEol);
+  return lines.join("\n");
+}
+
+/**
  * Line-only transform: if `content` (a real review artifact, NOT the
  * `# Review Stale` placeholder — callers gate that separately) carries the
  * persisted commit-drift stale banner, replace just that line with the
@@ -629,7 +749,11 @@ export function markReviewInProgressBannerV1(content: string): string {
     return content;
   }
   const lines = content.split("\n");
-  const bannerIndex = lines.findIndex((line) => STALE_REVIEW_BANNER_TEXT_RE_V1.test(line));
+  // Either stale-banner kind (commit-drift or artifact-change) is swapped to
+  // the same transient in-progress line — see
+  // ANY_STALE_OR_IN_PROGRESS_BANNER_RE_V1's doc comment for why this lookup
+  // is deliberately broader than upsertStaleReviewBanner's own.
+  const bannerIndex = lines.findIndex((line) => ANY_STALE_OR_IN_PROGRESS_BANNER_RE_V1.test(line));
   if (bannerIndex === -1) {
     return content;
   }
@@ -721,12 +845,26 @@ export function computeReviewFreshness(
  * Scoped by the caller to {@link REVIEWED_COMMIT_STAGES}: a plan review's
  * artifact never carries the marker, so this is a harmless no-op there
  * without an explicit stage check here.
+ *
+ * Also reports `false` when the artifact carries the artifact-change stale
+ * banner ({@link hasArtifactChangeStaleBannerV1}) — 2026-09-04 review
+ * follow-up (completion blocker, "narrowed"): that banner is written when an
+ * implementation round edits workspace files, which does NOT move HEAD when
+ * those edits are uncommitted, so `reviewedSha === headSha` can hold even
+ * though the tree the round just changed is exactly what the caller wants
+ * re-reviewed. The banner is direct evidence the tree changed since this
+ * review ran; treating it as "unchanged" would refuse (or silently skip,
+ * under automation) the very re-review Apply Review depends on after every
+ * implementation round.
  */
 export function isReviewDispatchAgainstUnchangedTreeV1(
   existingReviewContent: string | undefined,
   headSha: string | undefined
 ): boolean {
   if (!existingReviewContent || !headSha) {
+    return false;
+  }
+  if (hasArtifactChangeStaleBannerV1(existingReviewContent)) {
     return false;
   }
   const freshness = computeReviewFreshness(existingReviewContent, headSha);

@@ -239,6 +239,77 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
     }
   });
 
+  void it("does NOT close an operationId-carrying row (a manually-dispatched review round) while its own roundId has a live round-lease entry, even though the operationId is invisible to this window (2026-09-04 review follow-up, narrowed architectural blocker de9851ef…-0: cross-window liveness for MANUAL review rounds)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_manual_review_other_window", [
+        {
+          roundId: "manual-review-attempt-1",
+          attemptIds: ["manual-review-attempt-1"],
+          operationId: "op-from-a-different-window",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        // Both process-local signals false and no scheduling intent at all —
+        // exactly the shape a manually-invoked "Review with AI" round in a
+        // DIFFERENT VS Code window leaves this window's own registries in.
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: ["manual-review-attempt-1"],
+      });
+      assert.deepEqual(result.closed, []);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-1")?.state, "open");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes an operationId-carrying row when its roundId is absent from liveRoundLeaseIds and no other liveness signal covers it (no lease is not fail-open for manual review rounds either)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_manual_review_dead", [
+        {
+          roundId: "manual-review-attempt-dead",
+          attemptIds: ["manual-review-attempt-dead"],
+          operationId: "op-from-a-crashed-window",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: ["some-other-round"],
+      });
+      assert.deepEqual(result.closed, ["manual-review-attempt-dead"]);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-dead")?.state, "interrupted");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("closes an identity-less row when its roundId is absent from liveRoundLeaseIds and both task-wide booleans are false (no lease is not fail-open)", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

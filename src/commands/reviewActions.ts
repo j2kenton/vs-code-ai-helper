@@ -264,6 +264,8 @@ import {
   REVIEW_TARGETS,
   IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
   markReviewInProgressBannerV1,
+  isStaleReviewArtifactV1,
+  upsertArtifactChangeStaleBannerV1,
   ReviewBlocker,
   splitTaskFixableBlockersByOriginV1,
 } from "../utils/reviewReadiness";
@@ -563,6 +565,55 @@ export async function claimReviewAttempt(
         };
     return upsertRoundLedgerEntryV1({ ...current, reviewAttemptId }, openRow);
   });
+}
+
+/**
+ * `claimReviewAttempt`, plus the round-lease beacon (`roundLeaseV1.ts`) both
+ * of its call sites need — but marked live and AWAITED strictly BEFORE the
+ * round-ledger row is committed, not fire-and-forget afterward.
+ *
+ * @internal exported for testing.
+ *
+ * 2026-09-04 review follow-up (A1 architectural blocker, still open after two
+ * prior narrowing rounds): the previous ordering — commit the open row via
+ * `claimReviewAttempt`, THEN fire `void markRoundLiveV1(...)` unawaited — left
+ * a real (if narrow) gap between "the row is visible on disk/state" and "the
+ * durable, cross-window lease exists". A reconciliation sweep running in a
+ * DIFFERENT window (or this one) that reads the row inside that gap sees
+ * neither an `operationId`/`intentId` match (neither is attached yet) nor a
+ * live lease, and — per `isRoundLedgerRowProtectedV1`'s identity-less
+ * fallback — could close it as orphaned, terminating a round that had, in
+ * fact, just started. Awaiting the lease write first closes the gap: by the
+ * time the row exists, the lease already does.
+ *
+ * This does NOT reintroduce the failure mode `roundLeaseV1.ts`'s own doc
+ * comment warns against for `withRoundLeaseV1` (never let the round's own
+ * multi-minute dispatch depend on the lease write settling) — that guidance
+ * is about the round's WORK, which still never awaits anything here. This
+ * await only gates the sub-millisecond-scale row-open step itself, and on
+ * the rare path where the claim then still fails (task paused mid-flight, or
+ * the CAS write exhausts its retries), the lease is cleared immediately
+ * rather than left to expire on its own 90-minute TTL — though even an
+ * uncleared leak would be harmless: a lease with no matching row protects
+ * nothing.
+ */
+export async function claimReviewAttemptWithLiveLeaseV1(
+  folderUri: vscode.Uri,
+  reviewAttemptId: string,
+  targetStage: TaskStage
+): Promise<TaskProgress | undefined> {
+  await markRoundLiveV1(reviewAttemptId);
+  let claimed: TaskProgress | undefined;
+  try {
+    claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
+  } catch (error) {
+    await clearRoundLiveV1(reviewAttemptId);
+    throw error;
+  }
+  if (!claimed) {
+    await clearRoundLiveV1(reviewAttemptId);
+  }
+  return claimed;
 }
 
 /** Returns whether an absolute path is the supplied root or a descendant. */
@@ -4518,6 +4569,26 @@ export async function runReviewForFolder(
     return;
   }
 
+  // Notifications in-flight visibility: report the stage transition here, at
+  // the top of the function before any awaited work — including the
+  // unchanged-tree guard below, which itself awaits a file read and a git
+  // call (2026-09-04 review follow-up: reviewActionsStageActivity.test.ts's
+  // "reports 'starting'... before its first await" assertion caught this
+  // ordering breaking the moment the guard was inserted above this call in an
+  // earlier revision — the guard must never be allowed back above this line).
+  // The model itself is not resolved yet at this point, so this call carries
+  // none — `setModel` is called on its own, without touching activity or the
+  // elapsed origin this sets, once `dispatchModelId` is actually resolved
+  // below. The returned token guards the "running" report far below
+  // (reportStageRunningV1) so a late resolution here can never overwrite a
+  // stage this same root has since moved on to.
+  const stageToken = options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
+  // Captured alongside stageToken (not read back from the operation, which
+  // exposes no getter for it) so the completion-check accumulator below can
+  // restore this exact origin between check batches instead of the last
+  // active check's now-stale start time.
+  const stageElapsedOrigin = Date.now();
+
   // A1 (1.0.0 gate) Part C, Step 5: never dispatch a review against a tree
   // that is provably unchanged since the LAST review of this exact stage —
   // the verdict cannot differ by construction (observed 2026-08-28: a review
@@ -4565,22 +4636,6 @@ export async function runReviewForFolder(
       }
     }
   }
-
-  // Notifications in-flight visibility: report the stage transition here, at
-  // the top of the function before any awaited work, not once the dispatch
-  // model happens to be known ~600 lines down. The model itself is not
-  // resolved yet at this point, so this call carries none — `setModel` is
-  // called on its own, without touching activity or the elapsed origin this
-  // sets, once `dispatchModelId` is actually resolved below. The returned
-  // token guards the "running" report far below (reportStageRunningV1) so a
-  // late resolution here can never overwrite a stage this same root has
-  // since moved on to.
-  const stageToken = options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
-  // Captured alongside stageToken (not read back from the operation, which
-  // exposes no getter for it) so the completion-check accumulator below can
-  // restore this exact origin between check batches instead of the last
-  // active check's now-stale start time.
-  const stageElapsedOrigin = Date.now();
 
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
@@ -4991,8 +5046,6 @@ export async function runReviewForFolder(
   // superseded attempt stops spending quota on backups well before it would
   // eventually lose that final CAS anyway.
   const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
-  if (!claimed) return;
   // 2026-09-04 review follow-up (A1 architectural blocker): give this round's
   // ledger row the same cross-window liveness beacon a CLI implementation
   // round gets (see roundLeaseV1.ts's doc comment). Unlike that path this
@@ -5001,10 +5054,12 @@ export async function runReviewForFolder(
   // still only this window's process-local registry — a manual review
   // running in a DIFFERENT window would otherwise be invisible to
   // reconciliation's `isRoundLedgerRowProtectedV1`, which now also checks
-  // this lease for operationId-bearing rows. Cleared in the `finally` below
-  // regardless of outcome. Fire-and-forget, same reasoning as
-  // `withRoundLeaseV1`: a beacon, not a dependency.
-  void markRoundLiveV1(reviewAttemptId);
+  // this lease for operationId-bearing rows. `claimReviewAttemptWithLiveLeaseV1`
+  // awaits the lease write BEFORE the row commit (see its own doc comment for
+  // why fire-and-forget-after-the-fact left a real cross-window race); cleared
+  // in the `finally` below regardless of outcome.
+  const claimed = await claimReviewAttemptWithLiveLeaseV1(folderUri, reviewAttemptId, targetStage);
+  if (!claimed) return;
 
   // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
   // itself is eating a large share of the review-input limit — "the same
@@ -5384,9 +5439,24 @@ function validateReviewOutput(content: string): { valid: boolean; reason: string
   return { valid: true, reason: "" };
 }
 
-function isStaleReviewArtifact(content: string): boolean {
-  return content.trimStart().startsWith("# Review Stale");
-}
+/**
+ * A1 (1.0.0 gate, Part A3): local alias for {@link isStaleReviewArtifactV1}
+ * (reviewReadiness.ts), preserving this module's established call-site name.
+ * "Stale" means exactly what it always meant for every existing consumer of
+ * this predicate (recovery's usability check, Apply Review's guard, Fast
+ * Forward's baseline check, re-review prompt selection, backup-before-write)
+ * — this artifact's content no longer describes the current state and must
+ * not be trusted as a verdict. Before this fix that was ALWAYS the
+ * destructive `# Review Stale` placeholder. `markReviewArtifactStale` no
+ * longer destroys the content to say so — it prepends a banner instead — so
+ * the shared predicate's TRUTH VALUE is preserved at every call site (here
+ * and in `implementationRecoveryV1.ts`'s `isHighReviewArtifactUsableV1`) by
+ * checking for that banner too, without any call site needing further
+ * changes. The definition lives in reviewReadiness.ts, not here, so both
+ * modules can import it without a commands → commands cycle (this module
+ * already imports from implementationRecoveryV1.ts).
+ */
+const isStaleReviewArtifact = isStaleReviewArtifactV1;
 
 /** The transient placeholder `beginInProgressReviewMarkingV1` writes over a
  * `# Review Stale` placeholder while a rerun of that same review stage is
@@ -5480,28 +5550,47 @@ export async function backupReviewUnlessStale(reviewUri: vscode.Uri): Promise<vo
   }
 }
 
-async function markReviewArtifactStale(
+/** @internal exported for testing (2026-09-04 review follow-up: the
+ * no-existing-content branch's "never reviewed must not read as stale" fix
+ * needs direct coverage, not just coverage of the pure banner primitives it
+ * calls into). */
+export async function markReviewArtifactStale(
   reviewUri: vscode.Uri,
   changedArtifact: string
 ): Promise<void> {
-  // Snapshot the real review content as the "previous version" before it's
-  // clobbered by the placeholder below — otherwise the placeholder itself
-  // would become the backup once the next review publishes. skipBackup is
-  // required here: writeTextFile's own unconditional backup would otherwise
-  // immediately re-read the (still on-disk, not-yet-overwritten) content and
-  // redo the backup — which is harmless on the first staling but clobbers
-  // the guard above on a second consecutive staling, since by then the
-  // on-disk content is already the placeholder.
+  // A1 (1.0.0 gate, Part A3): this used to overwrite the artifact wholesale
+  // with a "# Review Stale" placeholder — 138 bytes where a real verdict,
+  // score, blockers and progress marker had been, recoverable only from
+  // `_prev`, which nothing points a reader at (observed: score/progress
+  // invisible for almost the whole run, since every implementation round
+  // re-invalidates the review and the placeholder outlives the few minutes
+  // between a review landing and the next round starting). The content is
+  // now preserved and marked with a one-line banner instead — see
+  // upsertArtifactChangeStaleBannerV1's doc comment — so `_prev` continues
+  // to serve View Changes' own purpose (diffing against the PRIOR write) and
+  // is no longer this artifact's only surviving copy of its own content.
+  const existing = await readNonEmptyText(reviewUri);
+  if (existing === undefined) {
+    // No real review to preserve — this is the "no review has ever run" case
+    // (or an already-empty artifact). 2026-09-04 review follow-up (completion
+    // blocker, new): this branch used to write the legacy `# Review Stale`
+    // placeholder here too, claiming "This review was generated before
+    // {changedArtifact} was updated" — false, since no review was ever
+    // generated. That contradicts A3's own requirement that "only a review
+    // that has never run should read as 'not yet reviewed'": staling a
+    // never-reviewed artifact must never make it read as a stale REVIEW.
+    // There is nothing to bannerize and nothing to stale, so this is a true
+    // no-op — the artifact stays exactly as it was (absent or empty), which
+    // every existing reader already treats as "not yet reviewed".
+    return;
+  }
+  // backupReviewUnlessStale's own guard already skips a no-op re-backup when
+  // `existing` already carries this same banner (isStaleReviewArtifact now
+  // recognizes it) — repeated staling events never clobber the last REAL
+  // review's `_prev` backup, matching this guard's original purpose.
   await backupReviewUnlessStale(reviewUri);
-  const staleNotice = [
-    "# Review Stale",
-    "",
-    `This review was generated before ${changedArtifact} was updated.`,
-    "",
-    "Run Review with AI again to evaluate the current artifact.",
-    "",
-  ].join("\n");
-  await writeTextFile(reviewUri, staleNotice, { skipBackup: true });
+  const banded = upsertArtifactChangeStaleBannerV1(existing, changedArtifact, new Date().toISOString());
+  await writeTextFile(reviewUri, banded, { skipBackup: true });
 }
 
 /** Result of {@link beginInProgressReviewMarkingV1}.
@@ -5524,13 +5613,14 @@ export interface InProgressReviewMarkingV1 {
  * never runs for an attempt that lost the claim race) and before the
  * provider call — the two surfaces a rerun can leave stale-looking:
  *
- *  - A `# Review Stale` content placeholder is replaced wholesale with the
- *    `# Review in progress` placeholder (no rerun instruction — one is
- *    already running).
- *  - A real review body carrying the commit-drift stale banner
- *    (`upsertStaleReviewBanner`) has ONLY that banner line swapped for its
- *    in-progress form (`markReviewInProgressBannerV1`); the body is never
- *    touched.
+ *  - A LEGACY `# Review Stale` content placeholder (pre-A3 data, with
+ *    nothing to preserve) is replaced wholesale with the `# Review in
+ *    progress` placeholder (no rerun instruction — one is already running).
+ *  - A real review body carrying EITHER stale banner — the commit-drift one
+ *    (`upsertStaleReviewBanner`) or the A1 (1.0.0 gate, Part A3)
+ *    artifact-change one (`upsertArtifactChangeStaleBannerV1`) — has ONLY
+ *    that banner line swapped for its in-progress form
+ *    (`markReviewInProgressBannerV1`); the body is never touched.
  *  - Anything else (a current review with no stale marker at all, being
  *    re-reviewed by choice) is left untouched — there is nothing to mark.
  *
@@ -5548,7 +5638,11 @@ export async function beginInProgressReviewMarkingV1(
   if (current === undefined) {
     return { rewrote: false };
   }
-  if (isStaleReviewArtifact(current)) {
+  // Deliberately the NARROW legacy-only check, not the broadened
+  // isStaleReviewArtifact — a review carrying the (content-preserving)
+  // artifact-change banner has real body left to swap a banner line on
+  // below, not a placeholder to replace wholesale.
+  if (current.trimStart().startsWith("# Review Stale")) {
     const inProgressNotice = [
       IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
       "",
@@ -10753,7 +10847,14 @@ async function executeImplementationRun(
       void scheduleAutomationChain(
         {
           command,
-          arg: { taskFolderPath: folderUri.fsPath },
+          // automationDispatch: true — 2026-09-04 review follow-up (completion
+          // blocker, "narrowed"): this chain fires after the dispatching
+          // round's operation lock releases, with no human synchronously
+          // attached (see ReviewCommandArg.automationDispatch). Without this
+          // flag, the unchanged-tree guard's interactive branch would open a
+          // modal nobody can answer instead of taking the silent-refusal path
+          // — exactly the hang this flag exists to prevent everywhere else.
+          arg: { taskFolderPath: folderUri.fsPath, automationDispatch: true },
           taskKey: folderUri.fsPath,
           chainId: "auto-review",
           // Re-checked immediately before dispatch: the root operation can
@@ -12480,16 +12581,17 @@ export async function resumeReviewInteractionV1(
   // runReviewForFolder) — distinct from the coordinator's own fresh
   // provider attemptId for the resumed operation.
   const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(taskFolderUri, reviewAttemptId, targetStage);
-  if (!claimed) {
-    return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
-  }
   // 2026-09-04 review follow-up (A1 architectural blocker, same reasoning as
   // runReviewForFolder's matching lease): this resumed round also attaches an
   // `operationId` to the same row below, and needs the same cross-window
   // liveness beacon so reconciliation in another window cannot close it out
-  // from under a live resume. Cleared in the `finally` below on every exit.
-  void markRoundLiveV1(reviewAttemptId);
+  // from under a live resume. `claimReviewAttemptWithLiveLeaseV1` awaits the
+  // lease write BEFORE the row commit — see its doc comment. Cleared in the
+  // `finally` below on every exit.
+  const claimed = await claimReviewAttemptWithLiveLeaseV1(taskFolderUri, reviewAttemptId, targetStage);
+  if (!claimed) {
+    return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
+  }
   try {
     // Preflight BEFORE resuming, and fail closed. An interaction can sit waiting
     // on questions while a later implementation round changes the tree and

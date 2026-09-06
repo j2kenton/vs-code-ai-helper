@@ -884,6 +884,69 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  void it("never contradicts itself on the task-fixable count when only a subset of blockers are fixable (2026-09-04 review follow-up)", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-partial-task-fixable");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    // 4 total blockers, only 3 task-fixable — the exact split observed on
+    // 2026-08-27 that produced "3 of the 4 remaining blockers" in the
+    // evidence but "4" in the recommendation.
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "task-fixable", description: "The retry loop still swallows the second failure" },
+      { category: "completion", resolver: "task-fixable", description: "The cache key omits the tenant id" },
+      { category: "completion", resolver: "task-fixable", description: "The migration lacks a down script" },
+      { category: "completion", resolver: "environmental", description: "CI runner has no network access to the registry" },
+    ];
+
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 5/10\n", blockers, taskFixableCount: 3 }
+      );
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.strictEqual(decision.recommendation.kind, "option");
+
+      // The recommendation's own reasoning must name the TASK-FIXABLE count
+      // (3), never the total blocker count (4) — the exact contradiction the
+      // review caught: this line previously read "4 of the remaining
+      // blockers are still task-fixable" while every other mention on the
+      // same card correctly said 3.
+      const reasoningText =
+        decision.recommendation.kind === "option" ? decision.recommendation.reasoning : "";
+      assert.match(reasoningText, /3 of the 4 remaining blockers are still task-fixable/);
+      assert.doesNotMatch(reasoningText, /\b4 of the 4 remaining blockers\b/);
+
+      // "What clears this" must describe the SAME dispatch sequence as the
+      // "Keep iterating" option itself (Apply Review edits first, then
+      // re-reviews) — not a bare "re-runs" that reads as a review-only
+      // dispatch.
+      const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
+      assert.ok(clearsThis);
+      assert.match(clearsThis.detail, /runs Apply Review against the 3 task-fixable blockers/);
+      assert.match(clearsThis.detail, /editing the workspace/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   void it("derives a distinct clearing action per blocker resolver class (needs-toolchain vs environmental)", async () => {
     const store = new Map<string, string>();
     installMemStore(store);

@@ -813,3 +813,51 @@ void test("armAll's stale-dispatch reclaim is race-safe across two concurrently-
     folder.cleanup();
   }
 });
+
+void test("armAll's watchdog GENERIC route (no implRecovery, no open round-ledger row) is also race-safe across two concurrently-sweeping windows — exactly one pause write, never two competing transitions (2026-09-04 review follow-up, completion blocker de9851ef…-1: \"the generic impossible-state route always uses the direct-patch fallback\" — this proves that fallback is itself safe under the same cross-window race the reclaim route was already proven safe under above)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  // The pure "impossible active state": active, no roundLedger row, no
+  // implRecovery, no scheduledRun — closeStalledTaskThroughLedgerV1's
+  // `attemptId` is `undefined` for this shape (isImpossibleActiveStateV1's own
+  // `hasOpenRoundLedgerRowV1` gate guarantees no row exists to terminalize),
+  // so BOTH windows must fall through to the direct pause(+clear) patch. The
+  // real file lock under `patchTaskProgressStrictV1` is what must serialize
+  // the two competing writes here, not test sequencing.
+  const progress: TaskProgress = {
+    ...readPersistedProgress(folder.progressPath),
+    status: "active",
+  };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+
+  const inventoryA = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const inventoryB = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const schedulerA = new TaskActionScheduler(inventoryA, clock, undefined, "window-A");
+  const schedulerB = new TaskActionScheduler(inventoryB, clock, undefined, "window-B");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    await Promise.all([schedulerA.armAll(), schedulerB.armAll()]);
+
+    const after = readPersistedProgress(folder.progressPath);
+    assert.equal(after.status, "paused", "the task must end up paused by exactly one of the two racing sweeps");
+    assert.equal(after.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+
+    const escalations = surface.entries.filter((e) => e.level === "warning" && /was stalled/.test(e.message));
+    assert.equal(
+      escalations.length,
+      1,
+      `exactly one escalation must be posted even though two windows raced the same detection; got ${JSON.stringify(surface.entries)}`
+    );
+  } finally {
+    deactivateNotificationRouter();
+    realFs.restore();
+    fakeContext.restore();
+    schedulerA.dispose();
+    schedulerB.dispose();
+    folder.cleanup();
+  }
+});

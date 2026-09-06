@@ -56,7 +56,7 @@ import {
 import { IncompleteTask } from "../types/incompleteTask";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
-import { readyToAdvanceStage } from "../utils/reviewReadiness";
+import { readyToAdvanceStage, isStaleReviewArtifactV1 } from "../utils/reviewReadiness";
 import { getAutoAdvanceScoreThreshold } from "../config/settings";
 import type { AutomationDispatch } from "../utils/automationChain";
 import type { AgentTransportExitV1, AgentTransportV1 } from "../types/agentExecutionV1";
@@ -686,7 +686,7 @@ async function runHarnessed(
         const review = fs.existsSync(reviewFile) ? fs.readFileSync(reviewFile, "utf8") : "";
         run.persistedStates.push({
           markerSet: persisted.reviewInvalidatedByRound !== undefined,
-          reviewStale: review.trimStart().startsWith("# Review Stale"),
+          reviewStale: isStaleReviewArtifactV1(review),
           status: persisted.status,
           checklistProgressUnreliable: persisted.checklistProgressUnreliable === true,
         });
@@ -868,7 +868,7 @@ void describe("deferred/incomplete round recovery (end to end)", () => {
     // now stale-stamped (its previous content is preserved as the _prev
     // backup by the stamp's own write path).
     const review = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
-    assert.ok(review.trimStart().startsWith("# Review Stale"));
+    assert.ok(isStaleReviewArtifactV1(review));
 
     // Ordering invariant across EVERY persisted state, not just the final
     // one: at no point was the marker cleared while the review artifact still
@@ -4455,7 +4455,7 @@ void describe("recovery mode selection and enforcement (Part 2, end to end)", ()
     // the stage's artifact is stale-stamped, so the prior score can never be
     // read as covering the continuation's edits.
     const review = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
-    assert.ok(review.trimStart().startsWith("# Review Stale"));
+    assert.ok(isStaleReviewArtifactV1(review));
   });
 
   void it("a summary-only continuation dispatches in TEXT mode, scoped to the reviewed files plus the quarantined delta, and its accepted report promotes and clears the record", async () => {
@@ -4538,7 +4538,7 @@ void describe("recovery mode selection and enforcement (Part 2, end to end)", ()
     // The combined scope still requires a fresh review: the prior 0-blocker
     // score never covered the quarantined delta.
     const review = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
-    assert.ok(review.trimStart().startsWith("# Review Stale"));
+    assert.ok(isStaleReviewArtifactV1(review));
   });
 
   void it("a successful post-review edit round makes the old 0-blocker score stale: the next unreported round is never summary-only (review blocker 2)", async () => {
@@ -4582,7 +4582,7 @@ void describe("recovery mode selection and enforcement (Part 2, end to end)", ()
       "utf8"
     );
     assert.ok(
-      reviewAfterRoundOne.trimStart().startsWith("# Review Stale"),
+      isStaleReviewArtifactV1(reviewAfterRoundOne),
       "round 1's edits must stale-stamp the review artifact"
     );
 

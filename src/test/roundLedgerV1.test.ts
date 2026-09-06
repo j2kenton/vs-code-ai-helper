@@ -53,11 +53,14 @@ import {
 } from "../services/workflowRuntimeServicesV1";
 import {
   claimReviewAttempt,
+  claimReviewAttemptWithLiveLeaseV1,
   handleReviewRoutingOutcome,
   terminalStateForUnclosedReviewOutcomeV1,
 } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-"));
 cp.execFileSync("git", ["init", "-q"], { cwd: REAL_ROOT, windowsHide: true });
@@ -1306,6 +1309,118 @@ void describe("claimReviewAttempt — opens the round-ledger row at the round's 
     } finally {
       wsStub.restore();
       fsBridge.restore();
+    }
+  });
+});
+
+function installFakeExtensionContextV1(): { restore: () => void } {
+  const values = new Map<string, unknown>();
+  const memento = {
+    get<T>(key: string, defaultValue: T): T {
+      return (values.has(key) ? values.get(key) : defaultValue) as T;
+    },
+    update(key: string, value: unknown): Promise<void> {
+      values.set(key, value);
+      return Promise.resolve();
+    },
+  } as unknown as vscode.Memento;
+  __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+  return { restore: (): void => __extensionContextV1TestOnly.reset() };
+}
+
+// 2026-09-04 review follow-up (A1 architectural blocker, still open after two
+// prior narrowing rounds): claimReviewAttempt's own fire-and-forget lease
+// write (formerly issued only AFTER the round-ledger row was already
+// committed) left a real gap where a concurrent reconciliation sweep could
+// observe the freshly-opened row with no live lease yet. claimReviewAttemptWithLiveLeaseV1
+// closes it by awaiting the lease write before the row commit.
+void describe("claimReviewAttemptWithLiveLeaseV1 (A1 architectural blocker, 2026-09-04 review follow-up)", () => {
+  void it("the lease is already live by the time the caller observes the committed row — no fire-and-forget gap", async () => {
+    const fakeContext = installFakeExtensionContextV1();
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_live_lease");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_live_lease",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), []);
+      const claimed = await claimReviewAttemptWithLiveLeaseV1(folderUri, "live-lease-attempt-1", "impl-high-review");
+      assert.equal(claimed?.reviewAttemptId, "live-lease-attempt-1");
+      // By the time the wrapper resolves, the row is committed (same
+      // postcondition as bare claimReviewAttempt) AND the lease is live —
+      // this is the ordering guarantee itself: markRoundLiveV1 is awaited
+      // strictly before claimReviewAttempt's row-opening patch runs.
+      const row = claimed ? resolveRoundV1(claimed, "live-lease-attempt-1") : undefined;
+      assert.ok(row, "the round-ledger row must be committed");
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), ["live-lease-attempt-1"]);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+      fakeContext.restore();
+    }
+  });
+
+  void it("clears the lease immediately when the claim is refused (task paused), rather than leaking it for the full TTL", async () => {
+    const fakeContext = installFakeExtensionContextV1();
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_live_lease_paused");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_live_lease_paused",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      await assert.rejects(
+        () => claimReviewAttemptWithLiveLeaseV1(folderUri, "live-lease-attempt-paused", "impl-high-review"),
+        /paused/
+      );
+      assert.deepEqual(
+        listLiveRoundLeaseIdsV1(),
+        [],
+        "a refused claim must not leave a phantom live lease behind"
+      );
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+      fakeContext.restore();
     }
   });
 });

@@ -69,7 +69,7 @@ import {
 } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { readTextIfExists } from "../utils/fileUtils";
-import { parseReadiness } from "../utils/reviewReadiness";
+import { parseReadiness, isStaleReviewArtifactV1 } from "../utils/reviewReadiness";
 import { isSummaryOnlyDispatchAvailableV1 } from "./implContinuationTextDispatchV1";
 import {
   quarantinePendingImplReviewFiles,
@@ -254,15 +254,25 @@ export function selectImplRecoveryModeV1(
 /**
  * Whether the on-disk impl-high-review artifact is currently a USABLE review
  * — the reviewed-boundary freshness half of the summary-only evidence (see
- * `latestHighReviewDescribesPreRoundTree`). A missing file, the
- * `# Review Stale` placeholder a post-review edit round writes, or content
- * with no `Readiness: N/10` line all mean the latest 0-blocker history entry
- * no longer describes the current tree.
+ * `latestHighReviewDescribesPreRoundTree`). A missing file, an artifact
+ * marked stale by a post-review edit round (the legacy `# Review Stale`
+ * placeholder, or — since the 1.0.0 gate's A3 fix — the non-destructive
+ * artifact-change banner `markReviewArtifactStale` now writes instead; see
+ * `isStaleReviewArtifactV1`), or content with no `Readiness: N/10` line all
+ * mean the latest 0-blocker history entry no longer describes the current
+ * tree.
  *
  * Read BEFORE the recovery transition's strict patch runs: for a rejected
  * summary, `executeImplementationRun` stale-stamps this artifact only AFTER
  * the transition (its marker-ordering invariant), so the content read here is
  * the pre-round state the mode decision needs.
+ *
+ * 2026-09-04 review follow-up (narrowed completion blocker de9851ef…): this
+ * used to detect staleness via its own literal `"# Review Stale"` prefix
+ * check, duplicating reviewActions.ts's `isStaleReviewArtifact` — which
+ * silently stopped matching the moment `markReviewArtifactStale` stopped
+ * writing that literal prefix for the artifact-change case. Reads the shared
+ * predicate instead so both call sites can never drift again.
  */
 async function isHighReviewArtifactUsableV1(folderUri: vscode.Uri): Promise<boolean> {
   const artifactUri = vscode.Uri.file(
@@ -275,7 +285,7 @@ async function isHighReviewArtifactUsableV1(folderUri: vscode.Uri): Promise<bool
   if (content === undefined || content.trim().length === 0) {
     return false;
   }
-  if (content.trimStart().startsWith("# Review Stale")) {
+  if (isStaleReviewArtifactV1(content)) {
     return false;
   }
   return parseReadiness(content).score !== null;

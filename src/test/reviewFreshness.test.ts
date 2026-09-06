@@ -26,6 +26,7 @@ import {
   parseReviewBlockersDetailed,
   parseReviewedCommitSha,
   parseReviewProgress,
+  upsertArtifactChangeStaleBannerV1,
   upsertStaleReviewBanner,
   withVisibleReviewedCommitLineV1,
 } from "../utils/reviewReadiness";
@@ -108,6 +109,19 @@ void describe("isReviewDispatchAgainstUnchangedTreeV1 (A1 1.0.0-gate Part C, Ste
     assert.equal(isReviewDispatchAgainstUnchangedTreeV1("Readiness: 8/10\n", HEAD), false);
     // No HEAD resolved.
     assert.equal(isReviewDispatchAgainstUnchangedTreeV1(jesterShapedReview(), undefined), false);
+  });
+
+  void it("reports false when the artifact carries the artifact-change stale banner, even though reviewedSha still equals HEAD (2026-09-04 review follow-up)", () => {
+    // An implementation round edited workspace files without committing:
+    // HEAD has not moved, so reviewedSha === HEAD still holds, but the
+    // artifact-change banner is direct evidence the tree the round just
+    // touched is not what this review assessed.
+    const bannered = upsertArtifactChangeStaleBannerV1(
+      jesterShapedReview(),
+      "workspace files",
+      "2026-09-04T17:00:00.000Z"
+    );
+    assert.equal(isReviewDispatchAgainstUnchangedTreeV1(bannered, REVIEWED), false);
   });
 });
 

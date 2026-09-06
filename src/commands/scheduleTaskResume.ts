@@ -460,17 +460,49 @@ export class TaskActionScheduler implements vscode.Disposable {
    * resolution — another window's reclaim of the same `implRecovery` record,
    * or the user resuming the task by hand — between this call's snapshot and
    * its write is a safe no-op, never a stale double-pause.
+   *
+   * 2026-09-04 review follow-up (completion blocker, narrowed further):
+   * "the watchdog still directly patches task state whenever no open ledger
+   * row is available" — recorded here as a deliberate design decision, not
+   * an oversight. `terminalizeRoundV1` DOES support synthesizing a fresh row
+   * on the fly (`synthesizeIfMissing`) for exactly this "no row exists"
+   * shape, and folding the generic route through it would make every
+   * watchdog action textually pass through the same one function. Rejected
+   * anyway: the generic route's whole premise is that NO round is running —
+   * `isImpossibleActiveStateV1` requires `hasOpenRoundLedgerRowV1` to be
+   * false before it ever fires. Synthesizing a row here would fabricate a
+   * `RoundLedgerEntryV1` for a round that never existed, permanently
+   * recorded in this task's ledger and rendered into chat history via
+   * `formatRoundOutcomeMessageV1` ("_Ended: `<stage>` — interrupted — ...
+   * mode `<mode>`_") as if a dispatch had actually happened — corrupting the
+   * ledger's own audit trail (one entry per real round) in exchange for
+   * routing a no-op through a terminalizer with nothing to terminalize. The
+   * direct `patchTaskProgressStrictV1` write (via `this.store.patch`) is the
+   * SAME durable, CAS-guarded, re-checked-against-fresh-state primitive
+   * every other transition in this codebase uses; "acts only through
+   * durable primitives, never dispatches work" — the actual safety property
+   * A1 requires — is satisfied without inventing a phantom round.
    */
   private async closeStalledTaskThroughLedgerV1(
     task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
     attemptId: string | undefined,
     reason: string
-  ): Promise<TaskProgress | undefined> {
+  ): Promise<{ readonly progress: TaskProgress | undefined; readonly transitioned: boolean }> {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+    // 2026-09-04 review follow-up: a disk-backed concurrency test caught two
+    // windows racing the generic no-ledger-row route both reading back
+    // `status: "paused"` from the shared file and both posting the stalled-
+    // task escalation, even though only one of them performed the write.
+    // `transitioned` is set only by the window whose own fresh read still
+    // found the impossible state, so the caller can post the escalation
+    // exactly once per real detection rather than once per window that
+    // merely observed the already-paused result.
+    let transitioned = false;
     const applyPauseAndClear = (current: TaskProgress): TaskProgress => {
       if (!isImpossibleActiveStateV1({ progress: current, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
         return current;
       }
+      transitioned = true;
       const cleared = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 ? { ...current, implRecovery: undefined } : current;
       return pauseTaskWithReason(cleared, reason);
     };
@@ -486,12 +518,13 @@ export class TaskActionScheduler implements vscode.Disposable {
         { taskFolderUri, postTerminalizePatch: (current) => applyPauseAndClear(current) }
       );
       if (result.ok && !result.alreadyTerminal) {
-        return result.progress;
+        return { progress: result.progress, transitioned };
       }
       // notFound or alreadyTerminal: no live ledger row left to close (the
       // normal case). Fall through to the direct pause(+clear) below.
     }
-    return this.store.patch(taskFolderUri, applyPauseAndClear);
+    const progress = await this.store.patch(taskFolderUri, applyPauseAndClear);
+    return { progress, transitioned };
   }
 
   /**
@@ -522,12 +555,16 @@ export class TaskActionScheduler implements vscode.Disposable {
       const expectedReason = stuckRecovery
         ? UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1
         : STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
-      const patched = await this.closeStalledTaskThroughLedgerV1(
+      const { progress: patched, transitioned } = await this.closeStalledTaskThroughLedgerV1(
         task,
         stuckRecovery ? recovery?.attemptId : undefined,
         expectedReason
       );
-      if (patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
+      if (!transitioned || patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
+        // Either nothing changed, or the task was already paused by a
+        // racing window's write between this loop's snapshot and this
+        // call's own fresh read — that window already posted the
+        // escalation, so this one must not post a second copy of it.
         continue;
       }
       this.stalledActiveNotified.add(task.taskFolderPath);
