@@ -105,10 +105,42 @@ export function isUnrecoverableImplRecoveryV1(
  * once those passes are done, so a task this returns `true` for genuinely has
  * nothing left that could still bring it back to life on its own.
  */
+/**
+ * How long a task must have been QUIET before this predicate will call it
+ * stalled (v1 fixes item 1, 2026-09-07).
+ *
+ * Without this the watchdog fires on a state that is not yet a fault. Resuming
+ * a task sets `status: "active"` and arranges no work — `resumeTask` is a
+ * status change, not a dispatch — so for the moment between resuming and the
+ * next dispatch a healthy task is indistinguishable from a silently stopped
+ * one. Worse, writing `task-progress.json` is itself what fires the sweep
+ * (`extension.ts` wires the progress watcher's `onDidChange` to `armAll()`),
+ * so the pause is a direct consequence of the resume rather than a timing
+ * accident. Measured on `version 1` 2026-09-07: active at 07:32:48, re-paused
+ * at 07:32:52 — four seconds, with no dispatch route available in between,
+ * because every dispatch command is gated on the task not being paused.
+ *
+ * A watchdog is meant to notice that nothing has happened for a while. Ninety
+ * seconds is long enough for a resume to be followed by its dispatch and for a
+ * dispatch to open its round-ledger row (which exempts the task on its own
+ * merits), and far shorter than the intervals at which real silent stops were
+ * observed — those sat idle for hours.
+ *
+ * This is a floor on detection latency, not a fix for the underlying defect:
+ * resume should schedule the next action rather than leaving a gap at all.
+ * That remains `v1 fixes` item 1's first requirement.
+ */
+export const STALLED_TASK_QUIET_PERIOD_MS = 90 * 1000;
+
 export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1): boolean {
   const { progress, taskCanonicalId } = input;
   const now = input.now ?? Date.now();
   if (progress.status !== "active") {
+    return false;
+  }
+  // Recently touched: not yet evidence of a stall. See the constant above.
+  const updatedAt = progress.updatedAt ? Date.parse(progress.updatedAt) : Number.NaN;
+  if (Number.isFinite(updatedAt) && now - updatedAt < STALLED_TASK_QUIET_PERIOD_MS) {
     return false;
   }
   if (hasOpenRoundLedgerRowV1(progress)) {
