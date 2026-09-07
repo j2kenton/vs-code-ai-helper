@@ -202,6 +202,21 @@ export class WorkflowDecisionStoreV1 {
    * than being superseded and appended after — see the class doc comment for
    * why (1.0.0 gate, A4/B2: a recurring standing condition must cost the
    * store nothing extra on repost).
+   *
+   * 1.0.0 gate, Part 5 (B3 diagnosis): this method itself never creates a
+   * SECOND simultaneous pending match for one key+task, but a store written
+   * before update-in-place landed could still hold several — the real-world
+   * case that made B3's "200 records, all unanswered" backlog untractable by
+   * hand was exactly this: a pre-fix build let a recurring condition (e.g.
+   * `reconcilePlanChecklist`) accumulate up to 245 simultaneous pending
+   * copies of itself, because every repost appended a new record instead of
+   * touching the old one. Facing that many near-identical cards, answering
+   * "the" decision was never a tractable single action, which is the
+   * mechanical reason none of them ever got a `resolvedAt`. Consolidating
+   * every OTHER pending match into a withdrawal here (not just updating the
+   * first one found and leaving the rest to rot) means the very next repost
+   * of a legacy backlog collapses it back down to one live decision, rather
+   * than leaving 244 stale duplicates permanently unresolved beside it.
    */
   async post(input: CreateWorkflowDecisionInputV1): Promise<PostWorkflowDecisionResultV1> {
     const created = createWorkflowDecisionV1(input);
@@ -210,19 +225,32 @@ export class WorkflowDecisionStoreV1 {
     }
     const canonicalId = normalizePath(input.taskCanonicalId);
     const existing = this.all();
-    const matchIndex = existing.findIndex(
-      (decision) =>
+    const matchIndices: number[] = [];
+    existing.forEach((decision, index) => {
+      if (
         decision.state === "pending" &&
         decision.decisionKey === input.decisionKey &&
         normalizePath(decision.taskCanonicalId) === canonicalId
-    );
-    if (matchIndex !== -1) {
+      ) {
+        matchIndices.push(index);
+      }
+    });
+    if (matchIndices.length > 0) {
+      const keepIndex = matchIndices[0]!;
       const updated: WorkflowDecisionV1 = {
         ...created.decision,
-        decisionId: existing[matchIndex]!.decisionId,
+        decisionId: existing[keepIndex]!.decisionId,
       };
       const next = [...existing];
-      next[matchIndex] = updated;
+      next[keepIndex] = updated;
+      for (const extraIndex of matchIndices.slice(1)) {
+        next[extraIndex] = {
+          ...existing[extraIndex]!,
+          state: "withdrawn",
+          withdrawnReason:
+            "superseded by a fresher repost of the same standing condition, consolidated into one pending decision",
+        };
+      }
       await this.saveAll(next);
       return { ok: true, decision: updated };
     }

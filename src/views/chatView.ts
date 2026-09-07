@@ -1623,6 +1623,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // never disagree with what actually happens if the user clicks through.
     sterileRoundRouting: async (target, decision) => this.staleReviewRoutingDecisionV1Impl(target, decision),
     preImplementationRouting: async (target, decision) => this.staleReviewRoutingDecisionV1Impl(target, decision),
+    // 1.0.0 gate, Part 5 (B2, item 131): a "reconcile the plan checklist"
+    // card is only answerable while `checklistProgressUnreliable` is still
+    // set — `reconcilePlanChecklistConfirmedV1` ("Mark Plan Checklist
+    // Reconciled") clears it directly, reachable from the Command Palette
+    // or tree context menu independent of this card's own "reconcile"
+    // option, so the latch can clear while a card posted earlier is still
+    // pending. The event-driven withdraw at that command's own mutation
+    // site (`reconcilePlanChecklist.ts`) is the immediate signal; this is
+    // the safety net for whatever it misses.
+    reconcilePlanChecklist: async (target) => {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath)).catch(
+        () => undefined
+      );
+      if (!read || !read.ok) {
+        return { stale: false };
+      }
+      if (!read.decoded.progress.checklistProgressUnreliable) {
+        return { stale: true, reason: "the plan checklist was already marked reconciled" };
+      }
+      return { stale: false };
+    },
   };
 
   /** Shared staleness check for `sterileRoundRouting`/`preImplementationRouting` — see their predicates above. */

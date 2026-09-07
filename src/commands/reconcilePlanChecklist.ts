@@ -17,6 +17,7 @@ import {
   normalizeChecklistItemTextV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
+  truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
 import {
@@ -296,6 +297,24 @@ async function computePlanReviewBlockerSupersessionEvidenceV1(
   return items;
 }
 
+/**
+ * 1.0.0 gate, A4 (review finding, 2026-09-06 second pass): the "Unchecked
+ * plan items" block below was bounded to a preview with an honest "and N
+ * more" tail; the three sibling evidence blocks in this function
+ * (`pendingImplReviewFiles`, `pendingOperationEvidence`, `coveredItems`) were
+ * not, and still inlined their full lists verbatim into the PERSISTED
+ * decision record on every post. Update-in-place (this task, prior round)
+ * removed the ×245-repost multiplier that made this the store's dominant
+ * growth driver, but an unbounded block is still an unbounded block per
+ * record — this mirrors the same bound so no evidence list in this file can
+ * grow without limit regardless of how many files/items a round touches.
+ */
+function boundedEvidenceListV1(lines: readonly string[], limit: number = 10, maxLineChars: number = 160): string {
+  const bounded = lines.slice(0, limit).map((line) => truncateChecklistItemTextV1(line, maxLineChars));
+  const more = lines.length > bounded.length ? `\n…and ${lines.length - bounded.length} more.` : "";
+  return bounded.join("\n") + more;
+}
+
 async function gatherReconcileEvidenceV1(
   folderUri: vscode.Uri,
   planOfRecord: string,
@@ -335,7 +354,7 @@ async function gatherReconcileEvidenceV1(
     label: "pendingImplReviewFiles",
     detail:
       pendingImplReviewFiles !== undefined && pendingImplReviewFiles.length > 0
-        ? `${pendingImplReviewFiles.length} file(s) changed by a round whose checklist state was not recorded:\n${pendingImplReviewFiles.map((f) => `- ${f}`).join("\n")}`
+        ? `${pendingImplReviewFiles.length} file(s) changed by a round whose checklist state was not recorded:\n${boundedEvidenceListV1(pendingImplReviewFiles.map((f) => `- ${f}`))}`
         : "None recorded.",
   });
 
@@ -351,14 +370,14 @@ async function gatherReconcileEvidenceV1(
   // this same round's evidence through `applyReviewerVerifiedTicks` once a
   // review names them verified complete.
   if (pendingOperationEvidence !== undefined && pendingOperationEvidence.length > 0) {
+    const lines = pendingOperationEvidence.map(
+      ({ item, evidence: itemEvidence }) => `- ${OPEN_ITEM_GLYPH} ${item} — ${itemEvidence}`
+    );
     evidence.push({
       label: "Applied-operation evidence (pending human attestation, not ticked automatically)",
       detail:
         `${pendingOperationEvidence.length} unticked item(s) have lexical corroboration from this round's own ` +
-        `applied operations — not a reviewer's judgement, so none of these were ticked:\n` +
-        pendingOperationEvidence
-          .map(({ item, evidence: itemEvidence }) => `- ${OPEN_ITEM_GLYPH} ${item} — ${itemEvidence}`)
-          .join("\n"),
+        `applied operations — not a reviewer's judgement, so none of these were ticked:\n${boundedEvidenceListV1(lines)}`,
     });
   }
 
@@ -379,7 +398,7 @@ async function gatherReconcileEvidenceV1(
       label: "Review-verified evidence (pending explicit selection, not ticked automatically)",
       detail:
         `${coveredItems.length} unticked item(s) are named verified complete by an implementation review ` +
-        `already on file:\n${coveredItems.map((item) => `- ${OPEN_ITEM_GLYPH} ${item}`).join("\n")}`,
+        `already on file:\n${boundedEvidenceListV1(coveredItems.map((item) => `- ${OPEN_ITEM_GLYPH} ${item}`))}`,
     });
   }
   for (const entry of perStage) {
@@ -1860,6 +1879,21 @@ export async function reconcilePlanChecklistConfirmedV1(
     );
     return;
   }
+  // 1.0.0 gate, Part 5 (B2, item 131): this command is reachable directly
+  // (Command Palette / tree context menu "Mark Plan Checklist Reconciled"),
+  // independent of a pending `reconcilePlanChecklist` decision's own
+  // "reconcile" option — which resolves the decision itself via the normal
+  // dispatch chokepoint before this function ever runs. Reaching this
+  // function any OTHER way just cleared the exact condition such a card
+  // exists to ask about, so any pending copy of it is now stale and must be
+  // withdrawn here rather than left presenting a question that no longer
+  // applies (the render-time safety net in `chatView.ts` also catches this
+  // on the next render, but withdrawing at the mutation site is immediate).
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+    "reconcilePlanChecklist",
+    "the plan checklist was marked reconciled directly, superseding the pending reconciliation card"
+  );
   await inventory.refresh();
   NotificationRouter.showInformation(
     "Plan checklist marked as reconciled — completeness now gates advancement again."

@@ -18,7 +18,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MAX_WORKFLOW_DECISIONS_V1, WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
-import { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
+import { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 
 /** Minimal in-memory stand-in for `vscode.Memento`. */
 class FakeMemento {
@@ -96,6 +96,11 @@ void describe("WorkflowDecisionStoreV1", () => {
       assert.equal(result.option.optionId, "wait");
       assert.equal(result.decision.state, "resolved");
       assert.equal(result.decision.resolvedOptionId, "wait");
+      // 1.0.0 gate, Part 5 (B3, hand-off check "answering a decision works
+      // end to end"): the settled record must carry a timestamp proving it
+      // was actually answered, not merely flipped to a resolved state.
+      assert.ok(result.decision.resolvedAt, "expected resolvedAt to be set on resolution");
+      assert.equal(store.get(posted.decision.decisionId)?.resolvedAt, result.decision.resolvedAt);
     }
     assert.equal(store.listPending().length, 0);
   });
@@ -174,6 +179,42 @@ void describe("WorkflowDecisionStoreV1", () => {
     }
     assert.equal(store.listPending().length, 1);
     assert.equal(store.listPending()[0]!.whatHappened, "round 49");
+  });
+
+  void it("reposting consolidates a pre-existing backlog of duplicate pending records into one, withdrawing the rest", async () => {
+    // 1.0.0 gate, Part 5 (B3 diagnosis): a store written before update-in-place
+    // landed could hold several simultaneous pending records for the same
+    // decisionKey+task (the real observed case: 245 for one condition, none
+    // of them ever answered because there was no single tractable decision to
+    // act on). Simulate that legacy backlog directly via the Memento, then
+    // confirm the next repost collapses it to exactly one pending record.
+    const memento = new FakeMemento() as unknown as import("vscode").Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    const legacyDuplicates: WorkflowDecisionV1[] = ["round 1", "round 2", "round 3"].map((whatHappened) => {
+      const input = decisionInput({ decisionKey: "reconcilePlanChecklist", whatHappened });
+      return { ...input, state: "pending" };
+    });
+    // Write the legacy backlog directly, bypassing post()'s own consolidation,
+    // to reproduce a store a pre-fix build actually wrote.
+    await memento.update("workflowDecisions", legacyDuplicates);
+    assert.equal(store.listPending().length, 3, "sanity check: the simulated legacy backlog is in place");
+
+    const reposted = await store.post(
+      decisionInput({ decisionKey: "reconcilePlanChecklist", whatHappened: "fresh repost" })
+    );
+    assert.equal(reposted.ok, true);
+
+    const pending = store.listPending();
+    assert.equal(pending.length, 1, "the legacy backlog must collapse to a single pending decision");
+    assert.equal(pending[0]!.whatHappened, "fresh repost");
+    assert.equal(pending[0]!.decisionId, legacyDuplicates[0]!.decisionId, "the oldest record's id is kept stable");
+
+    const all = memento.get<WorkflowDecisionV1[]>("workflowDecisions", []);
+    const withdrawn = all.filter((d) => d.state === "withdrawn");
+    assert.equal(withdrawn.length, 2, "every other duplicate must be withdrawn, not left dangling as pending");
+    for (const decision of withdrawn) {
+      assert.match(decision.withdrawnReason ?? "", /consolidated into one pending decision/);
+    }
   });
 
   void it("reposting a different decisionKey for the same task does not supersede", async () => {
