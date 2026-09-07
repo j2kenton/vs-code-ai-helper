@@ -50,6 +50,56 @@ function changeEmitterFor(state: vscode.Memento): vscode.EventEmitter<void> {
  */
 const orphanedDecisionIds = new Set<string>();
 
+/**
+ * 1.0.0 gate, A4 (task "1.0.0 Gate", Part A): `workspaceState` is a Memento —
+ * VS Code holds it in memory and rewrites it WHOLE on every update — so an
+ * unbounded `workflowDecisions` array is not just disk growth, it is
+ * resident memory that grows without limit as rounds run. Measured on a real
+ * workspace, 2026-09-04: 331 records (245 of them `reconcilePlanChecklist`
+ * re-posts for one standing condition) at 2.46 MB, cited as the dominant
+ * contributor to a repeated `oom` window termination. A "cap of 200" was
+ * assumed by design but never actually enforced anywhere in this store —
+ * every write just appended. This constant and `enforceWorkflowDecisionCapV1`
+ * are the enforcement that was missing.
+ */
+export const MAX_WORKFLOW_DECISIONS_V1 = 200;
+
+/**
+ * Bounds the persisted array to {@link MAX_WORKFLOW_DECISIONS_V1}, called
+ * from every write path via `saveAll`. PENDING decisions are never dropped
+ * to make room — they are still actionable, and silently discarding one
+ * would strand whatever it was holding paused exactly like the store
+ * overflow this guards against, just via a different mechanism. Only
+ * already-settled records (resolved/dismissed/withdrawn/superseded — pure
+ * history) are eligible for trimming, oldest-first, until the total is back
+ * at the cap or there is no more history left to drop. A workspace that
+ * somehow accumulates more than the cap's worth of PENDING decisions keeps
+ * all of them uncapped — that is a real backlog needing a human, not
+ * something safe to solve by deleting an unanswered decision.
+ */
+function enforceWorkflowDecisionCapV1(
+  decisions: readonly WorkflowDecisionV1[]
+): readonly WorkflowDecisionV1[] {
+  if (decisions.length <= MAX_WORKFLOW_DECISIONS_V1) {
+    return decisions;
+  }
+  const pendingCount = decisions.reduce((n, d) => (d.state === "pending" ? n + 1 : n), 0);
+  const keepSettledCount = Math.max(0, MAX_WORKFLOW_DECISIONS_V1 - pendingCount);
+  let settledSeen = 0;
+  const totalSettled = decisions.length - pendingCount;
+  const dropSettledCount = Math.max(0, totalSettled - keepSettledCount);
+  // Single forward pass, oldest-first (the array is append order): drop the
+  // OLDEST `dropSettledCount` settled records, keep every pending record and
+  // every settled record after that point.
+  return decisions.filter((decision) => {
+    if (decision.state === "pending") {
+      return true;
+    }
+    settledSeen += 1;
+    return settledSeen > dropSettledCount;
+  });
+}
+
 export function markWorkflowDecisionOrphanedV1(decisionId: string): void {
   orphanedDecisionIds.add(decisionId);
 }
@@ -109,11 +159,16 @@ export type WithdrawWorkflowDecisionResultV1 =
  * rather than the exclusive-create/revision-guarded filesystem stores used
  * for durable cross-process transactional records.
  *
- * `post` supersedes any existing PENDING decision sharing the same
- * `decisionKey` + `taskCanonicalId` (the record is kept, marked
- * `superseded`, for history) rather than accumulating stale duplicates —
- * e.g. a second `reconcilePlanChecklist` decision for the same task replaces
- * the first rather than presenting two.
+ * `post` updates any existing PENDING decision sharing the same
+ * `decisionKey` + `taskCanonicalId` IN PLACE (same `decisionId`, refreshed
+ * content) rather than superseding it and appending a new record —
+ * e.g. a second `reconcilePlanChecklist` decision for the same task refreshes
+ * the first instead of presenting two. 1.0.0 gate, A4/B2 (review finding,
+ * 2026-09-06): the prior supersede-then-append behavior meant a recurring
+ * standing condition (`reconcilePlanChecklist` reposted 245 times on one
+ * real task) grew the store by one record on every repost, relying on the
+ * array cap to eventually trim the resulting history; update-in-place means
+ * a recurring condition costs the store nothing extra at all.
  */
 export class WorkflowDecisionStoreV1 {
   /**
@@ -136,13 +191,17 @@ export class WorkflowDecisionStoreV1 {
   }
 
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {
-    await this.state.update(STORAGE_KEY, decisions);
+    await this.state.update(STORAGE_KEY, enforceWorkflowDecisionCapV1(decisions));
     changeEmitterFor(this.state).fire();
   }
 
   /**
-   * Validate and persist a new decision. Any existing PENDING decision for
-   * the same `decisionKey` + `taskCanonicalId` is marked `superseded` first.
+   * Validate and persist a decision. Any existing PENDING decision for the
+   * same `decisionKey` + `taskCanonicalId` is updated IN PLACE (same
+   * `decisionId`, every other field refreshed to the new content) rather
+   * than being superseded and appended after — see the class doc comment for
+   * why (1.0.0 gate, A4/B2: a recurring standing condition must cost the
+   * store nothing extra on repost).
    */
   async post(input: CreateWorkflowDecisionInputV1): Promise<PostWorkflowDecisionResultV1> {
     const created = createWorkflowDecisionV1(input);
@@ -151,14 +210,23 @@ export class WorkflowDecisionStoreV1 {
     }
     const canonicalId = normalizePath(input.taskCanonicalId);
     const existing = this.all();
-    const next = existing.map((decision) =>
-      decision.state === "pending" &&
-      decision.decisionKey === input.decisionKey &&
-      normalizePath(decision.taskCanonicalId) === canonicalId
-        ? { ...decision, state: "superseded" as const }
-        : decision
+    const matchIndex = existing.findIndex(
+      (decision) =>
+        decision.state === "pending" &&
+        decision.decisionKey === input.decisionKey &&
+        normalizePath(decision.taskCanonicalId) === canonicalId
     );
-    next.push(created.decision);
+    if (matchIndex !== -1) {
+      const updated: WorkflowDecisionV1 = {
+        ...created.decision,
+        decisionId: existing[matchIndex]!.decisionId,
+      };
+      const next = [...existing];
+      next[matchIndex] = updated;
+      await this.saveAll(next);
+      return { ok: true, decision: updated };
+    }
+    const next = [...existing, created.decision];
     await this.saveAll(next);
     return { ok: true, decision: created.decision };
   }

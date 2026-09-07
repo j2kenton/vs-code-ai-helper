@@ -227,6 +227,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         liveOperationIds: liveOperations.map((op) => op.id),
         liveSchedulingIntentIds: liveSchedulingIntentIdsBestEffortV1(task.taskFolderPath),
         liveRoundLeaseIds,
+        now: this.clock.now(),
       });
     }
   }
@@ -431,57 +432,45 @@ export class TaskActionScheduler implements vscode.Disposable {
   private readonly stalledActiveNotified = new Set<string>();
 
   /**
-   * A1's watchdog, both routes (2026-09-04 review follow-up, blocker "the
-   * watchdog fallback still calls pauseTaskWithReason directly rather than
-   * through the ledger's single terminalization path" — narrowed by this
-   * revision from two separately-written pause paths, one per route, to this
-   * ONE shared function both routes call): given `attemptId` (the stuck-
-   * `implRecovery` route's continuation row) or `undefined` (the generic
-   * route, which by construction has no open round-ledger row left — see
-   * `isImpossibleActiveStateV1`'s `hasOpenRoundLedgerRowV1` check — so there
-   * is nothing for the ledger to terminalize), always attempts
-   * `terminalizeRoundV1` — the round ledger's sole terminal writer — FIRST
-   * when an `attemptId` exists, folding the pause (and, for the recovery
-   * route, the `implRecovery` clear) into that SAME transaction via
+   * A1's watchdog, both routes, through ONE call into `terminalizeRoundV1` —
+   * the round ledger's sole exported transition authority (completion
+   * blocker `de9851ef-f5bb-41ed-ac18-f50cafefc245-1`, resolved 2026-09-06 by
+   * removing the previously-separate `pauseTaskWithNoLiveRoundV1` export and
+   * folding its behavior into `terminalizeRoundV1` itself via the
+   * `whenNoLiveRow` option). Given `attemptId` (the stuck-`implRecovery`
+   * route's continuation row) or `undefined` (the generic route, which by
+   * construction has no open round-ledger row left — see
+   * `isImpossibleActiveStateV1`'s `hasOpenRoundLedgerRowV1` check), the SAME
+   * call resolves the live-row case (folding the pause, and for the recovery
+   * route the `implRecovery` clear, into that transaction via
    * `postTerminalizePatch` so the ledger's ending and the task's paused
-   * status can never observably disagree. `implRecovery` MUST be cleared for
-   * the recovery route, not merely left in place under a paused status:
-   * without this, resuming the task reproduces the identical impossible state
+   * status can never observably disagree) and the no-live-row case (via
+   * `whenNoLiveRow`, never touching `roundLedger`) without the caller ever
+   * choosing between two functions. `implRecovery` MUST be cleared for the
+   * recovery route, not merely left in place under a paused status: without
+   * this, resuming the task reproduces the identical impossible state
    * instantly (the same stuck record, nothing changed). The common case for
    * the recovery route is `alreadyTerminal`/`notFound` — this task's own
    * round-ledger reconciliation pass, earlier in this same sweep, will
-   * already have closed the continuation's row as orphaned — so this falls
-   * back to the SAME direct pause(+clear) patch primitive
-   * (`patchTaskProgressStrictV1`, reached via `this.store.patch`) whenever
-   * there is no live ledger row left for `terminalizeRoundV1` to act on; the
-   * generic route always takes this fallback, for the reason above. Re-checks
-   * `isImpossibleActiveStateV1` against the FRESH state read inside the patch
-   * (not the snapshot the caller iterated over) either way, so a concurrent
-   * resolution — another window's reclaim of the same `implRecovery` record,
-   * or the user resuming the task by hand — between this call's snapshot and
-   * its write is a safe no-op, never a stale double-pause.
-   *
-   * 2026-09-04 review follow-up (completion blocker, narrowed further):
-   * "the watchdog still directly patches task state whenever no open ledger
-   * row is available" — recorded here as a deliberate design decision, not
-   * an oversight. `terminalizeRoundV1` DOES support synthesizing a fresh row
-   * on the fly (`synthesizeIfMissing`) for exactly this "no row exists"
-   * shape, and folding the generic route through it would make every
-   * watchdog action textually pass through the same one function. Rejected
-   * anyway: the generic route's whole premise is that NO round is running —
-   * `isImpossibleActiveStateV1` requires `hasOpenRoundLedgerRowV1` to be
-   * false before it ever fires. Synthesizing a row here would fabricate a
-   * `RoundLedgerEntryV1` for a round that never existed, permanently
-   * recorded in this task's ledger and rendered into chat history via
-   * `formatRoundOutcomeMessageV1` ("_Ended: `<stage>` — interrupted — ...
-   * mode `<mode>`_") as if a dispatch had actually happened — corrupting the
-   * ledger's own audit trail (one entry per real round) in exchange for
-   * routing a no-op through a terminalizer with nothing to terminalize. The
-   * direct `patchTaskProgressStrictV1` write (via `this.store.patch`) is the
-   * SAME durable, CAS-guarded, re-checked-against-fresh-state primitive
-   * every other transition in this codebase uses; "acts only through
-   * durable primitives, never dispatches work" — the actual safety property
-   * A1 requires — is satisfied without inventing a phantom round.
+   * already have closed the continuation's row as orphaned — so
+   * `terminalizeRoundV1` itself falls through to `whenNoLiveRow`; the generic
+   * route always takes that same fallback, for the reason above.
+   * Fabricating a `RoundLedgerEntryV1` via `terminalizeRoundV1`'s
+   * `synthesizeIfMissing` remains rejected for the reason recorded in prior
+   * revisions of this comment (the generic route's whole premise is that NO
+   * round ran; synthesizing one would render a false "_Ended: … —
+   * interrupted …_" into chat history and corrupt the ledger's "one entry
+   * per real round" invariant) — `whenNoLiveRow` moves `TaskProgress` off
+   * `active` without ever touching `roundLedger`.
+   * `isStillImpossible` re-checks `isImpossibleActiveStateV1` against the
+   * FRESH state read inside the patch (not the snapshot the caller iterated
+   * over) either way, so a concurrent resolution — another window's reclaim
+   * of the same `implRecovery` record, or the user resuming the task by
+   * hand — between this call's snapshot and its write is a safe no-op, never
+   * a stale double-pause. Still writes through `this.store.patch` for the
+   * no-live-row branch (the same durable, CAS-guarded,
+   * re-checked-against-fresh-state primitive every other transition in this
+   * codebase uses, and still injectable for tests) via `whenNoLiveRow.patch`.
    */
   private async closeStalledTaskThroughLedgerV1(
     task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
@@ -489,42 +478,57 @@ export class TaskActionScheduler implements vscode.Disposable {
     reason: string
   ): Promise<{ readonly progress: TaskProgress | undefined; readonly transitioned: boolean }> {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+    const isStillImpossible = (current: TaskProgress): boolean =>
+      isImpossibleActiveStateV1({ progress: current, taskCanonicalId: task.taskFolderPath, now: this.clock.now() });
+    const clearImplRecovery = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1;
+
     // 2026-09-04 review follow-up: a disk-backed concurrency test caught two
     // windows racing the generic no-ledger-row route both reading back
-    // `status: "paused"` from the shared file and both posting the stalled-
-    // task escalation, even though only one of them performed the write.
-    // `transitioned` is set only by the window whose own fresh read still
-    // found the impossible state, so the caller can post the escalation
-    // exactly once per real detection rather than once per window that
-    // merely observed the already-paused result.
-    let transitioned = false;
-    const applyPauseAndClear = (current: TaskProgress): TaskProgress => {
-      if (!isImpossibleActiveStateV1({ progress: current, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
-        return current;
-      }
-      transitioned = true;
-      const cleared = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 ? { ...current, implRecovery: undefined } : current;
-      return pauseTaskWithReason(cleared, reason);
-    };
-    if (attemptId) {
-      const result = await terminalizeRoundV1(
-        attemptId,
-        "interrupted",
-        {
-          rejectionReason:
-            "the continuation was dispatched but never finalized, and its record lost the evidence " +
-            "needed to safely re-arm it — closed by the watchdog",
+    // `status: "paused"` from the shared file and both posting the
+    // stalled-task escalation, even though only one of them performed the
+    // write. `liveRowTransitioned` (for the live-row branch) and the result's
+    // own `transitioned` field (for the no-live-row branch) are set only by
+    // the window whose own fresh read still found the impossible state, so
+    // the caller can post the escalation exactly once per real detection
+    // rather than once per window that merely observed the already-paused
+    // result.
+    let liveRowTransitioned = false;
+    const result = await terminalizeRoundV1(
+      attemptId,
+      "interrupted",
+      {
+        rejectionReason:
+          "the continuation was dispatched but never finalized, and its record lost the evidence " +
+          "needed to safely re-arm it — closed by the watchdog",
+      },
+      {
+        taskFolderUri,
+        postTerminalizePatch: (current) => {
+          if (!isStillImpossible(current)) {
+            return current;
+          }
+          liveRowTransitioned = true;
+          const cleared = clearImplRecovery ? { ...current, implRecovery: undefined } : current;
+          return pauseTaskWithReason(cleared, reason);
         },
-        { taskFolderUri, postTerminalizePatch: (current) => applyPauseAndClear(current) }
-      );
-      if (result.ok && !result.alreadyTerminal) {
-        return { progress: result.progress, transitioned };
+        whenNoLiveRow: {
+          reason,
+          clearImplRecovery,
+          isStillImpossible,
+          patch: (folder, transform) => this.store.patch(folder, transform),
+        },
       }
-      // notFound or alreadyTerminal: no live ledger row left to close (the
-      // normal case). Fall through to the direct pause(+clear) below.
+    );
+
+    if (result.ok && "noLiveRow" in result) {
+      return { progress: result.progress, transitioned: result.transitioned };
     }
-    const progress = await this.store.patch(taskFolderUri, applyPauseAndClear);
-    return { progress, transitioned };
+    if (!result.ok) {
+      // Unreachable in practice: `whenNoLiveRow` is always supplied above, so
+      // `terminalizeRoundV1` never falls through to a bare `ok: false` here.
+      return { progress: undefined, transitioned: false };
+    }
+    return { progress: result.progress, transitioned: liveRowTransitioned };
   }
 
   /**

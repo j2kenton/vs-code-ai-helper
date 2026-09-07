@@ -333,7 +333,7 @@ import {
 } from "../utils/reviewRouting";
 import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV1";
 import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
-import { escalateReviewToHuman } from "../utils/reviewEscalation";
+import { escalateReviewToHuman, postEnvironmentalAdvanceNoticeV1 } from "../utils/reviewEscalation";
 import {
   getAutoAdvanceMode,
   getAutoAdvanceScoreThreshold,
@@ -616,11 +616,19 @@ export async function claimReviewAttempt(
  * liveness signals, per `roundLeaseV1.ts`'s own "best-effort throughout"
  * design) into a hard failure of ordinary review dispatch — a strictly worse
  * outcome than the narrow reconciliation race this is meant to close. Logging
- * makes the previously-silent gap OBSERVABLE without making it fatal; closing
- * it completely would need either a production guarantee that
- * `ExtensionContext` is always available by the time a review dispatches (it
- * should be, post-activation, but nothing here proves it), or a change to
- * reconciliation's own protection check instead of this call site.
+ * makes the previously-silent gap OBSERVABLE without making it fatal.
+ *
+ * 2026-09-06 review follow-up (same blocker, closed by a change to
+ * reconciliation's own protection check rather than this call site, per the
+ * paragraph above): `isRoundLedgerRowProtectedV1`
+ * (`roundLedgerReconciliationV1.ts`) now protects ANY round-ledger row within
+ * `STALE_DISPATCH_GRACE_MS` of its own `startedAt` unconditionally — that
+ * timestamp is durable, cross-window evidence in its own right (written by
+ * the SAME transaction that opened the row), so a row this function commits
+ * without a lease is still protected from a concurrent orphan-close in
+ * another window for as long as any round dispatched here could legitimately
+ * still be running. See that predicate's own doc comment for the full
+ * argument.
  */
 export async function claimReviewAttemptWithLiveLeaseV1(
   folderUri: vscode.Uri,
@@ -3219,9 +3227,23 @@ export async function handleReviewRoutingOutcome(options: {
       return { escalated: false };
     }
     if (decision.route === "advance-with-note") {
-      NotificationRouter.showInformation(
-        `${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
-      );
+      // 1.0.0 gate, Part 4 / Step 14 (B4): a plain toast here used to name
+      // only the blocker's category ("only known-environmental blockers
+      // remain"), never the concrete failure, the fact it will gate Publish
+      // later, or that an audited override already exists for it — see
+      // postEnvironmentalAdvanceNoticeV1's doc comment. Falls back to the
+      // toast when no extension context is available to post a decision
+      // (unit tests, or an unusual host), so this notice is never dropped.
+      const posted = await postEnvironmentalAdvanceNoticeV1(targetStage, blockers, {
+        canonicalId: normalizePath(folderUri.fsPath),
+        taskFolderPath: folderUri.fsPath,
+        taskName: updated.displayName,
+      });
+      if (!posted) {
+        NotificationRouter.showInformation(
+          `${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
+        );
+      }
       return { escalated: false };
     }
     if (decision.route === "second-opinion") {

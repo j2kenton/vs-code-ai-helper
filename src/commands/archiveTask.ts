@@ -11,6 +11,7 @@ import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/ta
 import { clearZeroChangeImplRoundCounter } from "./reviewActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 
 /**
  * Accepted argument shapes: the tree TaskNode (`{ task: IncompleteTask }`)
@@ -130,6 +131,14 @@ export async function archiveTask(
         // A parked task is no longer iterating — drop its persisted
         // zero-change implementation-round counter too.
         await clearZeroChangeImplRoundCounter(resolved.taskFolderPath);
+        // 1.0.0 gate, A4 (review finding, 2026-09-06): an archived task can
+        // resume later, but nothing acts on it while parked — retire any
+        // still-pending decisions now rather than leaving a stale card
+        // presenting for a task nobody is looking at.
+        await retirePendingWorkflowDecisionsForTaskV1(
+          { taskFolderPath: resolved.taskFolderPath, canonicalId: resolved.canonicalId },
+          "the task was archived"
+        ).catch(() => undefined);
         if (currentTaskStore.get() === resolved.canonicalId) {
           await currentTaskStore.clear();
         }

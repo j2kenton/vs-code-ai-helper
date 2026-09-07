@@ -10,13 +10,14 @@
  *    failure);
  *  - `resolve`/`dismiss` against an unknown id report `missing`;
  *  - `dismiss` settles a pending decision without an option;
- *  - reposting a decision under the same `decisionKey` + task marks the
- *    prior pending one `superseded` rather than leaving two pending;
+ *  - reposting a decision under the same `decisionKey` + task updates the
+ *    prior pending one in place (same decisionId) rather than leaving two
+ *    pending or appending a new record;
  *  - `removeForTask` drops every record for one task.
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { MAX_WORKFLOW_DECISIONS_V1, WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
 
 /** Minimal in-memory stand-in for `vscode.Memento`. */
@@ -145,18 +146,34 @@ void describe("WorkflowDecisionStoreV1", () => {
     assert.equal(result.kind, "missing");
   });
 
-  void it("reposting the same decisionKey for the same task supersedes the earlier pending decision", async () => {
+  void it("reposting the same decisionKey for the same task updates the earlier pending decision in place", async () => {
+    // 1.0.0 gate, A4/B2 (review finding, 2026-09-06): a repost of the same
+    // standing condition must cost the store nothing extra — no new record,
+    // no `superseded` history entry — so a recurring condition never grows
+    // the array at all, however many times it reposts.
     const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
-    const first = await store.post(decisionInput({ decisionKey: "reconcilePlanChecklist" }));
+    const first = await store.post(decisionInput({ decisionKey: "reconcilePlanChecklist", whatHappened: "first" }));
     assert.equal(first.ok, true);
-    const second = await store.post(decisionInput({ decisionKey: "reconcilePlanChecklist" }));
+    const second = await store.post(decisionInput({ decisionKey: "reconcilePlanChecklist", whatHappened: "second" }));
     assert.equal(second.ok, true);
     if (!first.ok || !second.ok) {return;}
     const pending = store.listPending();
     assert.equal(pending.length, 1);
-    assert.equal(pending[0]!.decisionId, second.decision.decisionId);
-    const supersededFirst = store.get(first.decision.decisionId);
-    assert.equal(supersededFirst?.state, "superseded");
+    // Same decisionId, refreshed content: a repost is an UPDATE, not a
+    // supersede-and-append.
+    assert.equal(pending[0]!.decisionId, first.decision.decisionId);
+    assert.equal(pending[0]!.whatHappened, "second");
+    assert.equal(store.get(first.decision.decisionId)?.state, "pending");
+  });
+
+  void it("reposting a decision under the same decisionKey does not grow the store, however many times it repeats", async () => {
+    const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+    for (let i = 0; i < 50; i += 1) {
+      const posted = await store.post(decisionInput({ decisionKey: "reconcilePlanChecklist", whatHappened: `round ${i}` }));
+      assert.equal(posted.ok, true);
+    }
+    assert.equal(store.listPending().length, 1);
+    assert.equal(store.listPending()[0]!.whatHappened, "round 49");
   });
 
   void it("reposting a different decisionKey for the same task does not supersede", async () => {
@@ -164,6 +181,75 @@ void describe("WorkflowDecisionStoreV1", () => {
     await store.post(decisionInput({ decisionKey: "keyA" }));
     await store.post(decisionInput({ decisionKey: "keyB" }));
     assert.equal(store.listPending().length, 2);
+  });
+
+  // 1.0.0 gate, A4 (review finding, 2026-09-06): the store's "cap of 200" was
+  // assumed by design but never enforced anywhere — a real workspace grew to
+  // 331 records (2.46 MB, 88% of the extension's workspace-state memory) and
+  // was named as the dominant contributor to a repeated OOM window
+  // termination. These lock in the enforcement added in response.
+  void describe("MAX_WORKFLOW_DECISIONS_V1 cap enforcement (1.0.0 gate A4)", () => {
+    void it("trims oldest SETTLED records once the total exceeds the cap, keeping every pending one", async () => {
+      const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+      // Post and immediately dismiss MAX_WORKFLOW_DECISIONS_V1 + 50 distinct
+      // (unique decisionKey per task) decisions, so none supersede each
+      // other and every one becomes a settled (dismissed) history record.
+      const overflow = 50;
+      const dismissedIds: string[] = [];
+      for (let i = 0; i < MAX_WORKFLOW_DECISIONS_V1 + overflow; i += 1) {
+        const posted = await store.post(
+          decisionInput({ decisionKey: `history-${i}`, taskCanonicalId: `/tmp/tasks/task-${i}` })
+        );
+        assert.equal(posted.ok, true);
+        if (!posted.ok) {return;}
+        await store.dismiss(posted.decision.decisionId);
+        dismissedIds.push(posted.decision.decisionId);
+      }
+      // One more decision, left pending — must survive the cap regardless.
+      const pendingPosted = await store.post(
+        decisionInput({ decisionKey: "still-pending", taskCanonicalId: "/tmp/tasks/task-pending" })
+      );
+      assert.equal(pendingPosted.ok, true);
+      if (!pendingPosted.ok) {return;}
+
+      const memento = (store as unknown as { state: { get<T>(key: string, def: T): T } }).state;
+      const persisted = memento.get<Array<{ decisionId: string }>>("workflowDecisions", []);
+      assert.ok(
+        persisted.length <= MAX_WORKFLOW_DECISIONS_V1,
+        `persisted array (${persisted.length}) must never exceed the cap (${MAX_WORKFLOW_DECISIONS_V1})`
+      );
+      assert.ok(
+        persisted.some((d) => d.decisionId === pendingPosted.decision.decisionId),
+        "the still-pending decision must never be dropped to make room"
+      );
+      // The OLDEST dismissed records are the ones dropped, not the newest.
+      const oldestDismissedId = dismissedIds[0]!;
+      const newestDismissedId = dismissedIds[dismissedIds.length - 1]!;
+      assert.ok(
+        !persisted.some((d) => d.decisionId === oldestDismissedId),
+        "the oldest settled record must be the one trimmed"
+      );
+      assert.ok(
+        persisted.some((d) => d.decisionId === newestDismissedId),
+        "the newest settled record must survive the trim"
+      );
+    });
+
+    void it("never trims below the cap when every record is still pending", async () => {
+      const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+      const extra = 20;
+      for (let i = 0; i < MAX_WORKFLOW_DECISIONS_V1 + extra; i += 1) {
+        const posted = await store.post(
+          decisionInput({ decisionKey: `pending-${i}`, taskCanonicalId: `/tmp/tasks/task-${i}` })
+        );
+        assert.equal(posted.ok, true);
+      }
+      assert.equal(
+        store.listPending().length,
+        MAX_WORKFLOW_DECISIONS_V1 + extra,
+        "a backlog of genuinely unanswered decisions is a human problem, not something safe to solve by deleting one"
+      );
+    });
   });
 
   void it("removeForTask drops every record for one task", async () => {

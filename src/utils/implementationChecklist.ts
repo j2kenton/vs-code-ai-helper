@@ -36,7 +36,15 @@ import {
  * what counts as a checklist item.
  */
 const ITEM_LINE = /^([ \t]*[-*][ \t]*\[)([ xX])(\][ \t]+)(.*\S)([ \t]*\r?)$/m;
-const ANY_ITEM_LINE = /^[ \t]*[-*][ \t]*\[([ xX])\][ \t]+(.*\S)[ \t]*\r?$/;
+/**
+ * Captures leading indentation (group 1) alongside checked-glyph (group 2)
+ * and text (group 3) — the indentation is what {@link itemsInLatestRendering}
+ * uses to tell a top-level plan item from a nested discovered-sub-work child
+ * (1.0.0 gate A3, Step 13: "nested items do not count" toward the plan's
+ * fixed denominator, and must not be flagged as a checklist-item-set mutation
+ * when a round adds them under an existing, unchanged parent).
+ */
+const ANY_ITEM_LINE = /^([ \t]*)[-*][ \t]*\[([ xX])\][ \t]+(.*\S)[ \t]*\r?$/;
 
 /** The marker a generated implementation checklist opens with. */
 export const IMPLEMENTATION_CHECKLIST_MARKER =
@@ -593,7 +601,7 @@ function collectPlanItemsUnderPartHeadingV1(
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
-      items.push(match[2] ?? "");
+      items.push(match[3] ?? "");
     }
   }
   return items;
@@ -804,11 +812,19 @@ export interface ChecklistProgressV1 {
  * Every checklist item in one rendering, in document order — skipping items
  * inside fenced examples, which are illustrations of a checklist rather than
  * this plan's own work.
+ *
+ * `nested` is true for an item indented under another item (any non-zero
+ * leading whitespace) — a discovered-sub-work child (1.0.0 gate A3, Step 13),
+ * as opposed to a `nested: false` top-level plan item. Callers that compute
+ * the plan's fixed denominator or detect item-set mutation must filter to
+ * `nested === false`; callers that only tick/merge/list checkbox state
+ * operate on every item regardless of nesting, since a child's own box is
+ * still real, checkable state.
  */
 function itemsInLatestRendering(
   content: string
-): { text: string; checked: boolean; excluded: boolean }[] {
-  const items: { text: string; checked: boolean; excluded: boolean }[] = [];
+): { text: string; checked: boolean; excluded: boolean; nested: boolean }[] {
+  const items: { text: string; checked: boolean; excluded: boolean; nested: boolean }[] = [];
   // Scoped to the latest rendering, then cut at a run summary's `## Files
   // Changed` — but only when that heading really is a summary boundary.
   //
@@ -835,11 +851,12 @@ function itemsInLatestRendering(
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
-      const text = match[2] ?? "";
+      const text = match[3] ?? "";
       items.push({
         text,
-        checked: match[1]?.toLowerCase() === "x",
+        checked: match[2]?.toLowerCase() === "x",
         excluded: isExcludedChecklistItemText(text),
+        nested: (match[1]?.length ?? 0) > 0,
       });
     }
   }
@@ -854,7 +871,7 @@ function itemsInLatestRendering(
  * distinct steps that happen to share wording stay two steps, and neither
  * disappears from the denominator.
  *
- * `total` counts EVERY item, including ones marked excluded — the
+ * `total` counts EVERY TOP-LEVEL item, including ones marked excluded — the
  * denominator never shrinks (see `ChecklistProgressV1`'s doc comment). An
  * item marked excluded settles as `closedWithoutDoing` rather than
  * `checked`, so it still holds the completeness gate
@@ -864,23 +881,52 @@ function itemsInLatestRendering(
  * are all marked excluded is a real (if fully out-of-scope) checklist, not
  * "no checklist", so it must not fall through to `undefined` and silently
  * disable the gate.
+ *
+ * Nested items (1.0.0 gate A3, Step 13's "discovered sub-work nests, and
+ * nested items do not count") are indented checklist lines directly under a
+ * top-level item — a round records a discovered-but-unenumerated piece of
+ * work there instead of inflating the plan's fixed top-level denominator.
+ * They never contribute to `total`, but they DO gate their parent: a
+ * top-level item is only `checked` when its own box is ticked AND every
+ * nested child immediately following it (until the next top-level item) is
+ * itself settled (checked or excluded) — so a parent cannot be marked done
+ * while a child it spawned is still open, keeping the percentage honest.
  */
 export function countChecklistProgressV1(
   planOfRecord: string
 ): ChecklistProgressV1 | undefined {
   const items = itemsInLatestRendering(planOfRecord);
-  if (items.length === 0) {
+  const topLevelCount = items.filter((item) => !item.nested).length;
+  if (topLevelCount === 0) {
     return undefined;
   }
-  const checked = items.filter((item) => !item.excluded && item.checked).length;
-  const closedWithoutDoing = items.filter((item) => item.excluded).length;
+  let checked = 0;
+  let closedWithoutDoing = 0;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    if (item.nested) {
+      continue;
+    }
+    let allChildrenSettled = true;
+    for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
+      const child = items[j]!;
+      if (!child.excluded && !child.checked) {
+        allChildrenSettled = false;
+      }
+    }
+    if (item.excluded) {
+      closedWithoutDoing++;
+    } else if (item.checked && allChildrenSettled) {
+      checked++;
+    }
+  }
   const settled = checked + closedWithoutDoing;
   return {
-    total: items.length,
+    total: topLevelCount,
     checked,
     closedWithoutDoing,
     settled,
-    remaining: items.length - settled,
+    remaining: topLevelCount - settled,
     excluded: closedWithoutDoing,
   };
 }
@@ -967,13 +1013,44 @@ export interface ChecklistItemSetMutationV1 {
  * see the wf10 "Batch F" incident this guard exists to catch). Returns
  * `undefined` when the item sets match exactly, regardless of tick-state
  * changes.
+ *
+ * Compares TOP-LEVEL items only (`item.nested === false`) for the add/remove
+ * sets above. A nested item — indented under an existing top-level item — is
+ * a discovered-sub-work child (1.0.0 gate A3, Step 13) that a round is
+ * explicitly permitted to ADD without moving the plan's fixed denominator;
+ * treating an addition as a mutation would revert exactly the recording
+ * behavior that requirement asks for. Adding, removing, or reordering a
+ * TOP-LEVEL item is still caught unchanged.
+ *
+ * The addition exception is deliberately narrower than "nested items never
+ * count": a nested child recorded against a top-level item which is STILL
+ * PRESENT afterward, and that has since disappeared or been reworded, IS
+ * reported (folded into `removedItems`, same as a dropped top-level item) —
+ * review finding, 2026-09-06: filtering nested items out of both snapshots
+ * unconditionally let a round silently delete or reword a discovered child
+ * and tick its parent, since `countChecklistProgressV1` can only gate on
+ * children it can still see. Only ADDING a nested child is a permitted,
+ * denominator-neutral exception (1.0.0 gate A3, Step 13); removing or
+ * rewording one — settled (checked/excluded) or not — is still flagged,
+ * exactly like a top-level item's removal, so a round cannot silently erase
+ * the audit trail of discovered work once it has been recorded. Review
+ * finding, 2026-09-06 (second pass): an earlier revision of this fix
+ * exempted already-SETTLED children from removal detection on the theory
+ * that dropping done bookkeeping is harmless — but that let a round quietly
+ * delete a COMPLETED discovered child's record, which is exactly the
+ * plan-integrity guarantee this guard exists to enforce. The only exemption
+ * remaining is a child whose parent was itself removed (already caught as
+ * the parent's own top-level removal — deleting an item's children along
+ * with it is not an additional mutation).
  */
 export function detectChecklistItemSetMutationV1(
   beforeContent: string,
   afterContent: string
 ): ChecklistItemSetMutationV1 | undefined {
-  const beforeItems = itemsInLatestRendering(beforeContent);
-  const afterItems = itemsInLatestRendering(afterContent);
+  const beforeAll = itemsInLatestRendering(beforeContent);
+  const afterAll = itemsInLatestRendering(afterContent);
+  const beforeItems = beforeAll.filter((item) => !item.nested);
+  const afterItems = afterAll.filter((item) => !item.nested);
   const beforeKeys = new Set(beforeItems.map((item) => normalizeChecklistItemTextV1(item.text)));
   const afterKeys = new Set(afterItems.map((item) => normalizeChecklistItemTextV1(item.text)));
 
@@ -995,6 +1072,49 @@ export function detectChecklistItemSetMutationV1(
       removedItems.push(item.text);
     }
   }
+
+  // Pair each nested item with the top-level item immediately preceding it in
+  // document order, so removal can be checked against ITS OWN parent rather
+  // than the item set as a whole.
+  const pairWithParent = (
+    items: readonly { text: string; checked: boolean; excluded: boolean; nested: boolean }[]
+  ): { parentKey: string; text: string; checked: boolean; excluded: boolean }[] => {
+    const pairs: { parentKey: string; text: string; checked: boolean; excluded: boolean }[] = [];
+    let currentParentKey: string | undefined;
+    for (const item of items) {
+      if (!item.nested) {
+        currentParentKey = normalizeChecklistItemTextV1(item.text);
+      } else if (currentParentKey !== undefined) {
+        pairs.push({
+          parentKey: currentParentKey,
+          text: item.text,
+          checked: item.checked,
+          excluded: item.excluded,
+        });
+      }
+    }
+    return pairs;
+  };
+  const afterChildKeysByParent = new Map<string, Set<string>>();
+  for (const pair of pairWithParent(afterAll)) {
+    const key = normalizeChecklistItemTextV1(pair.text);
+    const set = afterChildKeysByParent.get(pair.parentKey) ?? new Set<string>();
+    set.add(key);
+    afterChildKeysByParent.set(pair.parentKey, set);
+  }
+  const seenRemovedNested = new Set<string>();
+  for (const pair of pairWithParent(beforeAll)) {
+    if (!afterKeys.has(pair.parentKey)) {
+      continue; // Parent itself was dropped — already caught above.
+    }
+    const key = normalizeChecklistItemTextV1(pair.text);
+    const stillPresent = afterChildKeysByParent.get(pair.parentKey)?.has(key) ?? false;
+    if (!stillPresent && !seenRemovedNested.has(key)) {
+      seenRemovedNested.add(key);
+      removedItems.push(pair.text);
+    }
+  }
+
   if (addedItems.length === 0 && removedItems.length === 0) {
     return undefined;
   }

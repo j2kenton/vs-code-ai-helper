@@ -29,8 +29,10 @@ import {
   CompletionLintResult,
 } from "../utils/completionLint";
 import {
+  computePublishStatusLineTextV1,
   ensurePublishReviewArtifactExistsV1,
   extractVerificationHeadingSectionV1,
+  mergePublishStatusLineSection,
   normalizeLegacyHeadingLevelV1,
   readPublishChecksFreshnessStampV1,
   renderPublishChecksFreshnessStamp,
@@ -377,6 +379,76 @@ void describe("upsertCompletionChecksReportV1", () => {
 
     const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
     assert.match(content, /Not yet reviewed/);
+  });
+
+  void describe("the status line tracks what actually happened (1.0.0 gate C1)", () => {
+    void it("replaces 'Not yet reviewed' with 'Publish Checks passed' once a passing run lands", async () => {
+      const dir = makeWorkspace("publish-status-line-pass", { name: "x" });
+      await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+      await upsertCompletionChecksReportV1(
+        vscode.Uri.file(dir),
+        fakeResult({ passed: true, summary: "No linting issues found.", failedChecks: [] })
+      );
+
+      const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+      assert.match(content, /\*\*Publish Checks passed\.\*\* Request a Publish review to finish\./);
+      assert.doesNotMatch(
+        content,
+        /Not yet reviewed/,
+        "the pre-checks instruction must not survive underneath a passing result"
+      );
+    });
+
+    void it("reports a concrete failure count instead of a generic instruction when checks fail", async () => {
+      const dir = makeWorkspace("publish-status-line-fail", { name: "x" });
+      await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+      await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
+
+      const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+      assert.match(content, /\*\*Publish Checks failed\*\* \(1 check red\)\. Fix the failures/);
+    });
+
+    void it("updates the status line again on a second run, replacing the first result", async () => {
+      const dir = makeWorkspace("publish-status-line-flip", { name: "x" });
+      await ensurePublishReviewArtifactExistsV1(vscode.Uri.file(dir));
+      await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
+      await upsertCompletionChecksReportV1(
+        vscode.Uri.file(dir),
+        fakeResult({ passed: true, summary: "No linting issues found.", failedChecks: [] })
+      );
+
+      const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_REVIEW_FILENAME), "utf8");
+      assert.match(content, /Publish Checks passed/);
+      assert.doesNotMatch(content, /Publish Checks failed/);
+    });
+
+    void it("never touches a real AI review's content once one has landed", () => {
+      const reviewed = "Readiness: 8/10\n\nSummary verdict: ready to publish.\n";
+      const merged = mergePublishStatusLineSection(reviewed, "**Publish Checks passed.** Request a Publish review to finish.");
+      assert.equal(merged, reviewed, "a landed review's own verdict must never be overwritten with a status line");
+    });
+
+    void it("computePublishStatusLineTextV1 treats a quarantined-only failure as passed", () => {
+      const text = computePublishStatusLineTextV1({
+        passed: false,
+        passedModuloKnownFlakes: true,
+        failedChecks: [{ command: "npm test", exitCode: 1 }],
+        knownFlakeFailures: [{ command: "npm test", exitCode: 1 }],
+      });
+      assert.match(text, /Publish Checks passed/);
+    });
+
+    void it("computePublishStatusLineTextV1 excludes quarantined failures from the reported count", () => {
+      const text = computePublishStatusLineTextV1({
+        passed: false,
+        failedChecks: [
+          { command: "npm run lint", exitCode: 1 },
+          { command: "npm test", exitCode: 1 },
+        ],
+        knownFlakeFailures: [{ command: "npm test", exitCode: 1 }],
+      });
+      assert.match(text, /\(1 check red\)/);
+    });
   });
 
   void it("normalizeLegacyHeadingLevelV1 demotes exactly the two known legacy headings and leaves everything else alone", () => {

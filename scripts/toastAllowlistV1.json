@@ -20,12 +20,12 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7592,
+      "line": 7614,
       "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8763,
+      "line": 8785,
       "reason": "Pre-run safety check synchronously inline in the user-invoked 'Run Implementation' command (unrelated uncommitted changes in the workspace) — a git-safety confirmation, not a review/round outcome."
     },
     {
@@ -88,27 +88,27 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 11229,
+      "line": 11251,
       "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision."
     },
     {
       "file": "src/commands/markTaskDone.ts",
-      "line": 182,
+      "line": 183,
       "reason": "Direct synchronous response to the user-invoked Complete Task command when the Publish artifact is missing — 'Complete Anyway' re-invokes the same command with an explicit override, not a decision surfaced from a background round."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7833,
-      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a required completion artifact is missing — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:182."
+      "line": 7855,
+      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a required completion artifact is missing — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 7867,
-      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a plan-review blocker is not recorded as resolved — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:182."
+      "line": 7889,
+      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a plan-review blocker is not recorded as resolved — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2177,
+      "line": 2185,
       "reason": "Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome."
     },
     {
@@ -123,22 +123,22 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2917,
+      "line": 2925,
       "reason": "Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15)."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8066,
+      "line": 8088,
       "reason": "Publish Anyway nudge pointing at commitAndPushTask when the Complete & Move On Publish review could not be started automatically (another review in progress) — the drop reason is already logged; this only offers the manual alternative."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8092,
+      "line": 8114,
       "reason": "Publish Anyway nudge pointing at commitAndPushTask when the entry-owned publish preflight check failed — the failure reason is named in the message; this only offers the manual alternative."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8107,
+      "line": 8129,
       "reason": "Publish nudge pointing at commitAndPushTask when the entry-owned publish preflight check passed — Commit and Push must only ever run from the user's own click, so this only nudges toward it."
     },
     {
@@ -148,22 +148,22 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9678,
+      "line": 9700,
       "reason": "Nudge to run this stage's review after an Implementation round reported nothing to fix — the round's own outcome is recorded in the run log and chat ledger; this toast only points at the single follow-up command (Run Review) already named in the message text."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9872,
+      "line": 9894,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision (no activating extension context) — the checklist-under-recording case (the checklist still shows unfinished items even though the most recent review already scored full marks with zero blockers)."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10129,
+      "line": 10151,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — same fallback-of-a-migrated-decision pattern as copilotImplementationRunner.ts:794, just for the checklist-reconciliation decision instead of the round-limit gate."
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10767,
+      "line": 10789,
       "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — the unverified-step-counts case."
     },
     {
@@ -183,7 +183,7 @@
     },
     {
       "file": "src/views/chatView.ts",
-      "line": 1903,
+      "line": 1927,
       "reason": "Chat-history recovery notice (plan §5.1) — a corrupted local chat-v1.json needs 'Reset Chat History' or manual inspection via 'Ensemble: Open Chat Data'; a data-recovery affordance, not a task review/round workflow decision."
     }
   ]

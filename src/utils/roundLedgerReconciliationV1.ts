@@ -75,6 +75,7 @@ import { formatRoundOutcomeMessageV1, terminalizeRoundV1 } from "./roundLedgerV1
 import { resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
+import { STALE_DISPATCH_GRACE_MS } from "./taskWatchdogV1";
 
 function isTaskStage(value: unknown): value is TaskStage {
   return typeof value === "string" && (STAGE_ORDER as readonly string[]).includes(value);
@@ -139,6 +140,12 @@ export interface ReconcileOrphanedRoundLedgerRowsInputV1 {
    * identity-less row, same as before this field existed.
    */
   readonly liveRoundLeaseIds?: readonly string[];
+  /**
+   * Injectable clock, defaulting to `Date.now()` — lets tests set up a row
+   * that is within/past the just-opened grace below without waiting on the
+   * wall clock, mirroring `taskWatchdogV1.ts`'s own injectable `now`.
+   */
+  readonly now?: number;
 }
 
 /**
@@ -155,6 +162,38 @@ function isRoundLedgerRowProtectedV1(
   row: RoundLedgerEntryV1,
   input: ReconcileOrphanedRoundLedgerRowsInputV1
 ): boolean {
+  // 2026-09-06 review follow-up (A1 architectural blocker de9851ef…-0,
+  // narrowed a fourth time): every check below depends on SOME OTHER signal
+  // having already been successfully written after this row opened — an
+  // operationId the coordinator attaches moments later, a scheduling intent,
+  // or the round-lease beacon (`roundLeaseV1.ts`). All three can be absent
+  // through no fault of a genuinely-live round: the coordinator has not
+  // attached its id yet, no scheduling intent was ever used for a manual
+  // dispatch, or `markRoundLiveV1`'s `workspaceState` write itself failed
+  // (see `claimReviewAttemptWithLiveLeaseV1`'s own doc comment — it warns and
+  // proceeds rather than refusing the claim). Unlike any of those, the row's
+  // own `startedAt` is ALREADY durable, cross-window evidence: it was written
+  // by the very same `patchTaskProgressStrictV1` transaction that opened the
+  // row, so it requires no separate signal to have succeeded. A row within
+  // `STALE_DISPATCH_GRACE_MS` of its own start is therefore protected
+  // unconditionally, using the identical 90-minute margin over the 60-minute
+  // CLI ceiling the rest of A1 already uses to distinguish "still within its
+  // legitimate runtime" from "definitely dead"
+  // (`scheduleTaskResume.ts`'s `armPendingImplRecoveries`,
+  // `taskWatchdogV1.ts`'s `isStaleDispatchedImplRecoveryV1`). This closes the
+  // exact gap the review identified — "reconciliation protects such a row
+  // only when another live operation or scheduling intent happens to exist...
+  // another window can still close a genuinely running review" — because
+  // protection here no longer depends on any of those signals having landed:
+  // a sweep firing moments after (or on the same progress-change event as)
+  // the row's own commit can never see it unprotected. Only once a row has
+  // been open longer than any round could legitimately still be running does
+  // this stop protecting it unconditionally and fall through to the identity/
+  // lease checks below.
+  const startedAtMs = Date.parse(row.startedAt);
+  if (!Number.isNaN(startedAtMs) && (input.now ?? Date.now()) - startedAtMs < STALE_DISPATCH_GRACE_MS) {
+    return true;
+  }
   // 2026-09-04 review follow-up (A1 architectural blocker): `liveOperationIds`
   // is ONLY ever this window's own process-local `taskOperations` registry —
   // a round genuinely running in a DIFFERENT VS Code window is invisible to

@@ -431,6 +431,48 @@ export async function withdrawWorkflowDecisionsByKeyV1(
   }
 }
 
+/**
+ * Withdraw EVERY still-pending decision for one task, regardless of
+ * `decisionKey` — 1.0.0 gate, A4 (review finding, 2026-09-06): "a decision
+ * for a task that has been completed cannot be acted on and should not be
+ * retained or rendered" (observed: a `reconcilePlanChecklist` card still
+ * presented for a jester task completed a day earlier). Call this from every
+ * lifecycle transition after which no further work on the task's stages will
+ * ever run again (mark-done completion, archive) — never from a transition
+ * that can still resume (pause), where the decision may still need
+ * answering.
+ *
+ * Mirrors {@link withdrawWorkflowDecisionsByKeyV1}'s best-effort contract
+ * exactly (silent no-op with no extension context; one failed write does not
+ * abort withdrawing the rest), just without the `decisionKey` filter.
+ */
+export async function retirePendingWorkflowDecisionsForTaskV1(
+  target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
+  reason: string
+): Promise<void> {
+  const context = getExtensionContextV1();
+  if (!context) {
+    return;
+  }
+  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const matches = store.listPending(target.canonicalId);
+  for (const decision of matches) {
+    try {
+      const result = await store.withdraw(decision.decisionId, reason);
+      if (result.kind === "withdrawn") {
+        await appendChatMessageV1(target.taskFolderPath, {
+          role: "assistant",
+          text: `Withdrawn: ${reason}`,
+          stage: decision.stage,
+          at: new Date().toISOString(),
+        }, target.canonicalId).catch(() => undefined);
+      }
+    } catch (err) {
+      console.error(`Failed to retire workflow decision "${decision.decisionId}"`, err);
+    }
+  }
+}
+
 export async function dismissOrphanedAwaitedDecisionsV1(state: import("vscode").Memento): Promise<number> {
   const store = new WorkflowDecisionStoreV1(state);
   const orphaned = store.listPending().filter((decision) => AWAIT_ANSWER_DECISION_KEYS.has(decision.decisionKey));

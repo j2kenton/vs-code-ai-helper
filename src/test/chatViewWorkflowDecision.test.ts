@@ -69,6 +69,7 @@ import {
   writeChatHistory,
 } from "../utils/chatHistoryStore";
 import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
+import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress";
 import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 
@@ -2893,6 +2894,301 @@ void describe("Chat With AI — a pending 'sterileRoundRouting' decision is re-c
       assert.equal(stored?.state, "withdrawn");
       assert.ok(stored?.withdrawnReason && stored.withdrawnReason.length > 0);
     } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A3 Part 3 / Step 12 (2026-09-06 review, completion blocker): the chat header
+// is the third of the three surfaces the plan names for the implementation
+// row's live checklist percentage (alongside the task tree and the status
+// bar) — previously the header showed no number for the impl stage at all.
+// ---------------------------------------------------------------------------
+void describe("Chat With AI — implementation checklist percentage in the header (A3 Part 3 / Step 12)", () => {
+  void it("appends the live checklist percentage to the header label for an impl-stage chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        [
+          "<!-- ensemble:implementation-checklist -->",
+          "",
+          "- [x] One",
+          "- [x] Two",
+          "- [x] Three",
+          "- [x] Four",
+          "- [ ] Five",
+          "",
+        ].join("\n")
+      );
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForState(fake, (state) => typeof state.label === "string" && state.label.includes("%"));
+
+      const state = lastState(fake);
+      const label = String(state?.label ?? "");
+      assert.match(
+        label,
+        /— 80%$/,
+        `expected the header label to end with the checklist percentage, got "${label}"`
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("never appends a percentage for a non-impl stage chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [x] One", "- [ ] Two", ""].join("\n")
+      );
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForStateMessage(fake);
+
+      const state = lastState(fake);
+      const label = String(state?.label ?? "");
+      assert.ok(
+        !label.includes("%"),
+        `implementationProgress is scoped to the impl stage only, got "${label}"`
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A3 Part 3 / Step 12 (2026-09-06 review, completion blocker): the chat header
+// must also carry the REVIEW row's score for a review-stage chat — the
+// previous round wired the implementation percentage to all three plan-named
+// surfaces but left the review score off the status bar and chat header
+// entirely, so a review-stage chat showed no number whatsoever.
+// ---------------------------------------------------------------------------
+void describe("Chat With AI — review stage score in the header (A3 Part 3 / Step 12)", () => {
+  void it("appends the review score to the header label for a review-stage chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(`${folder}/impl-high-review.md`, "Readiness: 6/10\n");
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForState(fake, (state) => typeof state.label === "string" && state.label.includes("6/10"));
+
+      const state = lastState(fake);
+      const label = String(state?.label ?? "");
+      assert.match(
+        label,
+        /— 6\/10$/,
+        `expected the header label to end with the review score, got "${label}"`
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it('shows "—/10" (never reviewed), not nothing, for a review-stage chat with no artifact', async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForState(fake, (state) => typeof state.label === "string" && state.label.includes("—/10"));
+
+      const state = lastState(fake);
+      const label = String(state?.label ?? "");
+      assert.match(
+        label,
+        /— —\/10$/,
+        `expected the header label to end with "—/10", got "${label}"`
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  void it("never appends the review score for an impl-stage chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      fs.writeFileSync(`${folder}/impl-high-review.md`, "Readiness: 6/10\n");
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [x] One", "- [ ] Two", ""].join("\n")
+      );
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForState(fake, (state) => typeof state.label === "string" && state.label.includes("%"));
+
+      const state = lastState(fake);
+      const label = String(state?.label ?? "");
+      assert.ok(!label.includes("6/10"), `a review score must never appear on an impl-stage row, got "${label}"`);
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-06 review, completion blocker: `render()`'s own async-boundary
+// staleness guards used the task-level `sameIdentity` (canonicalId + folder
+// only), so a same-task STAGE switch mid-read was invisible to them. A render
+// begun for the impl stage could resume after the user switched to a review
+// stage of the SAME task and publish the stale impl-stage label/percentage
+// under the review stage's own target. Fixed via `sameRenderTarget`, which
+// also compares `stage` and `kind`.
+// ---------------------------------------------------------------------------
+void describe("Chat With AI — render() drops a stale render across a same-task stage switch (2026-09-06 review, completion blocker)", () => {
+  void it("does not publish a stale impl-stage percentage under a review-stage target reached mid-read", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    const originalReadProgress = effectiveReviewProgressModule.readEffectivePlanChecklistProgressV1;
+    let releaseImplRead: (() => void) | undefined;
+    const implReadGate = new Promise<void>((resolve) => {
+      releaseImplRead = resolve;
+    });
+    try {
+      fs.writeFileSync(
+        `${folder}/plan-final.md`,
+        ["<!-- ensemble:implementation-checklist -->", "", "- [x] One", "- [x] Two", "- [x] Three", "- [x] Four", "- [ ] Five", ""].join(
+          "\n"
+        )
+      );
+      fs.writeFileSync(`${folder}/impl-high-review.md`, "Readiness: 6/10\n");
+
+      // Only the impl-stage read (the FIRST render, below) is gated — a
+      // subsequent read for a different stage/module call must not hang the
+      // whole suite on this held-open promise.
+      let gatedOnce = false;
+      (
+        effectiveReviewProgressModule as unknown as {
+          readEffectivePlanChecklistProgressV1: typeof originalReadProgress;
+        }
+      ).readEffectivePlanChecklistProgressV1 = async (
+        ...args: Parameters<typeof originalReadProgress>
+      ): ReturnType<typeof originalReadProgress> => {
+        if (!gatedOnce) {
+          gatedOnce = true;
+          await implReadGate;
+        }
+        return originalReadProgress(...args);
+      };
+
+      provider.resolveWebviewView(fake.view);
+      // open() awaits only the memento write and the focus command, then
+      // fires render() WITHOUT awaiting it (see waitForStateMessage's doc
+      // comment above) — so by the time this resolves, the impl-stage
+      // render has captured `target` and is blocked inside the gated read.
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+
+      // Switch to a review stage of the SAME task while the impl-stage
+      // render is still suspended in its gated read.
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      await waitForState(fake, (state) => typeof state.label === "string" && state.label.includes("6/10"));
+
+      const stateBeforeRelease = lastState(fake);
+      const labelBeforeRelease = String(stateBeforeRelease?.label ?? "");
+      assert.match(
+        labelBeforeRelease,
+        /— 6\/10$/,
+        `expected the review-stage render to publish its own score, got "${labelBeforeRelease}"`
+      );
+      assert.ok(
+        !labelBeforeRelease.includes("%"),
+        `a stale impl-stage percentage must never appear on the review-stage header, got "${labelBeforeRelease}"`
+      );
+
+      // Now let the suspended impl-stage render resume: with the fix, it
+      // must detect the stage mismatch and return without posting anything
+      // further; without it, it would publish the stale "impl stage chat —
+      // 80%" label under `target: this.target` (the review target).
+      const postedCountBeforeResume = fake.posted.filter((m) => m.type === "state").length;
+      releaseImplRead?.();
+      // Give the resumed render a chance to run to completion (or to wrongly
+      // post) before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const finalState = lastState(fake);
+      const finalLabel = String(finalState?.label ?? "");
+      assert.ok(
+        !finalLabel.includes("%"),
+        `the resumed impl-stage render must not leak its percentage into a later state, got "${finalLabel}"`
+      );
+      assert.match(
+        finalLabel,
+        /— 6\/10$/,
+        `the review stage's own label/score must remain the last published state, got "${finalLabel}"`
+      );
+      const postedCountAfterResume = fake.posted.filter((m) => m.type === "state").length;
+      assert.equal(
+        postedCountAfterResume,
+        postedCountBeforeResume,
+        "the stale impl-stage render must not post a state message at all once it resumes after the stage switch"
+      );
+    } finally {
+      (
+        effectiveReviewProgressModule as unknown as {
+          readEffectivePlanChecklistProgressV1: typeof originalReadProgress;
+        }
+      ).readEffectivePlanChecklistProgressV1 = originalReadProgress;
+      releaseImplRead?.();
       realFs.restore();
       notify.restore();
       cmds.restore();

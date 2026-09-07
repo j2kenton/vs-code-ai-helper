@@ -111,6 +111,20 @@ const LEVEL_FILTER_STATE_KEY = "ensemble.notificationLevelFilter";
 const ALL_LEVELS: ReadonlyArray<StatusEntry["level"]> = ["info", "warning", "error"];
 /** Label text above this length is truncated with an ellipsis; the full text is still in the hover tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
+/**
+ * 1.0.0 gate, A4 (task "1.0.0 Gate", Part A): `ensemble.notifications` is the
+ * same kind of unbounded Memento-backed array as `workflowDecisions` — VS
+ * Code rewrites it whole on every persist, so unretained growth is resident
+ * memory, not just disk. Measured alongside the `workflowDecisions` overflow
+ * that repeatedly OOM-killed the extension host, 2026-09-04: 0.31 MB here,
+ * not yet the dominant contributor, but the identical unbounded shape.
+ * Entries are newest-first (`unshift`), so trimming the tail drops the
+ * OLDEST entries first — the same "keep what's actionable/recent" intent as
+ * the decision store's cap, without that store's pending/settled distinction
+ * (a notification is never "pending"; the user's own unread state lives
+ * elsewhere).
+ */
+const MAX_STATUS_ENTRIES = 500;
 
 export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface, vscode.Disposable {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusTreeNode | undefined | null | void>();
@@ -141,8 +155,12 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       this.levelFilter = new Set(ALL_LEVELS);
     }
     const persisted = state?.get<Array<Omit<StatusEntry, "timestamp"> & { timestamp: string }>>(STATUS_STATE_KEY, []) ?? [];
-    // Notifications persist for the lifetime of this workspace with no
-    // retention limit — the user only clears them explicitly via Clear All.
+    // Notifications are bounded to MAX_STATUS_ENTRIES (1.0.0 gate A4) rather
+    // than retained for the lifetime of the workspace — the user can still
+    // clear them early via Clear All. Trimmed here too (not just in
+    // addEntry below) so a workspace whose array already exceeds the cap
+    // from before this fix landed is bounded again the moment it next loads,
+    // not only once enough new entries arrive to push old ones out.
     // sourceOperationId is stripped on load too, not just in persist() below
     // — state written by a version before that fix can still carry one on
     // disk, and loading it verbatim would reintroduce the same cross-session
@@ -150,7 +168,8 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     this.entries = persisted
       .filter(entry => typeof entry.message === "string" && typeof entry.timestamp === "string")
       .map(({ sourceOperationId: _sourceOperationId, ...entry }) => ({ ...entry, timestamp: new Date(entry.timestamp) }))
-      .filter(entry => !Number.isNaN(entry.timestamp.getTime()));
+      .filter(entry => !Number.isNaN(entry.timestamp.getTime()))
+      .slice(0, MAX_STATUS_ENTRIES);
 
     // Operations themselves are necessarily in-memory, but a tiny snapshot
     // lets a later activation tell the user that a live operation was cut off
@@ -167,6 +186,15 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       }
     }
     if (interrupted.length > 0) {
+      // 1.0.0 gate, A4 (review-narrowed, 2026-09-06): the array was already
+      // trimmed to the cap above BEFORE these interrupted-operation entries
+      // were unshifted in, so persisting here without re-trimming could write
+      // more than MAX_STATUS_ENTRIES to disk whenever there are enough
+      // interrupted operations to push the total back over the cap — the
+      // exact "write path that can exceed its nominal cap" the review found.
+      if (this.entries.length > MAX_STATUS_ENTRIES) {
+        this.entries.length = MAX_STATUS_ENTRIES;
+      }
       this.persist();
       void state?.update(RUNNING_OPERATIONS_STATE_KEY, []);
     }
@@ -212,8 +240,9 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   }
 
   /**
-   * Add a new status entry to the surface.
-   * Entries persist indefinitely (no retention cap); the user clears them via Clear All.
+   * Add a new status entry to the surface. Bounded to MAX_STATUS_ENTRIES
+   * (1.0.0 gate A4) — the oldest entries drop off once the cap is reached;
+   * the user can still clear them early via Clear All.
    */
   addEntry(
     message: string,
@@ -235,8 +264,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       actionCommand,
     };
 
-    // Insert newest first
+    // Insert newest first, then bound to MAX_STATUS_ENTRIES (1.0.0 gate A4)
+    // by dropping the OLDEST overflow rather than letting the array grow
+    // without limit.
     this.entries.unshift(entry);
+    if (this.entries.length > MAX_STATUS_ENTRIES) {
+      this.entries.length = MAX_STATUS_ENTRIES;
+    }
 
     this.persist();
     this.refresh();

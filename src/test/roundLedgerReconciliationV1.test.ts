@@ -484,6 +484,121 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
       fsBridge.restore();
     }
   });
+
+  void it("does NOT close an identity-less row within the just-opened grace window, even with every other liveness signal false (2026-09-06 review follow-up, architectural blocker de9851ef…-0: durable cross-window liveness when the round-lease write itself failed)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const openedAt = "2026-03-01T00:00:00.000Z";
+      const { folderPath, folderUri } = makeTaskFolder("orphan_grace_protected", [
+        {
+          roundId: "no-lease-just-opened",
+          attemptIds: [],
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: openedAt,
+          state: "open",
+        },
+      ]);
+
+      // Every signal a lease-write failure would leave unset: no operation,
+      // no scheduling intent, no round-lease entry for this round at all —
+      // simulating `claimReviewAttemptWithLiveLeaseV1` proceeding after
+      // `markRoundLiveV1` returned `false`. Only 5 minutes have elapsed since
+      // the row opened — well within the 90-minute grace.
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: [],
+        now: Date.parse(openedAt) + 5 * 60 * 1000,
+      });
+      assert.deepEqual(result.closed, []);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "no-lease-just-opened")?.state, "open");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes an identity-less row with no liveness signal once the just-opened grace window has elapsed (grace protects, it does not exempt forever)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const openedAt = "2026-03-01T00:00:00.000Z";
+      const { folderPath, folderUri } = makeTaskFolder("orphan_grace_expired", [
+        {
+          roundId: "no-lease-grace-expired",
+          attemptIds: [],
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: openedAt,
+          state: "open",
+        },
+      ]);
+
+      // 91 minutes elapsed — one minute past the 90-minute grace (the same
+      // STALE_DISPATCH_GRACE_MS margin the rest of A1 uses), with no signal
+      // ever having appeared. This is the genuinely-dead case: a round that
+      // legitimately started here could never still be running.
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: [],
+        now: Date.parse(openedAt) + 91 * 60 * 1000,
+      });
+      assert.deepEqual(result.closed, ["no-lease-grace-expired"]);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "no-lease-grace-expired")?.state, "interrupted");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("the just-opened grace protects an operationId-carrying row too, before the coordinator has had a chance to attach an operation the caller's registries can see", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const openedAt = "2026-03-01T00:00:00.000Z";
+      const { folderPath, folderUri } = makeTaskFolder("orphan_grace_protected_with_operation_id", [
+        {
+          roundId: "manual-review-just-opened",
+          attemptIds: ["manual-review-just-opened"],
+          operationId: "op-not-yet-visible-anywhere",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: openedAt,
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: [],
+        now: Date.parse(openedAt) + 1000,
+      });
+      assert.deepEqual(result.closed, []);
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "manual-review-just-opened")?.state, "open");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
 });
 
 void describe("repairMissingRoundOutcomeMessagesV1 (Part 4 step 14, pass (b))", () => {

@@ -251,7 +251,7 @@ import {
 } from "../types/taskProgress";
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { appendRoundOutcome, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
+import { appendRoundOutcome, pauseTaskWithReason, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
@@ -370,6 +370,41 @@ export interface TerminalizeRoundOptionsV1 {
    * rather than needing a second, separately-racing transaction).
    */
   readonly postTerminalizePatch?: (current: TaskProgress, entry: RoundLedgerEntryV1) => TaskProgress;
+  /**
+   * A1 watchdog generic route (completion blocker
+   * `de9851ef-f5bb-41ed-ac18-f50cafefc245-1`, resolved by folding this into
+   * `terminalizeRoundV1` itself rather than a second exported authority): the
+   * "no round is running, but the task's status must still move" case. Tried
+   * ONLY when `id` is `undefined`, or resolution (including
+   * `fallbackToAnyLiveRow`) finds no LIVE row and no `synthesizeIfMissing`
+   * recovers one — i.e. exactly the cases that would otherwise return
+   * `notFound`/`alreadyTerminal`/`writeFailed`. Fabricating a
+   * `RoundLedgerEntryV1` for a round that never ran remains rejected (it would
+   * render a false `"_Ended: … — interrupted …"` into chat and break the "one
+   * entry per real round" invariant); this option instead lets the SAME sole
+   * exported function move `TaskProgress` off `active` without touching
+   * `roundLedger` at all, so a caller with nothing to terminalize never needs
+   * a second transition authority. `isStillImpossible` is re-evaluated inside
+   * `patch`'s own transform against FRESH state (never the caller's snapshot),
+   * mirroring the re-check every other branch of this function already
+   * applies to its own live-row lookup.
+   */
+  readonly whenNoLiveRow?: {
+    readonly reason: string;
+    /** Cleared in the SAME write as the pause, when this transition is
+     * closing out an unrecoverable `implRecovery` record — without this,
+     * resuming the task would reproduce the identical impossible state
+     * instantly. */
+    readonly clearImplRecovery: boolean;
+    readonly isStillImpossible: (current: TaskProgress) => boolean;
+    /** Injectable durable write primitive for this branch, matching
+     * `SchedulerProgressStore.patch`'s signature — real disk in production,
+     * swappable in tests. Defaults to `patchTaskProgressStrictV1`. */
+    readonly patch?: (
+      folder: vscode.Uri,
+      transform: (current: TaskProgress) => TaskProgress
+    ) => Promise<TaskProgress | undefined>;
+  };
 }
 
 export type TerminalizeRoundResultV1 =
@@ -384,6 +419,32 @@ export type TerminalizeRoundResultV1 =
       readonly progress?: TaskProgress;
     }
   | { readonly ok: false; readonly reason: "notFound" | "writeFailed" };
+
+/**
+ * The wider result a caller sees only when it supplies `whenNoLiveRow` (kept
+ * as a distinct type, rather than folded into `TerminalizeRoundResultV1`
+ * itself, purely so the many existing callers that never supply
+ * `whenNoLiveRow` keep narrowing `result.ok` straight to `alreadyTerminal`/
+ * `entry` exactly as before — see the overloads on `terminalizeRoundV1`
+ * below). Functionally this and `TerminalizeRoundResultV1` describe the
+ * SAME single function's outcomes; the split exists only to avoid a
+ * `noLiveRow` case that could never actually occur polluting every other
+ * call site's type.
+ */
+export type TerminalizeRoundNoLiveRowResultV1 =
+  | TerminalizeRoundResultV1
+  | {
+      /** The `whenNoLiveRow` branch ran: no round was terminalized (nothing
+       * touched `roundLedger`), only `TaskProgress`'s own status possibly
+       * moved. */
+      readonly ok: true;
+      readonly noLiveRow: true;
+      /** True only when THIS call's own write actually applied the pause —
+       * false when the predicate no longer held against fresh state (already
+       * resolved by a racing window, or by the user resuming by hand). */
+      readonly transitioned: boolean;
+      readonly progress: TaskProgress | undefined;
+    };
 
 /** The `_Ended: …_` line rendered into the chat transcript for a
  * terminalized round — Part 9 (step 25) owns the FULL rendering contract for
@@ -442,17 +503,76 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
 }
 
 /**
+ * Fold `whenNoLiveRow` into a real write when supplied — the watchdog's "no
+ * round is running, but the task's status must still move" case — or report
+ * `notFound` unchanged when it is not. Kept as a private helper so
+ * `terminalizeRoundV1` itself, not a second export, is the only place a
+ * caller reaches this transition from.
+ */
+async function runWhenNoLiveRowV1(
+  taskFolderUri: vscode.Uri,
+  whenNoLiveRow: NonNullable<TerminalizeRoundOptionsV1["whenNoLiveRow"]>
+): Promise<TerminalizeRoundNoLiveRowResultV1> {
+  const patch = whenNoLiveRow.patch ?? patchTaskProgressStrictV1;
+  let transitioned = false;
+  const progress = await patch(taskFolderUri, (current) => {
+    if (!whenNoLiveRow.isStillImpossible(current)) {
+      return current;
+    }
+    transitioned = true;
+    const cleared = whenNoLiveRow.clearImplRecovery ? { ...current, implRecovery: undefined } : current;
+    return pauseTaskWithReason(cleared, whenNoLiveRow.reason);
+  });
+  return { ok: true, noLiveRow: true, transitioned, progress };
+}
+
+/**
  * Resolve `id` against `taskFolderUri`'s current `roundLedger`, set the
  * terminal `state`/`endedAt`/`outcome` (and optional `roundOutcomes`
  * classification) in one transaction, then best-effort append the chat
  * outcome message. See this module's doc comment for the full contract.
+ *
+ * `id` is `undefined` for a caller that has no round to resolve at all — the
+ * A1 watchdog's generic route, which by construction has no open round-ledger
+ * row (see `whenNoLiveRow`'s own doc comment on `TerminalizeRoundOptionsV1`).
+ * That case, and every other path that would otherwise return
+ * `notFound`/`alreadyTerminal`/`writeFailed`, falls through to
+ * `options.whenNoLiveRow` when supplied — so this one exported function
+ * remains the sole entry point for ending a task's active round-based state,
+ * whether or not a round actually ran.
+ *
+ * Overloaded purely for return-type precision: a caller that never supplies
+ * `whenNoLiveRow` (every existing call site) keeps the narrower
+ * `TerminalizeRoundResultV1` it always had, so none of them need updating for
+ * a `noLiveRow` outcome that can never occur for them; a caller that DOES
+ * supply it (the A1 watchdog) sees the wider `TerminalizeRoundNoLiveRowResultV1`.
+ * Both overloads share one implementation below.
  */
-export async function terminalizeRoundV1(
+export function terminalizeRoundV1(
   id: string,
   state: RoundLedgerTerminalStateV1,
   outcome: RoundLedgerOutcomeV1 | undefined,
+  options: TerminalizeRoundOptionsV1 & { whenNoLiveRow?: undefined }
+): Promise<TerminalizeRoundResultV1>;
+export function terminalizeRoundV1(
+  id: string | undefined,
+  state: RoundLedgerTerminalStateV1,
+  outcome: RoundLedgerOutcomeV1 | undefined,
+  options: TerminalizeRoundOptionsV1 & { whenNoLiveRow: NonNullable<TerminalizeRoundOptionsV1["whenNoLiveRow"]> }
+): Promise<TerminalizeRoundNoLiveRowResultV1>;
+export async function terminalizeRoundV1(
+  id: string | undefined,
+  state: RoundLedgerTerminalStateV1,
+  outcome: RoundLedgerOutcomeV1 | undefined,
   options: TerminalizeRoundOptionsV1
-): Promise<TerminalizeRoundResultV1> {
+): Promise<TerminalizeRoundNoLiveRowResultV1> {
+  if (id === undefined) {
+    if (options.whenNoLiveRow) {
+      return runWhenNoLiveRowV1(options.taskFolderUri, options.whenNoLiveRow);
+    }
+    return { ok: false, reason: "notFound" };
+  }
+
   let resultKind: "notFound" | "alreadyTerminal" | "terminalized" = "notFound";
   let finalEntry: RoundLedgerEntryV1 | undefined;
 
@@ -535,15 +655,24 @@ export async function terminalizeRoundV1(
   });
 
   if (resultKind === "notFound") {
+    if (options.whenNoLiveRow) {
+      return runWhenNoLiveRowV1(options.taskFolderUri, options.whenNoLiveRow);
+    }
     return { ok: false, reason: "notFound" };
   }
   if (!patched) {
+    if (options.whenNoLiveRow) {
+      return runWhenNoLiveRowV1(options.taskFolderUri, options.whenNoLiveRow);
+    }
     return { ok: false, reason: "writeFailed" };
   }
   if (resultKind === "alreadyTerminal") {
     console.warn(
       `terminalizeRoundV1: round "${id}" is already terminal (state=${finalEntry?.state}); no-op`
     );
+    if (options.whenNoLiveRow) {
+      return runWhenNoLiveRowV1(options.taskFolderUri, options.whenNoLiveRow);
+    }
     return { ok: true, alreadyTerminal: true, entry: finalEntry as RoundLedgerEntryV1 };
   }
 
@@ -574,6 +703,17 @@ export async function terminalizeRoundV1(
 
   return { ok: true, alreadyTerminal: false, entry, progress: patched };
 }
+
+// A1 watchdog GENERIC route (completion blocker
+// `de9851ef-f5bb-41ed-ac18-f50cafefc245-1`, resolved 2026-09-06 by removing
+// the second exported authority this comment used to describe
+// (`pauseTaskWithNoLiveRoundV1`) in favor of folding the same "confirm no
+// round is running, then move the task's status anyway" transition directly
+// into `terminalizeRoundV1` via its `whenNoLiveRow` option — see that
+// option's own doc comment above and `runWhenNoLiveRowV1` below. This keeps
+// the module's declared invariant true without qualification: `terminalizeRoundV1`
+// is the ONLY exported function that ends a task's active round-based state,
+// whether or not a round actually ran to terminalize.
 
 /**
  * Best-effort, coarse classification of a round-ledger row's `mode` from the

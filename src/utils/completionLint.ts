@@ -16,9 +16,11 @@ import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1
 import { ReviewBlocker } from "./reviewReadiness";
 import { scopeToLatestChecklistV1, unescapeChecklistItemTextV1 } from "./implementationChecklist";
 import {
+  computePublishStatusLineTextV1,
   ensureVerificationHeadingV1,
   importLegacyPublishChecksIfAbsentV1,
   invalidatePublishChecksFreshnessStamp,
+  mergePublishStatusLineSection,
   withPublishChecksReportLockV1,
   writeFileAtomicV1,
 } from "./publishChecksFreshness";
@@ -2076,15 +2078,36 @@ export function buildVerifiedChecksSection(
  * reviewer would file it under. `origin: "mechanical"` distinguishes this
  * from a blocker a reviewer actually raised in prose, in the durable record
  * (`ReviewBlockerIdentity.origin`).
+ *
+ * 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
+ * description used to carry only the command and exit code — "which file,
+ * which assertion, and the provider's own output" were on `check.output` all
+ * along but never made it into the blocker text itself, so every downstream
+ * consumer that only has `ReviewBlocker.description` to work with (the
+ * escalation cards in reviewEscalation.ts) could not show them no matter how
+ * the card was built. A short, bounded excerpt of the check's own output
+ * (the file/assertion/failure detail a reader actually needs) is appended
+ * here so the evidence travels with the blocker instead of being dropped at
+ * the point of synthesis.
  */
+const MECHANICAL_BLOCKER_OUTPUT_EXCERPT_MAX_CHARS = 400;
+
 export function synthesizeMechanicalBlockers(result: CompletionLintResult): ReviewBlocker[] {
   const unquarantinedFailures = result.failedChecks.filter((check) => !isQuarantinedCheckV1(result, check));
-  return unquarantinedFailures.map((check) => ({
-    category: "completion",
-    resolver: "task-fixable",
-    description: `\`${check.command}\` failed (exit ${check.exitCode}) — generated mechanically from Verified Checks`,
-    origin: "mechanical",
-  }));
+  return unquarantinedFailures.map((check) => {
+    const excerpt = truncateCheckOutput(
+      check.output.trim(),
+      MECHANICAL_BLOCKER_OUTPUT_EXCERPT_MAX_CHARS
+    ).trim();
+    const evidenceSuffix = excerpt.length > 0 ? ` — output:\n\`\`\`\n${excerpt}\n\`\`\`` : "";
+    return {
+      category: "completion",
+      resolver: "task-fixable",
+      description:
+        `\`${check.command}\` failed (exit ${check.exitCode}) — generated mechanically from Verified Checks${evidenceSuffix}`,
+      origin: "mechanical",
+    };
+  });
 }
 
 /**
@@ -2162,6 +2185,11 @@ export async function upsertCompletionChecksReportV1(
     // Scope Check (or other section this call doesn't itself produce).
     existing = await importLegacyPublishChecksIfAbsentV1(taskFolderUri, existing);
     existing = ensureVerificationHeadingV1(existing);
+    // 1.0.0 gate C1: the top-of-file status line must track what actually
+    // happened, not stay frozen at "Not yet reviewed" underneath passing
+    // results. A no-op once a real AI review has landed — see
+    // mergePublishStatusLineSection's doc comment.
+    existing = mergePublishStatusLineSection(existing, computePublishStatusLineTextV1(result));
 
     const section = renderCompletionChecksSection(result, override);
     const merged = mergeCompletionChecksSection(existing, section);

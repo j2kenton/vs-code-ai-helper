@@ -47,6 +47,7 @@ import {
   setPendingAutomationRoundIntentV1,
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -61,6 +62,7 @@ import { deactivateNotificationRouter, initNotificationRouter } from "../utils/n
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
+import { reconcileOrphanedRoundLedgerRowsV1 } from "../utils/roundLedgerReconciliationV1";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-"));
 cp.execFileSync("git", ["init", "-q"], { cwd: REAL_ROOT, windowsHide: true });
@@ -572,6 +574,162 @@ void describe("terminalizeRoundV1 (Part 4 step 12/13/47)", () => {
 
       const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
       assert.equal(raw.taskMdSizeBandAnnounced, undefined);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+// A1's watchdog generic route (completion blocker de9851ef…-1): the
+// `whenNoLiveRow` option folded directly into `terminalizeRoundV1` for a
+// transition that has no live round to terminalize — resolving the review's
+// objection to a separately-exported second transition authority by making
+// this the SAME sole function every other call site here already uses.
+// Verified in isolation here — the real production call site
+// (`scheduleTaskResume.ts`'s `closeStalledTaskThroughLedgerV1`) is covered
+// end to end by `scheduleTaskResume.test.ts`'s watchdog tests.
+void describe("terminalizeRoundV1's whenNoLiveRow option (A1 watchdog generic route, folded into the sole terminalization path)", () => {
+  void it("pauses the task, clears implRecovery when requested, reports transitioned:true, and never writes a roundLedger entry", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "pause_no_live_round_basic");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "pause_no_live_round_basic",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+        implRecovery: {
+          sourceAttemptId: "x",
+          reason: "the continuation was dispatched but never finalized",
+          trigger: "roundIncomplete",
+          mode: "unconstrained",
+          dispatch: "dispatched",
+          at: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const result = await terminalizeRoundV1(undefined, "interrupted", undefined, {
+        taskFolderUri: folderUri,
+        whenNoLiveRow: {
+          reason: "test pause reason",
+          clearImplRecovery: true,
+          isStillImpossible: () => true,
+          patch: patchTaskProgressStrictV1,
+        },
+      });
+      assert.equal(result.ok, true);
+      if (!result.ok || !("noLiveRow" in result)) throw new Error("expected the whenNoLiveRow branch");
+      assert.equal(result.transitioned, true);
+      assert.equal(result.progress?.status, "paused");
+      assert.equal(result.progress?.pausedReason, "test pause reason");
+      assert.equal(result.progress?.implRecovery, undefined);
+      assert.equal(result.progress?.roundLedger, undefined, "must never write a roundLedger entry");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("is a no-op (transitioned:false, status unchanged) when the predicate no longer holds against fresh state", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "pause_no_live_round_resolved");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "pause_no_live_round_resolved",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const result = await terminalizeRoundV1(undefined, "interrupted", undefined, {
+        taskFolderUri: folderUri,
+        whenNoLiveRow: {
+          reason: "test pause reason",
+          clearImplRecovery: false,
+          // Simulates a concurrent resolution (another window's reclaim, or
+          // the user resuming by hand) between the caller's snapshot and
+          // this write's own fresh read.
+          isStillImpossible: () => false,
+          patch: patchTaskProgressStrictV1,
+        },
+      });
+      assert.equal(result.ok, true);
+      if (!result.ok || !("noLiveRow" in result)) throw new Error("expected the whenNoLiveRow branch");
+      assert.equal(result.transitioned, false);
+      assert.equal(result.progress?.status, "active");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("falls through to whenNoLiveRow when a supplied id resolves to no live row (mirrors the recovery route's alreadyTerminal/notFound cases)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "pause_no_live_round_fallthrough");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "pause_no_live_round_fallthrough",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const result = await terminalizeRoundV1(
+        "no-such-round-id",
+        "interrupted",
+        undefined,
+        {
+          taskFolderUri: folderUri,
+          whenNoLiveRow: {
+            reason: "test pause reason",
+            clearImplRecovery: false,
+            isStillImpossible: () => true,
+            patch: patchTaskProgressStrictV1,
+          },
+        }
+      );
+      assert.equal(result.ok, true);
+      if (!result.ok || !("noLiveRow" in result)) throw new Error("expected the whenNoLiveRow branch");
+      assert.equal(result.transitioned, true);
+      assert.equal(result.progress?.status, "paused");
+      assert.equal(result.progress?.roundLedger, undefined, "must never write a roundLedger entry");
     } finally {
       wsStub.restore();
       fsBridge.restore();
@@ -1543,6 +1701,83 @@ void describe("claimReviewAttemptWithLiveLeaseV1 (A1 architectural blocker, 2026
       assert.ok(
         warnings.some((args) => String(args[0]).includes("could not establish a durable cross-window liveness lease")),
         "the failed lease write must be logged, not silent"
+      );
+    } finally {
+      console.warn = realWarn;
+      wsStub.restore();
+      fsBridge.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // 2026-09-06 review follow-up (same blocker, narrowed a fourth time): the
+  // tests above only proved the lease-write failure is now OBSERVABLE
+  // (logged). This proves the actual safety property the review demanded —
+  // that a row opened this way is still protected from a concurrent
+  // reconciliation sweep in ANOTHER window, which sees none of this window's
+  // process-local state and has no lease to check either — end to end,
+  // through the real reconciliation predicate rather than by construction.
+  void it("a row opened without a lease is still protected from orphan-closure by reconciliation's just-opened grace, end to end", async () => {
+    const memento = {
+      get<T>(_key: string, defaultValue: T): T {
+        return defaultValue;
+      },
+      update(): Promise<void> {
+        return Promise.reject(new Error("simulated workspaceState failure"));
+      },
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const realWarn = console.warn;
+    console.warn = (): void => {};
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_lease_failed_reconciled");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_lease_failed_reconciled",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const claimed = await claimReviewAttemptWithLiveLeaseV1(
+        folderUri,
+        "lease-failed-reconciled-attempt",
+        "impl-high-review"
+      );
+      assert.equal(claimed?.reviewAttemptId, "lease-failed-reconciled-attempt");
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), [], "no phantom lease may be recorded");
+
+      // Simulate a DIFFERENT window's reconciliation sweep: no in-process
+      // operation, no scheduling intent, no round-lease entry for this round
+      // (the failure above means none exists), a few minutes after open.
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+        liveRoundLeaseIds: listLiveRoundLeaseIdsV1(),
+        now: Date.now() + 5 * 60 * 1000,
+      });
+      assert.deepEqual(result.closed, [], "a genuinely just-opened round must not be closed as orphaned");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(
+        raw.roundLedger?.find((r) => r.roundId === "lease-failed-reconciled-attempt")?.state,
+        "open",
+        "the row must survive a same-window-visible reconciliation sweep despite no lease"
       );
     } finally {
       console.warn = realWarn;

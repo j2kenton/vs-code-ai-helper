@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
 import * as path from "path";
-import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { isReviewStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { describeReviewStageScoreV1 } from "./taskTreeProvider";
+import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
 import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
@@ -38,6 +40,7 @@ import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
 import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import {
   deriveOwedContinuationRecordV1,
@@ -309,6 +312,27 @@ export interface StructuredChatQuestion extends ChatTarget {
 function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined): boolean {
   if (!a || !b) return a === b;
   return a.canonicalId === b.canonicalId && a.taskFolderPath === b.taskFolderPath;
+}
+
+/**
+ * Full-identity match for `render()`'s own async-boundary staleness guards.
+ * `sameIdentity` (task+folder only) is right for callers deciding whether to
+ * re-render or refocus at all — a stage switch within the same task there is
+ * harmless because a subsequent `render()` call reads `this.target` fresh.
+ * `render()` itself is different: "Stage chats are fully isolated" (its own
+ * opening comment), and it computes stage-specific data (transcript, the
+ * implementation percentage vs. the review score, scheduling posture) against
+ * a `target` captured once at the top, across several `await`s. Guarding
+ * those awaits with task-level `sameIdentity` alone let a same-task stage
+ * switch slip through undetected, so a stale stage's label/score could still
+ * be appended and published under the newly-selected stage's identity
+ * (2026-09-06 review, completion blocker). `kind` is compared too since the
+ * global assistant and a stage chat can share no canonicalId/folder in
+ * practice but the comparison should not rely on that.
+ */
+function sameRenderTarget(a: ChatTarget | undefined, b: ChatTarget | undefined): boolean {
+  if (!a || !b) return a === b;
+  return sameIdentity(a, b) && a.stage === b.stage && (a.kind ?? "stage") === (b.kind ?? "stage");
 }
 
 /**
@@ -1919,7 +1943,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           : "Chat history could not be loaded. Check the Notifications view for details.";
       }
     }
-    if (!sameIdentity(target, this.target)) return;
+    if (!sameRenderTarget(target, this.target)) return;
     // Pending `WorkflowDecisionV1` records for this exact task/stage (the
     // global assistant never carries decisions — they are always stage-
     // scoped). Read fresh on every render so a decision resolved from
@@ -2015,6 +2039,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } else if (target) {
       const taskLabel = target.taskName ?? target.taskFolderPath.replace(/\\/g, "/").split("/").pop() ?? "task";
       label = `${formatTaskNameForDisplay(taskLabel)} — ${STAGE_DISPLAY_NAMES[target.stage]} stage chat`;
+    }
+    // Implementation row's live checklist percentage, review row's score
+    // (A3 Part 3 / Step 12): the chat header is the third of the three
+    // surfaces the plan names for these numbers (alongside the task tree and
+    // the status bar) — implementation owns the percentage, review owns the
+    // score, and neither stage's chat shows the other's number. Both reads
+    // are async, so a target switch mid-read must drop the stale append
+    // rather than tagging one task's number onto another's (or the global
+    // assistant's) header — the same rule the scheduling-posture read below
+    // is already held to.
+    //
+    // 2026-09-06 review, completion blocker: this previously omitted the
+    // review score entirely ("that stays on the review row alone"), which
+    // read the "neither row shows the other's number" contract as forbidding
+    // the SCORE from appearing here at all, rather than only forbidding the
+    // PERCENTAGE from appearing on a review stage's chat. A review-stage
+    // chat header showed no number whatsoever — the same "is it working, and
+    // how far along" question the task tree already answers for that stage.
+    if (target && target.kind !== "global" && target.stage === "impl") {
+      const implCounted = await readEffectivePlanChecklistProgressV1(
+        vscode.Uri.file(target.taskFolderPath)
+      ).catch(() => undefined);
+      if (!sameRenderTarget(target, this.target)) return;
+      if (implCounted) {
+        label = `${label} — ${formatChecklistPercentV1(implCounted.settled, implCounted.total)}%`;
+      }
+    } else if (target && target.kind !== "global" && isReviewStage(target.stage)) {
+      const reviewScoreLabel = await describeReviewStageScoreV1(
+        target.canonicalId,
+        target.stage,
+        vscode.Uri.file(target.taskFolderPath),
+        () => resolveHeadCommitSha(target.taskFolderPath)
+      ).catch(() => undefined);
+      if (!sameRenderTarget(target, this.target)) return;
+      if (reviewScoreLabel) {
+        label = `${label} — ${reviewScoreLabel}`;
+      }
     }
     // Attribution comments belong in generated artifact files, not in a
     // conversation — strip them from every displayed message (including
@@ -2167,7 +2228,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // this stale render rather than painting one task's scheduling posture
       // into another's (or the global assistant's) header — same rule the
       // transcript read above is already held to.
-      if (!sameIdentity(target, this.target)) return;
+      if (!sameRenderTarget(target, this.target)) return;
     }
     // A small badge on the view itself draws the eye even when this panel is
     // present but not the currently focused element, mirroring how other

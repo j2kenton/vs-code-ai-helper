@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { parseReadiness } from "./reviewReadiness";
 
 /**
  * Freshness stamp for `publish-review.md` (plan PART 2, step 6; plan item 17,
@@ -119,6 +120,117 @@ export function ensureVerificationHeadingV1(existing: string): string {
     return existing;
   }
   return mergeVerificationHeadingSection(existing, renderVerificationHeading());
+}
+
+// ---------------------------------------------------------------------------
+// Publish-stage status line (1.0.0 gate C1): the one line at the top of
+// publish-review.md telling a user what to do next. Before this, the file was
+// seeded once with a static "Not yet reviewed. Run Publish Checks..." stub
+// (renderUnreviewedPublishStub, below) and NOTHING ever updated it — every
+// later Completion Checks / Scope Check run merged its own managed section in
+// underneath, but the original instruction sat above the passing results
+// verbatim, unchanged. Observed live (jester, 2026-08-29): a user ran Publish
+// Checks, saw thirteen green commands, and read "Not yet reviewed. Run
+// Publish Checks" directly above them — reasonably reading it as "that
+// failed, try again." Wrapping the line in its own managed markers lets every
+// checks run replace it with the truth instead of leaving the first-ever
+// message frozen in place.
+// ---------------------------------------------------------------------------
+
+export const PUBLISH_STATUS_LINE_START = "<!-- publish-status-line:start -->";
+export const PUBLISH_STATUS_LINE_END = "<!-- publish-status-line:end -->";
+
+/** The exact prose {@link renderUnreviewedPublishStub} wrote before this line
+ * carried its own markers — recognized so a task whose publish-review.md
+ * predates this fix still gets it replaced by the next checks run, instead of
+ * being left frozen forever alongside every other task's already-migrated
+ * line. @internal exported for testing */
+export const LEGACY_UNMARKED_STATUS_LINE_V1 =
+  "**Not yet reviewed.** Run Publish Checks, then request a Publish review.";
+
+/** @internal exported for testing */
+export function renderPublishStatusLineV1(text: string): string {
+  return [PUBLISH_STATUS_LINE_START, text, PUBLISH_STATUS_LINE_END].join("\n");
+}
+
+/**
+ * The status text a Completion Checks run should show, computed from the
+ * SAME pass/fail verdict the Completion Checks section and reviewer both use
+ * (`passedModuloKnownFlakes`, falling back to `passed` — a quarantined known
+ * flake is not a reason to tell the user their checks failed).
+ * @internal exported for testing
+ */
+export function computePublishStatusLineTextV1(result: {
+  readonly passed: boolean;
+  readonly passedModuloKnownFlakes?: boolean;
+  readonly failedChecks: ReadonlyArray<{ readonly command: string; readonly exitCode: number }>;
+  readonly knownFlakeFailures?: ReadonlyArray<{ readonly command: string; readonly exitCode: number }>;
+}): string {
+  const effectivelyPassed = result.passedModuloKnownFlakes ?? result.passed;
+  if (effectivelyPassed) {
+    return "**Publish Checks passed.** Request a Publish review to finish.";
+  }
+  const unquarantinedFailureCount = result.failedChecks.filter(
+    (check) =>
+      !(result.knownFlakeFailures ?? []).some(
+        (flake) => flake.command === check.command && flake.exitCode === check.exitCode
+      )
+  ).length;
+  const noun = unquarantinedFailureCount === 1 ? "check" : "checks";
+  return (
+    `**Publish Checks failed** (${unquarantinedFailureCount} ${noun} red). ` +
+    "Fix the failures, then run Publish Checks again."
+  );
+}
+
+/** True once a real AI Publish review has been written to `content` — that
+ * review's own prose (starting with `Readiness: N/10`) is the authoritative
+ * status from that point on, and this module's pre-review status line must
+ * never be inserted into, or update, a file in that state. */
+function publishReviewHasLandedV1(content: string): boolean {
+  return parseReadiness(content).score !== null;
+}
+
+/**
+ * Upsert the managed status-line section, replacing whichever prior form is
+ * present (its own markers, or the pre-fix unmarked legacy line) in place, or
+ * inserting it right after the `# Publish Review` title when neither is
+ * found yet. A no-op once a real AI review has landed (see
+ * {@link publishReviewHasLandedV1}) — the review's own verdict speaks for
+ * itself and this line must never be grafted into it.
+ * @internal exported for testing
+ */
+export function mergePublishStatusLineSection(existing: string, text: string): string {
+  if (publishReviewHasLandedV1(existing)) {
+    return existing;
+  }
+  const section = renderPublishStatusLineV1(text);
+  const startIdx = existing.indexOf(PUBLISH_STATUS_LINE_START);
+  const endIdx = existing.indexOf(PUBLISH_STATUS_LINE_END);
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    return (
+      existing.slice(0, startIdx) + section + existing.slice(endIdx + PUBLISH_STATUS_LINE_END.length)
+    );
+  }
+  const legacyIdx = existing.indexOf(LEGACY_UNMARKED_STATUS_LINE_V1);
+  if (legacyIdx !== -1) {
+    return (
+      existing.slice(0, legacyIdx) +
+      section +
+      existing.slice(legacyIdx + LEGACY_UNMARKED_STATUS_LINE_V1.length)
+    );
+  }
+  const lines = existing.split("\n");
+  const titleIdx = lines.findIndex((line) => line.trim() === "# Publish Review");
+  if (titleIdx === -1) {
+    return existing.trim().length > 0 ? `${section}\n\n${existing.trim()}\n` : `${section}\n`;
+  }
+  let insertAt = titleIdx + 1;
+  while (insertAt < lines.length && lines[insertAt]!.trim() === "") {
+    insertAt++;
+  }
+  lines.splice(insertAt, 0, section, "");
+  return lines.join("\n");
 }
 
 function readStampField(block: string, name: string): string | undefined {
@@ -532,12 +644,17 @@ export async function readPublishChecksFreshnessStampV1(
 
 /** Placeholder body for a Publish stage that has no review yet and no legacy
  * checks to import — makes "not created yet" unreachable (plan item 17, step
- * 20(a)) without asserting anything about readiness. */
+ * 20(a)) without asserting anything about readiness. Its status line carries
+ * this module's own markers from the moment the file is created, so the very
+ * first Completion Checks run can find and replace it (see
+ * `mergePublishStatusLineSection`) instead of leaving it frozen. */
 function renderUnreviewedPublishStub(): string {
   return [
     "# Publish Review",
     "",
-    "**Not yet reviewed.** Run Publish Checks, then request a Publish review.",
+    renderPublishStatusLineV1(
+      "**Not yet reviewed.** Run Publish Checks, then request a Publish review."
+    ),
     "",
   ].join("\n");
 }

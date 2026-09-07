@@ -752,6 +752,11 @@
           "group": "inline@20"
         },
         {
+          "command": "vs-code-ai-helper.runReviewWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "inline@25"
+        },
+        {
           "command": "vs-code-ai-helper.viewStageChanges",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@30"

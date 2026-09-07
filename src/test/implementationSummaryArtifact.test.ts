@@ -556,6 +556,177 @@ void describe("detectChecklistItemSetMutationV1 — the checklist-mutation guard
     const after = ["## Plan", "", "- [ ] Add the resolver", "- [ ]  Wire the decoder  "].join("\n");
     assert.equal(detectChecklistItemSetMutationV1(BEFORE, after), undefined);
   });
+
+  void it("does not flag an indented nested child added under an existing top-level item (1.0.0 gate A3, Step 13)", () => {
+    const after = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: the resolver also needs a null-input guard",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    assert.equal(
+      detectChecklistItemSetMutationV1(BEFORE, after),
+      undefined,
+      "a nested discovered-sub-work child is a permitted addition, outside the counted top-level set"
+    );
+  });
+
+  void it("still flags a removed nested child's PARENT if the parent itself is dropped", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: needs a null-input guard",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    const after = ["## Plan", "", "- [ ] Wire the decoder"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation);
+    assert.equal(mutation.kind, "removed");
+    assert.deepEqual(mutation.removedItems, ["Add the resolver"]);
+  });
+
+  // Review finding, 2026-09-06: the guard previously filtered nested items
+  // out of BOTH snapshots unconditionally, so a round could silently delete
+  // (or reword) an OPEN discovered child and tick its parent — the child's
+  // disappearance was invisible to the detector even though the parent still
+  // existed. These four cases lock in the fix.
+  void it("flags deletion of an OPEN nested child whose parent is kept and ticked", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: needs a null-input guard",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    const after = ["## Plan", "", "- [x] Add the resolver", "- [ ] Wire the decoder"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation, "deleting an open nested child must be flagged even though its parent survives");
+    assert.equal(mutation.kind, "removed");
+    assert.deepEqual(mutation.removedItems, ["Discovered: needs a null-input guard"]);
+  });
+
+  void it("flags rewording of an OPEN nested child under a kept parent", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: needs a null-input guard",
+    ].join("\n");
+    const after = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: needs some other guard",
+    ].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation, "rewording an open nested child's key away must be flagged");
+    assert.deepEqual(mutation.removedItems, ["Discovered: needs a null-input guard"]);
+  });
+
+  // Review finding, 2026-09-06 (second pass): an earlier revision of this
+  // guard exempted already-SETTLED children from removal detection, on the
+  // theory that dropping done bookkeeping is harmless. That let a round
+  // silently delete a COMPLETED discovered child's record — exactly the
+  // audit-trail loss this guard exists to catch. Only ADDING a nested child
+  // is the permitted exception; removing one, settled or not, is flagged.
+  void it("flags removal of an already-SETTLED (checked) nested child", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [x] Discovered: needs a null-input guard",
+    ].join("\n");
+    const after = ["## Plan", "", "- [x] Add the resolver"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation, "dropping a settled nested child's record must still be flagged");
+    assert.deepEqual(mutation.removedItems, ["Discovered: needs a null-input guard"]);
+  });
+
+  void it("flags removal of an already-SETTLED (excluded) nested child", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      `  - [ ] Discovered: not needed after all ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ].join("\n");
+    const after = ["## Plan", "", "- [x] Add the resolver"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation, "dropping an excluded nested child's record must still be flagged");
+    assert.deepEqual(mutation.removedItems, [`Discovered: not needed after all ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`]);
+  });
+
+  void it("does NOT double-flag an open nested child when its parent is also removed", () => {
+    const withChild = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      "  - [ ] Discovered: needs a null-input guard",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    const after = ["## Plan", "", "- [ ] Wire the decoder"].join("\n");
+    const mutation = detectChecklistItemSetMutationV1(withChild, after);
+    assert.ok(mutation);
+    assert.deepEqual(
+      mutation.removedItems,
+      ["Add the resolver"],
+      "the child's own removal is not reported separately once its parent's removal already covers it"
+    );
+  });
+});
+
+void describe("nested checklist children (1.0.0 gate A3, Step 13)", () => {
+  void it("excludes nested items from the fixed top-level denominator", () => {
+    const plan = [
+      "## Plan",
+      "",
+      "- [x] Add the resolver",
+      "  - [ ] Discovered: needs a null-input guard",
+      "  - [ ] Discovered: needs a unit test",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    // total counts only the 2 top-level items; the 2 nested children never
+    // move the denominator.
+    assert.deepEqual(countChecklistProgressV1(plan), {
+      total: 2,
+      checked: 0,
+      closedWithoutDoing: 0,
+      settled: 0,
+      remaining: 2,
+      excluded: 0,
+    });
+  });
+
+  void it("does not count a parent checked while an unsettled child remains open", () => {
+    const plan = [
+      "## Plan",
+      "",
+      "- [x] Add the resolver",
+      "  - [x] Discovered: needs a null-input guard",
+      "  - [ ] Discovered: needs a unit test",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    const counted = countChecklistProgressV1(plan);
+    assert.equal(counted?.total, 2);
+    assert.equal(counted?.checked, 0, "the parent is not settled while its child is still open");
+    assert.equal(counted?.remaining, 2);
+  });
+
+  void it("counts a parent checked once every nested child is settled (checked or excluded)", () => {
+    const plan = [
+      "## Plan",
+      "",
+      "- [x] Add the resolver",
+      "  - [x] Discovered: needs a null-input guard",
+      "  - [ ] Discovered: turned out unnecessary <!-- ensemble:excluded -->",
+      "- [ ] Wire the decoder",
+    ].join("\n");
+    const counted = countChecklistProgressV1(plan);
+    assert.equal(counted?.total, 2);
+    assert.equal(counted?.checked, 1, "both nested children are settled, so the parent counts as done");
+    assert.equal(counted?.remaining, 1);
+  });
 });
 
 void describe("the shape gate matches real headings, not mentions of them", () => {

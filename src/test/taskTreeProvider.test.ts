@@ -362,15 +362,26 @@ void describe("StageNode — done review stage icon", () => {
     assert.strictEqual(icon.id, "arrow-right");
   });
 
-  void it("has no status description for a done review stage — the tick icon conveys it", () => {
+  void it("shows the score as the description for a done review stage — the tick icon alone lost the number after advance (A3 Part 3 / Step 12)", () => {
     const task = makeTask("impl");
     const readiness = { label: "7/10" };
     const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
 
     assert.strictEqual(
       node.description,
-      undefined,
-      `Expected no description for a done review stage, got "${node.description}"`
+      "7/10",
+      `Expected the score as the description for a done review stage, got "${node.description}"`
+    );
+  });
+
+  void it('shows "—/10" (never reviewed), not a blank description, for a done review stage when readiness data is absent', () => {
+    const task = makeTask("impl");
+    const node = new StageNode(task, "plan-low-review", "done", undefined, undefined);
+
+    assert.strictEqual(
+      node.description,
+      "—/10",
+      `Expected "—/10" for a done review stage with no readiness, got "${node.description}"`
     );
   });
 
@@ -911,6 +922,18 @@ void describe("Icon selection in StageNode", () => {
 // policy — the same value the advance gates act on.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// A3 Part 3 / Step 12: the review row and implementation row used to compete
+// for one line ("20% · 9/10") — a percentage over a self-invented denominator
+// next to a score measuring something else entirely. They now own one number
+// each: review carries the score only (this describe block); implementation
+// carries the live checklist percentage (see "StageNode — implementation row
+// percentage" below). The tests below were rewritten from the pre-split
+// assertions (`"20% · 9/10"` etc.) to the score-only equivalents; the
+// underlying `tryReadReadiness`/`effectiveReviewProgressV1` reconciliation
+// they exercise is otherwise unchanged.
+// ---------------------------------------------------------------------------
+
 void describe("StageNode — review score and step progress", () => {
   const folderUri = vscode.Uri.file("/workspace/tasks/progress-task");
   const reviewUri = vscode.Uri.joinPath(folderUri, "review-impl-high.md");
@@ -964,7 +987,7 @@ void describe("StageNode — review score and step progress", () => {
     };
   }
 
-  void it("renders the score and the step progress in the description, with a divided tooltip", async () => {
+  void it("renders the score in the description, with no step-progress figure in the tooltip", async () => {
     const restore = installReadFileStub(new Map([[reviewUri.fsPath, reviewContent("9", "1/5")]]));
     try {
       const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
@@ -973,11 +996,13 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 1, total: 5 });
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "20% · 9/10");
+      assert.strictEqual(node.description, "9/10", "the row shows the score only");
       const tooltip = (node.tooltip as vscode.MarkdownString).value;
-      assert.ok(tooltip.includes("Review score: 9/10"), "score line leads the tooltip block");
-      assert.ok(tooltip.includes("\n\n---\n\n"), "a divider sits between score and progress");
-      assert.ok(tooltip.includes("1 of 5 steps · 4 left"));
+      // Neither row shows the other's number (A3 Part 3 / Step 12): the
+      // review's self-reported step-progress marker no longer appears
+      // anywhere on this row's surface, including its tooltip.
+      assert.ok(!tooltip.includes("Review score:"), "the score is not repeated in the tooltip");
+      assert.ok(!tooltip.includes("1 of 5 steps"), "the reviewer's own step tally does not leak into the tooltip");
     } finally {
       restore();
     }
@@ -1034,9 +1059,12 @@ void describe("StageNode — review score and step progress", () => {
       );
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "40% · 9/10");
+      assert.strictEqual(node.description, "9/10", "the row shows the score only");
       assert.ok(!String(node.description).includes("5 of 5"));
-      assert.ok((node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps · 3 left"));
+      assert.ok(
+        !(node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps"),
+        "the reconciled step count does not leak into the tooltip either"
+      );
     } finally {
       restore();
     }
@@ -1059,7 +1087,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 3, total: 5 });
 
       const node = new StageNode(makeTask("plan-high-review"), "plan-high-review", "current", planReviewUri, readiness);
-      assert.strictEqual(node.description, "60% · 8/10");
+      assert.strictEqual(node.description, "8/10", "the row shows the score only");
     } finally {
       restore();
     }
@@ -1072,6 +1100,178 @@ void describe("StageNode — review score and step progress", () => {
       assert.equal(readiness, undefined);
     } finally {
       restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A3 Part 3 / Step 26: the implementation row's live checklist percentage —
+// the counterpart the review row's score was split away from above. `impl`
+// is never a review stage, so this is a distinct code path
+// (`implementationProgress`, not `readiness`).
+// ---------------------------------------------------------------------------
+void describe("StageNode — implementation row percentage", () => {
+  void it("renders the live checklist percentage for the current impl stage", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task,
+      "impl",
+      "current",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      false,
+      undefined,
+      { complete: 4, total: 10 }
+    );
+    assert.strictEqual(node.description, "40%");
+  });
+
+  void it("renders nothing when the impl stage has no checklist yet", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined);
+    assert.strictEqual(node.description, undefined);
+  });
+
+  void it("never shows a percentage for a non-impl current stage, even if implementationProgress is somehow supplied", () => {
+    const task = makeTask("plan");
+    const node = new StageNode(
+      task,
+      "plan",
+      "current",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      false,
+      undefined,
+      { complete: 4, total: 10 }
+    );
+    assert.strictEqual(node.description, undefined, "implementationProgress is scoped to the impl stage only");
+  });
+
+  void it("shows the review score, never the implementation percentage, on a review row even if both are supplied", () => {
+    const task = makeTask("impl-high-review");
+    const readiness = { label: "7/10" };
+    const node = new StageNode(
+      task,
+      "impl-high-review",
+      "current",
+      undefined,
+      readiness,
+      false,
+      false,
+      false,
+      false,
+      undefined,
+      { complete: 4, total: 10 }
+    );
+    assert.strictEqual(node.description, "7/10", "neither row shows the other's number");
+  });
+
+  // 2026-09-06 review, completion blocker: once the impl stage advances to
+  // "done" it previously fell back to the bare tick with no percentage at
+  // all — exactly the "reads as verdict on the instant, not history" gap A3
+  // exists to close. The percentage must survive the advance.
+  void it("keeps showing the live checklist percentage after the impl stage advances to done", () => {
+    const task = makeTask("impl-high-review");
+    const node = new StageNode(
+      task,
+      "impl",
+      "done",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      false,
+      undefined,
+      { complete: 8, total: 10 }
+    );
+    assert.strictEqual(node.description, "80%", "a done impl row still shows its percentage");
+  });
+
+  void it("shows no description for a done impl row when there is no checklist to report", () => {
+    const task = makeTask("impl-high-review");
+    const node = new StageNode(task, "impl", "done", undefined, undefined, false, false, false, false, undefined, undefined);
+    assert.strictEqual(node.description, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A3 Part 3 / Step 12: "running... (previous: N/10)" — a review rerun in
+// flight must name the last known score rather than going blank. Every other
+// case — a review stage on its very first run (no prior score to name) and
+// every non-review stage — keeps the plain "running" text that predates this
+// change (see reviewInProgressStatus.test.ts's pre-existing pre-review-stage
+// coverage, which pins that text for exactly this no-readiness case).
+// ---------------------------------------------------------------------------
+void describe("StageNode — running review row shows the previous score", () => {
+  function beginStageOp(task: { folderUri: vscode.Uri }, stage: TaskStage): ReturnType<typeof taskOperations.begin> {
+    return taskOperations.begin(task.folderUri.fsPath, {
+      label: "Reviewing",
+      stage,
+      exclusive: true,
+    });
+  }
+
+  void it('shows "running... (previous: N/10)" for a review stage with a prior score', () => {
+    const task = makeTask("impl-high-review");
+    const handle = beginStageOp(task, "impl-high-review");
+    assert.ok(handle);
+    try {
+      const readiness = { label: "6/10" };
+      const node = new StageNode(task, "impl-high-review", "current", undefined, readiness);
+      assert.strictEqual(node.description, "running... (previous: 6/10)");
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+
+  void it('leaves a review stage with no prior score as plain "running" — only a real previous verdict gets its own shape', () => {
+    const task = makeTask("impl-high-review");
+    const handle = beginStageOp(task, "impl-high-review");
+    assert.ok(handle);
+    try {
+      const node = new StageNode(task, "impl-high-review", "current", undefined, undefined);
+      assert.strictEqual(node.description, "running");
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+
+  void it('leaves a running non-review stage as plain "running", unaffected by the review-row format', () => {
+    const task = makeTask("impl");
+    const handle = beginStageOp(task, "impl");
+    assert.ok(handle);
+    try {
+      const node = new StageNode(task, "impl", "current", undefined, undefined);
+      assert.strictEqual(node.description, "running");
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+
+  void it("shows the previous score while a rerun is running against an already-DONE review stage", () => {
+    // getStageNodes now computes readiness for a "done" review stage too
+    // (not only "current"), precisely so a rerun that still targets this row
+    // after the stage has advanced has a previous score to show instead of
+    // going blank. This proves the StageNode side of that: readiness passed
+    // alongside status "done" is used identically to status "current" while
+    // `isRunning` is true, since the isRunning branch is checked before the
+    // status switch.
+    const task = makeTask("impl");
+    const handle = beginStageOp(task, "impl-high-review");
+    assert.ok(handle);
+    try {
+      const readiness = { label: "5/10" };
+      const node = new StageNode(task, "impl-high-review", "done", undefined, readiness);
+      assert.strictEqual(node.description, "running... (previous: 5/10)");
+    } finally {
+      taskOperations.end(handle);
     }
   });
 });
@@ -1226,6 +1426,68 @@ void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
     } finally {
       provider.dispose();
       gitRepoInfoModule.resolveHeadCommitSha = originalResolve;
+      workspaceRecord.workspaceFolders = originalFolders;
+      restoreFs();
+    }
+  });
+
+  // 2026-09-06 review, completion blocker: a done review stage previously
+  // only read readiness while an operation targeting it was in flight, so an
+  // idle done row showed no score at all — the tick alone lost the number
+  // the instant the workflow advanced past the stage. getStageNodes must now
+  // read readiness for a done review stage unconditionally.
+  void it("shows a done review stage's score with no in-flight operation anywhere (A3 Part 3 / Step 12)", async () => {
+    const folder = vscode.Uri.file("/workspace/tasks/done-review-idle");
+    const reviewName = STAGE_ARTIFACT_FILENAMES["impl-high-review"]!;
+    const DONE_REVIEW = ["# Implementation Review", "", "Readiness: 8/10", ""].join("\n");
+    const restoreFs = installFsStubs(new Map([[vscode.Uri.joinPath(folder, reviewName).fsPath, DONE_REVIEW]]));
+
+    const workspaceRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFolders = workspaceRecord.workspaceFolders;
+    workspaceRecord.workspaceFolders = [
+      { uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 },
+    ];
+
+    const inventory = {
+      getTasks: () => [
+        {
+          taskFolderPath: folder.fsPath,
+          folderName: path.basename(folder.fsPath),
+          progress: {
+            // Current stage is past impl-high-review in STAGE_ORDER, so
+            // impl-high-review renders with status "done" — and no
+            // taskOperations entry exists for this task at all.
+            currentStage: "impl-low-review" as TaskStage,
+            status: "active",
+            taskFolder: path.basename(folder.fsPath),
+            createdAt: "2026-08-14T00:00:00.000Z",
+            updatedAt: "2026-08-14T00:00:00.000Z",
+          },
+          canonicalId: folder.fsPath,
+        },
+      ],
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    const provider = new TaskTreeProvider(inventory);
+    try {
+      const roots = await withStubbedCommands(() => provider.getChildren());
+      const taskNodes = roots.filter((n): n is TaskNode => n instanceof TaskNode);
+      assert.equal(taskNodes.length, 1);
+
+      const stages = await provider.getChildren(taskNodes[0]);
+      const reviewNode = stages.find(
+        (n): n is StageNode => n instanceof StageNode && n.stage === "impl-high-review"
+      );
+      assert.ok(reviewNode, "the done review stage still renders a StageNode");
+      assert.strictEqual(
+        reviewNode.description,
+        "8/10",
+        "a done review stage shows its score with no operation running for the task"
+      );
+    } finally {
+      provider.dispose();
       workspaceRecord.workspaceFolders = originalFolders;
       restoreFs();
     }

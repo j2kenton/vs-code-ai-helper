@@ -24,7 +24,7 @@ import {
   resolveImplementationArtifact,
 } from "../utils/implementationArtifactResolver";
 import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
-import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
+import { effectiveReviewProgressV1, readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
   parseReadiness,
@@ -637,11 +637,18 @@ export class StageNode extends vscode.TreeItem {
     public readonly stage: TaskStage,
     status: StageStatus,
     artifactUri: vscode.Uri | undefined,
-    /** Optional readiness info for review stages: the score label plus, when
-     * the review carries a usable progress marker, the checklist-reconciled
-     * step counts (see effectiveReviewProgressV1). `staleReviewedSha` is set
-     * when the review's recorded commit is no longer HEAD (review freshness —
-     * display-side only, the artifact itself is never mutated here). */
+    /** Optional readiness info for review stages: the score label — the ONLY
+     * number the review row (and its tooltip) renders, in both the
+     * "current" and "done" states (A3 Part 3 / Step 12). `progress`, when
+     * the review carries a usable progress marker, is the checklist-reconciled
+     * step count (see effectiveReviewProgressV1) — retained on this type for
+     * callers/tests that inspect `tryReadReadiness`'s raw result, but no
+     * longer rendered anywhere on this row or its tooltip: that number is
+     * `implementationProgress`'s job instead, and showing it here would
+     * violate "neither row shows the other's number".
+     * `staleReviewedSha` is set when the review's recorded commit is no
+     * longer HEAD (review freshness — display-side only, the artifact itself
+     * is never mutated here). */
     readiness?: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string },
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
@@ -651,7 +658,14 @@ export class StageNode extends vscode.TreeItem {
      * have, so the tooltip can say so before the user clicks and hits the
      * refusal — `undefined` when the stage has no declared requirement or
      * every requirement is met. */
-    missingPrerequisite?: StageArtifactRequirementV1
+    missingPrerequisite?: StageArtifactRequirementV1,
+    /** Live checklist progress for the `impl` stage ONLY (ticked/settled over
+     * the plan-final.md checklist's fixed total) — the implementation row's
+     * counterpart to `readiness` above. A3 Part 3 / Step 12 splits the two
+     * numbers that used to compete on one review row: implementation owns
+     * the percentage, review owns the score. `undefined` for every other
+     * stage, and for `impl` itself whenever the task carries no checklist. */
+    implementationProgress?: { complete: number; total: number }
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -695,11 +709,60 @@ export class StageNode extends vscode.TreeItem {
 
     if (isRunning) {
       this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
-      this.description = "running";
+      // Review rows carry the score, so a rerun in flight names the previous
+      // verdict instead of going blank until it lands — the owner-specified
+      // "running... (previous: 7/10)" shape (A3 Part 3 / Step 12). This is
+      // also the one case `readiness` is read for a DONE review stage: a
+      // rerun launched after the stage already advanced still targets this
+      // row (see the REVIEW_TARGETS translation comment above), and without
+      // readiness computed for done rows too there would be no previous
+      // score to show here. Everything else — a review stage with no prior
+      // score yet (its very first run), and every non-review stage — keeps
+      // the plain "running" text unchanged; no case here needed a new shape
+      // of its own, only the one that names a real previous verdict.
+      this.description =
+        isReviewStage(stage) && readiness?.label
+          ? `running... (previous: ${readiness.label})`
+          : "running";
     } else if (isWaitingForUser) {
       this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
       this.description = "waiting for you";
     } else {
+      // Score-only at a glance (A3 Part 3 / Step 12): the review row and the
+      // implementation row used to compete for one line — a percentage over
+      // a self-invented denominator next to a score that measures something
+      // else entirely. They now own one number each: review owns quality
+      // (the score), implementation owns quantity (the checklist
+      // percentage). A review whose recorded commit is no longer HEAD
+      // carries a "stale" qualifier so its score stops reading as a verdict
+      // on the current workspace. Hoisted above the status switch (rather
+      // than computed only inside the "current" case) so a DONE stage can
+      // show the same number — the 2026-09-06 review's completion blocker:
+      // the tick alone loses the score/percentage the moment the workflow
+      // advances past a stage, which is exactly the "reads as verdict on
+      // the instant, not history" gap A3 exists to close.
+      const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
+      // A review stage that has never produced a readable artifact at all —
+      // no file yet, or a file with no parseable Readiness line — must never
+      // render as a BLANK description: blank is indistinguishable from "this
+      // number doesn't apply here" (e.g. a non-review stage), while "—/10" is
+      // the one label that unambiguously means "never reviewed" (2026-09-06
+      // review, completion blocker). `readiness` already carries "—/10" via
+      // `parseReadiness` whenever the artifact exists but has no Readiness
+      // line; this closes the remaining gap where `tryReadReadiness` returns
+      // `undefined` outright because no artifact exists yet.
+      const readinessLabel = isReviewStage(stage)
+        ? (readiness ? readiness.label + staleSuffix : "—/10")
+        : undefined;
+      // The implementation row's counterpart: the live checklist percentage
+      // from plan-final.md, over the FIXED total (implementationChecklist.ts's
+      // `ChecklistProgressV1`) — moving as boxes tick, never as a raw
+      // fraction competing with the review row's score.
+      const percentLabel =
+        stage === "impl" && implementationProgress
+          ? `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
+          : undefined;
+      const statusLabel = readinessLabel ?? percentLabel;
       switch (status) {
         case "done":
           // Completed stages always render with the done/tick icon, regardless
@@ -707,12 +770,18 @@ export class StageNode extends vscode.TreeItem {
           // readiness icon (thumbsup/question/thumbsdown) would make completed
           // stages visually ambiguous after a refresh — the acceptance criterion
           // for reliable completed-stage ticks requires the tick to be
-          // unconditional for the "done" state. No "done" description text:
-          // the tick already conveys the status (same rule as TaskNode rows).
+          // unconditional for the "done" state.
           this.iconPath = new vscode.ThemeIcon(
             "check",
             new vscode.ThemeColor("charts.green")
           );
+          // A done review/impl stage still shows its score/percentage — see
+          // the hoisted-statusLabel comment above. Every other done stage
+          // keeps no description text; the tick alone conveys its status
+          // (same rule as TaskNode rows).
+          if (statusLabel) {
+            this.description = statusLabel;
+          }
           break;
         case "current": {
           // The current-stage icon is always the plain horizontal arrow,
@@ -726,30 +795,6 @@ export class StageNode extends vscode.TreeItem {
             escalated ? "warning" : "arrow-right",
             new vscode.ThemeColor(escalated ? "charts.orange" : "charts.blue")
           );
-          // Score AND step progress at a glance: the score alone read as
-          // "finished" when the workflow had only completed some of the
-          // plan's steps (a loop back into implementation looked like a
-          // bug). A missing/malformed marker renders exactly the pre-existing
-          // score-only output. A review whose recorded commit is no longer
-          // HEAD carries a "stale" qualifier so its score stops reading as a
-          // verdict on the current workspace. No "current" status word in the
-          // text — the arrow icon already says that; only information the
-          // icon cannot carry (score/steps, staleness, escalation) renders.
-          //
-          // wf "make the stage chat a record of work", Part 5 / item 6: a
-          // percentage over a MOVING denominator was worse than the raw
-          // fraction it replaced, because it discarded the very information
-          // that explained its own movement. Now that the denominator is
-          // fixed (implementationChecklist.ts's `ChecklistProgressV1`), the
-          // percentage is a faithful "how far along" headline and the raw
-          // count moves to the tooltip (below) rather than competing with it
-          // as a second fraction on the same row.
-          const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
-          const readinessLabel = readiness
-            ? (readiness.progress
-                ? `${formatChecklistPercentV1(readiness.progress.complete, readiness.progress.total)}% · ${readiness.label}`
-                : readiness.label) + staleSuffix
-            : undefined;
           // Item 11 (Part 17 step 45, second bullet): the owed-continuation
           // indicator was only ever rendered on the TASK row — the current
           // STAGE row (where the continuation would actually resume) showed
@@ -767,12 +812,12 @@ export class StageNode extends vscode.TreeItem {
               );
           if (owedIndicator) {
             this.iconPath = new vscode.ThemeIcon(owedIndicator.iconId, new vscode.ThemeColor(owedIndicator.colorId));
-            this.description = readinessLabel
-              ? `${owedIndicator.description} · ${readinessLabel}`
+            this.description = statusLabel
+              ? `${owedIndicator.description} · ${statusLabel}`
               : owedIndicator.description;
           } else {
-            this.description = readinessLabel
-              ? (escalated ? `${readinessLabel} · escalated` : readinessLabel)
+            this.description = statusLabel
+              ? (escalated ? `${statusLabel} · escalated` : statusLabel)
               : (escalated ? "escalated" : undefined);
           }
           break;
@@ -816,18 +861,17 @@ export class StageNode extends vscode.TreeItem {
       ? (artifactUri ? `Open ${artifactName}` : `${artifactName} has not been created yet`)
       : STAGE_DISPLAY_NAMES[stage];
 
-    if (readiness?.progress) {
-      // The score on one line, a divider, then the step progress on the next
-      // — the two read as separate facts instead of one conflated number.
-      // The row shows only the percentage (above); the tooltip keeps the raw
-      // count AND the remaining-steps figure, which stays the more concrete
-      // number when deciding whether to continue ("3 steps left" beats "96%"
-      // — wf "make the stage chat a record of work", Part 5 / item 6).
-      const stepsLeft = readiness.progress.total - readiness.progress.complete;
-      tooltipStr +=
-        `\n\nReview score: ${readiness.label}\n\n---\n\n` +
-        `${readiness.progress.complete} of ${readiness.progress.total} steps · ${stepsLeft} left`;
-    }
+    // The 2026-09-06 review's completion blocker: this tooltip previously
+    // repeated the review's self-reported step-progress figure
+    // (`readiness.progress`) alongside the score, which is exactly the
+    // implementation-row's kind of number appearing on the review side —
+    // the "neither row shows the other's number" contract A3 Part 3 / Step
+    // 12 requires applies to the tooltip too, not only the row's own
+    // description text. The score alone (shown on the row itself, above)
+    // is what this tooltip omits repeating; no other fact is lost, since
+    // `readiness.progress` is the reviewer's own invented tally (Step 13
+    // retires it in favor of the plan checklist's fixed denominator, which
+    // is what the implementation row already shows).
     if (readiness && isReviewStage(stage)) {
       // Reviewer/mechanical split (wf10 continuation item 12): the newest
       // recorded history entry for this stage carries `taskFixableCount` plus
@@ -1016,6 +1060,47 @@ export async function tryReadReadiness(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Cross-surface review-stage score display (A3 Part 3 / Step 12, 2026-09-06
+ * review completion blocker): the ONE definition of what a review stage's
+ * score label looks like, shared by the status bar and the chat header (the
+ * task tree's own StageNode computes the identical three cases inline, since
+ * it also needs the readiness value itself for its icon/tooltip — this is
+ * exported so the OTHER two plan-named surfaces, which need only the final
+ * string, do not each grow a second copy of the same running/idle/stale/
+ * never-reviewed decision). Mirrors StageNode's rules exactly:
+ *  - a rerun of THIS review stage genuinely in flight: "running... (previous:
+ *    N/10)", or plain "running..." when there is no prior score yet;
+ *  - idle with a readable score: "N/10", with " · stale" appended when the
+ *    review's recorded commit is behind HEAD;
+ *  - idle with nothing readable at all (never reviewed): "—/10".
+ *
+ * Returns `undefined` for a non-review stage — callers render nothing for it,
+ * the same gate the implementation-percentage surfaces already apply for
+ * their own (non-review) stage.
+ */
+export async function describeReviewStageScoreV1(
+  taskPath: string,
+  stage: TaskStage,
+  folderUri: vscode.Uri,
+  resolveHeadSha: () => Promise<string | undefined>
+): Promise<string | undefined> {
+  if (!isReviewStage(stage)) {
+    return undefined;
+  }
+  const artifactName = STAGE_ARTIFACT_FILENAMES[stage];
+  const artifactUri = artifactName ? vscode.Uri.joinPath(folderUri, artifactName) : undefined;
+  const readiness = await tryReadReadiness(artifactUri, stage, folderUri, resolveHeadSha);
+  const isRunning =
+    taskOperations.getActiveStages(taskPath).includes(stage) ||
+    hasActiveOperationTargetingStage(taskPath, "review", stage, (s) => REVIEW_TARGETS[s], false);
+  if (isRunning) {
+    return readiness?.label ? `running... (previous: ${readiness.label})` : "running...";
+  }
+  const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
+  return readiness ? `${readiness.label}${staleSuffix}` : "—/10";
 }
 
 /**
@@ -1568,14 +1653,38 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         }
       }
 
-      // For review stages, only try to parse readiness when the stage is
-      // current — done stages always render with the tick icon regardless of
-      // readiness data present in the artifact.
+      // For review stages, parse readiness for both a CURRENT stage and a
+      // DONE one, unconditionally — the score must stay visible after the
+      // workflow advances past this stage (A3 Part 3 / Step 12's "at any
+      // moment" contract, and the 2026-09-06 review's completion blocker: an
+      // idle done review row previously showed no score at all). A rerun
+      // launched after the stage has already advanced still targets this row
+      // via the REVIEW_TARGETS translation (see StageNode's isRunning
+      // comment) and needs the same read for its "running... (previous:
+      // N/10)" line. The extra file read and git-freshness check per
+      // completed review stage is the accepted cost of the visibility
+      // requirement, not gated on an in-flight operation any more.
       let readiness: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string } | undefined;
-      if (isReviewStage(stage) && status === "current") {
+      if (isReviewStage(stage) && (status === "current" || status === "done")) {
         readiness = await tryReadReadiness(artifactUri, stage, task.folderUri, () =>
           this.resolveHeadShaShared(task.folderUri)
         );
+      }
+
+      // Implementation row's live checklist percentage (A3 Part 3 / Step 12)
+      // — read for the `impl` stage regardless of status, so the percentage
+      // stays visible after the workflow advances past it (the same "at any
+      // moment" requirement as the review score above; a done implementation
+      // row previously fell back to a bare tick with no number).
+      // `readEffectivePlanChecklistProgressV1` already resolves plan-final.md
+      // the same way the advance gates do and never throws (lenient policy),
+      // so no extra try/catch is needed here.
+      let implementationProgress: { complete: number; total: number } | undefined;
+      if (stage === "impl") {
+        const counted = await readEffectivePlanChecklistProgressV1(task.folderUri);
+        if (counted) {
+          implementationProgress = { complete: counted.settled, total: counted.total };
+        }
       }
 
       // Say what a stage's action needs BEFORE the attempt, not only in the
@@ -1629,7 +1738,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           this.isMetaManaged,
           hasBackup,
           redoAvailable,
-          missingPrerequisite
+          missingPrerequisite,
+          implementationProgress
         )
       );
     }

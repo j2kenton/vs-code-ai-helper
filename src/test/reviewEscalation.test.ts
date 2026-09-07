@@ -33,6 +33,7 @@ import {
   EscalationChatTarget,
   escalateReviewToHuman,
   initReviewEscalationChat,
+  postEnvironmentalAdvanceNoticeV1,
   __reviewEscalationChatTestOnly,
 } from "../utils/reviewEscalation";
 import { handleReviewRoutingOutcome } from "../commands/reviewActions";
@@ -665,6 +666,120 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  void it("plateau card quotes EVERY blocker verbatim, not a summarized count of the rest", async () => {
+    // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06.
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-multi-blocker");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-multi" }));
+
+    const blockers: ReviewBlocker[] = [
+      { category: "review-confidence", resolver: "environmental", description: "first plateau blocker verbatim text" },
+      { category: "completion", resolver: "task-fixable", description: "second plateau blocker verbatim text" },
+    ];
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-multi",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 8/10\n\n<!-- progress: 6/6 -->\n", blockers, taskFixableCount: 1 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.ok(decision.whatHappened.includes("first plateau blocker verbatim text"));
+      assert.ok(decision.whatHappened.includes("second plateau blocker verbatim text"));
+      assert.ok(
+        !decision.whatHappened.includes("more of the same kind"),
+        "must not summarize additional blockers instead of quoting them"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // A3 (2026-09-06): the plateau card previously rendered the review's raw,
+  // self-reported `<!-- progress: N/M -->` marker verbatim — a reviewer that
+  // invents its own denominator can report "6 of 6" while plan-final.md's
+  // real checklist still has most of its items unchecked, producing a frozen,
+  // wrong count next to a live, correct one elsewhere on the same screen (the
+  // observed "13 of 46" vs "49/127" mismatch). This asserts the card instead
+  // renders the checklist-reconciled figure.
+  void it("renders the checklist-reconciled progress, not the review's raw self-reported marker, when plan-final.md has unfinished items", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-reconciled-progress");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    const checklist = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] item 1",
+      "- [x] item 2",
+      "- [x] item 3",
+      "- [x] item 4",
+      "- [ ] item 5",
+      "- [ ] item 6",
+      "- [ ] item 7",
+      "- [ ] item 8",
+      "- [ ] item 9",
+      "- [ ] item 10",
+    ].join("\n");
+    store.set(planFinalUri.toString(), checklist);
+
+    const blockers: ReviewBlocker[] = [
+      { category: "review-confidence", resolver: "environmental", description: "The five live-AWS acceptance checks remain unexecuted" },
+    ];
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        // The review's OWN marker claims a self-invented "6/6" — fully done.
+        { content: "Readiness: 8/10\n\n<!-- progress: 6/6 -->\n", blockers, taskFixableCount: 0 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision, "a reviewPlateauEscalation decision must be posted");
+      // The checklist has 4 settled of 10 real items — that must win over the
+      // review's self-reported "6/6", which does not match plan-final.md at
+      // all.
+      assert.match(decision.whyUserNeeded, /4 of 10 plan steps verified/);
+      assert.doesNotMatch(decision.whyUserNeeded, /6 of 6 plan steps verified/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // wf10 review fix (2026-08-25, new architectural blocker): the ORIGINAL
   // version of this test asserted the opposite — that a recorded
   // `blockerSupersessions` entry suppressed the plateau decision even when
@@ -1206,6 +1321,220 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();
+    }
+  });
+});
+
+// 1.0.0 gate, Part 4 / Step 14 (B4): decideReviewRoute's "advance-with-note"
+// route used to be a plain informational toast naming only the blocker
+// category ("only known-environmental blockers remain") — never the concrete
+// failure, the fact it will gate Publish later, or that an audited override
+// already exists. postEnvironmentalAdvanceNoticeV1 replaces that toast with a
+// non-blocking chat decision; these tests cover both the direct function and
+// its wiring into handleReviewRoutingOutcome.
+void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notice", () => {
+  void it("returns false and posts nothing when every blocker is task-fixable", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1(
+        "impl-high-review",
+        [{ category: "completion", resolver: "task-fixable", description: "still needs a null check" }],
+        { canonicalId: "c1", taskFolderPath: "/tmp/task1" }
+      );
+      assert.strictEqual(posted, false);
+      assert.equal(
+        new WorkflowDecisionStoreV1(context.workspaceState).listPending().length,
+        0,
+        "no decision should be posted when there is nothing non-task-fixable to name"
+      );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("names the blocker concretely, states the Publish consequence, and offers all three exits without pausing", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const blockers: ReviewBlocker[] = [
+      {
+        category: "completion",
+        resolver: "environmental",
+        description:
+          "Root `npm run test` remains red in unrelated referral-race cron default-environment assertions because workspace-local configuration is loaded",
+      },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: "/tmp/task1",
+        taskName: "jester",
+      });
+      assert.strictEqual(posted, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision, "must post a durable decision, not a plain toast");
+      assert.ok(
+        decision.whatHappened.includes(
+          "Root `npm run test` remains red in unrelated referral-race cron default-environment assertions"
+        ),
+        "must quote the blocker's own concrete description, not just its category"
+      );
+      assert.match(
+        decision.whyUserNeeded,
+        /block Publish/i,
+        "must state the consequence: this will gate Publish later"
+      );
+      assert.strictEqual(decision.gating?.holdsTaskPaused, false, "must not present as holding the task paused");
+      assert.strictEqual(decision.gating?.unblocksProgress, false);
+
+      const optionIds = decision.options.map((option) => option.optionId);
+      assert.deepEqual(
+        optionIds,
+        ["acknowledgeAdvance", "handleMyself", "publishAnyway"],
+        "must offer all three exits named in Part 4: advance anyway, fix it yourself, Publish Anyway"
+      );
+      assert.deepEqual(
+        decision.options.find((o) => o.optionId === "acknowledgeAdvance")?.effect,
+        { kind: "doNothing" }
+      );
+      assert.deepEqual(decision.options.find((o) => o.optionId === "handleMyself")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanFinal",
+        args: [{ taskFolderPath: "/tmp/task1" }],
+      });
+      assert.deepEqual(decision.options.find((o) => o.optionId === "publishAnyway")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.commitAndPushTask",
+        args: [{ taskFolderPath: "/tmp/task1" }],
+      });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("quotes EVERY non-fixable blocker verbatim, not a summarized count of the rest", async () => {
+    // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: a
+    // summarized "(and N more of the same kind)" is not the concrete
+    // command/file/assertion/provider-output evidence the requirement calls
+    // for — every non-fixable blocker must be quoted in full.
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "first blocker: env failure detail A" },
+      { category: "completion", resolver: "unverifiable", description: "second blocker: unverifiable detail B" },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: "/tmp/task1",
+      });
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
+      assert.ok(decision.whatHappened.includes("first blocker: env failure detail A"));
+      assert.ok(decision.whatHappened.includes("second blocker: unverifiable detail B"));
+      assert.ok(
+        !decision.whatHappened.includes("more of the same kind"),
+        "must not summarize additional blockers instead of quoting them"
+      );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("handleReviewRoutingOutcome posts the notice (never pausing) when threshold is met with only environmental blockers remaining", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("advance-with-note-environmental");
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-note" })
+    );
+
+    const content = [
+      "Readiness: 9/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [environmental] Root `npm run test` remains red in unrelated referral-race cron default-environment assertions",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-note",
+        content,
+        score: 9,
+        threshold: 8,
+      });
+      assert.strictEqual(escalated, false, "meeting the threshold must not pause the task");
+
+      const after = readProgress(store, folderUri);
+      assert.strictEqual(after.status, "active", "the task keeps advancing — this notice never pauses it");
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision, "an advance-with-note route must post a chat decision, not only a plain toast");
+      assert.ok(decision.whatHappened.includes("Root `npm run test` remains red"));
+      assert.strictEqual(
+        surface.entries.some((entry) => entry.message.includes("only known-environmental blockers remain")),
+        false,
+        "the old category-only toast must not fire once the decision posts successfully"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("handleReviewRoutingOutcome falls back to the plain toast when no extension context is available", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const folderUri = makeTaskFolderUri("advance-with-note-no-context");
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-note-2" })
+    );
+
+    const content = [
+      "Readiness: 9/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [environmental] some environmental failure",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-note-2",
+        content,
+        score: 9,
+        threshold: 8,
+      });
+      assert.strictEqual(escalated, false);
+      assert.ok(
+        surface.entries.some((entry) => entry.message.includes("only known-environmental blockers remain")),
+        "without an activating extension context, the notice must fall back to the plain toast rather than going silent"
+      );
+    } finally {
+      deactivateNotificationRouter();
     }
   });
 });

@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
-import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { isReviewStage, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
-import { describeOwedContinuationRowIndicatorV1 } from "./taskTreeProvider";
+import { describeOwedContinuationRowIndicatorV1, describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import {
   SchedulingIntentStoreV1,
@@ -14,6 +14,9 @@ import {
   describeSchedulingPostureV1,
 } from "../state/schedulingIntentV1";
 import { renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
+import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
+import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -35,6 +38,14 @@ export class TaskStatusBar implements vscode.Disposable {
   private lastTasks: IncompleteTask[] = [];
   private lastCurrentTaskId: string | undefined = undefined;
   private readonly onDidChangeSub: vscode.Disposable;
+  /**
+   * Bumped on every `update()` call and captured by the async implementation-
+   * percentage fetch (`attachImplPercentV1`) so a stale fetch — one started
+   * for a render that a newer `update()` has since superseded — never
+   * overwrites the bar with percentage text for a task/stage that is no
+   * longer shown (A3 Part 3 / Step 12).
+   */
+  private renderGeneration = 0;
 
   constructor(private readonly currentTaskStore: CurrentTaskStore) {
     this.item = vscode.window.createStatusBarItem(
@@ -59,6 +70,17 @@ export class TaskStatusBar implements vscode.Disposable {
   ): void {
     this.lastTasks = tasks;
     this.lastCurrentTaskId = currentTaskCanonicalId;
+
+    // Bumped unconditionally, before any of this method's early returns
+    // (2026-09-06 review, completion blocker): the previous placement — after
+    // the completed/no-active-task early returns — let a percentage/score
+    // fetch started for an earlier ACTIVE render outlive a subsequent
+    // `update()` call that returned early into a neutral or completed state.
+    // That later call never bumped the generation, so the async fetch's
+    // generation check still matched and it clobbered the newer render with
+    // stale percentage text for a task that was no longer even shown.
+    this.renderGeneration += 1;
+    const myGeneration = this.renderGeneration;
 
     // Find the task matching the stored canonical ID.
     const taskToShow = tasks.find(
@@ -113,6 +135,85 @@ export class TaskStatusBar implements vscode.Disposable {
       return;
     }
 
+    this.renderActiveTask(taskToShow, icon, undefined);
+    // Implementation row's live checklist percentage, review row's score
+    // (A3 Part 3 / Step 12): the status bar is one of the three surfaces the
+    // plan names for these numbers (alongside the task tree and the chat
+    // header) — implementation owns the percentage, review owns the score,
+    // and neither stage shows the other's number. `update()` must stay
+    // synchronous — it runs from a plain `taskOperations.onDidChange`
+    // callback with no async caller to await — so the number is rendered in
+    // a first pass without it, then patched in once the (best-effort,
+    // fire-and-forget) read resolves. `myGeneration` (bumped unconditionally
+    // at the top of this method) guards against a stale fetch from a
+    // superseded render — including one superseded by an early return into
+    // the neutral/completed states above — clobbering a newer one.
+    if (taskToShow.progress.currentStage === "impl") {
+      void this.attachImplPercent(taskToShow, icon, myGeneration);
+    } else if (isReviewStage(taskToShow.progress.currentStage)) {
+      void this.attachReviewScore(taskToShow, icon, myGeneration);
+    }
+  }
+
+  /**
+   * Best-effort async augmentation for `update()`'s implementation-percentage
+   * display — see the call site's comment for why this cannot be inline.
+   * Never throws; a checklist that cannot be read simply leaves the bar
+   * without a percentage, matching every other lenient reader of
+   * `plan-final.md` in this codebase.
+   */
+  private async attachImplPercent(
+    task: IncompleteTask,
+    icon: string,
+    generation: number
+  ): Promise<void> {
+    const counted = await readEffectivePlanChecklistProgressV1(task.folderUri).catch(() => undefined);
+    if (generation !== this.renderGeneration || !counted) {
+      return;
+    }
+    this.renderActiveTask(task, icon, `${formatChecklistPercentV1(counted.settled, counted.total)}%`);
+  }
+
+  /**
+   * Best-effort async augmentation for `update()`'s review-score display —
+   * the status bar's half of the same cross-surface contract
+   * `describeReviewStageScoreV1` defines once for every surface. Never
+   * throws; an unreadable review artifact simply leaves the bar without a
+   * score rather than failing the render.
+   */
+  private async attachReviewScore(
+    task: IncompleteTask,
+    icon: string,
+    generation: number
+  ): Promise<void> {
+    const label = await describeReviewStageScoreV1(
+      task.canonicalId ?? task.folderUri.fsPath,
+      task.progress.currentStage,
+      task.folderUri,
+      () => resolveHeadCommitSha(task.folderUri.fsPath)
+    ).catch(() => undefined);
+    if (generation !== this.renderGeneration || !label) {
+      return;
+    }
+    this.renderActiveTask(task, icon, undefined, label);
+  }
+
+  /**
+   * Render the status bar text/tooltip for the shown active (non-completed)
+   * task. Split out of `update()` so the implementation-percentage/review-
+   * score patches (`attachImplPercent`/`attachReviewScore`, once their async
+   * reads resolve) can re-render the same task with the number added,
+   * without duplicating the surrounding owed-continuation/posture logic.
+   * `implPercentLabel` and `reviewScoreLabel` are mutually exclusive by
+   * stage — never both set — mirroring the "neither row shows the other's
+   * number" contract the task tree's StageNode already enforces.
+   */
+  private renderActiveTask(
+    taskToShow: IncompleteTask,
+    icon: string,
+    implPercentLabel: string | undefined,
+    reviewScoreLabel?: string
+  ): void {
     const stage = taskToShow.progress.currentStage;
     const isPaused = taskToShow.progress.status === "paused";
     const statusLabel = isPaused ? "paused" : "active";
@@ -164,9 +265,13 @@ export class TaskStatusBar implements vscode.Disposable {
     // full sentence (`detail`) stays in the tooltip for elaboration.
     const posture = owedIndicator ? undefined : this.derivePostureFields(taskToShow);
 
-    // Text: Checklist, folderName, stage display name, status, posture
+    // Text: Checklist, folderName, stage display name, status, checklist
+    // percentage (impl stage only) or review score (review stages only),
+    // posture
+    const extraLabel = implPercentLabel ?? reviewScoreLabel;
     this.item.text =
       `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}` +
+      `${extraLabel ? ` — ${extraLabel}` : ""}` +
       `${owedIndicator ? ` — ${owedIndicator.description}` : ""}` +
       `${posture ? ` — ${posture.shortLabel}` : ""}`;
     this.item.tooltip = new vscode.MarkdownString(
@@ -175,6 +280,8 @@ export class TaskStatusBar implements vscode.Disposable {
         "",
         `Task: \`${taskToShow.folderName}\``,
         `Stage: **${STAGE_DISPLAY_NAMES[stage]}**`,
+        ...(implPercentLabel ? [`Checklist: **${implPercentLabel}**`] : []),
+        ...(reviewScoreLabel ? [`Review score: **${reviewScoreLabel}**`] : []),
         ...(owedIndicator ? [`$(watch) ${owedIndicator.description}`] : []),
         ...(quarantinedFilesLine ? [quarantinedFilesLine] : []),
         ...(posture ? [`$(watch) **What happens next** — ${posture.detail}`] : []),

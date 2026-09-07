@@ -18,6 +18,7 @@ import { normalizePath } from "./taskRoot";
 import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
+import { effectiveReviewProgressV1 } from "./effectiveReviewProgress";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import {
   WorkflowDecisionOptionEffectV1,
@@ -291,11 +292,30 @@ function buildReconsiderRequirementOptionV1(
 interface EscalationPlateauContextV1 {
   readonly blockersCount: number;
   readonly primaryBlockerDescription?: string;
+  /**
+   * Every blocker's own description, verbatim, in the same order as
+   * `normalized.blockers` — 1.0.0 gate, Part 4 / Step 14 (B4), review finding
+   * 2026-09-06: the card used to quote only `primaryBlockerDescription` and
+   * summarize the rest as "and N more", which is not the concrete evidence
+   * the requirement calls for. Empty when `blockersCount === 0`.
+   */
+  readonly allBlockerDescriptions: readonly string[];
   /** Appended immediately after the quoted blocker description; empty string when not narrowed. */
   readonly narrowedNote: string;
   readonly progressNote: string;
   readonly taskFixableCount: number;
   readonly hasSpecDefect: boolean;
+  /**
+   * 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
+   * `escalate` route (reviewRouting.ts's `onlyNonFixableRemain`, or a
+   * plateau that still carries a non-task-fixable blocker) can pause the
+   * task with an environmental/unverifiable/spec-defect/needs-toolchain
+   * blocker on record — the SAME kind of blocker `postEnvironmentalAdvanceNoticeV1`
+   * warns about on the `advance-with-note` route. Without this, only the
+   * threshold-met path told the user the blocker would gate Publish and
+   * offered the "Publish Anyway" exit; the paused route left both out.
+   */
+  readonly hasNonFixableBlocker: boolean;
   readonly nextStageHasRun: boolean;
   readonly clearingNote: string;
   readonly dispatchModeEvidence: readonly { label: string; detail: string }[];
@@ -327,10 +347,12 @@ function buildEscalationDecisionV1(
     const {
       blockersCount,
       primaryBlockerDescription,
+      allBlockerDescriptions,
       narrowedNote,
       progressNote,
       taskFixableCount,
       hasSpecDefect,
+      hasNonFixableBlocker,
       nextStageHasRun,
       clearingNote,
       dispatchModeEvidence,
@@ -394,6 +416,13 @@ function buildEscalationDecisionV1(
             "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
             "believe otherwise despite that."
       ),
+      // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
+      // paused `escalate` route previously omitted the "publish over it"
+      // exit entirely, even when a non-task-fixable blocker on record here
+      // is the exact same kind that will gate Publish later — leaving the
+      // owner to discover the override for the first time in a modal at
+      // publish time. Only offered when such a blocker is actually present.
+      ...(hasNonFixableBlocker ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
     ];
 
     // 2026-09-04 review follow-up (completion blocker, new): this label
@@ -445,11 +474,15 @@ function buildEscalationDecisionV1(
         `${stageName} can't progress on its own. ` +
         (primaryBlockerDescription !== undefined
           ? `${blockersCount === 1 ? "One blocker remains" : `${blockersCount} blockers remain`}` +
-            `, and here is the first one, verbatim:\n\n"${primaryBlockerDescription}"${narrowedNote}`
+            `, verbatim:\n\n${allBlockerDescriptions.map((d) => `"${d}"`).join("\n\n")}${narrowedNote}`
           : reason),
       whyUserNeeded:
         `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
-        `${blockersCount} remaining blocker(s) are task-fixable.`,
+        `${blockersCount} remaining blocker(s) are task-fixable.` +
+        (hasNonFixableBlocker
+          ? " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
+            "later, until it clears or you choose \"I'll publish over it\" below to override it there."
+          : ""),
       options,
       recommendation,
       evidence: [{ label: "What clears this", detail: clearingNote }, ...dispatchModeEvidence],
@@ -558,6 +591,152 @@ function buildEscalationDecisionV1(
       detail: "This decision is holding the task paused until you choose how to proceed.",
     },
   };
+}
+
+/**
+ * 1.0.0 gate, Part 4 / Step 14 (B4): when `decideReviewRoute` returns
+ * `advance-with-note` — the score met threshold, but every remaining blocker
+ * is environmental or unverifiable (`onlyEnvironmentalRemain`,
+ * `reviewRouting.ts`) — this used to be a single informational toast naming
+ * only the category, e.g. "only known-environmental blockers remain". That
+ * told the user nothing they could act on and never mentioned that the SAME
+ * issue will later gate Publish: the owner's real complaint ("why didn't
+ * Ensemble handle it?") came from discovering this for the first time at
+ * publish time, with the audit-trailed "Publish Anyway" override
+ * (`commitAndPushTask.ts`) hidden behind a blocking modal nobody had been
+ * told existed.
+ *
+ * This posts a non-blocking chat decision INSTEAD of that toast, at the
+ * moment the blocker is first seen, naming the failure concretely (the
+ * blocker's own description, exactly as the reviewer or mechanical check
+ * wrote it — never just its category), the consequence (it will block
+ * Publish until it clears or is overridden there), and all three exits named
+ * in Part 4: advance anyway (already happening — this option just
+ * acknowledges it), fix it yourself (opens plan-final.md), and "I'll publish
+ * over it" (runs Publish Checks now if the task has reached Publish, so the
+ * existing audited override is one click away instead of a surprise later;
+ * gracefully tells the user it isn't available yet otherwise, via
+ * `runPublishChecks`'s own stage guard).
+ *
+ * Deliberately non-blocking (`holdsTaskPaused: false`): the stage is already
+ * advancing on its own merits, so this notice must never read as something
+ * that needs answering before progress continues — only as advance warning
+ * of what to expect later. Returns whether the decision was actually posted
+ * (no extension context available is the one expected failure mode, as with
+ * every other `postWorkflowDecisionV1` call site); the caller falls back to
+ * a plain informational toast when this returns false, so the notice is
+ * never silently dropped.
+ */
+/**
+ * B4's third exit ("Publish over it with an audit trail"), shared by every
+ * card that offers it, so the wiring can never drift between call sites —
+ * one derivation, per Part C Step 9. Dispatches the SAME
+ * `vs-code-ai-helper.commitAndPushTask` command every other "Publish Anyway"
+ * affordance in the product already uses (see the Step 3/3b publish nudges
+ * in reviewActions.ts) — never `runPublishChecks`, which is an unrelated
+ * lint/type/test/plan-verification check with no path into the actual
+ * audited override.
+ *
+ * Review finding, 2026-09-06: an earlier revision wired this option to
+ * `runPublishChecks` instead. That command only runs its (unrelated) checks
+ * when the task has already reached Publish, and even then never reaches
+ * `runCommitPushCompletionChecksV1`'s "Publish Anyway" modal — the actual
+ * mechanism that writes the audit trail into `publish-review.md`. The
+ * option was therefore advice to run more, unrelated steps later, not the
+ * promised exit. `commitAndPushTask` is the real path: eligible, it runs
+ * the full commit/push flow and reaches the audited override if its own
+ * checks fail; ineligible (task not yet completed/at Publish), it reports
+ * that accurately via its own stage-eligibility message instead of silently
+ * doing nothing.
+ */
+function buildPublishAnywayOptionV1(taskFolderPath: string): WorkflowDecisionOptionV1 {
+  return {
+    optionId: "publishAnyway",
+    label: "I'll publish over it",
+    consequence:
+      "Opens Commit and Push for this task. If it's ready to publish and this same issue fails its checks " +
+      "there, choose \"Publish Anyway\" to record the override in publish-review.md with an audit trail. If " +
+      "the task hasn't reached Publish yet, this tells you so instead of running anything.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.commitAndPushTask",
+      args: [{ taskFolderPath }],
+    },
+  };
+}
+
+export async function postEnvironmentalAdvanceNoticeV1(
+  stage: TaskStage,
+  blockers: readonly ReviewBlocker[],
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+): Promise<boolean> {
+  const nonFixable = blockers.filter((b) => b.resolver !== "task-fixable");
+  if (nonFixable.length === 0) {
+    return false;
+  }
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  const nextStage = nextStageInOrderV1(stage);
+  const nextStageName = nextStage ? STAGE_DISPLAY_NAMES[nextStage] : undefined;
+  // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
+  // non-fixable blocker verbatim, not just the first with "(and N more of
+  // the same kind)" — a summarized count is not the "command, file,
+  // assertion, provider output" evidence the requirement calls for, and each
+  // blocker's own description (now enriched with output evidence for
+  // mechanical blockers — see synthesizeMechanicalBlockers) is the actual
+  // evidence a reader needs to act on it.
+  const quotedBlockers = nonFixable.map((b) => `"${b.description}"`).join("\n\n");
+
+  const options: WorkflowDecisionOptionV1[] = [
+    {
+      optionId: "acknowledgeAdvance",
+      label: "Continue — advance anyway",
+      consequence:
+        `${stageName} already met its score threshold, so it advances to ` +
+        `${nextStageName ?? "the next stage"} regardless of this notice — choosing this just closes it.`,
+      effect: { kind: "doNothing" },
+    },
+    {
+      optionId: "handleMyself",
+      label: "Fix it yourself first",
+      consequence: "Opens plan-final.md so you can address the blocker before it reaches Publish.",
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.openPlanFinal",
+        args: [{ taskFolderPath: target.taskFolderPath }],
+      },
+    },
+    buildPublishAnywayOptionV1(target.taskFolderPath),
+  ];
+
+  const decisionInput: PostWorkflowDecisionInputV1 = {
+    decisionKey: "environmentalAdvanceNotice",
+    taskCanonicalId: target.canonicalId,
+    stage,
+    whatHappened:
+      `${stageName} met its score threshold, but ${nonFixable.length === 1 ? "a blocker remains" : `${nonFixable.length} blockers remain`} ` +
+      `that no further automated round can fix — here ${nonFixable.length === 1 ? "it is" : "they are"}, verbatim:\n\n${quotedBlockers}`,
+    whyUserNeeded:
+      "This will not stop the stage from advancing now, but the same issue will block Publish later, until it " +
+      "clears or you override it there — this is the moment to see the exits, not a surprise at publish time.",
+    options,
+    recommendation: {
+      kind: "option",
+      optionId: "acknowledgeAdvance",
+      reasoning: "The stage is already advancing on its own; this notice only tells you what to expect at Publish.",
+    },
+    gating: {
+      holdsTaskPaused: false,
+      unblocksProgress: false,
+      detail: "This does not pause the task — it is already advancing. Nothing here is required before proceeding.",
+    },
+  };
+  const posted = await postWorkflowDecisionV1(decisionInput, {
+    canonicalId: target.canonicalId,
+    taskFolderPath: target.taskFolderPath,
+    stage,
+    taskName: target.taskName,
+  });
+  return posted !== undefined;
 }
 
 /**
@@ -806,9 +985,18 @@ async function postReviewPlateauDecisionV1(
       ? ` This blocker has narrowed across rounds (declared \`[narrowed:${narrowedRef}]\`) — iteration IS making ` +
         "progress on it, it has simply not cleared yet."
       : "";
+  // A3 (2026-09-06): render the checklist-reconciled figure here, never
+  // `normalized.progress`'s raw, self-reported marker — a reviewer that
+  // invents its own denominator (46 vs plan-final.md's real 127) produced a
+  // frozen "13 of 46 plan steps verified" beside a live, correct "49/127
+  // items settled" elsewhere on the same screen. `effectiveReviewProgressV1`
+  // is the single reconciled source every other progress display already
+  // reads from (see its own doc comment); this call site was the one place
+  // still bypassing it in favor of the unreconciled marker.
+  const effectiveProgress = await effectiveReviewProgressV1(folderUri, stage, evidence.content, "lenient");
   const progressNote =
-    normalized.progress !== null
-      ? `${normalized.progress.complete} of ${normalized.progress.total} plan steps verified.`
+    effectiveProgress !== null
+      ? `${effectiveProgress.complete} of ${effectiveProgress.total} plan steps verified.`
       : "No plan-progress marker was reported for this round.";
 
   const nextStage = nextStageInOrderV1(stage);
@@ -821,6 +1009,12 @@ async function postReviewPlateauDecisionV1(
     }
   }
   const hasSpecDefect = normalized.blockers.some((b) => b.resolver === "spec-defect");
+  // 1.0.0 gate, Part 4 / Step 14 (B4): same "non-task-fixable" definition
+  // `postEnvironmentalAdvanceNoticeV1` uses (everything but `task-fixable` —
+  // environmental, unverifiable, spec-defect, needs-toolchain), so the
+  // Publish-consequence note and "publish over it" exit appear here under
+  // the identical condition, not a narrower one.
+  const hasNonFixableBlocker = normalized.blockers.some((b) => b.resolver !== "task-fixable");
   // Review-narrowed (Step 27, 2026-08-25): read the approved plan alongside
   // the review markdown so `describeResolverClearingActionV1` can also find
   // a clearing command the PLAN itself names (e.g. a "How to verify" step)
@@ -889,10 +1083,12 @@ async function postReviewPlateauDecisionV1(
     buildEscalationDecisionV1("plateau", stage, reason, target, {
       blockersCount: normalized.blockers.length,
       primaryBlockerDescription: primaryBlocker?.description,
+      allBlockerDescriptions: normalized.blockers.map((b) => b.description),
       narrowedNote,
       progressNote,
       taskFixableCount: evidence.taskFixableCount,
       hasSpecDefect,
+      hasNonFixableBlocker,
       nextStageHasRun,
       clearingNote,
       dispatchModeEvidence,

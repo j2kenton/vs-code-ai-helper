@@ -12,6 +12,7 @@ import { invokeLifecycleRowV1 } from "../actions/productionTaskActionRuntimeV1";
 import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { missingCompletionArtifactsV1 } from "../utils/stageArtifactRequirementsV1";
+import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -239,6 +240,16 @@ export async function markTaskDone(
       return;
     }
     await inventory.refresh();
+
+    // 1.0.0 gate, A4 (review finding, 2026-09-06): a decision for a task that
+    // has just been completed can never be acted on again — retire any still
+    // pending ones now, rather than leaving a stale card (e.g. a
+    // `reconcilePlanChecklist` reconciliation nudge) presenting for a task no
+    // further round will ever touch.
+    await retirePendingWorkflowDecisionsForTaskV1(
+      { taskFolderPath: taskFolderUri.fsPath, canonicalId: resolvedTask.canonicalId },
+      "the task was marked complete"
+    ).catch(() => undefined);
 
     // ── Step 2: Select next active task deterministically ──────────────────
     const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);

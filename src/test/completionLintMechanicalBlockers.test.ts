@@ -40,10 +40,38 @@ void describe("synthesizeMechanicalBlockers", () => {
         category: "completion",
         resolver: "task-fixable",
         description:
-          "`npm run verify:workflow-production-sources` failed (exit 1) — generated mechanically from Verified Checks",
+          "`npm run verify:workflow-production-sources` failed (exit 1) — generated mechanically from Verified Checks" +
+          " — output:\n```\nbaseline drifted\n```",
         origin: "mechanical",
       },
     ]);
+  });
+
+  // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
+  // description must carry the check's own output (file/assertion/failure
+  // detail), not just command+exit code, so a downstream card that only has
+  // `ReviewBlocker.description` to work with can still show real evidence.
+  void it("appends a bounded excerpt of the check's own output as evidence", () => {
+    const result = baseResult({
+      failedChecks: [
+        { command: "npm run test", exitCode: 1, output: "AssertionError: expected 1 to equal 2\n  at foo.test.ts:42" },
+      ],
+    });
+    const blockers = synthesizeMechanicalBlockers(result);
+    assert.strictEqual(blockers.length, 1);
+    assert.ok(blockers[0]!.description.includes("AssertionError: expected 1 to equal 2"));
+    assert.ok(blockers[0]!.description.includes("foo.test.ts:42"));
+  });
+
+  void it("omits the output suffix entirely when the check produced no output", () => {
+    const result = baseResult({
+      failedChecks: [{ command: "npm run lint", exitCode: 1, output: "" }],
+    });
+    const blockers = synthesizeMechanicalBlockers(result);
+    assert.strictEqual(
+      blockers[0]!.description,
+      "`npm run lint` failed (exit 1) — generated mechanically from Verified Checks"
+    );
   });
 
   void it("emits one blocker per distinct failed check, preserving order", () => {
