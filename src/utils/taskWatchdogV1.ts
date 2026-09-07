@@ -120,17 +120,34 @@ export function isUnrecoverableImplRecoveryV1(
  * at 07:32:52 — four seconds, with no dispatch route available in between,
  * because every dispatch command is gated on the task not being paused.
  *
- * A watchdog is meant to notice that nothing has happened for a while. Ninety
- * seconds is long enough for a resume to be followed by its dispatch and for a
- * dispatch to open its round-ledger row (which exempts the task on its own
- * merits), and far shorter than the intervals at which real silent stops were
- * observed — those sat idle for hours.
+ * A watchdog is meant to notice that nothing has happened for a while.
  *
- * This is a floor on detection latency, not a fix for the underlying defect:
- * resume should schedule the next action rather than leaving a gap at all.
- * That remains `v1 fixes` item 1's first requirement.
+ * **Ninety seconds was tried first and was not enough** (2026-09-07 08:45:55).
+ * A review was started by hand on a resumed task, spent its setup phase
+ * assembling a 47 KB context pack, and the sweep paused the task underneath
+ * it. The review then aborted on its own paused check:
+ *
+ *     Error: The task was paused while the review was starting.
+ *         at ... vs-code-ai-helper.runReviewWithAI
+ *
+ * The cause is not slowness but ordering: **a command that is starting work
+ * has not yet opened the round-ledger row that would exempt the task**, so
+ * during setup it is indistinguishable from a task doing nothing. Any period
+ * short enough to be useful can be outrun by a slower context pack, so the
+ * value is a mitigation, not a boundary.
+ *
+ * Ten minutes cannot be outrun by a setup phase, and still catches every real
+ * silent stop observed — those sat idle for hours, not minutes. Detection
+ * latency is the cheap side of this trade: a stall noticed ten minutes late
+ * costs a little time, while a false pause aborts live work and strands the
+ * task, because every dispatch route is gated on the task not being paused.
+ *
+ * This remains a mitigation, not the fix. `v1 fixes` item 1 records both real
+ * requirements: resume must arrange work rather than leaving a gap, and a
+ * command that is starting work must register that intent BEFORE its setup
+ * phase, so the sweep can see it.
  */
-export const STALLED_TASK_QUIET_PERIOD_MS = 90 * 1000;
+export const STALLED_TASK_QUIET_PERIOD_MS = 10 * 60 * 1000;
 
 export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1): boolean {
   const { progress, taskCanonicalId } = input;

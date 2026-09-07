@@ -155,11 +155,42 @@ export async function resumePausedTask(
         // escalation left behind here would otherwise linger in the task
         // tree and (once the task plateaus again) skew
         // secondOpinionTriedThisPlateau against a fresh attempt.
-        // preserveFreshness: resuming is selection, not progress — it must
-        // not hoist the task in the recency-ordered task list.
+        // `updatedAt` IS bumped here, deliberately (v1 fixes item 1,
+        // 2026-09-07). This call previously passed `preserveFreshness: true`
+        // on the reasoning that "resuming is selection, not progress" and so
+        // must not hoist the task in the recency-ordered list. That reasoning
+        // is defensible for focus/selection (see taskActivationCoordinator,
+        // which still preserves freshness when activating one task pauses the
+        // others), but for an explicit resume it hands the stalled-task
+        // watchdog a clock that started at the wrong moment.
+        //
+        // STALLED_TASK_QUIET_PERIOD_MS stands the watchdog down while a task
+        // has been touched recently, measured from `updatedAt`. Pausing DOES
+        // bump `updatedAt` (pauseTaskWithReason relies on updateTaskStatus's
+        // default) — so a task resumed after a watchdog pause inherited the
+        // PAUSE's timestamp, and its grace period was not the quiet period but
+        //
+        //     STALLED_TASK_QUIET_PERIOD_MS - (time since the pause)
+        //
+        // Measured on `version 1` 2026-09-07: watchdog pause wrote `updatedAt`
+        // 09:45:28, user resumed 09:46:12 (44 seconds later), and the resumed
+        // task carried the 09:45:28 stamp. Under the 90-second threshold this
+        // originally shipped with, that left ~46 seconds before the sweep could
+        // re-pause — which is exactly the reported "it reverted to paused
+        // straight away", and exactly why being quicker sometimes worked: the
+        // user was racing to open an exempting ledger row. Ten minutes made the
+        // race winnable, but the window still shrinks by however long the pause
+        // went unnoticed, so a pause noticed nine minutes later still leaves
+        // sixty seconds.
+        //
+        // Bumping here makes the window a full quiet period measured from the
+        // resume itself, which is the event that actually means "a human is
+        // dealing with this". The cost is that an explicitly resumed task sorts
+        // to the top of the task list — the correct outcome, since the user
+        // just acted on it.
         await patchTaskProgressStrictV1(
           vscode.Uri.file(resolvedTask.taskFolderPath),
-          (current) => clearEscalation(current, { preserveFreshness: true })
+          (current) => clearEscalation(current)
         );
         // Part 11 item 13c (event-driven half, "stage advance/resume
         // invalidates escalation cards"): every escalation card exists to
