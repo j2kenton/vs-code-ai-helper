@@ -293,6 +293,12 @@
         "icon": "$(comment)"
       },
       {
+        "command": "vs-code-ai-helper.respondToStageDecision",
+        "title": "Review Pending Decision",
+        "category": "Ensemble",
+        "icon": "$(comment-unresolved)"
+      },
+      {
         "command": "vs-code-ai-helper.postStageQuestion",
         "title": "Post Stage AI Question",
         "category": "Ensemble"
@@ -773,7 +779,12 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-decisionPending/)",
+          "group": "inline@40"
+        },
+        {
+          "command": "vs-code-ai-helper.respondToStageDecision",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && viewItem =~ /-decisionPending/",
           "group": "inline@40"
         },
         {
@@ -798,22 +809,27 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-decisionPending/)",
+          "group": "inline@7"
+        },
+        {
+          "command": "vs-code-ai-helper.respondToStageDecision",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/) && viewItem =~ /-decisionPending/",
           "group": "inline@7"
         },
         {
           "command": "vs-code-ai-helper.viewStageChanges",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && !(viewItem =~ /^stage-publish-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-paused/)",
           "group": "inline@8"
         },
         {
           "command": "vs-code-ai-helper.revertStageChanges",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-revert-available/ && !(viewItem =~ /^stage-publish-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-revert-available/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-paused/)",
           "group": "inline@9"
         },
         {
           "command": "vs-code-ai-helper.redoStageChanges",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-redo-available/ && !(viewItem =~ /^stage-publish-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-redo-available/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-paused/)",
           "group": "inline@9"
         },
         {
@@ -824,7 +840,7 @@
         {
           "command": "vs-code-ai-helper.viewPendingTaskDecision",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-decisionPending/",
-          "group": "inline@1"
+          "group": "inline@0"
         },
         {
           "command": "vs-code-ai-helper.renameTask",

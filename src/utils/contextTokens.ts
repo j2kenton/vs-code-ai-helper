@@ -109,6 +109,17 @@ export interface StageContextInput {
    * Survives reload/crash; never true without hasBackup also true.
    */
   redoAvailable?: boolean;
+  /**
+   * At least one pending workflow decision is scoped to THIS stage — the
+   * chat is holding a question the user has not answered.
+   *
+   * Gates the swap of this stage's "Respond to AI" inline button for
+   * "Review Pending Decision" (menus match /-decisionPending/). Deliberately
+   * a stage-level token even though the same condition already produces one
+   * on the task row: a paused task hides every stage action except the chat
+   * button, so the stage row is where the only reachable action lives.
+   */
+  hasPendingDecision?: boolean;
 }
 
 /**
@@ -301,6 +312,14 @@ export function buildStageContextValue(input: StageContextInput): string {
   // "redo-available".
   if (input.hasBackup) {
     tokens.push(input.redoAvailable ? "redo-available" : "revert-available");
+  }
+
+  // Pending decision: swaps this stage's "Respond to AI" inline button for
+  // "Review Pending Decision" (menus match /-decisionPending/). Kept before
+  // the trailing modelable token so /-modelable$/ clauses keep matching, the
+  // same rule has-backup above follows.
+  if (input.hasPendingDecision) {
+    tokens.push("decisionPending");
   }
 
   // Modelable state (always at the end for regex compatibility)

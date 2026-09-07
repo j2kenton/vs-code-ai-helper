@@ -884,6 +884,20 @@ export function registerChatWithStageCommand(context: vscode.ExtensionContext, i
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.chatWithStage", (arg?: ChatWithStageArg) => chatWithStage(context, inventory, chatViewProvider, arg, currentTaskStore)
   ));
+  // Same destination as chatWithStage above — deliberately a second command
+  // id rather than one command whose presentation varies, because a VS Code
+  // menu contribution cannot change a command's icon or title per when-clause.
+  // Two entries with mutually exclusive `when`s is the only way to make the
+  // button on a stage row LOOK different while a decision is waiting.
+  //
+  // Why it matters (owner-reported 2026-09-07): every stage action button is
+  // gated on `!(viewItem =~ /-paused/)`, so a paused task keeps only the chat
+  // button — which reads "Respond to AI" whether or not anything is actually
+  // waiting. The user's instinct on a stopped task is to hover the row and
+  // press a button; this makes the button they find say what it is for.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.respondToStageDecision", (arg?: ChatWithStageArg) => chatWithStage(context, inventory, chatViewProvider, arg, currentTaskStore)
+  ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.postStageQuestion",
     // This command IS the notification's own "Open Chat" action — the user

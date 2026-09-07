@@ -548,10 +548,29 @@ export class TaskNode extends vscode.TreeItem {
       );
       this.description = `${taskLevelOp.label}…`;
     } else if (isPaused) {
-      this.iconPath = new vscode.ThemeIcon(
-        "debug-pause",
-        new vscode.ThemeColor("charts.orange")
-      );
+      // A paused task holding an unanswered decision is more usefully
+      // described as waiting on the user than as paused: "paused" reads as
+      // something the user did, while the truth is that the workflow stopped
+      // and cannot continue until they answer. The pause itself is not lost —
+      // it stays in the description, in the `-paused` context token every
+      // when-clause reads, and in the presence of the Resume button.
+      //
+      // Only the paused branch does this. Active tasks keep play-circle and
+      // completed tasks keep their tick, because that icon is the user's only
+      // indicator of whether a task is alive (owner-specified 2026-09-07):
+      // an indicator that can mean paused, active or finished means nothing.
+      if (pendingDecisions.length > 0) {
+        this.iconPath = new vscode.ThemeIcon(
+          "comment-unresolved",
+          new vscode.ThemeColor("charts.yellow")
+        );
+        this.description = "paused · needs your decision";
+      } else {
+        this.iconPath = new vscode.ThemeIcon(
+          "debug-pause",
+          new vscode.ThemeColor("charts.orange")
+        );
+      }
     } else if (task.progress.status === "archived") {
       this.iconPath = new vscode.ThemeIcon(
         "archive",
@@ -665,7 +684,22 @@ export class StageNode extends vscode.TreeItem {
      * numbers that used to compete on one review row: implementation owns
      * the percentage, review owns the score. `undefined` for every other
      * stage, and for `impl` itself whenever the task carries no checklist. */
-    implementationProgress?: { complete: number; total: number }
+    implementationProgress?: { complete: number; total: number },
+    /**
+     * How many pending workflow decisions are scoped to THIS stage — the
+     * chat is holding that many questions for the user here.
+     *
+     * Owner-specified (2026-09-07), and deliberately the smallest version of
+     * a larger idea: a decision was raised, correctly recorded, correctly
+     * stage-routed and rendered in chat with its options — and was still
+     * missed, because nothing on the row the user was actually looking at
+     * changed. The stage row's own icon and description are the only parts
+     * of a tree row visible with no hover at all, so they are where "the AI
+     * is waiting on you" has to appear. Inline action buttons are a fine
+     * SECOND surface (the user reaches for them to resume a stopped task),
+     * but they render only on hover, so they cannot be the first signal.
+     */
+    pendingDecisionCount: number = 0
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -685,8 +719,12 @@ export class StageNode extends vscode.TreeItem {
     // would miss it. hasActiveOperationTargetingStage translates through
     // REVIEW_TARGETS (the same mapping reviewActions.ts's
     // isReviewActivelyRerunningV1 uses) so this row still takes the running
-    // branch, which is what suppresses the "· stale" qualifier below in
-    // favor of "Review in progress" (Part 2, review status messaging).
+    // branch, which is what gives it the "running... (previous: N/10)" shape
+    // rather than an idle score (Part 2, review status messaging). It also
+    // still governs the TOOLTIP's freshness wording, which says "Review in
+    // progress" instead of the re-run instruction while a rerun is live —
+    // the row's own "· stale" qualifier this used to suppress no longer
+    // exists (display trim, 2026-09-07).
     //
     // The translated check must itself split on waitingForUser (matchWaiting
     // false/true below) the same way getActiveStages/getWaitingStages split
@@ -741,7 +779,19 @@ export class StageNode extends vscode.TreeItem {
       // the tick alone loses the score/percentage the moment the workflow
       // advances past a stage, which is exactly the "reads as verdict on
       // the instant, not history" gap A3 exists to close.
-      const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
+      //
+      // The "· stale" qualifier that used to ride along here was removed
+      // (owner-specified 2026-09-07). The row is a fixed, narrow strip —
+      // icon, stage name, and ONE number — and every extra word pushes the
+      // things a user acts on out of view; that pressure only grew once the
+      // row started carrying "needs your decision" too. The word also
+      // explained little on its own: a review is self-evidently stale while
+      // its stage is re-running, and the cases where it matters are the ones
+      // a user opens the artifact for anyway. The full explanation survives
+      // where there is room for it — the tooltip still names the commit that
+      // was reviewed and tells the user to re-run — and `staleReviewedSha`
+      // itself is untouched, so nothing that reasons about freshness loses
+      // information. This is a display trim, not a semantic change.
       // A review stage that has never produced a readable artifact at all —
       // no file yet, or a file with no parseable Readiness line — must never
       // render as a BLANK description: blank is indistinguishable from "this
@@ -752,7 +802,7 @@ export class StageNode extends vscode.TreeItem {
       // line; this closes the remaining gap where `tryReadReadiness` returns
       // `undefined` outright because no artifact exists yet.
       const readinessLabel = isReviewStage(stage)
-        ? (readiness ? readiness.label + staleSuffix : "—/10")
+        ? (readiness ? readiness.label : "—/10")
         : undefined;
       // The implementation row's counterpart: the live checklist percentage
       // from plan-final.md, over the FIXED total (implementationChecklist.ts's
@@ -831,6 +881,70 @@ export class StageNode extends vscode.TreeItem {
           );
           break;
       }
+    }
+
+    // Something in chat is waiting on an answer for THIS stage. Applied as an
+    // override AFTER the status branches above rather than as another branch
+    // inside them, so it reaches every stage state (done / current /
+    // outstanding) without restating any of their logic, and so the number
+    // each row already owns — the review score, the implementation
+    // percentage — survives alongside it instead of being replaced.
+    //
+    // `isRunning` deliberately wins: while a round is genuinely in flight the
+    // spinner is the more truthful signal, and a decision raised mid-round is
+    // answerable once it settles. Every other state yields, including the
+    // escalation warning — an escalation says something is wrong, a pending
+    // decision says the user can act on it right now, and the actionable one
+    // belongs on the row.
+    //
+    // NOT gated on the task being paused — deliberately unlike the TASK row
+    // (owner-specified 2026-09-07). The two rows carry different signals: a
+    // task row's icon is the only channel saying whether the task is alive,
+    // so a decision must never overwrite it on an active task, while a stage
+    // row's icon says where the workflow stands, which is exactly the place a
+    // "this stage is waiting on you" mark belongs. The case that decides it:
+    // a user who resumes a paused task and ignores the chat must still find
+    // the indicator when they drill into the stage that owes an answer —
+    // resuming is not answering.
+    //
+    // `isRunning` still wins, which covers the user's own exception: re-run
+    // the review on that stage and the spinner takes the row back until it
+    // settles.
+    //
+    // Completed and archived tasks are excluded because their decisions are
+    // no longer answerable in any useful sense — on 2026-09-07 all 7 pending
+    // decisions in the jester workspace belonged to COMPLETED tasks, the
+    // oldest from 23 August, and lighting those rows up would teach the user
+    // to ignore the mark everywhere else. Nothing actionable is lost: the
+    // inline "Review Pending Decision" BUTTON is not gated at all, so a
+    // stranded decision on a finished task is still reachable and answerable.
+    const taskStatusShowsDecisions =
+      task.progress.status !== "completed" && task.progress.status !== "archived";
+    if (pendingDecisionCount > 0 && !isRunning && taskStatusShowsDecisions) {
+      this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
+      // Same phrasing as the isWaitingForUser branch above, plus the count —
+      // one vocabulary for "this is on you" across every row, rather than a
+      // second wording that has to be learned separately. Not "needs your
+      // decision": some decisions are genuinely optional (the checklist
+      // reconciliation notice says so on its face), and overclaiming on a
+      // row the user cannot dismiss would train them to ignore it.
+      // "needs your decision", not a count and not "waiting for you"
+      // (owner-specified 2026-09-07). "Waiting for you" states a posture and
+      // leaves the user to infer the verb; "needs your decision" names the
+      // act. The count was dropped for the same reason the "· stale"
+      // qualifier was: on a one-line row, a number the user cannot act on
+      // differently — answering is answering whether there is one decision or
+      // three — costs space that the words earn back.
+      const waiting = "needs your decision";
+      // `TreeItem.description` is `string | boolean | undefined`; only a
+      // non-empty STRING carries a number worth keeping in front of it.
+      // `isWaitingForUser` already wrote a bare posture line this replaces,
+      // so it is never appended to itself.
+      const existing =
+        !isWaitingForUser && typeof this.description === "string" && this.description.length > 0
+          ? this.description
+          : undefined;
+      this.description = existing ? `${existing} · ${waiting}` : waiting;
     }
 
     if (artifactUri) {
@@ -932,7 +1046,8 @@ export class StageNode extends vscode.TreeItem {
       isScheduled,
       isMetaManaged,
       hasBackup,
-      redoAvailable
+      redoAvailable,
+      pendingDecisionCount > 0
     );
   }
 
@@ -955,7 +1070,8 @@ export function getStageNodeContextValue(
   isScheduled: boolean = false,
   isMetaManaged: boolean = false,
   hasBackup: boolean = false,
-  redoAvailable: boolean = false
+  redoAvailable: boolean = false,
+  hasPendingDecision: boolean = false
 ): string {
   return buildStageContextValue({
     stage,
@@ -967,6 +1083,7 @@ export function getStageNodeContextValue(
     isMetaManaged,
     hasBackup,
     redoAvailable,
+    hasPendingDecision,
   });
 }
 
@@ -1073,8 +1190,10 @@ export async function tryReadReadiness(
  * never-reviewed decision). Mirrors StageNode's rules exactly:
  *  - a rerun of THIS review stage genuinely in flight: "running... (previous:
  *    N/10)", or plain "running..." when there is no prior score yet;
- *  - idle with a readable score: "N/10", with " · stale" appended when the
- *    review's recorded commit is behind HEAD;
+ *  - idle with a readable score: "N/10" — no freshness qualifier, whether or
+ *    not the review's recorded commit is behind HEAD (display trim,
+ *    2026-09-07; the tree row's tooltip still names the reviewed commit and
+ *    tells the user to re-run);
  *  - idle with nothing readable at all (never reviewed): "—/10".
  *
  * Returns `undefined` for a non-review stage — callers render nothing for it,
@@ -1099,8 +1218,10 @@ export async function describeReviewStageScoreV1(
   if (isRunning) {
     return readiness?.label ? `running... (previous: ${readiness.label})` : "running...";
   }
-  const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
-  return readiness ? `${readiness.label}${staleSuffix}` : "—/10";
+  // No "· stale" qualifier — see the StageNode branch this shares its
+  // contract with. Both surfaces are one narrow line, and the status bar has
+  // even less room than the tree row.
+  return readiness ? readiness.label : "—/10";
 }
 
 /**
@@ -1633,6 +1754,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
     const nodes: StageNode[] = [];
 
+    // Read once for the whole task rather than per stage: `listPending` is
+    // the same store call the task row already makes (see getTaskNodes), and
+    // decisions are stage-scoped the same way chatView.ts renders them
+    // (`listPending(...).filter((d) => d.stage === target.stage)`), so the
+    // two surfaces can never disagree about which stage is being asked.
+    const pendingDecisions = this.workflowDecisionStore?.listPending(taskIdentityKey(task)) ?? [];
+
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
 
@@ -1739,7 +1867,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           hasBackup,
           redoAvailable,
           missingPrerequisite,
-          implementationProgress
+          implementationProgress,
+          pendingDecisions.filter((decision) => decision.stage === stage).length
         )
       );
     }

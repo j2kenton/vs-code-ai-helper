@@ -294,6 +294,148 @@ void describe("getStageNodeContextValue", () => {
 //   visually ambiguous after a refresh.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Owner-reported 2026-09-07: a decision was raised, recorded, stage-routed and
+// rendered in chat with its options — and was missed, because nothing on the
+// row the user was looking at changed. The stage row's own icon/description are
+// the only parts of a tree row visible with NO hover, so that is where "the AI
+// is waiting on you" has to appear.
+// ---------------------------------------------------------------------------
+
+/** `makeTask` with the paused status the decision indicator is gated on. */
+function makePausedTask(currentStage: TaskStage = "impl"): ReturnType<typeof makeTask> {
+  const task = makeTask(currentStage);
+  return { ...task, progress: { ...task.progress, status: "paused" as unknown as "active" } };
+}
+
+void describe("StageNode — pending decision indicator", () => {
+  void it("shows the unresolved-comment icon and a count when a decision is scoped to this stage", () => {
+    const task = makePausedTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined, 1
+    );
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "comment-unresolved");
+    assert.strictEqual((icon.color as unknown as { id: string }).id, "charts.yellow");
+    assert.strictEqual(node.description, "needs your decision");
+  });
+
+  void it("keeps the row's own number and appends the count rather than replacing it", () => {
+    const task = makePausedTask("impl");
+    const node = new StageNode(
+      task, "plan-high-review", "done", undefined, { label: "9/10" }, false, false, false, false, undefined, undefined, 2
+    );
+
+    // The done tick is replaced (the decision is the actionable fact), but the
+    // score the row owns must survive alongside the count.
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "comment-unresolved");
+    assert.strictEqual(node.description, "9/10 · needs your decision");
+  });
+
+  void it("still marks the stage on an ACTIVE task — resuming a task is not answering its decision", () => {
+    // Unlike the TASK row (whose icon is the only "is this alive?" channel and
+    // is therefore pause-gated), a stage row's icon says where the workflow
+    // stands. A user who resumes and ignores the chat must still find the mark
+    // when they drill into the stage that owes an answer.
+    const task = makeTask("plan-high-review");
+    const node = new StageNode(
+      task, "plan-high-review", "current", undefined, { label: "9/10" }, false, false, false, false, undefined, undefined, 3
+    );
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "comment-unresolved");
+    assert.strictEqual(node.description, "9/10 · needs your decision");
+  });
+
+  void it("stays quiet on a COMPLETED task, whose decisions are no longer answerable", () => {
+    // jester carried 7 pending decisions on finished tasks (oldest 23 Aug);
+    // marking those rows would train the user to ignore the indicator. The
+    // inline button is still offered, so nothing actionable is lost.
+    const base = makeTask("plan-high-review");
+    const task = { ...base, progress: { ...base.progress, status: "completed" as unknown as "active" } };
+    const node = new StageNode(
+      task, "plan-high-review", "done", undefined, { label: "9/10" }, false, false, false, false, undefined, undefined, 2
+    );
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "check");
+    assert.strictEqual(node.description, "9/10");
+  });
+
+  void it("leaves the row untouched when no decision is scoped to this stage", () => {
+    const task = makePausedTask("plan-high-review");
+    const node = new StageNode(
+      task, "plan-high-review", "current", undefined, { label: "9/10" }, false, false, false, false, undefined, undefined, 0
+    );
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "arrow-right");
+    assert.strictEqual(node.description, "9/10");
+  });
+
+  void it("defaults to no indicator when the count argument is omitted entirely", () => {
+    const task = makePausedTask("impl");
+    const node = new StageNode(task, "impl", "current", undefined);
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.notStrictEqual(icon.id, "comment-unresolved");
+  });
+
+  void it("offers the button on a COMPLETED task even though the icon stays quiet", () => {
+    // The two surfaces are gated differently on purpose: the icon competes
+    // with a status signal, the button does not. A decision stranded on
+    // finished work must still be reachable and answerable.
+    const base = makeTask("impl");
+    const task = { ...base, progress: { ...base.progress, status: "completed" as unknown as "active" } };
+    const node = new StageNode(
+      task, "impl", "done", undefined, undefined, false, false, false, false, undefined, undefined, 1
+    );
+
+    assert.ok(node.contextValue?.includes("decisionPending"));
+    assert.strictEqual((node.iconPath as import("vscode").ThemeIcon).id, "check");
+  });
+
+
+  void it("carries the decisionPending context token so the row's chat button can be swapped", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined, 1
+    );
+
+    assert.ok(
+      node.contextValue?.includes("decisionPending"),
+      `expected a decisionPending token, got "${node.contextValue}"`
+    );
+  });
+
+  void it("keeps decisionPending BEFORE the trailing modelable token", () => {
+    // package.json's chat-button clauses match /-modelable$/, anchored at the
+    // end. A token appended after `modelable` would silently unbind the
+    // button this feature exists to swap — the same rule has-backup follows.
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined, 2
+    );
+
+    assert.ok(
+      node.contextValue?.endsWith("modelable"),
+      `contextValue must still end with "modelable", got "${node.contextValue}"`
+    );
+  });
+
+  void it("omits the decisionPending token when nothing is pending for the stage", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined, 0
+    );
+
+    assert.ok(!node.contextValue?.includes("decisionPending"));
+    assert.ok(node.contextValue?.endsWith("modelable"));
+  });
+});
+
 void describe("StageNode — done review stage icon", () => {
   void it('renders green "check" tick when status is "done" and readiness data is present', () => {
     const task = makeTask("impl"); // current stage is after plan-high-review
@@ -1411,8 +1553,11 @@ void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
         (n): n is StageNode => n instanceof StageNode && n.stage === "impl-high-review"
       );
       assert.ok(reviewNode, "the current review stage renders a StageNode");
+      // The row no longer prints "· stale" (display trim, 2026-09-07) — the
+      // freshness fact this test exists for now lives in the tooltip, which
+      // has room to name the commit and say what to do about it.
       assert.ok(
-        String(reviewNode.description).includes("stale"),
+        String((reviewNode.tooltip as vscode.MarkdownString).value).includes("no longer HEAD"),
         "the cached path still flags a behind-HEAD review"
       );
 
@@ -1548,7 +1693,7 @@ void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
         );
         assert.ok(reviewNode, "each task's current review stage renders a StageNode");
         assert.ok(
-          String(reviewNode.description).includes("stale"),
+          String((reviewNode.tooltip as vscode.MarkdownString).value).includes("no longer HEAD"),
           "the shared-cache path still flags every behind-HEAD review"
         );
       }
