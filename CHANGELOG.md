@@ -2,6 +2,22 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [Unreleased] — Stalled-task detection, and a decision backlog that self-heals
+
+### Added
+
+- **A task can no longer stop working without saying so.** The headline fix of this release. A task `active` with no live operation, no owed continuation and nothing scheduled is in a state that cannot occur while work is actually happening — but by definition nothing announced it, because every other failure mode leaves *some* trace (an escalation, a paused status, a visible error) and this one is defined by producing nothing. A periodic sweep now detects that state, pauses the task and escalates, so silent death becomes a visible pause with a reason. Detection is deliberately restricted to durable, cross-window state (the persisted round ledger, `implRecovery`, `scheduledRun`, and the scheduling-intent store) rather than one window's in-memory bookkeeping, and it fails *open* — it never pauses a task that might still be about to do something.
+- **`Resume and apply the current stage action`** — a paused task previously offered no route back that also arranged work; resume was a status flip with no dispatch behind it.
+
+### Fixed
+
+- **Resuming a task reset the stall clock only by accident, so a resumed task could be re-paused within seconds.** The quiet period that stands the detector down measures "recently touched" from `progress.updatedAt` — and pausing bumps that field while resuming deliberately preserved it, on the reasoning that resuming is selection rather than progress. A task resumed after a watchdog pause therefore inherited the *pause's* timestamp, so its real grace period was `quiet period − time since the pause`, not the quiet period. Measured: a pause at 09:45:28 and a resume at 09:46:12 left about 46 seconds under the 90-second threshold this originally shipped with — which reads to the user as "resuming does nothing, it just pauses again", and made getting any work started a race. Resume now bumps `updatedAt`, so the grace period runs from the user's own action. Focus/selection activation still preserves freshness; that case really is selection.
+- **The quiet period itself was too short to survive a round's setup phase.** A command that is starting work has not yet opened the round-ledger row that would exempt its task, so throughout setup it is indistinguishable from a task doing nothing — and the sweep could pause a task while a review was assembling a 47 KB context pack, after which the review aborted on its own paused check. Raised to ten minutes: long enough that no setup phase is outrun, still far shorter than the hours-long idles real silent stops produce. Detection latency is the cheap side of this trade. This is a mitigation, not the whole fix — the ordering problem it papers over (register the round's intent *before* setup, not after) is tracked separately.
+- **Workflow decisions could pile up as unanswerable duplicates.** One recurring condition let `post()` accumulate up to 245 simultaneous pending duplicates of the same decision — an untractable backlog no human could work through by hand, which also made the genuine decision impossible to find among them. The resolve/dispatch mechanism itself was already correct. `post()` now finds every matching pending duplicate rather than only the first and withdraws all but one, so an existing backlog self-heals to a single answerable decision on the next repost.
+- **Reconcile decision records could grow without bound.** Evidence lists in reconcile records (`pendingImplReviewFiles`, `pendingOperationEvidence`, `coveredItems`) are now bounded, so a task with a large change set can't produce a record that grows until it becomes a problem in its own right.
+- **Round-ledger rows could be closed while their work was still live.** Reconciliation now protects rows carrying an `operationId` by live scheduling intent when no live operation ids match, instead of treating "no match" as proof the round is dead.
+- **`markRoundLiveV1` silently swallowed a failed persist** — it now reports persistence status and logs a warning when a lease is missing, so a round that failed to register as live is visible rather than inferred later from its consequences.
+
 ## [Unreleased] — Add opencode CLI provider
 
 ### Added
