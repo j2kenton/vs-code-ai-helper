@@ -15,6 +15,7 @@ import {
   resetHostIdentityForTestV1,
   resolveDurableHostIdentityV1,
   resolveHostIdentityV1,
+  setHostIdentityFsFailureInjectionForTestV1,
 } from "../state/hostIdentityV1";
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
 
@@ -515,4 +516,119 @@ void test("when cleanup ALSO fails after a rename failure, the claim is left beh
       fs.unlinkSync(path.join(dir, entry));
     }
   }
+});
+
+// ── Review-round coverage added 2026-09-08 (blockers `…-0`/`…-1`/`…-2`, and
+// the non-blocking heartbeat-queue suggestion) ─────────────────────────────
+
+void test("a non-EEXIST link failure still converges on a record someone else published moments before, instead of minting an independent ephemeral id", async () => {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-link-failure-converge-"));
+  const publishedId = "22222222-2222-2222-2222-222222222222";
+  const finalPath = path.join(root, "host-identity-v1.json");
+  setHostIdentityFsFailureInjectionForTestV1({
+    onBeforeLink: () => {
+      // Simulate a concurrent racer publishing the durable record at the
+      // exact moment this caller's own link() attempt runs, then report a
+      // REAL (non-EEXIST) failure for THIS caller's own attempt — e.g. a
+      // transient handle/locking issue, not ordinary contention.
+      fs.writeFileSync(
+        finalPath,
+        JSON.stringify({ hostId: publishedId, hostname: "other-host", createdAt: new Date().toISOString() })
+      );
+      return Object.assign(new Error("simulated EPERM on link"), { code: "EPERM" });
+    },
+  });
+  try {
+    const id = await resolveDurableHostIdentityV1(root);
+    assert.equal(
+      id,
+      publishedId,
+      "must read back and converge on the record that actually got published, not mint its own ephemeral id"
+    );
+    assert.ok(!id.startsWith("ephemeral-"), "a readable durable record must never be abandoned for an ephemeral fallback");
+  } finally {
+    setHostIdentityFsFailureInjectionForTestV1(undefined);
+  }
+});
+
+void test("a live marker plus a cleanup failure on the losing claim escalates to writeFailed, naming both the real owner and the stranded claim", async () => {
+  const task = freshTaskFolder("existing-marker-cleanup-failure");
+  const first = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "owner-a",
+  });
+  assert.equal(first.outcome, "acquired");
+  if (first.outcome !== "acquired") return;
+
+  const cleanupError = Object.assign(new Error("simulated EBUSY on claim unlink"), { code: "EBUSY" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeClaimCleanupUnlink: () => cleanupError,
+  });
+  try {
+    const second = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "owner-b",
+    });
+    // Completion blocker fix, narrowed (2026-09-08 review): a cleanup
+    // failure on the LOSING caller's own claim must never be reported as a
+    // plain "busy" — that would hide that owner-b's OWN admission.claim file
+    // is now stranded on disk too, on top of owner-a's real live marker.
+    assert.equal(second.outcome, "writeFailed");
+    if (second.outcome === "writeFailed") {
+      assert.match(second.error.message, /owner-a/, "the real owner's identity must still be named");
+      assert.match(second.error.message, /could not be removed during cleanup/);
+      assert.match(second.error.message, /simulated EBUSY on claim unlink/);
+    }
+    // owner-a's live marker itself is untouched by owner-b's failed cleanup.
+    assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+    // Manual cleanup of owner-b's stranded claim.claim so this test doesn't
+    // leak it into TEST_ROOT's teardown expectations (the injected failure
+    // is gone now).
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    for (const entry of fs.readdirSync(dir)) {
+      if (entry === "admission.claim") {
+        fs.unlinkSync(path.join(dir, entry));
+      }
+    }
+    await first.handle.release();
+  }
+});
+
+void test("a failed heartbeat does not poison the owner-local queue: release() afterward still removes the marker", async () => {
+  const task = freshTaskFolder("heartbeat-failure-does-not-poison-release");
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "heartbeat-poison-test",
+  });
+  assert.equal(result.outcome, "acquired");
+  if (result.outcome !== "acquired") return;
+
+  const injectedError = Object.assign(new Error("simulated EBUSY on heartbeat rename"), { code: "EBUSY" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeHeartbeatRename: () => injectedError,
+  });
+  try {
+    await assert.rejects(() => result.handle.heartbeat(), /simulated EBUSY on heartbeat rename/);
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+
+  // Non-blocking review suggestion (2026-09-08): before the fix, a rejected
+  // heartbeat step became the new `queue`, and every LATER queued step
+  // (release/handover) chained onto it via a bare `.then()` with no
+  // rejection handler — passing the same rejection through forever without
+  // ever actually running. release() must still unlink the marker.
+  await result.handle.release();
+  assert.equal(
+    hasLiveWorkAdmissionBestEffortV1(task),
+    false,
+    "release() after a failed heartbeat must still remove the marker, not silently no-op"
+  );
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  assert.equal(fs.readdirSync(dir).length, 0);
 });

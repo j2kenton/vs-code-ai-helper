@@ -6005,18 +6005,31 @@ export async function runReviewWithAI(
       heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
 
-    if (resolved.progress.status === "paused") {
-      // v1 fixes item 1 (Part 1a): admission is now guaranteed live for this
-      // exact target — a pause observed only now can only be the watchdog's
-      // own (a user cannot pause a task admission already protects from the
-      // impossible state), so reverse it and continue rather than bail. Never
-      // reverses anything else: `reconcileWatchdogPauseAgainstAdmissionV1`
-      // checks the pause's own recorded reason before touching it.
-      const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
-      if (reconciled.outcome !== "reversed") {
-        NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
-        return;
-      }
+    // 2026-09-08 review (blocker `…-0`): reread and reconcile
+    // UNCONDITIONALLY, not only when the pre-admission `resolved.progress`
+    // snapshot already said paused. `resolved.progress` was captured by
+    // `resolveTask` BEFORE admission (in both the early- and late-acquisition
+    // paths above), so a watchdog pause that landed in the window between
+    // that read and admission actually publishing would leave
+    // `resolved.progress.status` stale at "active" and skip reconciliation
+    // entirely under the old conditional check. `reconcileWatchdogPauseAgainstAdmissionV1`
+    // itself performs a fresh disk read on every call and is a genuine no-op
+    // (no write) when the task is not currently paused, so calling it
+    // unconditionally costs one extra read, never an extra write. Admission
+    // is now guaranteed live for this exact target, so any pause found here
+    // can only be the watchdog's own; a user pause is never reversed
+    // (`reconcileWatchdogPauseAgainstAdmissionV1` checks the pause's own
+    // recorded reason before touching it).
+    const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+    if (reconciled.outcome === "unreadable") {
+      NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+      return;
+    }
+    if (reconciled.outcome === "userPaused") {
+      NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+      return;
+    }
+    if (reconciled.outcome === "reversed") {
       resolved.progress = reconciled.progress;
     }
 
@@ -6455,6 +6468,62 @@ export async function fastForwardReviewWithAI(
   chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // 2026-09-08 review (blocker `…-4`, new): moved to run BEFORE the §7.5
+  // provider-path gate and its `{ taskFolderPath }` peek below. Both are
+  // awaited I/O — a CLI existence probe / Copilot model-list probe, or a
+  // targeted task-progress read — that used to run first, leaving a target
+  // already known synchronously from `arg` unprotected from the watchdog
+  // sweep for their whole duration (the exact setup-phase race this task
+  // exists to close, on the one route that still deferred acquisition past
+  // its first awaited step). Acquiring here — the first awaited thing this
+  // function does after the legacy-route gate — closes that window. The rest
+  // of the function, INCLUDING the provider-path gate and peek below, is now
+  // inside the try/finally further down, so this handle is always released,
+  // however early a return happens (including from those two gates, which
+  // used to return before admission had ever been acquired). This does not
+  // reorder the provider-path gate itself relative to the workspace-folder
+  // guard, the malformed-arg guard, `ensureAiConsent`'s modal, or
+  // `resolveTask` — AC-HOST-03 still requires the gate to precede all of
+  // those, and it still does, just now with admission acquired first when
+  // the target is already known. A malformed or workspace-less `arg` can
+  // never produce a folder path here either: `extractSynchronousReviewFolderPathV1`
+  // requires the same `task.folderUri`/`taskFolderPath` shape `isMalformedReviewArg`
+  // validates, so those guards below still reject such args before any real
+  // work starts. The no-arg QuickPick path has no folder to protect until
+  // `resolveTask` picks one, so this stays undefined here and admission is
+  // acquired right after resolution instead, mirroring `runReviewWithAI`.
+  const ffEarlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
+  const ffEarly = ffEarlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: ffEarlyFolderPath,
+        purpose: "admission",
+        commandId: "fastForwardReviewWithAI",
+      })
+    : undefined;
+  if (ffEarly && ffEarly.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffEarly));
+    return;
+  }
+
+  let ffHandle: WorkAdmissionHandleV1 | undefined = ffEarly?.outcome === "acquired" ? ffEarly.handle : undefined;
+  let ffHeartbeat = ffHandle ? setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let ffReleased = false;
+  const releaseFfAdmissionV1 = async (): Promise<void> => {
+    if (ffReleased) {
+      return;
+    }
+    ffReleased = true;
+    if (ffHeartbeat) {
+      clearInterval(ffHeartbeat);
+    }
+    if (ffHandle) {
+      await ffHandle.release();
+    }
+  };
+
+  try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
   // touches TaskInventory, current-task state, or any per-task file — but
   // it is NOT zero-I/O: it resolves the impl stage's WINNING candidate via
@@ -6463,9 +6532,9 @@ export async function fastForwardReviewWithAI(
   // to a configured backup) and, only when that candidate is Copilot,
   // additionally probes the host API shape (see checkEditActionProviderPathGateV1's
   // own header in runEditActionV1.ts). Calling it here, unconditionally, is
-  // the first thing this function does after the legacy-route gate —
-  // strictly before ANY task or source read, including an in-memory
-  // TaskInventory lookup.
+  // the first thing this function does after the legacy-route gate and early
+  // admission above — strictly before ANY task or source read, including an
+  // in-memory TaskInventory lookup.
   //
   // Fast Forward's apply loop only reaches the edit-capable branch
   // (applyReviewEditWithAI's edit branch) when the target review is an
@@ -6537,46 +6606,6 @@ export async function fastForwardReviewWithAI(
     return;
   }
 
-  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
-  // Same rationale and mechanism as `runReviewWithAI` immediately above:
-  // acquire durable admission BEFORE the consent gate and task resolution
-  // whenever the target folder is known synchronously from `arg`, so the
-  // whole of Fast Forward's setup phase (consent's unbounded wait, task
-  // resolution, the provider-path/availability gates already run above, the
-  // initial-review dispatch) is protected from the watchdog sweep. The no-arg
-  // QuickPick path has no folder to protect until `resolveTask` picks one, so
-  // this stays undefined here and admission is acquired right after
-  // resolution instead, mirroring `runReviewWithAI` exactly.
-  const ffEarlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
-  const ffEarly = ffEarlyFolderPath
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: ffEarlyFolderPath,
-        purpose: "admission",
-        commandId: "fastForwardReviewWithAI",
-      })
-    : undefined;
-  if (ffEarly && ffEarly.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffEarly));
-    return;
-  }
-
-  let ffHandle: WorkAdmissionHandleV1 | undefined = ffEarly?.outcome === "acquired" ? ffEarly.handle : undefined;
-  let ffHeartbeat = ffHandle ? setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let ffReleased = false;
-  const releaseFfAdmissionV1 = async (): Promise<void> => {
-    if (ffReleased) {
-      return;
-    }
-    ffReleased = true;
-    if (ffHeartbeat) {
-      clearInterval(ffHeartbeat);
-    }
-    if (ffHandle) {
-      await ffHandle.release();
-    }
-  };
-
-  try {
   const consented = await ensureAiConsent(context);
   if (!consented) {
     return;
@@ -6616,16 +6645,23 @@ export async function fastForwardReviewWithAI(
     ffHeartbeat = setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
-  if (resolved.progress.status === "paused") {
-    // Admission is now guaranteed live for this exact target — a pause
-    // observed only now can only be the watchdog's own, so reverse it and
-    // continue rather than bail. Same reconciliation `runReviewWithAI` uses;
-    // never reverses a user pause.
-    const ffReconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
-    if (ffReconciled.outcome !== "reversed") {
-      NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
-      return;
-    }
+  // 2026-09-08 review (blocker `…-4`): reread and reconcile UNCONDITIONALLY,
+  // same fix and same rationale as `runReviewWithAI` above — checking the
+  // pre-admission `resolved.progress.status` snapshot can miss a watchdog
+  // pause that landed in the window between that read and admission actually
+  // publishing. Admission is now guaranteed live for this exact target, so
+  // any pause found here can only be the watchdog's own; a user pause is
+  // never reversed.
+  const ffReconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+  if (ffReconciled.outcome === "unreadable") {
+    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    return;
+  }
+  if (ffReconciled.outcome === "userPaused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
+    return;
+  }
+  if (ffReconciled.outcome === "reversed") {
     resolved.progress = ffReconciled.progress;
   }
 

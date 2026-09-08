@@ -70,6 +70,58 @@ function readValidHostIdentitySyncV1(filePath: string): string | undefined {
   return undefined;
 }
 
+function sleepV1(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A handful of short, bounded retries — enough to ride out a transient
+ * read glitch (e.g. antivirus/indexer locking on Windows, a filesystem
+ * hiccup) without turning a real "nothing durable exists yet" miss into a
+ * long stall. */
+const HOST_IDENTITY_READ_RETRY_COUNT_V1 = 3;
+const HOST_IDENTITY_READ_RETRY_DELAY_MS_V1 = 20;
+
+/**
+ * 2026-09-08 review (blocker `…-1`, narrowed): every failure branch below
+ * used to fall back to `readValidHostIdentitySyncV1` — a single, synchronous,
+ * best-effort read — or straight to a fresh `ephemeral-${randomUUID()}`
+ * without even that. A transient read glitch (the winning file momentarily
+ * locked by an indexer/antivirus scan, a slow filesystem) then looked
+ * identical to "nothing durable exists", and two racing hosts that each hit
+ * a transient glitch at slightly different moments would each mint their own
+ * independent ephemeral id instead of converging once the glitch passed.
+ * This retries the read a few times, with a short delay between attempts,
+ * before conceding — used everywhere this module is about to give up and
+ * fail open, so any failure path checks for an already-durable winner first.
+ */
+async function readValidHostIdentityWithRetryV1(filePath: string): Promise<string | undefined> {
+  for (let attempt = 0; attempt < HOST_IDENTITY_READ_RETRY_COUNT_V1; attempt++) {
+    const value = readValidHostIdentitySyncV1(filePath);
+    if (value) {
+      return value;
+    }
+    if (attempt < HOST_IDENTITY_READ_RETRY_COUNT_V1 - 1) {
+      await sleepV1(HOST_IDENTITY_READ_RETRY_DELAY_MS_V1);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Test-only deterministic failure injection for the `link()` publish step —
+ * otherwise as impractical to force reliably and cross-platform as the
+ * equivalent seam in `workAdmissionV1.ts` (see that module's own doc comment
+ * for why). Set only from tests; `undefined` (the default) means production
+ * behavior is unchanged.
+ */
+export interface HostIdentityFsFailureInjectionV1 {
+  readonly onBeforeLink?: () => Error | undefined;
+}
+let fsFailureInjectionV1: HostIdentityFsFailureInjectionV1 | undefined;
+export function setHostIdentityFsFailureInjectionForTestV1(injection: HostIdentityFsFailureInjectionV1 | undefined): void {
+  fsFailureInjectionV1 = injection;
+}
+
 /**
  * The actual exclusive-create-then-read-fallback race, with no in-process
  * short-circuit. Exported (only) so tests can drive genuine concurrent
@@ -121,23 +173,35 @@ export async function resolveDurableHostIdentityV1(rootDir: string): Promise<str
     // into the shared final path.
     await fs.promises.writeFile(tempPath, JSON.stringify(record), { flag: "wx" });
   } catch {
-    // Cannot persist a durable identity (permissions, missing volume, ...) —
-    // fail open to an ephemeral id rather than blocking every admission call
-    // on a storage problem outside its scope.
-    return `ephemeral-${randomUUID()}`;
+    // Cannot even create our own private, uniquely-named temp file —
+    // genuinely a storage/permission problem, not contention. Before
+    // conceding to a private ephemeral id, check (with retry) whether a
+    // durable record already exists — a concurrent racer may have published
+    // one moments ago even though nothing about that publication caused our
+    // own failure. Only fail open when there is truly nothing to converge on.
+    return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
   }
   try {
+    const injected = fsFailureInjectionV1?.onBeforeLink?.();
+    if (injected) {
+      throw injected;
+    }
     await fs.promises.link(tempPath, filePath);
     return record.hostId;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      return `ephemeral-${randomUUID()}`;
+      // A non-EEXIST link failure (EPERM, a transient handle/locking issue,
+      // ...) does not by itself prove no one else has published — check
+      // (with retry) before failing open to our own independent ephemeral id.
+      return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
     }
     // Someone else published first. Their temp file was necessarily complete
     // BEFORE their link() could succeed (link only ever exposes fully-written
-    // content — see doc comment above), so the final path is safe to read
-    // immediately, with no retry/backoff needed.
-    return readValidHostIdentitySyncV1(filePath) ?? `ephemeral-${randomUUID()}`;
+    // content — see doc comment above), so the final path holds a complete
+    // record as soon as it is readable at all; retry a transient read glitch
+    // (e.g. a momentary lock from an indexer/antivirus scan) rather than
+    // treating it as "nothing published" on the first miss.
+    return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
   } finally {
     // Always remove our own private temp file — it played no further role
     // once link() has either published it or failed.

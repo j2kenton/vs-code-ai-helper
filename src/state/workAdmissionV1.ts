@@ -251,9 +251,40 @@ export function hasLiveWorkAdmissionBestEffortV1(taskFolderPath: string): boolea
   }
 }
 
+/** Build a `busy` diagnostic directly from a known marker file, bypassing
+ * `describeWorkAdmissionBlockerV1`'s claim-before-marker priority. Used where
+ * the caller already positively knows the REAL blocker is a marker (not its
+ * own claim) — see that function's own doc comment for why conflating the
+ * two there would be wrong. */
+function describeMarkerAsBlockerV1(markerFilePath: string, now: number): WorkAdmissionBusyV1 {
+  let ageMs = 0;
+  try {
+    ageMs = now - fs.statSync(markerFilePath).mtimeMs;
+  } catch {
+    ageMs = Number.POSITIVE_INFINITY;
+  }
+  return {
+    outcome: "busy",
+    owner: readClaimInfoSyncV1(markerFilePath),
+    markerPath: markerFilePath,
+    ageMs,
+    likelyStale: ageMs > WORK_ADMISSION_LIKELY_STALE_MS_V1,
+  };
+}
+
 /** Diagnostic snapshot of whatever is currently blocking admission for a
  * task, for a `busy` outcome's message or a stand-down log line. `undefined`
- * when nothing is present. */
+ * when nothing is present.
+ *
+ * Prioritizes a live `admission.claim` over a marker: normally correct (a
+ * claim mid-genesis is a real, if young, blocker), but this makes it the
+ * WRONG diagnostic for a caller who already knows the real blocker is a
+ * MARKER and who may itself have a not-yet-cleaned-up claim sitting at the
+ * same fixed path (e.g. cleanup failed after losing to an existing marker) —
+ * that caller would see this function misreport its OWN stale claim as "the
+ * blocker" instead of the marker's real owner. Such a caller must use
+ * `describeMarkerAsBlockerV1` on the marker it already found directly,
+ * rather than calling this. */
 export function describeWorkAdmissionBlockerV1(
   taskFolderPath: string,
   now: number = Date.now()
@@ -276,20 +307,7 @@ export function describeWorkAdmissionBlockerV1(
   if (markers.length === 0) {
     return undefined;
   }
-  const marker = markers[0]!;
-  let ageMs = 0;
-  try {
-    ageMs = now - fs.statSync(marker.filePath).mtimeMs;
-  } catch {
-    ageMs = Number.POSITIVE_INFINITY;
-  }
-  return {
-    outcome: "busy",
-    owner: readClaimInfoSyncV1(marker.filePath),
-    markerPath: marker.filePath,
-    ageMs,
-    likelyStale: ageMs > WORK_ADMISSION_LIKELY_STALE_MS_V1,
-  };
+  return describeMarkerAsBlockerV1(markers[0]!.filePath, now);
 }
 
 /** Small fixed delays between cleanup retries — long enough to ride out a
@@ -380,6 +398,11 @@ export interface WorkAdmissionFsFailureInjectionV1 {
   readonly onBeforeClaimWrite?: () => Error | undefined;
   readonly onBeforeMarkerRename?: () => Error | undefined;
   readonly onBeforeClaimCleanupUnlink?: () => Error | undefined;
+  /** Non-blocking review suggestion (2026-09-08): forces a genuine (non-ENOENT)
+   * failure of a HEARTBEAT's own rename, distinct from `onBeforeMarkerRename`
+   * (genesis only) — otherwise as impractical to produce reliably as the two
+   * genesis steps above, for the same reason. */
+  readonly onBeforeHeartbeatRename?: () => Error | undefined;
 }
 let fsFailureInjectionV1: WorkAdmissionFsFailureInjectionV1 | undefined;
 export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmissionFsFailureInjectionV1 | undefined): void {
@@ -463,17 +486,39 @@ export async function acquireWorkAdmissionV1(params: {
     return { outcome: "writeFailed", error: withCleanupFailureNotedV1(error as Error, cleanupError, claimPath) };
   }
   if (existingMarkers.length > 0) {
-    await cleanupOwnClaimBestEffortV1(claimPath);
-    const blocker = describeWorkAdmissionBlockerV1(taskFolderPath);
-    return (
-      blocker ?? {
-        outcome: "busy",
-        owner: undefined,
-        markerPath: existingMarkers[0]!.filePath,
-        ageMs: 0,
-        likelyStale: false,
-      }
+    // 2026-09-08 review (blocker `…-2`, narrowed): this branch used to await
+    // cleanup and discard whatever it returned. If that unlink genuinely
+    // fails (not ENOENT — `cleanupOwnClaimBestEffortV1` already treats a
+    // displaced claim as success), OUR OWN just-created `admission.claim`
+    // is left behind on disk, and since v1a never reclaims a stale claim
+    // automatically, every later caller for this task is now permanently
+    // "busy" against a claim that isn't even the live marker's owner — the
+    // exact stranding this whole cleanup path exists to prevent. A `busy`
+    // result alone would hide that: the caller would correctly learn about
+    // the OTHER owner's marker but never learn its own claim also needs
+    // manual removal. Escalate to `writeFailed`, composing the busy
+    // diagnosis as the primary message via `withCleanupFailureNotedV1`, so
+    // the stranded-claim note always reaches the caller when it happens.
+    //
+    // The busy diagnosis is captured from `existingMarkers[0]` directly via
+    // `describeMarkerAsBlockerV1`, NOT via `describeWorkAdmissionBlockerV1(taskFolderPath)`
+    // — that function checks for a live `admission.claim` FIRST, and if
+    // cleanup below fails, THIS caller's own not-yet-removed claim is sitting
+    // at that exact fixed path. Calling it (especially after cleanup, when
+    // failure is most likely) would misreport this caller's own stranded
+    // claim as "the blocker" instead of the marker's real owner.
+    const busy = describeMarkerAsBlockerV1(existingMarkers[0]!.filePath, Date.now());
+    const cleanupError = await cleanupOwnClaimBestEffortV1(claimPath);
+    if (!cleanupError) {
+      return busy;
+    }
+    const ownerDetail = busy.owner
+      ? `held by ${busy.owner.commandId} (pid ${busy.owner.pid} on ${busy.owner.hostId})`
+      : "held by an unreadable record";
+    const primary = new Error(
+      `Work admission is already ${ownerDetail} at ${busy.markerPath}.`
     );
+    return { outcome: "writeFailed", error: withCleanupFailureNotedV1(primary, cleanupError, claimPath) };
   }
 
   let currentGeneration = 1;
@@ -496,8 +541,28 @@ export async function acquireWorkAdmissionV1(params: {
   // Owner-local serialization queue: heartbeat and release for THIS handle
   // must never run concurrently with each other, or a heartbeat could rename
   // a marker release just unlinked (or vice versa).
+  //
+  // Non-blocking review suggestion (2026-09-08): `queue` itself must never
+  // become a rejected promise. The original `queue = queue.then(fn)` made a
+  // failed step's rejection the new `queue` — every LATER call chains via
+  // `.then()` with no rejection handler, which passes a rejection straight
+  // through without ever running `fn`. A single failed heartbeat (a real,
+  // non-ENOENT rename error) would then permanently poison `release()` and
+  // `handover()` for this handle: they would resolve to that same old
+  // rejection without ever unlinking the marker, leaving it behind forever.
+  // `enqueueV1` keeps the CALLER-facing promise for each step accurately
+  // reflecting that step's own success/failure (so a failed heartbeat's
+  // caller still sees the error), while the internal `queue` used purely for
+  // sequencing always settles, so the next queued step still runs regardless
+  // of how the previous one ended.
   let queue: Promise<void> = Promise.resolve();
   let released = false;
+
+  function enqueueV1(fn: () => Promise<void>): Promise<void> {
+    const step = queue.then(fn);
+    queue = step.catch(() => undefined);
+    return step;
+  }
 
   const handle: WorkAdmissionHandleV1 = {
     ownerToken,
@@ -505,7 +570,7 @@ export async function acquireWorkAdmissionV1(params: {
     commandId,
     purpose,
     heartbeat(): Promise<void> {
-      queue = queue.then(async () => {
+      return enqueueV1(async () => {
         if (released) {
           return;
         }
@@ -513,6 +578,10 @@ export async function acquireWorkAdmissionV1(params: {
         const nextEpoch = freshEpochV1();
         const nextPath = path.join(dir, markerBasenameV1(ownerToken, nextGeneration, nextEpoch));
         try {
+          const injected = fsFailureInjectionV1?.onBeforeHeartbeatRename?.();
+          if (injected) {
+            throw injected;
+          }
           await fs.promises.rename(currentPath, nextPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -525,19 +594,16 @@ export async function acquireWorkAdmissionV1(params: {
         currentGeneration = nextGeneration;
         currentPath = nextPath;
       });
-      return queue;
     },
     release(): Promise<void> {
-      queue = queue.then(() => releaseMarkerOnceV1());
-      return queue;
+      return enqueueV1(() => releaseMarkerOnceV1());
     },
     handover(): Promise<void> {
       // See the interface doc comment: mechanically identical to `release()`
       // in v1a — same exact-filename unlink, same ENOENT-is-displaced
       // handling, same owner-local queue — distinguished only by call-site
       // intent (protection was handed off, not simply finished).
-      queue = queue.then(() => releaseMarkerOnceV1());
-      return queue;
+      return enqueueV1(() => releaseMarkerOnceV1());
     },
   };
 
