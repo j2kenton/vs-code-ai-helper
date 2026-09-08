@@ -11377,12 +11377,6 @@ export async function runImplementationWithAI(
     return;
   }
 
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
-    return;
-  }
-
   // Keyboard and coordinator callers target a specific path. Normalize it
   // before resolving so an action for the current task can never fall back to
   // a QuickPick containing another eligible implementation task.
@@ -11394,6 +11388,53 @@ export async function runImplementationWithAI(
     return;
   }
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the consent gate (an unbounded human
+  // wait) and task resolution, exactly like `runReviewWithAI`/
+  // `fastForwardReviewWithAI` — the same setup-phase race this task exists to
+  // close applies here too: Implementation assembles a context pack and can
+  // generate an implementation checklist before any provider call, all of
+  // which is indistinguishable from a stalled task to the watchdog until
+  // admission is live. `acquireOrAdoptWorkAdmissionV1`, not the raw acquire,
+  // for the same same-process resume-then-dispatch handoff reason documented
+  // on `runReviewWithAI`'s own early acquisition above.
+  const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
+  const early = earlyFolderPath
+    ? await acquireOrAdoptWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "runImplementationWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     IMPLEMENTATION_ELIGIBLE_STAGES,
@@ -11402,6 +11443,37 @@ export async function runImplementationWithAI(
   );
   if (!resolved) {
     return;
+  }
+
+  if (!handle) {
+    // No-arg QuickPick path: nothing was known to protect until resolution
+    // just picked a target. Acquire admission now, before the pause
+    // reconciliation below reads task status, mirroring `runReviewWithAI`'s
+    // late-acquisition path.
+    const late = await acquireOrAdoptWorkAdmissionV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      purpose: "admission",
+      commandId: "runImplementationWithAI",
+      handoffToken: extractAdmissionHandoffTokenV1(arg),
+    });
+    if (late.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      return;
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target — reconcile a
+  // watchdog-provenance pause (never a user pause) before the paused check
+  // below, exactly like `runReviewWithAI`.
+  const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+  if (reconciled.outcome === "unreadable") {
+    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    return;
+  }
+  if (reconciled.outcome === "reversed") {
+    resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
@@ -12028,6 +12100,9 @@ export async function runImplementationWithAI(
         // Best-effort record only.
       }
     }
+  }
+  } finally {
+    await releaseAdmissionV1();
   }
 }
 

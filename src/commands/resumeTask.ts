@@ -108,20 +108,51 @@ export function resumeTaskArgHasExplicitTask(
  *   succeeded).
  * - `"busy"` — the task was paused, but another owner already holds durable
  *   admission for it; this call made no changes at all.
+ * - `"superseded"` — this call observed `paused` from the (possibly cached)
+ *   `resolveTaskContext` snapshot and WON admission, and a fresh disk
+ *   re-read taken immediately after acquiring admission SUCCEEDED but shows
+ *   the task is no longer `paused` — a concurrent resume already completed
+ *   and released before this call reached the admission directory
+ *   (2026-09-08 review, narrowed completion blocker: the `"busy"` fix above
+ *   only closes the case where the winner is STILL holding admission when
+ *   this call arrives; it does nothing when the winner already finished and
+ *   released). Admission acquired by this call is released immediately and
+ *   no mutation is made — the task is already exactly where the concurrent
+ *   winner left it, so writing `active`/`scheduledRun` again here would be a
+ *   second, redundant (and potentially divergent) resume for the same event.
+ *   Distinct from `"failed"`'s read-error case below: here the re-read
+ *   succeeded and positively confirms a non-paused status, so treating it as
+ *   "someone else already handled this" is actually established, not assumed.
  * - `"notPaused"` — the task exists and is not paused (already active, or
  *   some other non-paused status); this call made no changes at all.
  * - `"notFound"` — no resolvable task (deleted/moved, or no paused task and
  *   no explicit target); this call made no changes at all.
  * - `"completed"` — the task was completed; handled via the separate
  *   `resumeCompletedTask` reopen flow, not a plain resume.
- * - `"failed"` — admission was acquired but the resume mutation itself threw
- *   (e.g. `activateTask` could not read progress); admission is always
- *   released before this outcome is returned, regardless of
- *   `holdAdmissionForCaller`, since the resume did not actually succeed.
+ * - `"failed"` — admission was acquired but either (a) the mandatory
+ *   post-admission disk re-read used to detect `"superseded"` itself failed
+ *   — the file is missing, unreadable, or fails strict decode (2026-09-08
+ *   review, new completion blocker: an earlier revision collapsed this into
+ *   `"superseded"`, which silently misreported "this call could not confirm
+ *   what happened" as "another invocation already handled it" and abandoned
+ *   the resume with no explanation shown to the user) — or (b) the resume
+ *   mutation itself threw (e.g. `activateTask` could not read progress).
+ *   Admission is always released before this outcome is returned, regardless
+ *   of `holdAdmissionForCaller`, since the resume did not actually succeed;
+ *   the read-error case additionally surfaces the reader's own failure
+ *   reason via `NotificationRouter.showError` before returning.
+ *   `resumeThenDispatchV1` treats this identically to `"busy"`/`"superseded"`
+ *   — it stops and never falls back to a fresh admission-and-dispatch
+ *   (2026-09-08 review, second narrowing of the same completion blocker):
+ *   since this outcome means the re-read that would have distinguished a
+ *   genuine resume from a concurrent one could not be trusted, a fallback
+ *   re-read could observe a status written by a *different* concurrent
+ *   invocation and dispatch a duplicate action for its resume.
  */
 export type ResumePausedTaskOutcomeV1 =
   | { readonly outcome: "resumed"; readonly release: (() => Promise<void>) | undefined }
   | { readonly outcome: "busy" }
+  | { readonly outcome: "superseded" }
   | { readonly outcome: "notPaused" }
   | { readonly outcome: "notFound" }
   | { readonly outcome: "completed" }
@@ -255,6 +286,40 @@ export async function resumePausedTask(
     clearInterval(admissionHeartbeat);
     await admission.handle.release();
   };
+
+  // 2026-09-08 review, narrowed completion blocker: `resolvedTask.progress`
+  // above came from `resolveTaskContext`'s (possibly cached) `inventory`
+  // snapshot, taken BEFORE this call reached the admission directory. A
+  // concurrent invocation can observe the same "paused" snapshot, win
+  // admission first, complete its own resume, and release — all before this
+  // call's own `acquireWorkAdmissionV1` above resolves. Winning admission
+  // here does not mean this call is the one that should perform the resume;
+  // it only means the admission directory happened to be free at the moment
+  // this call reached it. Re-read straight off disk, under admission, before
+  // trusting the cached "paused" status for anything that mutates: if the
+  // task is no longer paused, someone else already handled this exact
+  // resume event and this call must not perform a second, redundant one.
+  const freshStatus = await readTaskProgressStrictV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+  if (!freshStatus.ok) {
+    // 2026-09-08 review, new completion blocker: an earlier revision folded
+    // this branch into "superseded" alongside the confirmed-non-paused case
+    // below. That silently misrepresented "the re-read itself failed — a
+    // missing, unreadable, or invalid task-progress.json" as "a concurrent
+    // resume already handled this event", which is not established here at
+    // all — no other invocation's success has been observed. The labeled
+    // resume-and-rerun action must not perform no work with no explanation;
+    // surface the reader's own reason and stop, mirroring the
+    // activateTask-threw catch below, before any mutation is even attempted.
+    NotificationRouter.showError(
+      `Could not confirm the task's status before resuming: ${freshStatus.reason}`
+    );
+    await releaseAdmissionV1();
+    return { outcome: "failed" };
+  }
+  if (freshStatus.decoded.progress.status !== "paused") {
+    await releaseAdmissionV1();
+    return { outcome: "superseded" };
+  }
 
   // Tracked instant mutation (taxonomy: resume-task / terminal-always). The
   // terminal entry is recorded centrally by the operation-notification bridge.
@@ -450,14 +515,33 @@ export async function resumePausedTask(
  * blocker). `resumePausedTask` now returns a discriminated
  * {@link ResumePausedTaskOutcomeV1}, and this function acts only on
  * `"resumed"` and the genuinely-nothing-to-resume outcomes (`"notPaused"`,
- * `"notFound"`, `"completed"`, `"failed"`) via the fresh-acquisition
- * fallback below; a `"busy"` outcome means another invocation is (or very
- * recently was) the one actually handling this exact resume-and-dispatch
- * event, so this call stops immediately (2026-09-08 review, narrowed
- * completion blocker) rather than falling back to a fresh admission and a
- * SECOND, possibly different, dispatch once that owner's own dispatch has
- * settled and released — that would be a duplicate action, not a recovery
- * from unprotected work.
+ * `"notFound"`, `"completed"`) via the fresh-acquisition
+ * fallback below; `"busy"`, `"superseded"`, and `"failed"` (2026-09-08
+ * review, second narrowing of the same blocker) all mean this call must stop
+ * here and never fall back to a fresh admission-and-dispatch. `"busy"` and
+ * `"superseded"` both mean another invocation is
+ * (or very recently was) the one actually handling this exact
+ * resume-and-dispatch event — `"busy"` when that owner still held admission
+ * when this call tried to acquire it, `"superseded"` when that owner had
+ * already finished and released BEFORE this call reached the admission
+ * directory, caught by `resumePausedTask`'s own post-admission disk re-read
+ * (2026-09-08 review, narrowed completion blocker) — so this call stops
+ * immediately in either case rather than falling back to a fresh admission
+ * and a SECOND, possibly different, dispatch once that owner's own dispatch
+ * has settled and released — that would be a duplicate action, not a
+ * recovery from unprotected work. `"failed"` means this call's OWN
+ * post-admission re-read — the one that would have distinguished a genuine
+ * resume from a superseded one — could not be trusted at all: it threw, or
+ * decoded invalid. That is NOT the same as "nothing to resume"
+ * (`"notPaused"`/`"notFound"`/`"completed"`, where no admission was ever
+ * attempted for a mutation and no ambiguity exists). Falling back to a fresh
+ * re-read here — as an earlier revision did — can observe a status of
+ * `"active"` that a DIFFERENT, concurrent invocation wrote in the gap
+ * between this call's failed re-read and its fallback re-read, and dispatch
+ * a second time against that other invocation's already-in-flight or
+ * already-completed resume. `resumePausedTask` has already surfaced the read
+ * failure to the user and released its admission; there is nothing further
+ * for this call to safely do.
  *
  * For every other outcome, several of this function's dispatch targets
  * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
@@ -466,7 +550,7 @@ export async function resumePausedTask(
  * state this whole mechanism exists to close — it must never happen merely
  * because another owner changed disk status to active out from under this
  * call. When `resumePausedTask` did not retain an admission handle
- * (`"notPaused"`/`"notFound"`/`"completed"`/`"failed"`), this acquires a
+ * (`"notPaused"`/`"notFound"`/`"completed"`), this acquires a
  * fresh one of its own — after confirming via the re-read that the task is
  * genuinely `active` and worth acquiring for at all — before dispatching; if
  * that is also refused (a real owner is genuinely working right now), it
@@ -491,8 +575,24 @@ async function resumeThenDispatchV1<T>(
   // back to a fresh admission-and-dispatch here, even if that owner has
   // since released and a re-read would show the task active. Falling back
   // would risk firing a second, possibly different, dispatch for the same
-  // resume-and-dispatch request.
-  if (resumed.outcome === "busy") {
+  // resume-and-dispatch request. `"busy"` covers the case where the
+  // concurrent winner still holds admission when this call arrives;
+  // `"superseded"` (2026-09-08 review, narrowed completion blocker) covers
+  // the case where that winner already finished its own resume and released
+  // BEFORE this call reached the admission directory — `resumePausedTask`'s
+  // own post-admission re-read caught that and refused to act. `"failed"`
+  // (2026-09-08 review, second narrowing of the same blocker) covers the
+  // case where THAT SAME post-admission re-read could not be trusted at all
+  // — it threw, or decoded invalid — rather than positively confirming
+  // either outcome. An earlier revision let `"failed"` fall through to the
+  // fresh-acquisition fallback below, which re-reads disk one more time: if
+  // a DIFFERENT concurrent invocation's resume lands in the gap between the
+  // failed re-read and that fallback re-read, the fallback observes
+  // "active" and dispatches a second time for the same event — the exact
+  // duplicate-dispatch race this function exists to prevent. All three
+  // outcomes must stop here identically: none of them means "nothing is
+  // protecting this task and a fresh dispatch is safe".
+  if (resumed.outcome === "busy" || resumed.outcome === "superseded" || resumed.outcome === "failed") {
     return undefined;
   }
 

@@ -25,6 +25,10 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import {
+  acquireWorkAdmissionV1,
+  hasLiveWorkAdmissionBestEffortV1,
+} from "../state/workAdmissionV1";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-gate-"));
 
@@ -208,6 +212,83 @@ void describe("runLintingFixes gate and fallback messages", () => {
         message,
         /^No Publish report found/i,
         "must not flatly assert no report exists when a Publish report is visibly present on disk"
+      );
+    } finally {
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * Work-admission wiring for runLintingFixes (v1 fixes item 1, Part 1a — the
+ * remaining Part 1a route-inventory item for this command). Uses the same
+ * real-fs `REAL_ROOT` fixture and `installReadFileBridge`/
+ * `installWorkspaceFoldersStub` helpers as the gate-message tests above,
+ * since `acquireWorkAdmissionV1` itself always does real `fs` I/O regardless
+ * of how `vscode.workspace.fs` is bridged.
+ */
+void describe("runLintingFixes work admission (v1 fixes item 1, Part 1a)", () => {
+  void it("refuses with the busy diagnostic, naming the other owner, when durable admission is already held for the task — and never reaches the stage gate", async () => {
+    const taskFolderPath = makeTaskFolder("admission-busy");
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, "publish"));
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+
+    const held = await acquireWorkAdmissionV1({
+      taskFolderPath,
+      purpose: "admission",
+      commandId: "someOtherConcurrentCommand",
+    });
+    assert.equal(held.outcome, "acquired");
+
+    try {
+      const inventory = makeInventory(taskFolderPath, fixtureProgress(taskFolderPath, "publish"));
+      await runLintingFixes(inventory, vscode.Uri.file(REAL_ROOT), { taskFolderPath });
+
+      assert.equal(surface.entries.length, 1);
+      assert.equal(surface.entries[0]?.level, "warning");
+      assert.match(
+        surface.entries[0]?.message ?? "",
+        /someOtherConcurrentCommand/,
+        "must name the actual blocking owner, not a generic 'task is busy' message"
+      );
+      assert.doesNotMatch(
+        surface.entries[0]?.message ?? "",
+        /publish stage/i,
+        "must refuse on admission BEFORE reaching the stage gate — the stage check is part of the setup this exists to protect"
+      );
+    } finally {
+      if (held.outcome === "acquired") {
+        await held.handle.release();
+      }
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("releases its own admission once the command finishes, even on the fast \"wrong stage\" exit path", async () => {
+    const taskFolderPath = makeTaskFolder("admission-released-on-exit");
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, "impl"));
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+
+    try {
+      const inventory = makeInventory(taskFolderPath, fixtureProgress(taskFolderPath, "impl"));
+      await runLintingFixes(inventory, vscode.Uri.file(REAL_ROOT), { taskFolderPath });
+
+      assert.equal(
+        hasLiveWorkAdmissionBestEffortV1(taskFolderPath),
+        false,
+        "admission acquired at command entry must be released in `finally`, not left held after an early return"
       );
     } finally {
       rf.restore();

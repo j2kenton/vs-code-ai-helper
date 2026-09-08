@@ -30,7 +30,7 @@
     },
     {
       "file": "src/commands/runLintingFixes.ts",
-      "line": 482,
+      "line": 577,
       "reason": "Pre-run safety check synchronously inline in the user-invoked 'AI final fixes' command, mirroring reviewActions.ts:7690 for the same git-safety concern in a different entry point."
     },
     {
@@ -88,7 +88,7 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 11537,
+      "line": 11609,
       "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision."
     },
     {
@@ -113,12 +113,12 @@
     },
     {
       "file": "src/commands/runLintingFixes.ts",
-      "line": 189,
+      "line": 284,
       "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when no usable Publish check result is recorded — points to Run Publish Checks, the action the message names. Not a review/round outcome."
     },
     {
       "file": "src/commands/runLintingFixes.ts",
-      "line": 234,
+      "line": 329,
       "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when the persisted Publish verification scope is stale — points to Run Publish Checks to choose a new scope. Not a review/round outcome."
     },
     {

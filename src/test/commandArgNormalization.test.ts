@@ -1753,6 +1753,368 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
       wsFolders.restore();
     }
   });
+
+  // 2026-09-08 review, narrowed completion blocker: the "busy" fix above only
+  // closes the race where the concurrent winner is STILL holding admission
+  // when this call tries to acquire its own. It does nothing for the case the
+  // review actually flagged as still open: `resolveTaskContext` resolves
+  // `paused` from the (possibly cached) `inventory` snapshot, and BEFORE this
+  // call ever reaches the admission directory, a concurrent winner has
+  // already resolved the identical `paused` snapshot, won admission,
+  // activated the task, and released — leaving the admission directory
+  // completely empty by the time this call arrives. With no marker present,
+  // this call's own `acquireWorkAdmissionV1` genuinely succeeds; the only
+  // thing that can now stop it from performing a second, redundant resume is
+  // a disk re-read taken AFTER winning admission, not the cached snapshot
+  // taken before. Reproduced deterministically: disk is seeded already
+  // "active" (as the winner would have left it) while the inventory stub
+  // still reports the stale "paused" snapshot, and no admission marker
+  // exists at all.
+  void it("does not perform a second resume when the winning owner already finished and released before this call reached admission (post-admission re-read catches a superseded snapshot)", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-superseded-by-already-released-winner");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-superseded-by-already-released-winner",
+        currentStage: "impl",
+        // The disk already reflects the winner's completed resume — status
+        // "active", no scheduledRun from THIS call yet possible since it
+        // never gets the chance to write one.
+        status: "active",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:05:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+      // No admission marker: the winner already released.
+
+      // The inventory stub is the stale, pre-race snapshot this call resolves
+      // against — it still reports "paused", exactly as `resolveTaskContext`
+      // would have observed it moments before the winner's write landed.
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      const result = await resumePausedTask(inv, currentStore, { taskFolderPath: folderPath });
+
+      assert.strictEqual(
+        result.outcome,
+        "superseded",
+        "acquiring admission against a stale 'paused' snapshot must not be treated as a real resume once " +
+          "the post-admission disk re-read shows the task already active"
+      );
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.updatedAt,
+        "2026-09-08T00:05:00.000Z",
+        "this call must not overwrite updatedAt or otherwise re-mutate a task another invocation already resumed"
+      );
+      assert.strictEqual(
+        stored!.scheduledRun,
+        undefined,
+        "this call must not arrange a second, redundant scheduledRun on top of whatever the real winner arranged"
+      );
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      const leftoverMarkers = nodeFs.existsSync(admissionDir)
+        ? nodeFs.readdirSync(admissionDir).filter((f) => f.startsWith("admission."))
+        : [];
+      assert.deepStrictEqual(
+        leftoverMarkers,
+        [],
+        "the admission this call won must be released once it discovers it was superseded, not left dangling"
+      );
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "resumeThenDispatchV1 must treat 'superseded' exactly like 'busy' and never fall back to a fresh " +
+          "admission-and-dispatch for the same event"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // 2026-09-08 review, new completion blocker: an earlier revision of the
+  // post-admission re-read collapsed `!freshStatus.ok` (the re-read itself
+  // failing — missing, unreadable, or undecodable task-progress.json) into
+  // the SAME "superseded" outcome as a successful re-read that positively
+  // confirms a concurrent winner already resumed. That is not established at
+  // all when the re-read fails outright: no other invocation's success has
+  // been observed, yet the labeled "Resume and re-run this stage" action
+  // silently did nothing. This reproduces the outright-failure case (the read
+  // itself throws, as a transient disk error would) and asserts the call
+  // reports "failed" with a surfaced, specific diagnostic instead.
+  void it("reports a failure with a specific diagnostic — rather than silently treating it as 'superseded' — when the post-admission re-read of task-progress.json fails outright", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-post-admission-reread-throws");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-post-admission-reread-throws",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+      const origReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile as (
+        uri: vscode.Uri
+      ) => Promise<Uint8Array>;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
+        uri: vscode.Uri
+      ): Promise<Uint8Array> => {
+        if (uri.fsPath === progressUri.fsPath) {
+          return Promise.reject(new Error("simulated disk failure"));
+        }
+        return origReadFile(uri);
+      };
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      const result = await resumePausedTask(inv, currentStore, { taskFolderPath: folderPath });
+
+      assert.strictEqual(
+        result.outcome,
+        "failed",
+        "a post-admission re-read that fails outright must be reported as 'failed', not silently folded " +
+          "into 'superseded' as though a concurrent resume had already handled the event"
+      );
+
+      const errorMsg = msgs.captured.find((m) => m.method === "error");
+      assert.ok(
+        errorMsg && /Could not confirm the task's status/.test(errorMsg.message),
+        "the reader's own failure reason must be surfaced to the user, not silently swallowed"
+      );
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "paused",
+        "a re-read failure must not resume (mutate) the task"
+      );
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      const leftoverMarkers = nodeFs.existsSync(admissionDir)
+        ? nodeFs.readdirSync(admissionDir).filter((f) => f.startsWith("admission."))
+        : [];
+      assert.deepStrictEqual(
+        leftoverMarkers,
+        [],
+        "the admission this call won must be released once the post-admission re-read fails, not left dangling"
+      );
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "resumeThenDispatchV1 must not dispatch when the underlying resume could not confirm task status"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // Companion to the outright-failure case above: here the re-read
+  // SUCCEEDS at the I/O layer but the content fails strict decode (corrupt
+  // JSON), which readTaskProgressStrictV1 reports as a decode-recovery
+  // failure rather than the "missing" code. Both failure shapes must be
+  // treated identically by resumePausedTask — reported as "failed" with a
+  // surfaced reason, never silently folded into "superseded".
+  void it("reports a failure with a specific diagnostic — rather than silently treating it as 'superseded' — when the post-admission re-read of task-progress.json decodes as invalid", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-post-admission-reread-invalid");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-post-admission-reread-invalid",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      // Corrupt the real on-disk file directly (installMemStore's readFile
+      // mock prefers the real file when present, exactly as production's
+      // writeAtomic-backed reads do), so the post-admission re-read hits a
+      // genuine strict-decode failure rather than an I/O throw.
+      const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+      nodeFs.writeFileSync(progressUri.fsPath, "{ this is not valid json", "utf8");
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      const result = await resumePausedTask(inv, currentStore, { taskFolderPath: folderPath });
+
+      assert.strictEqual(
+        result.outcome,
+        "failed",
+        "a post-admission re-read that decodes as invalid must be reported as 'failed', not silently folded " +
+          "into 'superseded' as though a concurrent resume had already handled the event"
+      );
+
+      const errorMsg = msgs.captured.find((m) => m.method === "error");
+      assert.ok(
+        errorMsg && /Could not confirm the task's status/.test(errorMsg.message),
+        "the decoder's own failure reason must be surfaced to the user, not silently swallowed"
+      );
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      const leftoverMarkers = nodeFs.existsSync(admissionDir)
+        ? nodeFs.readdirSync(admissionDir).filter((f) => f.startsWith("admission."))
+        : [];
+      assert.deepStrictEqual(
+        leftoverMarkers,
+        [],
+        "the admission this call won must be released once the post-admission re-read fails, not left dangling"
+      );
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "resumeThenDispatchV1 must not dispatch when the underlying resume could not confirm task status"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // 2026-09-08 review, second narrowing of the same completion blocker: the
+  // two "fails outright" / "decodes as invalid" tests above keep the
+  // progress-file read failing on EVERY call, so `resumeThenDispatchV1`'s own
+  // separate re-read (performed only when it does NOT stop early on "failed")
+  // fails too either way — neither test actually exercises the fallthrough
+  // the review flagged as still open. This reproduces the one-shot ordering
+  // precisely: THIS call's own post-admission re-read (inside
+  // `resumePausedTask`) fails exactly once, and by the time any LATER read of
+  // the same file would occur, disk already shows "active" — exactly as if a
+  // different, concurrent invocation completed its own resume in the gap
+  // right after this call's failed read. Before the fix, `resumeThenDispatchV1`
+  // treated "failed" as a nothing-to-resume outcome and fell back to a fresh
+  // re-read, which would observe that "active" status and dispatch a SECOND,
+  // duplicate action for the concurrent invocation's resume. The fix must
+  // stop immediately on "failed" — proven here not just by the absence of a
+  // dispatch, but by asserting the progress file is never read a second time
+  // at all, since the fixed code never reaches that later re-read.
+  void it("does not fall back to a fresh dispatch when its own post-admission re-read fails once, even though a later re-read would show a different concurrent invocation's completed resume", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-reread-fails-once-then-concurrent-active");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-reread-fails-once-then-concurrent-active",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+      const origReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile as (
+        uri: vscode.Uri
+      ) => Promise<Uint8Array>;
+      let progressReadCount = 0;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
+        uri: vscode.Uri
+      ): Promise<Uint8Array> => {
+        if (uri.fsPath === progressUri.fsPath) {
+          progressReadCount++;
+          if (progressReadCount === 1) {
+            // Simulate a different, concurrent invocation completing its own
+            // resume in the gap right after THIS call's own post-admission
+            // re-read: by the time any subsequent read of this file happens,
+            // disk already shows "active". The first read itself is a
+            // transient, one-shot failure for this call only.
+            nodeFs.writeFileSync(
+              progressUri.fsPath,
+              JSON.stringify({ ...progress, status: "active" }, null, 2),
+              "utf8"
+            );
+            return Promise.reject(new Error("simulated one-shot transient disk failure"));
+          }
+        }
+        return origReadFile(uri);
+      };
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "a one-shot post-admission re-read failure must never fall back to a fresh admission-and-dispatch, " +
+          "even though a later re-read would show a status a different concurrent invocation wrote"
+      );
+      assert.strictEqual(
+        progressReadCount,
+        1,
+        "resumeThenDispatchV1 must stop on 'failed' and never perform its own later re-read of the progress " +
+          "file at all — reaching a second read is itself the fallthrough this test guards against"
+      );
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      const leftoverMarkers = nodeFs.existsSync(admissionDir)
+        ? nodeFs.readdirSync(admissionDir).filter((f) => f.startsWith("admission."))
+        : [];
+      assert.deepStrictEqual(
+        leftoverMarkers,
+        [],
+        "the admission this call won must be released once its post-admission re-read fails, not left dangling"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

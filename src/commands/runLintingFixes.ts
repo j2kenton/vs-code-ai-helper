@@ -37,6 +37,13 @@ import {
   TaskOperationHandle,
   resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -67,6 +74,27 @@ function normalizeArg(node: RunLintingFixesArg | undefined): {
   return hasExplicit
     ? { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath }
     : undefined;
+}
+
+/**
+ * Work admission (v1 fixes item 1, Part 1a) needs a task folder path
+ * BEFORE any awaited setup — `resolveTaskContext` below is itself the first
+ * awaited read this command performs, so it must not run unprotected. Mirrors
+ * `reviewActions.ts`'s `extractSynchronousReviewFolderPathV1`: only returns a
+ * path when one is known synchronously from the argument (a tree-row button
+ * or a resolver-aware caller); a bare canonicalId or no-arg invocation has
+ * nothing to protect until `resolveTaskContext` picks a target, so admission
+ * is acquired right after resolution instead, in `runLintingFixes` itself.
+ */
+function extractSynchronousLintingFolderPathV1(node: RunLintingFixesArg | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+  if ("task" in node && node.task) {
+    return node.task.folderUri.fsPath;
+  }
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  return n.taskFolderPath;
 }
 
 /**
@@ -125,6 +153,51 @@ export async function runLintingFixes(
   assertLegacyAiRouteAllowedV0("lint.v1");
   const resolverArg = normalizeArg(explicitArg);
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE `resolveTaskContext` — the command's
+  // first awaited setup read — whenever the target folder is known
+  // synchronously from `explicitArg` (the dominant invocation: the Publish
+  // stage's tree-row/inline button). No handoff-token adoption is wired here
+  // (unlike `runReviewWithAI`/`fastForwardReviewWithAI`): no resume-then-
+  // dispatch flow currently targets this command, so an ordinary
+  // `acquireWorkAdmissionV1` genesis is always correct — there is no
+  // same-process marker to adopt.
+  const earlyFolderPath = extractSynchronousLintingFolderPathV1(explicitArg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "runLintingFixes",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  // Single mutable admission slot for the whole command — filled either by
+  // the early acquisition above or, once a target is resolved (a bare
+  // canonicalId or no-arg invocation), right after `resolveTaskContext`
+  // below. Released in `finally` regardless of which branch of this command
+  // returns, so a resolution failure, an unsupported stage, an already-passed
+  // report, or a completed run all release admission exactly once.
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
   });
@@ -135,6 +208,28 @@ export async function runLintingFixes(
     );
     return;
   }
+
+  if (!handle) {
+    const late = await acquireWorkAdmissionV1({
+      taskFolderPath: resolvedTask.taskFolderPath,
+      purpose: "admission",
+      commandId: "runLintingFixes",
+    });
+    if (late.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      return;
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target — reverse a
+  // watchdog-provenance pause (never a user pause) before any further setup,
+  // exactly like `runReviewWithAI`/`fastForwardReviewWithAI`. This command
+  // does not itself gate on pause status (`allowPaused: true` above), but a
+  // stale watchdog pause left in place would still strand the task for every
+  // OTHER pause-sensitive reader once this command's own work is done.
+  await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
 
   if (
     resolvedTask.progress.currentStage !== "publish"
@@ -597,6 +692,9 @@ export async function runLintingFixes(
       );
     }
   );
+  } finally {
+    await releaseAdmissionV1();
+  }
 }
 
 /**
