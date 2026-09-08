@@ -2,7 +2,6 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hostname } from "node:os";
 import { after, test } from "node:test";
 import {
   acquireWorkAdmissionV1,
@@ -10,6 +9,12 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
   ADMISSION_DIRNAME_V1,
 } from "../state/workAdmissionV1";
+import {
+  configureHostIdentityRootV1,
+  resetHostIdentityForTestV1,
+  resolveDurableHostIdentityV1,
+  resolveHostIdentityV1,
+} from "../state/hostIdentityV1";
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-work-admission-test-"));
@@ -33,7 +38,7 @@ void test("acquireWorkAdmissionV1 publishes exactly one marker file, written onc
   const task = freshTaskFolder("single-owner-writes-once");
   const result = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "test-command",
   });
   assert.equal(result.outcome, "acquired");
@@ -54,7 +59,7 @@ void test("single-owner invariant: a second caller is refused busy while the mar
   const task = freshTaskFolder("single-owner-invariant");
   const first = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "owner-a",
   });
   assert.equal(first.outcome, "acquired");
@@ -62,7 +67,7 @@ void test("single-owner invariant: a second caller is refused busy while the mar
 
   const second = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "owner-b",
   });
   assert.equal(second.outcome, "busy");
@@ -79,7 +84,7 @@ void test("single-owner invariant: a second caller is refused busy while the mar
 
   const third = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "owner-c",
   });
   assert.equal(third.outcome, "acquired");
@@ -92,7 +97,7 @@ void test("racing geneses: exactly one of several concurrent acquirers wins", as
   const task = freshTaskFolder("racing-geneses");
   const attempts = await Promise.all(
     Array.from({ length: 8 }, (_, i) =>
-      acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "commandDispatch", commandId: `racer-${i}` })
+      acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: `racer-${i}` })
     )
   );
   const acquired = attempts.filter((a) => a.outcome === "acquired");
@@ -112,7 +117,7 @@ void test("heartbeat renews the marker across several generations without ever l
   const task = freshTaskFolder("heartbeat-renewal");
   const result = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "heartbeat-owner",
   });
   assert.equal(result.outcome, "acquired");
@@ -139,7 +144,7 @@ void test("release after an owner is displaced (marker already gone) does not th
   const task = freshTaskFolder("release-displaced");
   const result = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "displaced-owner",
   });
   assert.equal(result.outcome, "acquired");
@@ -160,7 +165,7 @@ void test("stale-state fail-open diagnostic: an old marker is reported busy with
   const task = freshTaskFolder("stale-fail-open");
   const result = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "stale-owner",
   });
   assert.equal(result.outcome, "acquired");
@@ -183,7 +188,7 @@ void test("stale-state fail-open diagnostic: an old marker is reported busy with
   // reclaim, no matter how stale — and the watchdog exemption still holds.
   const second = await acquireWorkAdmissionV1({
     taskFolderPath: task,
-    purpose: "commandDispatch",
+    purpose: "admission",
     commandId: "would-be-reclaimer",
   });
   assert.equal(second.outcome, "busy");
@@ -195,7 +200,7 @@ void test("stale-state fail-open diagnostic: an old marker is reported busy with
   await result.handle.release();
 });
 
-void test("host identity is populated on every claim", async () => {
+void test("host identity is populated on every claim, and is a stable per-install id (not the raw hostname)", async () => {
   const task = freshTaskFolder("host-identity");
   const result = await acquireWorkAdmissionV1({
     taskFolderPath: task,
@@ -215,7 +220,12 @@ void test("host identity is populated on every claim", async () => {
     commandId: string;
     claimId: string;
   };
-  assert.equal(info.hostId, hostname());
+  // Unconfigured (this test's process never calls configureHostIdentityRootV1)
+  // falls open to a process-local ephemeral id rather than the raw
+  // `os.hostname()` — see hostIdentityV1.ts's module doc comment for why a
+  // bare hostname is not a safe cross-process owner identity.
+  assert.equal(typeof info.hostId, "string");
+  assert.ok(info.hostId.length > 0);
   assert.equal(info.pid, process.pid);
   assert.equal(typeof info.processStartTime, "number");
   assert.equal(info.purpose, "pauseCommit");
@@ -230,4 +240,131 @@ void test("admission-directory paths classify as workflowControl", () => {
   const relativeMarker = `${ADMISSION_DIRNAME_V1}/admission.abc.g1.def`;
   assert.equal(classifyWorkflowPathV1(relativeMarker), "workflowControl");
   assert.equal(classifyWorkflowPathV1(`${ADMISSION_DIRNAME_V1}/admission.claim`), "workflowControl");
+});
+
+// ── Completion-blocker coverage added 2026-09-08 review round ──────────────
+
+void test("a real filesystem failure surfaces as writeFailed, distinct from an ordinary busy outcome", async () => {
+  const task = freshTaskFolder("write-failure-distinct-from-busy");
+  // Make the admission directory's OWN path a plain file, so
+  // `fs.promises.mkdir(dir, { recursive: true })` fails with a real
+  // filesystem error (ENOTDIR / EEXIST-as-file) rather than "someone else
+  // already owns admission" — this must never be reported as `busy`.
+  fs.writeFileSync(path.join(task, ADMISSION_DIRNAME_V1), "not a directory");
+
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "write-failure-command",
+  });
+  assert.equal(result.outcome, "writeFailed");
+  if (result.outcome === "writeFailed") {
+    assert.ok(result.error instanceof Error);
+    assert.ok(result.error.message.length > 0, "the real underlying error must be preserved, not a byte count or generic message");
+  }
+});
+
+void test("a displaced owner's heartbeat and release never mutate or remove a successor generation's marker", async () => {
+  const task = freshTaskFolder("successor-generation-protected");
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "original-owner",
+  });
+  assert.equal(result.outcome, "acquired");
+  if (result.outcome !== "acquired") return;
+
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const originalMarkerPath = path.join(dir, fs.readdirSync(dir)[0]!);
+
+  // Simulate a takeover (1c's future job, not anything v1a does on its own):
+  // the original marker is removed and replaced by a DIFFERENT owner's
+  // marker file — a "successor generation" this handle never tracked.
+  fs.unlinkSync(originalMarkerPath);
+  const successorPath = path.join(dir, "admission.successor-owner.g1.zzzz9999");
+  const successorContent = JSON.stringify({ ownerToken: "successor-owner", commandId: "successor-command" });
+  fs.writeFileSync(successorPath, successorContent);
+  const successorStatBefore = fs.statSync(successorPath);
+
+  // Both operations on the ORIGINAL (displaced) handle must be safe no-ops —
+  // they address only the exact filename this handle tracked, which is gone
+  // (ENOENT), and must never discover or touch the successor's file by
+  // scanning the directory.
+  await assert.doesNotReject(() => result.handle.heartbeat());
+  await assert.doesNotReject(() => result.handle.release());
+
+  const successorStatAfter = fs.statSync(successorPath);
+  assert.equal(fs.readFileSync(successorPath, "utf8"), successorContent, "successor marker content must be untouched");
+  assert.equal(successorStatAfter.mtimeMs, successorStatBefore.mtimeMs, "successor marker must not have been rewritten");
+  assert.equal(fs.readdirSync(dir).length, 1, "exactly the successor marker must remain");
+});
+
+void test("heartbeat and release are serialized through the same owner-local queue, including handover", async () => {
+  const task = freshTaskFolder("serialized-heartbeat-release-handover");
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "serialization-owner",
+  });
+  assert.equal(result.outcome, "acquired");
+  if (result.outcome !== "acquired") return;
+
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  // Fire a heartbeat and an immediate release WITHOUT awaiting the first —
+  // if they were not serialized through one queue, the release could race
+  // the heartbeat's rename (unlinking the pre-rename path while the rename
+  // is in flight, or vice versa) and either throw or leave two files behind.
+  await assert.doesNotReject(() => Promise.all([result.handle.heartbeat(), result.handle.release()]));
+  assert.equal(fs.readdirSync(dir).length, 0, "release must win cleanly after the queued heartbeat, leaving no marker behind");
+
+  // handover() must be interchangeable with release() in the SAME queue: a
+  // fresh handle, heartbeat-then-handover must leave the directory empty too.
+  const second = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "serialization-owner-2",
+  });
+  assert.equal(second.outcome, "acquired");
+  if (second.outcome !== "acquired") return;
+  await assert.doesNotReject(() => Promise.all([second.handle.heartbeat(), second.handle.handover()]));
+  assert.equal(fs.readdirSync(dir).length, 0);
+});
+
+void test("exclusive-create host-identity initialization converges under racing first runs", async () => {
+  resetHostIdentityForTestV1();
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-race-"));
+  configureHostIdentityRootV1(root);
+  try {
+    const ids = await Promise.all(Array.from({ length: 12 }, () => resolveHostIdentityV1()));
+    const distinct = new Set(ids);
+    assert.equal(distinct.size, 1, "every racing first-run caller must converge on exactly one id");
+
+    const files = fs.readdirSync(root);
+    assert.equal(files.length, 1, "exactly one durable host-identity record must be written, never one per racer");
+    const record = JSON.parse(fs.readFileSync(path.join(root, files[0]!), "utf8")) as { hostId: string };
+    assert.equal(record.hostId, ids[0]);
+
+    // Resolving again (with a cold cache, simulating a second process reading
+    // the same install's durable identity) must read back the SAME winner,
+    // not mint a second one.
+    resetHostIdentityForTestV1();
+    configureHostIdentityRootV1(root);
+    const again = await resolveHostIdentityV1();
+    assert.equal(again, ids[0]);
+    assert.equal(fs.readdirSync(root).length, 1);
+  } finally {
+    resetHostIdentityForTestV1();
+  }
+});
+
+void test("resolveDurableHostIdentityV1 itself (no in-process cache) resolves a genuine exclusive-create filesystem race to one winner", async () => {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-fs-race-"));
+  // Calling the uncached primitive directly, concurrently, exercises the
+  // real `{ flag: "wx" }` exclusive-create-then-read-fallback race at the
+  // filesystem layer — the same style of proof the admission module's own
+  // "racing geneses" test above uses for its claim file.
+  const ids = await Promise.all(Array.from({ length: 8 }, () => resolveDurableHostIdentityV1(root)));
+  const distinct = new Set(ids);
+  assert.equal(distinct.size, 1, "every racer against the same root must converge on exactly one durable id");
+  assert.equal(fs.readdirSync(root).length, 1, "exactly one durable host-identity record must survive the race");
 });

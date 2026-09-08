@@ -223,7 +223,7 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
     try {
       const admission = await acquireWorkAdmissionV1({
         taskFolderPath: taskDir,
-        purpose: "commandDispatch",
+        purpose: "admission",
         commandId: "test-command",
       });
       assert.equal(admission.outcome, "acquired");
@@ -239,6 +239,44 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
         isImpossibleActiveStateV1({ progress: baseProgress(), taskCanonicalId: taskDir }),
         true,
         "once admission is released, the predicate must fire again"
+      );
+    } finally {
+      fs.rmSync(taskDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("stands down (never fires) through the actual watchdog predicate for a stale UNPUBLISHED admission.claim file, not just a stale marker", () => {
+    // Completion-blocker coverage (2026-09-08 review): the fail-open interim
+    // invariant must hold for a stale CLAIM (the transient staging file a
+    // genesis attempt writes before it renames to a marker) as well as a
+    // stale published marker. A crash between claim-create and rename is
+    // exactly step 2's documented interim exposure window — the predicate
+    // below is the actual mechanism the sweep consults, not a stand-in.
+    const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-watchdog-stale-claim-test-"));
+    try {
+      const admissionDir = path.join(taskDir, "admission-v1");
+      fs.mkdirSync(admissionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(admissionDir, "admission.claim"),
+        JSON.stringify({
+          claimId: "stale-claim-id",
+          purpose: "admission",
+          ownerToken: "crashed-owner",
+          pid: 999999,
+          processStartTime: 0,
+          hostId: "some-other-host",
+          commandId: "crashed-command",
+          startedAt: "2020-01-01T00:00:00.000Z",
+        })
+      );
+      const old = new Date(Date.now() - 60 * 60 * 1000);
+      fs.utimesSync(path.join(admissionDir, "admission.claim"), old, old);
+
+      assert.equal(
+        isImpossibleActiveStateV1({ progress: baseProgress(), taskCanonicalId: taskDir }),
+        false,
+        "a stale, never-published admission.claim must still stand the watchdog down — never pause a task with " +
+          "a crashed-mid-genesis claim, per v1a's interim never-reclaim policy"
       );
     } finally {
       fs.rmSync(taskDir, { recursive: true, force: true });

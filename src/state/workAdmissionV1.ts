@@ -1,8 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { hostname } from "os";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
+import { resolveHostIdentityV1 } from "./hostIdentityV1";
 
 /**
  * Work admission (v1 fixes item 1, Part 1a — 1.0.0 gate).
@@ -77,7 +77,7 @@ const MARKER_RE_V1 = /^admission\.([0-9a-z-]+)\.g(\d+)\.([0-9a-z]+)$/;
  * stale to a concurrent reader. */
 export const WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 = 2 * 60 * 1000;
 
-export type WorkAdmissionPurposeV1 = "commandDispatch" | "pauseCommit";
+export type WorkAdmissionPurposeV1 = "admission" | "pauseCommit";
 
 export interface WorkAdmissionClaimInfoV1 {
   readonly claimId: string;
@@ -104,6 +104,23 @@ export interface WorkAdmissionHandleV1 {
   heartbeat(): Promise<void>;
   /** Release the marker. Best-effort — a displaced marker (ENOENT) is not an error. */
   release(): Promise<void>;
+  /**
+   * Release the marker because durable protection has been HANDED OVER to
+   * something else that now exempts the task on its own terms (e.g. an
+   * opened round-ledger row) — as opposed to `release()`, called when the
+   * command itself is simply done. Mechanically identical to `release()` in
+   * v1a (both unlink the exact tracked generation and are ENOENT-safe): the
+   * distinction is call-site intent, not different disk behavior, and it
+   * matters for what comes next. A command's setup phase must call ONE of
+   * `handover()` or `release()` before the task can be considered
+   * unprotected again — never neither (see the module doc comment's "keep
+   * durable protection until a confirmed exemption has taken over" rule) —
+   * and future callers (a round-ledger integration) can distinguish "hand
+   * off" from "done" in logs/telemetry without this module needing to know
+   * what took over. Serialized through the same owner-local queue as
+   * `heartbeat()`/`release()`, so a heartbeat can never race a handover.
+   */
+  handover(): Promise<void>;
 }
 
 export interface WorkAdmissionAcquiredV1 {
@@ -135,7 +152,6 @@ export type WorkAdmissionResultV1 = WorkAdmissionAcquiredV1 | WorkAdmissionBusyV
 export const WORK_ADMISSION_LIKELY_STALE_MS_V1 = 20 * 60 * 1000;
 
 const processStartTimeV1 = Date.now() - Math.floor(process.uptime() * 1000);
-const hostIdV1 = hostname();
 
 /** Process-local registry of admission handles this window currently holds,
  * keyed by task folder path. Lets same-window callers answer "do I already
@@ -276,6 +292,20 @@ export function describeWorkAdmissionBlockerV1(
   };
 }
 
+/** Best-effort removal of a claim file this exact call created — never an
+ * error if it is already gone (a concurrent path already cleaned it up, or
+ * the failure that triggered this cleanup was the write itself). Used by
+ * every `acquireWorkAdmissionV1` failure branch AFTER the claim was
+ * successfully created, so a mid-genesis failure never orphans it. */
+async function cleanupOwnClaimBestEffortV1(claimPath: string): Promise<void> {
+  try {
+    await fs.promises.unlink(claimPath);
+  } catch {
+    // Already gone, or unremovable for a reason the caller's own reported
+    // error already covers — never let cleanup itself throw.
+  }
+}
+
 /**
  * Acquire durable work admission for `taskFolderPath`, running the genesis
  * flow described in the module doc comment. Never throws — filesystem
@@ -292,13 +322,14 @@ export async function acquireWorkAdmissionV1(params: {
   const { taskFolderPath, purpose, commandId } = params;
   const dir = admissionDirV1(taskFolderPath);
   const ownerToken = `${process.pid.toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
+  const hostId = await resolveHostIdentityV1();
   const claimInfo: WorkAdmissionClaimInfoV1 = {
     claimId: crypto.randomUUID(),
     purpose,
     ownerToken,
     pid: process.pid,
     processStartTime: processStartTimeV1,
-    hostId: hostIdV1,
+    hostId,
     commandId,
     startedAt: new Date().toISOString(),
   };
@@ -330,13 +361,25 @@ export async function acquireWorkAdmissionV1(params: {
   // released), this caller's own just-created claim file is removed — it is
   // unambiguously ours — and we report busy against the existing marker
   // instead of completing genesis.
-  const existingMarkers = listMarkersSyncV1(dir);
+  //
+  // Completion blocker fix (2026-09-08 review): this listing can itself
+  // throw (a non-ENOENT `readdirSync` error), and this whole branch's
+  // cleanup — including the ORIGINAL EEXIST branch above, which never
+  // touches its own claim at all — must never leave `admission.claim`
+  // orphaned on disk. An orphaned claim makes every later caller busy and
+  // the watchdog stand down for this task FOREVER (v1a's interim policy
+  // never reclaims a claim/marker automatically) — exactly the kind of
+  // dead end this whole task exists to remove. Every failure path from here
+  // on cleans up the claim it just created before returning.
+  let existingMarkers: readonly { readonly filePath: string; readonly basename: string }[];
+  try {
+    existingMarkers = listMarkersSyncV1(dir);
+  } catch (error) {
+    await cleanupOwnClaimBestEffortV1(claimPath);
+    return { outcome: "writeFailed", error: error as Error };
+  }
   if (existingMarkers.length > 0) {
-    try {
-      await fs.promises.unlink(claimPath);
-    } catch {
-      // Best-effort cleanup of our own contended claim file.
-    }
+    await cleanupOwnClaimBestEffortV1(claimPath);
     const blocker = describeWorkAdmissionBlockerV1(taskFolderPath);
     return (
       blocker ?? {
@@ -354,6 +397,11 @@ export async function acquireWorkAdmissionV1(params: {
   try {
     await fs.promises.rename(claimPath, currentPath);
   } catch (error) {
+    // The rename failed — the claim may still be sitting at `claimPath`
+    // (a partial/failed rename never moves the source on most platforms,
+    // but this must not assume that): clean it up rather than leaving it to
+    // strand every future caller for this task.
+    await cleanupOwnClaimBestEffortV1(claimPath);
     return { outcome: "writeFailed", error: error as Error };
   }
 
@@ -392,24 +440,34 @@ export async function acquireWorkAdmissionV1(params: {
       return queue;
     },
     release(): Promise<void> {
-      queue = queue.then(async () => {
-        if (released) {
-          return;
-        }
-        released = true;
-        localHandlesV1.delete(taskFolderPath);
-        try {
-          await fs.promises.unlink(currentPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw error;
-          }
-          // Displaced — not an error.
-        }
-      });
+      queue = queue.then(() => releaseMarkerOnceV1());
+      return queue;
+    },
+    handover(): Promise<void> {
+      // See the interface doc comment: mechanically identical to `release()`
+      // in v1a — same exact-filename unlink, same ENOENT-is-displaced
+      // handling, same owner-local queue — distinguished only by call-site
+      // intent (protection was handed off, not simply finished).
+      queue = queue.then(() => releaseMarkerOnceV1());
       return queue;
     },
   };
+
+  async function releaseMarkerOnceV1(): Promise<void> {
+    if (released) {
+      return;
+    }
+    released = true;
+    localHandlesV1.delete(taskFolderPath);
+    try {
+      await fs.promises.unlink(currentPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      // Displaced — not an error.
+    }
+  }
 
   localHandlesV1.set(taskFolderPath, handle);
   return { outcome: "acquired", handle };

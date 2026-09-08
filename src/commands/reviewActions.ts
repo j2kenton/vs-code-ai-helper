@@ -17,7 +17,14 @@ import {
   reportStageRunningV1,
   resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
-import { withWorkAdmissionV1, WorkAdmissionBusyV1, WorkAdmissionWriteFailedV1 } from "../state/workAdmissionV1";
+import {
+  acquireWorkAdmissionV1,
+  withWorkAdmissionV1,
+  WorkAdmissionBusyV1,
+  WorkAdmissionWriteFailedV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
@@ -5845,6 +5852,34 @@ function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | WorkAdmis
 }
 
 /**
+ * Extract the target task folder path SYNCHRONOUSLY from `arg`, when the
+ * shape carries one directly — mirroring exactly what `normalizeReviewArg` +
+ * `resolveTask` will later derive from the same arg, so a folder path
+ * returned here is guaranteed to equal the eventual `resolved.folderUri.fsPath`.
+ * Returns `undefined` only for the no-arg QuickPick path, where no task is
+ * chosen yet and there is nothing to protect.
+ *
+ * v1 fixes item 1 (Part 1a): this is what lets `runReviewWithAI` acquire
+ * admission BEFORE the consent gate — a first-use consent dialog awaits an
+ * UNBOUNDED user decision, which is squarely inside the setup-phase race this
+ * task exists to close, not just context-pack assembly.
+ */
+function extractSynchronousReviewFolderPathV1(arg: ReviewCommandArg): string | undefined {
+  if (!arg || typeof arg !== "object") {
+    return undefined;
+  }
+  if ("task" in arg && arg.task?.folderUri?.fsPath) {
+    return arg.task.folderUri.fsPath;
+  }
+  if ("taskFolderPath" in arg && typeof arg.taskFolderPath === "string" && arg.taskFolderPath.length > 0) {
+    // Same normalization `normalizeReviewArg` applies before resolveTask ever
+    // sees it, so this always matches `resolved.folderUri.fsPath` exactly.
+    return vscode.Uri.file(arg.taskFolderPath).fsPath;
+  }
+  return undefined;
+}
+
+/**
  * Run (or re-run) the review for the task's current position in the
  * workflow. Labeled "Review" in the UI.
  *
@@ -5883,50 +5918,94 @@ export async function runReviewWithAI(
     return;
   }
 
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the consent gate and task resolution
+  // whenever the target folder is known synchronously from `arg` — the
+  // dominant invocation path (tree-row buttons, the keyboard-shortcut
+  // router). This closes the architectural gap the 2026-09-08 review raised:
+  // acquiring only after `resolveTask` left the whole consent wait (unbounded
+  // — a human decision) and the resolution read outside admission's
+  // protection. The no-arg QuickPick path has no folder to protect until one
+  // is chosen, so `earlyHandle` stays undefined and admission is acquired
+  // after resolution instead (unchanged from before).
+  const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "runReviewWithAI",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
+  const earlyHandle = early?.outcome === "acquired" ? early.handle : undefined;
+  const earlyHeartbeat = earlyHandle
+    ? setInterval(() => void earlyHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  let earlyReleased = false;
+  const releaseEarlyAdmissionV1 = async (): Promise<void> => {
+    if (earlyReleased) {
+      return;
+    }
+    earlyReleased = true;
+    if (earlyHeartbeat) {
+      clearInterval(earlyHeartbeat);
+    }
+    if (earlyHandle) {
+      await earlyHandle.release();
+    }
+  };
 
-  const resolved = await resolveTask(
-    normalizeReviewArg(arg),
-    Object.keys(REVIEW_TARGETS) as TaskStage[],
-    "Review with AI",
-    context
-  );
-  if (!resolved) {
-    return;
-  }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
-    return;
-  }
+  try {
+    // ── Consent gate ───────────────────────────────────────────────────────
+    const consented = await ensureAiConsent(context);
+    if (!consented) {
+      return;
+    }
 
-  // Prefer the task's persisted ownership.workspaceRoot over the active-editor
-  // workspace so the context pack is generated from the correct workspace.
-  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
-  if (!workspaceRoot) {
-    NotificationRouter.showError(
-      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    const resolved = await resolveTask(
+      normalizeReviewArg(arg),
+      Object.keys(REVIEW_TARGETS) as TaskStage[],
+      "Review with AI",
+      context
     );
-    return;
-  }
+    if (!resolved) {
+      return;
+    }
+    if (resolved.progress.status === "paused") {
+      if (!earlyHandle) {
+        NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+        return;
+      }
+      // v1 fixes item 1 (Part 1a): we have held durable admission since
+      // BEFORE the consent wait and task resolution — a pause observed only
+      // now, with admission already live, can only be the watchdog's own
+      // (a user cannot pause a task admission already protects from the
+      // impossible state), so reverse it and continue rather than bail. Never
+      // reverses anything else: `reconcileWatchdogPauseAgainstAdmissionV1`
+      // checks the pause's own recorded reason before touching it.
+      const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+      if (reconciled.outcome !== "reversed") {
+        NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+        return;
+      }
+      resolved.progress = reconciled.progress;
+    }
 
-  const lockKey = resolved.folderUri.fsPath;
-  // v1 fixes item 1 (Part 1a): register durable admission BEFORE any
-  // setup — context-pack assembly inside runReviewForFolder can legitimately
-  // take long enough for the watchdog's quiet period to end mid-setup (the
-  // 2026-09-07 abort this closes), and without this the sweep has no durable
-  // evidence this command is working until a round-ledger row opens.
-  await withWorkAdmissionV1(
-    {
-      taskFolderPath: lockKey,
-      purpose: "commandDispatch",
-      commandId: "runReviewWithAI",
-      onRefused: (outcome) => NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(outcome)),
-    },
-    () =>
+    // Prefer the task's persisted ownership.workspaceRoot over the active-editor
+    // workspace so the context pack is generated from the correct workspace.
+    const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+    if (!workspaceRoot) {
+      NotificationRouter.showError(
+        "Could not determine the owning workspace for this task. Please open the workspace that created it."
+      );
+      return;
+    }
+
+    const lockKey = resolved.folderUri.fsPath;
+    const runIt = (): Promise<void> =>
       runTrackedOperation(
         lockKey,
         {
@@ -5954,8 +6033,32 @@ export async function runReviewWithAI(
               automationDispatch: isAutomationDispatchV1(arg),
             }
           )
-      )
-  );
+      );
+
+    if (earlyHandle) {
+      // By construction (extractSynchronousReviewFolderPathV1's doc comment)
+      // earlyFolderPath === lockKey — the same admission marker already
+      // covers the actual target; run directly under it instead of
+      // acquiring a second, redundant marker.
+      await runIt();
+      return;
+    }
+
+    // No-arg QuickPick path: nothing was known to protect until resolution
+    // just picked one. Acquire admission now, immediately before setup,
+    // exactly as before this round's early-acquisition change.
+    await withWorkAdmissionV1(
+      {
+        taskFolderPath: lockKey,
+        purpose: "admission",
+        commandId: "runReviewWithAI",
+        onRefused: (outcome) => NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(outcome)),
+      },
+      runIt
+    );
+  } finally {
+    await releaseEarlyAdmissionV1();
+  }
 }
 
 /**

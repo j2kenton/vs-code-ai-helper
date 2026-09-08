@@ -87,6 +87,7 @@ import {
   getWorkflowPathRegistryV1,
   setChatInteractionTransactionStoreV1,
 } from "./services/workflowRuntimeServicesV1";
+import { configureHostIdentityRootV1 } from "./state/hostIdentityV1";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
@@ -282,6 +283,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     (err: unknown) => console.error("Could not create the extension's global storage directory", err)
   );
   const workflowPrivateStorageRootId = configureWorkflowPrivateStorageRootV1(context.globalStorageUri.fsPath);
+  // v1 fixes item 1 (Part 1a): work admission's race-safe per-install host
+  // identity (hostIdentityV1.ts) is wired from the same per-install,
+  // per-profile directory as the workflow private-storage root above — never
+  // task-scoped, so it is stable across every window/task this install ever
+  // touches.
+  configureHostIdentityRootV1(context.globalStorageUri.fsPath);
   const chatInteractionTransactionStore = createChatInteractionTransactionStoreV1({
     registry: getWorkflowPathRegistryV1(),
     fileStore: getWorkflowFileStoreV1(),
