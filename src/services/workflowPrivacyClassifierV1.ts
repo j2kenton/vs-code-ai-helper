@@ -70,6 +70,11 @@ export const EDIT_RUNS_DIRNAME_V1 = "edit-runs";
 export const LEASES_DIRNAME_V1 = "leases";
 /** Meta-root directory of creation intent/journal/tombstone records (plan §4.2). */
 export const CREATION_INTENTS_DIRNAME_V1 = "creation-intents-v1";
+/** Task-folder-relative directory of durable work-admission claim/marker
+ * records (v1 fixes item 1, Part 1a — state/workAdmissionV1.ts, which
+ * imports this constant rather than duplicating it, so the classifier and
+ * the module that writes these paths cannot drift apart). */
+export const ADMISSION_DIRNAME_V1 = "admission-v1";
 /** Task-folder creation sentinel (plan §4.2). */
 export const CREATION_SENTINEL_FILENAME_V1 = ".ensemble-creation-sentinel-v1.json";
 
@@ -189,6 +194,10 @@ export function classifyWorkflowPathV1(pathLike: string): WorkflowPathClassV1 {
   }
 
   if (segments.includes(CREATION_INTENTS_DIRNAME_V1)) {
+    return "workflowControl";
+  }
+
+  if (segments.includes(ADMISSION_DIRNAME_V1)) {
     return "workflowControl";
   }
 

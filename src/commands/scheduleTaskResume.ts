@@ -34,6 +34,7 @@ import {
   isStaleDispatchedImplRecoveryV1,
   isUnrecoverableImplRecoveryV1,
 } from "../utils/taskWatchdogV1";
+import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -569,6 +570,32 @@ export class TaskActionScheduler implements vscode.Disposable {
         // racing window's write between this loop's snapshot and this
         // call's own fresh read — that window already posted the
         // escalation, so this one must not post a second copy of it.
+        continue;
+      }
+      // v1 fixes item 1 (Part 1a), post-write race close: a command may have
+      // begun its own durable admission (state/workAdmissionV1.ts) in the
+      // narrow window between this pause's write landing on disk and this
+      // loop reaching the notification step below — `isStillImpossible`
+      // inside `closeStalledTaskThroughLedgerV1` above already re-checks
+      // admission immediately BEFORE the write, but not after it. A full
+      // generation-fenced reversal (so a late admission can never coexist
+      // with an effective pause, from either write order) is 1b's job; for
+      // now, an admission observed right after our own write is reversed
+      // here rather than announced, so a command that won the race is never
+      // told it was paused for a state that is no longer true.
+      if (hasLiveWorkAdmissionBestEffortV1(task.taskFolderPath)) {
+        await this.store.patch(vscode.Uri.file(task.taskFolderPath), (current) => {
+          if (current.status !== "paused" || current.pausedReason !== expectedReason) {
+            // Something else already moved the task on; do not clobber it.
+            return current;
+          }
+          return {
+            ...current,
+            status: "active",
+            pausedReason: undefined,
+            updatedAt: new Date(this.clock.now()).toISOString(),
+          };
+        });
         continue;
       }
       this.stalledActiveNotified.add(task.taskFolderPath);

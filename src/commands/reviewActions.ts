@@ -17,6 +17,7 @@ import {
   reportStageRunningV1,
   resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
+import { withWorkAdmissionV1, WorkAdmissionBusyV1, WorkAdmissionWriteFailedV1 } from "../state/workAdmissionV1";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
@@ -5824,6 +5825,26 @@ export async function restoreRejectedImplementationRoundV1(
 }
 
 /**
+ * Format the interim `busy`/`writeFailed` work-admission diagnostic (v1
+ * fixes item 1, Part 1a's interim policy) as a user-facing message — naming
+ * the blocking owner, its age, and the marker path for `busy`, or the real
+ * filesystem error for `writeFailed`, rather than a generic "task is busy".
+ */
+function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1): string {
+  if (outcome.outcome === "writeFailed") {
+    return `Could not start this stage action: ${outcome.error.message}`;
+  }
+  const ageSeconds = Math.round(outcome.ageMs / 1000);
+  const ownerDetail = outcome.owner
+    ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
+    : "held by an unreadable record";
+  return (
+    `This task already has a stage action in progress (${ownerDetail}, started ~${ageSeconds}s ago at ` +
+    `${outcome.markerPath})${outcome.likelyStale ? " — this looks stale, but it is not reclaimed automatically." : ""}.`
+  );
+}
+
+/**
  * Run (or re-run) the review for the task's current position in the
  * workflow. Labeled "Review" in the UI.
  *
@@ -5893,32 +5914,46 @@ export async function runReviewWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  await runTrackedOperation(
-    lockKey,
+  // v1 fixes item 1 (Part 1a): register durable admission BEFORE any
+  // setup — context-pack assembly inside runReviewForFolder can legitimately
+  // take long enough for the watchdog's quiet period to end mid-setup (the
+  // 2026-09-07 abort this closes), and without this the sweep has no durable
+  // evidence this command is working until a round-ledger row opens.
+  await withWorkAdmissionV1(
     {
-      label: "Review",
-      stage: resolved.progress.currentStage,
-      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
-      kind: "review",
-      cancellable: true,
+      taskFolderPath: lockKey,
+      purpose: "commandDispatch",
+      commandId: "runReviewWithAI",
+      onRefused: (outcome) => NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(outcome)),
     },
-    (op) =>
-      runReviewForFolder(
-        extensionUri,
-        resolved.folderUri,
-        workspaceRoot,
-        resolved.progress.currentStage,
-        true,
+    () =>
+      runTrackedOperation(
+        lockKey,
         {
-          operation: op,
-          chatViewProvider,
-          // 2026-09-04 review follow-up (completion blocker, narrowed): the
-          // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
-          // itself so it is a single choke point every review dispatch passes
-          // through — not just this command's entry — see that function's own
-          // doc comment for the full rationale and the automation/manual split.
-          automationDispatch: isAutomationDispatchV1(arg),
-        }
+          label: "Review",
+          stage: resolved.progress.currentStage,
+          taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
+          kind: "review",
+          cancellable: true,
+        },
+        (op) =>
+          runReviewForFolder(
+            extensionUri,
+            resolved.folderUri,
+            workspaceRoot,
+            resolved.progress.currentStage,
+            true,
+            {
+              operation: op,
+              chatViewProvider,
+              // 2026-09-04 review follow-up (completion blocker, narrowed): the
+              // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
+              // itself so it is a single choke point every review dispatch passes
+              // through — not just this command's entry — see that function's own
+              // doc comment for the full rationale and the automation/manual split.
+              automationDispatch: isAutomationDispatchV1(arg),
+            }
+          )
       )
   );
 }

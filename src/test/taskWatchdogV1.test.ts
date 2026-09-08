@@ -21,6 +21,10 @@ import {
 import { ImplRecoveryV1, RoundLedgerEntryV1, TaskProgress } from "../types/taskProgress";
 import { __extensionContextV1TestOnly, getExtensionContextV1 } from "../utils/extensionContextV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
 
 function baseProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
   return {
@@ -212,6 +216,33 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
       }),
       false
     );
+  });
+
+  void it("is false with live work admission (v1 fixes item 1, Part 1a), and returns to true once released", async () => {
+    const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-watchdog-admission-test-"));
+    try {
+      const admission = await acquireWorkAdmissionV1({
+        taskFolderPath: taskDir,
+        purpose: "commandDispatch",
+        commandId: "test-command",
+      });
+      assert.equal(admission.outcome, "acquired");
+      assert.equal(
+        isImpossibleActiveStateV1({ progress: baseProgress(), taskCanonicalId: taskDir }),
+        false,
+        "a live admission marker must exempt the task"
+      );
+      if (admission.outcome === "acquired") {
+        await admission.handle.release();
+      }
+      assert.equal(
+        isImpossibleActiveStateV1({ progress: baseProgress(), taskCanonicalId: taskDir }),
+        true,
+        "once admission is released, the predicate must fire again"
+      );
+    } finally {
+      fs.rmSync(taskDir, { recursive: true, force: true });
+    }
   });
 
   void it("is false with a live scheduling-intent entry, and returns to true once it clears", async () => {

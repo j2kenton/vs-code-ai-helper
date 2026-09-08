@@ -22,6 +22,7 @@
  */
 import { ImplRecoveryV1, TaskProgress } from "../types/taskProgress";
 import { hasLiveSchedulingIntentBestEffortV1 } from "../state/schedulingIntentV1";
+import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 
 /** True when this task's own persisted round ledger still has an open row. */
 export function hasOpenRoundLedgerRowV1(progress: TaskProgress): boolean {
@@ -183,6 +184,16 @@ export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1):
   // comment) — exactly the conservative direction the watchdog needs: it
   // must never pause a task that might actually be about to do something.
   if (hasLiveSchedulingIntentBestEffortV1(taskCanonicalId)) {
+    return false;
+  }
+  // v1 fixes item 1 (Part 1a): a command that is starting work registers
+  // durable admission (state/workAdmissionV1.ts) BEFORE its setup phase, so
+  // the sweep can see it even before a round-ledger row exists. `taskCanonicalId`
+  // is the task folder path — the same value `acquireWorkAdmissionV1` keys
+  // its admission directory by. Fails OPEN (any present claim/marker, live or
+  // stale, counts) per that module's interim policy: v1a has no safe way to
+  // tell a dead owner from a slow one, so it never lets the sweep guess.
+  if (hasLiveWorkAdmissionBestEffortV1(taskCanonicalId)) {
     return false;
   }
   return true;

@@ -16,6 +16,7 @@ import {
   classifyWorkflowPathV1,
   isWorkflowPrivatePathV1,
   CREATION_SENTINEL_FILENAME_V1,
+  ADMISSION_DIRNAME_V1,
 } from "../services/workflowPrivacyClassifierV1";
 import {
   CHAT_HISTORY_CORRUPT_FILENAME,
@@ -96,6 +97,23 @@ void describe("workflowPrivacyClassifierV1", () => {
     assert.equal(classifyWorkflowPathV1(".ensemble-task.lock.stale-1234-ab12cd"), "workflowControl");
     assert.equal(classifyWorkflowPathV1(`plans/t/plan.md${REVERT_JOURNAL_SUFFIX}`), "workflowControl");
     assert.equal(classifyWorkflowPathV1(`plans/t/plan.md${REDO_SIDECAR_SUFFIX}`), "workflowControl");
+  });
+
+  void it("classifies work-admission claim/marker records as workflow-control (v1 fixes item 1, Part 1a)", () => {
+    assert.equal(
+      classifyWorkflowPathV1(`plans/t/${ADMISSION_DIRNAME_V1}/admission.claim`),
+      "workflowControl"
+    );
+    assert.equal(
+      classifyWorkflowPathV1(`plans/t/${ADMISSION_DIRNAME_V1}/admission.abc123.g1.xyz789`),
+      "workflowControl"
+    );
+    // Case-insensitive and backslash-style, same as every other family.
+    assert.equal(
+      classifyWorkflowPathV1(`C:\\ws\\plans\\t\\${ADMISSION_DIRNAME_V1.toUpperCase()}\\admission.claim`),
+      "workflowControl"
+    );
+    assert.equal(isWorkflowPrivatePathV1(`plans/t/${ADMISSION_DIRNAME_V1}/admission.claim`), true);
   });
 
   void it("classifies the meta-root migration journal as workflow-control (pinned to its owner export)", () => {
