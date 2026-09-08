@@ -19,8 +19,8 @@ import {
 } from "../utils/taskOperations";
 import {
   acquireWorkAdmissionV1,
-  withWorkAdmissionV1,
   WorkAdmissionBusyV1,
+  WorkAdmissionHandleV1,
   WorkAdmissionWriteFailedV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
@@ -5926,8 +5926,8 @@ export async function runReviewWithAI(
   // acquiring only after `resolveTask` left the whole consent wait (unbounded
   // — a human decision) and the resolution read outside admission's
   // protection. The no-arg QuickPick path has no folder to protect until one
-  // is chosen, so `earlyHandle` stays undefined and admission is acquired
-  // after resolution instead (unchanged from before).
+  // is chosen, so this stays undefined here and admission is acquired right
+  // after resolution instead, below.
   const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
@@ -5940,21 +5940,32 @@ export async function runReviewWithAI(
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
-  const earlyHandle = early?.outcome === "acquired" ? early.handle : undefined;
-  const earlyHeartbeat = earlyHandle
-    ? setInterval(() => void earlyHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
-    : undefined;
-  let earlyReleased = false;
-  const releaseEarlyAdmissionV1 = async (): Promise<void> => {
-    if (earlyReleased) {
+
+  // Single mutable admission slot for the whole command, filled either by the
+  // early acquisition above or, for the no-arg QuickPick path, right after
+  // resolution below — but in BOTH cases, the pause check further down never
+  // runs until this slot is filled. That is the fix for the 2026-09-08 review's
+  // remaining architectural blocker: the no-arg path used to check
+  // `resolved.progress.status` from a pre-admission snapshot and only acquire
+  // admission afterward, leaving a window where a
+  // sweep could commit a pause between the check and admission actually
+  // publishing — the exact setup-phase race this task exists to close, just on
+  // the one path that deferred acquisition. Now every path re-reads and
+  // reconciles status only once admission is confirmed live for the resolved
+  // target.
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
       return;
     }
-    earlyReleased = true;
-    if (earlyHeartbeat) {
-      clearInterval(earlyHeartbeat);
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
     }
-    if (earlyHandle) {
-      await earlyHandle.release();
+    if (handle) {
+      await handle.release();
     }
   };
 
@@ -5974,15 +5985,30 @@ export async function runReviewWithAI(
     if (!resolved) {
       return;
     }
-    if (resolved.progress.status === "paused") {
-      if (!earlyHandle) {
-        NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+
+    if (!handle) {
+      // No-arg QuickPick path: nothing was known to protect until resolution
+      // just picked a target. Acquire admission now, BEFORE the pause check
+      // below reads `resolved.progress.status` — so that check always runs
+      // against a target admission already protects, exactly like the
+      // early-acquisition path above.
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        purpose: "admission",
+        commandId: "runReviewWithAI",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
         return;
       }
-      // v1 fixes item 1 (Part 1a): we have held durable admission since
-      // BEFORE the consent wait and task resolution — a pause observed only
-      // now, with admission already live, can only be the watchdog's own
-      // (a user cannot pause a task admission already protects from the
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    if (resolved.progress.status === "paused") {
+      // v1 fixes item 1 (Part 1a): admission is now guaranteed live for this
+      // exact target — a pause observed only now can only be the watchdog's
+      // own (a user cannot pause a task admission already protects from the
       // impossible state), so reverse it and continue rather than bail. Never
       // reverses anything else: `reconcileWatchdogPauseAgainstAdmissionV1`
       // checks the pause's own recorded reason before touching it.
@@ -6005,59 +6031,36 @@ export async function runReviewWithAI(
     }
 
     const lockKey = resolved.folderUri.fsPath;
-    const runIt = (): Promise<void> =>
-      runTrackedOperation(
-        lockKey,
-        {
-          label: "Review",
-          stage: resolved.progress.currentStage,
-          taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
-          kind: "review",
-          cancellable: true,
-        },
-        (op) =>
-          runReviewForFolder(
-            extensionUri,
-            resolved.folderUri,
-            workspaceRoot,
-            resolved.progress.currentStage,
-            true,
-            {
-              operation: op,
-              chatViewProvider,
-              // 2026-09-04 review follow-up (completion blocker, narrowed): the
-              // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
-              // itself so it is a single choke point every review dispatch passes
-              // through — not just this command's entry — see that function's own
-              // doc comment for the full rationale and the automation/manual split.
-              automationDispatch: isAutomationDispatchV1(arg),
-            }
-          )
-      );
-
-    if (earlyHandle) {
-      // By construction (extractSynchronousReviewFolderPathV1's doc comment)
-      // earlyFolderPath === lockKey — the same admission marker already
-      // covers the actual target; run directly under it instead of
-      // acquiring a second, redundant marker.
-      await runIt();
-      return;
-    }
-
-    // No-arg QuickPick path: nothing was known to protect until resolution
-    // just picked one. Acquire admission now, immediately before setup,
-    // exactly as before this round's early-acquisition change.
-    await withWorkAdmissionV1(
+    await runTrackedOperation(
+      lockKey,
       {
-        taskFolderPath: lockKey,
-        purpose: "admission",
-        commandId: "runReviewWithAI",
-        onRefused: (outcome) => NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(outcome)),
+        label: "Review",
+        stage: resolved.progress.currentStage,
+        taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
+        kind: "review",
+        cancellable: true,
       },
-      runIt
+      (op) =>
+        runReviewForFolder(
+          extensionUri,
+          resolved.folderUri,
+          workspaceRoot,
+          resolved.progress.currentStage,
+          true,
+          {
+            operation: op,
+            chatViewProvider,
+            // 2026-09-04 review follow-up (completion blocker, narrowed): the
+            // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
+            // itself so it is a single choke point every review dispatch passes
+            // through — not just this command's entry — see that function's own
+            // doc comment for the full rationale and the automation/manual split.
+            automationDispatch: isAutomationDispatchV1(arg),
+          }
+        )
     );
   } finally {
-    await releaseEarlyAdmissionV1();
+    await releaseAdmissionV1();
   }
 }
 
@@ -6534,6 +6537,46 @@ export async function fastForwardReviewWithAI(
     return;
   }
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Same rationale and mechanism as `runReviewWithAI` immediately above:
+  // acquire durable admission BEFORE the consent gate and task resolution
+  // whenever the target folder is known synchronously from `arg`, so the
+  // whole of Fast Forward's setup phase (consent's unbounded wait, task
+  // resolution, the provider-path/availability gates already run above, the
+  // initial-review dispatch) is protected from the watchdog sweep. The no-arg
+  // QuickPick path has no folder to protect until `resolveTask` picks one, so
+  // this stays undefined here and admission is acquired right after
+  // resolution instead, mirroring `runReviewWithAI` exactly.
+  const ffEarlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
+  const ffEarly = ffEarlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: ffEarlyFolderPath,
+        purpose: "admission",
+        commandId: "fastForwardReviewWithAI",
+      })
+    : undefined;
+  if (ffEarly && ffEarly.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffEarly));
+    return;
+  }
+
+  let ffHandle: WorkAdmissionHandleV1 | undefined = ffEarly?.outcome === "acquired" ? ffEarly.handle : undefined;
+  let ffHeartbeat = ffHandle ? setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let ffReleased = false;
+  const releaseFfAdmissionV1 = async (): Promise<void> => {
+    if (ffReleased) {
+      return;
+    }
+    ffReleased = true;
+    if (ffHeartbeat) {
+      clearInterval(ffHeartbeat);
+    }
+    if (ffHandle) {
+      await ffHandle.release();
+    }
+  };
+
+  try {
   const consented = await ensureAiConsent(context);
   if (!consented) {
     return;
@@ -6553,9 +6596,37 @@ export async function fastForwardReviewWithAI(
   if (!resolved) {
     return;
   }
+
+  if (!ffHandle) {
+    // No-arg QuickPick path: nothing was known to protect until resolution
+    // just picked a target. Acquire admission now, BEFORE the pause check
+    // below reads `resolved.progress.status` — same ordering fix as
+    // `runReviewWithAI`'s no-arg path, so a sweep can never commit a pause in
+    // the window between reading status and admission actually publishing.
+    const ffLate = await acquireWorkAdmissionV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      purpose: "admission",
+      commandId: "fastForwardReviewWithAI",
+    });
+    if (ffLate.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffLate));
+      return;
+    }
+    ffHandle = ffLate.handle;
+    ffHeartbeat = setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
   if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
-    return;
+    // Admission is now guaranteed live for this exact target — a pause
+    // observed only now can only be the watchdog's own, so reverse it and
+    // continue rather than bail. Same reconciliation `runReviewWithAI` uses;
+    // never reverses a user pause.
+    const ffReconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+    if (ffReconciled.outcome !== "reversed") {
+      NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
+      return;
+    }
+    resolved.progress = ffReconciled.progress;
   }
 
   const lockKey = resolved.folderUri.fsPath;
@@ -7332,6 +7403,9 @@ export async function fastForwardReviewWithAI(
   }
     }
   );
+  } finally {
+    await releaseFfAdmissionV1();
+  }
 }
 
 /**

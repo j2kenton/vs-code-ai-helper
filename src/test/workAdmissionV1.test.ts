@@ -7,6 +7,7 @@ import {
   acquireWorkAdmissionV1,
   describeWorkAdmissionBlockerV1,
   hasLiveWorkAdmissionBestEffortV1,
+  setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
 } from "../state/workAdmissionV1";
 import {
@@ -367,4 +368,151 @@ void test("resolveDurableHostIdentityV1 itself (no in-process cache) resolves a 
   const distinct = new Set(ids);
   assert.equal(distinct.size, 1, "every racer against the same root must converge on exactly one durable id");
   assert.equal(fs.readdirSync(root).length, 1, "exactly one durable host-identity record must survive the race");
+});
+
+// ── Completion-blocker coverage added 2026-09-08 review round, 2nd pass ────
+
+void test("a leftover, incomplete temp file from a crashed writer is never adopted as the durable host identity", async () => {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-torn-temp-"));
+  // Simulate a process that crashed AFTER creating its private temp file but
+  // BEFORE the write completed — the exact window the temp-file+link design
+  // exists to keep off the shared final path. Because nothing ever links
+  // this temp file to the final path, it must be completely inert: not read
+  // as a record, not mistaken for the final file, and not an obstacle to a
+  // fresh resolution converging normally.
+  fs.writeFileSync(path.join(root, "host-identity-v1.json.tmp-deadbeef-crashed"), '{"hostId":"AB');
+
+  const id = await resolveDurableHostIdentityV1(root);
+  assert.equal(typeof id, "string");
+  assert.ok(id.length > 0);
+  assert.notEqual(id, "", "must never surface the torn content as (part of) an identity");
+
+  const finalPath = path.join(root, "host-identity-v1.json");
+  const record = JSON.parse(fs.readFileSync(finalPath, "utf8")) as { hostId: string };
+  assert.equal(record.hostId, id, "the published final record must be the complete one just resolved, never the torn leftover");
+
+  // Resolving again must read the same, now-published record back — the
+  // leftover torn temp file (still present; nothing in this path claims to
+  // garbage-collect it) never gets preferred over the real final file.
+  const again = await resolveDurableHostIdentityV1(root);
+  assert.equal(again, id);
+});
+
+void test("a leftover temp file that WAS fully written but never linked is never adopted as the durable host identity", async () => {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-orphaned-temp-"));
+  // A subtler crash window: the writer finished writing its COMPLETE temp
+  // file but crashed before (or while) calling `link()`. Even though this
+  // temp file's content is perfectly valid JSON, it must never be treated as
+  // the durable identity — only content actually reachable at the exact
+  // final filename counts. If this were adopted, two processes that each
+  // independently reached this state (each writing their own complete-but-
+  // unlinked temp file with a DIFFERENT hostId) would never converge.
+  const orphanedId = "11111111-1111-1111-1111-111111111111";
+  fs.writeFileSync(
+    path.join(root, "host-identity-v1.json.tmp-orphan-1"),
+    JSON.stringify({ hostId: orphanedId, hostname: "orphan-host", createdAt: new Date().toISOString() })
+  );
+
+  const id = await resolveDurableHostIdentityV1(root);
+  assert.notEqual(id, orphanedId, "an unlinked temp file's content must never be adopted, however complete/valid it is");
+
+  const finalPath = path.join(root, "host-identity-v1.json");
+  assert.ok(fs.existsSync(finalPath), "resolution must publish its own record rather than silently adopting the orphan");
+  const record = JSON.parse(fs.readFileSync(finalPath, "utf8")) as { hostId: string };
+  assert.equal(record.hostId, id);
+});
+
+void test("a genuine claim-create failure (not EEXIST) surfaces as writeFailed and creates no orphan claim file", async () => {
+  const task = freshTaskFolder("claim-create-genuine-failure");
+  const injectedError = Object.assign(new Error("simulated EACCES on claim create"), { code: "EACCES" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeClaimWrite: () => injectedError,
+  });
+  try {
+    const result = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "claim-create-failure-command",
+    });
+    assert.equal(result.outcome, "writeFailed");
+    if (result.outcome === "writeFailed") {
+      assert.match(result.error.message, /simulated EACCES on claim create/);
+    }
+    // The write never actually happened (it was intercepted before the real
+    // fs call), so there is nothing to clean up and nothing left behind.
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0);
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+});
+
+void test("a marker-rename failure cleans up the claim file it created, leaving the directory empty", async () => {
+  const task = freshTaskFolder("rename-failure-cleans-up-claim");
+  const injectedError = Object.assign(new Error("simulated EPERM on marker rename"), { code: "EPERM" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeMarkerRename: () => injectedError,
+  });
+  try {
+    const result = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "rename-failure-command",
+    });
+    assert.equal(result.outcome, "writeFailed");
+    if (result.outcome === "writeFailed") {
+      assert.match(result.error.message, /simulated EPERM on marker rename/);
+      assert.doesNotMatch(
+        result.error.message,
+        /could not be removed during cleanup/,
+        "cleanup succeeded in this test, so the message must not falsely claim it also failed"
+      );
+    }
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    assert.equal(fs.readdirSync(dir).length, 0, "the claim file created before the failed rename must have been cleaned up");
+    assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false, "a cleaned-up failure must never leave the task looking admitted");
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+});
+
+void test("when cleanup ALSO fails after a rename failure, the claim is left behind but the error names both failures", async () => {
+  const task = freshTaskFolder("rename-and-cleanup-both-fail");
+  const renameError = Object.assign(new Error("simulated EPERM on marker rename"), { code: "EPERM" });
+  const cleanupError = Object.assign(new Error("simulated EBUSY on claim unlink"), { code: "EBUSY" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeMarkerRename: () => renameError,
+    onBeforeClaimCleanupUnlink: () => cleanupError,
+  });
+  try {
+    const result = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "double-failure-command",
+    });
+    assert.equal(result.outcome, "writeFailed");
+    if (result.outcome === "writeFailed") {
+      // Completion blocker fix: the ORIGINAL failure and the fact that
+      // cleanup could not remove the stranded claim must BOTH be named —
+      // this is the diagnosed-instead-of-silent behavior the review asked for.
+      assert.match(result.error.message, /simulated EPERM on marker rename/);
+      assert.match(result.error.message, /could not be removed during cleanup/);
+      assert.match(result.error.message, /simulated EBUSY on claim unlink/);
+      assert.match(result.error.message, /removed manually/);
+    }
+    // The claim file genuinely could not be removed in this scenario — it is
+    // still on disk, and the task correctly reads as admitted/busy (v1a's
+    // interim policy: presence is live) rather than silently vanishing.
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    assert.equal(fs.readdirSync(dir).length, 1);
+    assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+    // Manual cleanup so this test doesn't leak a stranded claim file into
+    // TEST_ROOT's teardown expectations (the injected failure is gone now).
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    for (const entry of fs.readdirSync(dir)) {
+      fs.unlinkSync(path.join(dir, entry));
+    }
+  }
 });

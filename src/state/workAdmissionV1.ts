@@ -292,18 +292,98 @@ export function describeWorkAdmissionBlockerV1(
   };
 }
 
-/** Best-effort removal of a claim file this exact call created — never an
+/** Small fixed delays between cleanup retries — long enough to ride out a
+ * transient same-host contender (e.g. an antivirus scan or another process
+ * that briefly opened the file), short enough not to meaningfully delay
+ * error reporting for a genuinely stuck cleanup. */
+const CLAIM_CLEANUP_RETRY_DELAYS_MS_V1 = [10, 50, 150];
+
+function delayV1(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort removal of a claim file this exact call created — never an
  * error if it is already gone (a concurrent path already cleaned it up, or
  * the failure that triggered this cleanup was the write itself). Used by
  * every `acquireWorkAdmissionV1` failure branch AFTER the claim was
- * successfully created, so a mid-genesis failure never orphans it. */
-async function cleanupOwnClaimBestEffortV1(claimPath: string): Promise<void> {
-  try {
-    await fs.promises.unlink(claimPath);
-  } catch {
-    // Already gone, or unremovable for a reason the caller's own reported
-    // error already covers — never let cleanup itself throw.
+ * successfully created, so a mid-genesis failure never orphans it.
+ *
+ * Completion blocker fix (2026-09-08 review): the prior version swallowed
+ * EVERY unlink failure unconditionally, including a real, non-ENOENT one
+ * (permissions, an antivirus/indexer holding the file open on Windows, ...).
+ * Under v1a's interim never-reclaim policy that silently strands
+ * `admission.claim` on disk forever — every later caller for the task reads
+ * it back as "busy" and the watchdog stands down for the task permanently,
+ * with nothing in the returned diagnostic hinting that cleanup itself is
+ * what actually failed. This now retries a genuine failure a few times
+ * (transient locks are the common real-world case) and, if it still cannot
+ * remove the file, returns the error to the caller instead of swallowing it,
+ * so `acquireWorkAdmissionV1` can fold it into the reported error message —
+ * turning a silent, permanent stranding into a diagnosed one a human can act
+ * on immediately instead of discovering only when every later dispatch
+ * reports busy against a file that was created by an error path.
+ */
+async function cleanupOwnClaimBestEffortV1(claimPath: string): Promise<Error | undefined> {
+  for (let attempt = 0; attempt <= CLAIM_CLEANUP_RETRY_DELAYS_MS_V1.length; attempt++) {
+    try {
+      const injected = fsFailureInjectionV1?.onBeforeClaimCleanupUnlink?.();
+      if (injected) {
+        throw injected;
+      }
+      await fs.promises.unlink(claimPath);
+      return undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // Already gone — a concurrent path cleaned it up, or it was never
+        // fully created; nothing to report.
+        return undefined;
+      }
+      const delayMs = CLAIM_CLEANUP_RETRY_DELAYS_MS_V1[attempt];
+      if (delayMs === undefined) {
+        return error as Error;
+      }
+      await delayV1(delayMs);
+    }
   }
+  return undefined;
+}
+
+/** Combine a primary failure with a secondary claim-cleanup failure into one
+ * error message, when cleanup itself could not remove the claim file — so the
+ * report names BOTH the original problem and the fact that `admission.claim`
+ * was left behind and needs manual removal, rather than only the first. */
+function withCleanupFailureNotedV1(primary: Error, cleanupError: Error | undefined, claimPath: string): Error {
+  if (!cleanupError) {
+    return primary;
+  }
+  return new Error(
+    `${primary.message} (additionally, the claim file at ${claimPath} could not be removed during cleanup: ` +
+      `${cleanupError.message} — it will strand every later stage action for this task as "busy" until it is ` +
+      `removed manually)`
+  );
+}
+
+/**
+ * Test-only deterministic failure injection for the two genesis steps that
+ * are otherwise impractical to force reliably and cross-platform with real
+ * filesystem permissions (`chmod`'s effect on NEW file creation inside a
+ * directory is unreliable on Windows, and the marker's random epoch makes
+ * pre-creating a colliding path for the rename target impossible). Set only
+ * from tests; `undefined` (the default) means production behavior is
+ * unchanged. Completion blocker fix (2026-09-08 review): without this seam
+ * the claim-create-failure and rename-failure branches — including their
+ * cleanup calls — had no test forcing them for a reason OTHER than the
+ * pre-existing `mkdir`-fails-first case, which never reaches either of them.
+ */
+export interface WorkAdmissionFsFailureInjectionV1 {
+  readonly onBeforeClaimWrite?: () => Error | undefined;
+  readonly onBeforeMarkerRename?: () => Error | undefined;
+  readonly onBeforeClaimCleanupUnlink?: () => Error | undefined;
+}
+let fsFailureInjectionV1: WorkAdmissionFsFailureInjectionV1 | undefined;
+export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmissionFsFailureInjectionV1 | undefined): void {
+  fsFailureInjectionV1 = injection;
 }
 
 /**
@@ -342,6 +422,10 @@ export async function acquireWorkAdmissionV1(params: {
   }
 
   try {
+    const injected = fsFailureInjectionV1?.onBeforeClaimWrite?.();
+    if (injected) {
+      throw injected;
+    }
     await fs.promises.writeFile(claimPath, JSON.stringify(claimInfo), { flag: "wx" });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -375,8 +459,8 @@ export async function acquireWorkAdmissionV1(params: {
   try {
     existingMarkers = listMarkersSyncV1(dir);
   } catch (error) {
-    await cleanupOwnClaimBestEffortV1(claimPath);
-    return { outcome: "writeFailed", error: error as Error };
+    const cleanupError = await cleanupOwnClaimBestEffortV1(claimPath);
+    return { outcome: "writeFailed", error: withCleanupFailureNotedV1(error as Error, cleanupError, claimPath) };
   }
   if (existingMarkers.length > 0) {
     await cleanupOwnClaimBestEffortV1(claimPath);
@@ -395,14 +479,18 @@ export async function acquireWorkAdmissionV1(params: {
   let currentGeneration = 1;
   let currentPath = path.join(dir, markerBasenameV1(ownerToken, currentGeneration, freshEpochV1()));
   try {
+    const injected = fsFailureInjectionV1?.onBeforeMarkerRename?.();
+    if (injected) {
+      throw injected;
+    }
     await fs.promises.rename(claimPath, currentPath);
   } catch (error) {
     // The rename failed — the claim may still be sitting at `claimPath`
     // (a partial/failed rename never moves the source on most platforms,
     // but this must not assume that): clean it up rather than leaving it to
     // strand every future caller for this task.
-    await cleanupOwnClaimBestEffortV1(claimPath);
-    return { outcome: "writeFailed", error: error as Error };
+    const cleanupError = await cleanupOwnClaimBestEffortV1(claimPath);
+    return { outcome: "writeFailed", error: withCleanupFailureNotedV1(error as Error, cleanupError, claimPath) };
   }
 
   // Owner-local serialization queue: heartbeat and release for THIS handle
