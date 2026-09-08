@@ -188,9 +188,30 @@ export async function resumePausedTask(
         // dealing with this". The cost is that an explicitly resumed task sorts
         // to the top of the task list — the correct outcome, since the user
         // just acted on it.
+        // The bump is applied HERE, unconditionally, and deliberately NOT left
+        // to `clearEscalation` (2026-09-08 defect report — the first shipped
+        // attempt at this fix, in 0.105.0/0.106.0, did exactly that and was
+        // inert for most tasks).
+        //
+        // `clearEscalation` early-returns `progress` untouched when there is no
+        // escalation to clear (`taskProgressTransforms.ts`), so hanging the
+        // refresh on it only refreshed tasks that happened to carry one. The
+        // resulting behaviour, reported verbatim: "Every single task, when I try
+        // to resume it, it re-pauses. I do it a second time, then it's fine."
+        //
+        // That two-step is the bug's own signature. First resume: no escalation,
+        // so no bump, so the stale timestamp stands and the sweep re-pauses.
+        // The watchdog pause then writes BOTH an escalation and a fresh
+        // `updatedAt`. Second resume: an escalation now exists, `clearEscalation`
+        // does bump, and it holds. The fix appeared to work in testing for
+        // exactly the same reason — a task that had just been watchdog-paused
+        // always had an escalation to clear.
+        //
+        // Resuming must refresh the clock because a human acted on the task, not
+        // because that task happened to be carrying an escalation record.
         await patchTaskProgressStrictV1(
           vscode.Uri.file(resolvedTask.taskFolderPath),
-          (current) => clearEscalation(current)
+          (current) => ({ ...clearEscalation(current), updatedAt: new Date().toISOString() })
         );
         // Part 11 item 13c (event-driven half, "stage advance/resume
         // invalidates escalation cards"): every escalation card exists to

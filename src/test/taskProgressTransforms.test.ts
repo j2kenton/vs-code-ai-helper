@@ -341,6 +341,40 @@ void test("updateTaskProgressStage clears an escalation recorded on the stage be
 });
 
 // ---------------------------------------------------------------------------
+// clearEscalation is NOT a freshness bump — resumeTask's regression
+//
+// 0.105.0/0.106.0 shipped a resume fix that refreshed `updatedAt` by calling
+// `clearEscalation(current)` without `preserveFreshness`. That is inert on any
+// task with no escalation, because clearEscalation early-returns `progress`
+// untouched — so resume left a stale timestamp and the stalled-task sweep
+// re-paused the task immediately. Reported 2026-09-08: "Every single task,
+// when I try to resume it, it re-pauses. I do it a second time, then it's
+// fine" — the second resume works only because the watchdog's own pause wrote
+// an escalation for clearEscalation to find.
+//
+// These pin the trap so the bump is never hung off this function again.
+// ---------------------------------------------------------------------------
+
+void test("clearEscalation does NOT bump updatedAt when there is no escalation to clear", () => {
+  const progress = makeProgress();
+  const cleared = clearEscalation(progress);
+  assert.equal(
+    cleared.updatedAt,
+    progress.updatedAt,
+    "no escalation means no write at all — callers needing a freshness bump must apply it themselves"
+  );
+  assert.equal(cleared, progress, "returns the same object, so nothing is persisted");
+});
+
+void test("resume's composed patch bumps updatedAt even with no escalation present", () => {
+  // The exact expression resumeTask.ts applies.
+  const progress = makeProgress();
+  const patched = { ...clearEscalation(progress), updatedAt: "2026-09-08T06:00:00.000Z" };
+  assert.notEqual(patched.updatedAt, progress.updatedAt);
+  assert.equal(patched.escalation, undefined);
+});
+
+// ---------------------------------------------------------------------------
 // appendReviewScoreHistory / recordEscalation / clearEscalation
 // ---------------------------------------------------------------------------
 
