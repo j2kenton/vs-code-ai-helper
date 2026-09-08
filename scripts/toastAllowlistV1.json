@@ -35,7 +35,7 @@
     },
     {
       "file": "src/extension.ts",
-      "line": 1033,
+      "line": 1038,
       "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision."
     },
     {

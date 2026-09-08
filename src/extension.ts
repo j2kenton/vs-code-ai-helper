@@ -287,8 +287,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // identity (hostIdentityV1.ts) is wired from the same per-install,
   // per-profile directory as the workflow private-storage root above — never
   // task-scoped, so it is stable across every window/task this install ever
-  // touches.
-  configureHostIdentityRootV1(context.globalStorageUri.fsPath);
+  // touches. `vscode.env.machineId` is also passed through: it is VS Code's
+  // own globally-unique per-machine id, and hostIdentityV1's persistent-
+  // failure fallback needs it to tell apart two machines that could otherwise
+  // report an identical `globalStorageUri.fsPath` (e.g. containers built from
+  // the same image) — see that module's `deterministicFallbackHostIdV1` doc
+  // comment (2026-09-08 review, third pass).
+  configureHostIdentityRootV1(context.globalStorageUri.fsPath, vscode.env.machineId);
   const chatInteractionTransactionStore = createChatInteractionTransactionStoreV1({
     registry: getWorkflowPathRegistryV1(),
     fileStore: getWorkflowFileStoreV1(),

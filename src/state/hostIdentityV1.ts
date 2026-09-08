@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { hostname } from "os";
 
 /**
@@ -30,6 +30,17 @@ import { hostname } from "os";
  * storage to write to), `resolveHostIdentityV1` fails open to a process-local
  * ephemeral id rather than throwing — consistent with this whole subsystem's
  * fail-open philosophy: an admission caller must always be able to proceed.
+ *
+ * When a root IS configured but publishing/reading the durable record fails
+ * persistently (not a transient glitch the retry in
+ * `readValidHostIdentityWithRetryV1` already rides out — see
+ * `deterministicFallbackHostIdV1` below), the fallback is deterministically
+ * derived from `rootDir` PLUS the caller-supplied `machineId` (VS Code's own
+ * `vscode.env.machineId`, wired in at `configureHostIdentityRootV1`) and
+ * `os.hostname()`, rather than randomly minted, so every process for the same
+ * install still converges on one id with zero filesystem I/O, even though
+ * nothing was ever durably published — see the 2026-09-08 second-review note
+ * on `deterministicFallbackHostIdV1` for why `rootDir` alone was unsafe here.
  */
 
 const HOST_IDENTITY_FILENAME_V1 = "host-identity-v1.json";
@@ -41,15 +52,28 @@ interface HostIdentityRecordV1 {
 }
 
 let configuredRootDir: string | undefined;
+/** VS Code's own `vscode.env.machineId` — a globally unique, per-machine
+ * identifier VS Code itself generates and persists specifically so telemetry
+ * (and, here, host identity) can distinguish machines that otherwise look
+ * identical. See `deterministicFallbackHostIdV1`'s doc comment for why this
+ * module cannot safely fall back to a hash of `rootDir` alone. */
+let configuredMachineId: string | undefined;
 let cachedHostId: string | undefined;
 /** Serializes concurrent in-process resolutions so two racing callers in the
  * SAME process both await one filesystem round trip instead of each
  * attempting their own exclusive create. */
 let inFlight: Promise<string> | undefined;
 
-/** Activation wiring: call once with `context.globalStorageUri.fsPath`. */
-export function configureHostIdentityRootV1(rootDir: string): void {
+/**
+ * Activation wiring: call once with `context.globalStorageUri.fsPath` and
+ * `vscode.env.machineId`. `machineId` is optional only so this module's own
+ * unit tests (which run outside any extension host and have no `vscode.env`
+ * to read) can configure a root without one; production activation always
+ * supplies it.
+ */
+export function configureHostIdentityRootV1(rootDir: string, machineId?: string): void {
   configuredRootDir = rootDir;
+  configuredMachineId = machineId;
   cachedHostId = undefined;
   inFlight = undefined;
 }
@@ -108,6 +132,57 @@ async function readValidHostIdentityWithRetryV1(filePath: string): Promise<strin
 }
 
 /**
+ * 2026-09-08 review (blocker `…-1`, second pass — the retry above narrowed
+ * but did not close it): when durable storage is configured but a failure
+ * PERSISTS past the retry (storage genuinely unwritable/unreadable, not a
+ * momentary glitch), every failure branch used to concede to
+ * `ephemeral-${randomUUID()}` — a fresh random id, independently minted by
+ * whichever process hit the failure. Two extension host processes for the
+ * SAME install (same `configuredRootDir`, e.g. two windows on one profile,
+ * or a restart during an outage) experiencing the same persistent failure
+ * would then diverge onto two different fallback identities, defeating the
+ * one guarantee this module exists to provide: converge on ONE id per
+ * install. Admission itself must still fail open (a caller must always be
+ * able to proceed — see module doc comment), so this cannot become a thrown
+ * error; instead it derives a STABLE fallback with no filesystem I/O at all.
+ *
+ * 2026-09-08 review, THIRD pass: the first fix derived this purely from
+ * `rootDir`, which converges same-install processes but is not actually an
+ * INSTALLATION identity — a filesystem path is just a string, and two
+ * genuinely different machines can independently produce the identical
+ * `context.globalStorageUri.fsPath` (this is the normal case, not an edge
+ * case, for containerized/remote-dev setups built from one image: every
+ * container mounts the same profile layout at the same path). Part 1c's
+ * conservative liveness probing is designed to compare a marker's recorded
+ * `hostId` against "am I that host" before ever treating a same-host PID as
+ * probeable — a path-only fallback could make two unrelated machines look
+ * like the same host, exactly backwards from that safety property. So this
+ * also folds in `machineId` (VS Code's own `vscode.env.machineId`, a
+ * globally-unique per-machine id VS Code itself generates and persists) and
+ * `os.hostname()`: two machines would need an identical path AND an
+ * identical VS Code machine id AND an identical hostname to collide, and the
+ * first of those three is specifically the one VS Code manufactures to be
+ * globally unique. `machineId` is optional purely so this module's own
+ * out-of-extension-host unit tests can exercise the persistent-failure path
+ * without a `vscode.env` to read (production activation always supplies it).
+ * Prefixed `derived-` (not `ephemeral-`) so it is distinguishable in
+ * diagnostics from the "not configured at all" fallback below, which has no
+ * `rootDir` to derive from and is a different, narrower case (this module's
+ * own unit tests running outside any extension host).
+ */
+function deterministicFallbackHostIdV1(rootDir: string, machineId: string | undefined): string {
+  const digest = createHash("sha256")
+    .update(machineId ?? "")
+    .update(" ")
+    .update(hostname())
+    .update(" ")
+    .update(rootDir)
+    .digest("hex")
+    .slice(0, 32);
+  return `derived-${digest}`;
+}
+
+/**
  * Test-only deterministic failure injection for the `link()` publish step —
  * otherwise as impractical to force reliably and cross-platform as the
  * equivalent seam in `workAdmissionV1.ts` (see that module's own doc comment
@@ -147,7 +222,7 @@ export function setHostIdentityFsFailureInjectionForTestV1(injection: HostIdenti
  * forever" — there is no partial-content state a reader can observe, and no
  * second writer can ever silently replace the first winner's content.
  */
-export async function resolveDurableHostIdentityV1(rootDir: string): Promise<string> {
+export async function resolveDurableHostIdentityV1(rootDir: string, machineId?: string): Promise<string> {
   const filePath = path.join(rootDir, HOST_IDENTITY_FILENAME_V1);
   try {
     await fs.promises.mkdir(rootDir, { recursive: true });
@@ -175,11 +250,12 @@ export async function resolveDurableHostIdentityV1(rootDir: string): Promise<str
   } catch {
     // Cannot even create our own private, uniquely-named temp file —
     // genuinely a storage/permission problem, not contention. Before
-    // conceding to a private ephemeral id, check (with retry) whether a
+    // conceding to the deterministic fallback, check (with retry) whether a
     // durable record already exists — a concurrent racer may have published
     // one moments ago even though nothing about that publication caused our
-    // own failure. Only fail open when there is truly nothing to converge on.
-    return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
+    // own failure. Only fail open to the derived id when there is truly
+    // nothing durable to converge on.
+    return (await readValidHostIdentityWithRetryV1(filePath)) ?? deterministicFallbackHostIdV1(rootDir, machineId);
   }
   try {
     const injected = fsFailureInjectionV1?.onBeforeLink?.();
@@ -192,16 +268,19 @@ export async function resolveDurableHostIdentityV1(rootDir: string): Promise<str
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
       // A non-EEXIST link failure (EPERM, a transient handle/locking issue,
       // ...) does not by itself prove no one else has published — check
-      // (with retry) before failing open to our own independent ephemeral id.
-      return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
+      // (with retry) before failing open to the derived fallback.
+      return (await readValidHostIdentityWithRetryV1(filePath)) ?? deterministicFallbackHostIdV1(rootDir, machineId);
     }
     // Someone else published first. Their temp file was necessarily complete
     // BEFORE their link() could succeed (link only ever exposes fully-written
     // content — see doc comment above), so the final path holds a complete
     // record as soon as it is readable at all; retry a transient read glitch
     // (e.g. a momentary lock from an indexer/antivirus scan) rather than
-    // treating it as "nothing published" on the first miss.
-    return (await readValidHostIdentityWithRetryV1(filePath)) ?? `ephemeral-${randomUUID()}`;
+    // treating it as "nothing published" on the first miss. If it never
+    // becomes readable (e.g. a genuinely broken/permission-denied final
+    // path), fall back to the derived id rather than an independent random
+    // one.
+    return (await readValidHostIdentityWithRetryV1(filePath)) ?? deterministicFallbackHostIdV1(rootDir, machineId);
   } finally {
     // Always remove our own private temp file — it played no further role
     // once link() has either published it or failed.
@@ -219,7 +298,7 @@ export async function resolveHostIdentityV1(): Promise<string> {
     return cachedHostId;
   }
   if (!inFlight) {
-    inFlight = resolveDurableHostIdentityV1(configuredRootDir).finally(() => {
+    inFlight = resolveDurableHostIdentityV1(configuredRootDir, configuredMachineId).finally(() => {
       inFlight = undefined;
     });
   }
@@ -231,6 +310,7 @@ export async function resolveHostIdentityV1(): Promise<string> {
 /** Test isolation: restore the pristine, unconfigured state. Production never calls this. */
 export function resetHostIdentityForTestV1(): void {
   configuredRootDir = undefined;
+  configuredMachineId = undefined;
   cachedHostId = undefined;
   inFlight = undefined;
 }

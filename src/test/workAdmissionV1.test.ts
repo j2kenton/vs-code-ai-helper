@@ -551,6 +551,69 @@ void test("a non-EEXIST link failure still converges on a record someone else pu
   }
 });
 
+void test("persistent link failures still converge on the same machine+rootDir-derived id across independent calls, instead of each minting its own random ephemeral id", async () => {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-persistent-failure-"));
+  setHostIdentityFsFailureInjectionForTestV1({
+    // Unlike the transient-glitch test above, no one ever actually publishes
+    // a durable record here — this simulates storage that is genuinely
+    // unwritable for the whole outage, not a momentary hiccup.
+    onBeforeLink: () => Object.assign(new Error("simulated persistent EPERM on link"), { code: "EPERM" }),
+  });
+  try {
+    const first = await resolveDurableHostIdentityV1(root, "machine-guid-a");
+    const second = await resolveDurableHostIdentityV1(root, "machine-guid-a");
+    assert.equal(
+      first,
+      second,
+      "two independent calls for the same install (same rootDir AND machineId) must converge on the same fallback id even though nothing was ever durably published — this is what two extension host processes hitting the same outage need to agree on"
+    );
+    assert.ok(
+      first.startsWith("derived-"),
+      "a persistent-failure fallback must be recognizable as deterministically derived, not the random `ephemeral-` id used when no root is configured at all"
+    );
+
+    const otherRoot = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-persistent-failure-other-install-"));
+    const otherInstallResult = await resolveDurableHostIdentityV1(otherRoot, "machine-guid-a");
+    assert.notEqual(first, otherInstallResult, "different installs (different rootDir) must not derive the same fallback id");
+  } finally {
+    setHostIdentityFsFailureInjectionForTestV1(undefined);
+  }
+});
+
+void test("persistent-failure fallback distinguishes two machines that happen to share an identical rootDir string", async () => {
+  // 2026-09-08 review, third pass: a path string is not an installation
+  // identity — containers built from the same image, or two machines with
+  // otherwise-identical profile layouts, can report the exact same
+  // `context.globalStorageUri.fsPath`. This reproduces exactly that: same
+  // rootDir, different `vscode.env.machineId`, and asserts the derived
+  // fallback must NOT collide, which a rootDir-only hash would have done.
+  const sharedRoot = fs.mkdtempSync(path.join(TEST_ROOT, "host-identity-shared-path-"));
+  setHostIdentityFsFailureInjectionForTestV1({
+    onBeforeLink: () => Object.assign(new Error("simulated persistent EPERM on link"), { code: "EPERM" }),
+  });
+  try {
+    const machineA = await resolveDurableHostIdentityV1(sharedRoot, "machine-guid-a");
+    const machineB = await resolveDurableHostIdentityV1(sharedRoot, "machine-guid-b");
+    assert.notEqual(
+      machineA,
+      machineB,
+      "two machines sharing an identical rootDir string but distinct vscode.env.machineId values must never derive the same fallback id — otherwise Part 1c's same-host liveness probing could treat two unrelated machines as one"
+    );
+
+    // Without any machineId at all (this module's own out-of-extension-host
+    // unit tests, or a genuinely absent `vscode.env.machineId`), the fallback
+    // must still be deterministic across repeated calls for the SAME
+    // (rootDir, undefined machineId) pair rather than throwing or reverting
+    // to a random ephemeral id.
+    const noMachineIdFirst = await resolveDurableHostIdentityV1(sharedRoot, undefined);
+    const noMachineIdSecond = await resolveDurableHostIdentityV1(sharedRoot, undefined);
+    assert.equal(noMachineIdFirst, noMachineIdSecond, "omitting machineId must still converge deterministically, not randomly");
+    assert.notEqual(noMachineIdFirst, machineA, "a call with no machineId must not accidentally collide with one that has a real machineId");
+  } finally {
+    setHostIdentityFsFailureInjectionForTestV1(undefined);
+  }
+});
+
 void test("a live marker plus a cleanup failure on the losing claim escalates to writeFailed, naming both the real owner and the stranded claim", async () => {
   const task = freshTaskFolder("existing-marker-cleanup-failure");
   const first = await acquireWorkAdmissionV1({
