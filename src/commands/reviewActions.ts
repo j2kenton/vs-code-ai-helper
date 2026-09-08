@@ -18,10 +18,9 @@ import {
   resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import {
-  acquireWorkAdmissionV1,
-  WorkAdmissionBusyV1,
+  acquireOrAdoptWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
   WorkAdmissionHandleV1,
-  WorkAdmissionWriteFailedV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
@@ -763,6 +762,19 @@ type ReviewCommandArg =
        * ever see.
        */
       automationDispatch?: true;
+      /**
+       * Set ONLY by `resumeTask.ts`'s `resumeThenDispatchV1` (2026-09-08
+       * review architectural blocker fix), never by a UI surface — the
+       * single-use token a resume-then-dispatch flow mints immediately
+       * before dispatching this exact command, authorizing THIS invocation
+       * (and no other) to adopt the marker that flow already holds instead
+       * of racing a fresh genesis against it. See
+       * `workAdmissionV1.ts`'s `pendingHandoffTokensV1` doc comment for the
+       * full rationale — an absent, stale, or non-matching token here simply
+       * falls through to the ordinary genesis path, which is refused `busy`
+       * against the live marker exactly like any unrelated caller.
+       */
+      admissionHandoffTokenV1?: string;
     }
   | undefined;
 
@@ -5832,26 +5844,6 @@ export async function restoreRejectedImplementationRoundV1(
 }
 
 /**
- * Format the interim `busy`/`writeFailed` work-admission diagnostic (v1
- * fixes item 1, Part 1a's interim policy) as a user-facing message — naming
- * the blocking owner, its age, and the marker path for `busy`, or the real
- * filesystem error for `writeFailed`, rather than a generic "task is busy".
- */
-function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1): string {
-  if (outcome.outcome === "writeFailed") {
-    return `Could not start this stage action: ${outcome.error.message}`;
-  }
-  const ageSeconds = Math.round(outcome.ageMs / 1000);
-  const ownerDetail = outcome.owner
-    ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
-    : "held by an unreadable record";
-  return (
-    `This task already has a stage action in progress (${ownerDetail}, started ~${ageSeconds}s ago at ` +
-    `${outcome.markerPath})${outcome.likelyStale ? " — this looks stale, but it is not reclaimed automatically." : ""}.`
-  );
-}
-
-/**
  * Extract the target task folder path SYNCHRONOUSLY from `arg`, when the
  * shape carries one directly — mirroring exactly what `normalizeReviewArg` +
  * `resolveTask` will later derive from the same arg, so a folder path
@@ -5877,6 +5869,25 @@ function extractSynchronousReviewFolderPathV1(arg: ReviewCommandArg): string | u
     return vscode.Uri.file(arg.taskFolderPath).fsPath;
   }
   return undefined;
+}
+
+/**
+ * Extract `admissionHandoffTokenV1` from `arg`, when present (2026-09-08
+ * review architectural blocker fix). Only the `{ taskFolderPath }` arg
+ * variant carries it — the `TaskNodeArg` (`{ task }`) shape, used by tree-row
+ * buttons and other UI surfaces, never does, so a UI-originated invocation
+ * can never accidentally supply a token and trigger adoption.
+ */
+function extractAdmissionHandoffTokenV1(arg: ReviewCommandArg): string | undefined {
+  // Positive check on the field itself (not a negative check on `task`):
+  // `task` is OPTIONAL on `TaskNodeArg`, so an absent-`task` guard would not
+  // actually exclude that variant from the union here, and
+  // `admissionHandoffTokenV1` is never declared on `TaskNodeArg` at all —
+  // narrowing on its presence is what correctly excludes it.
+  if (!arg || typeof arg !== "object" || !("admissionHandoffTokenV1" in arg)) {
+    return undefined;
+  }
+  return typeof arg.admissionHandoffTokenV1 === "string" ? arg.admissionHandoffTokenV1 : undefined;
 }
 
 /**
@@ -5928,12 +5939,28 @@ export async function runReviewWithAI(
   // protection. The no-arg QuickPick path has no folder to protect until one
   // is chosen, so this stays undefined here and admission is acquired right
   // after resolution instead, below.
+  //
+  // acquireOrAdoptWorkAdmissionV1, not the raw acquire (2026-09-08 review
+  // completion blocker): a resume-then-dispatch flow
+  // (`resumeTask.ts`'s `resumeThenDispatchV1`) now holds its OWN admission
+  // continuously through this command's entire dispatch, including this
+  // setup phase — so this call must be able to JOIN that same-process marker
+  // instead of racing a fresh genesis against it and being refused `busy`
+  // against a marker this very process already owns. Adoption only happens
+  // when `arg` carries the single-use handoff token that flow minted for
+  // THIS exact dispatch (2026-09-08 review architectural blocker fix —
+  // `extractAdmissionHandoffTokenV1`, `workAdmissionV1.ts`'s
+  // `pendingHandoffTokensV1`); an ordinary invocation (no token, or a
+  // UI-originated `arg` that can never carry one) always falls through to
+  // the raw acquire, which is correctly refused `busy` if another command
+  // already holds the marker.
   const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
   const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
+    ? await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
         commandId: "runReviewWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
@@ -5991,11 +6018,13 @@ export async function runReviewWithAI(
       // just picked a target. Acquire admission now, BEFORE the pause check
       // below reads `resolved.progress.status` — so that check always runs
       // against a target admission already protects, exactly like the
-      // early-acquisition path above.
-      const late = await acquireWorkAdmissionV1({
+      // early-acquisition path above. acquireOrAdoptWorkAdmissionV1 for the
+      // same same-process-handoff reason as the early acquisition above.
+      const late = await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: resolved.folderUri.fsPath,
         purpose: "admission",
         commandId: "runReviewWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
@@ -6494,12 +6523,18 @@ export async function fastForwardReviewWithAI(
   // work starts. The no-arg QuickPick path has no folder to protect until
   // `resolveTask` picks one, so this stays undefined here and admission is
   // acquired right after resolution instead, mirroring `runReviewWithAI`.
+  // acquireOrAdoptWorkAdmissionV1, not the raw acquire (2026-09-08 review
+  // completion blocker): joins an already-live same-process marker — e.g. one
+  // held by a resume-then-dispatch flow — instead of racing a fresh genesis
+  // against it and being refused `busy`. See `runReviewWithAI`'s identical
+  // comment above for the full rationale.
   const ffEarlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
   const ffEarly = ffEarlyFolderPath
-    ? await acquireWorkAdmissionV1({
+    ? await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: ffEarlyFolderPath,
         purpose: "admission",
         commandId: "fastForwardReviewWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
       })
     : undefined;
   if (ffEarly && ffEarly.outcome !== "acquired") {
@@ -6632,10 +6667,13 @@ export async function fastForwardReviewWithAI(
     // below reads `resolved.progress.status` — same ordering fix as
     // `runReviewWithAI`'s no-arg path, so a sweep can never commit a pause in
     // the window between reading status and admission actually publishing.
-    const ffLate = await acquireWorkAdmissionV1({
+    // acquireOrAdoptWorkAdmissionV1 for the same same-process-handoff reason
+    // as the early acquisition above.
+    const ffLate = await acquireOrAdoptWorkAdmissionV1({
       taskFolderPath: resolved.folderUri.fsPath,
       purpose: "admission",
       commandId: "fastForwardReviewWithAI",
+      handoffToken: extractAdmissionHandoffTokenV1(arg),
     });
     if (ffLate.outcome !== "acquired") {
       NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffLate));

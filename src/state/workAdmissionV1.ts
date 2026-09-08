@@ -151,13 +151,141 @@ export type WorkAdmissionResultV1 = WorkAdmissionAcquiredV1 | WorkAdmissionBusyV
  * anywhere in v1a. Generous, so a slow-but-alive owner is never flagged. */
 export const WORK_ADMISSION_LIKELY_STALE_MS_V1 = 20 * 60 * 1000;
 
+/**
+ * Format the interim `busy`/`writeFailed` work-admission diagnostic (v1
+ * fixes item 1, Part 1a's interim policy) as a user-facing message — naming
+ * the blocking owner, its age, and the marker path for `busy`, or the real
+ * filesystem error for `writeFailed`, rather than a generic "task is busy".
+ *
+ * Co-located here rather than in `reviewActions.ts` (non-blocking review
+ * suggestion, raised twice, 2026-09-08): it formats only this module's own
+ * result types and has no dependency on anything else in that (large) file,
+ * so keeping it there forced `resumeTask.ts` to import from
+ * `reviewActions.ts` just for this one formatter.
+ */
+export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1): string {
+  if (outcome.outcome === "writeFailed") {
+    return `Could not start this stage action: ${outcome.error.message}`;
+  }
+  const ageSeconds = Math.round(outcome.ageMs / 1000);
+  const ownerDetail = outcome.owner
+    ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
+    : "held by an unreadable record";
+  return (
+    `This task already has a stage action in progress (${ownerDetail}, started ~${ageSeconds}s ago at ` +
+    `${outcome.markerPath})${outcome.likelyStale ? " — this looks stale, but it is not reclaimed automatically." : ""}.`
+  );
+}
+
 const processStartTimeV1 = Date.now() - Math.floor(process.uptime() * 1000);
 
 /** Process-local registry of admission handles this window currently holds,
  * keyed by task folder path. Lets same-window callers answer "do I already
  * hold admission for this task" without a filesystem round trip, and backs
- * the synchronous half of `hasLiveWorkAdmissionBestEffortV1`. */
+ * the synchronous half of `hasLiveWorkAdmissionBestEffortV1`. Also backs
+ * `acquireOrAdoptWorkAdmissionV1`'s same-process handoff below. */
 const localHandlesV1 = new Map<string, WorkAdmissionHandleV1>();
+
+/**
+ * Total outstanding in-process holders of one task's live marker — the
+ * original acquirer plus every adopted view created by
+ * `acquireOrAdoptWorkAdmissionV1` that has not yet released. Absent is read
+ * as 1 (just the original acquirer, no adoption has happened). Every release
+ * — the original handle's own, or any adopted view's — decrements this by
+ * one; only the release that brings it to zero actually unlinks the marker,
+ * via `localReleaseFinalizersV1` below. This is what lets a resume flow hold
+ * admission continuously across a downstream dispatch that itself also
+ * acquires admission for the same task in the same process (2026-09-08
+ * review completion blocker: releasing before dispatch left a real gap with
+ * no admission and no arranged work; holding across dispatch without this
+ * would instead make the downstream acquisition observe a live marker it
+ * does not own and refuse with `busy`).
+ */
+const localHolderCountsV1 = new Map<string, number>();
+
+/** The live marker's actual unlink-when-last-holder-releases logic for a
+ * task, captured once at genesis (it closes over that acquisition's mutable
+ * `currentPath`, which heartbeats advance) so an adopted view — created
+ * later, outside that closure — can trigger the real unlink without ever
+ * needing filesystem details of its own. Removed once the marker is
+ * actually unlinked. */
+const localReleaseFinalizersV1 = new Map<string, () => Promise<void>>();
+
+/**
+ * One FIFO serializer per task, shared by the base handle AND every adopted
+ * view created over it — the same closure `acquireWorkAdmissionV1` already
+ * builds for its own `heartbeat()`/`release()`/`handover()`, additionally
+ * registered here so `createAdoptedViewV1` can enqueue its release through
+ * that SAME queue instead of calling the finalizer directly.
+ *
+ * Completion blocker fix (2026-09-08 review): an adopted view's `release()`
+ * previously called `localReleaseFinalizersV1`'s finalizer straight away,
+ * outside any queue. If the base handle (or another adopted view) had an
+ * in-flight heartbeat rename at that moment, the two could race: unlink
+ * could observe the marker at its OLD path (ENOENT, swallowed as
+ * "displaced") a moment before the heartbeat's rename landed at the NEW
+ * path, leaving that renamed file behind forever — a leaked marker under
+ * v1a's interim never-reclaim policy, i.e. the task stays "busy" permanently.
+ * Routing every release through this shared queue means the unlink can only
+ * run after every heartbeat enqueued before it has settled, and any
+ * heartbeat that loses the race and gets enqueued AFTER the unlink simply
+ * finds `currentPath` gone and treats it as an ordinary displaced-marker
+ * ENOENT (already-handled, non-error) instead of racing it.
+ *
+ * Removed at the same moment as `localReleaseFinalizersV1`'s entry, once the
+ * marker is actually unlinked.
+ */
+const localSerializersV1 = new Map<string, (fn: () => Promise<void>) => Promise<void>>();
+
+/**
+ * Per-task single-use handoff authorization (2026-09-08 review architectural
+ * blocker fix). `acquireOrAdoptWorkAdmissionV1` used to adopt an already-live
+ * SAME-PROCESS marker for ANY caller in the same extension host, which
+ * defeats single-owner admission for a task the moment two unrelated
+ * commands for it happen to run in the same window — exactly the
+ * cross-process exclusivity `acquireWorkAdmissionV1` otherwise guarantees.
+ *
+ * A resume-then-dispatch flow (`resumeTask.ts`'s `resumeThenDispatchV1`) is
+ * the only legitimate adopter: it already holds admission and is about to
+ * make exactly ONE specific downstream dispatch on its own behalf. It calls
+ * `authorizeWorkAdmissionHandoffV1` immediately before that dispatch and
+ * threads the returned token through the dispatched command's own arguments
+ * (see `reviewActions.ts`'s `admissionHandoffTokenV1` arg field); the
+ * downstream command's own admission-acquisition call passes that token back
+ * in. Adoption succeeds ONLY when the token presented matches the one
+ * currently authorized for that exact task, and the token is consumed
+ * (deleted) the instant it is used, so it can authorize at most one adoption.
+ * Any other same-process caller — a concurrent unrelated invocation, or a
+ * stale/already-consumed token — presents no token or a non-matching one and
+ * falls through to the ordinary `acquireWorkAdmissionV1` genesis path, which
+ * observes the live marker on disk and is correctly refused `busy`, exactly
+ * like a cross-process caller.
+ */
+const pendingHandoffTokensV1 = new Map<string, string>();
+
+/**
+ * Authorize exactly one same-process adoption of `taskFolderPath`'s
+ * currently-held admission marker, returning the single-use token the
+ * intended downstream dispatch must present to `acquireOrAdoptWorkAdmissionV1`.
+ * Overwrites (invalidates) any previous unconsumed token for the same task —
+ * only the most recently authorized handoff is honored, matching "about to
+ * make exactly one specific dispatch".
+ */
+export function authorizeWorkAdmissionHandoffV1(taskFolderPath: string): string {
+  const token = crypto.randomUUID();
+  pendingHandoffTokensV1.set(taskFolderPath, token);
+  return token;
+}
+
+/**
+ * Invalidate any outstanding, unconsumed handoff token for `taskFolderPath`.
+ * Called once the resume-then-dispatch flow's own dispatch has settled
+ * (successfully consumed or not), so a token never outlives the single
+ * dispatch it was minted for. A no-op if already consumed or never issued.
+ */
+export function revokeWorkAdmissionHandoffV1(taskFolderPath: string): void {
+  pendingHandoffTokensV1.delete(taskFolderPath);
+}
 
 function admissionDirV1(taskFolderPath: string): string {
   return path.join(taskFolderPath, ADMISSION_DIRNAME_V1);
@@ -563,6 +691,10 @@ export async function acquireWorkAdmissionV1(params: {
     queue = step.catch(() => undefined);
     return step;
   }
+  // Shared with any adopted view created later over this same marker (see
+  // `localSerializersV1`'s doc comment) so an adopted view's release cannot
+  // race this handle's own in-flight heartbeat.
+  localSerializersV1.set(taskFolderPath, enqueueV1);
 
   const handle: WorkAdmissionHandleV1 = {
     ownerToken,
@@ -570,10 +702,21 @@ export async function acquireWorkAdmissionV1(params: {
     commandId,
     purpose,
     heartbeat(): Promise<void> {
+      // 2026-09-08 review completion blocker: this used to return early once
+      // THIS handle's own `released` flag was set — but `released` only
+      // means "this specific handle called release()/handover()", not "the
+      // marker itself is gone". While an adopted view (`createAdoptedViewV1`)
+      // still holds the SAME marker, `released` can already be true here
+      // (the original acquirer let go first) while `currentPath` still
+      // exists on disk, owned by that remaining holder — and every adopted
+      // view's heartbeat forwards to THIS closure (`shared.heartbeat()`), so
+      // that early return silently stopped renewing the marker for the rest
+      // of its life the moment the original handle released, regardless of
+      // how many holders remained. The rename below already treats a
+      // genuinely displaced marker (ENOENT, e.g. after the real unlink once
+      // every holder has released) as a no-op, so no separate guard is
+      // needed to make a heartbeat on an already-unlinked marker safe.
       return enqueueV1(async () => {
-        if (released) {
-          return;
-        }
         const nextGeneration = currentGeneration + 1;
         const nextEpoch = freshEpochV1();
         const nextPath = path.join(dir, markerBasenameV1(ownerToken, nextGeneration, nextEpoch));
@@ -607,12 +750,13 @@ export async function acquireWorkAdmissionV1(params: {
     },
   };
 
-  async function releaseMarkerOnceV1(): Promise<void> {
-    if (released) {
-      return;
-    }
-    released = true;
-    localHandlesV1.delete(taskFolderPath);
+  // Same-process handoff (2026-09-08 review completion blocker): the actual
+  // unlink, factored out so an adopted view (created later, in
+  // `acquireOrAdoptWorkAdmissionV1`, outside this closure) can trigger it too
+  // without needing any filesystem detail of its own — it closes over
+  // `currentPath`, which heartbeats keep current. Registered in
+  // `localReleaseFinalizersV1` below and removed once actually run.
+  async function unlinkMarkerV1(): Promise<void> {
     try {
       await fs.promises.unlink(currentPath);
     } catch (error) {
@@ -623,8 +767,137 @@ export async function acquireWorkAdmissionV1(params: {
     }
   }
 
+  // Decrement the total-holders count and unlink only when it reaches zero.
+  // Called by this handle's own `release()`/`handover()` (guarded below by
+  // `released`, so it contributes at most one decrement) AND by every
+  // adopted view's release (guarded by that view's own flag) — whichever
+  // call brings the count to zero performs the real unlink, so the marker
+  // survives until every in-process holder, original and adopted alike, has
+  // let go. See `localHolderCountsV1`'s doc comment for the full protocol.
+  async function decrementHoldersAndMaybeUnlinkV1(): Promise<void> {
+    const current = localHolderCountsV1.get(taskFolderPath) ?? 1;
+    if (current > 1) {
+      localHolderCountsV1.set(taskFolderPath, current - 1);
+      return;
+    }
+    localHolderCountsV1.delete(taskFolderPath);
+    localReleaseFinalizersV1.delete(taskFolderPath);
+    localSerializersV1.delete(taskFolderPath);
+    localHandlesV1.delete(taskFolderPath);
+    await unlinkMarkerV1();
+  }
+
+  async function releaseMarkerOnceV1(): Promise<void> {
+    if (released) {
+      return;
+    }
+    released = true;
+    await decrementHoldersAndMaybeUnlinkV1();
+  }
+
   localHandlesV1.set(taskFolderPath, handle);
+  localReleaseFinalizersV1.set(taskFolderPath, decrementHoldersAndMaybeUnlinkV1);
   return { outcome: "acquired", handle };
+}
+
+/**
+ * Adopt an already-live, SAME-PROCESS admission marker instead of racing a
+ * fresh genesis against it — the fix for the 2026-09-08 review completion
+ * blocker. A resume-then-dispatch flow (`resumeTask.ts`'s
+ * `resumeThenDispatchV1`) holds its own admission continuously through a
+ * downstream command's ENTIRE dispatch, including that command's own setup;
+ * a downstream command that is itself admission-wired (`runReviewWithAI`,
+ * `fastForwardReviewWithAI`) must therefore be able to join that already-live
+ * marker rather than trying to create a second one and being refused `busy`
+ * against a marker this very process already owns.
+ *
+ * Adoption is gated by `handoffToken` (2026-09-08 review architectural
+ * blocker fix — see `pendingHandoffTokensV1`'s doc comment). When no local
+ * handle exists for the task, or a local handle exists but the caller's
+ * token does not match the one currently authorized for it (absent,
+ * mismatched, or already consumed), this is exactly `acquireWorkAdmissionV1`
+ * — the ordinary, cross-process-safe genesis path. Against an already-live
+ * SAME-process marker with no matching authorization, that ordinary path
+ * observes the marker on disk and correctly refuses `busy`: adoption is
+ * therefore never a way for an unrelated concurrent same-process command to
+ * join another command's admission.
+ *
+ * Only when the token matches does this return a distinct VIEW over the same
+ * live marker: its own `heartbeat()` renews the shared marker; its own
+ * `release()`/`handover()` are independently idempotent (a caller can call
+ * either exactly once, same as any other handle), run through the SAME
+ * owner-local serialized queue as the base handle's own heartbeat (via
+ * `localSerializersV1`, so a release can never race an in-flight heartbeat
+ * rename), and decrement the shared total-holders count so the marker is
+ * only actually unlinked once every holder — the original acquirer and every
+ * adopted view — has released, regardless of the order they do so in.
+ */
+export async function acquireOrAdoptWorkAdmissionV1(params: {
+  readonly taskFolderPath: string;
+  readonly purpose: WorkAdmissionPurposeV1;
+  readonly commandId: string;
+  /** Presented by the intended downstream dispatch of a resume-then-dispatch
+   * flow; must match the token `authorizeWorkAdmissionHandoffV1` most
+   * recently issued for this exact task, or adoption does not happen. */
+  readonly handoffToken?: string;
+}): Promise<WorkAdmissionResultV1> {
+  const existing = localHandlesV1.get(params.taskFolderPath);
+  const authorized = pendingHandoffTokensV1.get(params.taskFolderPath);
+  const authorizedForThisCaller =
+    existing !== undefined &&
+    params.handoffToken !== undefined &&
+    authorized !== undefined &&
+    params.handoffToken === authorized;
+  if (!authorizedForThisCaller) {
+    return acquireWorkAdmissionV1(params);
+  }
+  // Single-use: consume the token the instant it authorizes an adoption, so
+  // it cannot be replayed to join a second, later, unrelated dispatch.
+  pendingHandoffTokensV1.delete(params.taskFolderPath);
+  return { outcome: "acquired", handle: createAdoptedViewV1(params.taskFolderPath, existing) };
+}
+
+function createAdoptedViewV1(taskFolderPath: string, shared: WorkAdmissionHandleV1): WorkAdmissionHandleV1 {
+  const current = localHolderCountsV1.get(taskFolderPath) ?? 1;
+  localHolderCountsV1.set(taskFolderPath, current + 1);
+
+  let viewReleased = false;
+  const releaseViewV1 = async (): Promise<void> => {
+    if (viewReleased) {
+      return;
+    }
+    viewReleased = true;
+    const finalize = localReleaseFinalizersV1.get(taskFolderPath);
+    if (!finalize) {
+      // The marker was unlinked by another holder between this view's
+      // creation and its release — nothing left to decrement or unlink; a
+      // displaced view releasing is not an error, same as an ENOENT on the
+      // base handle's own unlink.
+      return;
+    }
+    // Route through the SAME owner-local queue the base handle's own
+    // heartbeat/release/handover use (`localSerializersV1`), not a direct
+    // call — see that map's doc comment for the heartbeat-vs-unlink race
+    // this closes. If the serializer is already gone (marker unlinked
+    // concurrently, same race as the `finalize` check above), there is
+    // nothing left to serialize against either.
+    const serialize = localSerializersV1.get(taskFolderPath);
+    if (serialize) {
+      await serialize(finalize);
+    } else {
+      await finalize();
+    }
+  };
+
+  return {
+    ownerToken: shared.ownerToken,
+    taskFolderPath: shared.taskFolderPath,
+    commandId: shared.commandId,
+    purpose: shared.purpose,
+    heartbeat: () => shared.heartbeat(),
+    release: releaseViewV1,
+    handover: releaseViewV1,
+  };
 }
 
 /**

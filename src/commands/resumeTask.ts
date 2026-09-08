@@ -8,6 +8,13 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
+  describeWorkAdmissionRefusalV1,
+  revokeWorkAdmissionHandoffV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
@@ -80,18 +87,99 @@ export function resumeTaskArgHasExplicitTask(
 }
 
 /**
+ * Discriminated outcome of {@link resumePausedTask}, replacing the previous
+ * bare `(() => Promise<void>) | undefined` return (2026-09-08 review
+ * completion blocker, narrowed form): that shape let `resumeThenDispatchV1`
+ * treat "this call found the task already active, so there was nothing to
+ * resume" and "this call found the task genuinely paused, but a CONCURRENT
+ * resume won the admission race first" identically — both surfaced as
+ * `undefined`. Only the first case is safe to fall back to a fresh
+ * admission-and-dispatch: the task was never mid-resume by anyone. The
+ * second case means another invocation is (or very recently was) the one
+ * actually handling this resume-and-dispatch event; if its own dispatch has
+ * since settled and released, a `busy`-refused caller must NOT then acquire
+ * its own admission and fire a second, possibly different, dispatch for the
+ * same event — that is a duplicate action, not a fallback for unprotected
+ * work.
+ *
+ * - `"resumed"` — this call itself flipped the task to `active` (per
+ *   `release`, admission may already be released, or retained for the
+ *   caller when `holdAdmissionForCaller` was requested and the mutation
+ *   succeeded).
+ * - `"busy"` — the task was paused, but another owner already holds durable
+ *   admission for it; this call made no changes at all.
+ * - `"notPaused"` — the task exists and is not paused (already active, or
+ *   some other non-paused status); this call made no changes at all.
+ * - `"notFound"` — no resolvable task (deleted/moved, or no paused task and
+ *   no explicit target); this call made no changes at all.
+ * - `"completed"` — the task was completed; handled via the separate
+ *   `resumeCompletedTask` reopen flow, not a plain resume.
+ * - `"failed"` — admission was acquired but the resume mutation itself threw
+ *   (e.g. `activateTask` could not read progress); admission is always
+ *   released before this outcome is returned, regardless of
+ *   `holdAdmissionForCaller`, since the resume did not actually succeed.
+ */
+export type ResumePausedTaskOutcomeV1 =
+  | { readonly outcome: "resumed"; readonly release: (() => Promise<void>) | undefined }
+  | { readonly outcome: "busy" }
+  | { readonly outcome: "notPaused" }
+  | { readonly outcome: "notFound" }
+  | { readonly outcome: "completed" }
+  | { readonly outcome: "failed" };
+
+/**
  * Resume a paused task (set status back to "active") and persist it as the
  * current task in CurrentTaskStore so the keyboard shortcut and status bar
  * immediately reflect the resumed task.
  *
  * Uses patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
  * scheduled metadata, lint results) when writing the updated status.
+ *
+ * `options.arrangeStageDispatch` (default `true`) controls whether this
+ * function itself durably arranges the current stage's action to run once
+ * the task is active (v1 fixes item 1, Part 1a step 5 — "resume must arrange
+ * work, not just change a status"). The five `resumeAndXxxV1` helpers below
+ * pass `false`: each of them already dispatches its OWN specific follow-up
+ * command moments after this resolves, so leaving arrangement on here would
+ * durably schedule a SECOND, possibly different, stage action alongside their
+ * explicit one. Only the bare `resumeTask` command (and any other caller with
+ * no follow-up dispatch of its own) needs this function to arrange one.
+ *
+ * `options.holdAdmissionForCaller` (default `false`, review completion
+ * blocker 2026-09-08): when `true`, this function does NOT release its own
+ * durable admission marker in its `finally` — it returns the release function
+ * instead, so a caller that is about to dispatch its OWN follow-up command
+ * (the five `resumeAndXxxV1` helpers, via `resumeThenDispatchV1`) can keep
+ * the task continuously protected across its post-resume re-read
+ * (`readTaskProgressStrictV1`, a filesystem round trip) AND all the way
+ * through that follow-up command's entire dispatch, releasing only once the
+ * dispatch has fully settled. This closes the gap completely rather than
+ * merely shrinking it: there is no longer any window where the task is
+ * active with neither admission nor arranged work. Holding across the
+ * dispatch does not risk a spurious `busy` refusal from a downstream command
+ * that itself acquires admission (`runReviewWithAI`, `fastForwardReviewWithAI`)
+ * PROVIDED `resumeThenDispatchV1` forwards it the single-use handoff token it
+ * mints (`workAdmissionV1.ts`'s `authorizeWorkAdmissionHandoffV1`) — that
+ * command's own admission call presents the token to
+ * `acquireOrAdoptWorkAdmissionV1`, which adopts this same-process marker
+ * instead of racing a fresh genesis against it, and the marker is only
+ * actually unlinked once every holder has released
+ * (`workAdmissionV1.ts`'s `localHolderCountsV1`). Without a matching token,
+ * adoption does not happen — this is deliberate: it is what keeps an
+ * unrelated, concurrent same-process command from ever joining this hold.
+ * Downstream commands not yet admission-wired themselves
+ * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
+ * `goToReviewAndApplyV1`) never call that function at all, so holding
+ * through their dispatch is unconditionally safe for them too.
  */
 export async function resumePausedTask(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
-  explicitArg?: ResumeTaskArg
-): Promise<void> {
+  explicitArg?: ResumeTaskArg,
+  options?: { readonly arrangeStageDispatch?: boolean; readonly holdAdmissionForCaller?: boolean }
+): Promise<ResumePausedTaskOutcomeV1> {
+  const arrangeStageDispatch = options?.arrangeStageDispatch ?? true;
+  const holdAdmissionForCaller = options?.holdAdmissionForCaller ?? false;
   // Block on the startup gate's classification pass before this lifecycle
   // command's first task-state read, so it cannot race the read-only
   // creating-folder reconciliation extension.ts kicks off during activate()
@@ -117,20 +205,56 @@ export async function resumePausedTask(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
-      return;
+      return { outcome: "notFound" };
     }
     NotificationRouter.showInformation("No paused tasks to resume.");
-    return;
+    return { outcome: "notFound" };
   }
 
   if (resolvedTask.progress.status === "completed") {
-    return resumeCompletedTask(inventory, currentTaskStore, resolvedTask);
+    await resumeCompletedTask(inventory, currentTaskStore, resolvedTask);
+    return { outcome: "completed" };
   }
 
   if (resolvedTask.progress.status !== "paused") {
     NotificationRouter.showInformation(`Task is not paused.`);
-    return;
+    return { outcome: "notPaused" };
   }
+
+  // v1 fixes item 1 (Part 1a, step 5): acquire durable work admission for
+  // this task BEFORE activateTask's status write reaches disk. That write
+  // fires the progress-file watcher, which runs the stalled-task sweep —
+  // this task's own headline defect, measured at 4 seconds: the sweep found
+  // the freshly-activated task with no live operation, no owed continuation,
+  // and nothing scheduled, and re-paused it immediately, and the pause
+  // reason's own advice ("resume it") is what re-triggered it. Admission
+  // held for the whole of this mutation is the exemption
+  // `isImpossibleActiveStateV1` already checks
+  // (`hasLiveWorkAdmissionBestEffortV1`), so the sweep now finds a task
+  // under active protection instead of one that silently went active with
+  // nothing running.
+  const admission = await acquireWorkAdmissionV1({
+    taskFolderPath: resolvedTask.taskFolderPath,
+    purpose: "admission",
+    commandId: "resumeTask",
+  });
+  if (admission.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(admission));
+    return { outcome: "busy" };
+  }
+  let admissionReleased = false;
+  const admissionHeartbeat = setInterval(
+    () => void admission.handle.heartbeat(),
+    WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1
+  );
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (admissionReleased) {
+      return;
+    }
+    admissionReleased = true;
+    clearInterval(admissionHeartbeat);
+    await admission.handle.release();
+  };
 
   // Tracked instant mutation (taxonomy: resume-task / terminal-always). The
   // terminal entry is recorded centrally by the operation-notification bridge.
@@ -209,9 +333,30 @@ export async function resumePausedTask(
         //
         // Resuming must refresh the clock because a human acted on the task, not
         // because that task happened to be carrying an escalation record.
+        //
+        // v1 fixes item 1 (Part 1a step 5): when `arrangeStageDispatch` is
+        // set (the bare `resumeTask` command), also arrange the current
+        // stage's action to run — a durable `scheduledRun` for "now",
+        // consumed by the SAME `TaskActionScheduler.fire` ->
+        // `applyCurrentStageAction` path a manually scheduled rerun uses
+        // (`scheduleTaskResume.ts`). Written in this same mutation as the
+        // `active` status is (from `activateTask`, just above) and the
+        // `updatedAt` bump, so there is no observable moment where the task
+        // is active with admission as the ONLY protection — once this write
+        // lands, `scheduledRun` is itself a standing exemption
+        // (`isImpossibleActiveStateV1`) that outlives admission's release
+        // below. Never overwrites an existing `scheduledRun` — e.g. a
+        // quota-park's own future rerun — which is a deliberate future
+        // intent, not a stand-in for "nothing is arranged yet".
         await patchTaskProgressStrictV1(
           vscode.Uri.file(resolvedTask.taskFolderPath),
-          (current) => ({ ...clearEscalation(current), updatedAt: new Date().toISOString() })
+          (current) => ({
+            ...clearEscalation(current),
+            updatedAt: new Date().toISOString(),
+            ...(arrangeStageDispatch && current.scheduledRun === undefined
+              ? { scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } }
+              : {}),
+          })
         );
         // Part 11 item 13c (event-driven half, "stage advance/resume
         // invalidates escalation cards"): every escalation card exists to
@@ -235,6 +380,158 @@ export async function resumePausedTask(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     NotificationRouter.showError(message);
+    // The resume mutation itself did not succeed, so there is nothing for a
+    // caller to hold or dispatch against — always release here regardless of
+    // `holdAdmissionForCaller`. Previously this fell through to the shared
+    // `finally` below and then unconditionally returned `releaseAdmissionV1`
+    // whenever `holdAdmissionForCaller` was set, telling the caller "the
+    // resume succeeded, here is your live handle" even though it had just
+    // thrown — a caller trusting that handle would have gone on to dispatch
+    // against a task that was never actually flipped to `active`.
+    await releaseAdmissionV1();
+    return { outcome: "failed" };
+  } finally {
+    if (!holdAdmissionForCaller) {
+      await releaseAdmissionV1();
+    }
+  }
+  return { outcome: "resumed", release: holdAdmissionForCaller ? releaseAdmissionV1 : undefined };
+}
+
+/**
+ * Resume a paused task, then dispatch a follow-up command against it once it
+ * is confirmed active — the shared shape behind all five `resumeAndXxxV1`
+ * helpers below.
+ *
+ * Closes (2026-09-08 review completion blocker) the gap between "resume
+ * finishes" and "the follow-up dispatch has itself established durable
+ * protection": `resumePausedTask`'s own durable admission is held via
+ * `holdAdmissionForCaller: true` through the post-resume re-read AND all the
+ * way through `dispatch()` itself, released only in `finally` once dispatch
+ * has fully settled. There is no window in between where the task is active
+ * with neither admission nor arranged work.
+ *
+ * Holding across `dispatch()` no longer risks a `busy` refusal from a
+ * downstream command that itself acquires admission (`runReviewWithAI`,
+ * `fastForwardReviewWithAI`): `dispatch` is handed a single-use handoff
+ * token (2026-09-08 review architectural blocker fix —
+ * `workAdmissionV1.ts`'s `authorizeWorkAdmissionHandoffV1`/
+ * `pendingHandoffTokensV1`), minted immediately before it runs and revoked
+ * once it settles. A caller that forwards this token into the downstream
+ * command's own arguments (see `resumeAndRerunReviewV1` below) lets that
+ * command's admission-acquisition call adopt this function's already-live
+ * marker via `acquireOrAdoptWorkAdmissionV1`, instead of racing a fresh
+ * genesis against it. Without a matching token, adoption never happens —
+ * any OTHER same-process command targeting this task (unrelated, concurrent)
+ * still races an ordinary genesis and is correctly refused `busy` against
+ * the live marker, exactly like a cross-process caller. The marker is only
+ * actually unlinked once every holder (this function's own hold, and any
+ * adopted view the dispatched command created) has released, regardless of
+ * release order (see `workAdmissionV1.ts`'s `localHolderCountsV1` doc
+ * comment). Downstream commands that are not yet admission-wired
+ * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
+ * `goToReviewAndApplyV1`) simply never call `acquireOrAdoptWorkAdmissionV1`,
+ * so holding admission through their dispatch is unconditionally safe for
+ * them too — it can only add protection, never conflict — and they ignore
+ * the token argument they are handed.
+ *
+ * Re-reads `task-progress.json` straight off disk rather than trusting the
+ * in-memory `inventory`: that cache is not guaranteed to reflect the write
+ * `resumePausedTask` (via `activateTask`) just made, and re-checking through
+ * the cache risks seeing the pre-resume "paused" snapshot and silently
+ * skipping the dispatch.
+ *
+ * `resumePausedTask` used to return bare `undefined` for two different
+ * reasons — the task was already active when it checked (nothing to
+ * resume), or a concurrent resume raced this call to admission and lost
+ * (refused `busy`) — and this function used to dispatch in EITHER case
+ * merely because a disk re-read shows the task active, without this
+ * function ever holding admission itself (2026-09-08 review completion
+ * blocker). `resumePausedTask` now returns a discriminated
+ * {@link ResumePausedTaskOutcomeV1}, and this function acts only on
+ * `"resumed"` and the genuinely-nothing-to-resume outcomes (`"notPaused"`,
+ * `"notFound"`, `"completed"`, `"failed"`) via the fresh-acquisition
+ * fallback below; a `"busy"` outcome means another invocation is (or very
+ * recently was) the one actually handling this exact resume-and-dispatch
+ * event, so this call stops immediately (2026-09-08 review, narrowed
+ * completion blocker) rather than falling back to a fresh admission and a
+ * SECOND, possibly different, dispatch once that owner's own dispatch has
+ * settled and released — that would be a duplicate action, not a recovery
+ * from unprotected work.
+ *
+ * For every other outcome, several of this function's dispatch targets
+ * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
+ * `goToReviewAndApplyV1`) are not admission-wired themselves, so dispatching
+ * against them with no live admission at all would be the exact impossible
+ * state this whole mechanism exists to close — it must never happen merely
+ * because another owner changed disk status to active out from under this
+ * call. When `resumePausedTask` did not retain an admission handle
+ * (`"notPaused"`/`"notFound"`/`"completed"`/`"failed"`), this acquires a
+ * fresh one of its own — after confirming via the re-read that the task is
+ * genuinely `active` and worth acquiring for at all — before dispatching; if
+ * that is also refused (a real owner is genuinely working right now), it
+ * stops rather than double-dispatching unprotected. The re-read happens
+ * BEFORE any admission attempt specifically so a task that cannot even be
+ * resolved (deleted, moved) short-circuits on `!reread.ok` without ever
+ * touching the admission directory for a folder that may not exist.
+ */
+async function resumeThenDispatchV1<T>(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg: ResumeTaskArg | undefined,
+  taskFolderPath: string,
+  dispatch: (admissionHandoffToken: string | undefined) => Promise<T> | Thenable<T>
+): Promise<T | undefined> {
+  const resumed = await resumePausedTask(inventory, currentTaskStore, explicitArg, {
+    arrangeStageDispatch: false,
+    holdAdmissionForCaller: true,
+  });
+
+  // A concurrent resume owns this event (or very recently did) — never fall
+  // back to a fresh admission-and-dispatch here, even if that owner has
+  // since released and a re-read would show the task active. Falling back
+  // would risk firing a second, possibly different, dispatch for the same
+  // resume-and-dispatch request.
+  if (resumed.outcome === "busy") {
+    return undefined;
+  }
+
+  const resumedRelease = resumed.outcome === "resumed" ? resumed.release : undefined;
+
+  const reread = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath));
+  if (!reread.ok || reread.decoded.progress.status !== "active") {
+    if (resumedRelease) {
+      await resumedRelease();
+    }
+    return undefined;
+  }
+
+  let release = resumedRelease;
+  if (!release) {
+    const fresh = await acquireWorkAdmissionV1({
+      taskFolderPath,
+      purpose: "admission",
+      commandId: "resumeThenDispatchV1",
+    });
+    if (fresh.outcome !== "acquired") {
+      return undefined;
+    }
+    const freshHeartbeat = setInterval(
+      () => void fresh.handle.heartbeat(),
+      WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1
+    );
+    release = async () => {
+      clearInterval(freshHeartbeat);
+      await fresh.handle.release();
+    };
+  }
+
+  const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
+  try {
+    return await dispatch(handoffToken);
+  } finally {
+    revokeWorkAdmissionHandoffV1(taskFolderPath);
+    await release();
   }
 }
 
@@ -334,19 +631,25 @@ export async function resumeAndRerunReviewV1(
   if (!target) {
     return;
   }
-  await resumePausedTask(inventory, currentTaskStore, explicitArg);
-  // Re-read `task-progress.json` straight off disk rather than asking
-  // `inventory`/`resolveTaskContext` again: `inventory` is an in-memory cache
-  // that is not guaranteed to reflect the write `resumePausedTask` (via
-  // `activateTask`) just made, and reading it a second time risks seeing the
-  // pre-resume "paused" snapshot and silently skipping the review dispatch.
-  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-  if (!reread.ok || reread.decoded.progress.status === "paused") {
-    return;
-  }
-  await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-    taskFolderPath: target.taskFolderPath,
-  });
+  // arrangeStageDispatch: false — this function dispatches its OWN specific
+  // follow-up (runReviewWithAI, below) moments after resume; letting
+  // resumePausedTask also durably arrange the generic current-stage action
+  // would schedule a SECOND, possibly different, stage action alongside it.
+  // resumeThenDispatchV1 holds resumePausedTask's admission continuously
+  // through the post-resume re-read AND the whole of runReviewWithAI's own
+  // dispatch, releasing only once it settles — forwarding the single-use
+  // handoff token it hands us lets runReviewWithAI's own admission call
+  // adopt this same-process marker (acquireOrAdoptWorkAdmissionV1) rather
+  // than racing its own genesis against it, so there is no gap and no busy
+  // refusal. Without the token, adoption would not happen at all (2026-09-08
+  // review architectural blocker fix — see `pendingHandoffTokensV1`'s doc
+  // comment in `workAdmissionV1.ts`).
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, (admissionHandoffToken) =>
+    vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+      taskFolderPath: target.taskFolderPath,
+      admissionHandoffTokenV1: admissionHandoffToken,
+    })
+  );
 }
 
 /**
@@ -387,17 +690,19 @@ export async function resumeAndDispatchImplementationV1(
   if (!target) {
     return;
   }
-  await resumePausedTask(inventory, currentTaskStore, explicitArg);
-  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
-  // does: `inventory` is an in-memory cache not guaranteed to reflect the
-  // write resumePausedTask (via activateTask) just made.
-  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-  if (!reread.ok || reread.decoded.progress.status === "paused") {
-    return;
-  }
-  await vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
-    taskFolderPath: target.taskFolderPath,
-  });
+  // arrangeStageDispatch: false — see resumeAndRerunReviewV1's identical note;
+  // this function dispatches runImplementationWithAI itself, below.
+  // resumeThenDispatchV1 now holds admission continuously through the whole
+  // of this dispatch (see its doc comment). `runImplementationWithAI` is not
+  // yet admission-wired on its own (separate, still-open plan item), but that
+  // is not a conflict here — it simply never calls
+  // acquireOrAdoptWorkAdmissionV1, so holding through its dispatch can only
+  // add protection, not refuse it.
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+    vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
+      taskFolderPath: target.taskFolderPath,
+    })
+  );
 }
 
 /**
@@ -440,17 +745,20 @@ export async function resumeAndApplyCurrentStageActionV1(
   if (!target) {
     return;
   }
-  await resumePausedTask(inventory, currentTaskStore, explicitArg);
-  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
-  // does: `inventory` is an in-memory cache not guaranteed to reflect the
-  // write resumePausedTask (via activateTask) just made.
-  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-  if (!reread.ok || reread.decoded.progress.status === "paused") {
-    return;
-  }
-  await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
-    taskFolderPath: target.taskFolderPath,
-  });
+  // arrangeStageDispatch: false — this function dispatches
+  // applyCurrentStageAction itself, below; even though that is the same
+  // command a durable arrangement would eventually reach, letting both fire
+  // would still be a duplicate dispatch.
+  // resumeThenDispatchV1 now holds admission continuously through the whole
+  // of this dispatch (see its doc comment). `applyCurrentStageAction` is not
+  // yet admission-wired on its own (separate, still-open plan item), but that
+  // is not a conflict here — it never calls acquireOrAdoptWorkAdmissionV1, so
+  // holding through its dispatch can only add protection, not refuse it.
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+    vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
+      taskFolderPath: target.taskFolderPath,
+    })
+  );
 }
 
 /**
@@ -492,18 +800,21 @@ export async function resumeAndSetTaskStageV1(
     return;
   }
   const stage = explicitArg.stage;
-  await resumePausedTask(inventory, currentTaskStore, explicitArg);
-  // Re-read straight off disk for the same reason resumeAndRerunReviewV1
-  // does: `inventory` is an in-memory cache not guaranteed to reflect the
-  // write resumePausedTask (via activateTask) just made.
-  const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-  if (!reread.ok || reread.decoded.progress.status === "paused") {
-    return;
-  }
-  await vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
-    taskFolderPath: target.taskFolderPath,
-    stage,
-  });
+  // arrangeStageDispatch: false — this function dispatches setTaskStage
+  // itself, below, which is a stage MOVE, not a rerun of the current stage's
+  // action; a durably arranged current-stage action would be actively wrong
+  // here (it would run the escalated stage's action, not advance past it).
+  // resumeThenDispatchV1 now holds admission continuously through the whole
+  // of this dispatch (see its doc comment). `setTaskStage` is not yet
+  // admission-wired on its own (separate, still-open plan item), but that is
+  // not a conflict here — it never calls acquireOrAdoptWorkAdmissionV1, so
+  // holding through its dispatch can only add protection, not refuse it.
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+    vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
+      taskFolderPath: target.taskFolderPath,
+      stage,
+    })
+  );
 }
 
 /**
@@ -549,19 +860,21 @@ export async function resumeIfPausedThenGoToReviewAndApplyV1(
   if (!target || !explicitArg?.reviewStage) {
     return false;
   }
+  const reviewStage = explicitArg.reviewStage;
   if (target.progress.status === "paused") {
-    await resumePausedTask(inventory, currentTaskStore, explicitArg);
-    // Re-read straight off disk for the same reason resumeAndRerunReviewV1
-    // does: `inventory` is an in-memory cache not guaranteed to reflect the
-    // write resumePausedTask (via activateTask) just made.
-    const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-    if (!reread.ok || reread.decoded.progress.status === "paused") {
-      return false;
-    }
+    // arrangeStageDispatch: false — this function dispatches
+    // goToReviewAndApplyV1 itself, via resumeThenDispatchV1 below, which now
+    // holds admission continuously through the whole of that dispatch (see
+    // its doc comment). `goToReviewAndApplyV1` is not itself admission-wired,
+    // so this can only add protection, never refuse it.
+    const result = await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+      goToReviewAndApplyV1({ taskFolderPath: target.taskFolderPath, reviewStage })
+    );
+    return result ?? false;
   }
   return goToReviewAndApplyV1({
     taskFolderPath: target.taskFolderPath,
-    reviewStage: explicitArg.reviewStage,
+    reviewStage,
   });
 }
 

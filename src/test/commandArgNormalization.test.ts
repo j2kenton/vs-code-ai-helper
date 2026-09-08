@@ -832,6 +832,11 @@ import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/task
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import type { TaskProgress } from "../types/taskProgress";
 import { IMPLEMENTATION_SUMMARY_FILENAME } from "../types/taskProgress";
+import {
+  ADMISSION_DIRNAME_V1,
+  acquireOrAdoptWorkAdmissionV1,
+  hasLiveWorkAdmissionBestEffortV1,
+} from "../state/workAdmissionV1";
 
 void describe("pauseTask integration (full command path)", () => {
   void it("TaskNode-shaped arg pauses the exact named task", async () => {
@@ -980,6 +985,127 @@ void describe("resumePausedTask integration (full command path)", () => {
     }
   });
 
+  // v1 fixes item 1 (Part 1a step 5): the bare "Resume Task" command must
+  // durably arrange the current stage's action in the SAME mutation that
+  // bumps updatedAt, so the task is never observably active with admission
+  // as the only protection. This is the fix for the measured 4-second
+  // resume-trap: a resumed task used to go active with nothing scheduled and
+  // no admission, and the sweep re-paused it before the user could act.
+  void it("arranges a durable scheduledRun for the current stage alongside the active status write", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-arranges-scheduled-run");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-arranges-scheduled-run",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-09-07T09:45:28.000Z",
+        updatedAt: "2026-09-07T09:45:28.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+      const task = makeIncompleteTask(folderPath, "paused");
+
+      await resumePausedTask(inv, currentStore, { task });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.status, "active", "task must be resumed to active");
+      assert.ok(
+        stored!.scheduledRun !== undefined,
+        "resumePausedTask must arrange a durable scheduledRun so the task is never active with " +
+          "nothing admitted or scheduled — the whole point of this fix"
+      );
+      assert.strictEqual(
+        stored!.scheduledRun.stage,
+        "impl-high-review",
+        "the arranged scheduledRun must target the task's actual current stage"
+      );
+    } finally {
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // Proves the ORDERING invariant, not just the end state: admission must be
+  // acquired BEFORE the active-status write reaches disk. If a durable
+  // admission marker already exists for the task (planted here exactly as
+  // acquireWorkAdmissionV1's own genesis flow would leave one), resumePausedTask
+  // must refuse via the busy diagnostic and must NOT flip the task to active —
+  // proving the acquire-then-write order rather than merely a write followed
+  // by an incidental marker.
+  void it("does not resume when durable admission is already held (proves admission precedes the active write)", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-blocked-by-busy-admission");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-blocked-by-busy-admission",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-09-07T00:00:00.000Z",
+        updatedAt: "2026-09-07T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      nodeFs.mkdirSync(admissionDir, { recursive: true });
+      nodeFs.writeFileSync(
+        nodePath.join(admissionDir, "admission.otherowner.g1.abc123"),
+        JSON.stringify({
+          claimId: "11111111-1111-1111-1111-111111111111",
+          purpose: "admission",
+          ownerToken: "otherowner",
+          pid: 999999,
+          processStartTime: 0,
+          hostId: "some-other-host",
+          commandId: "runReviewWithAI",
+          startedAt: "2026-09-07T00:00:00.000Z",
+        }),
+        "utf8"
+      );
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+      const task = makeIncompleteTask(folderPath, "paused");
+
+      const result = await resumePausedTask(inv, currentStore, { task });
+
+      assert.strictEqual(
+        result.outcome,
+        "busy",
+        "2026-09-08 review, narrowed completion blocker: a refused concurrent resume must be reported " +
+          "as its own distinct outcome, not conflated with 'the task was already active' — callers like " +
+          "resumeThenDispatchV1 rely on this to avoid a duplicate fallback dispatch"
+      );
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(
+        stored!.status,
+        "paused",
+        "the active-status write must never happen while another owner holds admission — proves " +
+          "admission is acquired BEFORE the write, not merely alongside it"
+      );
+      assert.ok(
+        msgs.captured.some((m) => m.method === "warning" && m.message.includes("runReviewWithAI")),
+        "must show the busy diagnostic naming the actual blocking owner"
+      );
+    } finally {
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
   void it("deleted/missing task with TaskNode arg shows error, not generic fallback", async () => {
     const inv = makeEmptyInventoryStub();
     const currentStore = makeCurrentTaskStoreStub(undefined);
@@ -1096,9 +1222,174 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
         "must dispatch vs-code-ai-helper.runReviewWithAI after resuming — the whole point of this " +
           "command over plain resumeTask"
       );
-      assert.deepEqual(reviewDispatch.arg, { taskFolderPath: folderPath });
+      // Also carries `admissionHandoffTokenV1` (2026-09-08 review architectural
+      // blocker fix): the single-use token that lets runReviewWithAI's own
+      // admission acquisition adopt resumeAndRerunReviewV1's still-held
+      // marker. Checked structurally rather than via a fixed-shape
+      // deepEqual, since the token's value is randomly generated per call.
+      assert.strictEqual((reviewDispatch.arg as { taskFolderPath?: string }).taskFolderPath, folderPath);
+      assert.strictEqual(
+        typeof (reviewDispatch.arg as { admissionHandoffTokenV1?: unknown }).admissionHandoffTokenV1,
+        "string",
+        "must forward a handoff token so the downstream command can adopt the still-held marker"
+      );
+      assert.deepEqual(Object.keys(reviewDispatch.arg as object).sort(), [
+        "admissionHandoffTokenV1",
+        "taskFolderPath",
+      ]);
     } finally {
       execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // Completion blocker fix (2026-09-08 review, narrowed): resumeAndRerunReviewV1
+  // used to release resumePausedTask's own admission BEFORE dispatching
+  // runReviewWithAI at all, leaving a real gap — active task, no admission,
+  // no arranged work — for the whole of the re-read plus the dispatch call
+  // itself. The review's point was sharper than "shrink the gap": ANY
+  // interval with neither admission nor arranged work reproduces the
+  // watchdog's impossible state, so the fix is to hold admission
+  // CONTINUOUSLY through the entire dispatch rather than release early. This
+  // no longer risks runReviewWithAI's own admission acquisition refusing with
+  // "busy": that acquisition now adopts this same-process marker
+  // (`acquireOrAdoptWorkAdmissionV1`) instead of racing a fresh genesis
+  // against it. Proven here by asserting admission IS still live at the exact
+  // moment the stubbed executeCommand is invoked, and is only released once
+  // the whole resume-and-dispatch sequence has fully settled.
+  void it("holds resumePausedTask's admission through the entire runReviewWithAI dispatch, not just the re-read", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const captured: Array<{ command: string; admissionLiveAtDispatch: boolean }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string
+    ): Promise<undefined> => {
+      captured.push({ command, admissionLiveAtDispatch: hasLiveWorkAdmissionBestEffortV1(folderPath) });
+      return Promise.resolve(undefined);
+    };
+    let folderPath = "";
+    try {
+      const folderUri = makeTaskFolderUri("resume-releases-admission-before-dispatch");
+      folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-releases-admission-before-dispatch",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndRerunReviewV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const reviewDispatch = captured.find((e) => e.command === "vs-code-ai-helper.runReviewWithAI");
+      assert.ok(reviewDispatch !== undefined, "must dispatch the review");
+      assert.strictEqual(
+        reviewDispatch.admissionLiveAtDispatch,
+        true,
+        "resumePausedTask's admission marker must still be live at the exact moment the downstream " +
+          "command dispatches — there must be no window where the task is active with neither " +
+          "admission nor arranged work"
+      );
+      assert.strictEqual(
+        hasLiveWorkAdmissionBestEffortV1(folderPath),
+        false,
+        "admission must not be left held after the whole resume-and-dispatch sequence completes"
+      );
+    } finally {
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // End-to-end proof of the actual adoption mechanism (2026-09-08 review
+  // completion blocker, narrowed): the previous test proves resumeTask's own
+  // admission stays live at dispatch time; this one proves that a downstream
+  // command's OWN admission acquisition — the exact call runReviewWithAI
+  // makes — succeeds by joining that same-process marker instead of being
+  // refused "busy" against it, which is what would happen if this were still
+  // a plain acquireWorkAdmissionV1 call. The stub simulates runReviewWithAI's
+  // admission entry point directly rather than invoking the full command
+  // (which pulls in the whole review pipeline), acquiring-or-adopting and
+  // then releasing exactly as that command's own try/finally would.
+  void it("lets runReviewWithAI's own admission acquisition adopt resumePausedTask's still-held marker instead of refusing busy", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const captured: Array<{ command: string; outcome: string }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: { taskFolderPath?: string; admissionHandoffTokenV1?: string }
+    ): Promise<undefined> => {
+      // Mirrors runReviewWithAI's own admission-acquisition call exactly,
+      // including forwarding the `admissionHandoffTokenV1` resumeAndRerunReviewV1
+      // now threads through the dispatched command's arguments (2026-09-08
+      // review architectural blocker fix) — without it, adoption would
+      // correctly be refused busy, same as any unrelated caller.
+      const adopted = await acquireOrAdoptWorkAdmissionV1({
+        taskFolderPath: arg?.taskFolderPath ?? "",
+        purpose: "admission",
+        commandId: "runReviewWithAI",
+        handoffToken: arg?.admissionHandoffTokenV1,
+      });
+      captured.push({ command, outcome: adopted.outcome });
+      if (adopted.outcome === "acquired") {
+        await adopted.handle.release();
+      }
+      return Promise.resolve(undefined);
+    };
+    let folderPath = "";
+    try {
+      const folderUri = makeTaskFolderUri("resume-adopts-admission-not-busy");
+      folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-adopts-admission-not-busy",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndRerunReviewV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const reviewDispatch = captured.find((e) => e.command === "vs-code-ai-helper.runReviewWithAI");
+      assert.ok(reviewDispatch !== undefined, "must dispatch the review");
+      assert.strictEqual(
+        reviewDispatch.outcome,
+        "acquired",
+        "the downstream command's own admission acquisition must adopt the resume flow's still-held " +
+          "same-process marker, not be refused busy against it"
+      );
+      assert.strictEqual(
+        hasLiveWorkAdmissionBestEffortV1(folderPath),
+        false,
+        "admission must not be left held after both the resume flow and the adopted downstream view " +
+          "have released"
+      );
+    } finally {
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
       msgs.restore();
       fs.restore();
       wsFolders.restore();
@@ -1231,6 +1522,235 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     } finally {
       execCmd.restore();
       msgs.restore();
+    }
+  });
+
+  // 2026-09-08 review completion blocker: resumePausedTask returns
+  // `undefined` for an already-active task exactly as it does for a busy
+  // refusal, and resumeThenDispatchV1 used to dispatch in either case merely
+  // because a disk re-read showed the task active — without ever holding
+  // admission itself. runImplementationWithAI is one of the dispatch targets
+  // named as NOT admission-wired on its own, so that dispatched real,
+  // unprotected work the instant another window's resume won the race. Prove
+  // the fix: when a REAL owner already holds a live admission marker for
+  // this already-active task, this command must not dispatch at all, and
+  // must leave that owner's marker completely untouched.
+  void it("does not dispatch implementation against an already-active task while a real owner still holds admission", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-dispatch-active-real-owner");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-dispatch-active-real-owner",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      nodeFs.mkdirSync(admissionDir, { recursive: true });
+      const markerPath = nodePath.join(admissionDir, "admission.realowner.g1.abc123");
+      nodeFs.writeFileSync(
+        markerPath,
+        JSON.stringify({
+          claimId: "22222222-2222-2222-2222-222222222222",
+          purpose: "admission",
+          ownerToken: "realowner",
+          pid: 999999,
+          processStartTime: 0,
+          hostId: "some-other-host",
+          commandId: "otherWindowCommand",
+          startedAt: "2026-09-08T00:00:00.000Z",
+        }),
+        "utf8"
+      );
+
+      const inv = makeInventoryStub(folderPath, folderPath, "active");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "must not dispatch unprotected work while a real owner's admission marker is live"
+      );
+      assert.ok(nodeFs.existsSync(markerPath), "the real owner's marker must be left completely untouched");
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // The other side of the same fix: when the task is already active and NO
+  // owner holds admission at all — the impossible state itself — this
+  // command must still dispatch (matching its pre-existing behavior for the
+  // ordinary paused-resume case), but now only after acquiring a fresh
+  // admission marker of its own first, so the dispatch is never unprotected.
+  void it("acquires its own fresh admission and dispatches implementation for an already-active task with no live owner (the impossible state)", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const captured: Array<{ command: string; admissionLiveAtDispatch: boolean }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string
+    ): Promise<undefined> => {
+      captured.push({ command, admissionLiveAtDispatch: hasLiveWorkAdmissionBestEffortV1(folderPath) });
+      return Promise.resolve(undefined);
+    };
+    let folderPath = "";
+    try {
+      const folderUri = makeTaskFolderUri("resume-dispatch-active-no-owner");
+      folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-dispatch-active-no-owner",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "active");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const implDispatch = captured.find((e) => e.command === "vs-code-ai-helper.runImplementationWithAI");
+      assert.ok(implDispatch !== undefined, "must still dispatch implementation once it holds its own admission");
+      assert.strictEqual(
+        implDispatch.admissionLiveAtDispatch,
+        true,
+        "must hold a live admission marker of its own at the exact moment it dispatches unwired work — this " +
+          "is the fresh-acquisition fallback, since resumePausedTask itself had nothing to resume"
+      );
+      assert.strictEqual(
+        hasLiveWorkAdmissionBestEffortV1(folderPath),
+        false,
+        "the fresh admission must be released once the dispatch settles"
+      );
+    } finally {
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // 2026-09-08 review, narrowed completion blocker: `resumePausedTask` used
+  // to return bare `undefined` both when the task was already active
+  // (nothing to resume) AND when a concurrent resume raced this call to
+  // admission and lost (refused "busy"). `resumeThenDispatchV1` used to
+  // treat both identically — re-read disk, and if it now showed "active",
+  // fall back to a fresh admission-and-dispatch. That fallback is only safe
+  // for the first case. This reproduces the second: this call's OWN resume
+  // attempt is genuinely refused "busy" (a live marker exists at the exact
+  // moment it tries), and only AFTER that refusal does the winning owner
+  // finish and release — exactly the ordering the review measured ("A wins
+  // admission, activates the task, arranges scheduledRun, and releases
+  // before invocation B reaches [the fallback]"). Simulated deterministically
+  // by intercepting the very next read of task-progress.json (the post-busy
+  // re-read `resumeThenDispatchV1` performs) and, as a side effect of that
+  // read, flipping status to "active" and removing the winner's marker — the
+  // fixed code must never reach that re-read at all once its own attempt was
+  // refused busy, so no dispatch may occur regardless.
+  void it("does not fall back to a fresh dispatch when this call's own resume was refused busy, even if the winning owner finishes and releases immediately after", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-busy-then-winner-releases");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-busy-then-winner-releases",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const admissionDir = nodePath.join(folderPath, ADMISSION_DIRNAME_V1);
+      nodeFs.mkdirSync(admissionDir, { recursive: true });
+      const markerPath = nodePath.join(admissionDir, "admission.winner.g1.abc123");
+      nodeFs.writeFileSync(
+        markerPath,
+        JSON.stringify({
+          claimId: "33333333-3333-3333-3333-333333333333",
+          purpose: "admission",
+          ownerToken: "winner",
+          pid: 999999,
+          processStartTime: 0,
+          hostId: "some-other-host",
+          commandId: "otherWindowResume",
+          startedAt: "2026-09-08T00:00:00.000Z",
+        }),
+        "utf8"
+      );
+
+      const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+      const origReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile as (
+        uri: vscode.Uri
+      ) => Promise<Uint8Array>;
+      let winnerSimulated = false;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
+        uri: vscode.Uri
+      ): Promise<Uint8Array> => {
+        if (!winnerSimulated && uri.fsPath === progressUri.fsPath) {
+          winnerSimulated = true;
+          nodeFs.writeFileSync(
+            progressUri.fsPath,
+            JSON.stringify({ ...progress, status: "active" }, null, 2),
+            "utf8"
+          );
+          nodeFs.rmSync(markerPath, { force: true });
+        }
+        return origReadFile(uri);
+      };
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const implDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runImplementationWithAI"
+      );
+      assert.strictEqual(
+        implDispatch,
+        undefined,
+        "a busy-refused resume must never fall back to a fresh admission-and-dispatch, even once the " +
+          "winning owner has since finished and released — that would fire a duplicate action for the " +
+          "same resume event"
+      );
+      assert.strictEqual(
+        winnerSimulated,
+        false,
+        "the fixed code must stop on its own 'busy' outcome and never even perform the post-busy re-read"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
     }
   });
 });

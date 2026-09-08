@@ -4,9 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import {
+  acquireOrAdoptWorkAdmissionV1,
   acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionBlockerV1,
   hasLiveWorkAdmissionBestEffortV1,
+  revokeWorkAdmissionHandoffV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
 } from "../state/workAdmissionV1";
@@ -93,6 +96,314 @@ void test("single-owner invariant: a second caller is refused busy while the mar
   if (third.outcome === "acquired") {
     await third.handle.release();
   }
+});
+
+void test("acquireOrAdoptWorkAdmissionV1 falls through to a fresh genesis when no local handle exists", async () => {
+  const task = freshTaskFolder("adopt-falls-through-to-genesis");
+  const result = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "solo-caller",
+  });
+  assert.equal(result.outcome, "acquired");
+  if (result.outcome !== "acquired") return;
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+  await result.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+});
+
+void test("same-process handoff: acquireOrAdoptWorkAdmissionV1 joins an already-live local marker when presented the authorized handoff token", async () => {
+  const task = freshTaskFolder("adopt-joins-live-local-marker");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  // A same-process caller acquiring fresh would be refused busy against this
+  // exact marker (the invariant `acquireWorkAdmissionV1` still enforces for
+  // any OTHER, non-adopting caller — proven by the "single-owner invariant"
+  // test above and by the "refuses an unrelated same-process caller" test
+  // below). The adopt-aware entry point joins ONLY when presented the token
+  // the resume-flow-equivalent holder just authorized for this exact task
+  // (2026-09-08 review architectural blocker fix).
+  const handoffToken = authorizeWorkAdmissionHandoffV1(task);
+  const adopted = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken,
+  });
+  assert.equal(adopted.outcome, "acquired");
+  if (adopted.outcome !== "acquired") return;
+
+  // Exactly one marker file on disk throughout — adoption never creates a
+  // second one.
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  assert.equal(fs.readdirSync(dir).length, 1);
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  // The downstream (adopted) view releasing first must NOT unlink the
+  // marker — the original resume-flow handle still holds it.
+  await adopted.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+  assert.equal(fs.readdirSync(dir).length, 1);
+
+  // Only once the ORIGINAL handle also releases is the marker actually gone.
+  await original.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+  assert.equal(fs.readdirSync(dir).length, 0);
+});
+
+void test("acquireOrAdoptWorkAdmissionV1 refuses an unrelated same-process caller with no matching handoff token (architectural blocker fix)", async () => {
+  const task = freshTaskFolder("adopt-refuses-unrelated-caller");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  // No token at all — an unrelated concurrent invocation in the same process
+  // must fall through to the ordinary genesis path and be refused busy
+  // against the live marker, exactly like a cross-process caller. This is
+  // the fix for the 2026-09-08 review's architectural blocker: adoption used
+  // to succeed for ANY same-process caller regardless of relationship to the
+  // marker's owner.
+  const noToken = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "unrelated-command",
+  });
+  assert.equal(noToken.outcome, "busy");
+
+  // A stale/foreign token (never authorized for this task) must also be
+  // refused, not just an absent one.
+  const wrongToken = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "unrelated-command",
+    handoffToken: "not-a-real-token",
+  });
+  assert.equal(wrongToken.outcome, "busy");
+
+  await original.handle.release();
+});
+
+void test("a handoff token authorizes exactly one adoption and cannot be replayed", async () => {
+  const task = freshTaskFolder("adopt-token-single-use");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const handoffToken = authorizeWorkAdmissionHandoffV1(task);
+  const first = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken,
+  });
+  assert.equal(first.outcome, "acquired");
+  if (first.outcome !== "acquired") return;
+
+  // Replaying the SAME token for a second, later call must not authorize a
+  // second adoption — it was consumed by the first.
+  const replay = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "another-downstream-command",
+    handoffToken,
+  });
+  assert.equal(replay.outcome, "busy");
+
+  await first.handle.release();
+  await original.handle.release();
+});
+
+void test("revokeWorkAdmissionHandoffV1 invalidates an unconsumed token", async () => {
+  const task = freshTaskFolder("adopt-token-revoked");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const handoffToken = authorizeWorkAdmissionHandoffV1(task);
+  revokeWorkAdmissionHandoffV1(task);
+
+  const afterRevoke = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken,
+  });
+  assert.equal(afterRevoke.outcome, "busy");
+
+  await original.handle.release();
+});
+
+void test("same-process handoff: releasing in the reverse order (original first, then the adopted view) still ends fully released", async () => {
+  const task = freshTaskFolder("adopt-reverse-release-order");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const adopted = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken: authorizeWorkAdmissionHandoffV1(task),
+  });
+  assert.equal(adopted.outcome, "acquired");
+  if (adopted.outcome !== "acquired") return;
+
+  // The original handle releasing first must NOT unlink the marker while the
+  // adopted view is still outstanding.
+  await original.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  await adopted.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  assert.equal(fs.readdirSync(dir).length, 0);
+});
+
+void test("an adopted view's heartbeat actually renews the marker after the original handle has already released (completion blocker fix, narrowed 2026-09-08)", async () => {
+  const task = freshTaskFolder("adopt-heartbeat-after-original-release");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const adopted = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken: authorizeWorkAdmissionHandoffV1(task),
+  });
+  assert.equal(adopted.outcome, "acquired");
+  if (adopted.outcome !== "acquired") return;
+
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const beforeRelease = fs.readdirSync(dir);
+  assert.equal(beforeRelease.length, 1);
+  const markerBeforeOriginalRelease = beforeRelease[0]!;
+  assert.match(markerBeforeOriginalRelease, /\.g1\./, "starts at generation 1");
+
+  // The original acquirer lets go first; the adopted view remains the sole
+  // holder, and the marker itself must still be live (not unlinked, since a
+  // holder remains).
+  await original.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  // Before the fix, heartbeat() returned immediately once the BASE handle's
+  // own `released` flag was set — which happens the moment `original`
+  // released, regardless of whether any holder remains. That made every
+  // subsequent heartbeat from the adopted view (or its own timer) a
+  // permanent silent no-op: the marker would stop renewing the instant the
+  // original resume flow let go, even though the downstream command (the
+  // adopted view) was still legitimately working. Prove the opposite here:
+  // the rename must actually happen.
+  await adopted.handle.heartbeat();
+
+  const afterHeartbeat = fs.readdirSync(dir);
+  assert.equal(afterHeartbeat.length, 1, "still exactly one marker file — the old one renamed, not duplicated");
+  assert.notEqual(
+    afterHeartbeat[0],
+    markerBeforeOriginalRelease,
+    "heartbeat must actually rename the marker to a new generation, not silently no-op"
+  );
+  assert.match(afterHeartbeat[0]!, /\.g2\./, "advances to generation 2");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  await adopted.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+  assert.equal(fs.readdirSync(dir).length, 0);
+});
+
+void test("adopted view release is serialized with heartbeat through the same owner-local queue and cannot leak an orphaned marker (completion blocker fix)", async () => {
+  const task = freshTaskFolder("adopt-release-serialized-with-heartbeat");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const adopted = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken: authorizeWorkAdmissionHandoffV1(task),
+  });
+  assert.equal(adopted.outcome, "acquired");
+  if (adopted.outcome !== "acquired") return;
+
+  // Original releases first so the adopted view becomes the sole remaining
+  // holder — its own release() is now the one that must actually unlink.
+  await original.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  // Fire a heartbeat and the final release from the SAME (now sole) adopted
+  // view back-to-back without awaiting the first. Before the fix, an adopted
+  // view's release() unlinked by calling the finalizer directly, bypassing
+  // the owner-local queue heartbeat/release already share on the base
+  // handle — so a release could race an in-flight heartbeat rename and leave
+  // the just-renamed marker behind forever (a permanent "busy" stranding
+  // under v1a's interim never-reclaim policy). Routing both through the
+  // shared queue (`localSerializersV1`) means whichever fires first fully
+  // completes before the other starts, so the marker always ends in a
+  // consistent, fully-unlinked state.
+  await Promise.all([adopted.handle.heartbeat(), adopted.handle.release()]);
+
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  assert.equal(fs.readdirSync(dir).length, 0, "no marker file must be left behind after release settles");
+});
+
+void test("an adopted view's release is idempotent, like any other handle", async () => {
+  const task = freshTaskFolder("adopt-idempotent-release");
+  const original = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "resume-flow",
+  });
+  assert.equal(original.outcome, "acquired");
+  if (original.outcome !== "acquired") return;
+
+  const adopted = await acquireOrAdoptWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "downstream-command",
+    handoffToken: authorizeWorkAdmissionHandoffV1(task),
+  });
+  assert.equal(adopted.outcome, "acquired");
+  if (adopted.outcome !== "acquired") return;
+
+  await adopted.handle.release();
+  await adopted.handle.release(); // must not double-decrement the shared count
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+
+  await original.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
 });
 
 void test("racing geneses: exactly one of several concurrent acquirers wins", async () => {
