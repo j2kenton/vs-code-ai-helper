@@ -10,7 +10,7 @@ Read the approved plan, implementation notes, and review below, then:
 
 1. Inspect the current code before touching anything
 2. Fix every unresolved or partially resolved blocker the review identifies, including architectural, defect, completion, and previous-review blockers
-3. Do not substitute smaller non-blocking changes while required blockers remain
+3. Do not substitute smaller non-blocking changes while **fixable** blockers remain. This rule exists to stop a round doing easy work while dodging a hard defect — it does not apply to a blocker this round cannot clear at all. A blocker classified `environmental` or `needs-toolchain`, or one whose own text says it awaits a human decision or another task, does not gate the rest of the plan: state plainly that it is unaddressable and why, then continue under rule 8 with the round's remaining capacity. Stopping with unbuilt plan steps because of a blocker nobody in this round can fix starves the task; doing the available work is strictly better than doing nothing
 4. Treat review-confidence blockers as an instruction to inspect the workspace directly or improve the missing evidence, not as proof of a code defect
 5. Address non-blocking suggestions where they are clearly correct and in scope
 6. Edit files directly in the workspace, and remove anything obsolete
