@@ -1492,7 +1492,18 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         "must dispatch vs-code-ai-helper.runImplementationWithAI after resuming — the whole point of " +
           "this command over plain resumeTask"
       );
-      assert.deepEqual(implDispatch.arg, { taskFolderPath: folderPath });
+      // 2026-09-09 review, narrowed completion blocker
+      // `d5e4bc19-f7ad-4ff5-a1b2-9fdea1397736-1`: the resumed marker's
+      // single-use handoff token must be forwarded so
+      // `runImplementationWithAI`'s own admission acquisition adopts this
+      // call's already-live marker instead of racing a fresh genesis and
+      // self-refusing busy.
+      const implArg = implDispatch.arg as
+        | { taskFolderPath?: string; admissionHandoffTokenV1?: string }
+        | undefined;
+      assert.equal(implArg?.taskFolderPath, folderPath);
+      assert.equal(typeof implArg?.admissionHandoffTokenV1, "string");
+      assert.ok((implArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
     } finally {
       execCmd.restore();
       msgs.restore();
@@ -2189,7 +2200,19 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
         "must dispatch vs-code-ai-helper.applyCurrentStageAction after resuming — the whole point of " +
           "this command over plain resumeTask"
       );
-      assert.deepEqual(dispatch.arg, { taskFolderPath: folderPath });
+      // 2026-09-09 review, narrowed completion blocker
+      // `d5e4bc19-f7ad-4ff5-a1b2-9fdea1397736-1`: the resumed marker's
+      // single-use handoff token must be forwarded so
+      // `applyCurrentStageAction`'s own admission acquisition (and, when it
+      // redirects to Apply Review, that redirect's own forwarding) adopts
+      // this call's already-live marker instead of racing a fresh genesis
+      // and self-refusing busy.
+      const dispatchArg = dispatch.arg as
+        | { taskFolderPath?: string; admissionHandoffTokenV1?: string }
+        | undefined;
+      assert.equal(dispatchArg?.taskFolderPath, folderPath);
+      assert.equal(typeof dispatchArg?.admissionHandoffTokenV1, "string");
+      assert.ok((dispatchArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
     } finally {
       execCmd.restore();
       msgs.restore();
@@ -2248,8 +2271,20 @@ void describe("resumeIfPausedThenGoToReviewAndApplyV1 (production code)", () => 
     (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
       command: string,
       arg?: unknown
-    ): Promise<undefined> => {
+    ): Promise<unknown> => {
       captured.push({ command, arg });
+      // `applyHighLevelReviewChanges`/`applyLowLevelReviewChanges` now report
+      // whether they actually dispatched (`true`) rather than resolving void
+      // (2026-09-09 review completion blocker, narrowed) — `goToReviewAndApplyV1`
+      // relays that real result instead of assuming dispatch succeeded, so this
+      // stub must mirror the real command's return value for these two commands
+      // to exercise the "actually dispatched" path this test is checking.
+      if (
+        command === "vs-code-ai-helper.applyHighLevelReviewChanges" ||
+        command === "vs-code-ai-helper.applyLowLevelReviewChanges"
+      ) {
+        return Promise.resolve(true);
+      }
       return Promise.resolve(undefined);
     };
     return {

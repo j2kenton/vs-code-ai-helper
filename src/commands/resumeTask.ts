@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearEscalation } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
@@ -198,10 +197,13 @@ export type ResumePausedTaskOutcomeV1 =
  * (`workAdmissionV1.ts`'s `localHolderCountsV1`). Without a matching token,
  * adoption does not happen — this is deliberate: it is what keeps an
  * unrelated, concurrent same-process command from ever joining this hold.
- * Downstream commands not yet admission-wired themselves
- * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
- * `goToReviewAndApplyV1`) never call that function at all, so holding
- * through their dispatch is unconditionally safe for them too.
+ * Downstream commands not themselves admission-wired (`applyCurrentStageAction`,
+ * `setTaskStage`) never call that function at all, so holding through their
+ * dispatch is unconditionally safe for them too. `runImplementationWithAI`
+ * and `goToReviewAndApplyV1` are no longer in that category (2026-09-09
+ * review completion blocker, narrowed): both now reach admission-wired
+ * commands and require a forwarded handoff token from any caller that holds
+ * admission across their dispatch — see each call site below.
  */
 export async function resumePausedTask(
   inventory: TaskInventory,
@@ -331,12 +333,6 @@ export async function resumePausedTask(
       resolvedTask.taskFolderPath,
       { label: "Resume Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "resume-task" },
       async () => {
-        const activated = await activateTask(
-          inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId
-        );
-        if (!activated) {
-          throw new Error("Could not read task progress.");
-        }
         // Resuming a task IS the human's "how would you like to proceed"
         // answer to a stuck-review escalation — clear it as a small,
         // additive follow-up write rather than threading it into
@@ -404,25 +400,37 @@ export async function resumePausedTask(
         // stage's action to run — a durable `scheduledRun` for "now",
         // consumed by the SAME `TaskActionScheduler.fire` ->
         // `applyCurrentStageAction` path a manually scheduled rerun uses
-        // (`scheduleTaskResume.ts`). Written in this same mutation as the
-        // `active` status is (from `activateTask`, just above) and the
-        // `updatedAt` bump, so there is no observable moment where the task
-        // is active with admission as the ONLY protection — once this write
-        // lands, `scheduledRun` is itself a standing exemption
-        // (`isImpossibleActiveStateV1`) that outlives admission's release
-        // below. Never overwrites an existing `scheduledRun` — e.g. a
+        // (`scheduleTaskResume.ts`). This is folded into `activateTask`'s
+        // OWN `mutateTarget` hook (below) rather than written as a separate,
+        // follow-up `patchTaskProgressStrictV1` call — an earlier revision
+        // did the latter, leaving a real (if admission-covered) gap on disk
+        // between the `active` status write and the write that added
+        // `updatedAt`/`scheduledRun`: any reader of `task-progress.json`
+        // between those two writes would see the task active with neither.
+        // `mutateTarget` composes into `activateTask`'s single CAS write as
+        // `updateTaskStatus(mutateTarget(current), "active", { preserveFreshness: true })`
+        // — `mutateTarget` below stamps its own fresh `updatedAt`, so
+        // `preserveFreshness: true` simply keeps that value rather than
+        // discarding it, and the whole thing — status flip, escalation
+        // clear, freshness bump, and scheduled dispatch intent — lands in
+        // one write. Never overwrites an existing `scheduledRun` — e.g. a
         // quota-park's own future rerun — which is a deliberate future
         // intent, not a stand-in for "nothing is arranged yet".
-        await patchTaskProgressStrictV1(
-          vscode.Uri.file(resolvedTask.taskFolderPath),
-          (current) => ({
-            ...clearEscalation(current),
-            updatedAt: new Date().toISOString(),
-            ...(arrangeStageDispatch && current.scheduledRun === undefined
-              ? { scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } }
-              : {}),
-          })
+        const activated = await activateTask(
+          inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId,
+          {
+            mutateTarget: (current) => ({
+              ...clearEscalation(current),
+              updatedAt: new Date().toISOString(),
+              ...(arrangeStageDispatch && current.scheduledRun === undefined
+                ? { scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } }
+                : {}),
+            }),
+          }
         );
+        if (!activated) {
+          throw new Error("Could not read task progress.");
+        }
         // Part 11 item 13c (event-driven half, "stage advance/resume
         // invalidates escalation cards"): every escalation card exists to
         // hold this exact pause open pending a decision — the clear above
@@ -493,12 +501,17 @@ export async function resumePausedTask(
  * actually unlinked once every holder (this function's own hold, and any
  * adopted view the dispatched command created) has released, regardless of
  * release order (see `workAdmissionV1.ts`'s `localHolderCountsV1` doc
- * comment). Downstream commands that are not yet admission-wired
- * (`runImplementationWithAI`, `applyCurrentStageAction`, `setTaskStage`,
- * `goToReviewAndApplyV1`) simply never call `acquireOrAdoptWorkAdmissionV1`,
- * so holding admission through their dispatch is unconditionally safe for
- * them too — it can only add protection, never conflict — and they ignore
- * the token argument they are handed.
+ * comment). Downstream commands that are not themselves admission-wired
+ * (`applyCurrentStageAction`, `setTaskStage`) simply never call
+ * `acquireOrAdoptWorkAdmissionV1`, so holding admission through their
+ * dispatch is unconditionally safe for them too — it can only add
+ * protection, never conflict — and they ignore the token argument they are
+ * handed. `runImplementationWithAI` and `goToReviewAndApplyV1` are no longer
+ * in that category (2026-09-09 review completion blocker, narrowed): both
+ * reach admission-wired commands, so a caller holding admission across their
+ * dispatch MUST forward the token or risk a self-inflicted `busy` refusal —
+ * see `resumeIfPausedThenGoToReviewAndApplyV1` below for the corrected
+ * pattern.
  *
  * Re-reads `task-progress.json` straight off disk rather than trusting the
  * in-memory `inventory`: that cache is not guaranteed to reflect the write
@@ -793,14 +806,17 @@ export async function resumeAndDispatchImplementationV1(
   // arrangeStageDispatch: false — see resumeAndRerunReviewV1's identical note;
   // this function dispatches runImplementationWithAI itself, below.
   // resumeThenDispatchV1 now holds admission continuously through the whole
-  // of this dispatch (see its doc comment). `runImplementationWithAI` is not
-  // yet admission-wired on its own (separate, still-open plan item), but that
-  // is not a conflict here — it simply never calls
-  // acquireOrAdoptWorkAdmissionV1, so holding through its dispatch can only
-  // add protection, not refuse it.
-  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+  // of this dispatch (see its doc comment). `runImplementationWithAI` IS
+  // admission-wired (its own early-acquisition block calls
+  // acquireOrAdoptWorkAdmissionV1), so the single-use handoff token must be
+  // forwarded here or that call races a fresh genesis against the marker this
+  // function is already holding and self-refuses busy (2026-09-09 review,
+  // narrowed completion blocker `d5e4bc19-f7ad-4ff5-a1b2-9fdea1397736-1`) —
+  // mirrors resumeAndRerunReviewV1's identical forwarding for runReviewWithAI.
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, (admissionHandoffToken) =>
     vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
       taskFolderPath: target.taskFolderPath,
+      admissionHandoffTokenV1: admissionHandoffToken,
     })
   );
 }
@@ -850,13 +866,18 @@ export async function resumeAndApplyCurrentStageActionV1(
   // command a durable arrangement would eventually reach, letting both fire
   // would still be a duplicate dispatch.
   // resumeThenDispatchV1 now holds admission continuously through the whole
-  // of this dispatch (see its doc comment). `applyCurrentStageAction` is not
-  // yet admission-wired on its own (separate, still-open plan item), but that
-  // is not a conflict here — it never calls acquireOrAdoptWorkAdmissionV1, so
-  // holding through its dispatch can only add protection, not refuse it.
-  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
+  // of this dispatch (see its doc comment). `applyCurrentStageAction` forwards
+  // an `admissionHandoffTokenV1` into whichever downstream stage command it
+  // dispatches, and — when the impl stage redirects to Apply Review — into
+  // `goToReviewAndApplyV1` as well, so the token must reach it here or every
+  // one of those downstream admission-wired commands races a fresh genesis
+  // against the marker this function is already holding and self-refuses busy
+  // (2026-09-09 review, narrowed completion blocker
+  // `d5e4bc19-f7ad-4ff5-a1b2-9fdea1397736-1`).
+  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, (admissionHandoffToken) =>
     vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
       taskFolderPath: target.taskFolderPath,
+      admissionHandoffTokenV1: admissionHandoffToken,
     })
   );
 }
@@ -965,10 +986,25 @@ export async function resumeIfPausedThenGoToReviewAndApplyV1(
     // arrangeStageDispatch: false — this function dispatches
     // goToReviewAndApplyV1 itself, via resumeThenDispatchV1 below, which now
     // holds admission continuously through the whole of that dispatch (see
-    // its doc comment). `goToReviewAndApplyV1` is not itself admission-wired,
-    // so this can only add protection, never refuse it.
-    const result = await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
-      goToReviewAndApplyV1({ taskFolderPath: target.taskFolderPath, reviewStage })
+    // its doc comment). `goToReviewAndApplyV1` now forwards a supplied
+    // handoff token into the `applyHighLevelReviewChanges`/
+    // `applyLowLevelReviewChanges` → `applyReviewWithAI`/
+    // `applyReviewEditWithAI` chain it dispatches, and those ARE
+    // admission-wired (2026-09-09 review completion blocker, narrowed) — so
+    // forwarding the token here is required, not merely protective: without
+    // it, that downstream admission call races this function's own held
+    // marker and is refused `busy`, silently dropping the redirect.
+    const result = await resumeThenDispatchV1(
+      inventory,
+      currentTaskStore,
+      explicitArg,
+      target.taskFolderPath,
+      (admissionHandoffToken) =>
+        goToReviewAndApplyV1({
+          taskFolderPath: target.taskFolderPath,
+          reviewStage,
+          admissionHandoffTokenV1: admissionHandoffToken,
+        })
     );
     return result ?? false;
   }

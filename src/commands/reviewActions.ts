@@ -19,7 +19,9 @@ import {
 } from "../utils/taskOperations";
 import {
   acquireOrAdoptWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
+  revokeWorkAdmissionHandoffV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
@@ -6132,7 +6134,7 @@ export async function applyReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg,
   options: ApplyReviewOptions = {}
-): Promise<void> {
+): Promise<boolean> {
   assertLegacyAiRouteAllowedV0("applyReview.v1");
 
   const targetStage =
@@ -6145,7 +6147,7 @@ export async function applyReviewWithAI(
     NotificationRouter.showWarning(
       "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
     );
-    return;
+    return false;
   }
 
   // ── Malformed-arg guard ───────────────────────────────────────────────────
@@ -6159,7 +6161,7 @@ export async function applyReviewWithAI(
       "Apply Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
-    return;
+    return false;
   }
 
   // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
@@ -6185,7 +6187,7 @@ export async function applyReviewWithAI(
       : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
-    return;
+    return false;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
@@ -6217,7 +6219,7 @@ export async function applyReviewWithAI(
       NotificationRouter.showWarning(
         "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
       );
-      return;
+      return false;
     }
   }
 
@@ -6228,7 +6230,7 @@ export async function applyReviewWithAI(
     context
   );
   if (!resolved) {
-    return;
+    return false;
   }
 
   if (!handle && !options.parentOperation) {
@@ -6244,7 +6246,7 @@ export async function applyReviewWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
-      return;
+      return false;
     }
     handle = late.handle;
     heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
@@ -6257,24 +6259,24 @@ export async function applyReviewWithAI(
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
-    return;
+    return false;
   }
   if (reconciled.outcome === "userPaused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return;
+    return false;
   }
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return;
+    return false;
   }
 
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
-    return;
+    return false;
   }
 
   // Prefer the task's persisted ownership.workspaceRoot over the active-editor
@@ -6284,32 +6286,41 @@ export async function applyReviewWithAI(
     NotificationRouter.showError(
       "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
-    return;
+    return false;
   }
 
   const lockKey = resolved.folderUri.fsPath;
   const stage = resolved.progress.currentStage;
-  const runApply = async (op: TaskOperationHandle): Promise<void> => {
+  // Returns whether this attempt actually reached the coordinator dispatch
+  // (`true`) or refused on one of its own guard clauses (`false` — no/empty/
+  // stale/invalid review artifact, no current plan content, no model
+  // configured for the plan stage). `applyReviewWithAI`'s own return value
+  // (below) relays this so a scheduled or router-driven caller can tell a
+  // genuine apply from a silent internal refusal (2026-09-09 review
+  // completion blocker, narrowed — the outer guard clauses above already
+  // reported this; this closes the gap for refusals made INSIDE the tracked
+  // operation).
+  const runApply = async (op: TaskOperationHandle): Promise<boolean> => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
     if (!reviewContent) {
       NotificationRouter.showWarning(
         "No review found (or it is empty). Run the review before applying it."
       );
-      return;
+      return false;
     }
     if (isStaleReviewArtifact(reviewContent)) {
       NotificationRouter.showWarning(
         "The review is stale. Run the review again before applying it."
       );
-      return;
+      return false;
     }
     const reviewValidation = validateReviewOutput(reviewContent);
     if (!reviewValidation.valid) {
       NotificationRouter.showWarning(
         `The review content is invalid (${reviewValidation.reason}). Run the review again before applying it.`
       );
-      return;
+      return false;
     }
 
 
@@ -6324,7 +6335,7 @@ export async function applyReviewWithAI(
       NotificationRouter.showWarning(
         stageActionRequirementMessageV1("applyReviewPlan", 0)
       );
-      return;
+      return false;
     }
     variables.plan = planContent;
     const contextPackUri = await writeContextPack(
@@ -6349,7 +6360,7 @@ export async function applyReviewWithAI(
     const { modelId } = await resolveFreshModelForStage(resolved.folderUri, "plan");
     if (!modelId) {
       NotificationRouter.showWarning("No model is configured for plan stage.");
-      return;
+      return false;
     }
     // Notifications in-flight visibility (Step 5 audit): this dispatch path
     // never reported its stage/model before — the row sat on whatever the
@@ -6445,20 +6456,30 @@ export async function applyReviewWithAI(
         }
       }
     }
+    // The coordinator dispatch above genuinely ran, regardless of its
+    // settled outcome kind (completed/questions/anything else) — this
+    // attempt is not a refusal.
+    return true;
   };
 
+  let dispatchedV1: boolean;
   if (options.parentOperation) {
     // A composite caller (fast-forward) already registered the tracked
     // operation; run under its handle so the whole composite renders exactly
     // one Notifications row and internal attempts nest as its children.
-    await runApply(options.parentOperation);
+    dispatchedV1 = await runApply(options.parentOperation);
   } else {
-    await runTrackedOperation(
-      lockKey,
-      { label: "Apply Review", stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true },
-      runApply
-    );
+    // `runTrackedOperation` resolves `undefined` when it refused outright
+    // (another operation already holds this task's lock; it shows its own
+    // busy warning) — that must also count as "did not dispatch".
+    dispatchedV1 =
+      (await runTrackedOperation(
+        lockKey,
+        { label: "Apply Review", stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true },
+        runApply
+      )) === true;
   }
+  return dispatchedV1;
   } finally {
     await releaseAdmissionV1();
   }
@@ -11438,7 +11459,7 @@ export async function runImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg,
   chatViewProvider?: ChatViewProvider
-): Promise<void> {
+): Promise<boolean> {
   // Post-§7.8 route gate: "implementation.v1" is MIGRATED (Copilot-resolved
   // models run the sealed two-phase pipeline via runSealedImplementationV1;
   // CLI-resolved models run their own direct edit-mode invocation — see
@@ -11472,7 +11493,7 @@ export async function runImplementationWithAI(
     : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
-    return;
+    return false;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
@@ -11503,14 +11524,14 @@ export async function runImplementationWithAI(
   const providerPathGate = await checkEditActionProviderPathGateV1("impl");
   if (!providerPathGate.ok) {
     NotificationRouter.showWarning(providerPathGate.reason);
-    return;
+    return false;
   }
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
-    return;
+    return false;
   }
 
   // Keyboard and coordinator callers target a specific path. Normalize it
@@ -11521,13 +11542,13 @@ export async function runImplementationWithAI(
       "Run Implementation: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
-    return;
+    return false;
   }
 
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
-    return;
+    return false;
   }
 
   const resolved = await resolveTask(
@@ -11537,7 +11558,7 @@ export async function runImplementationWithAI(
     context
   );
   if (!resolved) {
-    return;
+    return false;
   }
 
   if (!handle) {
@@ -11553,7 +11574,7 @@ export async function runImplementationWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
-      return;
+      return false;
     }
     handle = late.handle;
     heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
@@ -11565,7 +11586,7 @@ export async function runImplementationWithAI(
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
-    return;
+    return false;
   }
   // 2026-09-09 review (blocker `fc4ab7c1-b7bf-43bb-aa59-e3c5a5937c97-1`):
   // handle `userPaused` explicitly, same as `runReviewWithAI`/
@@ -11576,14 +11597,14 @@ export async function runImplementationWithAI(
   // fallback `resolved.progress.status === "paused"` check below.
   if (reconciled.outcome === "userPaused") {
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
-    return;
+    return false;
   }
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
-    return;
+    return false;
   }
 
   // Chained fast-forward request from "Complete & Move On triggers AI:
@@ -11601,7 +11622,7 @@ export async function runImplementationWithAI(
     NotificationRouter.showError(
       "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
-    return;
+    return false;
   }
   // Review blocker 2026-09-01 (Part 15 / Step 40 narrowed): a claimed
   // continuation (an owed `implRecovery` record — including the dirty-tree
@@ -11627,7 +11648,7 @@ export async function runImplementationWithAI(
   });
   if (!editAvailability.ok) {
     NotificationRouter.showWarning(editAvailability.reason);
-    return;
+    return false;
   }
 
   const lockKey = resolved.folderUri.fsPath;
@@ -11645,10 +11666,10 @@ export async function runImplementationWithAI(
   // redirect runs here, after `runTrackedOperation` has resolved and the
   // operation has genuinely ended.
   let redirectAfterOperationV1: { reviewStage: TaskStage; reason: string } | undefined;
-  await runTrackedOperation(
+  const implRoundRan = await runTrackedOperation(
     lockKey,
     { label: "Run Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "run-implementation", cancellable: true },
-    async (op) => {
+    async (op): Promise<boolean> => {
     const stageToken = reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
@@ -11658,7 +11679,7 @@ export async function runImplementationWithAI(
       NotificationRouter.showError(
         error instanceof Error ? error.message : String(error)
       );
-      return;
+      return false;
     }
 
     let planFinalContent = await readNonEmptyText(canonicalUri);
@@ -11666,7 +11687,7 @@ export async function runImplementationWithAI(
       NotificationRouter.showWarning(
         stageActionRequirementMessageV1("runImplementation", 0)
       );
-      return;
+      return false;
     }
 
     // Merged checklist behavior: on a task's first implementation run, if
@@ -11692,7 +11713,7 @@ export async function runImplementationWithAI(
         NotificationRouter.showError(
           "Could not determine the owning workspace for this task. Please open the workspace that created it."
         );
-        return;
+        return false;
       }
       const checklistContextPack = await generateContextPack(
         resolved.folderUri,
@@ -11719,7 +11740,7 @@ export async function runImplementationWithAI(
           undefined,
           { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
         );
-        return;
+        return false;
       }
       const { availability: checklistAvailability, providerLabel: checklistProviderLabel } =
         await checkImplementationAvailabilityForModel(checklistModel.modelId, "impl");
@@ -11727,11 +11748,11 @@ export async function runImplementationWithAI(
         NotificationRouter.showWarning(
           `${checklistProviderLabel} is unavailable: ${checklistAvailability.reason ?? "unknown reason"}. Implement the plan manually instead.`
         );
-        return;
+        return false;
       }
       const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);
       if (checklistSizeCheck === "abort" || checklistSizeCheck === "declined") {
-        return;
+        return false;
       }
       // Narrowed to a plain string outside the closure below: TS does not
       // carry the `checklistModel.modelId` truthiness check across into a
@@ -11790,7 +11811,7 @@ export async function runImplementationWithAI(
         // handleGenerateImplementationOutcomeV1), or was cancelled;
         // implementing straight from the raw promoted plan would silently
         // skip the checklist step.
-        return;
+        return false;
       }
       planFinalContent = (await readNonEmptyText(canonicalUri)) ?? planFinalContent;
     }
@@ -11805,7 +11826,7 @@ export async function runImplementationWithAI(
       NotificationRouter.showWarning(
         `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
       );
-      return;
+      return false;
     }
     op.setModel?.(model.modelId);
 
@@ -12010,7 +12031,7 @@ export async function runImplementationWithAI(
           reviewStage: autoDispatch.reviewStage,
           reason: autoDispatch.reason,
         };
-        return;
+        return false;
       }
     }
 
@@ -12102,7 +12123,7 @@ export async function runImplementationWithAI(
           `Apply Review continuation could not be reconstructed: ${reconstructionError ?? "unknown reason"} ` +
             "The pending changes remain quarantined; restore the missing artifact and retry."
         );
-        return;
+        return false;
       }
     }
 
@@ -12143,7 +12164,7 @@ export async function runImplementationWithAI(
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
     if (sizeCheck === "abort" || sizeCheck === "declined") {
-      return;
+      return false;
     }
 
     const postRunReviewStage = isReviewStage(resolved.progress.currentStage)
@@ -12172,6 +12193,7 @@ export async function runImplementationWithAI(
         ...(dispatchedBlockerIds ? { dispatchedBlockerIds } : {}),
       }
     );
+    return true;
     }
   );
 
@@ -12179,11 +12201,45 @@ export async function runImplementationWithAI(
   // ended — see `redirectAfterOperationV1`'s declaration comment. The stage
   // transition inside `goToReviewAndApplyV1` no longer has to wait on (and
   // cancel) the operation that is dispatching it.
+  //
+  // The router's own dispatch-or-retain contract (2026-09-09 review
+  // completion blocker, narrowed): a caller like `applyCurrentStageAction`
+  // (and through it `scheduleTaskResume.ts`'s `fire()`) needs to know
+  // whether this invocation actually dispatched real work — either an
+  // implementation round genuinely ran (`implRoundRan === true`, set only
+  // once every earlier guard has passed and `executeImplementationRun` has
+  // been awaited) or the automation redirect below genuinely moved the task
+  // and dispatched Apply Review. `implRoundRan` is `undefined` when
+  // `runTrackedOperation` refused outright (another operation already holds
+  // this task's lock; it shows its own busy warning), which must also count
+  // as "did not dispatch".
+  let redirectDispatchedV1 = false;
   if (redirectAfterOperationV1) {
-    const dispatched = await goToReviewAndApplyV1({
-      taskFolderPath: resolved.folderUri.fsPath,
-      reviewStage: redirectAfterOperationV1.reviewStage,
-    });
+    // This function's own admission `handle` (acquired above) is still live
+    // and held through this call — released only in the `finally` at the
+    // very end of this function. `goToReviewAndApplyV1` delegates to
+    // `applyHighLevelReviewChanges`/`applyLowLevelReviewChanges`, which
+    // themselves dispatch `applyReviewWithAI`/`applyReviewEditWithAI` — both
+    // of which acquire their OWN admission unless handed a token that lets
+    // them adopt this already-live marker instead. Without minting one here,
+    // that downstream acquisition would race this function's own hold and be
+    // refused `busy`, silently discarding the redirect (2026-09-09 review
+    // completion blocker, narrowed: "the Implementation-stage Apply Review
+    // redirect can self-block in the same way while its outer admission
+    // remains held"). Mirrors `resumeTask.ts`'s `resumeThenDispatchV1`
+    // mint-before/revoke-after pattern exactly.
+    const redirectHandoffToken = authorizeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+    let dispatched: boolean;
+    try {
+      dispatched = await goToReviewAndApplyV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        reviewStage: redirectAfterOperationV1.reviewStage,
+        admissionHandoffTokenV1: redirectHandoffToken,
+      });
+    } finally {
+      revokeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+    }
+    redirectDispatchedV1 = dispatched;
     if (!dispatched) {
       // `goToReviewAndApplyV1` already reports the specific cause (stage
       // transition failure, verification mismatch) via its own
@@ -12207,6 +12263,7 @@ export async function runImplementationWithAI(
       }
     }
   }
+  return implRoundRan === true || redirectDispatchedV1;
   } finally {
     await releaseAdmissionV1();
   }
@@ -12241,7 +12298,7 @@ export async function applyReviewEditWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg,
   options: ApplyReviewOptions = {}
-): Promise<void> {
+): Promise<boolean> {
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
 
   // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
@@ -12271,7 +12328,7 @@ export async function applyReviewEditWithAI(
       : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
-    return;
+    return false;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
@@ -12301,7 +12358,7 @@ export async function applyReviewEditWithAI(
   const providerPathGate = await checkEditActionProviderPathGateV1("impl");
   if (!providerPathGate.ok) {
     NotificationRouter.showWarning(providerPathGate.reason);
-    return;
+    return false;
   }
 
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
@@ -12309,7 +12366,7 @@ export async function applyReviewEditWithAI(
       "Apply Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
-    return;
+    return false;
   }
 
   const node = normalizeReviewArg(arg);
@@ -12321,7 +12378,7 @@ export async function applyReviewEditWithAI(
     context
   );
   if (!resolved) {
-    return;
+    return false;
   }
 
   if (!handle && !options.parentOperation) {
@@ -12337,7 +12394,7 @@ export async function applyReviewEditWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
-      return;
+      return false;
     }
     handle = late.handle;
     heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
@@ -12350,23 +12407,23 @@ export async function applyReviewEditWithAI(
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
-    return;
+    return false;
   }
   if (reconciled.outcome === "userPaused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return;
+    return false;
   }
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return;
+    return false;
   }
 
   const consented = await ensureAiConsent(context);
   if (!consented) {
-    return;
+    return false;
   }
 
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
@@ -12374,7 +12431,7 @@ export async function applyReviewEditWithAI(
     NotificationRouter.showError(
       "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
-    return;
+    return false;
   }
 
   // ── §7.5 full availability gate, BEFORE any review/plan artifact read ────
@@ -12395,24 +12452,29 @@ export async function applyReviewEditWithAI(
   });
   if (!editAvailability.ok) {
     NotificationRouter.showWarning(editAvailability.reason);
-    return;
+    return false;
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const runApply = async (op: TaskOperationHandle): Promise<void> => {
+  // Returns whether this attempt actually reached the implementation-round
+  // dispatch (`true`) or refused on one of its own guard clauses (`false` —
+  // no/empty/stale/invalid review artifact, or a still-owed continuation
+  // blocking a stale-invalidated review). Mirrors `applyReviewWithAI`'s
+  // identical contract (2026-09-09 review completion blocker, narrowed).
+  const runApply = async (op: TaskOperationHandle): Promise<boolean> => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
     if (!reviewContent) {
       NotificationRouter.showWarning(
         "No review found (or it is empty). Run the review before applying it."
       );
-      return;
+      return false;
     }
     if (isStaleReviewArtifact(reviewContent)) {
       NotificationRouter.showWarning(
         "The review is stale. Run the review again before applying it."
       );
-      return;
+      return false;
     }
     // An incomplete implementation round can invalidate this stage's review
     // via the durable `reviewInvalidatedByRound` marker WITHOUT staling the
@@ -12457,14 +12519,14 @@ export async function applyReviewEditWithAI(
           // Courtesy history record only — the refusal above already ran.
         }
       }
-      return;
+      return false;
     }
     const reviewValidation = validateReviewOutput(reviewContent);
     if (!reviewValidation.valid) {
       NotificationRouter.showWarning(
         `The review content is invalid (${reviewValidation.reason}). Run the review again before applying it.`
       );
-      return;
+      return false;
     }
 
     assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
@@ -12518,8 +12580,14 @@ export async function applyReviewEditWithAI(
           )
       );
     }
+    // The implementation-round dispatch above genuinely ran (whether or not
+    // it itself succeeded — `implementSucceeded` governs the re-review, not
+    // whether this attempt counts as dispatched); this attempt is not a
+    // refusal.
+    return true;
   };
 
+  let dispatchedV1: boolean;
   if (options.parentOperation) {
     // A composite caller (Fast Forward) already registered the exclusive
     // tracked operation on this task; run under its handle so the whole
@@ -12530,20 +12598,25 @@ export async function applyReviewEditWithAI(
     // by taskOperations.begin, and silently no-op every Fast Forward
     // attempt with a "task busy" warning — mirrors applyReviewWithAI's
     // identical branch, which is what let the plan path compose all along.
-    await runApply(options.parentOperation);
-    return;
+    dispatchedV1 = await runApply(options.parentOperation);
+  } else {
+    // `runTrackedOperation` resolves `undefined` when it refused outright
+    // (another operation already holds this task's lock; it shows its own
+    // busy warning) — that must also count as "did not dispatch".
+    dispatchedV1 =
+      (await runTrackedOperation(
+        lockKey,
+        {
+          label: "Apply Review",
+          stage,
+          taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
+          kind: "apply-review",
+          cancellable: true,
+        },
+        runApply
+      )) === true;
   }
-  await runTrackedOperation(
-    lockKey,
-    {
-      label: "Apply Review",
-      stage,
-      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
-      kind: "apply-review",
-      cancellable: true,
-    },
-    runApply
-  );
+  return dispatchedV1;
   } finally {
     await releaseAdmissionV1();
   }

@@ -115,8 +115,16 @@ export async function applyCurrentStageAction(
     return false;
   }
 
-  const execute = async (command: string): Promise<void> => {
-    await vscode.commands.executeCommand(command, {
+  // Returns whatever the dispatched command's own handler resolves to
+  // (2026-09-09 review completion blocker, narrowed): a command that
+  // reports whether it actually started real work (`boolean`) lets this
+  // router — and through it `scheduleTaskResume.ts`'s `fire()` — tell a
+  // genuine dispatch apart from a refusal that never got past its own guard
+  // clauses (still paused, no model configured, task not resolved, ...). A
+  // command not yet upgraded to report this resolves to `undefined` here,
+  // same as before this fix.
+  const execute = async (command: string): Promise<unknown> => {
+    return vscode.commands.executeCommand(command, {
       canonicalId: resolvedTask.canonicalId,
       taskFolderPath: resolvedTask.taskFolderPath,
       task: {
@@ -127,13 +135,11 @@ export async function applyCurrentStageAction(
   };
 
   if (stage === "desc") {
-    await execute("vs-code-ai-helper.draftTaskWithAI");
-    return true;
+    return (await execute("vs-code-ai-helper.draftTaskWithAI")) === true;
   }
 
   if (stage === "plan") {
-    await execute("vs-code-ai-helper.generatePlanWithAI");
-    return true;
+    return (await execute("vs-code-ai-helper.generatePlanWithAI")) === true;
   }
 
   if (stage === "impl") {
@@ -164,24 +170,39 @@ export async function applyCurrentStageAction(
       // Moves to the review stage first: the task is at `impl` here, which is
       // precisely why this branch was reached, and every apply command
       // refuses out of stage. See goToReviewAndApplyV1.
-      await goToReviewAndApplyV1({
+      return await goToReviewAndApplyV1({
         taskFolderPath: resolvedTask.taskFolderPath,
         reviewStage:
           decision.reviewStage === "impl-high-review"
             ? "impl-high-review"
             : "impl-low-review",
+        // Relay a scheduler-supplied token (see `ApplyArg` above) so a
+        // scheduled dispatch that lands on this redirect adopts the
+        // scheduler's already-live admission instead of racing a fresh
+        // genesis against it (2026-09-09 review completion blocker,
+        // narrowed).
+        admissionHandoffTokenV1: explicitArg?.admissionHandoffTokenV1,
       });
-      return true;
     }
-    await execute("vs-code-ai-helper.runImplementationWithAI");
-    return true;
+    return (await execute("vs-code-ai-helper.runImplementationWithAI")) === true;
   }
 
   if (stage === "publish") {
-    await execute("vs-code-ai-helper.runPublishChecks");
-    return true;
+    return (await execute("vs-code-ai-helper.runPublishChecks")) === true;
   }
 
+  // `applyHighLevelReviewChanges`/`applyLowLevelReviewChanges` report whether
+  // they actually dispatched their downstream apply command (`true`) or
+  // refused on their own guard clauses (`false` — task not resolved, wrong
+  // stage, still paused) OR on a refusal made internally by the
+  // `applyReviewWithAI`/`applyReviewEditWithAI` command they delegate to
+  // (missing/stale/invalid review artifact, no current plan content, no
+  // model configured — those two commands now resolve to a real `boolean`
+  // instead of `void`, and the handoff token above is forwarded into them so
+  // a scheduled dispatch adopts the caller's admission instead of
+  // self-blocking as busy), mirroring the
+  // `draftTaskWithAI`/`generatePlanWithAI`/`runImplementationWithAI`/
+  // `runPublishChecks` contract above (2026-09-09 review completion blocker).
   if (stage === "plan-high-review") {
     const artifactName = STAGE_ARTIFACT_FILENAMES["plan-high-review"];
     if (artifactName) {
@@ -191,8 +212,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
-        return true;
+        return (await execute("vs-code-ai-helper.applyHighLevelReviewChanges")) === true;
       } catch {
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
@@ -212,8 +232,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
-        return true;
+        return (await execute("vs-code-ai-helper.applyLowLevelReviewChanges")) === true;
       } catch {
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
@@ -233,8 +252,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
-        return true;
+        return (await execute("vs-code-ai-helper.applyHighLevelReviewChanges")) === true;
       } catch {
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
@@ -254,8 +272,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
-        return true;
+        return (await execute("vs-code-ai-helper.applyLowLevelReviewChanges")) === true;
       } catch {
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."

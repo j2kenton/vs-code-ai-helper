@@ -42,8 +42,77 @@ import {
   revokeWorkAdmissionHandoffV1,
   withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
+import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
+import { ChatTarget } from "../views/chatView";
+import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
+
+/**
+ * v1 fixes item 1, Part 1a step 7: the durable `WorkflowDecisionV1` card a
+ * watchdog pause posts, carrying the action that undoes it — see
+ * `detectAndRepairStalledActiveTasksV1`'s call site for why this is a posted
+ * decision rather than a toast `actionCommand`. Shared between the generic
+ * stall (`stuckRecovery: false`) and the unrecoverable-recovery route
+ * (`stuckRecovery: true`, `implRecovery` already cleared by the pause write
+ * that preceded this call) — both land the task in the identical "paused,
+ * nothing running" state, so the same "resume and re-run" remedy applies to
+ * either; only the explanatory text differs.
+ */
+function buildStalledTaskEscalationDecisionV1(
+  stuckRecovery: boolean,
+  target: ChatTarget
+): PostWorkflowDecisionInputV1 {
+  const displayName = target.taskName ?? target.taskFolderPath;
+  const whatHappened = stuckRecovery
+    ? describeUnrecoverableRecoveryEscalationV1(displayName)
+    : describeStalledActiveTaskEscalationV1(displayName);
+  const options: WorkflowDecisionOptionV1[] = [
+    {
+      optionId: "resumeAndRerun",
+      label: "Resume and re-run this stage",
+      consequence:
+        "Resumes the task and immediately re-dispatches its current stage's action through the same " +
+        "admission-protected path a scheduled resume uses — the task will not go active again without " +
+        "genuine work arranged for it.",
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        args: [{ taskFolderPath: target.taskFolderPath }],
+      },
+    },
+    {
+      optionId: "handleMyself",
+      label: "Leave it paused — I'll review it first",
+      consequence:
+        "Leaves the task paused; nothing is dispatched. Review the run log for what happened before resuming.",
+      effect: { kind: "doNothing" },
+    },
+  ];
+  const recommendation: WorkflowDecisionRecommendationV1 = {
+    kind: "option",
+    optionId: "resumeAndRerun",
+    reasoning: "The task is paused and this is the action that returns it to a runnable state.",
+  };
+  return {
+    decisionKey: "watchdogStalledEscalation",
+    taskCanonicalId: target.canonicalId,
+    stage: target.stage,
+    whatHappened,
+    whyUserNeeded: "Automation paused this task rather than leaving it silently active with nothing running, " +
+      "and cannot decide on your behalf whether the underlying stall needs investigation before continuing.",
+    options,
+    recommendation,
+    gating: {
+      holdsTaskPaused: true,
+      unblocksProgress: true,
+      detail:
+        "This decision is what is holding the task paused — resolving it with \"Resume and re-run this " +
+        "stage\" resumes the task immediately; \"Leave it paused — I'll review it first\" leaves it paused " +
+        "and dispatches nothing.",
+    },
+  };
+}
 
 export interface SchedulerClock {
   now(): number;
@@ -770,11 +839,46 @@ export class TaskActionScheduler implements vscode.Disposable {
           continue;
         }
         this.stalledActiveNotified.add(task.taskFolderPath);
-        NotificationRouter.showWarning(
-          stuckRecovery
-            ? describeUnrecoverableRecoveryEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
-            : describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+        // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
+        // action that undoes it" — a mechanism that can pause a task must
+        // offer the corresponding restart directly on the pause itself, not
+        // merely leave the user to find "Resume Task" in the tree's context
+        // menu on their own. Posted as a durable WorkflowDecisionV1 (mirrors
+        // every other escalation-driven pause — `reviewEscalation.ts`'s
+        // `buildEscalationDecisionV1`), NOT a toast `actionCommand`
+        // dispatching the command directly: `scripts/verifyToastAllowlistV1.mjs`
+        // enforces the project's notification-ownership rule (a workflow
+        // action must not exist ONLY on a transient toast) and rejects a
+        // direct-dispatch toast from a background sweep like this one — it is
+        // not "inline in the user-invoked command it belongs to", the one
+        // shape that would qualify for the allowlist instead. Adding
+        // "watchdogStalledEscalation" to `ESCALATION_DECISION_KEYS_V1`
+        // (reviewEscalation.ts) means `resumeTask.ts`'s resume-time
+        // withdrawal loop retires this card the same way it retires every
+        // other escalation, with no extra wiring needed here.
+        const target: ChatTarget = {
+          canonicalId: task.canonicalId,
+          taskFolderPath: task.taskFolderPath,
+          stage: task.progress.currentStage,
+          taskName: task.progress.displayName,
+        };
+        const posted = await postWorkflowDecisionV1(
+          buildStalledTaskEscalationDecisionV1(stuckRecovery, target),
+          target
         );
+        if (!posted) {
+          // Best-effort fallback (directAllowlistEntries shape 2): no
+          // activating extension context to post a decision through (e.g. a
+          // unit test, or a very early sweep before activation finishes).
+          // Plain text, no action button — the tree's own "Resume Task"
+          // context-menu entry (package.json's `task-paused` clause) remains
+          // reachable regardless of whether this notification carries one.
+          NotificationRouter.showWarning(
+            stuckRecovery
+              ? describeUnrecoverableRecoveryEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+              : describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+          );
+        }
       } finally {
         // Released only after the write and its post-write validation have
         // fully settled (plan step 4) — never earlier, so genesis stays

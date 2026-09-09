@@ -107,8 +107,8 @@ void describe("Stage 3 action matrix contracts", () => {
 
     assert.match(
       routerSource,
-      /runImplementationWithAI[\s\S]*?return true;/,
-      "The current-stage router must dispatch the implementation command."
+      /runImplementationWithAI[\s\S]*?=== true/,
+      "The current-stage router must dispatch the implementation command and relay its dispatched-or-not result."
     );
     assert.match(
       implementationSource,

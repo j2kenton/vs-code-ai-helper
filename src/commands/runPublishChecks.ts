@@ -23,6 +23,13 @@ import {
   invalidatePublishChecksFreshnessStampOnDiskV1,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 /**
  * Per-task queue for `runPublishChecks` invocations (plan PART 2, step 6): a
@@ -93,6 +100,27 @@ export function normalizeRunPublishChecksArg(node: RunPublishChecksArg | undefin
 }
 
 /**
+ * Synchronously extract a task folder path from `explicitArg`, when the
+ * shape carries one directly — mirrors
+ * `runLintingFixes.ts`'s `extractSynchronousLintingFolderPathV1` (v1 fixes
+ * item 1, Part 1a, "publish/complete actions" route). Lets admission be
+ * acquired before the command's first awaited setup step
+ * (`TaskCreationStartupReconcilerV1.waitUntilReady()`) for the dominant
+ * invocation (the Publish stage's tree-row/inline button), rather than only
+ * after `resolveTaskContext` resolves a bare canonicalId.
+ */
+function extractSynchronousPublishChecksFolderPathV1(node: RunPublishChecksArg | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+  if ("task" in node && node.task) {
+    return node.task.folderUri.fsPath;
+  }
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  return n.taskFolderPath;
+}
+
+/**
  * First Publish action: run the completion checks (lint/type/test against the
  * task's Publish verification scope, plus the AI-assisted plan-item
  * verification) and record the result as the Publish-stage report, spliced
@@ -104,7 +132,60 @@ export async function runPublishChecks(
   inventory: TaskInventory,
   explicitArg?: RunPublishChecksArg,
   parentOperation?: TaskOperationHandle
-): Promise<void> {
+): Promise<boolean> {
+  // Whether this call actually reached and began the protected checks run —
+  // as opposed to refusing during an earlier guard clause (no task, wrong
+  // stage, no model configured). 2026-09-09 review completion blocker: the
+  // caller (applyCurrentStageAction, and through it scheduleTaskResume's
+  // `fire()`) needs to distinguish the two so a scheduled fire that never
+  // started real work can restore its schedule instead of losing it.
+  let dispatched = false;
+
+  // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
+  // actions" route) ──────────────────────────────────────────────────────
+  // Acquire durable admission BEFORE the startup activation-order barrier
+  // below — this command's first awaited setup step — whenever the target
+  // folder is known synchronously from `explicitArg` (the dominant
+  // invocation: the Publish stage's tree-row/inline button), mirroring
+  // `runLintingFixes.ts`. Publish checks run real lint/type/test work
+  // (`runCompletionLint`/`runPublishScopeCheck`) that can take long enough
+  // for the watchdog sweep to observe an `active` task with nothing durable
+  // yet recorded, exactly the setup-phase race Part 1a closes.
+  const earlyFolderPath = extractSynchronousPublishChecksFolderPathV1(explicitArg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "runPublishChecks",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return dispatched;
+  }
+
+  // Single mutable admission slot for the whole command — filled either by
+  // the early acquisition above or, once a target is resolved (a bare
+  // canonicalId or no-arg invocation), right after `resolveTaskContext`
+  // below. Released in `finally` regardless of which branch of this command
+  // returns.
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   // Activation-order barrier (plan §1.4): never read task state while the
   // startup creating-folder classification pass is still running.
   await TaskCreationStartupReconcilerV1.waitUntilReady();
@@ -118,14 +199,33 @@ export async function runPublishChecks(
     NotificationRouter.showInformation(
       "No task found. Please select a task first."
     );
-    return;
+    return dispatched;
   }
+
+  if (!handle) {
+    const late = await acquireWorkAdmissionV1({
+      taskFolderPath: resolvedTask.taskFolderPath,
+      purpose: "admission",
+      commandId: "runPublishChecks",
+    });
+    if (late.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      return dispatched;
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target — reverse a
+  // watchdog-provenance pause (never a user pause) before any further setup,
+  // exactly like `runReviewWithAI`/`runLintingFixes`.
+  await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
 
   if (resolvedTask.progress.currentStage !== "publish") {
     NotificationRouter.showWarning(
       "Publish checks are only available for tasks at the Publish stage."
     );
-    return;
+    return dispatched;
   }
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
@@ -136,7 +236,7 @@ export async function runPublishChecks(
   // warn and open AI Models instead of running checks whose plan
   // verification would silently be recorded as unavailable.
   if (!(await ensureStageModelConfigured(taskFolderUri, "publish"))) {
-    return;
+    return dispatched;
   }
 
   const lockKey = taskFolderUri.fsPath;
@@ -147,7 +247,16 @@ export async function runPublishChecks(
   // this run's OWN starting HEAD — the scope guess and beforeSha below —
   // lives inside this queued closure, so it is resolved only once this
   // run actually acquires the lock, never at the moment it was triggered.
-  await queuePublishChecksRunV1(lockKey, () =>
+  //
+  // `runTrackedOperation` resolves `undefined` both when `taskOperations`
+  // refuses the run as busy (fn never invoked) AND when fn itself completes
+  // normally with no return value — the two are indistinguishable from the
+  // outer `undefined` alone. The callback below returns `true` once it has
+  // actually been invoked, so `dispatched` can tell "began the tracked run"
+  // apart from "refused as busy" (2026-09-09 review completion blocker,
+  // narrowed: Publish previously reported dispatched unconditionally,
+  // before knowing whether runTrackedOperation would refuse).
+  const ranTrackedOperation = await queuePublishChecksRunV1(lockKey, () =>
     runTrackedOperation(
       lockKey,
       {
@@ -160,7 +269,7 @@ export async function runPublishChecks(
         kind: "completion-checks",
         parent: parentOperation,
       },
-      async () => {
+      async (): Promise<true> => {
         await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Window,
@@ -254,9 +363,15 @@ export async function runPublishChecks(
             }
           }
         );
+        return true;
       }
     )
   );
+  dispatched = ranTrackedOperation === true;
+  return dispatched;
+  } finally {
+    await releaseAdmissionV1();
+  }
 }
 
 /**

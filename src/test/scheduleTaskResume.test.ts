@@ -21,6 +21,7 @@ import {
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
 import { setWorkAdmissionRootOverrideForTestV1 } from "../state/workAdmissionV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /**
  * The watchdog-sweep tests below exercise `detectAndRepairStalledActiveTasksV1`,
@@ -486,9 +487,20 @@ void test("scheduleQuotaResumeAtV1's fired run goes through the exact same pre-r
 // ---------------------------------------------------------------------------
 
 class RecordingSurfaceV1 implements StatusSurface {
-  entries: { message: string; level: "info" | "warning" | "error" }[] = [];
-  addEntry(message: string, level: "info" | "warning" | "error"): void {
-    this.entries.push({ message, level });
+  entries: {
+    message: string;
+    level: "info" | "warning" | "error";
+    actionCommand?: { command: string; title: string; args?: unknown[] };
+  }[] = [];
+  addEntry(
+    message: string,
+    level: "info" | "warning" | "error",
+    _filePath?: string,
+    _resultTargetUri?: string,
+    _sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
+    this.entries.push({ message, level, actionCommand });
   }
 }
 
@@ -497,7 +509,7 @@ class RecordingSurfaceV1 implements StatusSurface {
  * to "live" with no `ExtensionContext` configured — the default in this test
  * file. Install a minimal one backed by an in-memory Memento so a sweep can
  * actually observe "nothing scheduled" as `false` rather than "indeterminate". */
-function installFakeExtensionContextV1(): { restore: () => void } {
+function installFakeExtensionContextV1(): { restore: () => void; memento: import("vscode").Memento } {
   const values = new Map<string, unknown>();
   const memento = {
     get<T>(key: string, defaultValue: T): T {
@@ -509,7 +521,7 @@ function installFakeExtensionContextV1(): { restore: () => void } {
     },
   } as unknown as import("vscode").Memento;
   __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as import("vscode").ExtensionContext);
-  return { restore: (): void => __extensionContextV1TestOnly.reset() };
+  return { restore: (): void => __extensionContextV1TestOnly.reset(), memento };
 }
 
 /** `armPendingImplRecoveries`'s successful claim ends with a fire-and-forget
@@ -647,7 +659,9 @@ void test("armAll does NOT reclaim a stale dispatched implRecovery that has lost
     },
   });
   const state = memoryStore(progress);
-  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
   const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
   const surface = new RecordingSurfaceV1();
   initNotificationRouter(surface);
@@ -686,7 +700,9 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
   const progress = baseStalledProgress();
   const state = memoryStore(progress);
-  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
   const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
   const surface = new RecordingSurfaceV1();
   initNotificationRouter(surface);
@@ -698,10 +714,33 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     const after = state.current();
     assert.equal(after.status, "paused");
     assert.equal(after.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
-    assert.ok(
-      surface.entries.some((e) => e.level === "warning" && /was stalled/.test(e.message)),
-      `expected a stalled-task escalation; got: ${JSON.stringify(surface.entries)}`
+    const escalation = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
+    assert.ok(escalation, `expected a stalled-task escalation; got: ${JSON.stringify(surface.entries)}`);
+    // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
+    // action that undoes it" — posted as a durable WorkflowDecisionV1
+    // (mirrors every other escalation-driven pause), not a toast
+    // `actionCommand` dispatching the command directly (the project's
+    // notification-ownership rule, enforced by
+    // scripts/verifyToastAllowlistV1.mjs, forbids a background sweep from
+    // doing that). The toast itself only carries the chat-pointer command.
+    assert.equal(
+      escalation?.actionCommand?.command,
+      "vs-code-ai-helper.openWorkflowDecision",
+      "the pause escalation's toast must point at the durable chat decision, not dispatch a command directly"
     );
+    const decisionStore = new WorkflowDecisionStoreV1(fakeContext.memento);
+    const pending = decisionStore.listPending("C:\\tasks\\task");
+    const watchdogDecision = pending.find((d) => d.decisionKey === "watchdogStalledEscalation");
+    assert.ok(watchdogDecision, `expected a posted watchdogStalledEscalation decision; got: ${JSON.stringify(pending)}`);
+    const resumeOption = watchdogDecision?.options.find((o) => o.optionId === "resumeAndRerun");
+    assert.ok(resumeOption, "the decision must offer a \"resumeAndRerun\" option");
+    assert.equal(resumeOption?.label, "Resume and re-run this stage");
+    assert.deepEqual(resumeOption?.effect, {
+      kind: "command",
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+      args: [{ taskFolderPath: "C:\\tasks\\task" }],
+    });
+    assert.equal(watchdogDecision?.gating?.holdsTaskPaused, true);
   } finally {
     fakeContext.restore();
     deactivateNotificationRouter();
@@ -713,7 +752,9 @@ void test("armAll's watchdog is a no-op once the task is paused (idempotent — 
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
   const progress = baseStalledProgress();
   const state = memoryStore(progress);
-  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
   const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
   const surface = new RecordingSurfaceV1();
   initNotificationRouter(surface);

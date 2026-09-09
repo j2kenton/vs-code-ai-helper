@@ -200,11 +200,15 @@ function nextStageInOrderV1(stage: TaskStage): TaskStage | undefined {
 /**
  * Every `decisionKey` an escalation card can be posted under — the generic
  * `buildEscalationDecisionV1` card (`reviewEscalation:<kind>`, one per
- * {@link EscalationKind}) and the richer, evidence-led
+ * {@link EscalationKind}), the richer, evidence-led
  * `reviewPlateauEscalation` card `postReviewPlateauDecisionV1` posts for a
- * review-stage plateau with fresh blocker evidence in hand. Every escalation
- * pauses the task as part of raising it (`updateTaskStatus(..., "paused")`
- * above), so resuming the task is always the transition that ends whatever an
+ * review-stage plateau with fresh blocker evidence in hand, and
+ * `watchdogStalledEscalation` (`scheduleTaskResume.ts`'s
+ * `buildStalledTaskEscalationDecisionV1`, v1 fixes item 1 Part 1a step 7) for
+ * the stalled-task watchdog's own pause. Every escalation pauses the task as
+ * part of raising it (`updateTaskStatus(..., "paused")` above, or —
+ * `watchdogStalledEscalation`'s case — `pauseTaskWithReasonForClaimV1`), so
+ * resuming the task is always the transition that ends whatever an
  * escalation card was asking — see `resumeTask.ts`'s `resumePausedTask`,
  * which clears `escalation` on resume and withdraws every one of these keys
  * in the same step (Part 11 item 13c, event-driven half).
@@ -214,6 +218,7 @@ export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
   "reviewEscalation:spec-defect",
   "reviewEscalation:environmental",
   "reviewPlateauEscalation",
+  "watchdogStalledEscalation",
 ];
 
 /**

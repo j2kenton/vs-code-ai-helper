@@ -42,6 +42,21 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 export async function goToReviewAndApplyV1(input: {
   readonly taskFolderPath: string;
   readonly reviewStage: TaskStage;
+  /**
+   * Forwarded verbatim to whichever `applyHighLevelReviewChanges`/
+   * `applyLowLevelReviewChanges` dispatch this function makes below. Set
+   * ONLY by a caller that already holds live durable admission for this
+   * exact task across this whole call (currently `runImplementationWithAI`'s
+   * post-operation redirect, and `applyCurrentStageAction.ts`'s `impl`-stage
+   * branch relaying a scheduler-supplied token) and wants this redirect to
+   * adopt that marker instead of racing a fresh genesis against it and
+   * self-blocking as `busy` (2026-09-09 review completion blocker, narrowed
+   * — "the Implementation-stage Apply Review redirect can self-block in the
+   * same way while its outer admission remains held"). See
+   * `applyCurrentStageAction.ts`'s `ApplyArg.admissionHandoffTokenV1` doc
+   * comment for the full token-handoff rationale.
+   */
+  readonly admissionHandoffTokenV1?: string;
 }): Promise<boolean> {
   try {
     await vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
@@ -75,13 +90,22 @@ export async function goToReviewAndApplyV1(input: {
     // from "ran".
     return false;
   }
-  await vscode.commands.executeCommand(
+  // Both commands now report whether they actually dispatched the downstream
+  // apply command (`true`) or refused on their own guard clauses (`false`) —
+  // 2026-09-09 review completion blocker, narrowed. Relay that here instead
+  // of assuming dispatch succeeded just because the stage moved: the stage
+  // read above is a snapshot, and the apply command re-reads and re-checks
+  // (paused, stage) independently.
+  const applied = await vscode.commands.executeCommand<boolean>(
     input.reviewStage === "impl-high-review"
       ? "vs-code-ai-helper.applyHighLevelReviewChanges"
       : "vs-code-ai-helper.applyLowLevelReviewChanges",
-    { taskFolderPath: input.taskFolderPath }
+    {
+      taskFolderPath: input.taskFolderPath,
+      admissionHandoffTokenV1: input.admissionHandoffTokenV1,
+    }
   );
-  return true;
+  return applied === true;
 }
 
 /**

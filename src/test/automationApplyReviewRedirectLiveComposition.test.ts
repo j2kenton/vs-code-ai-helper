@@ -367,6 +367,17 @@ void describe("automatic Apply Review redirect — live composition (real operat
       applyCommandCalls.map((c) => c.command),
       ["vs-code-ai-helper.applyHighLevelReviewChanges"]
     );
-    assert.deepEqual(applyCommandCalls[0]?.arg, { taskFolderPath: FOLDER_PATH });
+    // 2026-09-09 review completion blocker, narrowed: the redirect now mints
+    // a single-use admission handoff token (this function's own admission
+    // `handle` is still live across the redirect) and forwards it, so the
+    // downstream `applyReviewWithAI`/`applyReviewEditWithAI` admission
+    // acquisition adopts this call's already-live marker instead of racing a
+    // fresh genesis against it and self-blocking `busy`.
+    const redirectArg = applyCommandCalls[0]?.arg as
+      | { taskFolderPath?: string; admissionHandoffTokenV1?: string }
+      | undefined;
+    assert.equal(redirectArg?.taskFolderPath, FOLDER_PATH);
+    assert.equal(typeof redirectArg?.admissionHandoffTokenV1, "string");
+    assert.ok((redirectArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
   });
 });

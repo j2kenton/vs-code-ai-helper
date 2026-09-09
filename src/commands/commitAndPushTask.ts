@@ -55,6 +55,13 @@ import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1"
 import { COMMIT_PUSH_ACTION_KEY_V1, CommitPushServicesV1 } from "../actions/rows/commitPushRowV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
@@ -110,6 +117,32 @@ function normalizeArg(node: CommitAndPushTaskArg | undefined): {
   return hasExplicit
     ? { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath }
     : undefined;
+}
+
+/**
+ * Synchronously extract a task folder path from `explicitArg`, when the
+ * shape carries one directly — mirrors `runLintingFixes.ts`'s
+ * `extractSynchronousLintingFolderPathV1` (v1 fixes item 1, Part 1a,
+ * "publish/complete actions" route). Commit and Push's own setup — index/
+ * privacy checks, lint, staging-scope resolution, and (via
+ * `buildCommitMessage`) a real AI commit-message generation run — can take
+ * long enough for the watchdog sweep to observe an `active` task with
+ * nothing durable yet recorded, the same setup-phase race Part 1a closes for
+ * the other stage actions. Neither `invokeLifecycleRowV1` nor the
+ * `taskActionCoordinatorV1` it routes through opens a `roundLedger` row for
+ * this action (that coordinator never touches `roundLedger` at all — see its
+ * own header notes), so this command must register admission itself rather
+ * than relying on an exemption a caller elsewhere already gets for free.
+ */
+function extractSynchronousCommitPushFolderPathV1(node: CommitAndPushTaskArg | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+  if ("task" in node && node.task) {
+    return node.task.folderUri.fsPath;
+  }
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  return n.taskFolderPath;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -2724,6 +2757,40 @@ export async function commitAndPushTask(
   if (!acquireCommitPushToken()) {
     return rejectDuplicateCommitPush();
   }
+  // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
+  // actions" route) ── acquired right after the process-global token, before
+  // the startup barrier below (this command's first awaited setup step),
+  // whenever the target folder is known synchronously — see
+  // `extractSynchronousCommitPushFolderPathV1`'s doc comment for why this
+  // command needs its own admission rather than inheriting one.
+  const earlyFolderPath = extractSynchronousCommitPushFolderPathV1(explicitArg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "commitAndPushTask",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    releaseCommitPushToken();
+    return;
+  }
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
   try {
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
@@ -2733,6 +2800,20 @@ export async function commitAndPushTask(
     if (!resolvedTask) {
       return;
     }
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        purpose: "admission",
+        commandId: "commitAndPushTask",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
     await invokeCommitPushRowV1(resolvedTask, {
       inventory,
       explicitArg,
@@ -2741,6 +2822,7 @@ export async function commitAndPushTask(
       chatViewProvider,
     });
   } finally {
+    await releaseAdmissionV1();
     releaseCommitPushToken();
   }
 }
@@ -2765,6 +2847,40 @@ export async function completeCommitAndPushTask(
   if (!acquireCommitPushToken()) {
     return rejectDuplicateCommitPush();
   }
+  // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
+  // actions" route) — see `commitAndPushTask`'s own admission block and
+  // `extractSynchronousCommitPushFolderPathV1`'s doc comment. This composite
+  // command's setup (stage transition, completion, next-task selection) all
+  // runs inside the single `runTrackedOperation` root below, so admission is
+  // held across the whole function, released only in the outer `finally`.
+  const earlyFolderPath = extractSynchronousCommitPushFolderPathV1(explicitArg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "completeCommitAndPushTask",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    releaseCommitPushToken();
+    return;
+  }
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
   try {
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
@@ -2788,6 +2904,21 @@ export async function completeCommitAndPushTask(
       }
       return;
     }
+
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        purpose: "admission",
+        commandId: "completeCommitAndPushTask",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
 
     // Check stage eligibility: must be at final review stage (impl-low-review) or completed
     if (resolvedTask.progress.currentStage !== "impl-low-review") {
@@ -2931,6 +3062,7 @@ export async function completeCommitAndPushTask(
       }
     );
   } finally {
+    await releaseAdmissionV1();
     releaseCommitPushToken();
   }
 }

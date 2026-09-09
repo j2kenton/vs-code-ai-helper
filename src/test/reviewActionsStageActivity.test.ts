@@ -198,7 +198,10 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     // Step 5 audit gap: this path resolves its own "plan" stage model and
     // dispatches through coordinator.executeAction, but previously never
     // reported it — the row carried whatever a prior stage last set.
-    const runApplyIdx = source.indexOf("const runApply = async (op: TaskOperationHandle): Promise<void> => {");
+    // 2026-09-09 review completion blocker, narrowed: `runApply` now reports
+    // its own started/refused result (`Promise<boolean>`) instead of `void`,
+    // so `applyReviewWithAI` can relay a genuine dispatch signal to callers.
+    const runApplyIdx = source.indexOf("const runApply = async (op: TaskOperationHandle): Promise<boolean> => {");
     assert.ok(runApplyIdx >= 0, "expected applyReviewWithAI's runApply closure");
 
     const modelIdDecl = source.indexOf('await resolveFreshModelForStage(resolved.folderUri, "plan");', runApplyIdx);

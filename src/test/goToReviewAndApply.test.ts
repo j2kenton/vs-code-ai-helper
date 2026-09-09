@@ -77,9 +77,19 @@ beforeEach(() => {
     arg: unknown
   ): Promise<unknown> => {
     dispatched.push({ command, arg });
+    // `applyHighLevelReviewChanges`/`applyLowLevelReviewChanges` now report
+    // whether they actually dispatched (`true`) rather than resolving void
+    // (2026-09-09 review completion blocker, narrowed) — `goToReviewAndApplyV1`
+    // relays that real result instead of assuming dispatch succeeded, so this
+    // stub must mirror the real command's return value for these two commands.
     // Resolved promise rather than `async`: the stub awaits nothing, and
     // `require-await` rejects an async function with no await expression.
-    return Promise.resolve(undefined);
+    return Promise.resolve(
+      command === "vs-code-ai-helper.applyHighLevelReviewChanges" ||
+        command === "vs-code-ai-helper.applyLowLevelReviewChanges"
+        ? true
+        : undefined
+    );
   };
 });
 
@@ -139,7 +149,10 @@ void describe("goToReviewAndApplyV1 — stage change succeeds", () => {
       "vs-code-ai-helper.setTaskStage",
       "vs-code-ai-helper.applyLowLevelReviewChanges",
     ]);
-    assert.deepEqual(dispatched[1]?.arg, { taskFolderPath: folder });
+    // `admissionHandoffTokenV1` is always forwarded (undefined here, since
+    // this call did not supply one) — see `goToReviewAndApplyV1`'s own doc
+    // comment (2026-09-09 review completion blocker, narrowed).
+    assert.deepEqual(dispatched[1]?.arg, { taskFolderPath: folder, admissionHandoffTokenV1: undefined });
   });
 
   void it("dispatches the high-level apply for the high review stage", async () => {
