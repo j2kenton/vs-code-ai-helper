@@ -565,16 +565,23 @@ export class TaskActionScheduler implements vscode.Disposable {
    * v1 fixes item 1, Part 1a step 4 ("make the ordinary pause lose the
    * ordinary race"): committing the pause now happens only while holding the
    * SAME shared `admission.claim` file a work-starting command's own genesis
-   * contends for (purpose `pauseCommit`). While held, no admission genesis
-   * for this task can complete — a concurrent genesis attempt sees this
-   * claim/marker and reports `busy`, exactly as it would against a live
-   * `admission`-purpose owner — so the sweep and a starting command can never
-   * both believe they have "won" at once. A claim this sweep cannot acquire
-   * (busy — genesis is mid-flight, or another `pauseCommit` attempt is) means
-   * the LOSER here is the pause, not the round: this task is simply skipped
-   * for this sweep pass, and the very next sweep re-evaluates from scratch —
-   * nothing is stranded by skipping, since `isImpossibleActiveStateV1` will
-   * see the same (or a resolved) state again next time.
+   * contends for (purpose `pauseCommit`). This claim is deliberately NOT a
+   * hard exclusion for a concurrent `admission`-purpose genesis (2026-09-09
+   * review, narrowed architectural blocker fix): such a genesis instead
+   * retries its own exclusive create for a short bounded window
+   * (`workAdmissionV1.ts`'s `CLAIM_CONTENTION_RETRY_DELAYS_MS_V1`) while this
+   * claim resolves, and once this sweep's claim becomes a MARKER,
+   * `markerBlocksAcquisitionV1` lets that genesis proceed immediately rather
+   * than reporting `busy` — so "the loser should be the pause, not the round"
+   * holds even while this claim is held, not only once it is gone. What this
+   * claim DOES still exclude is another concurrent `pauseCommit` attempt (a
+   * second sweep pass or window), so two sweeps can never both believe they
+   * have "won" a commit at once. A claim this sweep cannot acquire (busy —
+   * another `pauseCommit` attempt is live) means the LOSER here is the pause,
+   * not the round: this task is simply skipped for this sweep pass, and the
+   * very next sweep re-evaluates from scratch — nothing is stranded by
+   * skipping, since `isImpossibleActiveStateV1` will see the same (or a
+   * resolved) state again next time.
    */
   private async detectAndRepairStalledActiveTasksV1(): Promise<void> {
     for (const task of this.inventory.getTasks()) {

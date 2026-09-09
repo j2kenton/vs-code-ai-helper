@@ -1175,3 +1175,97 @@ void test("hasLiveWorkAdmissionExcludingOwnerV1 sees another caller's pending in
   }
   await sweepClaim.handle.release();
 });
+
+// ── Narrowed remainder of the same blocker (2026-09-09 review round): the
+// SHARED `admission.claim` file itself, held briefly during a `pauseCommit`
+// genesis BEFORE it becomes a marker, was still purpose-blind — an
+// `admission`-purpose acquirer that lost the exclusive-create race against it
+// was refused `busy` immediately, with no retry, reproducing "the pause wins"
+// at the claim stage even though the marker-stage fix above already prevents
+// it once a marker exists. ─────────────────────────────────────────────────
+
+function writeFakePauseCommitClaimV1(task: string, ownerToken: string): string {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const claimPath = path.join(dir, "admission.claim");
+  fs.writeFileSync(
+    claimPath,
+    JSON.stringify({
+      claimId: `${ownerToken}-claim`,
+      purpose: "pauseCommit",
+      ownerToken,
+      pid: 999999,
+      processStartTime: 0,
+      hostId: "fake-host",
+      commandId: "watchdog-sweep",
+      startedAt: new Date().toISOString(),
+    }),
+    { flag: "wx" }
+  );
+  return claimPath;
+}
+
+void test("an admission-purpose acquisition retries past a pauseCommit claim that is still mid-genesis, then proceeds once it resolves to a marker", async () => {
+  const task = freshTaskFolder("admission-retries-past-in-flight-pause-commit-claim");
+  const claimPath = writeFakePauseCommitClaimV1(task, "fake-sweep-owner");
+
+  const admissionPromise = acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+
+  // Give the retry loop a couple of ticks to observe the still-live claim —
+  // it must not have given up yet.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fs.existsSync(claimPath), true, "the fake pauseCommit claim should still be in place at this point");
+
+  // Simulate the sweep's own genesis completing its rename-to-marker step
+  // (`acquireWorkAdmissionCoreV1`'s real behavior once no blocking marker is
+  // found) — this frees the shared claim filename.
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const markerPath = path.join(dir, "admission.fake-sweep-owner.g1.deadbeef");
+  fs.renameSync(claimPath, markerPath);
+
+  const result = await admissionPromise;
+  assert.equal(
+    result.outcome,
+    "acquired",
+    "a work-starting admission attempt must retry past a resolving pauseCommit claim rather than losing immediately"
+  );
+  if (result.outcome === "acquired") {
+    await result.handle.release();
+  }
+  fs.rmSync(markerPath, { force: true });
+});
+
+void test("an admission-purpose acquisition against a permanently stuck pauseCommit claim eventually reports busy rather than retrying forever", async () => {
+  const task = freshTaskFolder("admission-busy-against-stuck-pause-commit-claim");
+  writeFakePauseCommitClaimV1(task, "stuck-sweep-owner");
+
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+  assert.equal(
+    result.outcome,
+    "busy",
+    "retries against a claim that never resolves must still be bounded and surface the interim busy diagnostic"
+  );
+});
+
+void test("a pauseCommit-purpose acquisition does not retry past another pauseCommit claim (immediate busy)", async () => {
+  const task = freshTaskFolder("pause-commit-does-not-retry-past-another-pause-commit-claim");
+  writeFakePauseCommitClaimV1(task, "other-sweep-owner");
+
+  const started = Date.now();
+  const result = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep",
+  });
+  const elapsedMs = Date.now() - started;
+  assert.equal(result.outcome, "busy");
+  assert.ok(elapsedMs < 500, `a pauseCommit-vs-pauseCommit claim conflict must not retry (took ${elapsedMs}ms)`);
+});

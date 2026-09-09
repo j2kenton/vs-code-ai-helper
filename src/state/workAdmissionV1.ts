@@ -27,13 +27,22 @@ import { resolveHostIdentityV1 } from "./hostIdentityV1";
  *   1. Exclusively create a SHARED contested filename, `admission.claim`
  *      (`fs.promises.writeFile(..., { flag: "wx" })` — the same primitive
  *      `primarySessionLock.ts` uses for its own exclusive-create lease).
- *      Only one concurrent caller can win this create; every loser reads the
- *      winner's claim back as a `busy` diagnostic.
+ *      Only one concurrent caller can win this create. A loser whose OWN
+ *      `purpose` is not blocked by the current holder's recorded `purpose`
+ *      (`markerBlocksAcquisitionV1` — concretely, an `admission`-purpose
+ *      loser against a `pauseCommit` holder) retries the create a bounded
+ *      number of times (`CLAIM_CONTENTION_RETRY_DELAYS_MS_V1`) while that
+ *      short-lived claim resolves one way or the other, so "the loser should
+ *      be the pause, not the round" holds at the claim stage, not only once a
+ *      marker exists. Every other loser reads the winner's claim back as a
+ *      `busy` diagnostic immediately, with no retry.
  *   2. Re-list the admission directory. If any marker (`admission.<token>.g
- *      <N>.<epoch>`) already exists — a prior owner never released — the
- *      just-created claim file is removed (it is unambiguously this caller's
- *      own file) and the caller reports `busy` against the existing marker
- *      instead of completing genesis.
+ *      <N>.<epoch>`) already exists whose recorded `purpose` blocks this
+ *      caller's own (`markerBlocksAcquisitionV1` again — a `pauseCommit`
+ *      marker never blocks a new `admission` acquisition) — a prior owner
+ *      never released — the just-created claim file is removed (it is
+ *      unambiguously this caller's own file) and the caller reports `busy`
+ *      against the existing marker instead of completing genesis.
  *   3. Otherwise rename `admission.claim` to `admission.<ownerToken>.g1.
  *      <epoch>` — the published, live, generation-1 marker. The rename is
  *      safe unaccompanied by a race check: exclusive create in step 1
@@ -598,6 +607,29 @@ export function describeWorkAdmissionBlockerV1(
  * error reporting for a genuinely stuck cleanup. */
 const CLAIM_CLEANUP_RETRY_DELAYS_MS_V1 = [10, 50, 150];
 
+/**
+ * Bounded delays between retries of the shared `admission.claim` exclusive
+ * create, used ONLY while the current holder's own recorded purpose does not
+ * block ours (`markerBlocksAcquisitionV1` — a `pauseCommit` claim contending
+ * against an `admission`-purpose acquirer).
+ *
+ * 2026-09-09 review architectural blocker (narrowed remainder): purpose-aware
+ * filtering already exempts a live `pauseCommit` MARKER from blocking a new
+ * `admission` acquisition, but the fixed, SHARED `admission.claim` filename
+ * that every genesis briefly holds before it either renames to a marker or
+ * backs off was still purpose-BLIND — a work-starting command that lost the
+ * exclusive-create race against the sweep's `pauseCommit` claim was refused
+ * immediately, with no retry, exactly reproducing "the pause wins" even
+ * though the marker-level fix already guarantees "the pause should lose".
+ * The sweep's own hold on this claim has no awaited step besides its own
+ * fast filesystem calls (write, a synchronous relist, then rename-to-marker
+ * or claim-cleanup) — summing to roughly 1 second of retry budget below is
+ * generous enough to ride that out while still bounded, so a genuinely stuck
+ * (e.g. crashed mid-genesis) `pauseCommit` claim still falls through to the
+ * ordinary interim fail-open `busy` diagnostic rather than retrying forever.
+ */
+const CLAIM_CONTENTION_RETRY_DELAYS_MS_V1 = [5, 15, 30, 60, 120, 250, 500];
+
 function delayV1(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -692,28 +724,37 @@ export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmis
 }
 
 /**
- * True when `markerPurpose` (a live marker's own recorded `purpose`,
- * `undefined` when the marker's record is unreadable/corrupt) should block a
- * NEW acquisition attempt for `acquiringPurpose`.
+ * True when `markerPurpose` (a live marker's OR a live claim's own recorded
+ * `purpose` — this is shared by both callers below, `undefined` when the
+ * record is unreadable/corrupt) should block a NEW acquisition attempt for
+ * `acquiringPurpose`.
  *
  * 2026-09-09 review architectural blocker fix ("starting admission can still
- * lose to `pauseCommit`"): a `pauseCommit` marker is the watchdog sweep's own
- * SHORT-LIVED transitional commit lock, never real work — the plan's own
- * contract is "the loser should be the pause, not the round", so a command
- * starting real work (`purpose: "admission"`) must not be turned away just
- * because the sweep happens to be mid-commit. It proceeds to publish its own
- * marker alongside the sweep's; the sweep's own pre-write/post-write checks
+ * lose to `pauseCommit`"): a `pauseCommit` marker (or the shared
+ * `admission.claim` file while a `pauseCommit` genesis is briefly mid-flight)
+ * is the watchdog sweep's own SHORT-LIVED transitional commit lock, never
+ * real work — the plan's own contract is "the loser should be the pause, not
+ * the round", so a command starting real work (`purpose: "admission"`) must
+ * not be turned away just because the sweep happens to be mid-commit. Against
+ * a live MARKER, it proceeds immediately to publish its own marker alongside
+ * the sweep's; the sweep's own pre-write/post-write checks
  * (`hasLiveWorkAdmissionExcludingOwnerV1`, which this filtering does NOT
  * apply to — that function intentionally treats ANY other marker as live) are
  * what then catch the command's marker and reverse an in-flight or already-
- * committed pause. Without this, the command was refused `busy` immediately,
- * never got to publish anything, and the sweep's reversal check had nothing
- * left to find — precisely the observed bug.
+ * committed pause. Against the shared `admission.claim` file itself — the
+ * narrower remainder of the same blocker, fixed separately in
+ * `acquireWorkAdmissionCoreV1`'s claim-write loop — a non-blocked loser
+ * instead RETRIES the exclusive create for a bounded window while the
+ * sweep's claim resolves (to a marker, or to nothing), rather than treating
+ * the claim's mere existence as an immediate, permanent `busy`. Without
+ * either half, the command was refused `busy` immediately, never got to
+ * publish anything, and the sweep's reversal check had nothing left to find —
+ * precisely the observed bug.
  *
- * A `pauseCommit` marker still blocks another `pauseCommit` acquisition
- * (prevents two concurrent sweep commits), and an `admission`-purpose marker
- * (or an unreadable one — conservative default) always blocks everything, as
- * before.
+ * A `pauseCommit` marker or claim still blocks another `pauseCommit`
+ * acquisition (prevents two concurrent sweep commits), and an
+ * `admission`-purpose marker or claim (or an unreadable one — conservative
+ * default) always blocks everything, as before.
  */
 function markerBlocksAcquisitionV1(
   markerPurpose: WorkAdmissionPurposeV1 | undefined,
@@ -781,24 +822,45 @@ async function acquireWorkAdmissionCoreV1(
     return { outcome: "writeFailed", error: error as Error };
   }
 
-  try {
-    const injected = fsFailureInjectionV1?.onBeforeClaimWrite?.();
-    if (injected) {
-      throw injected;
-    }
-    await fs.promises.writeFile(claimPath, JSON.stringify(claimInfo), { flag: "wx" });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      const blocker = describeWorkAdmissionBlockerV1(taskFolderPath);
-      if (blocker) {
-        return blocker;
+  // 2026-09-09 review architectural blocker (narrowed remainder): retry the
+  // shared, fixed-path `admission.claim` exclusive create when — and only
+  // when — its CURRENT holder's own recorded purpose does not block ours
+  // (`markerBlocksAcquisitionV1`, the same rule already applied to markers
+  // below). This is what makes "the loser should be the pause, not the
+  // round" hold at the claim stage too, not just once a marker exists: a
+  // work-starting `admission` acquirer that loses the exclusive-create race
+  // against the sweep's short-lived `pauseCommit` claim waits out
+  // `CLAIM_CONTENTION_RETRY_DELAYS_MS_V1` for that claim to resolve (rename
+  // to a marker, or vacate on its own busy backoff) instead of being refused
+  // immediately. Any OTHER contention — an `admission` claim already owns
+  // it, another `pauseCommit` attempt is racing this one, or the record is
+  // unreadable — blocks exactly as before, with no retry.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const injected = fsFailureInjectionV1?.onBeforeClaimWrite?.();
+      if (injected) {
+        throw injected;
       }
-      // The claim existed a moment ago but is gone now (the other owner
-      // released between our failed create and this read) — nothing to
-      // report as busy; the caller may simply retry.
-      return { outcome: "writeFailed", error: new Error("Work admission claim was contended and then vanished; retry.") };
+      await fs.promises.writeFile(claimPath, JSON.stringify(claimInfo), { flag: "wx" });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        return { outcome: "writeFailed", error: error as Error };
+      }
+      const existingPurpose = readClaimInfoSyncV1(claimPath)?.purpose;
+      const delayMs = CLAIM_CONTENTION_RETRY_DELAYS_MS_V1[attempt];
+      if (markerBlocksAcquisitionV1(existingPurpose, purpose) || delayMs === undefined) {
+        const blocker = describeWorkAdmissionBlockerV1(taskFolderPath);
+        if (blocker) {
+          return blocker;
+        }
+        // The claim existed a moment ago but is gone now (the other owner
+        // released between our failed create and this read) — nothing to
+        // report as busy; the caller may simply retry.
+        return { outcome: "writeFailed", error: new Error("Work admission claim was contended and then vanished; retry.") };
+      }
+      await delayV1(delayMs);
     }
-    return { outcome: "writeFailed", error: error as Error };
   }
 
   // Re-list: if a live marker already exists (a prior owner never
