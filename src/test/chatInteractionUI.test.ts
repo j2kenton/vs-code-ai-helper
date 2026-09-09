@@ -30,6 +30,7 @@ import { readChatDocumentIdentityV1, readChatInteractions } from "../utils/chatH
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { bindingIdForOwnedFolder, makeOwnedTaskFolder } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
+import { ADMISSION_DIRNAME_V1 } from "../state/workAdmissionV1";
 
 /** open() (invoked by askInteraction) raises an internal Notifications entry
  * and executes the webview-focus command — neither of which this test
@@ -541,6 +542,76 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       assert.equal(resumeCalled, true);
       const stored = await readChatInteractions(folder, folder, "impl");
       assert.equal(stored[0]!.state, "resumed");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * 2026-09-09 review completion blocker, narrowed re-review: chatView.ts's
+   * early work-admission acquisition used to be entirely best-effort — a
+   * real `writeFailed` filesystem error (not just `busy`) left setup
+   * (readChatInteractions/resolveInteractionRef here, and extension.ts's
+   * `loadInteraction`) completely unadmitted, the exact setup-phase
+   * watchdog-pause race this whole mechanism exists to close. Forcing a
+   * genuine writeFailed (a plain file sitting where the admission directory
+   * needs to be, the same technique workAdmissionV1.test.ts uses) must now
+   * fail the Resume dispatch closed BEFORE any of that setup runs, rather
+   * than falling through to it.
+   */
+  void it("resumeInteraction fails closed, before any setup read, when its own early admission write fails", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
+    const ref: ClientRef = { operationId: "3".repeat(32), interactionId: "4".repeat(32) };
+    let resumeCalled = false;
+    const services: ChatInteractionServicesV1 = {
+      submitAnswers: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      cancel: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      resume: () => {
+        resumeCalled = true;
+        return Promise.resolve({ ok: true, settlement: "resumed" });
+      },
+    };
+    provider.setInteractionServices(services);
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId: ref.interactionId,
+          operationId: ref.operationId,
+          actionKey: "generatePlan.v1",
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+        },
+        true,
+        false
+      );
+
+      // Force a genuine writeFailed: `fs.promises.mkdir(dir, { recursive:
+      // true })` fails with a real filesystem error when a plain file
+      // already occupies the admission directory's path.
+      fs.writeFileSync(path.join(folder, ADMISSION_DIRNAME_V1), "not a directory");
+
+      await fake.send({ type: "resumeInteraction", operationId: ref.operationId, interactionId: ref.interactionId });
+
+      assert.equal(resumeCalled, false, "the Resume service must never be reached when admission write-fails");
+      const stored = await readChatInteractions(folder, folder, "impl");
+      assert.equal(stored[0]!.state, "unresolved", "the interaction must remain unresolved — no setup read ran");
+
+      const lastState = fake.posted.filter((m) => m.type === "state").pop();
+      const entries = (lastState?.entries as ReadonlyArray<{ role: string; text: string }> | undefined) ?? [];
+      const decline = entries.find((e) => e.role === "assistant" && /Could not resume/.test(e.text));
+      assert.ok(decline, "expected a declined-in-chat message naming the write failure");
     } finally {
       notify.restore();
       cmds.restore();

@@ -763,16 +763,23 @@ type ReviewCommandArg =
        */
       automationDispatch?: true;
       /**
-       * Set ONLY by `resumeTask.ts`'s `resumeThenDispatchV1` (2026-09-08
-       * review architectural blocker fix), never by a UI surface — the
-       * single-use token a resume-then-dispatch flow mints immediately
-       * before dispatching this exact command, authorizing THIS invocation
-       * (and no other) to adopt the marker that flow already holds instead
-       * of racing a fresh genesis against it. See
-       * `workAdmissionV1.ts`'s `pendingHandoffTokensV1` doc comment for the
-       * full rationale — an absent, stale, or non-matching token here simply
-       * falls through to the ordinary genesis path, which is refused `busy`
-       * against the live marker exactly like any unrelated caller.
+       * Set ONLY by a flow that already holds (or is running inside another
+       * caller's live) admission for this task and is about to make exactly
+       * one downstream dispatch on its behalf — never by a UI surface. Two
+       * such flows exist today: `resumeTask.ts`'s `resumeThenDispatchV1`
+       * (2026-09-08 review architectural blocker fix), and
+       * `generatePlanWithAI.ts`'s `resumeGeneratePlanInteractionV1` scheduling
+       * its configured auto-review (2026-09-09 review completion blocker —
+       * that resume runs entirely inside chatView.ts's admission-holding
+       * `resumeInteraction`, so its own scheduled review must adopt that same
+       * marker rather than race it). Each mints the single-use token
+       * immediately before dispatching this exact command, authorizing THIS
+       * invocation (and no other) to adopt the marker instead of racing a
+       * fresh genesis against it. See `workAdmissionV1.ts`'s
+       * `pendingHandoffTokensV1` doc comment for the full rationale — an
+       * absent, stale, or non-matching token here simply falls through to the
+       * ordinary genesis path, which is refused `busy` against the live
+       * marker exactly like any unrelated caller.
        */
       admissionHandoffTokenV1?: string;
     }
@@ -6155,6 +6162,49 @@ export async function applyReviewWithAI(
     return;
   }
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // 2026-09-09: this route reaches `readTaskProgressStrictV1` (an awaited I/O
+  // read, for the impl-review redirect check below) and then `resolveTask`
+  // and the unbounded consent-gate wait, all before any admission previously
+  // existed — the exact setup-phase race the watchdog trap task exists to
+  // close, mirroring the identical gap already fixed on `runReviewWithAI`/
+  // `runImplementationWithAI`. Skipped when a composite caller (Fast Forward,
+  // via `options.parentOperation`) already holds its OWN admission
+  // continuously across this entire synchronous call — see
+  // `fastForwardReviewWithAI`'s own early acquisition; re-acquiring here
+  // would be redundant, not additionally protective.
+  const earlyFolderPath = options.parentOperation ? undefined : extractSynchronousReviewFolderPathV1(arg);
+  const early =
+    !options.parentOperation && earlyFolderPath
+      ? await acquireOrAdoptWorkAdmissionV1({
+          taskFolderPath: earlyFolderPath,
+          purpose: "admission",
+          commandId: "applyReviewWithAI",
+          handoffToken: extractAdmissionHandoffTokenV1(arg),
+        })
+      : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   const node = normalizeReviewArg(arg);
 
   const taskFolderUri = node.task?.folderUri;
@@ -6179,6 +6229,42 @@ export async function applyReviewWithAI(
   );
   if (!resolved) {
     return;
+  }
+
+  if (!handle && !options.parentOperation) {
+    // No-arg QuickPick path: nothing was known to protect until resolution
+    // just picked a target. Acquire admission now, before the pause
+    // reconciliation below reads task status — mirroring `runReviewWithAI`'s
+    // late-acquisition path.
+    const late = await acquireOrAdoptWorkAdmissionV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      purpose: "admission",
+      commandId: "applyReviewWithAI",
+      handoffToken: extractAdmissionHandoffTokenV1(arg),
+    });
+    if (late.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      return;
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target (or the caller's
+  // own admission covers it, under `options.parentOperation`) — reconcile a
+  // watchdog-provenance pause (never a user pause) before the paused check
+  // below, exactly like `runReviewWithAI`/`runImplementationWithAI`.
+  const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+  if (reconciled.outcome === "unreadable") {
+    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    return;
+  }
+  if (reconciled.outcome === "userPaused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    return;
+  }
+  if (reconciled.outcome === "reversed") {
+    resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
@@ -6372,6 +6458,9 @@ export async function applyReviewWithAI(
       { label: "Apply Review", stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true },
       runApply
     );
+  }
+  } finally {
+    await releaseAdmissionV1();
   }
 }
 
@@ -11356,6 +11445,53 @@ export async function runImplementationWithAI(
   // runImplementationOrSealedV1), so this assertion passes and exists to
   // fail closed if the key is ever re-gated.
   assertLegacyAiRouteAllowedV0("implementation.v1");
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // 2026-09-09 review (blocker `fc4ab7c1-b7bf-43bb-aa59-e3c5a5937c97-0`):
+  // moved to run BEFORE the §7.5 provider-path gate below. That gate is
+  // awaited I/O (a CLI existence probe or Copilot model-list probe to
+  // correctly fall through a down CLI primary to a configured backup) that
+  // used to run FIRST, leaving a target already known synchronously from
+  // `arg` unprotected from the watchdog sweep for its whole duration — the
+  // exact setup-phase race this task exists to close. Mirrors the identical
+  // fix already applied to `fastForwardReviewWithAI` (see its own comment
+  // above its early admission block for the full rationale). Everything from
+  // the provider-path gate onward is now inside the try/finally below, so
+  // this handle is always released however early a return happens, including
+  // from the gate itself. `acquireOrAdoptWorkAdmissionV1`, not the raw
+  // acquire, for the same same-process resume-then-dispatch handoff reason
+  // documented on `runReviewWithAI`'s own early acquisition.
+  const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
+  const early = earlyFolderPath
+    ? await acquireOrAdoptWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "runImplementationWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): first
   // real check, before consent, task resolution, or ANY task/source read —
   // still before any task/source read (Implementation always resolves
@@ -11388,47 +11524,6 @@ export async function runImplementationWithAI(
     return;
   }
 
-  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
-  // Acquire durable admission BEFORE the consent gate (an unbounded human
-  // wait) and task resolution, exactly like `runReviewWithAI`/
-  // `fastForwardReviewWithAI` — the same setup-phase race this task exists to
-  // close applies here too: Implementation assembles a context pack and can
-  // generate an implementation checklist before any provider call, all of
-  // which is indistinguishable from a stalled task to the watchdog until
-  // admission is live. `acquireOrAdoptWorkAdmissionV1`, not the raw acquire,
-  // for the same same-process resume-then-dispatch handoff reason documented
-  // on `runReviewWithAI`'s own early acquisition above.
-  const earlyFolderPath = extractSynchronousReviewFolderPathV1(arg);
-  const early = earlyFolderPath
-    ? await acquireOrAdoptWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "runImplementationWithAI",
-        handoffToken: extractAdmissionHandoffTokenV1(arg),
-      })
-    : undefined;
-  if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
-    return;
-  }
-
-  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
-    if (heartbeat) {
-      clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
-    }
-  };
-
-  try {
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
@@ -11470,6 +11565,17 @@ export async function runImplementationWithAI(
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    return;
+  }
+  // 2026-09-09 review (blocker `fc4ab7c1-b7bf-43bb-aa59-e3c5a5937c97-1`):
+  // handle `userPaused` explicitly, same as `runReviewWithAI`/
+  // `fastForwardReviewWithAI`. `resolved.progress` was captured by
+  // `resolveTask` BEFORE this reconciliation call, so a real user pause that
+  // lands in the window between that read and this re-read would leave
+  // `resolved.progress.status` stale at "active" and slip past the
+  // fallback `resolved.progress.status === "paused"` check below.
+  if (reconciled.outcome === "userPaused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
     return;
   }
   if (reconciled.outcome === "reversed") {
@@ -12137,6 +12243,54 @@ export async function applyReviewEditWithAI(
   options: ApplyReviewOptions = {}
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // 2026-09-09: mirrors the identical fix already applied to
+  // `runImplementationWithAI` — moved to run BEFORE the §7.5 provider-path
+  // gate below, which is awaited I/O (a CLI existence probe or Copilot
+  // model-list probe) that used to run first, leaving a target already known
+  // synchronously from `arg` unprotected for its whole duration. This closes
+  // the last of the three named "reaching the edit-action driver without
+  // acquiring admission" gaps (`applyReviewWithAI`/`applyReviewEditWithAI`/
+  // `applyImplementationReviewWithAI`) — `applyImplementationReviewWithAI` is
+  // never a command target itself; it is only ever reached from this
+  // function's own `runApply`, so admission held here for the whole call
+  // covers it too. Everything from the provider-path gate onward is inside
+  // the try/finally below. Skipped when a composite caller (Fast Forward, via
+  // `options.parentOperation`) already holds its own admission continuously
+  // across this entire synchronous call.
+  const earlyFolderPath = options.parentOperation ? undefined : extractSynchronousReviewFolderPathV1(arg);
+  const early =
+    !options.parentOperation && earlyFolderPath
+      ? await acquireOrAdoptWorkAdmissionV1({
+          taskFolderPath: earlyFolderPath,
+          purpose: "admission",
+          commandId: "applyReviewEditWithAI",
+          handoffToken: extractAdmissionHandoffTokenV1(arg),
+        })
+      : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): before
   // any task/source read (the edit branch always resolves against the impl
   // stage's model — see checkEditActionProviderPathGateV1's header). It
@@ -12168,6 +12322,42 @@ export async function applyReviewEditWithAI(
   );
   if (!resolved) {
     return;
+  }
+
+  if (!handle && !options.parentOperation) {
+    // No-arg QuickPick path: nothing was known to protect until resolution
+    // just picked a target. Acquire admission now, before the pause
+    // reconciliation below reads task status — mirroring
+    // `runImplementationWithAI`'s late-acquisition path.
+    const late = await acquireOrAdoptWorkAdmissionV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      purpose: "admission",
+      commandId: "applyReviewEditWithAI",
+      handoffToken: extractAdmissionHandoffTokenV1(arg),
+    });
+    if (late.outcome !== "acquired") {
+      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      return;
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target (or the caller's
+  // own admission covers it, under `options.parentOperation`) — reconcile a
+  // watchdog-provenance pause (never a user pause) before the paused check
+  // below.
+  const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
+  if (reconciled.outcome === "unreadable") {
+    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    return;
+  }
+  if (reconciled.outcome === "userPaused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    return;
+  }
+  if (reconciled.outcome === "reversed") {
+    resolved.progress = reconciled.progress;
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
@@ -12354,6 +12544,9 @@ export async function applyReviewEditWithAI(
     },
     runApply
   );
+  } finally {
+    await releaseAdmissionV1();
+  }
 }
 
 /**

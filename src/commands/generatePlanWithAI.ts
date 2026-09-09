@@ -26,6 +26,15 @@ import { TaskInventory } from "../state/taskInventory";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
+import {
+  acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
+  describeWorkAdmissionRefusalV1,
+  revokeWorkAdmissionHandoffV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 import {
   AutoTriggerMode,
@@ -161,6 +170,51 @@ export function normalizeGeneratePlanArg(
 }
 
 /**
+ * Work admission (v1 fixes item 1, Part 1a) needs a task folder path BEFORE
+ * any awaited setup — the consent gate below is an unbounded human wait, and
+ * this command then assembles a context pack and renders a prompt before any
+ * provider call, all indistinguishable from a stalled task to the watchdog
+ * until admission is live. Mirrors `runLintingFixes.ts`'s
+ * `extractSynchronousLintingFolderPathV1`: only returns a path when one is
+ * known synchronously — including a bare `{ canonicalId }`, which
+ * `normalizeGeneratePlanArg` also resolves synchronously via
+ * `inventory.getTaskById` (an in-memory lookup, zero I/O — see that
+ * function's own "Canonical ID" branch). 2026-09-09 review (completion
+ * blocker, new): this extractor used to omit that shape, so a `{ canonicalId }`
+ * invocation — the keyboard-shortcut router's own dispatch shape — fell
+ * through to late acquisition AFTER `ensureAiConsent`'s unbounded modal,
+ * leaving it unprotected for that whole wait despite being resolvable up
+ * front. Only a genuinely unresolvable canonical ID (not found in the
+ * inventory) or a no-arg invocation has nothing to protect until
+ * `normalizeGeneratePlanArg`/`pickTaskFolder` picks a target, so those cases
+ * still fall through to late acquisition in `generatePlanWithAI` itself.
+ */
+function extractSynchronousGeneratePlanFolderPathV1(
+  arg: GeneratePlanArg | undefined,
+  inventory: TaskInventory
+): string | undefined {
+  if (!arg) {
+    return undefined;
+  }
+  if (arg instanceof vscode.Uri) {
+    return arg.fsPath;
+  }
+  if ("task" in arg && arg.task && arg.task.folderUri?.fsPath) {
+    return arg.task.folderUri.fsPath;
+  }
+  if ("taskFolderPath" in arg && arg.taskFolderPath) {
+    return arg.taskFolderPath;
+  }
+  if ("canonicalId" in arg && arg.canonicalId) {
+    const task = inventory.getTaskById(arg.canonicalId);
+    if (task) {
+      return task.taskFolderPath;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Generate plan.md for a task folder using the user's Copilot access.
  * No overwrite confirmation is shown since the user has already triggered
  * this action deliberately.
@@ -179,109 +233,199 @@ export async function generatePlanWithAI(
   arg?: GeneratePlanArg
 ): Promise<boolean | undefined> {
   assertLegacyAiRouteAllowedV0("generatePlan.v1");
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the consent gate (an unbounded human
+  // wait) whenever the target folder is known synchronously from `arg` —
+  // this command then assembles a context pack and renders a prompt before
+  // any provider call, exactly the setup-phase gap the watchdog trap exists
+  // to close. Mirrors `runLintingFixes`/`runImplementationWithAI`'s
+  // early-acquisition path. No handoff-token adoption: no resume-then-
+  // dispatch flow currently targets this command.
+  const earlyFolderPath = extractSynchronousGeneratePlanFolderPathV1(arg, inventory);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "generatePlanWithAI",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
-  // Resolve the target task folder URI from the argument.
-  let taskFolderUri: vscode.Uri | undefined;
-
-  const normalized = normalizeGeneratePlanArg(arg, inventory);
-
-  if (normalized === undefined) {
-    // No arg or unresolvable arg — prompt user to pick
-    taskFolderUri = await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES);
-  } else if (normalized instanceof vscode.Uri) {
-    taskFolderUri = normalized;
-  } else {
-    // Sentinel: canonicalId was provided but not found in the inventory.
-    // After a refresh attempt the inventory still doesn't know this task —
-    // fail clearly rather than silently acting on a different task.
-    await inventory.refresh();
-    const retried = inventory.getTaskById(normalized.canonicalId);
-    if (retried) {
-      taskFolderUri = vscode.Uri.file(retried.taskFolderPath);
-    } else {
-      NotificationRouter.showError(
-        `Task with ID "${normalized.canonicalId}" not found. It may have been deleted or moved.`
-      );
+  // Single mutable admission slot for the whole command — filled either by
+  // the early acquisition above or, once a target is resolved (a bare
+  // canonicalId or no-arg invocation), right after resolution below.
+  // Released in `finally` BEFORE the automation-chain dispatch at the end of
+  // this function: that dispatch is awaited directly (no `rootOperation`, so
+  // it runs its follow-up review immediately rather than deferring), and the
+  // follow-up review command acquires its own fresh admission for this same
+  // task — holding ours through that await would make the follow-up see
+  // this run as still busy.
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
       return;
     }
-  }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
 
-  if (!taskFolderUri) {
-    return;
-  }
-
-  // The stage's own auto-review setting combined with a chained fast-forward
-  // request from "Complete & Move On triggers AI: auto-fast-forward" —
-  // whichever is stronger wins, so the chained request fires even when the
-  // standalone setting is off, and a standalone "auto-fast-forward" is never
-  // downgraded by a plain chained dispatch.
-  //
-  // The chained marker is re-validated against the setting that minted it:
-  // it was only ever attached while "Complete & Move On triggers AI" was
-  // "auto-fast-forward", so a queued/stale arg must not resurrect the loop
-  // after the user turned that setting off or downgraded it.
+  let result: GeneratePlanResult | undefined;
+  let effectiveReviewMode: AutoTriggerMode = "off";
   const currentChainedReviewMode = (): "auto-fast-forward" | undefined =>
     arg && !(arg instanceof vscode.Uri) && "followUpReviewMode" in arg &&
     arg.followUpReviewMode === "auto-fast-forward" &&
     getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
       ? arg.followUpReviewMode
       : undefined;
-  const chainedReviewMode = currentChainedReviewMode();
-  const effectiveReviewMode = strongestAutoTriggerMode(
-    getAutoReviewAfterPlanMode(),
-    chainedReviewMode
-  );
 
-  const lockKey = taskFolderUri.fsPath;
-  // This is a workflow root (carries a `stage`) — the Notifications row must
-  // show the task's real name, never a raw basename(taskPath) computed here
-  // in the caller (that would silently reproduce the exact "wf10" vs
-  // "2026-07-17_task_1" regression this task exists to prevent). An
-  // un-renamed task's displayName IS the raw folder name, which
-  // taskOperations.begin's workflow-root guard now rejects unconditionally
-  // (explicit or not) — resolveWorkflowRootTaskName reformats it so the
-  // guard never refuses a legitimate, un-renamed task. If the inventory
-  // hasn't indexed this task yet (e.g. a race right after creation),
-  // refresh once and fail safely rather than falling through to a
-  // synthesized name.
-  let resolvedForDisplay = inventory.getTaskByPath(lockKey);
-  if (!resolvedForDisplay) {
-    await inventory.refresh();
-    resolvedForDisplay = inventory.getTaskByPath(lockKey);
-  }
-  if (!resolvedForDisplay) {
-    NotificationRouter.showError(
-      `Task at "${lockKey}" could not be resolved. It may have been deleted or moved.`
+  try {
+    // ── Consent gate ─────────────────────────────────────────────────────────
+    const consented = await ensureAiConsent(context);
+    if (!consented) {
+      return;
+    }
+
+    // Resolve the target task folder URI from the argument.
+    let taskFolderUri: vscode.Uri | undefined;
+
+    const normalized = normalizeGeneratePlanArg(arg, inventory);
+
+    if (normalized === undefined) {
+      // No arg or unresolvable arg — prompt user to pick
+      taskFolderUri = await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES);
+    } else if (normalized instanceof vscode.Uri) {
+      taskFolderUri = normalized;
+    } else {
+      // Sentinel: canonicalId was provided but not found in the inventory.
+      // After a refresh attempt the inventory still doesn't know this task —
+      // fail clearly rather than silently acting on a different task.
+      await inventory.refresh();
+      const retried = inventory.getTaskById(normalized.canonicalId);
+      if (retried) {
+        taskFolderUri = vscode.Uri.file(retried.taskFolderPath);
+      } else {
+        NotificationRouter.showError(
+          `Task with ID "${normalized.canonicalId}" not found. It may have been deleted or moved.`
+        );
+        return;
+      }
+    }
+
+    if (!taskFolderUri) {
+      return;
+    }
+
+    if (!handle) {
+      // No-arg QuickPick / bare-canonicalId path: nothing was known to
+      // protect until resolution just picked a target.
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: taskFolderUri.fsPath,
+        purpose: "admission",
+        commandId: "generatePlanWithAI",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    // Admission is now guaranteed live for this exact target — reverse a
+    // watchdog-provenance pause (never a user pause) before further setup.
+    // 2026-09-09 review (completion blocker, new): the return value used to
+    // be discarded entirely, so this command continued on BOTH `userPaused`
+    // and `unreadable` — unlike the established `runReviewWithAI`/
+    // `fastForwardReviewWithAI` contract, which gates on both explicitly.
+    // Unlike `runLintingFixes` (which deliberately allows paused tasks via
+    // `allowPaused: true`), plan generation has no reason to run against a
+    // task a human has paused, so it gates here too.
+    const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(taskFolderUri);
+    if (reconciled.outcome === "unreadable") {
+      NotificationRouter.showError(`Could not read task progress for ${taskFolderUri.fsPath}.`);
+      return;
+    }
+    if (reconciled.outcome === "userPaused") {
+      NotificationRouter.showInformation("This task is paused. Resume it before generating a plan.");
+      return;
+    }
+
+    // The stage's own auto-review setting combined with a chained fast-forward
+    // request from "Complete & Move On triggers AI: auto-fast-forward" —
+    // whichever is stronger wins, so the chained request fires even when the
+    // standalone setting is off, and a standalone "auto-fast-forward" is never
+    // downgraded by a plain chained dispatch.
+    //
+    // The chained marker is re-validated against the setting that minted it:
+    // it was only ever attached while "Complete & Move On triggers AI" was
+    // "auto-fast-forward", so a queued/stale arg must not resurrect the loop
+    // after the user turned that setting off or downgraded it.
+    const chainedReviewMode = currentChainedReviewMode();
+    effectiveReviewMode = strongestAutoTriggerMode(
+      getAutoReviewAfterPlanMode(),
+      chainedReviewMode
     );
-    return;
-  }
-  const taskName = resolveWorkflowRootTaskName(
-    resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName,
-    lockKey
-  );
-  const result = await runTrackedOperation(
-    lockKey,
-    { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true },
-    (op) =>
-      generatePlanWithAIForResolvedTask(
-        context, inventory, chatViewProvider, taskFolderUri, op, effectiveReviewMode
-      )
-  );
-  if (!result) {
-    // Refused (another operation holds this task's lock) — the busy warning
-    // was already shown by runTrackedOperation.
-    return;
+
+    const lockKey = taskFolderUri.fsPath;
+    // This is a workflow root (carries a `stage`) — the Notifications row must
+    // show the task's real name, never a raw basename(taskPath) computed here
+    // in the caller (that would silently reproduce the exact "wf10" vs
+    // "2026-07-17_task_1" regression this task exists to prevent). An
+    // un-renamed task's displayName IS the raw folder name, which
+    // taskOperations.begin's workflow-root guard now rejects unconditionally
+    // (explicit or not) — resolveWorkflowRootTaskName reformats it so the
+    // guard never refuses a legitimate, un-renamed task. If the inventory
+    // hasn't indexed this task yet (e.g. a race right after creation),
+    // refresh once and fail safely rather than falling through to a
+    // synthesized name.
+    let resolvedForDisplay = inventory.getTaskByPath(lockKey);
+    if (!resolvedForDisplay) {
+      await inventory.refresh();
+      resolvedForDisplay = inventory.getTaskByPath(lockKey);
+    }
+    if (!resolvedForDisplay) {
+      NotificationRouter.showError(
+        `Task at "${lockKey}" could not be resolved. It may have been deleted or moved.`
+      );
+      return;
+    }
+    const taskName = resolveWorkflowRootTaskName(
+      resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName,
+      lockKey
+    );
+    result = await runTrackedOperation(
+      lockKey,
+      { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true },
+      (op) =>
+        generatePlanWithAIForResolvedTask(
+          context, inventory, chatViewProvider, taskFolderUri, op, effectiveReviewMode
+        )
+    );
+    if (!result) {
+      // Refused (another operation holds this task's lock) — the busy warning
+      // was already shown by runTrackedOperation.
+      return;
+    }
+  } finally {
+    await releaseAdmissionV1();
   }
 
   // Dispatched through the automation-chain scheduler. This run's own lock
-  // was already released above (runTrackedOperation returned), so no root
-  // operation is passed and the follow-up runs immediately — but the chain
-  // still goes through the single lock-safe dispatch point.
+  // AND its work admission were already released above (runTrackedOperation
+  // returned and admission's `finally` ran), so no root operation is passed
+  // and the follow-up runs immediately, acquiring its own fresh admission —
+  // but the chain still goes through the single lock-safe dispatch point.
   if (result.triggerAutoReview && result.taskFolderPath) {
     // "auto-fast-forward" runs the review + fixes loop instead of a single
     // review pass.
@@ -838,20 +982,43 @@ export async function resumeGeneratePlanInteractionV1(
     const command = getAutoReviewAfterPlanMode() === "auto-fast-forward"
       ? "vs-code-ai-helper.fastForwardReviewWithAI"
       : "vs-code-ai-helper.runReviewWithAI";
-    await scheduleAutomationChain({
-      command,
-      arg: { taskFolderPath: ownedTask.taskFolderPath },
-      taskKey: ownedTask.taskFolderPath,
-      chainId: "auto-review",
-      stillEnabled: () => getAutoReviewAfterPlanMode() !== "off",
-      intent: {
-        trigger: "auto-review after plan generation completes",
-        settingKey: "ensemble.autoReviewAfterPlan",
-        expectedTiming: "immediately, once plan generation finishes",
-        willRetry: false,
-        retryNote: "Not retried automatically if dropped — run the review manually.",
-      },
-    });
+    // 2026-09-09 review completion blocker: unlike the direct-command path
+    // above (which releases ITS OWN admission before scheduling this same
+    // chain, so the review acquires fresh admission cleanly), a Chat Resume
+    // of a generatePlan.v1 interaction runs entirely inside chatView.ts's
+    // `resumeInteraction`, which acquires admission BEFORE calling into this
+    // function and holds it for this function's ENTIRE duration — including
+    // this `await scheduleAutomationChain(...)` below, since there is no
+    // `rootOperation` here and the chain therefore dispatches and awaits the
+    // review command inline. Without a handoff, the review's own admission
+    // acquisition observes that still-live marker (owned by the same
+    // process, for the same task) and refuses `busy`, which
+    // scheduleAutomationChain then records as a completed chain even though
+    // no review ran. Minting a fresh single-use handoff token here — exactly
+    // resumeTask.ts's `resumeThenDispatchV1` pattern — lets the review adopt
+    // that SAME marker instead of racing it, whether or not this window's
+    // caller actually holds a live local handle (see
+    // `acquireOrAdoptWorkAdmissionV1`'s doc comment: an unmatched or
+    // superfluous token simply falls through to the ordinary genesis path).
+    const admissionHandoffTokenV1 = authorizeWorkAdmissionHandoffV1(ownedTask.taskFolderPath);
+    try {
+      await scheduleAutomationChain({
+        command,
+        arg: { taskFolderPath: ownedTask.taskFolderPath, admissionHandoffTokenV1 },
+        taskKey: ownedTask.taskFolderPath,
+        chainId: "auto-review",
+        stillEnabled: () => getAutoReviewAfterPlanMode() !== "off",
+        intent: {
+          trigger: "auto-review after plan generation completes",
+          settingKey: "ensemble.autoReviewAfterPlan",
+          expectedTiming: "immediately, once plan generation finishes",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — run the review manually.",
+        },
+      });
+    } finally {
+      revokeWorkAdmissionHandoffV1(ownedTask.taskFolderPath);
+    }
   }
 
   // Report the ORIGINAL interaction's actual settlement (re-read after

@@ -331,7 +331,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return validated.ok ? { ok: true } : { ok: false, reason: validated.reason };
     },
-    resume: async (ref, resumeIdempotencyId) => {
+    resume: async (ref, resumeIdempotencyId, admissionHandoffTokenV1) => {
       const loaded = await chatConversationOrchestrator.loadInteraction(ref);
       if (loaded.kind !== "ok") {
         return {
@@ -420,13 +420,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // Resume semantics: a fresh preflight attempt with a fresh
           // observation baseline, continuing into the sealed edit session
           // when a plan seals (plan §7.3 / AC-PREFLIGHT-04).
+          //
+          // `admissionHandoffTokenV1` (2026-09-09 review completion blocker):
+          // forwarded from chatView.ts's resumeInteraction, which acquired
+          // durable work admission for this task before ITS OWN first
+          // await — i.e. before the `loadInteraction` call just above too.
+          // Threading it through lets this handler adopt that SAME marker
+          // instead of racing its own genesis, closing the setup-phase
+          // watchdog-pause race across the whole chatView.ts → extension.ts →
+          // handler boundary, not just inside the handler itself.
           return await resumeEditPreflightInteractionV1(
             inventory,
             chatViewProvider,
             ref,
             actionKey,
             resumeIdempotencyId,
-            cancellation.token
+            cancellation.token,
+            admissionHandoffTokenV1
           );
         }
         return {

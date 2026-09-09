@@ -37,6 +37,14 @@ import {
 } from "../types/structuredQuestionV1";
 import { WorkflowDecisionOptionEffectV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import {
+  acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
+  describeWorkAdmissionRefusalV1,
+  revokeWorkAdmissionHandoffV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  WorkAdmissionHandleV1,
+} from "../state/workAdmissionV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
 import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
@@ -110,7 +118,22 @@ export interface ChatInteractionServicesV1 {
   cancel(ref: ChatInteractionRefV1): Promise<ChatInteractionServiceResultV1>;
   resume?(
     ref: ChatInteractionRefV1,
-    resumeIdempotencyId: string
+    resumeIdempotencyId: string,
+    /**
+     * Single-use same-process work-admission handoff token (2026-09-09
+     * review completion blocker), minted by `resumeInteraction` below the
+     * instant it has itself acquired durable admission for this task BEFORE
+     * its own first await — i.e. before `readChatInteractions`, before this
+     * service's `loadInteraction` await, and before any Resume handler's own
+     * setup. Present only when that early acquisition succeeded; a handler
+     * that needs admission (currently `resumeEditPreflightInteractionV1`)
+     * adopts the SAME marker via `acquireOrAdoptWorkAdmissionV1` instead of
+     * racing its own genesis, closing the setup-phase watchdog-pause race
+     * across the whole chatView.ts → extension.ts → handler boundary. Absent
+     * or unconsumed, a handler falls back to its own acquisition, exactly as
+     * before this token existed.
+     */
+    admissionHandoffTokenV1?: string
   ): Promise<ChatInteractionResumeResultV1>;
   /**
    * Validates a Chat Send BEFORE the user's message is appended to the
@@ -1444,66 +1467,141 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   ): Promise<void> {
     if (!this.target) return;
     const unavailableIdentity = this.target;
-    const interactions = await readChatInteractions(unavailableIdentity.taskFolderPath, unavailableIdentity.canonicalId);
-    const localRecord = interactions.find(
-      (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
-    );
-    if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
-      // Fully settled inside `settleLocalOnlyInteractionAnswersV1` — there is
-      // no coordinator action to resume, and no second acknowledgement to add.
-      return;
-    }
-    if (!this.interactionServices?.resume) {
-      NotificationRouter.showWarning(
-        "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow."
-      );
-      await this.append(
-        "assistant",
-        "Not resumed: Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
-        unavailableIdentity.stage,
-        unavailableIdentity
-      );
-      return;
-    }
-    const identity = this.target;
-    const services = this.interactionServices;
-    const resume = (r: ChatInteractionRefV1, id: string): Promise<ChatInteractionResumeResultV1> =>
-      services.resume!(r, id);
-    let resumed = false;
-    let declineMessage: string | undefined;
-    await this.runQueued(identity.taskFolderPath, async () => {
-      try {
-        const ref = await this.resolveInteractionRef(identity, clientRef);
-        if (!ref) {
-          declineMessage = "Could not resume: no matching question exists in this task's chat.";
-          NotificationRouter.showWarning(declineMessage);
-          return;
-        }
-        const result = await resume(ref, crypto.randomBytes(16).toString("hex"));
-        if (!result.ok) {
-          declineMessage = `Could not resume: ${result.reason}`;
-          NotificationRouter.showWarning(declineMessage);
-          return;
-        }
-        await settleChatInteraction(
-          identity.taskFolderPath,
-          identity.canonicalId,
-          clientRef.interactionId,
-          result.settlement
-        );
-        resumed = true;
-      } catch (error) {
-        declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
-        NotificationRouter.showWarning(declineMessage);
-      }
+
+    // ── Early work admission (2026-09-09 review completion blocker) ────────
+    // The review found that no admission covered chatView.ts's own awaits
+    // below (readChatInteractions/resolveInteractionRef) or extension.ts's
+    // `loadInteraction` await inside the configured Resume service — both run
+    // BEFORE resumeEditPreflightInteractionV1's own admission acquisition,
+    // leaving the same setup-phase watchdog-pause race already closed for
+    // fresh dispatches. `unavailableIdentity.taskFolderPath` is known
+    // synchronously, before any await in this method, so admission is
+    // acquired here first and threaded through as a single-use handoff token
+    // (the same acquireOrAdoptWorkAdmissionV1 mechanism resumeTask.ts's
+    // resumeThenDispatchV1 already uses) so a handler that needs it — today
+    // only resumeEditPreflightInteractionV1 — adopts this SAME marker instead
+    // of racing its own genesis.
+    //
+    // `busy` is safe to proceed through best-effort: it means a genuine live
+    // marker already exists for this task, owned by someone else, which
+    // already protects the task from the watchdog for the duration of our
+    // setup below — the actual handler's own admission call still enforces
+    // refusal against that same owner exactly as before this fix existed.
+    //
+    // `writeFailed` is not safe to proceed through (2026-09-09 review
+    // completion blocker, narrowed re-review): it means NO marker was
+    // written at all, so nothing protects the task during
+    // readChatInteractions/resolveInteractionRef here or `loadInteraction` in
+    // extension.ts. Continuing "best-effort" on a real filesystem error is
+    // exactly the unprotected setup-phase interval the plan requires be
+    // closed, so this fails the dispatch closed, before any further await,
+    // naming the real error — matching resumeEditPreflightInteractionV1's own
+    // contract for the same outcome.
+    const admission = await acquireWorkAdmissionV1({
+      taskFolderPath: unavailableIdentity.taskFolderPath,
+      purpose: "admission",
+      commandId: "chatResumeInteractionV1",
     });
-    if (resumed) {
-      await this.append("assistant", successMessage, identity.stage, identity);
-    } else if (declineMessage) {
-      await this.append("assistant", declineMessage, identity.stage, identity);
+    if (admission.outcome === "writeFailed") {
+      const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(admission)}`;
+      NotificationRouter.showWarning(declineMessage);
+      await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
+      if (sameIdentity(this.target, unavailableIdentity)) {
+        await this.render();
+      }
+      return;
     }
-    if (sameIdentity(this.target, identity)) {
-      await this.render();
+    const admissionHandle: WorkAdmissionHandleV1 | undefined =
+      admission.outcome === "acquired" ? admission.handle : undefined;
+    const admissionHeartbeat = admissionHandle
+      ? setInterval(() => void admissionHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+      : undefined;
+    try {
+      const interactions = await readChatInteractions(unavailableIdentity.taskFolderPath, unavailableIdentity.canonicalId);
+      const localRecord = interactions.find(
+        (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
+      );
+      if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
+        // Fully settled inside `settleLocalOnlyInteractionAnswersV1` — there is
+        // no coordinator action to resume, and no second acknowledgement to add.
+        return;
+      }
+      if (!this.interactionServices?.resume) {
+        NotificationRouter.showWarning(
+          "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow."
+        );
+        await this.append(
+          "assistant",
+          "Not resumed: Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
+          unavailableIdentity.stage,
+          unavailableIdentity
+        );
+        return;
+      }
+      const identity = this.target;
+      const services = this.interactionServices;
+      const resume = (
+        r: ChatInteractionRefV1,
+        id: string,
+        admissionHandoffTokenV1?: string
+      ): Promise<ChatInteractionResumeResultV1> => services.resume!(r, id, admissionHandoffTokenV1);
+      let resumed = false;
+      let declineMessage: string | undefined;
+      await this.runQueued(identity.taskFolderPath, async () => {
+        try {
+          const ref = await this.resolveInteractionRef(identity, clientRef);
+          if (!ref) {
+            declineMessage = "Could not resume: no matching question exists in this task's chat.";
+            NotificationRouter.showWarning(declineMessage);
+            return;
+          }
+          // Minted immediately before the dispatch it authorizes, matching
+          // authorizeWorkAdmissionHandoffV1's "about to make exactly one
+          // specific dispatch" contract — and revoked in the inner `finally`
+          // below the instant this one dispatch settles, so it can never be
+          // replayed against a later, unrelated Resume for the same task.
+          const admissionHandoffTokenV1 = admissionHandle
+            ? authorizeWorkAdmissionHandoffV1(unavailableIdentity.taskFolderPath)
+            : undefined;
+          try {
+            const result = await resume(ref, crypto.randomBytes(16).toString("hex"), admissionHandoffTokenV1);
+            if (!result.ok) {
+              declineMessage = `Could not resume: ${result.reason}`;
+              NotificationRouter.showWarning(declineMessage);
+              return;
+            }
+            await settleChatInteraction(
+              identity.taskFolderPath,
+              identity.canonicalId,
+              clientRef.interactionId,
+              result.settlement
+            );
+            resumed = true;
+          } finally {
+            if (admissionHandoffTokenV1) {
+              revokeWorkAdmissionHandoffV1(unavailableIdentity.taskFolderPath);
+            }
+          }
+        } catch (error) {
+          declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
+          NotificationRouter.showWarning(declineMessage);
+        }
+      });
+      if (resumed) {
+        await this.append("assistant", successMessage, identity.stage, identity);
+      } else if (declineMessage) {
+        await this.append("assistant", declineMessage, identity.stage, identity);
+      }
+      if (sameIdentity(this.target, identity)) {
+        await this.render();
+      }
+    } finally {
+      if (admissionHeartbeat) {
+        clearInterval(admissionHeartbeat);
+      }
+      if (admissionHandle) {
+        await admissionHandle.release();
+      }
     }
   }
 

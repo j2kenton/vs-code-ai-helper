@@ -69,6 +69,13 @@ import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../util
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
+import {
+  acquireOrAdoptWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import type { TaskInventory } from "../state/taskInventory";
 import type {
   ChatViewProvider,
@@ -1591,11 +1598,73 @@ export async function resumeEditPreflightInteractionV1(
   ref: ChatInteractionRefV1,
   actionKey: string,
   resumeIdempotencyId: string,
-  cancellationToken: vscode.CancellationToken
+  cancellationToken: vscode.CancellationToken,
+  /**
+   * Single-use same-process work-admission handoff token (2026-09-09 review
+   * completion blocker), forwarded from extension.ts, itself forwarded from
+   * chatView.ts's `resumeInteraction` — which acquired durable admission for
+   * this exact task BEFORE its own first await, i.e. before this whole
+   * Resume drive (including `loadInteraction` in extension.ts) began. When
+   * present, `acquireOrAdoptWorkAdmissionV1` adopts that SAME live marker
+   * instead of this function racing its own genesis, closing the
+   * setup-phase watchdog-pause race across the whole
+   * chatView.ts → extension.ts → this handler boundary. Absent (a caller
+   * other than the production Chat Resume wiring, e.g. a test), this falls
+   * back to the ordinary acquire-here behavior unchanged.
+   */
+  admissionHandoffTokenV1?: string
 ): Promise<ChatInteractionResumeResultV1> {
   if (!isEditPreflightActionKeyV1(actionKey)) {
     return { ok: false, reason: `unexpected action key ${actionKey} for an edit-preflight Resume` };
   }
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // 2026-09-09 review: this Resume drive can reach `coordinator.resumeAction`
+  // and, for a sealed plan, `continueSealedEditExecutionV1`'s workspace
+  // mutation — the same class of setup-phase watchdog race already closed
+  // for `runImplementationWithAI`/`fastForwardReviewWithAI`/
+  // `applyReviewEditWithAI`. `inventory.getTaskByBindingId` is a synchronous
+  // in-memory lookup (no I/O), so the target folder is knowable before the
+  // FIRST await below (`requireCopilotForResumeV1`) — this early peek is used
+  // ONLY to pick which task's admission to acquire; it does not replace the
+  // authoritative `ownedTask` resolution below, so the documented §7.5
+  // ordering (model-independent gate before any task read used for a
+  // decision) is unchanged. If the binding does not resolve yet, admission is
+  // acquired late, right after the authoritative lookup, mirroring
+  // `runImplementationWithAI`'s no-arg/QuickPick fallback. Either way,
+  // `acquireOrAdoptWorkAdmissionV1` (not the raw acquire) is used so a
+  // caller-presented `admissionHandoffTokenV1` adopts the already-live marker
+  // chatView.ts acquired, rather than racing a fresh genesis against it.
+  const earlyFolderPath = inventory.getTaskByBindingId(ref.taskBindingId)?.taskFolderPath;
+  const early = earlyFolderPath
+    ? await acquireOrAdoptWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "resumeEditPreflightInteractionV1",
+        handoffToken: admissionHandoffTokenV1,
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    return { ok: false, reason: describeWorkAdmissionRefusalV1(early) };
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
   // §7.5, applied to Resume drives too — but unlike a fresh invocation,
   // Resume is Copilot-only (see requireCopilotForResumeV1's header): the
   // task/model-INDEPENDENT gate runs first, before the inventory lookup
@@ -1622,6 +1691,40 @@ export async function resumeEditPreflightInteractionV1(
     return { ok: false, reason: "the task has no owning workspace" };
   }
   const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+
+  if (!handle) {
+    // The early peek above found nothing (the binding hadn't resolved via
+    // that lookup yet) — acquire now that the authoritative resolution above
+    // has produced a folder path, before any further setup. Still via
+    // acquireOrAdoptWorkAdmissionV1: the caller-presented handoff token is
+    // single-use and was not yet consumed by the early branch above (it
+    // never ran), so it is still valid here.
+    const late = await acquireOrAdoptWorkAdmissionV1({
+      taskFolderPath: ownedTask.taskFolderPath,
+      purpose: "admission",
+      commandId: "resumeEditPreflightInteractionV1",
+      handoffToken: admissionHandoffTokenV1,
+    });
+    if (late.outcome !== "acquired") {
+      return { ok: false, reason: describeWorkAdmissionRefusalV1(late) };
+    }
+    handle = late.handle;
+    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  }
+
+  // Admission is now guaranteed live for this exact target — reconcile a
+  // watchdog-provenance pause (never a user pause) before dispatching into
+  // the coordinator, exactly like `runImplementationWithAI`/
+  // `runReviewWithAI`/`fastForwardReviewWithAI`.
+  const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(taskFolderUri);
+  if (reconciled.outcome === "unreadable") {
+    return { ok: false, reason: `could not read task progress for ${ownedTask.taskFolderPath}` };
+  }
+  if (reconciled.outcome === "userPaused") {
+    return { ok: false, reason: "This task is paused. Resume it before continuing this action." };
+  }
+  const effectiveTaskStatus =
+    reconciled.outcome === "reversed" ? (reconciled.progress.status ?? "active") : (ownedTask.progress.status ?? "active");
 
   const orchestrator = getProductionActionConversationOrchestratorV1();
   const interactionRef: InteractionRefV1 = {
@@ -1659,7 +1762,7 @@ export async function resumeEditPreflightInteractionV1(
   const outcome = await coordinator.resumeAction({
     interaction: interactionRef,
     taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
+    taskStatus: effectiveTaskStatus,
     taskStage: ownedTask.progress.currentStage,
     resumeIdempotencyId,
     cancellationToken,
@@ -1705,7 +1808,7 @@ export async function resumeEditPreflightInteractionV1(
       outcome.correlation.operationId,
       {
         taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-        taskStatus: ownedTask.progress.status ?? "active",
+        taskStatus: effectiveTaskStatus,
         taskStage: ownedTask.progress.currentStage,
         cancellationToken,
       }
@@ -1756,4 +1859,7 @@ export async function resumeEditPreflightInteractionV1(
     return { ok: true, settlement: after.record.settlement };
   }
   return { ok: false, reason: "the interaction did not settle for this Resume — it may already be settled or still awaiting answers" };
+  } finally {
+    await releaseAdmissionV1();
+  }
 }
