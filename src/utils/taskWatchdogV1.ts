@@ -153,13 +153,10 @@ export function isUnrecoverableImplRecoveryV1(
  * value is a mitigation, not a boundary.
  *
  * Ten minutes was the second value tried, on the reasoning that it "cannot be
- * outrun by a setup phase". **It was, three times in eighteen hours** — raised
- * to thirty on 2026-09-09 after measuring the real setup duration rather than
- * estimating it.
- *
- * Every instance was `v1 fixes` running Fast Forward, and every one has the
- * same signature — the pause lands in the gap, and the killed round's own
- * context pack appears AFTER it:
+ * outrun by a setup phase". **It was, three times in eighteen hours**, every
+ * instance `v1 fixes` running Fast Forward, every one with the same signature
+ * — the pause lands in the gap, and the killed round's own context pack
+ * appears AFTER it:
  *
  *     20:50:59 round ends → 21:04:03 paused → 21:08:59 context-pack.md (43 KB)
  *     12:05:29 round ends → 12:18:00 paused → 12:27:30 context-pack.md (40 KB)
@@ -171,23 +168,27 @@ export function isUnrecoverableImplRecoveryV1(
  * minutes could not cover it, so the third of a thirty-iteration Fast Forward
  * run died at iteration 14, and the following two attempts died the same way.
  *
- * Thirty minutes covers the measured 22 with margin. It still catches every
- * real silent stop observed — those sat idle for HOURS, not minutes — and
- * detection latency remains the cheap side of this trade: a stall noticed
- * thirty minutes late costs a little time, while a false pause aborts live work
- * and strands the task, since every dispatch route is gated on not-paused.
- *
- * This remains a mitigation, and raising it a third time is evidence that
- * tuning a timeout is the wrong instrument — it is a race, not a slow task.
- * `v1 fixes` item 1 holds the real fix (a command registers its intent BEFORE
- * its setup phase, so the sweep has a positive signal instead of inferring
- * death from silence), and `v1 fixes 2` item 8 holds the safety net that should
- * exist regardless: the sweep must consult direct evidence of life — recent
- * writes in the task folder, a live provider process — before concluding a task
- * is dead. In all three instances above a 40 KB file was being written in the
- * task's own directory while the sweep declared it stopped.
+ * **This constant was raised to thirty minutes on 2026-09-09 as a same-round
+ * self-amendment, and reverted back to ten on the same day** (implementation
+ * review, `4abacb52-56de-4de9-bc74-cd1b0d728ea9-1`): the plan of record for
+ * this task (`.ensemble/2026-09-07_task_1/plan.md`, Part 1a step 9) requires
+ * "Keep `isImpossibleActiveStateV1` and the 10-minute quiet period unchanged,"
+ * and the task's own chat history contains no recorded human approval of the
+ * amendment — only a self-authored implementation-notes paragraph claiming
+ * approval. Per this project's standing rule, a reasonable alternative
+ * reached mid-round is not the same thing as approval: without a genuine,
+ * out-of-band recorded owner decision, the approved contract governs. The
+ * three-outrun measurements above are real and unresolved; they argue for
+ * finishing `v1 fixes` item 1 (a command registers its intent BEFORE its
+ * setup phase, so the sweep has a positive signal instead of inferring death
+ * from silence) and `v1 fixes 2` item 8 (the sweep consults direct evidence of
+ * life — recent writes in the task folder, a live provider process — before
+ * concluding a task is dead), not for silently re-tuning this timeout a
+ * fourth time. If thirty minutes (or another value) is genuinely wanted, it
+ * needs an explicit, recorded decision through the plan process — not a
+ * value chosen and self-approved inside an implementation round.
  */
-export const STALLED_TASK_QUIET_PERIOD_MS = 30 * 60 * 1000;
+export const STALLED_TASK_QUIET_PERIOD_MS = 10 * 60 * 1000;
 
 export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1): boolean {
   const { progress, taskCanonicalId } = input;

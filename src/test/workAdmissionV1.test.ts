@@ -1465,6 +1465,12 @@ void test(
         }
       },
     });
+    // Without this, reaching the exhaustion diagnostic at all requires
+    // waiting out the real WORK_ADMISSION_LIKELY_STALE_MS_V1 window (20
+    // real minutes) before the injected hook ever fires — the same fake
+    // clock the other two tests in this file use to reach their "stale"
+    // branches deterministically and quickly.
+    setWorkAdmissionClockForTestV1(fakeClockJumpingPastStalenessV1());
     try {
       const result = await acquireWorkAdmissionV1({
         taskFolderPath: task,
@@ -1482,6 +1488,7 @@ void test(
       }
     } finally {
       setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+      setWorkAdmissionClockForTestV1(undefined);
       fs.rmSync(markerPath, { force: true });
     }
   }

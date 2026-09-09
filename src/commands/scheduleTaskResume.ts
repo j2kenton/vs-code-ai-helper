@@ -36,7 +36,9 @@ import {
 } from "../utils/taskWatchdogV1";
 import {
   acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
+  withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
@@ -67,6 +69,17 @@ export class TaskActionScheduler implements vscode.Disposable {
   /** Signature of the persisted run represented by each armed timer. */
   private readonly armedRuns = new Map<string, string>();
   private readonly owner: string;
+  /**
+   * `fire()` is deliberately fire-and-forget from its `setTimeout` callback
+   * (production code cannot await a timer callback), but it now does real,
+   * disk-backed work-admission I/O before it does anything else (v1 fixes
+   * item 1, Part 1a step 6) — no longer the near-synchronous body it used to
+   * be. Tests that drive firing via a `FakeClock` need a deterministic way to
+   * wait for that I/O to actually settle, rather than guessing at a fixed
+   * number of ticks; tracked here for exactly that purpose and not consulted
+   * anywhere in production logic.
+   */
+  private readonly inFlightFiresForTestV1 = new Set<Promise<void>>();
 
   constructor(
     private readonly inventory: TaskInventory,
@@ -110,39 +123,96 @@ export class TaskActionScheduler implements vscode.Disposable {
       if (remaining > delay) {
         void this.arm(taskFolderPath, canonicalId);
       } else {
-        void this.fire(taskFolderPath, canonicalId, run.runAt, run.stage);
+        const firing = this.fire(taskFolderPath, canonicalId, run.runAt, run.stage);
+        this.inFlightFiresForTestV1.add(firing);
+        void firing.finally(() => this.inFlightFiresForTestV1.delete(firing));
       }
     }, delay));
   }
 
+  /** Test-only: resolve once every `fire()` currently in flight has settled
+   * — see `inFlightFiresForTestV1`'s doc comment. */
+  async waitForPendingFiresForTestV1(): Promise<void> {
+    await Promise.allSettled([...this.inFlightFiresForTestV1]);
+  }
+
+  /**
+   * v1 fixes item 1, Part 1a step 6 ("a scheduled stage action must dispatch,
+   * or must not consume its schedule"): admission is acquired BEFORE
+   * `scheduledRun` is cleared below and held across the dispatch itself
+   * (mirrors `resumeTask.ts`'s `resumeThenDispatchV1`), so there is no window
+   * where the schedule has already been consumed but nothing yet protects the
+   * task from the stalled-task watchdog. A `busy`/`writeFailed` refusal here
+   * means either a genuine owner is already working this task right now, or a
+   * real filesystem error prevented even trying — either way this firing is
+   * skipped WITHOUT touching `scheduledRun`, so the schedule is never
+   * destroyed without having dispatched anything: the very next `armAll()`
+   * sweep (on activation, or the periodic 5-minute timer) sees it still
+   * present and retries, rather than the run silently vanishing forever.
+   */
   private async fire(taskFolderPath: string, canonicalId: string | undefined, expectedRunAt: string, expectedStage: TaskProgress["currentStage"]): Promise<void> {
     this.timers.delete(taskFolderPath);
     this.armedRuns.delete(taskFolderPath);
-    let clearedByThisOwner = false;
-    let stageStillCurrent = false;
-    await this.store.patch(vscode.Uri.file(taskFolderPath), current => {
-      const run = current.scheduledRun;
-      // A stale callback must not consume a replacement schedule created by
-      // this same window, nor may it run a stage other than the one selected
-      // when the schedule was created.
-      if (run?.leaseOwner !== this.owner || run.runAt !== expectedRunAt || run.stage !== expectedStage) return current;
-      clearedByThisOwner = true;
-      stageStillCurrent = current.currentStage === run.stage;
-      return {
-        ...current,
-        scheduledRun: undefined,
-        scheduledResumeTime: undefined,
-        updatedAt: new Date(this.clock.now()).toISOString(),
-      };
-    });
 
-    // A different window can cancel or replace the schedule while this timer
-    // is pending. Only the lease owner that cleared its own schedule may run.
-    if (clearedByThisOwner && stageStillCurrent) {
-      await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", { canonicalId, taskFolderPath });
-    } else if (clearedByThisOwner) {
-      NotificationRouter.showInformation("Scheduled action was skipped because the task moved to a different stage.");
-    }
+    await withWorkAdmissionV1(
+      {
+        taskFolderPath,
+        purpose: "admission",
+        commandId: "vs-code-ai-helper.scheduleTaskResume.fire",
+        onRefused: (outcome) => {
+          NotificationRouter.showWarning(
+            `A scheduled stage action could not start yet (${describeWorkAdmissionRefusalV1(outcome)}); ` +
+              "it remains scheduled and will be retried automatically."
+          );
+        },
+      },
+      async () => {
+        let clearedByThisOwner = false;
+        let stageStillCurrent = false;
+        await this.store.patch(vscode.Uri.file(taskFolderPath), current => {
+          const run = current.scheduledRun;
+          // A stale callback must not consume a replacement schedule created
+          // by this same window, nor may it run a stage other than the one
+          // selected when the schedule was created.
+          if (run?.leaseOwner !== this.owner || run.runAt !== expectedRunAt || run.stage !== expectedStage) return current;
+          clearedByThisOwner = true;
+          stageStillCurrent = current.currentStage === run.stage;
+          return {
+            ...current,
+            scheduledRun: undefined,
+            scheduledResumeTime: undefined,
+            updatedAt: new Date(this.clock.now()).toISOString(),
+          };
+        });
+
+        // A different window can cancel or replace the schedule while this
+        // timer is pending. Only the lease owner that cleared its own
+        // schedule may run.
+        if (clearedByThisOwner && stageStillCurrent) {
+          try {
+            await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", { canonicalId, taskFolderPath });
+          } catch (error) {
+            // Dispatch failed before any downstream mechanism (its own round
+            // ledger row, its own admission) could take over protecting the
+            // task. Restore the schedule with its original stage rather than
+            // leaving the task silently unprotected AND with the action it
+            // promised never having run — only when nobody has since created
+            // a different schedule of their own.
+            await this.store.patch(vscode.Uri.file(taskFolderPath), current =>
+              current.scheduledRun === undefined
+                ? { ...current, scheduledRun: { runAt: expectedRunAt, stage: expectedStage } }
+                : current
+            );
+            const message = error instanceof Error ? error.message : String(error);
+            NotificationRouter.showWarning(
+              `A scheduled stage action failed to start (${message}); it has been rescheduled and will be retried.`
+            );
+          }
+        } else if (clearedByThisOwner) {
+          NotificationRouter.showInformation("Scheduled action was skipped because the task moved to a different stage.");
+        }
+      }
+    );
   }
 
   async armAll(): Promise<void> {

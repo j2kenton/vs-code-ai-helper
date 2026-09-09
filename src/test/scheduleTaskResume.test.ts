@@ -114,7 +114,11 @@ void test("scheduled action is skipped if the task moves to another stage before
     await scheduler.arm("C:\\tasks\\task", "task-id");
     await state.store.patch(vscode.Uri.file("C:\\tasks\\task"), current => ({ ...current, currentStage: "impl" }));
     clock.fireNext();
-    await new Promise(resolve => setImmediate(resolve));
+    // fire() now acquires real, disk-backed work admission before consuming
+    // scheduledRun (v1 fixes item 1, Part 1a step 6) — a fixed number of
+    // ticks cannot be trusted to outlast that I/O, so wait on the scheduler's
+    // own test-only signal that firing has actually settled.
+    await scheduler.waitForPendingFiresForTestV1();
 
     assert.equal(executed, false);
     assert.equal(state.current().scheduledRun, undefined);
@@ -142,7 +146,10 @@ void test("scheduled action runs when the scheduled stage is still current", asy
   try {
     await scheduler.arm("C:\\tasks\\task", "task-id");
     clock.fireNext();
-    await new Promise(resolve => setImmediate(resolve));
+    // fire() now acquires real, disk-backed work admission before consuming
+    // scheduledRun (v1 fixes item 1, Part 1a step 6) — see the identical note
+    // in the previous test.
+    await scheduler.waitForPendingFiresForTestV1();
 
     assert.equal(command, "vs-code-ai-helper.applyCurrentStageAction");
     assert.equal(state.current().scheduledRun, undefined);

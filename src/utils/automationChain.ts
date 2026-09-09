@@ -361,6 +361,36 @@ function terminalizeGenericAutomationRoundBestEffortV1(
  * `stillEnabled` returned false. `dispatch.onDropped`, when provided, is
  * called synchronously with the specific reason before the promise resolves
  * false.
+ *
+ * `v1 fixes` Part 1a step 3 route audit — documented proof of safety, no
+ * direct `acquireWorkAdmissionV1` call needed in this module: this function
+ * never performs any setup of its own before the target command runs; its
+ * only jobs are deciding WHEN to call `deps.execute(dispatch.command, ...)`
+ * (immediately, or once `rootOperation` ends) and recording best-effort
+ * scheduling-intent/round-ledger bookkeeping around that decision.
+ * `deps.execute` invokes the target command directly — the exact same
+ * command entry point a manual invocation would hit — so a command already
+ * covered by this audit (`runReviewWithAI`, `fastForwardReviewWithAI`, etc.,
+ * each registering admission synchronously at its own entry) is equally
+ * covered when reached through an automation chain; a command NOT yet
+ * covered is tracked as its own separate audit item, not a gap in this file.
+ *
+ * The waiting/deferred period itself is also covered, independent of that:
+ * BOTH dispatch branches (immediate and deferred-behind-`rootOperation`)
+ * start `intentIdPromise` synchronously, before any drop gate — it awaits
+ * `recordScheduledIntentBestEffortV1` (durably writes a `"scheduled"`
+ * scheduling-intent entry, which `hasLiveSchedulingIntentBestEffortV1`
+ * treats as live) and then, once that succeeds, durably opens a `"scheduled"`
+ * `roundLedger` row (which `hasOpenRoundLedgerRowV1` also treats as open).
+ * Both branches then AWAIT `intentIdPromise` — and, in turn,
+ * `announceAutoStartBestEffortV1` plus `recordRunningIntentBestEffortV1` —
+ * before ever calling `deps.execute`, so by construction `deps.execute` is
+ * never reached before at least one of those exemptions is durable. If the
+ * best-effort scheduling-intent write itself fails (caught, `id` stays
+ * `undefined`), no exemption from THIS module lands — but nothing in this
+ * module performed unprotected setup either; the dispatched command's own
+ * entry-point admission registration is the only protection that was ever
+ * load-bearing for the work itself, exactly as for a manual invocation.
  */
 export function scheduleAutomationChain(
   dispatch: AutomationDispatch,

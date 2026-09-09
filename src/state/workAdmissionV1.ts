@@ -596,10 +596,12 @@ function describeClaimAsBlockerV1(claimPath: string, now: number): WorkAdmission
  * `WORK_ADMISSION_LIKELY_STALE_MS_V1`) is exhausted. Despite the name, an
  * `undefined` result here is NOT terminal: the caller
  * (`acquireWorkAdmissionCoreV1`) treats it as "the path is free right now"
- * and retries the write itself, bounded separately (by a small fixed count,
- * not more elapsed time — see that call site's doc comment) so continuous
- * churn (a new contender appearing on every attempt) still terminates.
- * Only a defined result ends the attempt.
+ * and retries the write itself, bounded separately by
+ * `postExhaustionRetryStillFresh`'s own independently-anchored elapsed-time
+ * budget (not more retries of `claimContentionStillFresh`, which is
+ * guaranteed already false here — see that call site's doc comment) so
+ * continuous churn (a new contender appearing on every attempt) still
+ * terminates. Only a defined result ends the attempt.
  *
  * 2026-09-09 review architectural blocker (narrowed remainder, second half):
  * the shared `admission.claim` file, if STILL PHYSICALLY PRESENT after the
@@ -1011,9 +1013,45 @@ async function acquireWorkAdmissionCoreV1(
   // what keeps this from spinning the event loop, not a short attempt count,
   // so ordinary contention is never mistaken for a stuck/dead claim merely
   // because it churned a few times quickly.
+  //
+  // 2026-09-09 review architectural blocker (sixth round): reusing the SAME
+  // `claimContentionStillFresh()` predicate for the post-exhaustion retry was
+  // itself wrong, not just its earlier fixed-count predecessor — that branch
+  // is ONLY EVER REACHED once `claimContentionStillFresh()` has already
+  // turned false (that is precisely what triggers the exhaustion diagnosis a
+  // few lines above it), so re-checking the identical predicate immediately
+  // afterward is checking something already known false. The branch could
+  // never retry; every path through it fell straight to the terminal
+  // `writeFailed`, regardless of whether the diagnosis found a real blocker —
+  // reproducing "the pause wins" one boundary later than the fifth round's
+  // fix believed it had closed. A dedicated regression test
+  // (`workAdmissionV1.test.ts`, "retries the write when its own exhaustion
+  // diagnostic is raced...") demonstrates this directly: the injected race
+  // clears the obstruction, the diagnosis correctly reports no blocker, and
+  // the old code still returned `writeFailed`.
+  //
+  // The post-exhaustion retry now uses its OWN independently-anchored
+  // elapsed-time budget (`postExhaustionRetryStillFresh`, lazily started the
+  // first time it is consulted — i.e. the moment exhaustion is first
+  // reached), not the already-expired `claimContentionStillFresh` window. It
+  // reuses the same `WORK_ADMISSION_LIKELY_STALE_MS_V1` duration — still no
+  // arbitrary short timeout, per the plan's "the pause loses regardless of
+  // ordinary filesystem timing" — but measured from a start time that can
+  // actually still be fresh when consulted, so legitimate rapid churn
+  // (a contender resolving and a new one appearing) gets a real window to
+  // settle instead of a branch that was dead on arrival.
   const claimContentionStartedAtMs = nowV1();
   const claimContentionStillFresh = (): boolean =>
     nowV1() - claimContentionStartedAtMs < WORK_ADMISSION_LIKELY_STALE_MS_V1;
+
+  let postExhaustionRetryStartedAtMs: number | undefined;
+  const postExhaustionRetryStillFresh = (): boolean => {
+    const now = nowV1();
+    if (postExhaustionRetryStartedAtMs === undefined) {
+      postExhaustionRetryStartedAtMs = now;
+    }
+    return now - postExhaustionRetryStartedAtMs < WORK_ADMISSION_LIKELY_STALE_MS_V1;
+  };
 
   for (;;) {
     try {
@@ -1061,10 +1099,12 @@ async function acquireWorkAdmissionCoreV1(
       // retry the write itself rather than handing back a terminal failure
       // for an obstruction that has already cleared (this is what makes "the
       // loser should be the pause, not the round" hold at this boundary too).
-      // Bounded by the same elapsed-time staleness check as the ambiguous-
-      // wait branch above, not a short fixed count — see this section's own
-      // doc comment for why a count-based bound was wrong.
-      if (claimContentionStillFresh()) {
+      // Bounded by `postExhaustionRetryStillFresh`'s own, independently-
+      // anchored elapsed-time budget, NOT `claimContentionStillFresh` — that
+      // predicate is guaranteed already false here (it is what triggered the
+      // exhaustion diagnosis above), so reusing it made this branch
+      // unreachable in practice; see this section's own doc comment.
+      if (postExhaustionRetryStillFresh()) {
         await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
         continue;
       }
