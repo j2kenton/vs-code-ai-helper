@@ -89,6 +89,25 @@ void describe("workAdmissionReconciliationV1", () => {
     }
   });
 
+  void it("clears watchdogPauseClaimId alongside pausedReason on reversal (non-blocking review suggestion, 2026-09-09)", async () => {
+    const h = installHarness({
+      status: "paused",
+      pausedReason: STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+      watchdogPauseClaimId: "claim-abc-123",
+    });
+    try {
+      const result = await reconcileWatchdogPauseAgainstAdmissionV1(h.folderUri);
+      assert.equal(result.outcome, "reversed");
+      if (result.outcome === "reversed") {
+        assert.equal(result.progress.watchdogPauseClaimId, undefined);
+      }
+      const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as { watchdogPauseClaimId?: string };
+      assert.equal(onDisk.watchdogPauseClaimId, undefined);
+    } finally {
+      h.restore();
+    }
+  });
+
   void it("reverses a pause with the unrecoverable-recovery watchdog reason as well", async () => {
     const h = installHarness({ status: "paused", pausedReason: UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 });
     try {

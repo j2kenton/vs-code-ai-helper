@@ -97,6 +97,13 @@ export interface WorkAdmissionClaimInfoV1 {
 
 export interface WorkAdmissionHandleV1 {
   readonly ownerToken: string;
+  /** The claim record's own unique id (`WorkAdmissionClaimInfoV1.claimId`),
+   * exposed so a `pauseCommit` caller can bind it immutably to whatever it
+   * commits while holding this handle (see `pauseTaskWithReasonForClaimV1`,
+   * Part 1a step 4) — distinct from `ownerToken`, which identifies this
+   * PROCESS's acquisition across heartbeat generations, not this specific
+   * claim attempt. */
+  readonly claimId: string;
   readonly taskFolderPath: string;
   readonly commandId: string;
   readonly purpose: WorkAdmissionPurposeV1;
@@ -185,6 +192,74 @@ const processStartTimeV1 = Date.now() - Math.floor(process.uptime() * 1000);
  * the synchronous half of `hasLiveWorkAdmissionBestEffortV1`. Also backs
  * `acquireOrAdoptWorkAdmissionV1`'s same-process handoff below. */
 const localHandlesV1 = new Map<string, WorkAdmissionHandleV1>();
+
+/**
+ * Same-process PRE-genesis intent, keyed by task folder path to the set of
+ * `ownerToken`s currently attempting `acquireWorkAdmissionV1` for it whose
+ * genesis has not yet settled (durably acquired, busy, or writeFailed).
+ *
+ * 2026-09-09 review architectural blocker fix ("starting admission can still
+ * lose to `pauseCommit`"): `acquireWorkAdmissionV1` computes `ownerToken`
+ * synchronously but then AWAITS `resolveHostIdentityV1()` before writing
+ * anything — mkdir, the claim file, everything — so for that whole gap a
+ * command that is starting work is registered NOWHERE, neither in
+ * `localHandlesV1` (not acquired yet) nor on disk (not written yet). A
+ * same-process watchdog sweep's pre-check
+ * (`isImpossibleActiveStateV1` → `hasLiveWorkAdmissionBestEffortV1`) run
+ * during exactly that window sees nothing and can commit a pause on a task
+ * that is, at that very moment, starting real work.
+ *
+ * This entry is added synchronously the instant `ownerToken` exists — before
+ * the first `await` — and removed in a `finally` covering every exit path of
+ * `acquireWorkAdmissionV1` (acquired, busy, or writeFailed all clear it: once
+ * genesis settles, durable state — a marker, or nothing — is the source of
+ * truth again). Because Node runs synchronous code to completion before any
+ * other callback gets a turn, this registration is guaranteed to land before
+ * a same-process sweep's next check, closing the gap for the common single-
+ * window case; a cross-window sweep can only ever observe durable state, so
+ * that residual race is left to 1b/1c as documented in the module's own
+ * genesis notes.
+ */
+const localPendingIntentsV1 = new Map<string, Set<string>>();
+
+function registerPendingIntentV1(taskFolderPath: string, ownerToken: string): void {
+  const existing = localPendingIntentsV1.get(taskFolderPath);
+  if (existing) {
+    existing.add(ownerToken);
+  } else {
+    localPendingIntentsV1.set(taskFolderPath, new Set([ownerToken]));
+  }
+}
+
+function clearPendingIntentV1(taskFolderPath: string, ownerToken: string): void {
+  const existing = localPendingIntentsV1.get(taskFolderPath);
+  if (!existing) {
+    return;
+  }
+  existing.delete(ownerToken);
+  if (existing.size === 0) {
+    localPendingIntentsV1.delete(taskFolderPath);
+  }
+}
+
+/** True when some OTHER same-process caller (not `excludedOwnerToken`, when
+ * supplied) currently has a pre-genesis admission attempt in flight for this
+ * task. See `localPendingIntentsV1`'s doc comment. */
+function hasPendingIntentV1(taskFolderPath: string, excludedOwnerToken?: string): boolean {
+  const tokens = localPendingIntentsV1.get(taskFolderPath);
+  if (!tokens || tokens.size === 0) {
+    return false;
+  }
+  if (excludedOwnerToken === undefined) {
+    return true;
+  }
+  for (const token of tokens) {
+    if (token !== excludedOwnerToken) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Total outstanding in-process holders of one task's live marker — the
@@ -287,8 +362,29 @@ export function revokeWorkAdmissionHandoffV1(taskFolderPath: string): void {
   pendingHandoffTokensV1.delete(taskFolderPath);
 }
 
+/**
+ * Test-only override for the real directory a task's admission directory is
+ * rooted under. Production behavior (the default, `undefined`) roots
+ * `admission-v1/` directly inside the real task folder — but a test that
+ * exercises this module only through a PLACEHOLDER `taskFolderPath` (not a
+ * real directory on disk, e.g. a fixture like `"C:\\tasks\\task"` used by
+ * `scheduleTaskResume.test.ts`'s watchdog-sweep coverage) must not let this
+ * module's real `mkdir`/`writeFile`/`rename` calls land on that arbitrary,
+ * non-task-owned host path. Every disk path this module computes goes
+ * through `admissionDirV1` below, so installing a resolver here redirects
+ * ALL of them at once; every process-local registry in this module (keyed by
+ * the ORIGINAL `taskFolderPath`, never the resolved disk root) is unaffected.
+ */
+let admissionRootOverrideV1: ((taskFolderPath: string) => string) | undefined;
+export function setWorkAdmissionRootOverrideForTestV1(
+  resolver: ((taskFolderPath: string) => string) | undefined
+): void {
+  admissionRootOverrideV1 = resolver;
+}
+
 function admissionDirV1(taskFolderPath: string): string {
-  return path.join(taskFolderPath, ADMISSION_DIRNAME_V1);
+  const root = admissionRootOverrideV1 ? admissionRootOverrideV1(taskFolderPath) : taskFolderPath;
+  return path.join(root, ADMISSION_DIRNAME_V1);
 }
 
 function freshEpochV1(): string {
@@ -368,12 +464,70 @@ export function hasLiveWorkAdmissionBestEffortV1(taskFolderPath: string): boolea
   if (localHandlesV1.has(taskFolderPath)) {
     return true;
   }
+  if (hasPendingIntentV1(taskFolderPath)) {
+    return true;
+  }
   const dir = admissionDirV1(taskFolderPath);
   try {
     if (fs.existsSync(path.join(dir, CLAIM_FILENAME_V1))) {
       return true;
     }
     return listMarkersSyncV1(dir).length > 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Liveness check for a caller that ALREADY holds a live marker of its own
+ * (`excludedOwnerToken`) and wants to know whether a DIFFERENT admission is
+ * live — used by the watchdog sweep's `pauseCommit` commit protocol
+ * (`scheduleTaskResume.ts`, v1 fixes item 1, Part 1a step 4) so a sweep
+ * holding its own `pauseCommit` marker can check "did an unrelated admission
+ * arrive" without perpetually seeing its own transitional lock as that
+ * unrelated admission and refusing to ever commit.
+ *
+ * Deliberately checks MARKERS ONLY, never the shared `admission.claim` staging
+ * file — unlike `hasLiveWorkAdmissionBestEffortV1`, whose claim-file check is
+ * right for its OWN callers (deciding whether to touch the task at all, where
+ * "any genesis might be in flight" must fail open). Here the caller already
+ * holds a published marker, and the shared claim filename is exclusive: any
+ * OTHER `admission.claim` this call observes can only have been created
+ * AFTER the caller's own claim vacated that name (by publishing its marker) —
+ * every invariant `acquireWorkAdmissionV1` enforces guarantees such a
+ * contender will see the caller's marker during its own re-list step and
+ * back off `busy`, never complete genesis, while the caller's marker exists.
+ * Treating that transient, already-doomed claim file as "live" here is a pure
+ * false positive: it caused exactly this — a sweep reversing its own just-
+ * committed pause because a losing contender's SHARED claim file was still on
+ * disk at the instant of the check (2026-09-09, caught by
+ * "armAll's watchdog GENERIC route ... is also race-safe across two
+ * concurrently-sweeping windows", which requires exactly one of two racing
+ * sweeps to end up paused — the self-reversal made both end up active).
+ *
+ * `ownerToken` is unique per acquisition and embedded in every marker
+ * filename that acquisition publishes, so this can never accidentally
+ * exclude a DIFFERENT owner's marker.
+ */
+export function hasLiveWorkAdmissionExcludingOwnerV1(taskFolderPath: string, excludedOwnerToken: string): boolean {
+  const local = localHandlesV1.get(taskFolderPath);
+  if (local && local.ownerToken !== excludedOwnerToken) {
+    return true;
+  }
+  // A different same-process caller's pre-genesis attempt counts as "unrelated
+  // live work arriving" too (see `localPendingIntentsV1`'s doc comment) — this
+  // is what lets the sweep's pre-write and post-write checks catch a command
+  // that started admission in the narrow window before its own marker landed
+  // on disk, not just after.
+  if (hasPendingIntentV1(taskFolderPath, excludedOwnerToken)) {
+    return true;
+  }
+  const dir = admissionDirV1(taskFolderPath);
+  try {
+    return listMarkersSyncV1(dir).some((marker) => {
+      const parsed = parseMarkerBasenameV1(marker.basename);
+      return parsed === undefined || parsed.ownerToken !== excludedOwnerToken;
+    });
   } catch {
     return true;
   }
@@ -538,21 +692,76 @@ export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmis
 }
 
 /**
+ * True when `markerPurpose` (a live marker's own recorded `purpose`,
+ * `undefined` when the marker's record is unreadable/corrupt) should block a
+ * NEW acquisition attempt for `acquiringPurpose`.
+ *
+ * 2026-09-09 review architectural blocker fix ("starting admission can still
+ * lose to `pauseCommit`"): a `pauseCommit` marker is the watchdog sweep's own
+ * SHORT-LIVED transitional commit lock, never real work — the plan's own
+ * contract is "the loser should be the pause, not the round", so a command
+ * starting real work (`purpose: "admission"`) must not be turned away just
+ * because the sweep happens to be mid-commit. It proceeds to publish its own
+ * marker alongside the sweep's; the sweep's own pre-write/post-write checks
+ * (`hasLiveWorkAdmissionExcludingOwnerV1`, which this filtering does NOT
+ * apply to — that function intentionally treats ANY other marker as live) are
+ * what then catch the command's marker and reverse an in-flight or already-
+ * committed pause. Without this, the command was refused `busy` immediately,
+ * never got to publish anything, and the sweep's reversal check had nothing
+ * left to find — precisely the observed bug.
+ *
+ * A `pauseCommit` marker still blocks another `pauseCommit` acquisition
+ * (prevents two concurrent sweep commits), and an `admission`-purpose marker
+ * (or an unreadable one — conservative default) always blocks everything, as
+ * before.
+ */
+function markerBlocksAcquisitionV1(
+  markerPurpose: WorkAdmissionPurposeV1 | undefined,
+  acquiringPurpose: WorkAdmissionPurposeV1
+): boolean {
+  if (markerPurpose === "pauseCommit") {
+    return acquiringPurpose === "pauseCommit";
+  }
+  return true;
+}
+
+/**
  * Acquire durable work admission for `taskFolderPath`, running the genesis
  * flow described in the module doc comment. Never throws — filesystem
  * failures during the claim/rename sequence resolve to `writeFailed` with
  * the real underlying error, kept distinct from an ordinary `busy` (someone
  * else already owns admission) so a caller can tell "I could not even try"
  * from "someone got there first".
+ *
+ * Registers this attempt's `ownerToken` in `localPendingIntentsV1`
+ * SYNCHRONOUSLY, before the first `await`, and clears it in `finally` — see
+ * that map's doc comment for why (closes the pre-genesis race a same-process
+ * watchdog sweep could otherwise win).
  */
 export async function acquireWorkAdmissionV1(params: {
   readonly taskFolderPath: string;
   readonly purpose: WorkAdmissionPurposeV1;
   readonly commandId: string;
 }): Promise<WorkAdmissionResultV1> {
+  const ownerToken = `${process.pid.toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
+  registerPendingIntentV1(params.taskFolderPath, ownerToken);
+  try {
+    return await acquireWorkAdmissionCoreV1(params, ownerToken);
+  } finally {
+    clearPendingIntentV1(params.taskFolderPath, ownerToken);
+  }
+}
+
+async function acquireWorkAdmissionCoreV1(
+  params: {
+    readonly taskFolderPath: string;
+    readonly purpose: WorkAdmissionPurposeV1;
+    readonly commandId: string;
+  },
+  ownerToken: string
+): Promise<WorkAdmissionResultV1> {
   const { taskFolderPath, purpose, commandId } = params;
   const dir = admissionDirV1(taskFolderPath);
-  const ownerToken = `${process.pid.toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
   const hostId = await resolveHostIdentityV1();
   const claimInfo: WorkAdmissionClaimInfoV1 = {
     claimId: crypto.randomUUID(),
@@ -613,7 +822,16 @@ export async function acquireWorkAdmissionV1(params: {
     const cleanupError = await cleanupOwnClaimBestEffortV1(claimPath);
     return { outcome: "writeFailed", error: withCleanupFailureNotedV1(error as Error, cleanupError, claimPath) };
   }
-  if (existingMarkers.length > 0) {
+  // Purpose-aware filtering (2026-09-09 review architectural blocker fix):
+  // a live `pauseCommit` marker never blocks a NEW `admission`-purpose
+  // acquisition — see `markerBlocksAcquisitionV1`'s doc comment. Markers are
+  // re-read here (not cached from `existingMarkers`' listing) since content
+  // is only available per-file, and a marker whose record cannot be read is
+  // conservatively treated as blocking regardless of the acquiring purpose.
+  const blockingMarkers = existingMarkers.filter((marker) =>
+    markerBlocksAcquisitionV1(readClaimInfoSyncV1(marker.filePath)?.purpose, purpose)
+  );
+  if (blockingMarkers.length > 0) {
     // 2026-09-08 review (blocker `…-2`, narrowed): this branch used to await
     // cleanup and discard whatever it returned. If that unlink genuinely
     // fails (not ENOENT — `cleanupOwnClaimBestEffortV1` already treats a
@@ -628,14 +846,14 @@ export async function acquireWorkAdmissionV1(params: {
     // diagnosis as the primary message via `withCleanupFailureNotedV1`, so
     // the stranded-claim note always reaches the caller when it happens.
     //
-    // The busy diagnosis is captured from `existingMarkers[0]` directly via
+    // The busy diagnosis is captured from `blockingMarkers[0]` directly via
     // `describeMarkerAsBlockerV1`, NOT via `describeWorkAdmissionBlockerV1(taskFolderPath)`
     // — that function checks for a live `admission.claim` FIRST, and if
     // cleanup below fails, THIS caller's own not-yet-removed claim is sitting
     // at that exact fixed path. Calling it (especially after cleanup, when
     // failure is most likely) would misreport this caller's own stranded
     // claim as "the blocker" instead of the marker's real owner.
-    const busy = describeMarkerAsBlockerV1(existingMarkers[0]!.filePath, Date.now());
+    const busy = describeMarkerAsBlockerV1(blockingMarkers[0]!.filePath, Date.now());
     const cleanupError = await cleanupOwnClaimBestEffortV1(claimPath);
     if (!cleanupError) {
       return busy;
@@ -698,6 +916,7 @@ export async function acquireWorkAdmissionV1(params: {
 
   const handle: WorkAdmissionHandleV1 = {
     ownerToken,
+    claimId: claimInfo.claimId,
     taskFolderPath,
     commandId,
     purpose,
@@ -891,6 +1110,7 @@ function createAdoptedViewV1(taskFolderPath: string, shared: WorkAdmissionHandle
 
   return {
     ownerToken: shared.ownerToken,
+    claimId: shared.claimId,
     taskFolderPath: shared.taskFolderPath,
     commandId: shared.commandId,
     purpose: shared.purpose,

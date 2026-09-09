@@ -1482,27 +1482,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // only resumeEditPreflightInteractionV1 — adopts this SAME marker instead
     // of racing its own genesis.
     //
-    // `busy` is safe to proceed through best-effort: it means a genuine live
-    // marker already exists for this task, owned by someone else, which
-    // already protects the task from the watchdog for the duration of our
-    // setup below — the actual handler's own admission call still enforces
-    // refusal against that same owner exactly as before this fix existed.
-    //
-    // `writeFailed` is not safe to proceed through (2026-09-09 review
-    // completion blocker, narrowed re-review): it means NO marker was
-    // written at all, so nothing protects the task during
-    // readChatInteractions/resolveInteractionRef here or `loadInteraction` in
-    // extension.ts. Continuing "best-effort" on a real filesystem error is
-    // exactly the unprotected setup-phase interval the plan requires be
-    // closed, so this fails the dispatch closed, before any further await,
-    // naming the real error — matching resumeEditPreflightInteractionV1's own
-    // contract for the same outcome.
+    // Neither `busy` nor `writeFailed` is safe to proceed through (2026-09-09
+    // review completion blocker, re-review): this method's own admission call
+    // is the ONLY thing that can protect readChatInteractions/
+    // resolveInteractionRef here and `loadInteraction` in extension.ts, and it
+    // is also the ONLY source of a handoff token a downstream resume handler
+    // can adopt. It used to be assumed that every downstream handler enforces
+    // its own admission check against a `busy` owner, matching
+    // `resumeEditPreflightInteractionV1`'s contract — but
+    // `resumeGeneratePlanInteractionV1` (and the other Chat-Resume action
+    // handlers wired through `ChatInteractionServicesV1.resume`) call straight
+    // into `coordinator.resumeAction` with no admission check of their own,
+    // so a `busy` result here let Resume dispatch real, uncoordinated provider
+    // work under an unrelated owner's marker — the single-owner violation the
+    // review found. Refusing on any non-`acquired` outcome, before any further
+    // await, closes that gap uniformly at this one shared boundary instead of
+    // requiring every current and future resume handler to duplicate its own
+    // admission check.
     const admission = await acquireWorkAdmissionV1({
       taskFolderPath: unavailableIdentity.taskFolderPath,
       purpose: "admission",
       commandId: "chatResumeInteractionV1",
     });
-    if (admission.outcome === "writeFailed") {
+    if (admission.outcome !== "acquired") {
       const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(admission)}`;
       NotificationRouter.showWarning(declineMessage);
       await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
@@ -1511,8 +1513,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       return;
     }
-    const admissionHandle: WorkAdmissionHandleV1 | undefined =
-      admission.outcome === "acquired" ? admission.handle : undefined;
+    const admissionHandle: WorkAdmissionHandleV1 = admission.handle;
     const admissionHeartbeat = admissionHandle
       ? setInterval(() => void admissionHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
       : undefined;

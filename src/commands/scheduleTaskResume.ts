@@ -22,7 +22,7 @@ import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
-import { pauseTaskWithReason } from "../utils/taskProgressTransforms";
+import { pauseTaskWithReasonForClaimV1 } from "../utils/taskProgressTransforms";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
@@ -34,7 +34,10 @@ import {
   isStaleDispatchedImplRecoveryV1,
   isUnrecoverableImplRecoveryV1,
 } from "../utils/taskWatchdogV1";
-import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
+import {
+  acquireWorkAdmissionV1,
+  hasLiveWorkAdmissionExcludingOwnerV1,
+} from "../state/workAdmissionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -476,11 +479,24 @@ export class TaskActionScheduler implements vscode.Disposable {
   private async closeStalledTaskThroughLedgerV1(
     task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
     attemptId: string | undefined,
-    reason: string
+    reason: string,
+    claimId: string,
+    claimOwnerToken: string
   ): Promise<{ readonly progress: TaskProgress | undefined; readonly transitioned: boolean }> {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+    // `excludeWorkAdmissionOwnerToken` is this call's OWN `pauseCommit` claim
+    // — without it, re-checking `isImpossibleActiveStateV1` while holding
+    // that very claim would see the claim's own marker as live admission and
+    // conclude the state is no longer impossible, so the pause below could
+    // never actually commit (2026-09-09 fix — see the field's doc comment in
+    // `taskWatchdogV1.ts`).
     const isStillImpossible = (current: TaskProgress): boolean =>
-      isImpossibleActiveStateV1({ progress: current, taskCanonicalId: task.taskFolderPath, now: this.clock.now() });
+      isImpossibleActiveStateV1({
+        progress: current,
+        taskCanonicalId: task.taskFolderPath,
+        now: this.clock.now(),
+        excludeWorkAdmissionOwnerToken: claimOwnerToken,
+      });
     const clearImplRecovery = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1;
 
     // 2026-09-04 review follow-up: a disk-backed concurrency test caught two
@@ -510,12 +526,13 @@ export class TaskActionScheduler implements vscode.Disposable {
           }
           liveRowTransitioned = true;
           const cleared = clearImplRecovery ? { ...current, implRecovery: undefined } : current;
-          return pauseTaskWithReason(cleared, reason);
+          return pauseTaskWithReasonForClaimV1(cleared, reason, claimId);
         },
         whenNoLiveRow: {
           reason,
           clearImplRecovery,
           isStillImpossible,
+          claimId,
           patch: (folder, transform) => this.store.patch(folder, transform),
         },
       }
@@ -544,6 +561,20 @@ export class TaskActionScheduler implements vscode.Disposable {
    * dispatches work itself — so running this twice over unchanged state is a
    * no-op: the first run's pause flips `status` away from `"active"`, which
    * the predicate itself then excludes.
+   *
+   * v1 fixes item 1, Part 1a step 4 ("make the ordinary pause lose the
+   * ordinary race"): committing the pause now happens only while holding the
+   * SAME shared `admission.claim` file a work-starting command's own genesis
+   * contends for (purpose `pauseCommit`). While held, no admission genesis
+   * for this task can complete — a concurrent genesis attempt sees this
+   * claim/marker and reports `busy`, exactly as it would against a live
+   * `admission`-purpose owner — so the sweep and a starting command can never
+   * both believe they have "won" at once. A claim this sweep cannot acquire
+   * (busy — genesis is mid-flight, or another `pauseCommit` attempt is) means
+   * the LOSER here is the pause, not the round: this task is simply skipped
+   * for this sweep pass, and the very next sweep re-evaluates from scratch —
+   * nothing is stranded by skipping, since `isImpossibleActiveStateV1` will
+   * see the same (or a resolved) state again next time.
    */
   private async detectAndRepairStalledActiveTasksV1(): Promise<void> {
     for (const task of this.inventory.getTasks()) {
@@ -554,56 +585,85 @@ export class TaskActionScheduler implements vscode.Disposable {
       if (this.stalledActiveNotified.has(task.taskFolderPath)) {
         continue;
       }
-      const recovery = task.progress.implRecovery;
-      const stuckRecovery =
-        recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
-      const expectedReason = stuckRecovery
-        ? UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1
-        : STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
-      const { progress: patched, transitioned } = await this.closeStalledTaskThroughLedgerV1(
-        task,
-        stuckRecovery ? recovery?.attemptId : undefined,
-        expectedReason
-      );
-      if (!transitioned || patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
-        // Either nothing changed, or the task was already paused by a
-        // racing window's write between this loop's snapshot and this
-        // call's own fresh read — that window already posted the
-        // escalation, so this one must not post a second copy of it.
+      const claimResult = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "pauseCommit",
+        commandId: "vs-code-ai-helper.watchdogPauseCommit",
+      });
+      if (claimResult.outcome !== "acquired") {
         continue;
       }
-      // v1 fixes item 1 (Part 1a), post-write race close: a command may have
-      // begun its own durable admission (state/workAdmissionV1.ts) in the
-      // narrow window between this pause's write landing on disk and this
-      // loop reaching the notification step below — `isStillImpossible`
-      // inside `closeStalledTaskThroughLedgerV1` above already re-checks
-      // admission immediately BEFORE the write, but not after it. A full
-      // generation-fenced reversal (so a late admission can never coexist
-      // with an effective pause, from either write order) is 1b's job; for
-      // now, an admission observed right after our own write is reversed
-      // here rather than announced, so a command that won the race is never
-      // told it was paused for a state that is no longer true.
-      if (hasLiveWorkAdmissionBestEffortV1(task.taskFolderPath)) {
-        await this.store.patch(vscode.Uri.file(task.taskFolderPath), (current) => {
-          if (current.status !== "paused" || current.pausedReason !== expectedReason) {
-            // Something else already moved the task on; do not clobber it.
-            return current;
-          }
-          return {
-            ...current,
-            status: "active",
-            pausedReason: undefined,
-            updatedAt: new Date(this.clock.now()).toISOString(),
-          };
-        });
-        continue;
+      const { ownerToken, claimId } = claimResult.handle;
+      try {
+        // Repeat the absence check UNDER the claim: a command's genesis could
+        // have completed in the narrow window between this loop's admission
+        // pre-check (inside `isImpossibleActiveStateV1` above) and this
+        // claim's acquisition. Excludes this claim's own marker, which is
+        // this sweep's own transitional lock, never "someone else's" live
+        // work.
+        if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
+          continue;
+        }
+        const recovery = task.progress.implRecovery;
+        const stuckRecovery =
+          recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
+        const expectedReason = stuckRecovery
+          ? UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1
+          : STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
+        const { progress: patched, transitioned } = await this.closeStalledTaskThroughLedgerV1(
+          task,
+          stuckRecovery ? recovery?.attemptId : undefined,
+          expectedReason,
+          claimId,
+          ownerToken
+        );
+        if (!transitioned || patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
+          // Either nothing changed, or the task was already paused by a
+          // racing window's write between this loop's snapshot and this
+          // call's own fresh read — that window already posted the
+          // escalation, so this one must not post a second copy of it.
+          continue;
+        }
+        // Post-write check, again excluding this claim's own marker: a
+        // command's genesis that started AFTER our pre-write check but
+        // BEFORE our write landed on disk must still be found here and
+        // reversed, never announced as a pause — the mirror case of
+        // `reconcileWatchdogPauseAgainstAdmissionV1`, which covers the same
+        // race from the ADMITTING side. `watchdogPauseClaimId` is checked
+        // alongside status/reason so this reversal can only ever clear the
+        // EXACT pause attempt this call itself just committed.
+        if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
+          await this.store.patch(vscode.Uri.file(task.taskFolderPath), (current) => {
+            if (
+              current.status !== "paused" ||
+              current.pausedReason !== expectedReason ||
+              current.watchdogPauseClaimId !== claimId
+            ) {
+              // Something else already moved the task on; do not clobber it.
+              return current;
+            }
+            return {
+              ...current,
+              status: "active",
+              pausedReason: undefined,
+              watchdogPauseClaimId: undefined,
+              updatedAt: new Date(this.clock.now()).toISOString(),
+            };
+          });
+          continue;
+        }
+        this.stalledActiveNotified.add(task.taskFolderPath);
+        NotificationRouter.showWarning(
+          stuckRecovery
+            ? describeUnrecoverableRecoveryEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+            : describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
+        );
+      } finally {
+        // Released only after the write and its post-write validation have
+        // fully settled (plan step 4) — never earlier, so genesis stays
+        // excluded for the whole commit, not just its first half.
+        await claimResult.handle.release();
       }
-      this.stalledActiveNotified.add(task.taskFolderPath);
-      NotificationRouter.showWarning(
-        stuckRecovery
-          ? describeUnrecoverableRecoveryEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
-          : describeStalledActiveTaskEscalationV1(task.progress.displayName ?? task.progress.taskFolder)
-      );
     }
   }
 

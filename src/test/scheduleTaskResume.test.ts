@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -20,6 +20,27 @@ import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
+import { setWorkAdmissionRootOverrideForTestV1 } from "../state/workAdmissionV1";
+
+/**
+ * The watchdog-sweep tests below exercise `detectAndRepairStalledActiveTasksV1`,
+ * which (v1 fixes item 1, Part 1a step 4) now acquires a real, on-disk
+ * `pauseCommit` work-admission claim before committing a pause. These tests'
+ * `taskFolderPath` fixtures (e.g. `"C:\\tasks\\task"`) are placeholders, not
+ * real directories — without this override, that real filesystem I/O would
+ * land on an arbitrary, non-task-owned host path instead of a disposable temp
+ * directory. Installed once for the whole file; every test's fixture path is
+ * redirected to its own subdirectory under one temp root, torn down after the
+ * suite finishes.
+ */
+const admissionTestRootV1 = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-admission-test-"));
+setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
+  path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"))
+);
+after(() => {
+  setWorkAdmissionRootOverrideForTestV1(undefined);
+  fs.rmSync(admissionTestRootV1, { recursive: true, force: true });
+});
 
 class FakeClock implements SchedulerClock {
   private nextId = 0;

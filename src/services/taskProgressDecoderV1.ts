@@ -160,6 +160,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewInvalidatedByRound",
   "incompleteRoundContinuations",
   "pausedReason",
+  "watchdogPauseClaimId",
   "implRecovery",
   "quotaParkRecord",
 ] as const satisfies readonly (keyof TaskProgress)[];
@@ -2266,6 +2267,18 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.pausedReason = value;
+        break;
+      }
+      case "watchdogPauseClaimId": {
+        // Mirrors pausedReason's bound — this is the pauseCommit claim id
+        // bound to that same pause, not free text.
+        if (typeof value !== "string" || value.length === 0 || value.length > 2000) {
+          return recovery(
+            "invalidFieldValue",
+            "watchdogPauseClaimId must be a bounded non-empty string"
+          );
+        }
+        draft.watchdogPauseClaimId = value;
         break;
       }
       case "lintPayload": {

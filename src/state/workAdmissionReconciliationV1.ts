@@ -75,6 +75,13 @@ export async function reconcileWatchdogPauseAgainstAdmissionV1(
       ...current,
       status: "active",
       pausedReason: undefined,
+      // Non-blocking review suggestion (2026-09-09): clear the claim
+      // provenance alongside the reason it was bound to — leaving it behind
+      // would let a stale `watchdogPauseClaimId` survive on an `active`
+      // task, contrary to `updateTaskStatus`'s own default-clear behavior for
+      // every other transition away from `paused` (see
+      // `taskProgressFieldPolicyV1.ts`).
+      watchdogPauseClaimId: undefined,
       updatedAt: new Date().toISOString(),
     };
   });

@@ -22,7 +22,7 @@
  */
 import { ImplRecoveryV1, TaskProgress } from "../types/taskProgress";
 import { hasLiveSchedulingIntentBestEffortV1 } from "../state/schedulingIntentV1";
-import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
+import { hasLiveWorkAdmissionBestEffortV1, hasLiveWorkAdmissionExcludingOwnerV1 } from "../state/workAdmissionV1";
 
 /** True when this task's own persisted round ledger still has an open row. */
 export function hasOpenRoundLedgerRowV1(progress: TaskProgress): boolean {
@@ -79,6 +79,21 @@ export interface StalledActiveTaskCheckInputV1 {
    * `dispatched` record that is stale/not-stale without waiting on the wall
    * clock, mirroring the sweep's own injectable `SchedulerClock`. */
   readonly now?: number;
+  /**
+   * The `ownerToken` of a `pauseCommit`-purpose work-admission claim the
+   * CALLER itself currently holds for this same task (`scheduleTaskResume.ts`,
+   * v1 fixes item 1, Part 1a step 4), so the live-admission check below can
+   * exclude it. Without this, a sweep re-checking `isImpossibleActiveStateV1`
+   * WHILE holding its own `pauseCommit` claim would see that claim's own
+   * marker via `hasLiveWorkAdmissionBestEffortV1` and conclude the state is
+   * no longer impossible — the sweep's own transitional lock disqualifying
+   * the exact state it exists to detect, so the pause it is mid-committing
+   * never actually lands (caught 2026-09-09: `transitioned` stayed `false` on
+   * every watchdog pause attempt once the claim protocol shipped). Omitted by
+   * every caller that does not hold a claim of its own — the ordinary
+   * pre-claim check, and every non-watchdog caller.
+   */
+  readonly excludeWorkAdmissionOwnerToken?: string;
 }
 
 /**
@@ -193,7 +208,11 @@ export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1):
   // its admission directory by. Fails OPEN (any present claim/marker, live or
   // stale, counts) per that module's interim policy: v1a has no safe way to
   // tell a dead owner from a slow one, so it never lets the sweep guess.
-  if (hasLiveWorkAdmissionBestEffortV1(taskCanonicalId)) {
+  const hasUnrelatedLiveAdmission =
+    input.excludeWorkAdmissionOwnerToken !== undefined
+      ? hasLiveWorkAdmissionExcludingOwnerV1(taskCanonicalId, input.excludeWorkAdmissionOwnerToken)
+      : hasLiveWorkAdmissionBestEffortV1(taskCanonicalId);
+  if (hasUnrelatedLiveAdmission) {
     return false;
   }
   return true;

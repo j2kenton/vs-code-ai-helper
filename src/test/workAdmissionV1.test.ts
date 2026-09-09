@@ -9,6 +9,7 @@ import {
   authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionBlockerV1,
   hasLiveWorkAdmissionBestEffortV1,
+  hasLiveWorkAdmissionExcludingOwnerV1,
   revokeWorkAdmissionHandoffV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
@@ -1005,4 +1006,172 @@ void test("a failed heartbeat does not poison the owner-local queue: release() a
   );
   const dir = path.join(task, ADMISSION_DIRNAME_V1);
   assert.equal(fs.readdirSync(dir).length, 0);
+});
+
+// ── Architectural-blocker coverage added 2026-09-09 review round: "starting
+// admission can still lose to pauseCommit" ──────────────────────────────────
+
+void test("pending pre-genesis intent makes hasLiveWorkAdmissionBestEffortV1 true before any durable write lands", async () => {
+  const task = freshTaskFolder("pending-intent-closes-pre-genesis-gap");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+
+  // acquireWorkAdmissionV1 runs synchronously up to its first `await`
+  // (resolveHostIdentityV1()) before returning a pending promise — the
+  // pending-intent registration happens in that synchronous prefix, so it
+  // must already be visible the instant this call returns, well before any
+  // durable claim/marker file exists on disk.
+  const promise = acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "pending-intent-caller",
+  });
+  assert.equal(
+    hasLiveWorkAdmissionBestEffortV1(task),
+    true,
+    "a same-process caller mid-genesis must already read as live, closing the pre-write race"
+  );
+  assert.equal(fs.existsSync(path.join(task, ADMISSION_DIRNAME_V1)), false, "nothing durable has been written yet");
+
+  const result = await promise;
+  assert.equal(result.outcome, "acquired");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "now backed by the durable marker instead");
+  if (result.outcome === "acquired") {
+    await result.handle.release();
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+});
+
+void test("pending intent is cleared even when genesis settles busy or writeFailed", async () => {
+  const task = freshTaskFolder("pending-intent-cleared-on-every-exit");
+  const holder = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "holder",
+  });
+  assert.equal(holder.outcome, "acquired");
+  if (holder.outcome !== "acquired") return;
+
+  // A second caller for the same purpose is refused busy against the live
+  // marker — its own pending-intent entry must still be cleared afterward,
+  // not leaked forever (which would wrongly make every later check see
+  // permanently "live" admission for this task).
+  const refused = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "refused-caller",
+  });
+  assert.equal(refused.outcome, "busy");
+
+  await holder.handle.release();
+  assert.equal(
+    hasLiveWorkAdmissionBestEffortV1(task),
+    false,
+    "the refused caller's pending intent must not outlive its own settled call"
+  );
+});
+
+void test("a live pauseCommit marker does not block a new admission-purpose acquisition, and both markers coexist", async () => {
+  const task = freshTaskFolder("pause-commit-marker-does-not-block-admission");
+  const sweepClaim = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep",
+  });
+  assert.equal(sweepClaim.outcome, "acquired");
+  if (sweepClaim.outcome !== "acquired") return;
+
+  // Contract (v1 fixes item 1): "the loser should be the pause, not the
+  // round" — a command starting real work must not be turned away just
+  // because the sweep is mid-commit.
+  const commandAdmission = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+  assert.equal(commandAdmission.outcome, "acquired");
+  if (commandAdmission.outcome !== "acquired") return;
+
+  // Both markers now coexist on disk under distinct owner tokens.
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const markers = fs.readdirSync(dir).filter((name) => name !== "admission.claim");
+  assert.equal(markers.length, 2);
+
+  // The sweep's own exclusion check must still see the command's marker as
+  // unrelated live work, so its pre-write/post-write reconciliation can
+  // catch and reverse an in-flight pause.
+  assert.equal(hasLiveWorkAdmissionExcludingOwnerV1(task, sweepClaim.handle.ownerToken), true);
+
+  await commandAdmission.handle.release();
+  await sweepClaim.handle.release();
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+});
+
+void test("a live admission-purpose marker still blocks a new pauseCommit acquisition (the sweep backs off)", async () => {
+  const task = freshTaskFolder("admission-marker-still-blocks-pause-commit");
+  const commandAdmission = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+  assert.equal(commandAdmission.outcome, "acquired");
+  if (commandAdmission.outcome !== "acquired") return;
+
+  const sweepClaim = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep",
+  });
+  assert.equal(sweepClaim.outcome, "busy");
+
+  await commandAdmission.handle.release();
+});
+
+void test("a live pauseCommit marker still blocks a second pauseCommit acquisition (no double sweep commit)", async () => {
+  const task = freshTaskFolder("pause-commit-marker-blocks-another-pause-commit");
+  const first = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep-a",
+  });
+  assert.equal(first.outcome, "acquired");
+  if (first.outcome !== "acquired") return;
+
+  const second = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep-b",
+  });
+  assert.equal(second.outcome, "busy");
+
+  await first.handle.release();
+});
+
+void test("hasLiveWorkAdmissionExcludingOwnerV1 sees another caller's pending intent but not its own", async () => {
+  const task = freshTaskFolder("exclude-owner-sees-others-pending-intent");
+  const sweepClaim = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "watchdog-sweep",
+  });
+  assert.equal(sweepClaim.outcome, "acquired");
+  if (sweepClaim.outcome !== "acquired") return;
+
+  // The sweep excluding its own token sees no unrelated live admission yet.
+  assert.equal(hasLiveWorkAdmissionExcludingOwnerV1(task, sweepClaim.handle.ownerToken), false);
+
+  // A command starts its own genesis concurrently; its pending intent must be
+  // visible to the sweep's exclusion check before any durable marker exists.
+  const commandPromise = acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+  assert.equal(hasLiveWorkAdmissionExcludingOwnerV1(task, sweepClaim.handle.ownerToken), true);
+
+  const commandAdmission = await commandPromise;
+  assert.equal(commandAdmission.outcome, "acquired");
+  if (commandAdmission.outcome === "acquired") {
+    await commandAdmission.handle.release();
+  }
+  await sweepClaim.handle.release();
 });

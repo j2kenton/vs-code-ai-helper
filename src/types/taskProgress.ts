@@ -567,6 +567,21 @@ export interface TaskProgress {
   pausedReason?: string;
 
   /**
+   * The `pauseCommit`-purpose work-admission `claimId` (`workAdmissionV1.ts`)
+   * bound to the CURRENT watchdog pause, when this pause was committed
+   * through that protocol (v1 fixes item 1, Part 1a step 4, "make the
+   * ordinary pause lose the ordinary race" — see
+   * `pauseTaskWithReasonForClaimV1`). Lets a post-write reversal (or, from
+   * 1b, a fence-generation check) confirm it is reversing/superseding the
+   * EXACT pause attempt it observed, not a different one that happened to
+   * land with the same `pausedReason` text in between. Absent for any pause
+   * not committed through that protocol (a user pause, a quota park, or an
+   * older build); cleared by the same rule as `pausedReason` — any status
+   * change away from paused, or a later unrelated pause overwriting it.
+   */
+  watchdogPauseClaimId?: string;
+
+  /**
    * Durable record that an implementation round finished without a usable
    * report and a recovery continuation is owed — the ONE transition every
    * unreported round lands on (deferred, cut short, or a stamped-unusable

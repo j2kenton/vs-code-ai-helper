@@ -18,7 +18,10 @@
  * deferredRoundRecovery.test.ts patches it.
  */
 import * as assert from "node:assert/strict";
-import { afterEach, describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, afterEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { TaskActionScheduler } from "../commands/scheduleTaskResume";
@@ -34,6 +37,24 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { StatusTreeProvider } from "../views/statusView";
+import { setWorkAdmissionRootOverrideForTestV1 } from "../state/workAdmissionV1";
+
+/**
+ * `armAll()` (exercised throughout this file) may reach the watchdog sweep's
+ * `pauseCommit` admission claim (v1 fixes item 1, Part 1a step 4), which does
+ * real filesystem I/O rooted at each task's `taskFolderPath` — a placeholder
+ * here (e.g. `"C:/tasks/2026-08-14_task_1"`), not a real directory. Redirect
+ * to a disposable temp root for the whole file, same as
+ * `scheduleTaskResume.test.ts`.
+ */
+const admissionTestRootV1 = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-admission-test-"));
+setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
+  path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"))
+);
+after(() => {
+  setWorkAdmissionRootOverrideForTestV1(undefined);
+  fs.rmSync(admissionTestRootV1, { recursive: true, force: true });
+});
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const automationChainModule = require("../utils/automationChain") as Record<string, unknown>;

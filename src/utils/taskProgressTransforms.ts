@@ -135,9 +135,11 @@ export function updateTaskStatus(
     // A workflow-imposed pause reason describes the CURRENT paused state
     // only — any transition away from paused (resume, completion, archive)
     // retires it, or a long-resolved "no provider available" banner would
-    // reappear on the next unrelated pause.
-    ...(status !== "paused" && progress.pausedReason !== undefined
-      ? { pausedReason: undefined }
+    // reappear on the next unrelated pause. Its bound claim-commit provenance
+    // (`watchdogPauseClaimId`) is retired in the same step, for the same
+    // reason.
+    ...(status !== "paused" && (progress.pausedReason !== undefined || progress.watchdogPauseClaimId !== undefined)
+      ? { pausedReason: undefined, watchdogPauseClaimId: undefined }
       : {}),
     // Unlike pausedReason, quotaParkRecord is a durable PREDICTION about
     // when a model/provider becomes usable again, not a description of the
@@ -172,6 +174,32 @@ export function pauseTaskWithReason(
     // record of its own (this exhaustion wasn't quota/entitlement-shaped)
     // must not leave a stale record from an earlier, unrelated pause behind.
     ...(quotaParkRecord !== undefined ? { quotaParkRecord } : { quotaParkRecord: undefined }),
+    // Same replace-not-carry-over rule as quotaParkRecord above, for the
+    // claim-commit protocol's own provenance field: a plain (non-claim) pause
+    // must not leave a PRIOR watchdog pause's claimId attached to a reason
+    // that is no longer that pause. `pauseTaskWithReasonForClaimV1` stamps a
+    // fresh one back on top of this.
+    watchdogPauseClaimId: undefined,
+  };
+}
+
+/**
+ * `pauseTaskWithReason`, additionally binding the `pauseCommit`-purpose
+ * work-admission `claimId` (`workAdmissionV1.ts`) that the caller held while
+ * committing this exact pause (v1 fixes item 1, Part 1a step 4). Used
+ * exclusively by the watchdog sweep's claim-guarded commit path
+ * (`scheduleTaskResume.ts`'s `detectAndRepairStalledActiveTasksV1`), never by
+ * a user-initiated or quota pause — those have no claim to bind and use the
+ * plain function above.
+ */
+export function pauseTaskWithReasonForClaimV1(
+  progress: TaskProgress,
+  reason: string,
+  claimId: string
+): TaskProgress {
+  return {
+    ...pauseTaskWithReason(progress, reason),
+    watchdogPauseClaimId: claimId,
   };
 }
 

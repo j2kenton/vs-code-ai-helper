@@ -30,7 +30,7 @@ import { readChatDocumentIdentityV1, readChatInteractions } from "../utils/chatH
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { bindingIdForOwnedFolder, makeOwnedTaskFolder } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
-import { ADMISSION_DIRNAME_V1 } from "../state/workAdmissionV1";
+import { ADMISSION_DIRNAME_V1, acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
 
 /** open() (invoked by askInteraction) raises an internal Notifications entry
  * and executes the webview-focus command — neither of which this test
@@ -613,6 +613,88 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       const decline = entries.find((e) => e.role === "assistant" && /Could not resume/.test(e.text));
       assert.ok(decline, "expected a declined-in-chat message naming the write failure");
     } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * 2026-09-09 review completion blocker: a `busy` admission result used to
+   * be treated as safe to proceed through, on the theory that every
+   * downstream Chat-Resume handler enforces its own admission check against
+   * the same owner. That is true for `resumeEditPreflightInteractionV1`, but
+   * `resumeGeneratePlanInteractionV1` (the handler under test's `resume`
+   * stand-in mirrors this) calls straight into real provider work with no
+   * admission check of its own — so a pre-existing local admission holder let
+   * Resume dispatch uncoordinated work under an unrelated owner's marker,
+   * violating the single-owner invariant. This must now refuse BEFORE
+   * `readChatInteractions`/`resolveInteractionRef`/the resume service are
+   * ever reached, exactly like the `writeFailed` case above.
+   */
+  void it("resumeInteraction refuses busy, before any setup read, when durable admission is already held by another owner", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
+    const ref: ClientRef = { operationId: "5".repeat(32), interactionId: "6".repeat(32) };
+    let resumeCalled = false;
+    const services: ChatInteractionServicesV1 = {
+      submitAnswers: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      cancel: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      resume: () => {
+        resumeCalled = true;
+        return Promise.resolve({ ok: true, settlement: "resumed" });
+      },
+    };
+    provider.setInteractionServices(services);
+
+    const held = await acquireWorkAdmissionV1({
+      taskFolderPath: folder,
+      purpose: "admission",
+      commandId: "someOtherConcurrentCommand",
+    });
+    assert.equal(held.outcome, "acquired");
+
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId: ref.interactionId,
+          operationId: ref.operationId,
+          actionKey: "generatePlan.v1",
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+        },
+        true,
+        false
+      );
+
+      await fake.send({ type: "resumeInteraction", operationId: ref.operationId, interactionId: ref.interactionId });
+
+      assert.equal(resumeCalled, false, "the Resume service must never be reached while another owner holds admission");
+      const stored = await readChatInteractions(folder, folder, "impl");
+      assert.equal(stored[0]!.state, "unresolved", "the interaction must remain unresolved — no setup read ran");
+
+      const lastState = fake.posted.filter((m) => m.type === "state").pop();
+      const entries = (lastState?.entries as ReadonlyArray<{ role: string; text: string }> | undefined) ?? [];
+      const decline = entries.find((e) => e.role === "assistant" && /Could not resume/.test(e.text));
+      assert.ok(decline, "expected a declined-in-chat message naming the other owner");
+      assert.match(
+        decline.text,
+        /someOtherConcurrentCommand/,
+        "must name the actual blocking owner, not a generic refusal"
+      );
+    } finally {
+      if (held.outcome === "acquired") {
+        await held.handle.release();
+      }
       notify.restore();
       cmds.restore();
       provider.dispose();

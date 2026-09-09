@@ -251,7 +251,7 @@ import {
 } from "../types/taskProgress";
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { appendRoundOutcome, pauseTaskWithReason, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
+import { appendRoundOutcome, pauseTaskWithReason, pauseTaskWithReasonForClaimV1, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
@@ -397,6 +397,13 @@ export interface TerminalizeRoundOptionsV1 {
      * instantly. */
     readonly clearImplRecovery: boolean;
     readonly isStillImpossible: (current: TaskProgress) => boolean;
+    /** The `pauseCommit`-purpose work-admission `claimId` the caller held
+     * while committing this pause (v1 fixes item 1, Part 1a step 4) — stamped
+     * onto the write via `pauseTaskWithReasonForClaimV1` when supplied, so a
+     * post-write reversal can confirm it is reversing this exact attempt.
+     * Omitted by callers with no claim to bind (falls back to the plain
+     * `pauseTaskWithReason`). */
+    readonly claimId?: string;
     /** Injectable durable write primitive for this branch, matching
      * `SchedulerProgressStore.patch`'s signature — real disk in production,
      * swappable in tests. Defaults to `patchTaskProgressStrictV1`. */
@@ -521,7 +528,9 @@ async function runWhenNoLiveRowV1(
     }
     transitioned = true;
     const cleared = whenNoLiveRow.clearImplRecovery ? { ...current, implRecovery: undefined } : current;
-    return pauseTaskWithReason(cleared, whenNoLiveRow.reason);
+    return whenNoLiveRow.claimId !== undefined
+      ? pauseTaskWithReasonForClaimV1(cleared, whenNoLiveRow.reason, whenNoLiveRow.claimId)
+      : pauseTaskWithReason(cleared, whenNoLiveRow.reason);
   });
   return { ok: true, noLiveRow: true, transitioned, progress };
 }
