@@ -995,21 +995,25 @@ async function acquireWorkAdmissionCoreV1(
   // diagnosed as stale, never merely because it outlasted a short,
   // disconnected wall-clock guess.
   //
-  // The separate post-exhaustion-diagnosis retry a few lines below (for the
-  // "nothing is blocking us right now" case) stays bounded by a small fixed
-  // COUNT rather than this same elapsed-time check: that step never sleeps
-  // between attempts (each retry is an immediate re-check), so it exists
-  // only to survive a handful of synchronous churn cycles — a fresh
-  // contender claiming the path on every single attempt — not to wait out
-  // one ordinary claim's genesis. Reusing the multi-minute staleness window
-  // there would let unbounded rapid churn spin the event loop for as long as
-  // the churn continued, which is a different failure mode than "genesis is
-  // ordinarily slow" and does not need — or want — the same generous budget.
+  // 2026-09-09 review architectural blocker (fifth round): the
+  // post-exhaustion-diagnosis retry below (for the "nothing is blocking us
+  // right now" case, including a BLOCKING claim that vanished between the
+  // purpose read and the stat) used to be bounded by a small fixed COUNT
+  // (5) instead of this same elapsed-time check, on the reasoning that
+  // reusing the staleness window would let rapid churn spin the event loop.
+  // That bound fired on genuinely fast, repeated vanish/recontend cycles —
+  // ordinary contention among legitimate acquirers, not a runaway loop —
+  // and turned it into a fabricated `writeFailed`, contradicting "the pause
+  // loses regardless of ordinary filesystem timing" at exactly the boundary
+  // that phrase is meant to cover. It is now bounded by the SAME elapsed-time
+  // check as the ambiguous-wait branch above, with a poll delay
+  // (`CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`) before each retry — the delay is
+  // what keeps this from spinning the event loop, not a short attempt count,
+  // so ordinary contention is never mistaken for a stuck/dead claim merely
+  // because it churned a few times quickly.
   const claimContentionStartedAtMs = nowV1();
   const claimContentionStillFresh = (): boolean =>
     nowV1() - claimContentionStartedAtMs < WORK_ADMISSION_LIKELY_STALE_MS_V1;
-  let emptyExhaustionDiagnosisRetries = 0;
-  const MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1 = 5;
 
   for (;;) {
     try {
@@ -1057,19 +1061,18 @@ async function acquireWorkAdmissionCoreV1(
       // retry the write itself rather than handing back a terminal failure
       // for an obstruction that has already cleared (this is what makes "the
       // loser should be the pause, not the round" hold at this boundary too).
-      // Bounded by a small fixed count (not the staleness window above), so
-      // rapid synchronous churn still terminates rather than spinning
-      // forever — see this section's own doc comment for why these two
-      // bounds are deliberately different.
-      if (emptyExhaustionDiagnosisRetries < MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1) {
-        emptyExhaustionDiagnosisRetries++;
+      // Bounded by the same elapsed-time staleness check as the ambiguous-
+      // wait branch above, not a short fixed count — see this section's own
+      // doc comment for why a count-based bound was wrong.
+      if (claimContentionStillFresh()) {
+        await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
         continue;
       }
       return {
         outcome: "writeFailed",
         error: new Error(
           "Work admission claim was repeatedly contended and kept vanishing without resolving to a durable " +
-            `blocker or a successful write, even after ${MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1} extra retries; giving up.`
+            "blocker or a successful write, even after waiting out the full staleness window; giving up."
         ),
       };
     }
