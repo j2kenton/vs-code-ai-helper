@@ -568,8 +568,9 @@ export class TaskActionScheduler implements vscode.Disposable {
    * contends for (purpose `pauseCommit`). This claim is deliberately NOT a
    * hard exclusion for a concurrent `admission`-purpose genesis (2026-09-09
    * review, narrowed architectural blocker fix): such a genesis instead
-   * retries its own exclusive create for a short bounded window
-   * (`workAdmissionV1.ts`'s `CLAIM_CONTENTION_RETRY_DELAYS_MS_V1`) while this
+   * polls its own exclusive create (`workAdmissionV1.ts`'s
+   * `CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`) for as long as this claim would
+   * not yet be judged stale (`WORK_ADMISSION_LIKELY_STALE_MS_V1`) while this
    * claim resolves, and once this sweep's claim becomes a MARKER,
    * `markerBlocksAcquisitionV1` lets that genesis proceed immediately rather
    * than reporting `busy` — so "the loser should be the pause, not the round"

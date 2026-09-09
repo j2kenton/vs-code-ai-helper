@@ -30,10 +30,15 @@ import { resolveHostIdentityV1 } from "./hostIdentityV1";
  *      Only one concurrent caller can win this create. A loser whose OWN
  *      `purpose` is not blocked by the current holder's recorded `purpose`
  *      (`markerBlocksAcquisitionV1` — concretely, an `admission`-purpose
- *      loser against a `pauseCommit` holder) retries the create a bounded
- *      number of times (`CLAIM_CONTENTION_RETRY_DELAYS_MS_V1`) while that
- *      short-lived claim resolves one way or the other, so "the loser should
- *      be the pause, not the round" holds at the claim stage, not only once a
+ *      loser against a `pauseCommit` holder) polls the create
+ *      (`CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`) while that
+ *      short-lived claim resolves one way or the other, bounded not by an
+ *      arbitrary short timeout but by the SAME `WORK_ADMISSION_LIKELY_STALE_MS_V1`
+ *      staleness threshold `describeClaimAsBlockerV1` already uses to judge a
+ *      claim stale — so an ordinary (if slow, e.g. under AV-scan or disk
+ *      contention) claim genesis is always waited out, and only a genuinely
+ *      stale claim falls through to the interim `busy` diagnostic. "The loser
+ *      should be the pause, not the round" holds at the claim stage, not only once a
  *      marker exists. Every other loser reads the winner's claim back as a
  *      `busy` diagnostic immediately, with no retry.
  *   2. Re-list the admission directory. If any marker (`admission.<token>.g
@@ -563,6 +568,74 @@ function describeMarkerAsBlockerV1(markerFilePath: string, now: number): WorkAdm
   };
 }
 
+/** Build a `busy` diagnostic directly from the shared claim file, or
+ * `undefined` when it no longer exists. Used by the claim-write retry loop
+ * (`acquireWorkAdmissionCoreV1`) both for an immediately-confirmed blocking
+ * purpose and for its retry-exhausted fallback — see
+ * `describeClaimRetryExhaustedBlockerV1`'s doc comment for why the claim
+ * itself is always reported regardless of purpose, unlike a marker. */
+function describeClaimAsBlockerV1(claimPath: string, now: number): WorkAdmissionBusyV1 | undefined {
+  let claimStat: fs.Stats;
+  try {
+    claimStat = fs.statSync(claimPath);
+  } catch {
+    return undefined;
+  }
+  return {
+    outcome: "busy",
+    owner: readClaimInfoSyncV1(claimPath),
+    markerPath: claimPath,
+    ageMs: now - claimStat.mtimeMs,
+    likelyStale: now - claimStat.mtimeMs > WORK_ADMISSION_LIKELY_STALE_MS_V1,
+  };
+}
+
+/**
+ * Purpose-aware diagnostic for the claim-write retry loop, called once its
+ * elapsed-time budget (the claim's own age against
+ * `WORK_ADMISSION_LIKELY_STALE_MS_V1`) is exhausted. Despite the name, an
+ * `undefined` result here is NOT terminal: the caller
+ * (`acquireWorkAdmissionCoreV1`) treats it as "the path is free right now"
+ * and retries the write itself, bounded separately (by a small fixed count,
+ * not more elapsed time — see that call site's doc comment) so continuous
+ * churn (a new contender appearing on every attempt) still terminates.
+ * Only a defined result ends the attempt.
+ *
+ * 2026-09-09 review architectural blocker (narrowed remainder, second half):
+ * the shared `admission.claim` file, if STILL PHYSICALLY PRESENT after the
+ * entire retry window, is always reported as the blocker regardless of its
+ * recorded purpose — it has occupied the one fixed filename our own write
+ * needs for the whole window, so by this point it is a real, present
+ * obstruction, not a hypothetical one the retry loop was right to wait out.
+ * Only once the claim has actually vanished (renamed away to a marker, or
+ * removed) does purpose filtering apply, and only to markers — a live marker
+ * whose recorded purpose does not block `acquiringPurpose`
+ * (`markerBlocksAcquisitionV1`) is not a blocker at all, exactly like the
+ * `blockingMarkers` filter `acquireWorkAdmissionCoreV1` applies a few lines
+ * below this loop. Without this marker-side filtering, a `pauseCommit` claim
+ * that resolved into its own (non-blocking) marker in the narrow window
+ * between our failed `EEXIST` and this diagnostic call was misreported as
+ * busy purely because SOME marker existed, with no purpose check at all —
+ * reproducing "the pause wins" at the exhaustion step even though the
+ * ordinary retry path above already fixed the common case.
+ */
+function describeClaimRetryExhaustedBlockerV1(
+  taskFolderPath: string,
+  acquiringPurpose: WorkAdmissionPurposeV1,
+  now: number
+): WorkAdmissionBusyV1 | undefined {
+  const dir = admissionDirV1(taskFolderPath);
+  const claimPath = path.join(dir, CLAIM_FILENAME_V1);
+  const claimBlocker = describeClaimAsBlockerV1(claimPath, now);
+  if (claimBlocker) {
+    return claimBlocker;
+  }
+  const blockingMarker = listMarkersSyncV1(dir).find((marker) =>
+    markerBlocksAcquisitionV1(readClaimInfoSyncV1(marker.filePath)?.purpose, acquiringPurpose)
+  );
+  return blockingMarker ? describeMarkerAsBlockerV1(blockingMarker.filePath, now) : undefined;
+}
+
 /** Diagnostic snapshot of whatever is currently blocking admission for a
  * task, for a `busy` outcome's message or a stand-down log line. `undefined`
  * when nothing is present.
@@ -608,10 +681,12 @@ export function describeWorkAdmissionBlockerV1(
 const CLAIM_CLEANUP_RETRY_DELAYS_MS_V1 = [10, 50, 150];
 
 /**
- * Bounded delays between retries of the shared `admission.claim` exclusive
+ * Poll interval between retries of the shared `admission.claim` exclusive
  * create, used ONLY while the current holder's own recorded purpose does not
  * block ours (`markerBlocksAcquisitionV1` — a `pauseCommit` claim contending
- * against an `admission`-purpose acquirer).
+ * against an `admission`-purpose acquirer). This is a poll CADENCE, not a
+ * completion budget — the budget is elapsed real time against
+ * `WORK_ADMISSION_LIKELY_STALE_MS_V1`, below.
  *
  * 2026-09-09 review architectural blocker (narrowed remainder): purpose-aware
  * filtering already exempts a live `pauseCommit` MARKER from blocking a new
@@ -621,14 +696,30 @@ const CLAIM_CLEANUP_RETRY_DELAYS_MS_V1 = [10, 50, 150];
  * exclusive-create race against the sweep's `pauseCommit` claim was refused
  * immediately, with no retry, exactly reproducing "the pause wins" even
  * though the marker-level fix already guarantees "the pause should lose".
- * The sweep's own hold on this claim has no awaited step besides its own
- * fast filesystem calls (write, a synchronous relist, then rename-to-marker
- * or claim-cleanup) — summing to roughly 1 second of retry budget below is
- * generous enough to ride that out while still bounded, so a genuinely stuck
- * (e.g. crashed mid-genesis) `pauseCommit` claim still falls through to the
- * ordinary interim fail-open `busy` diagnostic rather than retrying forever.
+ *
+ * 2026-09-09 review architectural blocker (fourth round): the first fix
+ * bounded the retry by a fixed ~1 second delay schedule, reasoned from "the
+ * sweep's own hold on this claim has no awaited step besides its own fast
+ * filesystem calls." That reasoning is true of the LOGICAL steps (write, a
+ * synchronous relist, then rename-to-marker or claim-cleanup), but not of
+ * their WALL-CLOCK cost — each of those calls can individually be delayed
+ * well past a second by ordinary, non-crashed contention (the same
+ * antivirus/indexer interference `CLAIM_CLEANUP_RETRY_DELAYS_MS_V1`'s own
+ * doc comment already names for the cleanup unlink). A ~1 second budget is
+ * therefore still an arbitrary timeout the plan never approved as a
+ * substitute for "the pause loses regardless of ordinary filesystem timing" —
+ * it can make a healthy, still-in-flight `pauseCommit` claim look busy. The
+ * retry loop now polls at this cadence for as long as the claim's own age
+ * stays under `WORK_ADMISSION_LIKELY_STALE_MS_V1` — the SAME named staleness
+ * threshold `describeClaimAsBlockerV1` already uses to decide whether a
+ * claim record looks stale — so a claim is only ever given up on once it
+ * would ALSO be diagnosed as stale, never merely because it outlasted a
+ * short, unrelated wall-clock guess. A genuinely crashed/stuck claim still
+ * falls through to the ordinary interim fail-open `busy` diagnostic once it
+ * crosses that same threshold, per Part 1a step 2's interim policy — this
+ * never retries forever.
  */
-const CLAIM_CONTENTION_RETRY_DELAYS_MS_V1 = [5, 15, 30, 60, 120, 250, 500];
+const CLAIM_CONTENTION_POLL_INTERVAL_MS_V1 = 100;
 
 function delayV1(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -717,10 +808,38 @@ export interface WorkAdmissionFsFailureInjectionV1 {
    * (genesis only) — otherwise as impractical to produce reliably as the two
    * genesis steps above, for the same reason. */
   readonly onBeforeHeartbeatRename?: () => Error | undefined;
+  /** 2026-09-09 review architectural blocker (third round): a side-effect-only
+   * seam (no return value — this is not a failure to inject, it is a race to
+   * simulate) fired immediately before the claim-write retry loop's exhaustion
+   * diagnostic (`describeClaimRetryExhaustedBlockerV1`) runs. It exists to
+   * deterministically reproduce the one window that is otherwise impossible to
+   * hit with real timers: between the loop's final failed exclusive-create and
+   * its synchronous exhaustion diagnostic there is no `await`, so no other
+   * async callback (including a `setTimeout`-based test) can ever execute
+   * "during" it — only a hook invoked from inside that same synchronous
+   * stretch can land there. A test uses it to rename a still-present claim
+   * into a non-blocking marker at exactly that instant, proving the loop
+   * retries the write afterward instead of surfacing a terminal `writeFailed`
+   * for an obstruction that had already cleared. */
+  readonly onBeforeClaimRetryExhaustionDiagnosis?: () => void;
 }
 let fsFailureInjectionV1: WorkAdmissionFsFailureInjectionV1 | undefined;
 export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmissionFsFailureInjectionV1 | undefined): void {
   fsFailureInjectionV1 = injection;
+}
+
+/**
+ * Injectable time source for the claim-contention retry loop's elapsed-time
+ * bound (`WORK_ADMISSION_LIKELY_STALE_MS_V1`). Defaults to the real clock;
+ * tests override it so the loop's "genuinely stale" branch is reachable
+ * deterministically without an actual ~20-minute wait — see
+ * `setWorkAdmissionClockForTestV1`'s own call sites for how. Scoped to this
+ * one retry loop's `now()` calls only, not a general clock abstraction for
+ * the module.
+ */
+let nowV1: () => number = () => Date.now();
+export function setWorkAdmissionClockForTestV1(clock: (() => number) | undefined): void {
+  nowV1 = clock ?? ((): number => Date.now());
 }
 
 /**
@@ -829,13 +948,70 @@ async function acquireWorkAdmissionCoreV1(
   // below). This is what makes "the loser should be the pause, not the
   // round" hold at the claim stage too, not just once a marker exists: a
   // work-starting `admission` acquirer that loses the exclusive-create race
-  // against the sweep's short-lived `pauseCommit` claim waits out
-  // `CLAIM_CONTENTION_RETRY_DELAYS_MS_V1` for that claim to resolve (rename
-  // to a marker, or vacate on its own busy backoff) instead of being refused
-  // immediately. Any OTHER contention — an `admission` claim already owns
-  // it, another `pauseCommit` attempt is racing this one, or the record is
-  // unreadable — blocks exactly as before, with no retry.
-  for (let attempt = 0; ; attempt++) {
+  // against the sweep's short-lived `pauseCommit` claim polls
+  // (`CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`) for that claim to resolve
+  // (rename to a marker, or vacate on its own busy backoff) instead of being
+  // refused immediately — for as long as the claim would not yet be judged
+  // stale (`WORK_ADMISSION_LIKELY_STALE_MS_V1`), not merely a short fixed
+  // delay. Any OTHER contention — an `admission` claim already owns it,
+  // another `pauseCommit` attempt is racing this one — blocks immediately,
+  // with no retry.
+  //
+  // 2026-09-09 review architectural blocker (further narrowed, second
+  // round): `readClaimInfoSyncV1` returns `undefined` for BOTH "the claim is
+  // gone" and "the claim is present but its JSON is mid-write/corrupt" —
+  // there is no way to tell those apart from a failed read alone. The
+  // previous version fed that `undefined` straight into
+  // `markerBlocksAcquisitionV1`, which conservatively treats an unreadable
+  // purpose as blocking everything — so a claim caught mid-initialization
+  // was terminal on the very first `EEXIST`, with no retry at all, even
+  // though the write finishing (as it almost always does within
+  // milliseconds) would have revealed a harmless, non-blocking `pauseCommit`
+  // purpose. Only a SUCCESSFULLY READ purpose that positively conflicts with
+  // ours is treated as a confirmed, non-resolving blocker now; a read
+  // failure is treated the same as a known non-blocking purpose — ambiguous,
+  // and worth waiting out — so a transiently unreadable claim gets the same
+  // retry budget as a transiently non-blocking one.
+  // 2026-09-09 review architectural blocker (third round, remainder): once the
+  // retry budget below is spent, the obstruction can still resolve (to
+  // nothing, or to a marker whose purpose does not block us) in the narrow,
+  // synchronous window between the loop's final failed exclusive-create and
+  // its own exhaustion diagnostic — there is no `await` in that stretch, so a
+  // real timer can never land "during" it, but it is a real gap all the same.
+  // `describeClaimRetryExhaustedBlockerV1` returning `undefined` there means
+  // the shared claim path is free RIGHT NOW; the correct response is to retry
+  // the write immediately (nothing is blocking it), not to surface a terminal
+  // `writeFailed` for an obstruction that already cleared.
+  //
+  // 2026-09-09 review architectural blocker (fourth round): the ambiguous-
+  // claim wait above used to be bounded by a small, hand-picked ~1 second
+  // delay schedule — an arbitrary timeout the plan never approved as a
+  // stand-in for "the pause loses regardless of ordinary filesystem timing."
+  // It is now bounded by elapsed real time against the SAME
+  // `WORK_ADMISSION_LIKELY_STALE_MS_V1` staleness threshold
+  // `describeClaimAsBlockerV1` already uses to judge a claim record stale —
+  // captured once via the (test-overridable) `nowV1()` before this loop
+  // begins — so a claim is only ever given up on once it would ALSO be
+  // diagnosed as stale, never merely because it outlasted a short,
+  // disconnected wall-clock guess.
+  //
+  // The separate post-exhaustion-diagnosis retry a few lines below (for the
+  // "nothing is blocking us right now" case) stays bounded by a small fixed
+  // COUNT rather than this same elapsed-time check: that step never sleeps
+  // between attempts (each retry is an immediate re-check), so it exists
+  // only to survive a handful of synchronous churn cycles — a fresh
+  // contender claiming the path on every single attempt — not to wait out
+  // one ordinary claim's genesis. Reusing the multi-minute staleness window
+  // there would let unbounded rapid churn spin the event loop for as long as
+  // the churn continued, which is a different failure mode than "genesis is
+  // ordinarily slow" and does not need — or want — the same generous budget.
+  const claimContentionStartedAtMs = nowV1();
+  const claimContentionStillFresh = (): boolean =>
+    nowV1() - claimContentionStartedAtMs < WORK_ADMISSION_LIKELY_STALE_MS_V1;
+  let emptyExhaustionDiagnosisRetries = 0;
+  const MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1 = 5;
+
+  for (;;) {
     try {
       const injected = fsFailureInjectionV1?.onBeforeClaimWrite?.();
       if (injected) {
@@ -848,18 +1024,54 @@ async function acquireWorkAdmissionCoreV1(
         return { outcome: "writeFailed", error: error as Error };
       }
       const existingPurpose = readClaimInfoSyncV1(claimPath)?.purpose;
-      const delayMs = CLAIM_CONTENTION_RETRY_DELAYS_MS_V1[attempt];
-      if (markerBlocksAcquisitionV1(existingPurpose, purpose) || delayMs === undefined) {
-        const blocker = describeWorkAdmissionBlockerV1(taskFolderPath);
-        if (blocker) {
-          return blocker;
+      if (existingPurpose !== undefined && markerBlocksAcquisitionV1(existingPurpose, purpose)) {
+        // A successfully read purpose that genuinely conflicts with ours
+        // (e.g. two `pauseCommit` attempts) will not resolve into something
+        // we can proceed past — report it immediately, with no retry.
+        const claimBlocker = describeClaimAsBlockerV1(claimPath, nowV1());
+        if (claimBlocker) {
+          return claimBlocker;
         }
-        // The claim existed a moment ago but is gone now (the other owner
-        // released between our failed create and this read) — nothing to
-        // report as busy; the caller may simply retry.
-        return { outcome: "writeFailed", error: new Error("Work admission claim was contended and then vanished; retry.") };
+        // Vanished between the purpose read above and this stat — fall
+        // through to the ordinary exhaustion diagnostic below rather than
+        // fabricating a blocker that no longer exists.
+      } else if (claimContentionStillFresh()) {
+        // A confirmed non-blocking purpose, OR an unreadable/vanished
+        // record — both are ambiguous, and both deserve the chance to
+        // resolve (to a marker, to nothing, or to a readable non-conflicting
+        // purpose) before we give up, for as long as the claim itself would
+        // not yet be judged stale.
+        await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
+        continue;
       }
-      await delayV1(delayMs);
+      // Either the claim's age has crossed the staleness threshold, or it
+      // vanished right as we checked it — diagnose what, if anything, is
+      // left blocking us.
+      fsFailureInjectionV1?.onBeforeClaimRetryExhaustionDiagnosis?.();
+      const blocker = describeClaimRetryExhaustedBlockerV1(taskFolderPath, purpose, nowV1());
+      if (blocker) {
+        return blocker;
+      }
+      // Nothing currently blocks us: the claim vanished (and did not resolve
+      // into a marker whose purpose conflicts with ours). The path is free —
+      // retry the write itself rather than handing back a terminal failure
+      // for an obstruction that has already cleared (this is what makes "the
+      // loser should be the pause, not the round" hold at this boundary too).
+      // Bounded by a small fixed count (not the staleness window above), so
+      // rapid synchronous churn still terminates rather than spinning
+      // forever — see this section's own doc comment for why these two
+      // bounds are deliberately different.
+      if (emptyExhaustionDiagnosisRetries < MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1) {
+        emptyExhaustionDiagnosisRetries++;
+        continue;
+      }
+      return {
+        outcome: "writeFailed",
+        error: new Error(
+          "Work admission claim was repeatedly contended and kept vanishing without resolving to a durable " +
+            `blocker or a successful write, even after ${MAX_EMPTY_EXHAUSTION_DIAGNOSIS_RETRIES_V1} extra retries; giving up.`
+        ),
+      };
     }
   }
 

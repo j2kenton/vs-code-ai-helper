@@ -11,8 +11,10 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   revokeWorkAdmissionHandoffV1,
+  setWorkAdmissionClockForTestV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
+  WORK_ADMISSION_LIKELY_STALE_MS_V1,
 } from "../state/workAdmissionV1";
 import {
   configureHostIdentityRootV1,
@@ -1239,20 +1241,87 @@ void test("an admission-purpose acquisition retries past a pauseCommit claim tha
   fs.rmSync(markerPath, { force: true });
 });
 
+// 2026-09-09 review architectural blocker (fourth round): the previous fix
+// bounded the claim-contention retry loop by a fixed ~1 second delay
+// schedule — an arbitrary timeout, not the plan's "the pause loses
+// regardless of ordinary filesystem timing" invariant, since ordinary
+// (non-crashed) contention can plausibly outlast a second under real
+// disk/AV-scan conditions. The loop now waits out an ambiguous claim for as
+// long as it would not yet be judged STALE (`WORK_ADMISSION_LIKELY_STALE_MS_V1`
+// — the same threshold `describeClaimAsBlockerV1` already uses), rather than
+// a short, unrelated wall-clock guess. `setWorkAdmissionClockForTestV1` lets
+// the tests below exercise the "genuinely stale" branch deterministically,
+// without an actual ~20-minute wait.
+function fakeClockJumpingPastStalenessV1(): () => number {
+  const base = Date.now();
+  let calls = 0;
+  return () => {
+    calls += 1;
+    // The very first call establishes the retry loop's own start time; every
+    // call after that reports a time already past the staleness threshold,
+    // so the loop gives up on its first freshness check instead of polling.
+    return calls === 1 ? base : base + WORK_ADMISSION_LIKELY_STALE_MS_V1 + 1000;
+  };
+}
+
+void test(
+  "an admission-purpose acquisition waits out a pauseCommit claim held far longer than the previous fixed ~1 " +
+    "second retry budget, then proceeds once it resolves to a marker",
+  async () => {
+    const task = freshTaskFolder("admission-waits-past-old-fixed-retry-budget");
+    const claimPath = writeFakePauseCommitClaimV1(task, "slow-sweep-owner");
+
+    const admissionPromise = acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "runReviewWithAI",
+    });
+
+    // The module's previous fix bounded this wait to a fixed ~980ms retry
+    // schedule; hold the claim well past that (1.2s of REAL time, no fake
+    // clock here) to prove the current elapsed-time-against-staleness bound
+    // rides out ordinary, non-crashed contention regardless of how long it
+    // actually takes, rather than giving up on an arbitrary short timer.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    assert.equal(fs.existsSync(claimPath), true, "the fake pauseCommit claim should still be in place at this point");
+
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    const markerPath = path.join(dir, "admission.slow-sweep-owner.g1.deadbeef");
+    fs.renameSync(claimPath, markerPath);
+
+    const result = await admissionPromise;
+    assert.equal(
+      result.outcome,
+      "acquired",
+      "an admission attempt must keep waiting out an ordinary (non-stale) claim past the old ~1s budget, not give up"
+    );
+    if (result.outcome === "acquired") {
+      await result.handle.release();
+    }
+    fs.rmSync(markerPath, { force: true });
+  }
+);
+
 void test("an admission-purpose acquisition against a permanently stuck pauseCommit claim eventually reports busy rather than retrying forever", async () => {
   const task = freshTaskFolder("admission-busy-against-stuck-pause-commit-claim");
   writeFakePauseCommitClaimV1(task, "stuck-sweep-owner");
 
-  const result = await acquireWorkAdmissionV1({
-    taskFolderPath: task,
-    purpose: "admission",
-    commandId: "runReviewWithAI",
-  });
-  assert.equal(
-    result.outcome,
-    "busy",
-    "retries against a claim that never resolves must still be bounded and surface the interim busy diagnostic"
-  );
+  setWorkAdmissionClockForTestV1(fakeClockJumpingPastStalenessV1());
+  try {
+    const result = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "runReviewWithAI",
+    });
+    assert.equal(
+      result.outcome,
+      "busy",
+      "a claim that never resolves must still be bounded (by staleness, not a short arbitrary timer) and surface " +
+        "the interim busy diagnostic"
+    );
+  } finally {
+    setWorkAdmissionClockForTestV1(undefined);
+  }
 });
 
 void test("a pauseCommit-purpose acquisition does not retry past another pauseCommit claim (immediate busy)", async () => {
@@ -1269,3 +1338,151 @@ void test("a pauseCommit-purpose acquisition does not retry past another pauseCo
   assert.equal(result.outcome, "busy");
   assert.ok(elapsedMs < 500, `a pauseCommit-vs-pauseCommit claim conflict must not retry (took ${elapsedMs}ms)`);
 });
+
+// ── Further narrowed remainder (2026-09-09 review, second round): the retry
+// decision above reads the current claim's `purpose` via `readClaimInfoSyncV1`,
+// which returns `undefined` both when the claim has vanished AND when it is
+// present but its JSON is mid-write/corrupt — a real, if narrow, window every
+// exclusive-create writer passes through. Feeding that `undefined` straight
+// into `markerBlocksAcquisitionV1` treated "unreadable" the same as
+// "positively confirmed to conflict", so a claim caught mid-initialization
+// was refused immediately, with no retry at all — even though the write
+// finishing (as it does within milliseconds in practice) would very likely
+// have revealed a harmless, non-blocking `pauseCommit` purpose. ────────────
+
+function writeCorruptClaimV1(task: string): string {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const claimPath = path.join(dir, "admission.claim");
+  // Simulates a claim caught mid-write: present on disk, but not yet valid
+  // JSON — exactly the window a reader can observe between a writer's file
+  // create and its buffer actually landing.
+  fs.writeFileSync(claimPath, '{"ownerToken":"partial', { flag: "wx" });
+  return claimPath;
+}
+
+void test("an admission-purpose acquisition retries past a claim that is transiently unreadable (mid-write/corrupt), then proceeds once it resolves to a marker", async () => {
+  const task = freshTaskFolder("admission-retries-past-unreadable-claim");
+  const claimPath = writeCorruptClaimV1(task);
+
+  const admissionPromise = acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "runReviewWithAI",
+  });
+
+  // Give the retry loop a couple of ticks to observe the still-unreadable
+  // claim — it must not have given up yet.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fs.existsSync(claimPath), true, "the corrupt claim should still be in place at this point");
+
+  // The real writer finishes its genesis: the claim resolves into a live,
+  // readable, non-blocking `pauseCommit` marker.
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const markerPath = path.join(dir, "admission.fake-sweep-owner.g1.deadbeef");
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      claimId: "fake-sweep-owner-claim",
+      purpose: "pauseCommit",
+      ownerToken: "fake-sweep-owner",
+      pid: 999999,
+      processStartTime: 0,
+      hostId: "fake-host",
+      commandId: "watchdog-sweep",
+      startedAt: new Date().toISOString(),
+    })
+  );
+  fs.unlinkSync(claimPath);
+
+  const result = await admissionPromise;
+  assert.equal(
+    result.outcome,
+    "acquired",
+    "a transiently unreadable (mid-write) claim must be retried, not treated as an immediate, unresolvable blocker"
+  );
+  if (result.outcome === "acquired") {
+    await result.handle.release();
+  }
+  fs.rmSync(markerPath, { force: true });
+});
+
+void test("an admission-purpose acquisition against a permanently corrupt claim eventually reports busy (not writeFailed) rather than assuming it is free", async () => {
+  const task = freshTaskFolder("admission-busy-against-permanently-corrupt-claim");
+  const claimPath = writeCorruptClaimV1(task);
+
+  setWorkAdmissionClockForTestV1(fakeClockJumpingPastStalenessV1());
+  try {
+    const result = await acquireWorkAdmissionV1({
+      taskFolderPath: task,
+      purpose: "admission",
+      commandId: "runReviewWithAI",
+    });
+    assert.equal(
+      result.outcome,
+      "busy",
+      "a claim still physically present once it is judged stale must be reported busy, even though its content " +
+        "was never readable"
+    );
+  } finally {
+    setWorkAdmissionClockForTestV1(undefined);
+  }
+  fs.rmSync(claimPath, { force: true });
+});
+
+// ── Further narrowed remainder (2026-09-09 review, third round): even after
+// the fixes above, the retry loop's own EXHAUSTION diagnostic
+// (`describeClaimRetryExhaustedBlockerV1`) could itself be raced — if the
+// contended claim resolved into a non-blocking marker in the narrow,
+// synchronous window between the loop's last failed exclusive-create and
+// that diagnostic call, the diagnostic correctly found nothing blocking
+// (`undefined`), but the loop then treated that as a terminal `writeFailed`
+// instead of simply retrying the now-unobstructed write — reproducing "the
+// pause wins" one boundary later than the first two rounds' fixes cover. This
+// window has no `await` in it, so no real timer can ever land inside it; the
+// module exposes `onBeforeClaimRetryExhaustionDiagnosis` (a side-effect-only
+// test seam, not a failure injection) specifically to reproduce it
+// deterministically. ─────────────────────────────────────────────────────
+
+void test(
+  "an admission-purpose acquisition retries the write when its own exhaustion diagnostic is raced by the claim " +
+    "resolving into a non-blocking marker, instead of surfacing a terminal writeFailed",
+  async () => {
+    const task = freshTaskFolder("admission-retries-past-exhaustion-diagnosis-race");
+    const claimPath = writeFakePauseCommitClaimV1(task, "fake-sweep-owner-raced");
+    const dir = path.join(task, ADMISSION_DIRNAME_V1);
+    const markerPath = path.join(dir, "admission.fake-sweep-owner-raced.g1.deadbeef");
+
+    let fired = false;
+    setWorkAdmissionFsFailureInjectionForTestV1({
+      onBeforeClaimRetryExhaustionDiagnosis: () => {
+        // Simulate the sweep's own genesis completing its rename-to-marker
+        // step at exactly the instant the retry loop is about to diagnose
+        // the (by-then already-vanished) claim as its terminal blocker.
+        if (!fired && fs.existsSync(claimPath)) {
+          fired = true;
+          fs.renameSync(claimPath, markerPath);
+        }
+      },
+    });
+    try {
+      const result = await acquireWorkAdmissionV1({
+        taskFolderPath: task,
+        purpose: "admission",
+        commandId: "runReviewWithAI",
+      });
+      assert.equal(fired, true, "the injected race must actually have fired for this test to be meaningful");
+      assert.equal(
+        result.outcome,
+        "acquired",
+        "the exhaustion diagnostic finding nothing blocking must retry the write, not surface a terminal writeFailed"
+      );
+      if (result.outcome === "acquired") {
+        await result.handle.release();
+      }
+    } finally {
+      setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+      fs.rmSync(markerPath, { force: true });
+    }
+  }
+);
