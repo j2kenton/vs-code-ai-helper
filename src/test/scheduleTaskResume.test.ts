@@ -140,7 +140,12 @@ void test("scheduled action runs when the scheduled stage is still current", asy
   let command: string | undefined;
   commands.executeCommand = ((id: string) => {
     command = id;
-    return Promise.resolve(undefined);
+    // `applyCurrentStageAction` now reports back whether it actually
+    // dispatched a downstream stage action (2026-09-09 review completion
+    // blocker: "scheduled firing does not dispatch-or-retain") — `fire()`
+    // restores `scheduledRun` on anything other than `true`, so this stub
+    // must resolve `true` for this test to observe the schedule cleared.
+    return Promise.resolve(id === "vs-code-ai-helper.applyCurrentStageAction" ? true : undefined);
   }) as typeof commands.executeCommand;
 
   try {
@@ -155,6 +160,36 @@ void test("scheduled action runs when the scheduled stage is still current", asy
     assert.equal(state.current().scheduledRun, undefined);
   } finally {
     commands.executeCommand = original;
+    scheduler.dispose();
+  }
+});
+
+void test("scheduled firing restores the schedule when applyCurrentStageAction refuses without throwing (2026-09-09 review completion blocker: dispatch-or-retain)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T00:00:00.000Z"));
+  const state = memoryStore(scheduledProgress("plan"));
+  const inventory = { getTasks: () => [] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const original = commands.executeCommand;
+  const surface: StatusSurface = { addEntry(): void {} };
+  initNotificationRouter(surface);
+  // Simulates a downstream refusal that never throws — e.g. the task is
+  // still paused (`scheduleQuotaResumeAtV1` deliberately allows arming a
+  // schedule against a paused task) or a downstream command observed this
+  // call's own admission marker as busy and refused. Before this fix, a
+  // `false`/non-boolean return was indistinguishable from success and the
+  // schedule was silently lost.
+  commands.executeCommand = (() => Promise.resolve(false)) as typeof commands.executeCommand;
+
+  try {
+    await scheduler.arm("C:\\tasks\\task", "task-id");
+    clock.fireNext();
+    await scheduler.waitForPendingFiresForTestV1();
+
+    assert.deepEqual(state.current().scheduledRun, { runAt: "2026-01-01T00:01:00.000Z", stage: "plan" });
+  } finally {
+    commands.executeCommand = original;
+    deactivateNotificationRouter();
     scheduler.dispose();
   }
 });
@@ -394,7 +429,10 @@ void test("scheduleQuotaResumeAtV1's fired run goes through the exact same pre-r
   let command: string | undefined;
   commands.executeCommand = ((id: string) => {
     command = id;
-    return Promise.resolve(undefined);
+    // See the identical note in "scheduled action runs when the scheduled
+    // stage is still current" above: `fire()` restores `scheduledRun` unless
+    // `applyCurrentStageAction` reports back `true`.
+    return Promise.resolve(id === "vs-code-ai-helper.applyCurrentStageAction" ? true : undefined);
   }) as typeof commands.executeCommand;
   const surface: StatusSurface = { addEntry(): void {} };
   initNotificationRouter(surface);

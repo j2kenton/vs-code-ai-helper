@@ -27,7 +27,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
-  acquireWorkAdmissionV1,
+  acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
   revokeWorkAdmissionHandoffV1,
@@ -111,7 +111,33 @@ type GeneratePlanArg =
        * plain "auto". Never set by UI surfaces.
        */
       followUpReviewMode?: "auto-fast-forward";
+      /**
+       * Single-use same-process admission handoff token (2026-09-09, v1
+       * fixes item 1, Part 1a step 6 follow-up). Only `applyCurrentStageAction`
+       * — dispatching on behalf of a caller that already holds live durable
+       * admission for this exact task (the resume-and-rerun path, or the
+       * scheduled-firing path in `scheduleTaskResume.ts`) — ever sets this.
+       * Presenting it lets `acquireOrAdoptWorkAdmissionV1` adopt that
+       * already-live marker instead of racing a fresh genesis against it and
+       * observing `busy`, which used to silently consume a fired schedule
+       * without ever dispatching (see `scheduleTaskResume.ts`'s `fire()`).
+       */
+      admissionHandoffTokenV1?: string;
     };
+
+/**
+ * Extract `admissionHandoffTokenV1` from `arg`, when present — mirrors
+ * `reviewActions.ts`'s identically-named helper. Only the
+ * `{ taskFolderPath }` shape ever carries it, so a UI-originated invocation
+ * (tree buttons, keyboard shortcut with a bare `{ canonicalId }`, command
+ * palette) can never accidentally supply one and trigger adoption.
+ */
+function extractAdmissionHandoffTokenV1(arg: GeneratePlanArg | undefined): string | undefined {
+  if (!arg || arg instanceof vscode.Uri || !("admissionHandoffTokenV1" in arg)) {
+    return undefined;
+  }
+  return typeof arg.admissionHandoffTokenV1 === "string" ? arg.admissionHandoffTokenV1 : undefined;
+}
 
 /**
  * Normalize a GeneratePlanArg into a resolved value for the caller to act on.
@@ -240,14 +266,19 @@ export async function generatePlanWithAI(
   // this command then assembles a context pack and renders a prompt before
   // any provider call, exactly the setup-phase gap the watchdog trap exists
   // to close. Mirrors `runLintingFixes`/`runImplementationWithAI`'s
-  // early-acquisition path. No handoff-token adoption: no resume-then-
-  // dispatch flow currently targets this command.
+  // early-acquisition path. `acquireOrAdoptWorkAdmissionV1`, not the raw
+  // acquire (2026-09-09 review completion blocker: `applyCurrentStageAction`
+  // dispatching this command on behalf of a caller — `scheduleTaskResume.ts`'s
+  // `fire()` — that already holds live admission for this exact task used to
+  // observe that caller's own marker as `busy` and refuse without dispatching
+  // anything, silently consuming a fired schedule).
   const earlyFolderPath = extractSynchronousGeneratePlanFolderPathV1(arg, inventory);
   const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
+    ? await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
         commandId: "generatePlanWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
@@ -328,11 +359,13 @@ export async function generatePlanWithAI(
 
     if (!handle) {
       // No-arg QuickPick / bare-canonicalId path: nothing was known to
-      // protect until resolution just picked a target.
-      const late = await acquireWorkAdmissionV1({
+      // protect until resolution just picked a target. Same adoption reason
+      // as the early acquisition above.
+      const late = await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: taskFolderUri.fsPath,
         purpose: "admission",
         commandId: "generatePlanWithAI",
+        handoffToken: extractAdmissionHandoffTokenV1(arg),
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));

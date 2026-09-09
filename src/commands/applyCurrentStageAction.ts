@@ -13,8 +13,28 @@ import {
 } from "../utils/reviewRouting";
 import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
-type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
+type ApplyArg = {
+  canonicalId?: string;
+  taskFolderPath?: string;
+  /**
+   * Single-use same-process admission handoff token (2026-09-09 review
+   * completion blocker: "a scheduled stage action must dispatch, or must not
+   * consume its schedule"). Set only by a caller that already holds live
+   * durable admission for this exact task and wants THIS dispatch to run
+   * under it — currently `scheduleTaskResume.ts`'s `fire()`. Never set by a
+   * UI surface (tree buttons, command palette, keyboard shortcut), so an
+   * interactive invocation always takes the plain paused-refusal path below.
+   * Forwarded into whichever downstream stage command this function
+   * dispatches, so that command's own admission acquisition can adopt the
+   * caller's marker (`acquireOrAdoptWorkAdmissionV1`) instead of racing a
+   * fresh genesis against it and refusing `busy` — the exact self-block that
+   * used to make `fire()` silently consume a schedule without dispatching
+   * anything.
+   */
+  admissionHandoffTokenV1?: string;
+};
 
 /**
  * Routes the keyboard shortcut and other generic "current stage action"
@@ -27,12 +47,19 @@ type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
  *   checks and produce the report; fixing is the separate second action)
  * - High-Level Review -> applyHighLevelReviewChanges (if artifact exists)
  * - Low-Level Review  -> applyLowLevelReviewChanges (if artifact exists)
+ *
+ * Returns whether a downstream stage command was actually dispatched (`true`)
+ * or this call refused before dispatching anything (`false` — no task
+ * resolved, still paused, model not configured, unknown stage, no review
+ * artifact yet). `scheduleTaskResume.ts`'s `fire()` reads this to decide
+ * whether a fired schedule may be safely cleared or must be restored
+ * (2026-09-09 review completion blocker).
  */
 export async function applyCurrentStageAction(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ApplyArg
-): Promise<void> {
+): Promise<boolean> {
   assertLegacyAiRouteAllowedV0("applyCurrentStage.v1");
   // Block on the startup gate's classification pass before this command's
   // first task-state read (plan §1.4). Runs after the synchronous route gate
@@ -49,14 +76,29 @@ export async function applyCurrentStageAction(
     NotificationRouter.showWarning(
       "No active task found. Create or resume a task first."
     );
-    return;
+    return false;
   }
 
   if (resolvedTask.progress.status === "paused") {
-    NotificationRouter.showWarning(
-      "Task is paused. Resume it before using this shortcut."
-    );
-    return;
+    // A caller-presented handoff token means the caller (currently only
+    // `scheduleTaskResume.ts`'s `fire()`) already holds live durable
+    // admission for this exact task — proof this dispatch is exactly the
+    // work a watchdog pause complained was silently missing. Reconcile
+    // (never a user/quota pause — see that function's own doc comment)
+    // before falling back to the plain refusal below, so a resumed-then-
+    // immediately-re-paused race can't defeat a caller that already proved
+    // it is doing the work.
+    const stillPaused = explicitArg?.admissionHandoffTokenV1
+      ? (await reconcileWatchdogPauseAgainstAdmissionV1(
+          vscode.Uri.file(resolvedTask.taskFolderPath)
+        )).outcome !== "reversed"
+      : true;
+    if (stillPaused) {
+      NotificationRouter.showWarning(
+        "Task is paused. Resume it before using this shortcut."
+      );
+      return false;
+    }
   }
 
   const stage = resolvedTask.progress.currentStage;
@@ -70,7 +112,7 @@ export async function applyCurrentStageAction(
       stage
     ))
   ) {
-    return;
+    return false;
   }
 
   const execute = async (command: string): Promise<void> => {
@@ -80,17 +122,18 @@ export async function applyCurrentStageAction(
       task: {
         progress: resolvedTask.progress,
       },
+      admissionHandoffTokenV1: explicitArg?.admissionHandoffTokenV1,
     });
   };
 
   if (stage === "desc") {
     await execute("vs-code-ai-helper.draftTaskWithAI");
-    return;
+    return true;
   }
 
   if (stage === "plan") {
     await execute("vs-code-ai-helper.generatePlanWithAI");
-    return;
+    return true;
   }
 
   if (stage === "impl") {
@@ -128,15 +171,15 @@ export async function applyCurrentStageAction(
             ? "impl-high-review"
             : "impl-low-review",
       });
-      return;
+      return true;
     }
     await execute("vs-code-ai-helper.runImplementationWithAI");
-    return;
+    return true;
   }
 
   if (stage === "publish") {
     await execute("vs-code-ai-helper.runPublishChecks");
-    return;
+    return true;
   }
 
   if (stage === "plan-high-review") {
@@ -149,15 +192,15 @@ export async function applyCurrentStageAction(
       try {
         await vscode.workspace.fs.stat(artifactUri);
         await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
-        return;
+        return true;
       } catch {
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
-        return;
+        return false;
       }
     }
-    return;
+    return false;
   }
 
   if (stage === "plan-low-review") {
@@ -170,15 +213,15 @@ export async function applyCurrentStageAction(
       try {
         await vscode.workspace.fs.stat(artifactUri);
         await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
-        return;
+        return true;
       } catch {
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );
-        return;
+        return false;
       }
     }
-    return;
+    return false;
   }
 
   if (stage === "impl-high-review") {
@@ -191,15 +234,15 @@ export async function applyCurrentStageAction(
       try {
         await vscode.workspace.fs.stat(artifactUri);
         await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
-        return;
+        return true;
       } catch {
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
-        return;
+        return false;
       }
     }
-    return;
+    return false;
   }
 
   if (stage === "impl-low-review") {
@@ -212,16 +255,18 @@ export async function applyCurrentStageAction(
       try {
         await vscode.workspace.fs.stat(artifactUri);
         await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
-        return;
+        return true;
       } catch {
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );
-        return;
+        return false;
       }
     }
-    return;
+    return false;
   }
+
+  return false;
 }
 
 /**

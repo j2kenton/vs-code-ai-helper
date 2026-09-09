@@ -83,7 +83,7 @@
     },
     {
       "file": "src/commands/generatePlanWithAI.ts",
-      "line": 689,
+      "line": 722,
       "reason": "Synchronous pre-dispatch gate inline in the user-invoked Generate Plan command when no model is configured for the Plan stage — points to Ensemble Settings, not a review/round decision."
     },
     {

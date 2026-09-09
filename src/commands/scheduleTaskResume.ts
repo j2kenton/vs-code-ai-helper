@@ -36,8 +36,10 @@ import {
 } from "../utils/taskWatchdogV1";
 import {
   acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
+  revokeWorkAdmissionHandoffV1,
   withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
 
@@ -189,23 +191,60 @@ export class TaskActionScheduler implements vscode.Disposable {
         // timer is pending. Only the lease owner that cleared its own
         // schedule may run.
         if (clearedByThisOwner && stageStillCurrent) {
+          // 2026-09-09 review completion blocker ("scheduled firing does not
+          // dispatch-or-retain"): a thrown exception was the ONLY signal this
+          // used to treat as "dispatch failed, restore the schedule" —
+          // `applyCurrentStageAction` refusing normally (the task is still
+          // paused — `scheduleQuotaResumeAtV1` deliberately allows arming a
+          // schedule against a paused task — or a downstream stage command
+          // observed this call's own held admission marker as `busy` and
+          // refused without dispatching) never threw, so the schedule was
+          // silently consumed with nothing having run. `applyCurrentStageAction`
+          // now reports back whether it actually dispatched a downstream
+          // action; anything else — a thrown error OR a `false`/non-boolean
+          // return — is treated identically: restore, warn, retry later.
+          //
+          // The handoff token also closes the self-block half of that same
+          // gap: this admission marker is held for the WHOLE call below (see
+          // `withWorkAdmissionV1`'s wrapping above), so a downstream stage
+          // command that itself acquires admission (`generatePlanWithAI`,
+          // `runImplementationWithAI`) would otherwise observe this marker as
+          // an unrelated live admission and refuse `busy` — exactly the
+          // "self-blocking admission" reproduction from the review. Presenting
+          // the token lets that downstream acquisition ADOPT this same marker
+          // instead (`acquireOrAdoptWorkAdmissionV1`), mirroring
+          // `resumeTask.ts`'s `resumeThenDispatchV1`.
+          const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
+          let dispatched = false;
+          let failureMessage: string | undefined;
           try {
-            await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", { canonicalId, taskFolderPath });
+            dispatched = (await vscode.commands.executeCommand<boolean>(
+              "vs-code-ai-helper.applyCurrentStageAction",
+              { canonicalId, taskFolderPath, admissionHandoffTokenV1: handoffToken }
+            )) === true;
           } catch (error) {
-            // Dispatch failed before any downstream mechanism (its own round
-            // ledger row, its own admission) could take over protecting the
-            // task. Restore the schedule with its original stage rather than
-            // leaving the task silently unprotected AND with the action it
-            // promised never having run — only when nobody has since created
-            // a different schedule of their own.
+            failureMessage = error instanceof Error ? error.message : String(error);
+          } finally {
+            revokeWorkAdmissionHandoffV1(taskFolderPath);
+          }
+          if (!dispatched) {
+            // Dispatch never happened (or failed before any downstream
+            // mechanism — its own round ledger row, its own admission —
+            // could take over protecting the task). Restore the schedule
+            // with its original stage rather than leaving the task silently
+            // unprotected AND with the action it promised never having run —
+            // only when nobody has since created a different schedule of
+            // their own.
             await this.store.patch(vscode.Uri.file(taskFolderPath), current =>
               current.scheduledRun === undefined
                 ? { ...current, scheduledRun: { runAt: expectedRunAt, stage: expectedStage } }
                 : current
             );
-            const message = error instanceof Error ? error.message : String(error);
             NotificationRouter.showWarning(
-              `A scheduled stage action failed to start (${message}); it has been rescheduled and will be retried.`
+              failureMessage
+                ? `A scheduled stage action failed to start (${failureMessage}); it has been rescheduled and will be retried.`
+                : "A scheduled stage action did not start (the task may still be paused, or another action was " +
+                    "already in progress for it); it has been rescheduled and will be retried."
             );
           }
         } else if (clearedByThisOwner) {
