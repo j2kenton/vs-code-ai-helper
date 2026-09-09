@@ -152,18 +152,42 @@ export function isUnrecoverableImplRecoveryV1(
  * short enough to be useful can be outrun by a slower context pack, so the
  * value is a mitigation, not a boundary.
  *
- * Ten minutes cannot be outrun by a setup phase, and still catches every real
- * silent stop observed — those sat idle for hours, not minutes. Detection
- * latency is the cheap side of this trade: a stall noticed ten minutes late
- * costs a little time, while a false pause aborts live work and strands the
- * task, because every dispatch route is gated on the task not being paused.
+ * Ten minutes was the second value tried, on the reasoning that it "cannot be
+ * outrun by a setup phase". **It was, three times in eighteen hours** — raised
+ * to thirty on 2026-09-09 after measuring the real setup duration rather than
+ * estimating it.
  *
- * This remains a mitigation, not the fix. `v1 fixes` item 1 records both real
- * requirements: resume must arrange work rather than leaving a gap, and a
- * command that is starting work must register that intent BEFORE its setup
- * phase, so the sweep can see it.
+ * Every instance was `v1 fixes` running Fast Forward, and every one has the
+ * same signature — the pause lands in the gap, and the killed round's own
+ * context pack appears AFTER it:
+ *
+ *     20:50:59 round ends → 21:04:03 paused → 21:08:59 context-pack.md (43 KB)
+ *     12:05:29 round ends → 12:18:00 paused → 12:27:30 context-pack.md (40 KB)
+ *     12:59:06 round ends → 13:13:00 paused → 13:21:01 context-pack.md (40 KB)
+ *
+ * Consistently ~14 minutes from the previous round ending to the pause, and
+ * ~8 more before the pack lands: a setup phase of roughly 22 minutes on a plan
+ * of this size, writing nothing to `task-progress.json` the whole time. Ten
+ * minutes could not cover it, so the third of a thirty-iteration Fast Forward
+ * run died at iteration 14, and the following two attempts died the same way.
+ *
+ * Thirty minutes covers the measured 22 with margin. It still catches every
+ * real silent stop observed — those sat idle for HOURS, not minutes — and
+ * detection latency remains the cheap side of this trade: a stall noticed
+ * thirty minutes late costs a little time, while a false pause aborts live work
+ * and strands the task, since every dispatch route is gated on not-paused.
+ *
+ * This remains a mitigation, and raising it a third time is evidence that
+ * tuning a timeout is the wrong instrument — it is a race, not a slow task.
+ * `v1 fixes` item 1 holds the real fix (a command registers its intent BEFORE
+ * its setup phase, so the sweep has a positive signal instead of inferring
+ * death from silence), and `v1 fixes 2` item 8 holds the safety net that should
+ * exist regardless: the sweep must consult direct evidence of life — recent
+ * writes in the task folder, a live provider process — before concluding a task
+ * is dead. In all three instances above a 40 KB file was being written in the
+ * task's own directory while the sweep declared it stopped.
  */
-export const STALLED_TASK_QUIET_PERIOD_MS = 10 * 60 * 1000;
+export const STALLED_TASK_QUIET_PERIOD_MS = 30 * 60 * 1000;
 
 export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1): boolean {
   const { progress, taskCanonicalId } = input;
