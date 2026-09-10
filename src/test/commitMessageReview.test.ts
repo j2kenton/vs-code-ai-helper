@@ -319,7 +319,17 @@ function installHarness(
     showErrorMessage: vscode.window.showErrorMessage,
     fsWriteFile: workspaceFs.writeFile,
     fsRename: workspaceFs.rename,
+    fsReadFile: workspaceFs.readFile,
   };
+  // 2026-09-10 review completion blocker (new): commitAndPushTask now
+  // actually consults reconcileWatchdogPauseAgainstAdmissionV1's result,
+  // which reads task-progress.json via vscode.workspace.fs.readFile (not raw
+  // node fs) — the default test stub throws "not implemented" for that call,
+  // which reconciliation correctly treats as "unreadable" and now (correctly)
+  // refuses to continue past. Bridge it to the real file already written to
+  // disk above, so this test's task reads as a normal readable task.
+  workspaceFs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+    fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
 
   (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
     { uri: vscode.Uri.file(repoRoot), name: "root", index: 0 },
@@ -367,6 +377,7 @@ function installHarness(
       vscode.window.showErrorMessage = originals.showErrorMessage;
       workspaceFs.writeFile = originals.fsWriteFile;
       workspaceFs.rename = originals.fsRename;
+      workspaceFs.readFile = originals.fsReadFile;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originals.workspaceFolders;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
@@ -539,7 +550,19 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
       modelSelectionModule.resolveFreshModelForStage = () =>
         Promise.resolve({ modelId: "claude-cli:sonnet" });
       workspaceFs.createDirectory = () => Promise.resolve();
-      workspaceFs.readFile = () => Promise.resolve(new TextEncoder().encode(""));
+      // 2026-09-10 review completion blocker (new): this used to stub EVERY
+      // read as empty, including task-progress.json — commitAndPushTask now
+      // actually consults reconcileWatchdogPauseAgainstAdmissionV1's result,
+      // and an empty/undecodable progress file reads as "unreadable", which
+      // the command now (correctly) refuses to continue past. Fall back to
+      // "" only for a path that genuinely has nothing on disk (e.g. task.md,
+      // this fixture's original target), so task-progress.json — written for
+      // real above — still reads its real content.
+      workspaceFs.readFile = (uri: vscode.Uri) =>
+        fs.promises.readFile(uri.fsPath).then(
+          (buf) => new Uint8Array(buf),
+          () => new TextEncoder().encode("")
+        );
       // commitPushMetadataRowV1's promotion writes the generated metadata to
       // <task-folder>/runs/commit-metadata-<ts>.json via the real (raw-fs,
       // nonrecursive-mkdir) WorkflowFileStoreV1 — independent of the

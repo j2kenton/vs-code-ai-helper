@@ -99,6 +99,21 @@ function installFakeInventory(taskFolderPath: string, canonicalId: string): Task
     workspaceFolder: undefined,
     progress: fixtureTaskProgress(taskFolderPath),
   };
+  // 2026-09-10 review completion blocker (new): commitAndPushTask now
+  // actually consults reconcileWatchdogPauseAgainstAdmissionV1's result
+  // (rather than discarding it) before continuing — that reconciliation does
+  // a real disk read of task-progress.json, independent of this in-memory
+  // fake inventory. Without a real file on disk it reads as "unreadable",
+  // which the command must now correctly treat as "could not confirm the
+  // task is not paused" and refuse — exactly as it should for a real task
+  // whose progress file genuinely can't be read. Writing the same fixture
+  // progress to disk here keeps this test's task in the realistic state a
+  // real task is always in (a persisted progress file always exists).
+  fs.writeFileSync(
+    path.join(taskFolderPath, "task-progress.json"),
+    JSON.stringify(task.progress, null, 2),
+    "utf8"
+  );
   return {
     getTaskById: (id: string) => (id === canonicalId ? task : undefined),
     getVisibleTaskForSuppressedId: () => undefined,
@@ -159,6 +174,18 @@ function installGateHarness(
     { uri: vscode.Uri.file(repoRoot), name: "root", index: 0 },
   ];
 
+  // 2026-09-10 review completion blocker (new): commitAndPushTask now
+  // actually consults reconcileWatchdogPauseAgainstAdmissionV1's result,
+  // which reads task-progress.json via vscode.workspace.fs.readFile (not raw
+  // node fs) — the default test stub throws "not implemented" for that call,
+  // which reconciliation correctly treats as "unreadable" and now (correctly)
+  // refuses to continue past. Bridge it to the real file installFakeInventory
+  // already writes to disk, matching runPublishChecksAdmission.test.ts's
+  // pattern, so this test's task reads as a normal readable, non-paused task.
+  const originalReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile;
+  (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+    fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+
   completionLintModule.runCompletionLint = async (...args: unknown[]): Promise<unknown> => {
     const result = lintResults();
     // Mirror the production contract: runCompletionLint upserts the managed
@@ -196,6 +223,7 @@ function installGateHarness(
       completionLintModule.runCompletionLint = originalRunCompletionLint;
       vscode.window.showWarningMessage = originalShowWarningMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = originalReadFile;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
     },

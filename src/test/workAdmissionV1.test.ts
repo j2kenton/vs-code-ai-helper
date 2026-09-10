@@ -10,6 +10,7 @@ import {
   beginTargetResolutionV1,
   describeWorkAdmissionBlockerV1,
   endTargetResolutionV1,
+  hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionBestEffortV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
@@ -1510,19 +1511,19 @@ void test("hasResolutionInFlightBestEffortV1 reflects begin/end pairing, includi
   try {
     assert.equal(hasResolutionInFlightBestEffortV1(), false);
 
-    beginTargetResolutionV1();
+    void beginTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), true);
 
     // A second, concurrent resolution (a different command in the same
     // window) must keep the gate up until BOTH have ended — nesting must not
     // let the inner end() clear a still-outstanding outer resolution.
-    beginTargetResolutionV1();
+    void beginTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), true);
 
-    endTargetResolutionV1();
+    void endTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), true, "one of two concurrent resolutions ending must not clear the gate");
 
-    endTargetResolutionV1();
+    void endTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), false);
   } finally {
     resetTargetResolutionForTestV1();
@@ -1532,16 +1533,97 @@ void test("hasResolutionInFlightBestEffortV1 reflects begin/end pairing, includi
 void test("endTargetResolutionV1 clamps at zero — an extra end() (e.g. a caller with no matching begin()) never makes the counter negative or 'more ended than begun'", () => {
   resetTargetResolutionForTestV1();
   try {
-    endTargetResolutionV1();
-    endTargetResolutionV1();
+    void endTargetResolutionV1();
+    void endTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), false);
 
-    beginTargetResolutionV1();
+    void beginTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), true);
-    endTargetResolutionV1();
-    endTargetResolutionV1();
+    void endTargetResolutionV1();
+    void endTargetResolutionV1();
     assert.equal(hasResolutionInFlightBestEffortV1(), false);
   } finally {
     resetTargetResolutionForTestV1();
   }
+});
+
+/**
+ * 2026-09-10 review completion blocker (new): the same-process
+ * `resolutionInFlightCountV1` counter above is invisible to a different
+ * window sweeping the same workspace. `beginTargetResolutionV1`'s optional
+ * `taskRootPaths` parameter closes that gap with a real, durable, on-disk
+ * marker per root — this is what `hasDurableResolutionInFlightV1` (the
+ * cross-window counterpart the watchdog sweep also now consults) reads.
+ */
+void test("beginTargetResolutionV1 with root paths publishes a durable marker hasDurableResolutionInFlightV1 observes, released by the matching endTargetResolutionV1", async () => {
+  const root = freshTaskFolder("resolution-in-flight-root");
+  assert.equal(hasDurableResolutionInFlightV1([root]), false);
+
+  const handle = await beginTargetResolutionV1([root]);
+  try {
+    assert.deepEqual(handle.rootPaths, [root]);
+    assert.equal(hasDurableResolutionInFlightV1([root]), true);
+    // A root this call did NOT ask for stays unaffected.
+    assert.equal(hasDurableResolutionInFlightV1([freshTaskFolder("unrelated-root")]), false);
+  } finally {
+    await endTargetResolutionV1(handle);
+  }
+  assert.equal(hasDurableResolutionInFlightV1([root]), false);
+});
+
+void test("beginTargetResolutionV1 root markers are reference-counted per process: the marker survives until every concurrent same-window holder has ended", async () => {
+  const root = freshTaskFolder("resolution-in-flight-refcount");
+  const first = await beginTargetResolutionV1([root]);
+  const second = await beginTargetResolutionV1([root]);
+  try {
+    assert.equal(hasDurableResolutionInFlightV1([root]), true);
+    // Both calls observed (or reused) the same root — the marker directory
+    // holds exactly one marker file, not two, regardless of how many
+    // concurrent resolutions are sharing it.
+    const dir = path.join(root, ADMISSION_DIRNAME_V1);
+    assert.equal(fs.readdirSync(dir).length, 1);
+
+    await endTargetResolutionV1(first);
+    assert.equal(
+      hasDurableResolutionInFlightV1([root]),
+      true,
+      "one of two concurrent resolutions ending must not remove the shared marker"
+    );
+  } finally {
+    await endTargetResolutionV1(second);
+  }
+  assert.equal(hasDurableResolutionInFlightV1([root]), false);
+});
+
+void test("beginTargetResolutionV1 root marker acquisition is best-effort: a root it cannot acquire (already busy) is silently skipped, never thrown", async () => {
+  const root = freshTaskFolder("resolution-in-flight-busy-root");
+  const otherOwner = await acquireWorkAdmissionV1({
+    taskFolderPath: root,
+    purpose: "admission",
+    commandId: "unrelated-admission-holder",
+  });
+  assert.equal(otherOwner.outcome, "acquired");
+  try {
+    const handle = await beginTargetResolutionV1([root]);
+    try {
+      // The root marker was already held by an unrelated real admission
+      // acquisition (a normal per-task marker, not another resolution) — this
+      // call must not have been granted its own, and must not throw.
+      assert.deepEqual(handle.rootPaths, []);
+    } finally {
+      await endTargetResolutionV1(handle);
+    }
+    // The other owner's marker must be untouched by the failed attempt.
+    assert.equal(hasDurableResolutionInFlightV1([root]), true);
+  } finally {
+    if (otherOwner.outcome === "acquired") {
+      await otherOwner.handle.release();
+    }
+  }
+});
+
+void test("beginTargetResolutionV1's durable root marker path is classified workflowControl", () => {
+  const root = freshTaskFolder("resolution-in-flight-classification");
+  const markerPath = path.join(root, ADMISSION_DIRNAME_V1, "admission.some-owner.g1.abc123");
+  assert.equal(classifyWorkflowPathV1(markerPath), "workflowControl");
 });

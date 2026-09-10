@@ -38,11 +38,13 @@ import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
+  hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
   revokeWorkAdmissionHandoffV1,
   withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
@@ -773,7 +775,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     // resolution is in flight in this window, rather than risk pausing the
     // very task that resolution is about to settle on and start work for.
     // See `hasResolutionInFlightBestEffortV1`'s doc comment.
+    //
+    // 2026-09-10 review completion blocker (new): that same-process check
+    // alone is invisible to a DIFFERENT window's sweep — this pass also
+    // consults the durable, cross-window counterpart
+    // (`hasDurableResolutionInFlightV1`) across every task root candidate
+    // this window can see, so a resolution running in ANOTHER window on the
+    // same workspace stands this sweep down too.
     if (hasResolutionInFlightBestEffortV1()) {
+      return;
+    }
+    if (hasDurableResolutionInFlightV1(resolveTaskRootCandidates().map((candidate) => candidate.absolutePath))) {
       return;
     }
     for (const task of this.inventory.getTasks()) {

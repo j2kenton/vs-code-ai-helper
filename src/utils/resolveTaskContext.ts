@@ -75,11 +75,11 @@ export interface ResolveTaskOptions {
    *
    * This hook narrows that span close to its architectural minimum: it fires
    * (awaited) immediately AFTER the ownership/workspace path-safety checks
-   * below have passed, but before the `allowPaused` gate — so a caller can
-   * acquire/upgrade admission for the authoritative target, and reconcile
-   * any watchdog-provenance pause on it, before this function's own
-   * `allowPaused` check would otherwise reject a transiently-paused
-   * resolution outright.
+   * below AND the owning-workspace-folder binding have both passed, but
+   * before the `allowPaused` gate — so a caller can acquire/upgrade admission
+   * for the authoritative target, and reconcile any watchdog-provenance
+   * pause on it, before this function's own `allowPaused` check would
+   * otherwise reject a transiently-paused resolution outright.
    *
    * 2026-09-10 review architectural blocker fix: this used to fire right
    * after step 3 settled on `resolved`, BEFORE the path-existence,
@@ -99,6 +99,17 @@ export interface ResolveTaskOptions {
    * already committed to trusting. It does not eliminate the fundamental
    * fact that `inventory.refresh()` must complete before a brand-new
    * candidate is knowable at all — no synchronous peek can do that.
+   *
+   * 2026-09-10 review architectural blocker fix (narrowed further): the hook
+   * still fired before the final `workspaceFolderUri` binding a few lines
+   * below — a candidate can pass every ownership/containment check above yet
+   * have no matching open workspace folder (e.g. no workspace open, or a
+   * multi-root layout where none of the open roots bind it), in which case
+   * this function returns `undefined` regardless. That binding check is now
+   * computed and validated BEFORE this hook fires, so the hook only ever
+   * runs for a candidate this function is actually going to return —
+   * eliminating the last window where admission could mutate a directory for
+   * a candidate about to be rejected.
    */
   onResolvedCandidate?: (candidate: TaskWithProgress) => Promise<void>;
 }
@@ -557,14 +568,34 @@ export async function resolveTaskContext(
     !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))
   ) return undefined;
 
+  // Resolve and validate the owning workspace folder BEFORE firing the
+  // admission hook below (2026-09-10 review architectural blocker, narrowed
+  // further: the hook used to fire here, before this check — a candidate
+  // that passes every check above can still have no matching open workspace
+  // folder, e.g. no workspace open at all, and the hook's own contract is to
+  // call work admission, whose genesis step touches disk under
+  // `resolved.taskFolderPath`. Firing before this final binding check let
+  // admission mutate a directory for a candidate this function was about to
+  // reject). This computation does not depend on `allowPaused`, so moving it
+  // up costs nothing.
+  const resolvedPersistedOwner = persistedOwner ? normalizeForCompare(path.resolve(persistedOwner)) : undefined;
+  const workspaceFolderUri = resolvedPersistedOwner
+    ? vscode.workspace.workspaceFolders?.map(folder => folder.uri).find(uri => normalizeForCompare(path.resolve(uri.fsPath)) === resolvedPersistedOwner)
+    : resolved.workspaceFolder ?? (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri).find(uri => {
+    const root = path.resolve(uri.fsPath);
+    return isSameOrUnder(resolved.taskFolderPath, root);
+  });
+  if (!workspaceFolderUri) return undefined;
+
   // Fire the admission hook (see `ResolveTaskOptions.onResolvedCandidate`) now
-  // — `resolved` has passed every path-existence, ownership-resolution, and
-  // workspace-containment check above, so it is no longer untrusted input:
-  // this is the earliest point at which acquiring work admission (whose
-  // genesis step touches disk under `resolved.taskFolderPath`) is safe to do
-  // for it. Still fires before the `allowPaused` gate below, so a caller can
-  // reconcile a watchdog-provenance pause before that gate would otherwise
-  // reject a transiently-paused resolution outright.
+  // — `resolved` has passed every path-existence, ownership-resolution,
+  // workspace-containment, AND workspace-folder-binding check above, so it is
+  // no longer untrusted input: this is the earliest point at which acquiring
+  // work admission (whose genesis step touches disk under
+  // `resolved.taskFolderPath`) is safe to do for it. Still fires before the
+  // `allowPaused` gate below, so a caller can reconcile a watchdog-provenance
+  // pause before that gate would otherwise reject a transiently-paused
+  // resolution outright.
   if (options?.onResolvedCandidate) {
     await options.onResolvedCandidate(resolved);
   }
@@ -574,14 +605,6 @@ export async function resolveTaskContext(
     return undefined;
   }
 
-  const resolvedPersistedOwner = persistedOwner ? normalizeForCompare(path.resolve(persistedOwner)) : undefined;
-  const workspaceFolderUri = resolvedPersistedOwner
-    ? vscode.workspace.workspaceFolders?.map(folder => folder.uri).find(uri => normalizeForCompare(path.resolve(uri.fsPath)) === resolvedPersistedOwner)
-    : resolved.workspaceFolder ?? (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri).find(uri => {
-    const root = path.resolve(uri.fsPath);
-    return isSameOrUnder(resolved.taskFolderPath, root);
-  });
-  if (!workspaceFolderUri) return undefined;
   const taskRef = taskRefFromResolved({ canonicalId: resolved.canonicalId, taskFolderPath: resolved.taskFolderPath, workspaceFolder: workspaceFolderUri, metaRoot: resolved.progress.ownership?.metaRoot });
   return {
     taskRef,

@@ -28,8 +28,34 @@ import {
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
+
+/**
+ * Work admission (v1 fixes item 1, Part 1a) needs a task folder path BEFORE
+ * any awaited setup — mirrors `runLintingFixes.ts`'s
+ * `extractSynchronousLintingFolderPathV1`. Only returns a path when one is
+ * known synchronously from the argument (a tree-row invocation or a
+ * resolver-aware caller); a bare canonicalId or no-arg invocation has
+ * nothing to protect until `resolve()` picks a target, so admission is
+ * acquired right after resolution instead, in `renameTaskWithAI` itself.
+ */
+function extractSynchronousRenameFolderPathV1(arg?: TaskArg): string | undefined {
+  if (!arg) {
+    return undefined;
+  }
+  if (arg instanceof TaskNode) {
+    return arg.task.folderUri.fsPath;
+  }
+  return arg.taskFolderPath;
+}
 
 async function resolve(inventory: TaskInventory, arg?: TaskArg) {
   if (arg instanceof TaskNode) {
@@ -344,12 +370,68 @@ export async function renameTaskWithAI(
   inventory: TaskInventory,
   arg?: TaskArg
 ): Promise<void> {
-  // Same activation-barrier contract as renameTask above (plan §1.4).
-  await TaskCreationStartupReconcilerV1.waitUntilReady();
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the startup gate, task resolution, and
+  // consent gate whenever the target folder is known synchronously from
+  // `arg` — mirrors runLintingFixes.ts/draftTaskWithAI.ts. Without this, the
+  // real provider dispatch below (`requestAiNameV1`'s `coordinator.executeAction`)
+  // ran with no durable evidence this task was doing anything, so a watchdog
+  // sweep could pause it mid-run.
+  const earlyFolderPath = extractSynchronousRenameFolderPathV1(arg);
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "renameTaskWithAI",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
 
-  const task = await resolve(inventory, arg);
-  if (!task) return;
-  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  try {
+    // Same activation-barrier contract as renameTask above (plan §1.4).
+    await TaskCreationStartupReconcilerV1.waitUntilReady();
+
+    const task = await resolve(inventory, arg);
+    if (!task) return;
+    if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "admission",
+        commandId: "renameTaskWithAI",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    // Admission is now guaranteed live for this exact target — reverse a
+    // watchdog-provenance pause (never a user pause) before any further
+    // setup, exactly like runReviewWithAI/runLintingFixes.
+    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
 
   const readText = async (fileName: string): Promise<string> => {
     try {
@@ -465,6 +547,9 @@ export async function renameTaskWithAI(
       }
     }
   );
+  } finally {
+    await releaseAdmissionV1();
+  }
 }
 
 export function registerRenameTaskCommands(

@@ -18,7 +18,7 @@ import {
   resolveWorkflowRootTaskName,
 } from "../utils/taskOperations";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
-import { normalizePath } from "../utils/taskRoot";
+import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 import {
   computePublishScopeId,
   invalidatePublishChecksFreshnessStampOnDiskV1,
@@ -217,6 +217,21 @@ export async function runPublishChecks(
   // instead of acting on the current task. `registerRunPublishChecksCommand`
   // and its `extension.ts` call site now pass the shared `currentTaskStore`,
   // matching every other lifecycle command's registration.
+  //
+  // 2026-09-10 review completion blocker (narrowed further): the
+  // resolution-in-flight stand-down (`beginTargetResolutionV1`) used to start
+  // only around the `resolveTaskContext` call further below — AFTER this
+  // early guessed-target admission had already been awaited. The guess can be
+  // wrong (stale cache) or entirely absent (a true no-arg invocation with a
+  // cold current-task-store), and while this await was outstanding the
+  // watchdog was still free to pause whatever the eventual real target turns
+  // out to be, since the same-process stand-down had not begun yet. Starting
+  // it here closes that gap; `endTargetResolutionV1()` (in the inner
+  // `finally` below, once resolution completes) balances this call on every
+  // path, including the early-refusal return immediately below.
+  const targetResolutionHandle = await beginTargetResolutionV1(
+    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
+  );
   const earlyFolderPath =
     extractSynchronousPublishChecksFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, resolverArg, currentTaskStore);
@@ -229,6 +244,7 @@ export async function runPublishChecks(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return dispatched;
   }
@@ -260,13 +276,14 @@ export async function runPublishChecks(
   // 2026-09-10 review completion blocker (narrowed further): per-task
   // admission cannot protect a target that is not yet known — the earlier
   // peek above can miss a refresh-discovered actual target entirely (its
-  // guess predates the refresh that first reveals such a target). Stand the
-  // watchdog's whole pause pass down for the length of this barrier plus
-  // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
-  // (see that pair's doc comment in `workAdmissionV1.ts`), so a task the
-  // command is about to admit and start work on can never be paused
-  // underneath it during this specific gap.
-  beginTargetResolutionV1();
+  // guess predates the refresh that first reveals such a target). The
+  // watchdog's whole pause pass stays stood down (via
+  // `beginTargetResolutionV1`, now called BEFORE the early guessed-target
+  // admission acquisition above — see that call site's own comment) through
+  // this barrier plus resolution below, so a task the command is about to
+  // admit and start work on can never be paused underneath it during this
+  // specific gap. `endTargetResolutionV1()` in the `finally` immediately
+  // below balances that single `beginTargetResolutionV1()` call.
   let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
   try {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
@@ -305,7 +322,7 @@ export async function runPublishChecks(
     onResolvedCandidate: admitCandidateV1,
   }, currentTaskStore);
   } finally {
-    endTargetResolutionV1();
+    await endTargetResolutionV1(targetResolutionHandle);
   }
 
   if (!resolvedTask) {
@@ -342,7 +359,27 @@ export async function runPublishChecks(
   // Admission is now guaranteed live for this exact target — reverse a
   // watchdog-provenance pause (never a user pause) before any further setup,
   // exactly like `runReviewWithAI`/`runLintingFixes`.
-  await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+  //
+  // 2026-09-10 review completion blocker (new): the reconciliation result was
+  // previously discarded — a genuine `userPaused` (a real user pause, not a
+  // watchdog one) or `unreadable` (progress could not be confirmed at all)
+  // outcome must stop this command from continuing into the checks below,
+  // exactly as `completeCommitAndPushTask`'s own first reconciliation already
+  // does. `resolvedTask.progress.status` is only the pre-reconciliation
+  // snapshot and cannot by itself distinguish "genuinely paused right now"
+  // from "was paused by the watchdog and this call just reversed it".
+  const publishReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
+    vscode.Uri.file(resolvedTask.taskFolderPath)
+  );
+  if (
+    publishReconcileOutcome.outcome === "userPaused" ||
+    publishReconcileOutcome.outcome === "unreadable"
+  ) {
+    NotificationRouter.showWarning(
+      "Publish checks are only available for tasks that are not paused. Resume the task first."
+    );
+    return dispatched;
+  }
 
   if (resolvedTask.progress.currentStage !== "publish") {
     NotificationRouter.showWarning(

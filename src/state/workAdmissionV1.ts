@@ -557,30 +557,136 @@ export function hasLiveWorkAdmissionExcludingOwnerV1(taskFolderPath: string, exc
  * synchronous pre-refresh peek could have guessed — has no task folder path
  * to admit until resolution itself, including its own awaited
  * `inventory.refresh()`, has already run). Per-task admission cannot protect
- * a task whose identity is not yet known; this is a coarser, same-process-
- * only stand-down that covers the whole window regardless of which task
- * turns out to be the target, in exchange for pausing the sweep's ENTIRE
- * pass rather than just one task's. Never durable and never consulted
- * cross-window — the setup-phase race this closes is a same-window race
- * (the file watcher and the 5-minute timer both arm the sweep in the same
- * extension host the resolving command is running in), exactly like the
- * `localPendingIntentsV1` gap this mirrors.
+ * a task whose identity is not yet known; this is a coarser same-process
+ * stand-down that covers the whole window regardless of which task turns out
+ * to be the target, in exchange for pausing the sweep's ENTIRE pass rather
+ * than just one task's. The setup-phase race this closes is fundamentally a
+ * same-window race (the file watcher and the 5-minute timer both arm the
+ * sweep in the same extension host the resolving command is running in),
+ * exactly like the `localPendingIntentsV1` gap this mirrors — this counter
+ * alone is never durable and never visible cross-window.
+ *
+ * 2026-09-10 review completion blocker (new): a SECOND window sweeping the
+ * SAME workspace while this window resolves has no way to observe this
+ * in-process counter at all, and could pause a task this window is about to
+ * admit before this window's own `onResolvedCandidate` hook ever runs.
+ * `durableResolutionMarkersV1` below closes that gap with a best-effort
+ * cross-window signal, layered on top of (never replacing) this counter.
  */
 let resolutionInFlightCountV1 = 0;
 
-/** Call before `waitUntilReady()`/`resolveTaskContext` when the eventual
- * target folder path is not yet known synchronously. Always pair with
- * `endTargetResolutionV1()` in a `finally` — see that function's doc
- * comment. */
-export function beginTargetResolutionV1(): void {
-  resolutionInFlightCountV1 += 1;
+/**
+ * Process-local, reference-counted durable admission markers backing the
+ * cross-window half of target resolution — keyed by task ROOT path (e.g. the
+ * `.ensemble` directory itself), never by an individual task folder path,
+ * because the whole point is that no task folder path is known yet. Held at
+ * `<rootPath>/admission-v1/`, a directory distinct from and never contended
+ * by any real per-task admission marker (which always lives one level down,
+ * inside a specific task's own folder).
+ *
+ * Reference-counted per root so that several resolutions running
+ * concurrently IN THIS WINDOW (e.g. Publish checks and Commit/Push triggered
+ * moments apart) share one on-disk marker instead of contending with each
+ * other for it — `purpose: "admission"` always blocks another `admission`
+ * acquisition at the same path, including this module's own, so a second
+ * concurrent `beginTargetResolutionV1` call in this window would otherwise
+ * see its own root marker as `busy`. A DIFFERENT window's concurrent
+ * resolution can still see `busy` here and end up holding no durable marker
+ * of its own — accepted as a rare, narrow residual gap (documented on
+ * `beginTargetResolutionV1` itself): that other window's own
+ * `resolutionInFlightCountV1` still protects ITS sweep, and by the time a
+ * cross-window pause could land, this marker (acquired by whichever window
+ * got there first) is very likely still held, since resolution windows are
+ * short and release only after the acquiring window's own resolution ends.
+ */
+const durableResolutionMarkersV1 = new Map<string, { handle: WorkAdmissionHandleV1; refCount: number }>();
+
+/** Opaque handle returned by `beginTargetResolutionV1`, threaded back into
+ * the matching `endTargetResolutionV1` call so it releases exactly the
+ * durable root markers this call acquired (or reused) — never a different
+ * caller's. */
+export interface TargetResolutionHandleV1 {
+  readonly rootPaths: readonly string[];
 }
 
-/** Ends one `beginTargetResolutionV1()` window. Safe to call more times than
- * `begin` (clamped at zero) so a caller need not track whether `begin` ran on
- * every exit path. */
-export function endTargetResolutionV1(): void {
+/**
+ * Call before `waitUntilReady()`/`resolveTaskContext` when the eventual
+ * target folder path is not yet known synchronously. Always pair with an
+ * awaited `endTargetResolutionV1(handle)` in a `finally`, passing back the
+ * handle this call returns — see that function's doc comment.
+ *
+ * `taskRootPaths` (default: none) are the currently open workspace's task
+ * root candidates (`resolveTaskRootCandidates().map(c => c.absolutePath)`,
+ * computed by the caller — this module stays free of the VS Code API). For
+ * each one, this best-effort acquires (or reuses, if this window already
+ * holds one) a durable admission marker at that root, so a SECOND window's
+ * sweep can observe resolution-in-flight on disk, not just in this process.
+ * A root whose marker could not be acquired (busy, or a real write failure)
+ * is silently skipped — this cross-window signal is pure defense-in-depth
+ * layered on the durable `resolutionInFlightCountV1` bump above, which always
+ * happens synchronously regardless of what happens here, and it must never
+ * block or fail the caller's own resolution.
+ */
+export async function beginTargetResolutionV1(
+  taskRootPaths: readonly string[] = []
+): Promise<TargetResolutionHandleV1> {
+  resolutionInFlightCountV1 += 1;
+  const acquiredRoots: string[] = [];
+  for (const rootPath of taskRootPaths) {
+    const existing = durableResolutionMarkersV1.get(rootPath);
+    if (existing) {
+      existing.refCount += 1;
+      acquiredRoots.push(rootPath);
+      continue;
+    }
+    try {
+      const result = await acquireWorkAdmissionV1({
+        taskFolderPath: rootPath,
+        purpose: "admission",
+        commandId: "resolutionInFlight",
+      });
+      if (result.outcome === "acquired") {
+        durableResolutionMarkersV1.set(rootPath, { handle: result.handle, refCount: 1 });
+        acquiredRoots.push(rootPath);
+      }
+    } catch {
+      // Best-effort — never let a durable-marker failure block resolution.
+    }
+  }
+  return { rootPaths: acquiredRoots };
+}
+
+/**
+ * Ends one `beginTargetResolutionV1()` window: always decrements the
+ * same-process counter (clamped at zero, so a caller need not track whether
+ * `begin` ran on every exit path), and — when `handle` is the value that
+ * call returned — releases this caller's share of each durable root marker,
+ * actually removing it from disk only once every concurrent same-window
+ * holder has released its own share.
+ */
+export async function endTargetResolutionV1(handle?: TargetResolutionHandleV1): Promise<void> {
   resolutionInFlightCountV1 = Math.max(0, resolutionInFlightCountV1 - 1);
+  if (!handle) {
+    return;
+  }
+  for (const rootPath of handle.rootPaths) {
+    const entry = durableResolutionMarkersV1.get(rootPath);
+    if (!entry) {
+      continue;
+    }
+    entry.refCount -= 1;
+    if (entry.refCount <= 0) {
+      durableResolutionMarkersV1.delete(rootPath);
+      try {
+        await entry.handle.release();
+      } catch {
+        // Best-effort — a stuck marker here just means the interim fail-open
+        // policy (module doc comment) stands other windows' sweeps down for
+        // this root until it ages out, never that anything gets paused
+        // wrongly.
+      }
+    }
+  }
 }
 
 /** True while ANY same-process command is between `beginTargetResolutionV1()`
@@ -595,9 +701,27 @@ export function hasResolutionInFlightBestEffortV1(): boolean {
   return resolutionInFlightCountV1 > 0;
 }
 
+/**
+ * Cross-window counterpart to `hasResolutionInFlightBestEffortV1`: true when
+ * ANY task root candidate in `taskRootPaths` has a live durable admission
+ * marker or claim on disk — from THIS window's own `durableResolutionMarkersV1`
+ * (the process-local fast path `hasLiveWorkAdmissionBestEffortV1` already
+ * takes) or, cross-window, one a DIFFERENT window's resolution published.
+ * The watchdog sweep should stand its whole pass down (same as the
+ * same-process check) whenever this is true, so a second window's
+ * in-flight-but-not-yet-per-task-admitted resolution is never paused
+ * underneath it.
+ */
+export function hasDurableResolutionInFlightV1(taskRootPaths: readonly string[]): boolean {
+  return taskRootPaths.some((rootPath) => hasLiveWorkAdmissionBestEffortV1(rootPath));
+}
+
 /** Test-only reset, mirroring this module's other `*ForTestV1` escape
  * hatches — clears the counter between tests regardless of how many
- * begin/end calls a failed assertion left unbalanced. */
+ * begin/end calls a failed assertion left unbalanced. Does not touch
+ * `durableResolutionMarkersV1`: no test exercises non-empty `taskRootPaths`
+ * without pairing its own `begin`/`end` calls, so the map is always empty
+ * between tests already. */
 export function resetTargetResolutionForTestV1(): void {
   resolutionInFlightCountV1 = 0;
 }

@@ -57,6 +57,13 @@ import { resolveMarkdownUpdateTarget as resolveMarkdownUpdateTargetV1 } from "..
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -368,23 +375,145 @@ export async function chatWithStage(
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
-  const validated = await validateChatSendV1(inventory, resolverArg, stage);
-  if (!validated.ok) {
-    NotificationRouter.showWarning(validated.reason);
-    return;
-  }
-  const { task, targetStage } = validated;
-  if (!message?.trim()) {
-    await chatViewProvider.open({
-      canonicalId: task.canonicalId,
-      taskFolderPath: task.taskFolderPath,
-      stage: targetStage,
-      taskName: task.progress.displayName,
-    });
-    return;
-  }
-  if (!(await ensureAiConsent(context))) return;
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE task resolution and the consent gate
+  // whenever a message is actually being sent (an empty message only opens
+  // the chat view — no provider dispatch, nothing to protect) and the target
+  // folder is known synchronously from `explicitArg` — mirrors
+  // runReviewWithAI/runLintingFixes. This route matters more than most: it is
+  // the one stage-action button left reachable on a PAUSED task (see
+  // `registerChatWithStageCommand`'s own comment below on
+  // `respondToStageDecision`), so it must not itself be vulnerable to the
+  // exact setup-phase watchdog race this module exists to close. Chat Resume
+  // of a `chatSend.v1` question is already covered by chatView.ts's own
+  // shared admission acquisition ahead of every resume handler, so only this
+  // direct-invocation path needs its own.
+  const wantsSend = !!message?.trim();
+  const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "chatWithStage",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
+
+  let dispatch: ChatSendDispatchV1 | undefined;
+  try {
+    const validated = await validateChatSendV1(inventory, resolverArg, stage);
+    if (!validated.ok) {
+      NotificationRouter.showWarning(validated.reason);
+      return;
+    }
+    const { task, targetStage } = validated;
+    if (!message?.trim()) {
+      await chatViewProvider.open({
+        canonicalId: task.canonicalId,
+        taskFolderPath: task.taskFolderPath,
+        stage: targetStage,
+        taskName: task.progress.displayName,
+      });
+      return;
+    }
+    if (!(await ensureAiConsent(context))) return;
+
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "admission",
+        commandId: "chatWithStage",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    // Admission is now guaranteed live for this exact target — reverse a
+    // watchdog-provenance pause (never a user pause) before any further
+    // setup, exactly like runReviewWithAI/runLintingFixes.
+    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+
+    dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message);
+  } finally {
+    await releaseAdmissionV1();
+  }
+
+  // Dispatched AFTER admission is released, deliberately: a proposed stage
+  // action (e.g. `applyReviewWithAI` via `executeProposedAction`) acquires
+  // its OWN admission for this same task, and this call site mints no
+  // handoff token for it — so this command's marker must already be gone, or
+  // that downstream acquisition would see it as a live foreign marker and
+  // refuse `busy` against itself.
+  if (dispatch?.proposedAction) {
+    await dispatchProposedStageActionV1(
+      context,
+      inventory,
+      currentTaskStore,
+      chatViewProvider,
+      dispatch.task.taskFolderPath,
+      dispatch.task.canonicalId,
+      dispatch.targetStage,
+      dispatch.proposedAction
+    );
+  }
+  if (dispatch?.proposedBlockerSupersessionEdit) {
+    await dispatchProposedBlockerSupersessionEditV1(
+      chatViewProvider,
+      dispatch.task.taskFolderPath,
+      dispatch.task.canonicalId,
+      dispatch.targetStage,
+      dispatch.proposedBlockerSupersessionEdit,
+      dispatch.proposedBlockerSupersessionEditAt
+    );
+  }
+}
+
+interface ChatSendDispatchV1 {
+  readonly task: ResolvedTaskContext;
+  readonly targetStage: TaskStage;
+  readonly proposedAction: StageChatActionProposal | undefined;
+  readonly proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
+  readonly proposedBlockerSupersessionEditAt: string | undefined;
+}
+
+/**
+ * The actual send: everything that used to run directly inside
+ * `chatWithStage` after the consent gate, unchanged, extracted only so
+ * admission's `finally` (above it, in `chatWithStage`) can wrap it without
+ * also wrapping the proposed-action dispatches that intentionally run AFTER
+ * admission is released (see `chatWithStage`'s own call site). Returns what
+ * to dispatch instead of dispatching it directly, for the same reason.
+ */
+async function chatWithStageSendV1(
+  chatViewProvider: ChatViewProvider,
+  task: ResolvedTaskContext,
+  targetStage: TaskStage,
+  message: string
+): Promise<ChatSendDispatchV1 | undefined> {
   const lockKey = task.taskFolderPath;
   let proposedAction: StageChatActionProposal | undefined;
   let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
@@ -573,28 +702,7 @@ export async function chatWithStage(
     return;
   }
 
-  if (proposedAction) {
-    await dispatchProposedStageActionV1(
-      context,
-      inventory,
-      currentTaskStore,
-      chatViewProvider,
-      task.taskFolderPath,
-      task.canonicalId,
-      targetStage,
-      proposedAction
-    );
-  }
-  if (proposedBlockerSupersessionEdit) {
-    await dispatchProposedBlockerSupersessionEditV1(
-      chatViewProvider,
-      task.taskFolderPath,
-      task.canonicalId,
-      targetStage,
-      proposedBlockerSupersessionEdit,
-      proposedBlockerSupersessionEditAt
-    );
-  }
+  return { task, targetStage, proposedAction, proposedBlockerSupersessionEdit, proposedBlockerSupersessionEditAt };
 }
 
 /**

@@ -42,6 +42,13 @@ import {
 } from "../actions/rows/draftRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
+import {
+  acquireWorkAdmissionV1,
+  describeWorkAdmissionRefusalV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 import {
   buildTaskDocument,
@@ -524,35 +531,99 @@ export async function draftTaskWithAI(
   explicitArg?: DraftTaskArg
 ): Promise<boolean | undefined> {
   assertLegacyAiRouteAllowedV0("draft.v1");
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the consent gate and task resolution
+  // whenever the target folder is known synchronously from `explicitArg` —
+  // mirrors runReviewWithAI/runLintingFixes. Without this, the whole consent
+  // wait (unbounded — a human decision) and the coordinator dispatch below
+  // ran with no durable evidence this task was doing anything, so a watchdog
+  // sweep could pause it mid-run exactly like the resume-trap defect this
+  // module closes elsewhere. No handoff-token adoption is wired here: no
+  // resume-then-dispatch flow currently targets this command directly (Chat
+  // Resume of a `draft.v1` question goes through chatView.ts's own shared
+  // admission acquisition instead, see resumeDraftInteractionV1's caller).
+  const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
+  const early = earlyFolderPath
+    ? await acquireWorkAdmissionV1({
+        taskFolderPath: earlyFolderPath,
+        purpose: "admission",
+        commandId: "draftTaskWithAI",
+      })
+    : undefined;
+  if (early && early.outcome !== "acquired") {
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
-  const resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
-    allowPaused: false,
-  });
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let released = false;
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    if (handle) {
+      await handle.release();
+    }
+  };
 
-  if (!resolvedTask) {
-    NotificationRouter.showInformation(
-      "No active task found at the Task Description stage."
+  try {
+    // ── Consent gate ─────────────────────────────────────────────────────────
+    const consented = await ensureAiConsent(context);
+    if (!consented) {
+      return;
+    }
+
+    const resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
+      allowPaused: false,
+    });
+
+    if (!resolvedTask) {
+      NotificationRouter.showInformation(
+        "No active task found at the Task Description stage."
+      );
+      return;
+    }
+
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        purpose: "admission",
+        commandId: "draftTaskWithAI",
+      });
+      if (late.outcome !== "acquired") {
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    // Admission is now guaranteed live for this exact target — reverse a
+    // watchdog-provenance pause (never a user pause) before any further
+    // setup, exactly like runReviewWithAI/runLintingFixes.
+    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+
+    const lockKey = resolvedTask.taskFolderPath;
+    const result = await runTrackedOperation(
+      lockKey,
+      // TASK_NAME_WRITE_CONFLICT_KEY: description generation never writes the
+      // task's name (handleDraftOutcomeV1 leaves naming to the rename actions),
+      // but it runs under the name captured here, so it must never overlap a
+      // (non-exclusive) rename — the shared key makes begin() refuse whichever
+      // side arrives second, atomically.
+      { label: "Draft Task with AI", stage: "desc", taskName: resolveWorkflowRootTaskName(resolvedTask.progress.displayName ?? resolvedTask.folderName, resolvedTask.taskFolderPath), kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
+      (op) => draftTaskWithAIForResolvedTask(context, chatViewProvider, resolvedTask, op)
     );
-    return;
+    return result?.succeeded || undefined;
+  } finally {
+    await releaseAdmissionV1();
   }
-
-  const lockKey = resolvedTask.taskFolderPath;
-  const result = await runTrackedOperation(
-    lockKey,
-    // TASK_NAME_WRITE_CONFLICT_KEY: description generation never writes the
-    // task's name (handleDraftOutcomeV1 leaves naming to the rename actions),
-    // but it runs under the name captured here, so it must never overlap a
-    // (non-exclusive) rename — the shared key makes begin() refuse whichever
-    // side arrives second, atomically.
-    { label: "Draft Task with AI", stage: "desc", taskName: resolveWorkflowRootTaskName(resolvedTask.progress.displayName ?? resolvedTask.folderName, resolvedTask.taskFolderPath), kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
-    (op) => draftTaskWithAIForResolvedTask(context, chatViewProvider, resolvedTask, op)
-  );
-  return result?.succeeded || undefined;
 }
 
 /**

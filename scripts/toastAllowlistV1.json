@@ -5,17 +5,17 @@
   "entries": [
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 331,
+      "line": 332,
       "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision."
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 1792,
+      "line": 1793,
       "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round."
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 2186,
+      "line": 2187,
       "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push."
     },
     {
@@ -73,12 +73,12 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 416,
+      "line": 545,
       "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision."
     },
     {
       "file": "src/commands/draftTaskWithAI.ts",
-      "line": 374,
+      "line": 381,
       "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision."
     },
     {

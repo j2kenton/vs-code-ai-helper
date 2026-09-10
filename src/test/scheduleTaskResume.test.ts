@@ -772,7 +772,7 @@ void test("armAll's watchdog stands its whole pause pass down while a command el
 
   resetTargetResolutionForTestV1();
   try {
-    beginTargetResolutionV1();
+    await beginTargetResolutionV1();
     try {
       await scheduler.armAll();
       const duringResolution = state.current();
@@ -781,7 +781,7 @@ void test("armAll's watchdog stands its whole pause pass down while a command el
       const escalationDuring = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
       assert.equal(escalationDuring, undefined, "no stalled-task escalation must be posted while the gate is up");
     } finally {
-      endTargetResolutionV1();
+      await endTargetResolutionV1();
     }
 
     // Once resolution ends, the very next sweep must catch the same
