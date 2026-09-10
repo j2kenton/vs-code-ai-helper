@@ -40,6 +40,9 @@ import {
   buildMarkedSandboxCommandV1,
   quotePosixShellArgV1,
   CreateSandboxResultV1,
+  InteractiveSessionHandleV1,
+  InteractiveSessionRequestV1,
+  InteractiveSessionResultV1,
   SandboxClientV1,
   SandboxCommandRequestV1,
   SandboxCommandResultV1,
@@ -250,6 +253,64 @@ export function createLocalDockerSandboxClientV1(
       } catch {
         return "unknown";
       }
+    },
+
+    async createInteractiveSession(
+      request: InteractiveSessionRequestV1
+    ): Promise<InteractiveSessionHandleV1> {
+      const container = docker.getContainer(request.sandboxId);
+      const exec = await container.exec({
+        Cmd: [...request.argv],
+        WorkingDir: request.cwd,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ hijack: true, stdin: true });
+      const stdoutSink = new PassThrough();
+      const stderrSink = new PassThrough();
+      stdoutSink.on("data", (chunk: Buffer) => request.onOutput(chunk.toString("utf8")));
+      stderrSink.on("data", (chunk: Buffer) => request.onOutput(chunk.toString("utf8")));
+      docker.modem.demuxStream(stream, stdoutSink, stderrSink);
+
+      let settle: {
+        resolve: (result: InteractiveSessionResultV1) => void;
+        reject: (error: unknown) => void;
+      };
+      const exited = new Promise<InteractiveSessionResultV1>((resolve, reject) => {
+        settle = { resolve, reject };
+      });
+      stream.on("end", () => {
+        exec
+          .inspect()
+          .then((inspected) => settle.resolve({ exitCode: inspected.ExitCode ?? -1 }))
+          .catch((error: unknown) => settle.reject(error));
+      });
+      stream.on("error", (error: unknown) => settle.reject(error));
+
+      return {
+        sendInput(data: string): Promise<void> {
+          return new Promise<void>((resolve, reject) => {
+            stream.write(data, "utf8", (error) => (error ? reject(error) : resolve()));
+          });
+        },
+        wait(): Promise<InteractiveSessionResultV1> {
+          return exited;
+        },
+        async kill(): Promise<void> {
+          try {
+            const inspected = await exec.inspect();
+            if (inspected.Running && inspected.Pid > 0) {
+              // A hijacked exec stream has no standalone kill call in the
+              // Docker API — signal the process directly via its PID,
+              // visible from the daemon side (same /proc route `top()` uses).
+              await execCaptureV1(docker, request.sandboxId, `kill -TERM ${inspected.Pid} 2>/dev/null || true`);
+            }
+          } finally {
+            stream.end();
+          }
+        },
+      };
     },
   };
 }

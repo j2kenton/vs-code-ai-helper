@@ -144,6 +144,56 @@ export interface SandboxClientV1 {
     sandboxId: string,
     attemptKey: string
   ): Promise<EngineEffectReconcileVerdictV1>;
+  /**
+   * Start a long-running interactive process — distinct from `runCommand`
+   * (which blocks until exit and returns a bounded result): for a process
+   * that prints something and then WAITS for input before it can finish
+   * (the motivating case: a CLI's OAuth device-code login flow — print an
+   * authorize URL, wait for the user to complete it in their own browser
+   * and paste back a code). The caller streams output via `onOutput` and
+   * can send input at any point via the returned handle.
+   *
+   * Deliberately NOT under the Part 4c attempt-record protocol `runCommand`
+   * uses: an interactive session's outcome depends on a human completing
+   * something in the real world within some open-ended window, which does
+   * not fit the crash-safe exactly-once replay model built around
+   * short-lived, fully automated commands. A caller that needs crash-safety
+   * around an interactive step (e.g. "did the user finish logging in
+   * before we crashed?") builds that at a higher level once the session
+   * settles — this method itself carries no idempotency guarantee.
+   *
+   * Optional: implemented for providers with genuine interactive-session
+   * support (Docker via `dockerode`'s exec stdin; E2B and Daytona both
+   * expose background/PTY sessions their own SDKs support). `undefined`
+   * on a client that hasn't implemented it yet.
+   */
+  createInteractiveSession?(
+    request: InteractiveSessionRequestV1
+  ): Promise<InteractiveSessionHandleV1>;
+}
+
+/** One request to start a long-running interactive process inside a sandbox. */
+export interface InteractiveSessionRequestV1 {
+  readonly sandboxId: string;
+  /** Structured argv — element 0 is the program; nothing is shell syntax. */
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  /** Called with each chunk of combined stdout/stderr as it arrives. */
+  readonly onOutput: (chunk: string) => void;
+}
+
+export interface InteractiveSessionResultV1 {
+  readonly exitCode: number;
+}
+
+/** A live, running interactive process inside a sandbox. */
+export interface InteractiveSessionHandleV1 {
+  /** Send data to the process's stdin (as typed, not shell-interpreted). */
+  sendInput(data: string): Promise<void>;
+  /** Settles when the process exits. */
+  wait(): Promise<InteractiveSessionResultV1>;
+  /** Forcefully terminate the process. */
+  kill(): Promise<void>;
 }
 
 /** One recorded execution in the in-memory client's audit ledger. */
