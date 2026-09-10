@@ -49,7 +49,12 @@ import {
   isAuthenticationFailureV1,
 } from "./failureClassificationV1";
 import type { EngineGateMachineryV1 } from "./gateMachineryV1";
-import { buildEngineRoundPromptV1, ENGINE_ROUND_MAX_RESPONSE_BYTES_V1 } from "./providerDispatchV1";
+import {
+  buildEngineRoundPromptV1,
+  ENGINE_ROUND_MAX_RESPONSE_BYTES_V1,
+  engineFailureCodeForKindV1,
+  type EngineCliTransportRunnerV1,
+} from "./providerDispatchV1";
 import { parseAiResultEnvelopeV1 } from "./resultEnvelopeV1";
 import { quotePosixShellArgV1, type SandboxClientV1, type SandboxCommandResultV1 } from "./sandboxClientV1";
 import type {
@@ -80,10 +85,54 @@ export function sandboxCliModeForStageV1(stage: TaskStage): SandboxCliRoundModeV
   return stage === "impl" ? "edit" : "plan";
 }
 
+/**
+ * The extension's `@<effort>` model-suffix ladder for Claude Code
+ * (`CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS` in `providers.ts`),
+ * copied verbatim for the same reason as the system prompt above: a stored
+ * `claude-cli:opus@high` must mean the same flags in both hosts.
+ */
+const CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS_V1: ReadonlyMap<string, number> = new Map([
+  ["low", 1024],
+  ["medium", 4096],
+  ["high", 8192],
+  ["xhigh", 16384],
+  ["max", 32768],
+]);
+
+export interface ParsedSandboxCliModelSelectionV1 {
+  /** The model passed to `--model`; undefined runs the CLI's own default. */
+  readonly model: string | undefined;
+  readonly maxThinkingTokens: number | undefined;
+}
+
+/**
+ * Port of the extension's `parseClaudeCliModelSelection`: an `@<effort>`
+ * suffix from the known ladder becomes `--max-thinking-tokens`; any other
+ * `@` suffix is left on the model name untouched (the CLI decides whether
+ * it means anything), exactly as the extension does.
+ */
+export function parseSandboxCliModelSelectionV1(
+  model: string | undefined
+): ParsedSandboxCliModelSelectionV1 {
+  if (model === undefined || model.length === 0) {
+    return { model: undefined, maxThinkingTokens: undefined };
+  }
+  const separator = model.lastIndexOf("@");
+  if (separator <= 0) {
+    return { model, maxThinkingTokens: undefined };
+  }
+  const maxThinkingTokens = CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS_V1.get(model.slice(separator + 1));
+  if (maxThinkingTokens === undefined) {
+    return { model, maxThinkingTokens: undefined };
+  }
+  return { model: model.slice(0, separator), maxThinkingTokens };
+}
+
 export interface SandboxCliArgvOptionsV1 {
   readonly mode: SandboxCliRoundModeV1;
-  /** Provider-native model id (e.g. `claude-opus-5`); undefined runs the CLI default. */
+  /** Provider-native model id (e.g. `opus`, `claude-opus-5`); undefined runs the CLI default. */
   readonly model?: string;
+  readonly maxThinkingTokens?: number;
   /** The CLI executable; default `claude`. */
   readonly command?: string;
 }
@@ -104,6 +153,9 @@ export function buildClaudeCliArgvV1(options: SandboxCliArgvOptionsV1): readonly
   if (options.model !== undefined && options.model.length > 0) {
     argv.push("--model", options.model);
   }
+  if (options.maxThinkingTokens !== undefined) {
+    argv.push("--max-thinking-tokens", String(options.maxThinkingTokens));
+  }
   return argv;
 }
 
@@ -114,6 +166,12 @@ export interface CreateSandboxCliProviderRunnerOptionsV1 {
   readonly workingDirectoryRoot: string;
   /** This task's gate machinery — the CLI run is an attempt-recorded effect. */
   readonly machinery: EngineGateMachineryV1;
+  /**
+   * The model for plain `invoke` calls (the `EngineProviderRunnerV1` face);
+   * `invokeWithModel` — what dispatch uses — takes the selection's model per
+   * call instead, so one runner serves every stage's own configured model.
+   * Either form accepts the extension's `@<effort>` suffix.
+   */
   readonly model?: string;
   readonly command?: string;
   /**
@@ -179,9 +237,12 @@ export function buildSandboxCliScriptV1(input: {
   );
 }
 
+/** Both faces: the task loop's `invoke`, and dispatch's per-selection `invokeWithModel`. */
+export interface SandboxCliProviderRunnerV1 extends EngineProviderRunnerV1, EngineCliTransportRunnerV1 {}
+
 export function createSandboxCliProviderRunnerV1(
   options: CreateSandboxCliProviderRunnerOptionsV1
-): EngineProviderRunnerV1 {
+): SandboxCliProviderRunnerV1 {
   const { client, sandboxId, workingDirectoryRoot, machinery } = options;
   const scratchDir = (options.scratchDir ?? "/tmp/ensemble-cli").replace(/\/$/, "");
   const maxOutputBytes = options.maxOutputBytes ?? ENGINE_ROUND_MAX_RESPONSE_BYTES_V1;
@@ -200,9 +261,16 @@ export function createSandboxCliProviderRunnerV1(
     return { kind: "failed", code, retryable };
   }
 
-  return {
-    async invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
+  const runner: SandboxCliProviderRunnerV1 = {
+    invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
+      return runner.invokeWithModel(input, options.model);
+    },
+    async invokeWithModel(
+      input: EngineProviderInvocationV1,
+      selectedModel: string | undefined
+    ): Promise<EngineRoundResultV1> {
       const id = input.correlation.attemptId;
+      const selection = parseSandboxCliModelSelectionV1(selectedModel);
       const promptPath = `${scratchDir}/${id}.prompt.md`;
       const outputPath = `${scratchDir}/${id}.out`;
       const stderrPath = `${scratchDir}/${id}.err`;
@@ -217,7 +285,10 @@ export function createSandboxCliProviderRunnerV1(
 
         const argv = buildClaudeCliArgvV1({
           mode: sandboxCliModeForStageV1(input.stage),
-          ...(options.model !== undefined ? { model: options.model } : {}),
+          ...(selection.model !== undefined ? { model: selection.model } : {}),
+          ...(selection.maxThinkingTokens !== undefined
+            ? { maxThinkingTokens: selection.maxThinkingTokens }
+            : {}),
           ...(options.command !== undefined ? { command: options.command } : {}),
         });
         const script = buildSandboxCliScriptV1({
@@ -278,16 +349,11 @@ export function createSandboxCliProviderRunnerV1(
             errorMessage,
             authFailure: isAuthenticationFailureV1(errorMessage),
           });
-          const code =
-            classified.failureKind === "quota"
-              ? "quotaExhausted"
-              : classified.failureKind === "temporarily-unavailable"
-                ? "temporarilyUnavailable"
-                : classified.failureKind === "model-entitlement"
-                  ? "modelEntitlementBlocked"
-                  : classified.authFailure === true
-                    ? "authenticationFailed"
-                    : `cliExit${captured.exitCode}`;
+          const code = engineFailureCodeForKindV1(
+            classified.failureKind,
+            classified.authFailure === true,
+            `cliExit${captured.exitCode}`
+          );
           // Same discipline as the direct-API dispatch: auth never retries,
           // capacity-shaped failures do, anything else is terminal.
           return failed(code, classified.authFailure !== true && classified.failureKind !== "generic");
@@ -323,4 +389,5 @@ export function createSandboxCliProviderRunnerV1(
       }
     },
   };
+  return runner;
 }

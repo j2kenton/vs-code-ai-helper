@@ -28,11 +28,15 @@
  *    invocation's correlation as the expected echo; anything malformed is a
  *    typed retryable failure, never promoted content.
  *
- * The extension's Copilot LM and CLI-transport paths are replaced by the
- * direct-API adapters (`providerAdaptersV1.ts`) per the plan; edit-mode
- * dispatch (workspace-writing runs) is deliberately absent — generated code
- * executes only in the user's sandbox (Part 4d), never via a provider
- * "edit mode" on the engine host.
+ * The extension's Copilot LM path is replaced by the direct-API adapters
+ * (`providerAdaptersV1.ts`) per the plan. Its CLI-transport path has one
+ * counterpart here: a `sandbox-cli` provider (`claude-cli`) dispatches to an
+ * injected `EngineCliTransportRunnerV1` that runs the real CLI INSIDE the
+ * task's sandbox (`sandboxCliRunnerV1.ts`) — never on the engine host, which
+ * is also why edit-mode dispatch exists only there: generated code executes
+ * only in the user's sandbox (Part 4d). A CLI round takes part in the same
+ * chain resolution, runner-entry guard, and quota cascade as an API round;
+ * only the leaf "run this model" step differs.
  */
 import {
   buildAiResultContractPromptV1,
@@ -178,7 +182,73 @@ export function buildEngineRoundPromptV1(input: EngineProviderInvocationV1): str
   return sections.join("\n");
 }
 
+// ─── Failure codes shared by every transport ─────────────────────────────────
+
+/**
+ * The round failure codes that carry capacity/credential meaning across the
+ * dispatch boundary. Both transports report failures with these exact codes
+ * so the cascade decision (`engineFailureKindForCodeV1`) reads the same
+ * whether the round ran through an HTTP adapter or a sandboxed CLI.
+ */
+export const ENGINE_CLASSIFIED_FAILURE_CODES_V1 = {
+  quota: "quotaExhausted",
+  temporarilyUnavailable: "temporarilyUnavailable",
+  modelEntitlement: "modelEntitlementBlocked",
+  authentication: "authenticationFailed",
+} as const;
+
+/** The failure code for a classified provider failure; `genericCode` when it is neither capacity- nor auth-shaped. */
+export function engineFailureCodeForKindV1(
+  failureKind: EngineFailureKindV1,
+  authFailure: boolean,
+  genericCode: string
+): string {
+  switch (failureKind) {
+    case "quota":
+      return ENGINE_CLASSIFIED_FAILURE_CODES_V1.quota;
+    case "temporarily-unavailable":
+      return ENGINE_CLASSIFIED_FAILURE_CODES_V1.temporarilyUnavailable;
+    case "model-entitlement":
+      return ENGINE_CLASSIFIED_FAILURE_CODES_V1.modelEntitlement;
+    case "generic":
+      return authFailure ? ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication : genericCode;
+  }
+}
+
+/** The inverse: which classification a transport-reported code stands for; undefined for any other code. */
+export function engineFailureKindForCodeV1(
+  code: string
+): { readonly failureKind: EngineFailureKindV1; readonly authFailure: boolean } | undefined {
+  switch (code) {
+    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.quota:
+      return { failureKind: "quota", authFailure: false };
+    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.temporarilyUnavailable:
+      return { failureKind: "temporarily-unavailable", authFailure: false };
+    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.modelEntitlement:
+      return { failureKind: "model-entitlement", authFailure: false };
+    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication:
+      return { failureKind: "generic", authFailure: true };
+    default:
+      return undefined;
+  }
+}
+
 // ─── Dispatch ────────────────────────────────────────────────────────────────
+
+/**
+ * The leaf runner for a `sandbox-cli` provider. Unlike an HTTP adapter it
+ * returns a FINISHED round: prompt construction, frame parsing, and failure
+ * classification happen inside it, so the CLI path and the API path parse
+ * the same bytes with the same parser and report the same codes. The model
+ * is the selection's provider-native part (`claude-cli:opus@high` → `opus@high`),
+ * or undefined for the CLI's own default.
+ */
+export interface EngineCliTransportRunnerV1 {
+  invokeWithModel(
+    input: EngineProviderInvocationV1,
+    model: string | undefined
+  ): Promise<EngineRoundResultV1>;
+}
 
 export interface CreateEngineProviderRunnerOptionsV1 {
   /** Settings snapshots — the control plane's per-user settings store. */
@@ -190,6 +260,15 @@ export interface CreateEngineProviderRunnerOptionsV1 {
    */
   getProviderApiKey(provider: EngineProviderIdV1): string | undefined;
   readonly adapters: ReadonlyMap<EngineProviderIdV1, EngineModelProviderAdapterV1>;
+  /**
+   * The runner for a `sandbox-cli` provider, resolved per call because it is
+   * bound to the task's sandbox (which may not exist yet, or any more).
+   * Absent — or returning undefined — a CLI selection fails the round with
+   * `cliRunnerUnavailable`, a terminal (non-cascading) failure: routing
+   * around a missing sandbox to an API-keyed backup would silently change
+   * who pays for the round.
+   */
+  cliRunnerFor?(provider: EngineProviderIdV1): EngineCliTransportRunnerV1 | undefined;
   /** Defaults to a fresh in-memory store (tests / single-process dev). */
   readonly fallbackState?: EngineFallbackStateStoreV1;
   readonly quotaLedger?: EngineQuotaObservationLedgerV1;
@@ -243,6 +322,35 @@ export function createEngineProviderRunnerV1(
           "in Provider Selection. Enable the provider or choose another model.",
       };
     }
+    if (provider.transport === "sandbox-cli") {
+      const cliRunner = options.cliRunnerFor?.(provider.id);
+      if (cliRunner === undefined) {
+        return {
+          kind: "failure",
+          failureKind: "generic",
+          authFailure: false,
+          code: "cliRunnerUnavailable",
+          errorMessage:
+            `${provider.label} runs inside the task's sandbox, and no sandbox is available to this run.`,
+        };
+      }
+      const result = await cliRunner.invokeWithModel(input, model);
+      // The CLI runner already classified its failure; lift the capacity-
+      // and credential-shaped ones back into cascade decisions so a CLI
+      // quota exhaustion spends a backup exactly as an API 429 would.
+      const lifted = result.kind === "failed" ? engineFailureKindForCodeV1(result.code) : undefined;
+      if (result.kind === "failed" && lifted !== undefined) {
+        return {
+          kind: "failure",
+          failureKind: lifted.failureKind,
+          authFailure: lifted.authFailure,
+          code: result.code,
+          errorMessage: `${provider.label} reported ${result.code}`,
+        };
+      }
+      return { kind: "round", result };
+    }
+
     const apiKey = options.getProviderApiKey(provider.id);
     if (apiKey === undefined || apiKey.length === 0) {
       // Credentials problems are terminal for the provider (auth semantics):
@@ -280,16 +388,11 @@ export function createEngineProviderRunnerV1(
         kind: "failure",
         failureKind: classified.failureKind,
         authFailure: invoked.authFailure === true,
-        code:
-          classified.failureKind === "quota"
-            ? "quotaExhausted"
-            : classified.failureKind === "temporarily-unavailable"
-              ? "temporarilyUnavailable"
-              : classified.failureKind === "model-entitlement"
-                ? "modelEntitlementBlocked"
-                : invoked.authFailure === true
-                  ? "authenticationFailed"
-                  : "providerRequestFailed",
+        code: engineFailureCodeForKindV1(
+          classified.failureKind,
+          invoked.authFailure === true,
+          "providerRequestFailed"
+        ),
         errorMessage: invoked.errorMessage,
       };
     }

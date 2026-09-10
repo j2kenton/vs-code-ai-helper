@@ -27,6 +27,7 @@ import {
   buildSandboxCliScriptV1,
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT_V1,
   createSandboxCliProviderRunnerV1,
+  parseSandboxCliModelSelectionV1,
   renderEnvFileV1,
   sandboxCliModeForStageV1,
   SANDBOX_CLI_ROUND_FAILURE_CODES_V1,
@@ -241,4 +242,31 @@ test("recovery outcomes with no captured output fail closed instead of re-runnin
     retryable: true,
   });
   assert.equal(client.executedCommands.length, 0);
+});
+
+test("model selection: the extension's @<effort> suffix becomes --max-thinking-tokens, anything else stays on the name", () => {
+  assert.deepEqual(parseSandboxCliModelSelectionV1(undefined), { model: undefined, maxThinkingTokens: undefined });
+  assert.deepEqual(parseSandboxCliModelSelectionV1(""), { model: undefined, maxThinkingTokens: undefined });
+  assert.deepEqual(parseSandboxCliModelSelectionV1("opus"), { model: "opus", maxThinkingTokens: undefined });
+  assert.deepEqual(parseSandboxCliModelSelectionV1("opus@high"), { model: "opus", maxThinkingTokens: 8192 });
+  assert.deepEqual(parseSandboxCliModelSelectionV1("sonnet@max"), { model: "sonnet", maxThinkingTokens: 32768 });
+  // An unknown suffix is not an effort level: the CLI gets the name verbatim.
+  assert.deepEqual(parseSandboxCliModelSelectionV1("opus@turbo"), { model: "opus@turbo", maxThinkingTokens: undefined });
+  assert.deepEqual(buildClaudeCliArgvV1({ mode: "edit", model: "opus", maxThinkingTokens: 8192 }).slice(-4), [
+    "--model", "opus", "--max-thinking-tokens", "8192",
+  ]);
+});
+
+test("invokeWithModel binds the selection's model per call, overriding the runner's default", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const runner = makeRunner(client, { model: "sonnet" });
+
+  assert.equal((await runner.invokeWithModel(invocation("impl"), "opus@high")).kind, "completed");
+  assert.equal((await runner.invokeWithModel(invocation("impl"), undefined)).kind, "completed");
+  assert.equal((await runner.invoke(invocation("impl"))).kind, "completed");
+
+  const scripts = client.executedCommands.map((command) => command.argv[2] as string);
+  assert.match(scripts[0]!, /'--model' 'opus' '--max-thinking-tokens' '8192'/);
+  assert.equal(scripts[1]!.includes("--model"), false, "an undefined selection runs the CLI default, not the runner default");
+  assert.match(scripts[2]!, /'--model' 'sonnet'/);
 });

@@ -53,6 +53,7 @@ import {
 import {
   createEngineProviderRunnerV1,
   createInMemoryFallbackStateStoreV1,
+  EngineCliTransportRunnerV1,
 } from "../src/providerDispatchV1";
 import { EngineProviderInvocationV1 } from "../src/taskLoopV1";
 import { allocateHex128IdV1 } from "../../ensemble-core/src/actionCorrelationV1";
@@ -710,6 +711,133 @@ test("dispatch: a resumed invocation's prompt carries the user's answers", async
   const prompt = anthropic.invocations[0]!.prompt;
   assert.ok(prompt.includes("User answers to your structured questions"));
   assert.ok(prompt.includes("gamma first"));
+});
+
+// ─── 3b. The sandbox-CLI transport inside the same cascade ──────────────────
+
+type ScriptedCliRound =
+  | { readonly kind: "completed"; readonly markdown: string }
+  | { readonly kind: "failed"; readonly code: string; readonly retryable: boolean };
+
+/** A scripted `EngineCliTransportRunnerV1` recording every (invocation, model) it was handed. */
+function scriptedCliRunner(
+  behavior: (count: number) => ScriptedCliRound
+): EngineCliTransportRunnerV1 & { readonly calls: { readonly model: string | undefined; readonly stage: string }[] } {
+  const calls: { model: string | undefined; stage: string }[] = [];
+  return {
+    calls,
+    invokeWithModel(input, model) {
+      calls.push({ model, stage: input.stage });
+      const scripted = behavior(calls.length);
+      return Promise.resolve(
+        scripted.kind === "completed"
+          ? { kind: "completed", summaryMarkdown: scripted.markdown }
+          : { kind: "failed", code: scripted.code, retryable: scripted.retryable }
+      );
+    },
+  };
+}
+
+function cliRunner(options: {
+  cli: EngineCliTransportRunnerV1 | undefined;
+  anthropic?: ReturnType<typeof scriptedAdapter>;
+  settings: ModelSettings;
+  fallbackState?: ReturnType<typeof createInMemoryFallbackStateStoreV1>;
+}) {
+  const adapters = new Map<EngineProviderIdV1, EngineModelProviderAdapterV1>();
+  if (options.anthropic) {
+    adapters.set("anthropic", options.anthropic);
+  }
+  return createEngineProviderRunnerV1({
+    getModelSettings: () => options.settings,
+    getEnabledProviders: () => undefined,
+    // No key for claude-cli exists anywhere: the CLI's own login pays.
+    getProviderApiKey: (provider) => (provider === "anthropic" ? KEYS.anthropic : undefined),
+    adapters,
+    cliRunnerFor: (provider) => (provider === "claude-cli" ? options.cli : undefined),
+    ...(options.fallbackState !== undefined ? { fallbackState: options.fallbackState } : {}),
+  });
+}
+
+test("dispatch: a claude-cli selection routes to the injected CLI runner with the selection's own model, needing no API key or adapter", async () => {
+  const cli = scriptedCliRunner(() => ({ kind: "completed", markdown: "# done\n" }));
+  const settings: ModelSettings = { impl: { primary: "claude-cli:opus@high", strategy: "never-switch" } };
+
+  const result = await cliRunner({ cli, settings }).invoke(invocation());
+
+  assert.deepEqual(result, { kind: "completed", summaryMarkdown: "# done\n" });
+  assert.deepEqual(cli.calls, [{ model: "opus@high", stage: "impl" }]);
+});
+
+test("dispatch: claude-cli:default hands the CLI runner no model at all (the CLI's own default applies)", async () => {
+  const cli = scriptedCliRunner(() => ({ kind: "completed", markdown: "x" }));
+  for (const primary of ["claude-cli:default", "claude-cli:"]) {
+    cli.calls.length = 0;
+    await cliRunner({ cli, settings: { impl: { primary, strategy: "never-switch" } } }).invoke(invocation());
+    assert.deepEqual(cli.calls, [{ model: undefined, stage: "impl" }], primary);
+  }
+});
+
+test("dispatch: with no CLI runner available, a claude-cli selection fails closed and never cascades to an API-keyed backup", async () => {
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "paid for by an API key" }));
+  const settings: ModelSettings = {
+    impl: { primary: "claude-cli:sonnet", backups: ["anthropic:claude-sonnet-5"], strategy: "switch-to-backup" },
+  };
+  const fallbackState = createInMemoryFallbackStateStoreV1();
+
+  const result = await cliRunner({ cli: undefined, anthropic, settings, fallbackState }).invoke(invocation());
+
+  assert.deepEqual(result, { kind: "failed", code: "cliRunnerUnavailable", retryable: false });
+  assert.equal(anthropic.invocations.length, 0, "a missing sandbox must not silently move the round onto an API key");
+  assert.deepEqual(await fallbackState.read("impl"), { active: false });
+});
+
+test("dispatch: a CLI quota exhaustion cascades to the configured backup exactly as an API 429 does; a CLI auth failure never does", async () => {
+  const settings: ModelSettings = {
+    impl: { primary: "claude-cli:sonnet", backups: ["anthropic:claude-sonnet-5"], strategy: "switch-to-backup" },
+  };
+
+  const exhausted = scriptedCliRunner(() => ({ kind: "failed", code: "quotaExhausted", retryable: true }));
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "# backup\n" }));
+  const fallbackState = createInMemoryFallbackStateStoreV1();
+  const cascaded = await cliRunner({ cli: exhausted, anthropic, settings, fallbackState }).invoke(invocation());
+  assert.deepEqual(cascaded, { kind: "completed", summaryMarkdown: "# backup\n" });
+  assert.equal(anthropic.invocations.length, 1);
+  assert.deepEqual(await fallbackState.read("impl"), { active: true, modelId: "anthropic:claude-sonnet-5" });
+
+  const loggedOut = scriptedCliRunner(() => ({ kind: "failed", code: "authenticationFailed", retryable: false }));
+  const untouched = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
+  const authResult = await cliRunner({ cli: loggedOut, anthropic: untouched, settings }).invoke(invocation());
+  assert.deepEqual(authResult, { kind: "failed", code: "authenticationFailed", retryable: false });
+  assert.equal(untouched.invocations.length, 0, "an expired CLI login must surface, not burn a backup");
+
+  // A CLI failure that is neither capacity- nor credential-shaped is the
+  // round's own verdict: reported as-is, never cascaded.
+  const crashed = scriptedCliRunner(() => ({ kind: "failed", code: "cliExit2", retryable: false }));
+  const alsoUntouched = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
+  assert.deepEqual(await cliRunner({ cli: crashed, anthropic: alsoUntouched, settings }).invoke(invocation()), {
+    kind: "failed",
+    code: "cliExit2",
+    retryable: false,
+  });
+  assert.equal(alsoUntouched.invocations.length, 0);
+});
+
+test("dispatch: an API primary's quota exhaustion can cascade INTO a claude-cli backup, which then becomes the sticky route", async () => {
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "quota" }));
+  const cli = scriptedCliRunner(() => ({ kind: "completed", markdown: "# via the sandbox CLI\n" }));
+  const settings: ModelSettings = {
+    impl: { primary: "anthropic:claude-sonnet-5", backups: ["claude-cli:opus"], strategy: "switch-to-backup" },
+  };
+  const fallbackState = createInMemoryFallbackStateStoreV1();
+  const dispatch = cliRunner({ cli, anthropic, settings, fallbackState });
+
+  assert.deepEqual(await dispatch.invoke(invocation()), { kind: "completed", summaryMarkdown: "# via the sandbox CLI\n" });
+  assert.deepEqual(await fallbackState.read("impl"), { active: true, modelId: "claude-cli:opus" });
+
+  await dispatch.invoke(invocation());
+  assert.equal(anthropic.invocations.length, 1, "the sticky route must skip the exhausted primary");
+  assert.deepEqual(cli.calls.map((call) => call.model), ["opus", "opus"]);
 });
 
 // ─── 4. HTTP adapters ────────────────────────────────────────────────────────

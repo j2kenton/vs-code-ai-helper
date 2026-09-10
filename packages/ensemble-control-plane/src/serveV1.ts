@@ -30,15 +30,23 @@
  *    so `task-owned-ephemeral` bindings are acquired and reclaimed rather
  *    than orphaned.
  *
- * STILL MISSING, DELIBERATELY: nothing here turns a completed round's
- * `summaryMarkdown` into actual file changes or sandbox commands — that
- * bridge (provider output → `EngineFileChangeV1[]` → the gate machinery)
- * does not exist anywhere in this repo yet, is a real design decision, and
- * is intentionally out of scope for this composition. A hosted task today
- * will converse, plan, and ask/answer structured questions through a real
- * model, and its sandbox will be acquired and torn down — but no code gets
- * written and no command gets run. Do not describe this deployment as able
- * to "do" the work; it can only "think" about it, so far.
+ * WHAT ACTUALLY DOES WORK depends on the task's model selection:
+ *
+ *  - A direct-API selection (`anthropic:…`, `openai:…`, `google:…`) only
+ *    "thinks": nothing turns a completed round's `summaryMarkdown` into file
+ *    changes or sandbox commands — that bridge (provider output →
+ *    `EngineFileChangeV1[]` → the gate machinery) does not exist in this
+ *    repo, is a real design decision, and is deliberately out of scope here.
+ *  - A `claude-cli:…` selection runs the REAL Claude Code CLI inside the
+ *    task's sandbox for every round (`createSandboxCliProviderRunnerV1`,
+ *    wired through dispatch's `cliRunnerFor`): implementation rounds run in
+ *    the CLI's edit mode and actually write files and run commands there,
+ *    every other stage runs read-only — the same shape as the extension
+ *    running locally, with the CLI's own subscription login inside the
+ *    sandbox (`cliLoginSessionsV1.ts`) paying for it. The runner is bound to
+ *    the task's sandbox context, which is only knowable after key custody
+ *    and source acquisition, so it is resolved per call from a cache this
+ *    wrapper fills (`sandboxContextCache`) — the same shape as model keys.
  *
  * `task-owned-ephemeral` bindings are therefore now ACCEPTED (the
  * `runs === undefined` refusal in controlPlaneServerV1.ts no longer fires),
@@ -58,9 +66,10 @@ import { createRedactingLogSinkV1 } from "../../ensemble-engine/src/logRedaction
 import { createDefaultEngineAdaptersV1 } from "../../ensemble-engine/src/providerAdaptersV1";
 import { ENGINE_PROVIDERS_V1, type EngineProviderIdV1 } from "../../ensemble-engine/src/providerCatalogV1";
 import { createEngineProviderRunnerV1 } from "../../ensemble-engine/src/providerDispatchV1";
+import { createSandboxCliProviderRunnerV1 } from "../../ensemble-engine/src/sandboxCliRunnerV1";
 import { createControlPlaneHandlerV1, createControlPlaneNodeServerV1 } from "./controlPlaneServerV1";
 import { createCliLoginServiceV1 } from "./cliLoginSessionsV1";
-import { createEngineJobSupervisorV1 } from "./engineJobsV1";
+import { createEngineJobSupervisorV1, type EngineJobSupervisorV1 } from "./engineJobsV1";
 import { createEngineRunHostV1, type EngineRunHostV1, type EngineRunOutcomeV1 } from "./engineRunHostV1";
 import {
   createGitHubIdentityValidatorV1,
@@ -78,7 +87,7 @@ import { createSessionServiceV1 } from "./sessionServiceV1";
 import { createSqliteControlPlaneStoreV1 } from "./sqliteStoreV1";
 import { taskModelSettingsV1 } from "./taskModelSettingsV1";
 import type { ControlPlaneStoreV1, ControlPlaneTaskRecordV1 } from "./storeV1";
-import { createWsHubV1, type WsHubV1 } from "./wsHubV1";
+import { createWsHubV1 } from "./wsHubV1";
 import type { EngineLogSinkV1 } from "../../ensemble-engine/src/logRedactionV1";
 
 /** Google's published OIDC endpoints — fixed values, not configuration. */
@@ -158,13 +167,19 @@ export function buildIdentityValidatorsV1(): readonly IdentityValidatorV1[] {
 export interface CreateProductionRunHostOptionsV1 {
   readonly realHost: EngineRunHostV1;
   readonly store: ControlPlaneStoreV1;
-  readonly hub: WsHubV1;
   readonly kekProvider: Parameters<typeof decryptKeyMaterialV1>[0];
   readonly sandboxFactory: SandboxClientFactoryV1;
   /** Shared with `providerRunnerFor`'s closure — see that function's comment. */
   readonly modelKeyCache: Map<string, ReadonlyMap<EngineProviderIdV1, string>>;
-  /** Stable identity of this control-plane worker (gate/attempt lease holder). */
-  readonly workerId: string;
+  /**
+   * Also shared with `providerRunnerFor`: the task's resolved sandbox
+   * context (binding + provider client), filled here before any round runs
+   * and cleared once the run settles, so a `claude-cli` selection can bind
+   * its runner to the sandbox synchronously from inside dispatch.
+   */
+  readonly sandboxContextCache: Map<string, SandboxExecutionContextV1>;
+  /** The gate/attempt machinery source, shared with the CLI runner's per-round effects. */
+  readonly jobSupervisor: EngineJobSupervisorV1;
   readonly log?: EngineLogSinkV1;
 }
 
@@ -187,8 +202,16 @@ export interface CreateProductionRunHostOptionsV1 {
  *    the machinery is a stateless factory over the durable store.
  */
 function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): EngineRunHostV1 {
-  const { realHost, store, hub, kekProvider, sandboxFactory, modelKeyCache: cache, workerId, log } = options;
-  const jobSupervisor = createEngineJobSupervisorV1({ store, hub, workerId });
+  const {
+    realHost,
+    store,
+    kekProvider,
+    sandboxFactory,
+    modelKeyCache: cache,
+    sandboxContextCache,
+    jobSupervisor,
+    log,
+  } = options;
 
   async function prefetchModelKeys(task: ControlPlaneTaskRecordV1): Promise<void> {
     const keys = new Map<EngineProviderIdV1, string>();
@@ -214,13 +237,22 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
   async function sandboxContextFor(
     task: ControlPlaneTaskRecordV1
   ): Promise<SandboxExecutionContextV1 | undefined> {
+    const cached = sandboxContextCache.get(task.taskId);
+    if (cached !== undefined) {
+      return cached;
+    }
     const keyRecord = store.readKeyRecord(task.ownerUserId, `sandbox:${task.binding.provider}`);
     if (keyRecord === undefined) {
       return undefined;
     }
     try {
       const apiKey = await decryptKeyMaterialV1(kekProvider, keyRecord.envelope);
-      return { binding: task.binding, client: sandboxFactory.clientFor(task.binding.provider, apiKey) };
+      const context: SandboxExecutionContextV1 = {
+        binding: task.binding,
+        client: sandboxFactory.clientFor(task.binding.provider, apiKey),
+      };
+      sandboxContextCache.set(task.taskId, context);
+      return context;
     } catch (error) {
       if (error instanceof KeyCustodyUnavailableErrorV1) {
         return undefined;
@@ -264,6 +296,9 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
       return;
     }
     const context = await sandboxContextFor(task);
+    // Whatever happens below, a settled run must not keep a client (and
+    // the decrypted provider key inside it) alive in the cache.
+    sandboxContextCache.delete(task.taskId);
     if (context === undefined) {
       // No key to tear down with — the same key was needed to acquire the
       // source in the first place, so this only happens if it was revoked
@@ -293,6 +328,10 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
       const task = store.readTask(taskId);
       if (task !== undefined) {
         await prefetchModelKeys(task);
+        // Same restart-recovery reasoning for the sandbox context: a
+        // rehydrated run's `claude-cli` rounds need it, and the cache was
+        // lost with the previous process.
+        await sandboxContextFor(task);
       }
       const result = await realHost.submitAnswers(taskId, interactionId, rawAnswers, answerIdempotencyId);
       if (result.ok && task !== undefined) {
@@ -338,8 +377,16 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   // Per-task decrypted model keys, populated by createProductionRunHostV1
   // before each providerRunnerFor(task) call — see that function's own comment.
   const modelKeysByTask = new Map<string, ReadonlyMap<EngineProviderIdV1, string>>();
+  // Per-task sandbox context, same lifecycle and reason — see
+  // CreateProductionRunHostOptionsV1.sandboxContextCache.
+  const sandboxContextsByTask = new Map<string, SandboxExecutionContextV1>();
   const engineAdapters = createDefaultEngineAdaptersV1({ fetch: globalThis.fetch });
   const sandboxFactory = createSdkSandboxClientFactoryV1();
+  const jobSupervisor = createEngineJobSupervisorV1({
+    store,
+    hub,
+    workerId: process.env["ENSEMBLE_WORKER_ID"] ?? randomUUID(),
+  });
 
   function providerRunnerFor(task: ControlPlaneTaskRecordV1): ReturnType<typeof createEngineProviderRunnerV1> {
     return createEngineProviderRunnerV1({
@@ -348,17 +395,33 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
       getEnabledProviders: () => undefined,
       getProviderApiKey: (provider) => modelKeysByTask.get(task.taskId)?.get(provider),
       adapters: engineAdapters,
+      // The real Claude Code CLI, inside this task's sandbox. No env is
+      // handed in on purpose: the CLI authenticates with the login it
+      // persisted in that sandbox, never with a stored API key — a
+      // subscription selection must never silently bill an API key.
+      cliRunnerFor: (provider) => {
+        const context = sandboxContextsByTask.get(task.taskId);
+        if (provider !== "claude-cli" || context === undefined) {
+          return undefined;
+        }
+        return createSandboxCliProviderRunnerV1({
+          client: context.client,
+          sandboxId: context.binding.sandboxId,
+          workingDirectoryRoot: context.binding.workingDirectoryRoot,
+          machinery: jobSupervisor.machineryFor(task.taskId, task.ownerUserId),
+        });
+      },
     });
   }
 
   const runs = createProductionRunHostV1({
     realHost: createEngineRunHostV1({ store, hub, providerRunnerFor }),
     store,
-    hub,
     kekProvider,
     sandboxFactory,
     modelKeyCache: modelKeysByTask,
-    workerId: process.env["ENSEMBLE_WORKER_ID"] ?? randomUUID(),
+    sandboxContextCache: sandboxContextsByTask,
+    jobSupervisor,
     log,
   });
 
@@ -388,7 +451,8 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   log(`  database: ${databasePath}`);
   log(`  cors origins: ${corsOrigins.join(", ")}`);
   log("  engine run host: active — provider dispatch and sandbox source acquisition/teardown wired.");
-  log("    (tasks can think and converse; nothing yet turns a round into file changes/commands.)");
+  log("    claude-cli:* selections run the real Claude Code CLI inside the task's sandbox (edits + commands);");
+  log("    direct-API selections only think — nothing turns their rounds into file changes/commands.");
   return { port, close: (): void => void server.close() };
 }
 

@@ -26,7 +26,7 @@
  * a bounded response-body snippet with any occurrence of the key scrubbed,
  * so a logged failure can never leak a credential.
  */
-import { EngineProviderIdV1, getEngineProviderV1 } from "./providerCatalogV1";
+import { EngineProviderIdV1, getEngineDirectApiProviderV1 } from "./providerCatalogV1";
 import { isModelEntitlementFailureV1 } from "./failureClassificationV1";
 
 /** Minimal fetch shape so tests and hosts can inject their own transport. */
@@ -165,7 +165,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Anthropic Messages API (`POST /v1/messages`). */
 export function createAnthropicAdapterV1(options: CreateAdapterOptionsV1): EngineModelProviderAdapterV1 {
-  const def = getEngineProviderV1("anthropic")!;
+  const def = getEngineDirectApiProviderV1("anthropic");
   const baseUrl = (options.baseUrl ?? def.defaultBaseUrl).replace(/\/$/, "");
   const maxTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS_V1;
   return {
@@ -217,7 +217,7 @@ export function createAnthropicAdapterV1(options: CreateAdapterOptionsV1): Engin
 
 /** OpenAI Chat Completions API (`POST /v1/chat/completions`). */
 export function createOpenAiAdapterV1(options: CreateAdapterOptionsV1): EngineModelProviderAdapterV1 {
-  const def = getEngineProviderV1("openai")!;
+  const def = getEngineDirectApiProviderV1("openai");
   const baseUrl = (options.baseUrl ?? def.defaultBaseUrl).replace(/\/$/, "");
   return {
     providerId: "openai",
@@ -261,7 +261,7 @@ export function createOpenAiAdapterV1(options: CreateAdapterOptionsV1): EngineMo
 
 /** Google Generative Language API (`POST /v1beta/models/{model}:generateContent`). */
 export function createGoogleAdapterV1(options: CreateAdapterOptionsV1): EngineModelProviderAdapterV1 {
-  const def = getEngineProviderV1("google")!;
+  const def = getEngineDirectApiProviderV1("google");
   const baseUrl = (options.baseUrl ?? def.defaultBaseUrl).replace(/\/$/, "");
   return {
     providerId: "google",
