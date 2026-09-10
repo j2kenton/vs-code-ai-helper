@@ -620,10 +620,49 @@ export async function draftTaskWithAI(
       return;
     }
 
+    // 2026-09-10 review completion blocker fix (`d620c877...-2`): this used
+    // to call resolveTaskContext with `allowPaused: false`, which rejects a
+    // watchdog-paused target BEFORE any reconciliation can run — the pause
+    // gate fired first, so a watchdog-provenance pause could never be
+    // reversed and the command simply reported "no active task". Fixed by
+    // passing `allowPaused: true` and doing admission acquisition PLUS
+    // watchdog-pause reconciliation from `onResolvedCandidate`, which
+    // `resolveTaskContext` fires after its own ownership/containment/
+    // workspace-binding checks but BEFORE its `allowPaused` gate. A genuine
+    // user pause is still rejected below, using the reconciliation outcome
+    // captured here rather than the in-memory (pre-reconciliation) status.
+    let reconcileOutcomeCapturedV1: Awaited<ReturnType<typeof reconcileWatchdogPauseAgainstAdmissionV1>> | undefined;
     let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
     try {
       resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
-        allowPaused: false,
+        allowPaused: true,
+        onResolvedCandidate: async (candidate) => {
+          // The early guess above can target the wrong task (a
+          // stale/incorrect raw path) — release it and fall through to the
+          // ordinary late-acquisition path below, which acquires for the
+          // AUTHORITATIVE, now-validated folder.
+          if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+            await releaseCurrentAdmissionV1();
+          }
+          if (!handle) {
+            const late = await acquireWorkAdmissionV1({
+              taskFolderPath: candidate.taskFolderPath,
+              purpose: "admission",
+              commandId: "draftTaskWithAI",
+            });
+            if (late.outcome === "acquired") {
+              handle = late.handle;
+              heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+            }
+          }
+          // Admission is now live for this exact target (best-effort) —
+          // reverse a watchdog-provenance pause (never a user pause) BEFORE
+          // resolveTaskContext's own `allowPaused` gate would otherwise see
+          // the stale in-memory "paused" status and reject outright.
+          reconcileOutcomeCapturedV1 = await reconcileWatchdogPauseAgainstAdmissionV1(
+            vscode.Uri.file(candidate.taskFolderPath)
+          );
+        },
       });
     } finally {
       await endTargetResolutionOnceV1();
@@ -636,44 +675,18 @@ export async function draftTaskWithAI(
       return;
     }
 
-    // The early guess above can target the wrong task (a stale/incorrect
-    // raw path) — release it and fall through to the ordinary
-    // late-acquisition path below, which acquires for the AUTHORITATIVE,
-    // now-validated folder.
-    if (handle && handle.taskFolderPath !== resolvedTask.taskFolderPath) {
-      await releaseCurrentAdmissionV1();
-    }
-
-    if (!handle) {
-      const late = await acquireWorkAdmissionV1({
-        taskFolderPath: resolvedTask.taskFolderPath,
-        purpose: "admission",
-        commandId: "draftTaskWithAI",
-      });
-      if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
-        return;
-      }
-      handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
-    }
-
-    // Admission is now guaranteed live for this exact target — reverse a
-    // watchdog-provenance pause (never a user pause) before any further
-    // setup, exactly like runReviewWithAI/runLintingFixes.
-    //
-    // 2026-09-10 review completion blocker (new): the reconciliation result
-    // was previously discarded — a genuine `userPaused` (a real user pause,
-    // not a watchdog one) or `unreadable` outcome must stop this command
-    // from continuing, exactly as runPublishChecks/completeCommitAndPushTask
-    // already do.
-    const draftReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
-      vscode.Uri.file(resolvedTask.taskFolderPath)
-    );
-    if (draftReconcileOutcome.outcome === "userPaused" || draftReconcileOutcome.outcome === "unreadable") {
+    // A genuine user pause (or an unreadable progress file) must still stop
+    // this command — only a watchdog-provenance pause is reversible, and
+    // that reversal already happened above, before the allowPaused gate.
+    if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
       NotificationRouter.showWarning(
         "Draft Task with AI is only available for tasks that are not paused. Resume the task first."
       );
+      return;
+    }
+
+    if (!handle) {
+      NotificationRouter.showWarning("Could not acquire work admission for this task.");
       return;
     }
 
