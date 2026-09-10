@@ -65,6 +65,38 @@ test('a signed-out caller gets a local typed 401 with no network call', async ()
   assert.equal(requests.length, 0);
 });
 
+test('the in-sandbox CLI sign-in routes: start relays the prompt, code submission carries only the code', async () => {
+  const { requests, fetchImpl } = fakeFetch((request) =>
+    request.url.endsWith('/code')
+      ? json(200, { completed: true, success: true })
+      : json(201, { loginSessionId: 'ls-1', promptOutput: 'visit: https://claude.com/x\nPaste code here > ' })
+  );
+  const client = createControlPlaneClientV1({
+    baseUrl: 'https://cp.example.com',
+    getAccessToken: () => Promise.resolve('token-1'),
+    fetchImpl,
+  });
+
+  const started = await client.startSandboxLogin('docker');
+  assert.equal(started.ok, true);
+  assert.equal(started.ok && started.body.loginSessionId, 'ls-1');
+  assert.equal(requests[0]?.url, 'https://cp.example.com/v1/user-sandbox/login');
+  assert.equal(requests[0]?.method, 'POST');
+  assert.equal(requests[0]?.body, '{"provider":"docker"}');
+  assert.equal(requests[0]?.headers['authorization'], 'Bearer token-1');
+
+  const withRoot = await client.startSandboxLogin('docker', '/workspace');
+  assert.equal(withRoot.ok, true);
+  assert.equal(requests[1]?.body, '{"provider":"docker","workingDirectoryRoot":"/workspace"}');
+
+  const submitted = await client.submitSandboxLoginCode('ls/1', 'abc#state');
+  assert.equal(submitted.ok, true);
+  assert.deepEqual(submitted.ok && submitted.body, { completed: true, success: true });
+  // The session id is path-encoded; the code travels only in the JSON body.
+  assert.equal(requests[2]?.url, 'https://cp.example.com/v1/user-sandbox/login/ls%2F1/code');
+  assert.equal(requests[2]?.body, '{"code":"abc#state"}');
+});
+
 test('auth exchange and refresh do not require a session token', async () => {
   const { requests, fetchImpl } = fakeFetch(() =>
     json(200, {

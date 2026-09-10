@@ -1,6 +1,11 @@
 import React from 'react';
+import { Linking } from 'react-native';
 
-import type { SandboxProviderV1 } from '../api/controlPlaneClientV1';
+import {
+  DOCKER_SANDBOX_PLACEHOLDER_KEY_V1,
+  SANDBOX_PROVIDER_LABELS_V1,
+  type SandboxProviderV1,
+} from '../api/controlPlaneClientV1';
 import {
   Body,
   Card,
@@ -13,20 +18,52 @@ import {
   Title,
   TouchButton,
 } from '../components/primitives';
+import {
+  cliLoginVerdictV1,
+  describeCliLoginVerdictV1,
+  extractCliLoginUrlV1,
+} from '../sandbox/cliLoginPromptV1';
 import { getAppServicesV1 } from '../services/appServicesV1';
 import { useAppStore, type ThemePreference } from '../state/appStore';
 
 const THEME_OPTIONS: ThemePreference[] = ['system', 'light', 'dark'];
-const SANDBOX_PROVIDERS: SandboxProviderV1[] = ['e2b', 'daytona'];
+/** Docker first: the self-hosted, no-account default; the BYOS clouds after. */
+const SANDBOX_PROVIDERS: SandboxProviderV1[] = ['docker', 'e2b', 'daytona'];
 const SIGN_IN_PROVIDERS = ['github', 'google'] as const;
 
 /**
+ * The model id that routes rounds through the Claude Code CLI inside the
+ * sandbox (the engine's `claude-cli` provider) — the bring-your-own-
+ * subscription path. No API key is ever stored for it.
+ */
+const CLAUDE_CLI_MODEL_PROVIDER_V1 = 'claude-cli';
+const CLAUDE_CLI_DEFAULT_MODEL_V1 = 'claude-cli:sonnet';
+
+/**
+ * The in-sandbox CLI sign-in, step by step. Each state is exactly what the
+ * card renders; there is no hidden "loading" flag to fall out of sync.
+ */
+type CliLoginUiStateV1 =
+  | { readonly kind: 'idle' }
+  | { readonly kind: 'starting' }
+  | {
+      readonly kind: 'awaitingCode';
+      readonly loginSessionId: string;
+      readonly url: string | undefined;
+      readonly submitting: boolean;
+      readonly notice: string | null;
+    }
+  | { readonly kind: 'signedIn'; readonly message: string }
+  | { readonly kind: 'failed'; readonly message: string };
+
+/**
  * Settings tab (plan Part 6): sign-in, control-plane connection, sandbox
- * provider selection (E2B/Daytona), API key submission with masked
- * metadata, model configuration, and the gate policy default. Ported from
- * the extension's settings-view semantics (`ensemble.*` keys only). Key
- * material is submitted over TLS to the control plane and NEVER persisted
- * on-device; the list below shows the server's masked hints only.
+ * provider selection (Docker/E2B/Daytona), API key submission with masked
+ * metadata, the in-sandbox Claude Code sign-in, model configuration, and
+ * the gate policy default. Ported from the extension's settings-view
+ * semantics (`ensemble.*` keys only). Key material is submitted over TLS to
+ * the control plane and NEVER persisted on-device; the list below shows the
+ * server's masked hints only.
  */
 export function SettingsScreen(): React.JSX.Element {
   const themePreference = useAppStore((s) => s.themePreference);
@@ -55,9 +92,13 @@ export function SettingsScreen(): React.JSX.Element {
   } | null>(null);
   const [sandboxKeyDraft, setSandboxKeyDraft] = React.useState('');
   const [modelKeyDraft, setModelKeyDraft] = React.useState('');
+  const [cliLogin, setCliLogin] = React.useState<CliLoginUiStateV1>({ kind: 'idle' });
+  const [cliCodeDraft, setCliCodeDraft] = React.useState('');
 
   const services = getAppServicesV1(controlPlaneUrl);
   const signedIn = session.status === 'signedIn';
+  const sandboxProviderLabel = SANDBOX_PROVIDER_LABELS_V1[sandboxProvider];
+  const sandboxEnabled = keyRecords.some((record) => record.keyKind === `sandbox:${sandboxProvider}`);
 
   React.useEffect(() => services.session.onChange(setSession), [services, setSession]);
 
@@ -143,6 +184,89 @@ export function SettingsScreen(): React.JSX.Element {
       message: result.ok ? 'Removed.' : `Could not remove: ${result.message}`,
     });
     await refreshKeyRecords();
+  }
+
+  /**
+   * The bring-your-own-subscription sign-in: the control plane runs the
+   * Claude Code CLI's own login inside THIS user's persistent sandbox and
+   * relays the URL; the user finishes it in their browser and pastes the
+   * code back. Nothing here sees a credential — the CLI keeps what it
+   * receives inside the sandbox, and the server's code-submission reply is
+   * a verdict only (see `SandboxLoginCodeResultDtoV1`).
+   */
+  async function startCliLogin(): Promise<void> {
+    setCliLogin({ kind: 'starting' });
+    setCliCodeDraft('');
+    const started = await services.client.startSandboxLogin(sandboxProvider);
+    if (!started.ok) {
+      setCliLogin({
+        kind: 'failed',
+        message:
+          started.code === 'sandboxProviderKeyMissing'
+            ? `Enable ${sandboxProviderLabel} sandboxes above first.`
+            : started.code === 'userSandboxLoginUnsupported'
+              ? `${sandboxProviderLabel} sandboxes cannot run an interactive sign-in yet — use Docker.`
+              : `Could not start the sign-in: ${started.message}`,
+      });
+      return;
+    }
+    const url = extractCliLoginUrlV1(started.body.promptOutput);
+    setCliLogin({
+      kind: 'awaitingCode',
+      loginSessionId: started.body.loginSessionId,
+      url,
+      submitting: false,
+      notice:
+        url === undefined
+          ? 'The CLI did not print a sign-in link. It may already be signed in, or not be installed in this sandbox.'
+          : null,
+    });
+  }
+
+  async function submitCliLoginCode(): Promise<void> {
+    if (cliLogin.kind !== 'awaitingCode' || cliCodeDraft.trim().length === 0) {
+      return;
+    }
+    const pending = cliLogin;
+    setCliLogin({ ...pending, submitting: true, notice: null });
+    const result = await services.client.submitSandboxLoginCode(pending.loginSessionId, cliCodeDraft.trim());
+    if (!result.ok) {
+      setCliLogin({
+        kind: 'failed',
+        message:
+          result.code === 'loginSessionNotFound'
+            ? 'That sign-in timed out (codes are only valid for a few minutes). Start again.'
+            : `Could not submit the code: ${result.message}`,
+      });
+      return;
+    }
+    const verdict = cliLoginVerdictV1(result.body);
+    const message = describeCliLoginVerdictV1(verdict);
+    if (verdict.kind === 'signedIn') {
+      setCliCodeDraft('');
+      setCliLogin({ kind: 'signedIn', message });
+      if (!modelPrimary.startsWith(`${CLAUDE_CLI_MODEL_PROVIDER_V1}:`)) {
+        // The whole point of signing the sandbox in is to run on it; a
+        // default that still points at an API-keyed model would quietly
+        // keep billing the key instead. Prefill, don't force — the Models
+        // card below stays editable.
+        setModelPrimary(CLAUDE_CLI_DEFAULT_MODEL_V1);
+      }
+    } else if (verdict.kind === 'rejected') {
+      setCliLogin({ kind: 'failed', message });
+    } else {
+      setCliLogin({ ...pending, submitting: false, notice: message });
+    }
+  }
+
+  function openCliLoginUrl(url: string): void {
+    void Linking.openURL(url).catch(() => {
+      setCliLogin((current) =>
+        current.kind === 'awaitingCode'
+          ? { ...current, notice: 'Could not open a browser here — copy the link and open it yourself.' }
+          : current
+      );
+    });
   }
 
   /**
@@ -242,29 +366,115 @@ export function SettingsScreen(): React.JSX.Element {
             onChange={setSandboxProvider}
             options={SANDBOX_PROVIDERS.map((provider) => ({
               value: provider,
-              label: provider === 'e2b' ? 'E2B' : 'Daytona',
+              label: SANDBOX_PROVIDER_LABELS_V1[provider],
             }))}
           />
-          <TextField
-            value={sandboxKeyDraft}
-            onChangeText={setSandboxKeyDraft}
-            placeholder={`${sandboxProvider === 'e2b' ? 'E2B' : 'Daytona'} API key`}
-            secureTextEntry
-            editable={signedIn}
-          />
-          <Row>
-            <TouchButton
-              label="Save sandbox key"
-              disabled={!signedIn || sandboxKeyDraft.length === 0}
-              onPress={() =>
-                void submitKey(`sandbox:${sandboxProvider}`, sandboxKeyDraft, () =>
-                  setSandboxKeyDraft('')
-                )
-              }
-            />
-          </Row>
+          {sandboxProvider === 'docker' ? (
+            <Stack gap={2}>
+              <Body muted>
+                Self-hosted: sandboxes run on your control plane&apos;s own Docker host. No provider
+                account, no API key, nothing metered — bounded only by that machine.
+              </Body>
+              {signedIn && !sandboxEnabled ? (
+                <Row>
+                  <TouchButton
+                    label="Enable Docker sandboxes"
+                    onPress={() =>
+                      void submitKey('sandbox:docker', DOCKER_SANDBOX_PLACEHOLDER_KEY_V1, () => undefined)
+                    }
+                  />
+                </Row>
+              ) : null}
+            </Stack>
+          ) : (
+            <>
+              <TextField
+                value={sandboxKeyDraft}
+                onChangeText={setSandboxKeyDraft}
+                placeholder={`${sandboxProviderLabel} API key`}
+                secureTextEntry
+                editable={signedIn}
+              />
+              <Row>
+                <TouchButton
+                  label="Save sandbox key"
+                  disabled={!signedIn || sandboxKeyDraft.length === 0}
+                  onPress={() =>
+                    void submitKey(`sandbox:${sandboxProvider}`, sandboxKeyDraft, () =>
+                      setSandboxKeyDraft('')
+                    )
+                  }
+                />
+              </Row>
+            </>
+          )}
           {signedIn ? keyStatusFor('sandbox') : (
             <Body muted>Sign in to submit keys.</Body>
+          )}
+        </Stack>
+      </Card>
+
+      <Card>
+        <Stack>
+          <Heading>Claude Code in your sandbox</Heading>
+          <Body muted>
+            Sign the Claude Code CLI in inside your persistent {sandboxProviderLabel} sandbox, on
+            your own Claude subscription. Tasks whose model is `{CLAUDE_CLI_DEFAULT_MODEL_V1}` then
+            run every round through that CLI — editing files and running commands there, exactly
+            as it does on a laptop — with no API key stored anywhere.
+          </Body>
+          {!signedIn ? (
+            <Body muted>Sign in to the control plane first.</Body>
+          ) : cliLogin.kind === 'idle' || cliLogin.kind === 'failed' || cliLogin.kind === 'signedIn' ? (
+            <Stack gap={2}>
+              {cliLogin.kind !== 'idle' ? <Body>{cliLogin.message}</Body> : null}
+              <Row>
+                <TouchButton
+                  label={cliLogin.kind === 'signedIn' ? 'Sign in again' : 'Sign in Claude Code'}
+                  variant={cliLogin.kind === 'signedIn' ? 'secondary' : 'primary'}
+                  disabled={!sandboxEnabled}
+                  onPress={() => void startCliLogin()}
+                />
+              </Row>
+              {!sandboxEnabled ? (
+                <Body muted>{`Enable ${sandboxProviderLabel} sandboxes above first.`}</Body>
+              ) : null}
+            </Stack>
+          ) : cliLogin.kind === 'starting' ? (
+            <Body muted>Starting the CLI sign-in in your sandbox…</Body>
+          ) : (
+            <Stack gap={2}>
+              <Body>1. Open the sign-in link and approve it in your browser.</Body>
+              {cliLogin.url !== undefined ? (
+                <Row>
+                  <TouchButton label="Open sign-in link" onPress={() => openCliLoginUrl(cliLogin.url as string)} />
+                </Row>
+              ) : null}
+              {cliLogin.url !== undefined ? (
+                <TextField value={cliLogin.url} onChangeText={() => undefined} editable={false} />
+              ) : null}
+              <Body>2. Paste the code it shows you here — within a few minutes, before it expires.</Body>
+              <TextField
+                value={cliCodeDraft}
+                onChangeText={setCliCodeDraft}
+                placeholder="Authorization code"
+                editable={!cliLogin.submitting}
+              />
+              <Row>
+                <TouchButton
+                  label={cliLogin.submitting ? 'Submitting…' : 'Submit code'}
+                  disabled={cliLogin.submitting || cliCodeDraft.trim().length === 0}
+                  onPress={() => void submitCliLoginCode()}
+                />
+                <TouchButton
+                  label="Cancel"
+                  variant="secondary"
+                  disabled={cliLogin.submitting}
+                  onPress={() => setCliLogin({ kind: 'idle' })}
+                />
+              </Row>
+              {cliLogin.notice !== null ? <Body muted>{cliLogin.notice}</Body> : null}
+            </Stack>
           )}
         </Stack>
       </Card>
@@ -275,24 +485,33 @@ export function SettingsScreen(): React.JSX.Element {
           <TextField
             value={modelPrimary}
             onChangeText={setModelPrimary}
-            placeholder="provider:model (e.g. anthropic:claude-sonnet-5)"
+            placeholder="provider:model (e.g. claude-cli:sonnet or anthropic:claude-sonnet-5)"
           />
-          <TextField
-            value={modelKeyDraft}
-            onChangeText={setModelKeyDraft}
-            placeholder={`${modelProviderId} API key`}
-            secureTextEntry
-            editable={signedIn}
-          />
-          <Row>
-            <TouchButton
-              label="Save model key"
-              disabled={!signedIn || modelKeyDraft.length === 0}
-              onPress={() =>
-                void submitKey(`model:${modelProviderId}`, modelKeyDraft, () => setModelKeyDraft(''))
-              }
-            />
-          </Row>
+          {modelProviderId === CLAUDE_CLI_MODEL_PROVIDER_V1 ? (
+            <Body muted>
+              Runs through the Claude Code CLI signed in to your sandbox (above). No key to store;
+              the subscription pays. Append an effort level like `claude-cli:opus@high` if you want one.
+            </Body>
+          ) : (
+            <>
+              <TextField
+                value={modelKeyDraft}
+                onChangeText={setModelKeyDraft}
+                placeholder={`${modelProviderId} API key`}
+                secureTextEntry
+                editable={signedIn}
+              />
+              <Row>
+                <TouchButton
+                  label="Save model key"
+                  disabled={!signedIn || modelKeyDraft.length === 0}
+                  onPress={() =>
+                    void submitKey(`model:${modelProviderId}`, modelKeyDraft, () => setModelKeyDraft(''))
+                  }
+                />
+              </Row>
+            </>
+          )}
           {signedIn ? keyStatusFor('model') : null}
         </Stack>
       </Card>

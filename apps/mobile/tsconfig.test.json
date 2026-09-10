@@ -24,6 +24,7 @@
     "src/events/**/*.ts",
     "src/files/**/*.ts",
     "src/log/**/*.ts",
+    "src/sandbox/**/*.ts",
     "src/tasks/**/*.ts",
     "tests/**/*.ts"
   ]

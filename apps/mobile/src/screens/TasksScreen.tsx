@@ -1,12 +1,14 @@
 import React from 'react';
 import { StyleSheet, Text } from 'react-native';
 
-import type {
-  ControlPlaneClientV1,
-  SandboxBindingRequestV1,
-  SandboxProviderV1,
-  TaskDtoV1,
-  TaskRoundDtoV1,
+import {
+  SANDBOX_PROVIDER_LABELS_V1,
+  type ControlPlaneClientV1,
+  type SandboxBindingRequestV1,
+  type SandboxLifecycleV1,
+  type SandboxProviderV1,
+  type TaskDtoV1,
+  type TaskRoundDtoV1,
 } from '../api/controlPlaneClientV1';
 import { Body, Card, Heading, Row, Screen, SegmentedControl, Stack, TextField, Title, TouchButton } from '../components/primitives';
 import { getAppServicesV1 } from '../services/appServicesV1';
@@ -197,7 +199,18 @@ function TaskDetail({ client, taskId, onBack }: TaskDetailProps): React.JSX.Elem
   );
 }
 
-const SANDBOX_PROVIDERS: readonly SandboxProviderV1[] = ['e2b', 'daytona'];
+const SANDBOX_PROVIDERS: readonly SandboxProviderV1[] = ['docker', 'e2b', 'daytona'];
+
+/**
+ * The lifecycle a fresh form starts on. Docker's natural mode is the one
+ * persistent sandbox the control plane keeps per user — that is where a
+ * Claude Code sign-in lives, so a task created there runs on it; an
+ * ephemeral sandbox would start signed out every time. The BYOS clouds keep
+ * their original create-and-destroy default.
+ */
+function defaultLifecycleFor(provider: SandboxProviderV1): SandboxLifecycleV1 {
+  return provider === 'docker' ? 'user-owned-managed' : 'task-owned-ephemeral';
+}
 
 interface TaskCreateFormProps {
   readonly client: ControlPlaneClientV1;
@@ -219,20 +232,31 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
   const [gitRef, setGitRef] = React.useState('main');
   const [attachPath, setAttachPath] = React.useState('');
   const [workingDirectoryRoot, setWorkingDirectoryRoot] = React.useState('/workspace');
-  const [lifecycle, setLifecycle] = React.useState<'task-owned-ephemeral' | 'user-managed-persistent'>(
-    'task-owned-ephemeral'
+  const [lifecycle, setLifecycle] = React.useState<SandboxLifecycleV1>(
+    defaultLifecycleFor(props.defaultProvider)
   );
   const [cleanup, setCleanup] = React.useState<'destroy-on-completion' | 'retain'>(
     'destroy-on-completion'
   );
-  // A workspace you brought is never ours to destroy, and the server enforces
-  // that: `user-managed-persistent` + `destroy-on-completion` is rejected as
-  // sandboxBindingInvalid. Deriving the submitted value from the lifecycle —
-  // rather than leaving the picker's initial 'destroy-on-completion' in place —
-  // is what stops "Attach mine" from failing on every first submission.
-  const effectiveCleanup = lifecycle === 'user-managed-persistent' ? 'retain' : cleanup;
+  // A workspace you brought — or the persistent one kept for you — is never
+  // ours to destroy, and the server enforces that: a persistent lifecycle +
+  // `destroy-on-completion` is rejected as sandboxBindingInvalid. Deriving the
+  // submitted value from the lifecycle — rather than leaving the picker's
+  // initial 'destroy-on-completion' in place — is what stops "Attach mine"
+  // from failing on every first submission.
+  const persistentLifecycle = lifecycle !== 'task-owned-ephemeral';
+  const effectiveCleanup = persistentLifecycle ? 'retain' : cleanup;
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  function selectProvider(next: SandboxProviderV1): void {
+    setProvider(next);
+    // Follow the provider's natural default unless the user already chose a
+    // lifecycle that still makes sense for it.
+    if (lifecycle === defaultLifecycleFor(provider)) {
+      setLifecycle(defaultLifecycleFor(next));
+    }
+  }
 
   async function submit(): Promise<void> {
     const source: SandboxBindingRequestV1['source'] =
@@ -241,7 +265,9 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
         : { kind: 'attachExisting', path: attachPath };
     // sandboxId is submitted only when attaching to a workspace that already
     // exists. For a task-owned sandbox the control plane creates one and
-    // assigns the id, and sending a value here is rejected by the contract.
+    // assigns the id, and for the user's persistent one it resolves the id
+    // from its own record; sending a value in either case is rejected by the
+    // contract.
     const sandboxBinding: SandboxBindingRequestV1 =
       lifecycle === 'user-managed-persistent'
         ? {
@@ -252,13 +278,21 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             lifecycle: 'user-managed-persistent',
             cleanup: effectiveCleanup,
           }
-        : {
-            provider,
-            source,
-            workingDirectoryRoot,
-            lifecycle: 'task-owned-ephemeral',
-            cleanup: effectiveCleanup,
-          };
+        : lifecycle === 'user-owned-managed'
+          ? {
+              provider,
+              source,
+              workingDirectoryRoot,
+              lifecycle: 'user-owned-managed',
+              cleanup: 'retain',
+            }
+          : {
+              provider,
+              source,
+              workingDirectoryRoot,
+              lifecycle: 'task-owned-ephemeral',
+              cleanup: effectiveCleanup,
+            };
     const trimmedName = displayName.trim();
     const trimmedModel = model.trim();
     setSubmitting(true);
@@ -312,10 +346,10 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
           <SegmentedControl
             accessibilityLabel="Sandbox provider"
             value={provider}
-            onChange={setProvider}
+            onChange={selectProvider}
             options={SANDBOX_PROVIDERS.map((option) => ({
               value: option,
-              label: option === 'e2b' ? 'E2B' : 'Daytona',
+              label: SANDBOX_PROVIDER_LABELS_V1[option],
             }))}
           />
           <SegmentedControl
@@ -323,14 +357,20 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             value={lifecycle}
             onChange={setLifecycle}
             options={[
+              { value: 'user-owned-managed', label: 'My sandbox' },
               { value: 'task-owned-ephemeral', label: 'Create for me' },
               { value: 'user-managed-persistent', label: 'Attach mine' },
             ]}
           />
-          {lifecycle === 'task-owned-ephemeral' ? (
+          {lifecycle === 'user-owned-managed' ? (
             <Body muted>
-              A sandbox is created for this task and torn down afterwards. Nothing to set up — you
-              never create one yourself.
+              The one persistent sandbox kept for you per provider — created on first use, reused by
+              every later task, never destroyed. Where your Claude Code sign-in lives (Settings).
+            </Body>
+          ) : lifecycle === 'task-owned-ephemeral' ? (
+            <Body muted>
+              A fresh sandbox is created for this task and torn down afterwards. Nothing to set up —
+              but nothing signed in there either, so use an API-keyed model with it.
             </Body>
           ) : (
             <TextField
@@ -369,16 +409,16 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
               {
                 value: 'destroy-on-completion',
                 label: 'Destroy after',
-                // Not offered for a sandbox you own: the control shows what
-                // will actually be submitted rather than a choice the server
-                // would reject.
-                disabled: lifecycle === 'user-managed-persistent',
+                // Not offered for a sandbox you own or keep: the control
+                // shows what will actually be submitted rather than a choice
+                // the server would reject.
+                disabled: persistentLifecycle,
               },
               { value: 'retain', label: 'Keep' },
             ]}
           />
-          {lifecycle === 'user-managed-persistent' ? (
-            <Body muted>Your own sandbox is always kept — Ensemble never destroys it.</Body>
+          {persistentLifecycle ? (
+            <Body muted>A persistent sandbox is always kept — Ensemble never destroys it.</Body>
           ) : null}
         </Stack>
       </Card>

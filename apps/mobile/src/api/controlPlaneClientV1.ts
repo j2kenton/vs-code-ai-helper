@@ -40,11 +40,32 @@ export interface AuthExchangeRequestV1 {
   readonly nonce?: string;
 }
 
-export type SandboxProviderV1 = 'e2b' | 'daytona';
+/**
+ * `e2b`/`daytona` are BYOS cloud providers (your account, their bill);
+ * `docker` is the self-hosted default — the Docker daemon on the control
+ * plane's own host, no provider account and no API key at all.
+ */
+export type SandboxProviderV1 = 'e2b' | 'daytona' | 'docker';
+
+export const SANDBOX_PROVIDER_LABELS_V1: Readonly<Record<SandboxProviderV1, string>> = {
+  e2b: 'E2B',
+  daytona: 'Daytona',
+  docker: 'Docker',
+};
+
+/**
+ * The control plane requires a stored `sandbox:<provider>` key before it will
+ * touch that provider. Docker has no credential, but the server keeps the rule
+ * uniform (the key exists, its value is ignored) so "enabling" Docker is one
+ * PUT of this placeholder — see the Settings screen's Docker card.
+ */
+export const DOCKER_SANDBOX_PLACEHOLDER_KEY_V1 = 'local-docker-daemon';
 
 export type SandboxSourceAcquisitionV1 =
   | { readonly kind: 'gitClone'; readonly repoUrl: string; readonly ref: string }
   | { readonly kind: 'attachExisting'; readonly path: string };
+
+export type SandboxLifecycleV1 = 'task-owned-ephemeral' | 'user-managed-persistent' | 'user-owned-managed';
 
 /**
  * The SandboxBinding request shape (Part 3): validated server-side.
@@ -52,7 +73,11 @@ export type SandboxSourceAcquisitionV1 =
  * `sandboxId` is conditional on lifecycle, mirroring the contract. A
  * task-owned sandbox does not exist when the binding is submitted — the
  * control plane creates it and assigns the id — so sending one is rejected;
- * only an attached, user-managed workspace has an id to name.
+ * only an attached, user-managed workspace has an id to name. A
+ * `user-owned-managed` binding names no id either: the control plane keeps
+ * ONE persistent sandbox per (user, provider), creates it on first use, and
+ * reuses it for every later task — which is what keeps a CLI login inside it
+ * (see `startSandboxLogin`) valid across tasks.
  *
  * NOTE: this duplicates `@ensemble/contract`'s type rather than importing it.
  * The app declares no dependency on the contract package, so the two shapes
@@ -75,7 +100,39 @@ export type SandboxBindingRequestV1 =
       readonly workingDirectoryRoot: string;
       readonly lifecycle: 'user-managed-persistent';
       readonly cleanup: 'destroy-on-completion' | 'retain';
+    }
+  | {
+      readonly provider: SandboxProviderV1;
+      readonly source: SandboxSourceAcquisitionV1;
+      readonly workingDirectoryRoot: string;
+      readonly lifecycle: 'user-owned-managed';
+      /** A persistent sandbox is never destroyed; the server rejects anything else. */
+      readonly cleanup: 'retain';
+      readonly sandboxId?: undefined;
     };
+
+/**
+ * `POST /v1/user-sandbox/login`: the control plane starts the Claude Code
+ * CLI's own sign-in INSIDE the caller's persistent sandbox and relays what it
+ * printed — an authorization URL and a "paste code here" prompt. The user
+ * completes it in their own browser, on their own subscription; the app only
+ * ever carries the URL out and the code back.
+ */
+export interface SandboxLoginStartDtoV1 {
+  readonly loginSessionId: string;
+  /** Raw terminal output, control sequences included — see cliLoginPromptV1. */
+  readonly promptOutput: string;
+}
+
+/**
+ * `POST /v1/user-sandbox/login/:id/code`. `completed: false` means the CLI
+ * was still working when the server stopped watching; by design the body
+ * never carries the CLI's output after the code (it may contain credential
+ * material), only this verdict.
+ */
+export type SandboxLoginCodeResultDtoV1 =
+  | { readonly completed: false }
+  | { readonly completed: true; readonly success: boolean };
 
 export interface TaskDtoV1 {
   readonly taskId: string;
@@ -231,6 +288,17 @@ export interface ControlPlaneClientV1 {
   putKey(keyKind: string, key: string): Promise<ApiResultV1<undefined>>;
   deleteKey(keyKind: string): Promise<ApiResultV1<undefined>>;
 
+  /** Start the CLI sign-in inside the caller's persistent sandbox for `provider`. */
+  startSandboxLogin(
+    provider: SandboxProviderV1,
+    workingDirectoryRoot?: string
+  ): Promise<ApiResultV1<SandboxLoginStartDtoV1>>;
+  /** Hand the pasted authorization code to the waiting CLI. */
+  submitSandboxLoginCode(
+    loginSessionId: string,
+    code: string
+  ): Promise<ApiResultV1<SandboxLoginCodeResultDtoV1>>;
+
   listFiles(taskId: string, path: string): Promise<ApiResultV1<readonly FileEntryDtoV1[]>>;
   getFile(taskId: string, path: string): Promise<ApiResultV1<FileContentDtoV1>>;
   getDiff(taskId: string, gateId?: string): Promise<ApiResultV1<{ readonly unifiedDiff: string }>>;
@@ -344,6 +412,18 @@ export function createControlPlaneClientV1(
     putKey: (keyKind, key) =>
       call('PUT', `/v1/keys/${encodePath(keyKind)}`, { body: { key } }),
     deleteKey: (keyKind) => call('DELETE', `/v1/keys/${encodePath(keyKind)}`),
+
+    startSandboxLogin: (provider, workingDirectoryRoot) =>
+      call('POST', '/v1/user-sandbox/login', {
+        body: {
+          provider,
+          ...(workingDirectoryRoot !== undefined ? { workingDirectoryRoot } : {}),
+        },
+      }),
+    submitSandboxLoginCode: (loginSessionId, code) =>
+      call('POST', `/v1/user-sandbox/login/${encodePath(loginSessionId)}/code`, {
+        body: { code },
+      }),
 
     listFiles: (taskId, path) =>
       call('GET', `/v1/tasks/${encodePath(taskId)}/files?path=${encodePath(path)}`),
