@@ -17,48 +17,68 @@
  * throwaway, since a generated one would decrypt nothing on the next boot and
  * would look like data loss.
  *
- * DELIBERATELY OMITTED: the engine run host (`runs`). It requires a
- * `providerRunnerFor` — the component that actually invokes a model for a task
- * — and wiring that is a separate composition problem with its own credentials
- * and failure modes. Without it the handler is store-only, exactly as its own
- * documentation describes: sign-in, key custody, task records, bindings,
- * gates, files and the WebSocket stream all work; creating a task does not
- * start a run. That is the correct first milestone, and the gap is explicit
- * rather than hidden behind a half-wired runner.
+ * THE ENGINE RUN HOST (`runs`) IS WIRED, with two distinct halves:
  *
- * THIS NOW COSTS REAL MONEY, which it did not when the omission was written.
- * A `task-owned-ephemeral` binding makes task creation ALLOCATE a sandbox at
- * the user's provider. With no run host, nothing subsequently drives that task:
- * the git source is never acquired, the task stays `creating` forever, and
- * `teardownTaskSandboxV1` — which is what honours `destroy-on-completion` — has
- * no production caller, so the sandbox is never destroyed. Each task created
- * against this composition therefore leaves one billable sandbox running until
- * the user kills it in their provider's dashboard.
+ *  - Provider dispatch (the "thinking" half — producing plans, summaries and
+ *    questions via a real model) is fully composed: `createEngineRunHostV1`
+ *    over `createEngineProviderRunnerV1`, real Anthropic/OpenAI/Google
+ *    adapters, and per-task model-key custody. A created task now actually
+ *    runs rounds, exactly as `tests/engineRunHost.test.ts`'s "Part 9 round
+ *    trip" proves end to end through this same handler shape.
+ *  - Sandbox source acquisition and teardown (`acquireTaskSourceV1` /
+ *    `teardownTaskSandboxV1`) are wired too, around `start`/`submitAnswers`,
+ *    so `task-owned-ephemeral` bindings are acquired and reclaimed rather
+ *    than orphaned.
  *
- * So this composition REFUSES a `task-owned-ephemeral` binding outright
- * (422 sandboxBindingInvalid, explaining why) rather than allocating something
- * it cannot drive or reclaim. `user-managed-persistent` is unaffected and is
- * the working path here: it allocates nothing, and the sandbox is already
- * yours. Set `ENSEMBLE_ALLOW_UNMANAGED_SANDBOXES=1` to allocate anyway, and
- * accept that every created task leaves a billable sandbox to destroy by hand.
- * Tracked in docs/verification/known-gaps.md.
+ * STILL MISSING, DELIBERATELY: nothing here turns a completed round's
+ * `summaryMarkdown` into actual file changes or sandbox commands — that
+ * bridge (provider output → `EngineFileChangeV1[]` → the gate machinery)
+ * does not exist anywhere in this repo yet, is a real design decision, and
+ * is intentionally out of scope for this composition. A hosted task today
+ * will converse, plan, and ask/answer structured questions through a real
+ * model, and its sandbox will be acquired and torn down — but no code gets
+ * written and no command gets run. Do not describe this deployment as able
+ * to "do" the work; it can only "think" about it, so far.
+ *
+ * `task-owned-ephemeral` bindings are therefore now ACCEPTED (the
+ * `runs === undefined` refusal in controlPlaneServerV1.ts no longer fires),
+ * and that is only safe because acquisition/teardown are wired in the same
+ * change that lifts it — see the money-danger paragraph this replaced in
+ * git history if that stops being true. Tracked in
+ * docs/verification/known-gaps.md.
  *
  * Usage:
  *   ENSEMBLE_KEK_SECRET=... ENSEMBLE_GITHUB_CLIENT_ID=... \
  *   ENSEMBLE_GITHUB_CLIENT_SECRET=... pnpm --filter @ensemble/control-plane serve
  */
+import { randomUUID } from "node:crypto";
+
+import type { SandboxExecutionContextV1 } from "../../ensemble-engine/src/sandboxExecutionV1";
 import { createRedactingLogSinkV1 } from "../../ensemble-engine/src/logRedactionV1";
+import { createDefaultEngineAdaptersV1 } from "../../ensemble-engine/src/providerAdaptersV1";
+import { ENGINE_PROVIDERS_V1, type EngineProviderIdV1 } from "../../ensemble-engine/src/providerCatalogV1";
+import { createEngineProviderRunnerV1 } from "../../ensemble-engine/src/providerDispatchV1";
 import { createControlPlaneHandlerV1, createControlPlaneNodeServerV1 } from "./controlPlaneServerV1";
+import { createEngineJobSupervisorV1 } from "./engineJobsV1";
+import { createEngineRunHostV1, type EngineRunHostV1, type EngineRunOutcomeV1 } from "./engineRunHostV1";
 import {
   createGitHubIdentityValidatorV1,
   createOidcIdentityValidatorV1,
   type IdentityValidatorV1,
 } from "./identityValidatorsV1";
-import { createBootSecretKekProviderV1 } from "./keyCustodyV1";
-import { createSdkSandboxClientFactoryV1 } from "./sandboxLifecycleV1";
+import { createBootSecretKekProviderV1, decryptKeyMaterialV1, KeyCustodyUnavailableErrorV1 } from "./keyCustodyV1";
+import {
+  acquireTaskSourceV1,
+  createSdkSandboxClientFactoryV1,
+  teardownTaskSandboxV1,
+  type SandboxClientFactoryV1,
+} from "./sandboxLifecycleV1";
 import { createSessionServiceV1 } from "./sessionServiceV1";
 import { createSqliteControlPlaneStoreV1 } from "./sqliteStoreV1";
-import { createWsHubV1 } from "./wsHubV1";
+import { taskModelSettingsV1 } from "./taskModelSettingsV1";
+import type { ControlPlaneStoreV1, ControlPlaneTaskRecordV1 } from "./storeV1";
+import { createWsHubV1, type WsHubV1 } from "./wsHubV1";
+import type { EngineLogSinkV1 } from "../../ensemble-engine/src/logRedactionV1";
 
 /** Google's published OIDC endpoints — fixed values, not configuration. */
 const GOOGLE_TOKEN_ENDPOINT_V1 = "https://oauth2.googleapis.com/token";
@@ -134,6 +154,157 @@ export function buildIdentityValidatorsV1(): readonly IdentityValidatorV1[] {
   return validators;
 }
 
+export interface CreateProductionRunHostOptionsV1 {
+  readonly realHost: EngineRunHostV1;
+  readonly store: ControlPlaneStoreV1;
+  readonly hub: WsHubV1;
+  readonly kekProvider: Parameters<typeof decryptKeyMaterialV1>[0];
+  readonly sandboxFactory: SandboxClientFactoryV1;
+  /** Shared with `providerRunnerFor`'s closure — see that function's comment. */
+  readonly modelKeyCache: Map<string, ReadonlyMap<EngineProviderIdV1, string>>;
+  /** Stable identity of this control-plane worker (gate/attempt lease holder). */
+  readonly workerId: string;
+  readonly log?: EngineLogSinkV1;
+}
+
+/**
+ * Wrap a real run host with the two pieces of glue its composition needs but
+ * doesn't provide itself:
+ *
+ *  - Model-key prefetch: `providerRunnerFor`'s `getProviderApiKey` must
+ *    return synchronously, but key custody's decrypt is async, so each task's
+ *    keys are decrypted and cached here, BEFORE the entry points that trigger
+ *    a fresh `providerRunnerFor(task)` call (`start`, and `submitAnswers`
+ *    when it rehydrates a restart-recovered run).
+ *  - Sandbox source acquisition/teardown: `acquireTaskSourceV1` runs before
+ *    handing off to the real host, so a task-owned-ephemeral binding's source
+ *    exists before any round runs against it; `teardownTaskSandboxV1` runs
+ *    after any run leg settles into a TERMINAL outcome (`completed`/`failed`
+ *    — a `questionsPaused` leg is not done, so nothing is torn down yet).
+ *    Both route through `EngineGateMachineryV1` (attempt-recorded, crash-safe)
+ *    via a fresh `EngineJobSupervisorV1.machineryFor` per call — cheap, since
+ *    the machinery is a stateless factory over the durable store.
+ */
+function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): EngineRunHostV1 {
+  const { realHost, store, hub, kekProvider, sandboxFactory, modelKeyCache: cache, workerId, log } = options;
+  const jobSupervisor = createEngineJobSupervisorV1({ store, hub, workerId });
+
+  async function prefetchModelKeys(task: ControlPlaneTaskRecordV1): Promise<void> {
+    const keys = new Map<EngineProviderIdV1, string>();
+    for (const provider of ENGINE_PROVIDERS_V1) {
+      const record = store.readKeyRecord(task.ownerUserId, `model:${provider.id}`);
+      if (record === undefined) {
+        continue;
+      }
+      try {
+        keys.set(provider.id, await decryptKeyMaterialV1(kekProvider, record.envelope));
+      } catch (error) {
+        // Fail-closed per provider, not per task: a KEK outage makes that
+        // one provider unavailable for this run, matching the synchronous
+        // "no key" case `getProviderApiKey` already has to handle.
+        if (!(error instanceof KeyCustodyUnavailableErrorV1)) {
+          throw error;
+        }
+      }
+    }
+    cache.set(task.taskId, keys);
+  }
+
+  async function sandboxContextFor(
+    task: ControlPlaneTaskRecordV1
+  ): Promise<SandboxExecutionContextV1 | undefined> {
+    const keyRecord = store.readKeyRecord(task.ownerUserId, `sandbox:${task.binding.provider}`);
+    if (keyRecord === undefined) {
+      return undefined;
+    }
+    try {
+      const apiKey = await decryptKeyMaterialV1(kekProvider, keyRecord.envelope);
+      return { binding: task.binding, client: sandboxFactory.clientFor(task.binding.provider, apiKey) };
+    } catch (error) {
+      if (error instanceof KeyCustodyUnavailableErrorV1) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  function markFailed(task: ControlPlaneTaskRecordV1, code: string): EngineRunOutcomeV1 {
+    store.upsertJob({
+      jobId: task.taskId,
+      taskId: task.taskId,
+      ownerUserId: task.ownerUserId,
+      status: "failed",
+      updatedAt: new Date().toISOString(),
+    });
+    return { kind: "failed", code };
+  }
+
+  /** Returns a terminal outcome when acquisition itself fails; undefined to proceed. */
+  async function acquireSource(task: ControlPlaneTaskRecordV1): Promise<EngineRunOutcomeV1 | undefined> {
+    const context = await sandboxContextFor(task);
+    if (context === undefined) {
+      log?.("engine run host: source acquisition skipped, no sandbox key — task failed");
+      return markFailed(task, "sandboxProviderKeyMissing");
+    }
+    const machinery = jobSupervisor.machineryFor(task.taskId, task.ownerUserId);
+    const result = await acquireTaskSourceV1(machinery, context);
+    if (!result.acquired) {
+      log?.("engine run host: source acquisition failed — task failed");
+      return markFailed(task, "sourceAcquisitionFailed");
+    }
+    return undefined;
+  }
+
+  async function teardownIfTerminal(
+    task: ControlPlaneTaskRecordV1,
+    outcome: EngineRunOutcomeV1
+  ): Promise<void> {
+    if (outcome.kind !== "completed" && outcome.kind !== "failed") {
+      return;
+    }
+    const context = await sandboxContextFor(task);
+    if (context === undefined) {
+      // No key to tear down with — the same key was needed to acquire the
+      // source in the first place, so this only happens if it was revoked
+      // mid-run. Leaves the sandbox for manual cleanup; nothing else to do.
+      return;
+    }
+    const machinery = jobSupervisor.machineryFor(task.taskId, task.ownerUserId);
+    await teardownTaskSandboxV1(machinery, context);
+  }
+
+  return {
+    async start(task) {
+      await prefetchModelKeys(task);
+      const acquisitionFailure = await acquireSource(task);
+      if (acquisitionFailure !== undefined) {
+        return acquisitionFailure;
+      }
+      const outcome = await realHost.start(task);
+      await teardownIfTerminal(task, outcome);
+      return outcome;
+    },
+    async submitAnswers(taskId, interactionId, rawAnswers, answerIdempotencyId) {
+      // A running (non-rehydrated) task already has its keys cached from
+      // `start`; re-fetching here only matters for restart recovery, and
+      // doing it unconditionally keeps this wrapper ignorant of the real
+      // host's internal rehydrate-vs-resume distinction.
+      const task = store.readTask(taskId);
+      if (task !== undefined) {
+        await prefetchModelKeys(task);
+      }
+      const result = await realHost.submitAnswers(taskId, interactionId, rawAnswers, answerIdempotencyId);
+      if (result.ok && task !== undefined) {
+        const capturedTask = task;
+        void result.settled.then((outcome) => teardownIfTerminal(capturedTask, outcome));
+      }
+      return result;
+    },
+    pendingInteractionId: realHost.pendingInteractionId,
+    settled: realHost.settled,
+  };
+}
+
 export function startControlPlaneV1(): { readonly port: number; readonly close: () => void } {
   const port = Number(process.env["ENSEMBLE_PORT"] ?? DEFAULT_PORT_V1);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -163,9 +334,37 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     process.stdout.write(`${line}\n`);
   });
 
+  // Per-task decrypted model keys, populated by createProductionRunHostV1
+  // before each providerRunnerFor(task) call — see that function's own comment.
+  const modelKeysByTask = new Map<string, ReadonlyMap<EngineProviderIdV1, string>>();
+  const engineAdapters = createDefaultEngineAdaptersV1({ fetch: globalThis.fetch });
+  const sandboxFactory = createSdkSandboxClientFactoryV1();
+
+  function providerRunnerFor(task: ControlPlaneTaskRecordV1): ReturnType<typeof createEngineProviderRunnerV1> {
+    return createEngineProviderRunnerV1({
+      getModelSettings: () => taskModelSettingsV1(task),
+      // No per-user enabled-providers store exists yet; nothing is disabled.
+      getEnabledProviders: () => undefined,
+      getProviderApiKey: (provider) => modelKeysByTask.get(task.taskId)?.get(provider),
+      adapters: engineAdapters,
+    });
+  }
+
+  const runs = createProductionRunHostV1({
+    realHost: createEngineRunHostV1({ store, hub, providerRunnerFor }),
+    store,
+    hub,
+    kekProvider,
+    sandboxFactory,
+    modelKeyCache: modelKeysByTask,
+    workerId: process.env["ENSEMBLE_WORKER_ID"] ?? randomUUID(),
+    log,
+  });
+
   // Opt-in to creating sandboxes this composition cannot drive or tear down.
-  // Off by default: see the handler option's own note, and the "no engine run
-  // host" gap in docs/verification/known-gaps.md.
+  // Moot now that `runs` is always set — the `runs === undefined` refusal in
+  // controlPlaneServerV1.ts never fires here — kept only so an operator's
+  // existing env var doesn't silently change meaning.
   const allowEphemeralSandboxWithoutRunHost =
     process.env["ENSEMBLE_ALLOW_UNMANAGED_SANDBOXES"] === "1";
 
@@ -174,8 +373,9 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     sessions,
     hub,
     kekProvider,
-    sandboxFactory: createSdkSandboxClientFactoryV1(),
+    sandboxFactory,
     allowEphemeralSandboxWithoutRunHost,
+    runs,
     log,
   });
 
@@ -184,12 +384,8 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   log(`control plane listening on http://127.0.0.1:${port}`);
   log(`  database: ${databasePath}`);
   log(`  cors origins: ${corsOrigins.join(", ")}`);
-  log(
-    allowEphemeralSandboxWithoutRunHost
-      ? "  WARNING: task-owned sandboxes are permitted with no run host — each " +
-          "created task leaves a billable sandbox you must destroy by hand"
-      : "  task-owned sandboxes: refused (no engine run host); attach your own sandbox"
-  );
+  log("  engine run host: active — provider dispatch and sandbox source acquisition/teardown wired.");
+  log("    (tasks can think and converse; nothing yet turns a round into file changes/commands.)");
   return { port, close: (): void => void server.close() };
 }
 
