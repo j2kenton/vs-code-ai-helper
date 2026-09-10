@@ -704,7 +704,7 @@ test("dispatch: every non-impl stage's prompt says it is read-only; impl's says 
   const stages = ["desc", "plan", "plan-high-review", "plan-low-review", "impl", "impl-high-review", "impl-low-review", "publish"] as const;
   for (const stage of stages) {
     const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
-    const settings: ModelSettings = { desc: { primary: "anthropic:claude-sonnet-5" } };
+    const settings: ModelSettings = { desc: { primary: "anthropic:claude-sonnet-5", strategy: "never-switch" } };
     await runner({ anthropic, settings }).invoke({ ...invocation(), stage });
     const prompt = anthropic.invocations[0]!.prompt;
     assert.ok(prompt.includes(`(stage: ${stage}, round 1)`), stage);
