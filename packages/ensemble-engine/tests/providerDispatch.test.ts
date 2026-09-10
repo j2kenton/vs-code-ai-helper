@@ -700,6 +700,29 @@ test("dispatch: a malformed frame is a typed retryable failure that never cascad
   assert.equal(openai.invocations.length, 0);
 });
 
+test("dispatch: every non-impl stage's prompt says it is read-only; impl's says to edit and tick", async () => {
+  const stages = ["desc", "plan", "plan-high-review", "plan-low-review", "impl", "impl-high-review", "impl-low-review", "publish"] as const;
+  for (const stage of stages) {
+    const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
+    const settings: ModelSettings = { desc: { primary: "anthropic:claude-sonnet-5" } };
+    await runner({ anthropic, settings }).invoke({ ...invocation(), stage });
+    const prompt = anthropic.invocations[0]!.prompt;
+    assert.ok(prompt.includes(`(stage: ${stage}, round 1)`), stage);
+    assert.ok(prompt.includes("--- Stage ---"), stage);
+    if (stage === "impl") {
+      assert.equal(prompt.includes("READ-ONLY"), false, "impl must not be told it is read-only");
+      assert.ok(prompt.includes("IMPLEMENTS the plan of record"));
+      assert.ok(prompt.includes("<!-- progress: N/M -->"));
+    } else {
+      assert.ok(prompt.includes("This stage is READ-ONLY"), `${stage} must be told it is read-only`);
+      assert.ok(prompt.includes("do not report a failure for it"), stage);
+    }
+    // The stage block precedes the plan of record, which precedes the frame contract.
+    assert.ok(prompt.indexOf("--- Stage ---") < prompt.indexOf("--- Plan of record ---"));
+    assert.ok(prompt.indexOf("--- Plan of record ---") < prompt.indexOf("ENSEMBLE RESULT CONTRACT"));
+  }
+});
+
 test("dispatch: a resumed invocation's prompt carries the user's answers", async () => {
   const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
   await runner({ anthropic }).invoke({

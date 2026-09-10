@@ -147,16 +147,77 @@ export const ENGINE_ROUND_PERMITTED_RESULT_KINDS_V1 = [
 ] as const;
 export const ENGINE_ROUND_MAX_RESPONSE_BYTES_V1 = 4 * 1024 * 1024;
 
+const READ_ONLY_STAGE_RULE_V1 =
+  "This stage is READ-ONLY: do not create, modify, or delete any file, and do not run commands " +
+  "that change anything. If a tool is unavailable or an action is blocked, that is expected here — " +
+  "do not report a failure for it; complete the stage with your best output as response text.";
+
 /**
- * Deterministic round prompt: the plan of record, the user's validated
- * answers when resuming a question pause, and the result-contract fragment
- * (which embeds the invocation's correlation echo). Same inputs, same bytes
- * — the prompt-contract digest recorded in Chat transactions relies on it.
+ * What each stage is for, told to the model in its own words. Without this
+ * the prompt called every round an "implementation" round, and a
+ * description-stage model — running read-only, as every non-impl stage
+ * does — tried to write the requested file, was blocked, and reported the
+ * whole task failed (`plan_mode_blocked_write`, observed live 2026-09-10).
+ * The stage vocabulary is the core `TaskStage`; the loop's checklist rule
+ * (ticked items accumulate into the plan of record; a checklist-less plan
+ * advances one round per stage) is stated so the model's echo drives it.
+ */
+export const ENGINE_STAGE_GUIDANCE_V1: Readonly<Record<TaskStage, string>> = {
+  desc:
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: understand the request. Return a concise task description as markdown — " +
+    "goal, scope, constraints, and acceptance criteria. If the plan of record already carries a " +
+    "checklist, echo it unchanged.",
+  plan:
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: plan the work. Return an implementation plan as a markdown checklist " +
+    "(`- [ ] step`), each step small and independently verifiable. If the plan of record already " +
+    "carries a checklist, keep its items and their ticks; refine, do not replace.",
+  "plan-high-review":
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: review the plan of record for correctness, completeness, ordering, and " +
+    "risk. Return the checklist (ticks preserved) followed by your review findings.",
+  "plan-low-review":
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: a second, detail-level review of the plan of record — missing steps, " +
+    "unclear acceptance criteria, edge cases. Return the checklist (ticks preserved) followed by " +
+    "your findings.",
+  impl:
+    "This stage IMPLEMENTS the plan of record: edit files in the working directory and run the " +
+    "commands the work needs. When you stop, return the plan's checklist with every item you " +
+    "completed ticked (`- [x]`), untouched items left as they were, and a `<!-- progress: N/M -->` " +
+    "marker. Do not tick what you did not do.",
+  "impl-high-review":
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: review the implemented changes against the plan of record — correctness, " +
+    "completeness, tests. Return the checklist reflecting what is ACTUALLY done (untick anything " +
+    "claimed but not delivered) followed by your findings.",
+  "impl-low-review":
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: a detail-level review of the implemented changes — edge cases, error " +
+    "handling, naming, leftover debug code. Return the checklist reflecting what is actually done, " +
+    "followed by your findings.",
+  publish:
+    `${READ_ONLY_STAGE_RULE_V1}\n` +
+    "Goal of this stage: summarize what was delivered for the person who asked — what changed, " +
+    "how to verify it, anything left open. Return the final checklist followed by that summary.",
+};
+
+/**
+ * Deterministic round prompt: the stage's guidance, the plan of record, the
+ * user's validated answers when resuming a question pause, and the
+ * result-contract fragment (which embeds the invocation's correlation
+ * echo). Same inputs, same bytes — the prompt-contract digest recorded in
+ * Chat transactions relies on it.
  */
 export function buildEngineRoundPromptV1(input: EngineProviderInvocationV1): string {
   const sections: string[] = [
-    "You are the Ensemble engine's implementation agent for one round of a staged task.",
+    "You are the Ensemble engine's agent for one round of a staged task.",
     `Task: ${input.taskId} (stage: ${input.stage}, round ${input.round}).`,
+    "",
+    "--- Stage ---",
+    ENGINE_STAGE_GUIDANCE_V1[input.stage],
+    "--- End stage ---",
     "",
     "--- Plan of record ---",
     input.planOfRecord,
