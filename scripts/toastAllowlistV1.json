@@ -5,17 +5,17 @@
   "entries": [
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 326,
+      "line": 329,
       "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision."
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 1777,
+      "line": 1790,
       "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round."
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 2171,
+      "line": 2184,
       "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push."
     },
     {

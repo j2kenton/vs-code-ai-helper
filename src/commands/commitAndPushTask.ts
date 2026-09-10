@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TaskInventory } from "../state/taskInventory";
+import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import {
@@ -61,7 +61,10 @@ import {
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
-import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import {
+  reconcileWatchdogPauseAgainstAdmissionV1,
+  WorkAdmissionPauseReconciliationV1,
+} from "../state/workAdmissionReconciliationV1";
 
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
@@ -1555,11 +1558,21 @@ export type CommitAndPushCoreResultV1 =
 async function resolveCommitPushTargetTaskV1(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
-  currentTaskStore?: CurrentTaskStore
+  currentTaskStore?: CurrentTaskStore,
+  /**
+   * 2026-09-10 review completion blocker ("publish/complete actions" route,
+   * narrowed further) — see `ResolveTaskOptions.onResolvedCandidate`'s own
+   * doc comment. Threaded through only by `commitAndPushTask`, which holds
+   * an admission handle to upgrade; other callers of this shared resolver
+   * (`commitPushRowV1.ts`) already run under a task-scoped lock with
+   * admission already live and pass nothing here.
+   */
+  onResolvedCandidate?: (candidate: TaskWithProgress) => Promise<void>
 ): Promise<ResolvedTaskContext | undefined> {
   const resolverArg = normalizeArg(explicitArg);
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
+    onResolvedCandidate,
   }, currentTaskStore);
   if (!resolvedTask) {
     // If an explicit arg was supplied but resolution failed, the task is gone;
@@ -2803,7 +2816,32 @@ export async function commitAndPushTask(
     // state); after that, block on the startup gate's classification pass
     // before the core's first task-state read (plan §1.4).
     await TaskCreationStartupReconcilerV1.waitUntilReady();
-    const resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore);
+    // 2026-09-10 review completion blocker ("publish/complete actions"
+    // route, narrowed further): upgrade admission the INSTANT
+    // `resolveTaskContext` (inside `resolveCommitPushTargetTaskV1`) settles
+    // on its final candidate, rather than waiting for it to fully return —
+    // see `ResolveTaskOptions.onResolvedCandidate`'s doc comment for why a
+    // real target can otherwise go unprotected for the length of
+    // resolveTaskContext's own awaited `inventory.refresh()` plus every line
+    // after it. The block below the call remains as a defense-in-depth
+    // no-op for the ordinary case where this already ran.
+    const admitCandidateV1 = async (candidate: TaskWithProgress): Promise<void> => {
+      if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+        await releaseCurrentAdmissionV1();
+      }
+      if (!handle) {
+        const late = await acquireWorkAdmissionV1({
+          taskFolderPath: candidate.taskFolderPath,
+          purpose: "admission",
+          commandId: "commitAndPushTask",
+        });
+        if (late.outcome === "acquired") {
+          handle = late.handle;
+          heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+        }
+      }
+    };
+    const resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore, admitCandidateV1);
     if (!resolvedTask) {
       return;
     }
@@ -2916,11 +2954,54 @@ export async function completeCommitAndPushTask(
     // before this callback's first task-state read (plan §1.4).
     await TaskCreationStartupReconcilerV1.waitUntilReady();
     const resolverArg = normalizeArg(explicitArg);
+    // 2026-09-10 review completion blocker ("publish/complete actions"
+    // route, narrowed further): this call used to pass `allowPaused: false`,
+    // so a watchdog-provenance pause landing on the real target during
+    // resolveTaskContext's OWN resolution (its internal `inventory.refresh()`,
+    // discovering a task the early guess above could not have known about —
+    // see `ResolveTaskOptions.onResolvedCandidate`'s doc comment) made
+    // resolution itself report "not found", before this command ever got a
+    // chance to acquire admission and reverse that pause — exactly the trap
+    // this task exists to close. Resolving with `allowPaused: true` instead,
+    // and reconciling a watchdog pause the INSTANT the candidate is settled
+    // (via the hook, before resolveTaskContext's own `allowPaused` gate would
+    // otherwise apply), closes that gap. `reconcileOutcome` records whether
+    // reconciliation actually cleared a watchdog pause, so a GENUINE user
+    // pause (or a quota park, which also sets `status: "paused"`) still
+    // correctly reports "no active task" below — the in-memory
+    // `resolvedTask.progress.status` snapshot predates any reversal write,
+    // so it alone can't be trusted to tell the two apart.
+    let reconcileOutcome: WorkAdmissionPauseReconciliationV1 | undefined;
+    const admitCandidateV1 = async (candidate: TaskWithProgress): Promise<void> => {
+      if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+        await releaseCurrentAdmissionV1();
+      }
+      if (!handle) {
+        const late = await acquireWorkAdmissionV1({
+          taskFolderPath: candidate.taskFolderPath,
+          purpose: "admission",
+          commandId: "completeCommitAndPushTask",
+        });
+        if (late.outcome === "acquired") {
+          handle = late.handle;
+          heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+        }
+      }
+      if (handle) {
+        reconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(candidate.taskFolderPath));
+      }
+    };
     const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
-      allowPaused: false,
+      allowPaused: true,
+      onResolvedCandidate: admitCandidateV1,
     }, currentTaskStore);
 
-    if (!resolvedTask) {
+    const stillGenuinelyPaused =
+      !!resolvedTask &&
+      resolvedTask.progress.status === "paused" &&
+      reconcileOutcome?.outcome !== "reversed";
+
+    if (!resolvedTask || stillGenuinelyPaused) {
       if (resolverArg) {
         NotificationRouter.showError(
           "The task could not be found. It may have been deleted or moved. " +

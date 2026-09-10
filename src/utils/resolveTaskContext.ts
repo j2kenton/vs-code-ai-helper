@@ -59,6 +59,34 @@ export interface ResolveTaskOptions {
    * entry point.
    */
   promptForOwnershipResolution?: boolean;
+  /**
+   * 2026-09-10 review completion blocker ("publish/complete actions" route,
+   * narrowed further): `peekTaskFolderPathSynchronouslyV1` is a best-effort
+   * SYNCHRONOUS guess, corrected by callers only after this function fully
+   * returns. When the persisted current-task pointer is a cache miss that
+   * resolves (via this function's own awaited `inventory.refresh()`) to a
+   * PAUSED task, while the sole "active" task only becomes visible in the
+   * POST-refresh inventory, the peek cannot have guessed that active task —
+   * it wasn't discoverable without doing the same real disk I/O this
+   * function performs. The result is a real target that has no work
+   * admission for the entire span between when this function starts
+   * resolving and when the caller's own post-return "compare and
+   * reacquire" correction runs.
+   *
+   * This hook narrows that span to its architectural minimum: it fires
+   * (awaited) the INSTANT a final candidate is settled — immediately after
+   * step 3's paused/fallback logic below, before the ownership/workspace
+   * path-safety checks and before the `allowPaused` gate — so a caller can
+   * acquire/upgrade admission for the authoritative target, and reconcile
+   * any watchdog-provenance pause on it, before this function's own
+   * `allowPaused` check would otherwise reject a transiently-paused
+   * resolution outright. It does not eliminate the fundamental fact that
+   * `inventory.refresh()` must complete before a brand-new candidate is
+   * knowable at all — no synchronous peek can do that — but it removes
+   * every avoidable line of additional resolveTaskContext/caller execution
+   * that used to sit between "candidate known" and "admission requested".
+   */
+  onResolvedCandidate?: (candidate: TaskWithProgress) => Promise<void>;
 }
 
 /**
@@ -446,6 +474,15 @@ export async function resolveTaskContext(
         await currentTaskStore.set(onlyActiveTask.canonicalId);
       }
     }
+  }
+
+  // Fire the earliest-possible-admission hook (see `ResolveTaskOptions.onResolvedCandidate`)
+  // now — the final candidate is settled, but none of the ownership/path
+  // safety checks or the `allowPaused` gate below have run yet. Skipped
+  // entirely when nothing resolved; the "no fallback heuristics" return
+  // immediately below handles that case exactly as before.
+  if (resolved && options?.onResolvedCandidate) {
+    await options.onResolvedCandidate(resolved);
   }
 
   // ----------------------------------------------------------------

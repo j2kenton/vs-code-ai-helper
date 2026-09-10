@@ -26,7 +26,8 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { runPublishChecks } from "../commands/runPublishChecks";
-import { peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
+import { completeCommitAndPushTask } from "../commands/commitAndPushTask";
+import { peekTaskFolderPathSynchronouslyV1, resolveTaskContext } from "../utils/resolveTaskContext";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
@@ -40,6 +41,7 @@ import {
   authorizeWorkAdmissionHandoffV1,
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
+import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-checks-admission-"));
 
@@ -553,3 +555,246 @@ void describe("peekTaskFolderPathSynchronouslyV1 — cold-cache-miss id-as-path 
     assert.equal(result, taskFolderPath);
   });
 });
+
+/**
+ * A mutable multi-task inventory whose `refresh()` call transitions it from a
+ * "pre-refresh" snapshot (mirroring the stale in-memory cache
+ * `peekTaskFolderPathSynchronouslyV1` is limited to) to a "post-refresh"
+ * snapshot that can contain tasks the pre-refresh snapshot never had —
+ * mirroring `TaskInventory.refresh()`'s own real disk scan discovering a
+ * task the in-memory cache did not yet know about.
+ */
+function makeRefreshDiscoversNewTaskInventory(
+  before: { taskFolderPath: string; progress: TaskProgress }[],
+  after: { taskFolderPath: string; progress: TaskProgress }[]
+): TaskInventory {
+  let refreshed = false;
+  const snapshot = (): { taskFolderPath: string; progress: TaskProgress }[] => (refreshed ? after : before);
+  const toTask = (e: { taskFolderPath: string; progress: TaskProgress }): {
+    canonicalId: string;
+    taskFolderPath: string;
+    folderName: string;
+    sourceScopeKey: string;
+    progress: TaskProgress;
+  } => ({
+    canonicalId: e.taskFolderPath,
+    taskFolderPath: e.taskFolderPath,
+    folderName: path.basename(e.taskFolderPath),
+    sourceScopeKey: e.taskFolderPath,
+    progress: e.progress,
+  });
+  return {
+    getTaskById: (id: string) => snapshot().map(toTask).find((t) => t.canonicalId === id),
+    getTaskByPath: (p: string) => snapshot().map(toTask).find((t) => t.taskFolderPath === p),
+    getVisibleTaskForSuppressedId: () => undefined,
+    getVisibleTaskForSuppressedPath: () => undefined,
+    getTasks: () => snapshot().map(toTask),
+    refresh: () => {
+      refreshed = true;
+      return Promise.resolve(undefined);
+    },
+  } as unknown as TaskInventory;
+}
+
+void describe(
+  "resolveTaskContext — onResolvedCandidate hook (2026-09-10 review completion blocker, narrowed further: admission for a refresh-discovered target)",
+  () => {
+    void it(
+      "fires with the refresh-discovered ACTIVE task, never the stale-cache paused guess, when the persisted pointer is a cache-miss that resolves to paused",
+      async () => {
+        // The review's exact scenario: BEFORE refresh, the persisted pointer
+        // is a cache miss and the stale cache has NO active task at all (so
+        // a synchronous peek has nothing to fall back to but the paused
+        // pointer itself); refresh() discovers both the persisted (paused)
+        // task AND a different, unambiguous active task — exactly what
+        // resolveTaskContext's own internal `inventory.refresh()` would
+        // surface in production.
+        const persistedFolderPath = makeTaskFolder("resolve-hook-paused-persisted");
+        const activeFolderPath = makeTaskFolder("resolve-hook-active-discovered-by-refresh");
+        const inventory = makeRefreshDiscoversNewTaskInventory(
+          [],
+          [
+            { taskFolderPath: persistedFolderPath, progress: fixtureProgress(persistedFolderPath, { status: "paused" }) },
+            { taskFolderPath: activeFolderPath, progress: fixtureProgress(activeFolderPath, { status: "active" }) },
+          ]
+        );
+
+        const ws = installWorkspaceFoldersStub();
+        const rf = installReadFileBridge();
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        await currentTaskStore.set(persistedFolderPath);
+
+        const seen: string[] = [];
+        try {
+          const resolved = await resolveTaskContext(inventory, undefined, {
+            allowPaused: true,
+            onResolvedCandidate: (candidate) => {
+              seen.push(candidate.taskFolderPath);
+              return Promise.resolve();
+            },
+          }, currentTaskStore);
+
+          assert.equal(resolved?.taskFolderPath, activeFolderPath, "resolveTaskContext itself must land on the refresh-discovered active task");
+          assert.deepEqual(seen, [activeFolderPath], "the hook must fire exactly once, with the AUTHORITATIVE target — never the stale paused guess");
+        } finally {
+          rf.restore();
+          ws.restore();
+        }
+      }
+    );
+
+    void it("never fires when nothing resolves", async () => {
+      const inventory = makeColdCacheInventory();
+      const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+
+      let called = false;
+      const resolved = await resolveTaskContext(inventory, undefined, {
+        allowPaused: true,
+        onResolvedCandidate: () => {
+          called = true;
+          return Promise.resolve();
+        },
+      }, currentTaskStore);
+
+      assert.equal(resolved, undefined);
+      assert.equal(called, false);
+    });
+  }
+);
+
+void describe(
+  "runPublishChecks — admits the refresh-discovered active task, not the stale-cache paused guess (2026-09-10 review completion blocker, narrowed further)",
+  () => {
+    void it(
+      "attempts admission against the refresh-discovered ACTIVE task, reported busy by its real owner — proving the paused stale-cache guess was never the actual target",
+      async () => {
+        const persistedFolderPath = makeTaskFolder("rpc-hook-paused-persisted-busy");
+        const activeFolderPath = makeTaskFolder("rpc-hook-active-discovered-by-refresh-busy");
+        writeProgress(persistedFolderPath, fixtureProgress(persistedFolderPath, { status: "paused" }));
+        writeProgress(activeFolderPath, fixtureProgress(activeFolderPath, { status: "active" }));
+
+        const inventory = makeRefreshDiscoversNewTaskInventory(
+          [],
+          [
+            { taskFolderPath: persistedFolderPath, progress: fixtureProgress(persistedFolderPath, { status: "paused" }) },
+            { taskFolderPath: activeFolderPath, progress: fixtureProgress(activeFolderPath, { status: "active" }) },
+          ]
+        );
+
+        const surface = new RecordingSurface();
+        initNotificationRouter(surface);
+        const ws = installWorkspaceFoldersStub();
+        const rf = installReadFileBridge();
+
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        await currentTaskStore.set(persistedFolderPath);
+
+        // Held for the ACTIVE task specifically — never the paused one — so
+        // a busy refusal naming this owner proves resolution/admission
+        // targeted the correct (refresh-discovered) folder, not the
+        // stale-cache guess (which has no competing holder here and would
+        // have silently succeeded had it been used instead).
+        const held = await acquireWorkAdmissionV1({
+          taskFolderPath: activeFolderPath,
+          purpose: "admission",
+          commandId: "someOtherConcurrentCommand",
+        });
+        assert.equal(held.outcome, "acquired");
+
+        try {
+          const result = await runPublishChecks(inventory, undefined, undefined, currentTaskStore);
+
+          assert.equal(result, false);
+          assert.equal(surface.entries.length, 1);
+          assert.equal(surface.entries[0]?.level, "warning");
+          assert.match(
+            surface.entries[0]?.message ?? "",
+            /someOtherConcurrentCommand/,
+            "must have attempted admission against the refresh-discovered ACTIVE task, not the stale-cache paused guess"
+          );
+        } finally {
+          if (held.outcome === "acquired") {
+            await held.handle.release();
+          }
+          rf.restore();
+          ws.restore();
+          deactivateNotificationRouter();
+        }
+      }
+    );
+  }
+);
+
+void describe(
+  "completeCommitAndPushTask — a watchdog-provenance pause on the resolved target no longer fails resolution outright (2026-09-10 review completion blocker, narrowed further)",
+  () => {
+    void it(
+      "reconciles a watchdog-provenance pause on the resolved task and proceeds (reaching the stage guard), instead of reporting 'No active task found'",
+      async () => {
+        const taskFolderPath = makeTaskFolder("ccpt-watchdog-pause-reconciled");
+        const progress = fixtureProgress(taskFolderPath, {
+          status: "paused",
+          pausedReason: STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+          currentStage: "plan",
+        });
+        writeProgress(taskFolderPath, progress);
+
+        const surface = new RecordingSurface();
+        initNotificationRouter(surface);
+        const ws = installWorkspaceFoldersStub();
+        const rf = installReadFileBridge();
+
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        await currentTaskStore.set(taskFolderPath);
+
+        try {
+          await completeCommitAndPushTask(makeInventory(taskFolderPath, progress), undefined, currentTaskStore);
+
+          assert.equal(surface.entries.length, 1);
+          assert.match(
+            surface.entries[0]?.message ?? "",
+            /Complete, Commit and Push.*final review stage/,
+            "must reach the stage guard — proving the watchdog pause was reconciled rather than causing resolution to fail outright"
+          );
+          assert.doesNotMatch(surface.entries[0]?.message ?? "", /No active task found/i);
+        } finally {
+          rf.restore();
+          ws.restore();
+          deactivateNotificationRouter();
+        }
+      }
+    );
+
+    void it(
+      "still reports 'No active task found' for a genuine (non-watchdog) pause — the fix narrows the failure, it does not remove it",
+      async () => {
+        const taskFolderPath = makeTaskFolder("ccpt-genuine-user-pause-still-blocks");
+        const progress = fixtureProgress(taskFolderPath, {
+          status: "paused",
+          pausedReason: "Paused by the user",
+          currentStage: "plan",
+        });
+        writeProgress(taskFolderPath, progress);
+
+        const surface = new RecordingSurface();
+        initNotificationRouter(surface);
+        const ws = installWorkspaceFoldersStub();
+        const rf = installReadFileBridge();
+
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        await currentTaskStore.set(taskFolderPath);
+
+        try {
+          await completeCommitAndPushTask(makeInventory(taskFolderPath, progress), undefined, currentTaskStore);
+
+          assert.equal(surface.entries.length, 1);
+          assert.match(surface.entries[0]?.message ?? "", /No active task found to complete, commit, and push/);
+        } finally {
+          rf.restore();
+          ws.restore();
+          deactivateNotificationRouter();
+        }
+      }
+    );
+  }
+);

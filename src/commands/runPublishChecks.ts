@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as crypto from "node:crypto";
-import { TaskInventory } from "../state/taskInventory";
+import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -256,8 +256,38 @@ export async function runPublishChecks(
   // startup creating-folder classification pass is still running.
   await TaskCreationStartupReconcilerV1.waitUntilReady();
 
+  // 2026-09-10 review completion blocker ("publish/complete actions" route,
+  // narrowed further): upgrade admission the INSTANT resolveTaskContext
+  // settles on its final candidate, rather than waiting for it to fully
+  // return — see `ResolveTaskOptions.onResolvedCandidate`'s doc comment. A
+  // persisted pointer that is a cache miss resolving (via resolveTaskContext's
+  // own awaited `inventory.refresh()`) to a paused task, while the real
+  // active target only becomes visible in the POST-refresh inventory, means
+  // the peek above could not have guessed that target; this hook narrows the
+  // window in which it holds no admission to the architectural minimum. The
+  // block below the call remains as a defense-in-depth no-op for the
+  // ordinary case where this already ran.
+  const admitCandidateV1 = async (candidate: TaskWithProgress): Promise<void> => {
+    if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
+    }
+    if (!handle) {
+      const late = await acquireOrAdoptWorkAdmissionV1({
+        taskFolderPath: candidate.taskFolderPath,
+        purpose: "admission",
+        commandId: "runPublishChecks",
+        handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
+      });
+      if (late.outcome === "acquired") {
+        handle = late.handle;
+        heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      }
+    }
+  };
+
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
+    onResolvedCandidate: admitCandidateV1,
   }, currentTaskStore);
 
   if (!resolvedTask) {
