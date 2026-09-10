@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
@@ -7,6 +8,7 @@ import {
   PLAN_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
+  TASK_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
@@ -420,8 +422,17 @@ export async function chatWithStage(
   // the raw-path admission-before-validation blocker until the shared
   // admission helper itself enforces this.
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
-  const earlyFolderPathExists = earlyFolderPath ? fs.existsSync(earlyFolderPath) : false;
-  const early = earlyFolderPath && earlyFolderPathExists
+  // 2026-09-10 round: narrow the raw-path admission-before-validation gap
+  // further than a bare `fs.existsSync` — see draftTaskWithAI.ts's identical
+  // fix for the full reasoning. Requiring `task.md` alongside the caller-
+  // supplied path rules out creating admission bookkeeping under an
+  // arbitrary non-task directory; it does not replace the real ownership/
+  // containment/workspace-binding validation `validateChatSendV1` performs
+  // below, so the underlying architectural blocker remains open.
+  const earlyFolderPathIsTaskFolder = earlyFolderPath
+    ? fs.existsSync(earlyFolderPath) && fs.existsSync(path.join(earlyFolderPath, TASK_FILENAME))
+    : false;
+  const early = earlyFolderPath && earlyFolderPathIsTaskFolder
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",

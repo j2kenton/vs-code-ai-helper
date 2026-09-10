@@ -579,8 +579,21 @@ export async function draftTaskWithAI(
   // narrowing (not fully closing) the raw-path admission-before-validation
   // blocker until the shared admission helper itself enforces this.
   const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
-  const earlyFolderPathExists = earlyFolderPath ? fs.existsSync(earlyFolderPath) : false;
-  const early = earlyFolderPath && earlyFolderPathExists
+  // 2026-09-10 round: narrow the raw-path admission-before-validation gap
+  // further than a bare `fs.existsSync` — that only proved SOME filesystem
+  // entry exists at the caller-supplied path, not that it is genuinely a
+  // task folder. Requiring `task.md` to exist alongside it rules out
+  // `acquireWorkAdmissionV1`'s genesis `mkdir(dir, { recursive: true })`
+  // creating admission bookkeeping under an arbitrary non-task directory
+  // (e.g. a stale/bogus id that happens to collide with an unrelated real
+  // path). This still does not perform ownership/containment/workspace-
+  // binding validation — only `resolveTaskContext` below does that — so the
+  // underlying architectural blocker (validation must live in the shared
+  // admission helper) remains open; this only shrinks its blast radius.
+  const earlyFolderPathIsTaskFolder = earlyFolderPath
+    ? fs.existsSync(earlyFolderPath) && fs.existsSync(path.join(earlyFolderPath, TASK_FILENAME))
+    : false;
+  const early = earlyFolderPath && earlyFolderPathIsTaskFolder
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
