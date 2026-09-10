@@ -632,6 +632,16 @@ export async function draftTaskWithAI(
     // user pause is still rejected below, using the reconciliation outcome
     // captured here rather than the in-memory (pre-reconciliation) status.
     let reconcileOutcomeCapturedV1: Awaited<ReturnType<typeof reconcileWatchdogPauseAgainstAdmissionV1>> | undefined;
+    // 2026-09-10 review completion blocker fix (new): the late-acquisition
+    // branch used to discard a `busy`/`writeFailed` refusal from
+    // `acquireWorkAdmissionV1` and simply leave `handle` undefined, so the
+    // caller only ever saw the generic "Could not acquire work admission for
+    // this task." message below regardless of whether the real cause was a
+    // live owner (busy, with owner/age/path detail) or a genuine filesystem
+    // write failure — collapsing the required busy/write-failed distinction
+    // this module's own `describeWorkAdmissionRefusalV1` exists to preserve.
+    // Captured here and surfaced verbatim below instead.
+    let lateAdmissionRefusalV1: Parameters<typeof describeWorkAdmissionRefusalV1>[0] | undefined;
     let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
     try {
       resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
@@ -653,6 +663,8 @@ export async function draftTaskWithAI(
             if (late.outcome === "acquired") {
               handle = late.handle;
               heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+            } else {
+              lateAdmissionRefusalV1 = late;
             }
           }
           // Admission is now live for this exact target (best-effort) —
@@ -686,7 +698,11 @@ export async function draftTaskWithAI(
     }
 
     if (!handle) {
-      NotificationRouter.showWarning("Could not acquire work admission for this task.");
+      NotificationRouter.showWarning(
+        lateAdmissionRefusalV1
+          ? describeWorkAdmissionRefusalV1(lateAdmissionRefusalV1)
+          : "Could not acquire work admission for this task."
+      );
       return;
     }
 
