@@ -92,11 +92,34 @@ async function execCaptureV1(
   };
 }
 
+/**
+ * `uid:gid` this process itself runs as, when Node can report it (POSIX
+ * only — `undefined` on Windows, where this whole adapter is moot anyway
+ * since it targets a local Docker daemon meant for the deployment host).
+ * Sandboxes default to running AS this same user rather than the image's
+ * default (commonly root): `createInteractiveSession`'s `kill()` signals
+ * the sandboxed process via this control-plane process's own `process.kill`
+ * — a non-root process cannot signal a root-owned one (confirmed live:
+ * EPERM), so containers must run as us, not as root, for that to work at
+ * all. Least-privilege is also just the correct default regardless.
+ */
+const DEFAULT_CONTAINER_USER_V1: string | undefined =
+  typeof process.getuid === "function" && typeof process.getgid === "function"
+    ? `${process.getuid()}:${process.getgid()}`
+    : undefined;
+
 export interface CreateLocalDockerSandboxClientOptionsV1 {
   /** Ignored — no credential exists for a local daemon; see this file's header comment. */
   readonly apiKey?: string;
   /** Image for created sandboxes; default `node:24-bookworm`. */
   readonly image?: string;
+  /**
+   * `uid:gid` sandboxes run as; default matches THIS process (see
+   * `DEFAULT_CONTAINER_USER_V1`'s comment). Pass `""` to keep the image's
+   * own default user (root, typically) instead — e.g. for an image whose
+   * setup genuinely needs it.
+   */
+  readonly user?: string;
   /** DI seam for tests — production callers never override it. */
   readonly docker?: Docker;
 }
@@ -107,6 +130,7 @@ export function createLocalDockerSandboxClientV1(
 ): SandboxClientV1 {
   const docker = options?.docker ?? new Docker();
   const image = options?.image ?? DEFAULT_IMAGE_V1;
+  const containerUser = options?.user ?? DEFAULT_CONTAINER_USER_V1;
 
   return {
     provider: "docker",
@@ -120,6 +144,7 @@ export function createLocalDockerSandboxClientV1(
         Cmd: ["sleep", "infinity"],
         Tty: false,
         HostConfig: { AutoRemove: false },
+        ...(containerUser !== undefined && containerUser.length > 0 ? { User: containerUser } : {}),
       });
       await container.start();
       return { sandboxId: container.id };
@@ -259,19 +284,23 @@ export function createLocalDockerSandboxClientV1(
       request: InteractiveSessionRequestV1
     ): Promise<InteractiveSessionHandleV1> {
       const container = docker.getContainer(request.sandboxId);
+      // Tty: true is not cosmetic here — confirmed live against a real CLI
+      // (Claude Code's own login flow): without a real terminal attached, a
+      // program that checks isatty() before printing its interactive prompt
+      // produces NO output at all, even though it is genuinely running. Tty
+      // mode also changes the wire format: output is raw bytes, not the
+      // stdout/stderr-multiplexed frames a non-Tty exec produces, so this
+      // reads the stream directly rather than through `demuxStream`.
       const exec = await container.exec({
         Cmd: [...request.argv],
         WorkingDir: request.cwd,
         AttachStdin: true,
         AttachStdout: true,
         AttachStderr: true,
+        Tty: true,
       });
-      const stream = await exec.start({ hijack: true, stdin: true });
-      const stdoutSink = new PassThrough();
-      const stderrSink = new PassThrough();
-      stdoutSink.on("data", (chunk: Buffer) => request.onOutput(chunk.toString("utf8")));
-      stderrSink.on("data", (chunk: Buffer) => request.onOutput(chunk.toString("utf8")));
-      docker.modem.demuxStream(stream, stdoutSink, stderrSink);
+      const stream = await exec.start({ hijack: true, stdin: true, Tty: true });
+      stream.on("data", (chunk: Buffer) => request.onOutput(chunk.toString("utf8")));
 
       let settle: {
         resolve: (result: InteractiveSessionResultV1) => void;
@@ -301,10 +330,20 @@ export function createLocalDockerSandboxClientV1(
           try {
             const inspected = await exec.inspect();
             if (inspected.Running && inspected.Pid > 0) {
-              // A hijacked exec stream has no standalone kill call in the
-              // Docker API — signal the process directly via its PID,
-              // visible from the daemon side (same /proc route `top()` uses).
-              await execCaptureV1(docker, request.sandboxId, `kill -TERM ${inspected.Pid} 2>/dev/null || true`);
+              // `ExecInspectInfo.Pid` is the HOST-namespace pid, not the
+              // container's own — a `kill` run through ANOTHER `docker exec`
+              // runs inside the container's PID namespace and cannot see
+              // this number at all (confirmed live: it reports "no such
+              // process" for a pid `docker top`/this inspect both show as
+              // very much running). This adapter's own header states the
+              // control plane runs on the SAME host as the Docker daemon,
+              // so the correct — and only correct — way to signal it is
+              // this process's own `process.kill`, not another exec.
+              try {
+                process.kill(inspected.Pid, "SIGTERM");
+              } catch {
+                // Already exited between the inspect and the kill: fine.
+              }
             }
           } finally {
             stream.end();

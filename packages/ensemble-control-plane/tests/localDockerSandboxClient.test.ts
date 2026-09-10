@@ -1,12 +1,16 @@
 /**
  * Coverage for `createLocalDockerSandboxClientV1`'s `createInteractiveSession`
  * — the login-flow-shaped capability (print something, wait for input, react)
- * that `runCommand` (blocks to completion, bounded result) cannot express.
+ * that `runCommand` (blocks to completion, bounded result) cannot express —
+ * and for `createSandbox`'s default non-root container user.
+ *
  * Fakes dockerode's `container.exec`/`exec.start`/`exec.inspect` surface with
  * a real Duplex stream so sendInput/onOutput/wait exercise real stream
- * semantics, not just mocked call assertions — `docker.modem.demuxStream` is
- * faked as a plain pipe (dockerode's own frame-demuxing correctness is that
- * package's concern, not this adapter's).
+ * semantics, not just mocked call assertions. `createInteractiveSession`
+ * reads the exec stream directly (Tty mode, confirmed live against a real
+ * CLI as required for any isatty()-gated output — see the adapter's own
+ * comment); `docker.modem.demuxStream` is faked here only because
+ * `execCaptureV1` (the non-interactive `runCommand` path) still uses it.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -127,31 +131,24 @@ test("createInteractiveSession: sendInput reaches the running process, streamed 
   assert.deepEqual(result, { exitCode: 0 });
 });
 
-test("createInteractiveSession: kill() signals the process's real PID rather than fabricating success", async () => {
-  const killCommands: string[] = [];
+test("createInteractiveSession: kill() signals the process's real HOST pid via process.kill, never a nested container exec", async () => {
+  // ExecInspectInfo.Pid is the HOST-namespace pid — a `kill` run through
+  // ANOTHER `docker exec` executes inside the CONTAINER's pid namespace and
+  // cannot see that number at all (confirmed live against the real daemon:
+  // it reports "no such process" for a pid `docker top` shows as running).
+  // This adapter runs on the SAME host as the daemon (its own documented
+  // premise), so the only correct signal path is this process's own
+  // `process.kill` — regression test for exactly that bug.
   const { docker } = makeFakeDocker({ onWrite: () => undefined, killedPids: [] });
-  // Intercept the kill's own exec call (separate from the interactive session's exec).
-  const baseGetContainer = (docker as { getContainer: () => { exec: (opts: unknown) => Promise<unknown> } })
-    .getContainer;
-  (docker as { getContainer: () => unknown }).getContainer = () => {
-    const inner = baseGetContainer();
-    return {
-      exec: (opts: { Cmd?: readonly string[] }) => {
-        if (opts.Cmd?.[0] === "/bin/sh") {
-          killCommands.push((opts.Cmd as readonly string[])[2] ?? "");
-          return Promise.resolve({
-            start: () => {
-              const s = makeFakeExecStream(() => undefined);
-              queueMicrotask(() => (s as unknown as FakeStreamSelf).push(null));
-              return Promise.resolve(s);
-            },
-            inspect: () => Promise.resolve({ ExitCode: 0, Running: false, Pid: 0 }),
-          });
-        }
-        return inner.exec(opts);
-      },
-    };
-  };
+  const originalKill = process.kill;
+  const killedPids: Array<{ pid: number; signal?: string | number }> = [];
+  (process as unknown as { kill: typeof process.kill }).kill = ((
+    pid: number,
+    signal?: string | number
+  ) => {
+    killedPids.push({ pid, signal });
+    return true;
+  }) as typeof process.kill;
 
   const client = createLocalDockerSandboxClientV1({ docker: docker as never });
   const session = await client.createInteractiveSession!({
@@ -161,8 +158,45 @@ test("createInteractiveSession: kill() signals the process's real PID rather tha
     onOutput: () => undefined,
   });
 
-  await session.kill();
+  try {
+    await session.kill();
+    assert.deepEqual(killedPids, [{ pid: 4242, signal: "SIGTERM" }]);
+  } finally {
+    (process as unknown as { kill: typeof process.kill }).kill = originalKill;
+  }
+});
 
-  assert.equal(killCommands.length, 1);
-  assert.match(killCommands[0] as string, /^kill -TERM 4242\b/);
+test("createSandbox: defaults to this process's own uid:gid, never root — required for kill() to have permission at all", async () => {
+  const createContainerCalls: Array<{ User?: string }> = [];
+  const fakeDocker = {
+    createContainer: (opts: { User?: string }) => {
+      createContainerCalls.push(opts);
+      return Promise.resolve({ id: "sbx-created", start: () => Promise.resolve() });
+    },
+  };
+
+  const client = createLocalDockerSandboxClientV1({ docker: fakeDocker as never });
+  await client.createSandbox();
+
+  assert.equal(createContainerCalls.length, 1);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const gid = typeof process.getgid === "function" ? process.getgid() : undefined;
+  if (uid !== undefined && gid !== undefined) {
+    assert.equal(createContainerCalls[0]?.User, `${uid}:${gid}`);
+  }
+});
+
+test("createSandbox: an explicit empty user override falls back to the image's own default (e.g. root)", async () => {
+  const createContainerCalls: Array<{ User?: string }> = [];
+  const fakeDocker = {
+    createContainer: (opts: { User?: string }) => {
+      createContainerCalls.push(opts);
+      return Promise.resolve({ id: "sbx-created", start: () => Promise.resolve() });
+    },
+  };
+
+  const client = createLocalDockerSandboxClientV1({ docker: fakeDocker as never, user: "" });
+  await client.createSandbox();
+
+  assert.equal(createContainerCalls[0]?.User, undefined);
 });
