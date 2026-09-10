@@ -97,6 +97,21 @@ test('the in-sandbox CLI sign-in routes: start relays the prompt, code submissio
   assert.equal(requests[2]?.body, '{"code":"abc#state"}');
 });
 
+test('resetting the persistent sandbox is a DELETE on the provider, authorized, with no body', async () => {
+  const { requests, fetchImpl } = fakeFetch(() => new Response(null, { status: 204 }));
+  const client = createControlPlaneClientV1({
+    baseUrl: 'https://cp.example.com',
+    getAccessToken: () => Promise.resolve('token-1'),
+    fetchImpl,
+  });
+  const result = await client.resetUserSandbox('docker');
+  assert.equal(result.ok, true);
+  assert.equal(requests[0]?.method, 'DELETE');
+  assert.equal(requests[0]?.url, 'https://cp.example.com/v1/user-sandbox/docker');
+  assert.equal(requests[0]?.body, undefined);
+  assert.equal(requests[0]?.headers['authorization'], 'Bearer token-1');
+});
+
 test('auth exchange and refresh do not require a session token', async () => {
   const { requests, fetchImpl } = fakeFetch(() =>
     json(200, {

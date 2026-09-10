@@ -308,6 +308,12 @@ export interface ControlPlaneClientV1 {
     loginSessionId: string,
     code: string
   ): Promise<ApiResultV1<SandboxLoginCodeResultDtoV1>>;
+  /**
+   * Destroy and forget the caller's persistent sandbox for `provider`, so
+   * the next task or sign-in creates a fresh one. Destructive: everything
+   * inside it (files, the CLI login) is gone. 404 when none exists.
+   */
+  resetUserSandbox(provider: SandboxProviderV1): Promise<ApiResultV1<undefined>>;
 
   listFiles(taskId: string, path: string): Promise<ApiResultV1<readonly FileEntryDtoV1[]>>;
   getFile(taskId: string, path: string): Promise<ApiResultV1<FileContentDtoV1>>;
@@ -434,6 +440,7 @@ export function createControlPlaneClientV1(
       call('POST', `/v1/user-sandbox/login/${encodePath(loginSessionId)}/code`, {
         body: { code },
       }),
+    resetUserSandbox: (provider) => call('DELETE', `/v1/user-sandbox/${encodePath(provider)}`),
 
     listFiles: (taskId, path) =>
       call('GET', `/v1/tasks/${encodePath(taskId)}/files?path=${encodePath(path)}`),

@@ -259,6 +259,31 @@ export function SettingsScreen(): React.JSX.Element {
     }
   }
 
+  /**
+   * Two presses on purpose: the persistent sandbox holds the user's files
+   * and the CLI login, and there is no undo. The first press only re-labels
+   * the button with what it will do; only the second does it.
+   */
+  const [resetArmed, setResetArmed] = React.useState(false);
+  const [resetNotice, setResetNotice] = React.useState<string | null>(null);
+  async function resetSandbox(): Promise<void> {
+    if (!resetArmed) {
+      setResetArmed(true);
+      setResetNotice(null);
+      return;
+    }
+    setResetArmed(false);
+    const result = await services.client.resetUserSandbox(sandboxProvider);
+    if (result.ok) {
+      setResetNotice('Sandbox destroyed. The next task or sign-in creates a fresh one.');
+      setCliLogin({ kind: 'idle' });
+    } else if (result.code === 'userSandboxNotFound') {
+      setResetNotice('No persistent sandbox exists yet — nothing to reset.');
+    } else {
+      setResetNotice(`Could not reset: ${result.message}`);
+    }
+  }
+
   function openCliLoginUrl(url: string): void {
     void Linking.openURL(url).catch(() => {
       setCliLogin((current) =>
@@ -439,6 +464,19 @@ export function SettingsScreen(): React.JSX.Element {
               {!sandboxEnabled ? (
                 <Body muted>{`Enable ${sandboxProviderLabel} sandboxes above first.`}</Body>
               ) : null}
+              {sandboxEnabled ? (
+                <Row>
+                  <TouchButton
+                    label={resetArmed ? 'Really destroy it? Press again' : 'Reset sandbox'}
+                    variant="secondary"
+                    onPress={() => void resetSandbox()}
+                  />
+                  {resetArmed ? (
+                    <TouchButton label="Keep it" variant="secondary" onPress={() => setResetArmed(false)} />
+                  ) : null}
+                </Row>
+              ) : null}
+              {resetNotice !== null ? <Body muted>{resetNotice}</Body> : null}
             </Stack>
           ) : cliLogin.kind === 'starting' ? (
             <Body muted>Starting the CLI sign-in in your sandbox…</Body>

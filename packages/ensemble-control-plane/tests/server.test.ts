@@ -868,6 +868,52 @@ test("POST /v1/user-sandbox/login/:id/code: 404 without cliLogin, unknown sessio
   assert.equal(missingCode.status, 422);
 });
 
+test("DELETE /v1/user-sandbox/:provider destroys the persistent sandbox, then forgets it; a later task gets a fresh one", async () => {
+  const world = await makeWorld({ allowEphemeralSandboxWithoutRunHost: true });
+  await storeSandboxKey(world);
+  const persistent = {
+    provider: "e2b",
+    source: { kind: "attachExisting", path: "/workspace" },
+    workingDirectoryRoot: "/workspace",
+    lifecycle: "user-owned-managed",
+    cleanup: "retain",
+  };
+
+  // Nothing to reset yet: 404, and nothing destroyed.
+  const none = await world.call(world.tokenA, "DELETE", "/v1/user-sandbox/e2b");
+  assert.equal(none.status, 404);
+  assert.equal(code(none), "userSandboxNotFound");
+  assert.equal(world.sandbox.destroyedSandboxIds.length, 0);
+
+  const first = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: { request: "first", sandboxBinding: persistent },
+  });
+  assert.equal(first.status, 201);
+  const firstSandboxId = world.store.readUserSandbox(world.userA, "e2b")?.sandboxId;
+  assert.ok(firstSandboxId !== undefined);
+
+  const unauthenticated = await world.call("not-a-real-token", "DELETE", "/v1/user-sandbox/e2b");
+  assert.equal(unauthenticated.status, 401);
+  const foreign = await world.call(world.tokenB, "DELETE", "/v1/user-sandbox/e2b");
+  assert.equal(foreign.status, 404, "another user's sandbox reads as absent, never destroyed");
+  const badProvider = await world.call(world.tokenA, "DELETE", "/v1/user-sandbox/not-a-provider");
+  assert.equal(badProvider.status, 422);
+  assert.equal(world.sandbox.destroyedSandboxIds.length, 0);
+
+  const reset = await world.call(world.tokenA, "DELETE", "/v1/user-sandbox/e2b");
+  assert.equal(reset.status, 204);
+  assert.deepEqual(world.sandbox.destroyedSandboxIds, [firstSandboxId]);
+  assert.equal(world.store.readUserSandbox(world.userA, "e2b"), undefined);
+
+  // The next task creates a NEW persistent sandbox rather than reviving the old id.
+  const second = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: { request: "second", sandboxBinding: persistent },
+  });
+  assert.equal(second.status, 201);
+  const secondSandboxId = world.store.readUserSandbox(world.userA, "e2b")?.sandboxId;
+  assert.ok(secondSandboxId !== undefined && secondSandboxId !== firstSandboxId);
+});
+
 test("POST /v1/provider-calls: a stateless single-shot proxy over stored model-key custody", async () => {
   const seenPrompts: string[] = [];
   const fakeAdapter: EngineModelProviderAdapterV1 = {

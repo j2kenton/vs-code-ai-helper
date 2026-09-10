@@ -908,6 +908,47 @@ export function createControlPlaneHandlerV1(
         : { status: 200, body: { completed: false } };
     }
 
+    /**
+     * Reset the caller's persistent (`user-owned-managed`) sandbox for a
+     * provider: destroy it and forget it, so the next task or CLI sign-in
+     * creates a fresh one (the way to pick up a new sandbox image, or to
+     * start over after a bad login). Destroy-then-forget, never the
+     * reverse: a record that outlives its sandbox merely 422s on next use,
+     * but a sandbox that outlives its record is unreachable from every code
+     * path and — at a BYOS provider — bills until someone finds it.
+     */
+    const resetMatch = /^\/v1\/user-sandbox\/([^/]+)$/.exec(path);
+    if (resetMatch !== null && method === "DELETE") {
+      const provider = resetMatch[1] as string;
+      if (!SANDBOX_PROVIDERS_V1.has(provider)) {
+        return typed(422, "userSandboxResetInvalid", 'provider must be "e2b", "daytona", or "docker"');
+      }
+      const record = store.readUserSandbox(userId, provider as SandboxProviderV1);
+      if (record === undefined) {
+        return typed(404, "userSandboxNotFound", "no persistent sandbox exists for this provider");
+      }
+      const keyRecord = store.readKeyRecord(userId, `sandbox:${provider}`);
+      if (keyRecord === undefined) {
+        return typed(422, "sandboxProviderKeyMissing", "no stored key for the requested provider");
+      }
+      let apiKey: string;
+      try {
+        apiKey = await decryptKeyMaterialV1(kekProvider, keyRecord.envelope);
+      } catch (error) {
+        if (error instanceof KeyCustodyUnavailableErrorV1) {
+          return typed(503, error.code, error.message);
+        }
+        throw error;
+      }
+      try {
+        await sandboxFactory.clientFor(provider as SandboxProviderV1, apiKey).destroySandbox(record.sandboxId);
+      } catch {
+        return typed(422, "sandboxUnreachable", "the sandbox could not be destroyed; it was kept");
+      }
+      store.deleteUserSandbox(userId, provider as SandboxProviderV1);
+      return { status: 204 };
+    }
+
     if (method === "GET" && path === "/v1/keys") {
       return {
         status: 200,

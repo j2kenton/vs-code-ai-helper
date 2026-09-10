@@ -947,6 +947,13 @@ export function createSqliteControlPlaneStoreV1(
       return row === undefined ? undefined : (JSON.parse(row.record) as ControlPlaneUserSandboxRecordV1);
     },
 
+    deleteUserSandbox(ownerUserId: string, provider: SandboxProviderV1): boolean {
+      const result = db
+        .prepare("DELETE FROM user_sandboxes WHERE owner_user_id = ? AND provider = ?")
+        .run(ownerUserId, provider);
+      return Number(result.changes) > 0;
+    },
+
     close(): void {
       db.close();
     },

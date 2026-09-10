@@ -363,6 +363,8 @@ export interface ControlPlaneStoreV1 {
     ownerUserId: string,
     provider: SandboxProviderV1
   ): ControlPlaneUserSandboxRecordV1 | undefined;
+  /** Forget the record (the caller destroys the sandbox first); true when one existed. */
+  deleteUserSandbox(ownerUserId: string, provider: SandboxProviderV1): boolean;
 }
 
 export interface CreateControlPlaneStoreOptionsV1 {
@@ -851,6 +853,16 @@ export function createControlPlaneStoreV1(
       provider: SandboxProviderV1
     ): ControlPlaneUserSandboxRecordV1 | undefined {
       return document.userSandboxes[userSandboxKey(ownerUserId, provider)];
+    },
+
+    deleteUserSandbox(ownerUserId: string, provider: SandboxProviderV1): boolean {
+      const key = userSandboxKey(ownerUserId, provider);
+      if (document.userSandboxes[key] === undefined) {
+        return false;
+      }
+      delete document.userSandboxes[key];
+      persist();
+      return true;
     },
   };
 }
