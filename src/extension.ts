@@ -676,7 +676,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerChoosePublishScopeCommand(context, inventory);
   registerChatWithStageCommand(context, inventory, chatViewProvider, currentTaskStore);
   registerRunLintingFixesCommand(context, inventory, chatViewProvider);
-  registerRunPublishChecksCommand(context, inventory);
+  registerRunPublishChecksCommand(context, inventory, currentTaskStore);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);

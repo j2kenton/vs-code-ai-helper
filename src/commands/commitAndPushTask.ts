@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
-import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import {
   getImplementationSummaryUri,
@@ -2760,10 +2760,19 @@ export async function commitAndPushTask(
   // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
   // actions" route) ── acquired right after the process-global token, before
   // the startup barrier below (this command's first awaited setup step),
-  // whenever the target folder is known synchronously — see
-  // `extractSynchronousCommitPushFolderPathV1`'s doc comment for why this
-  // command needs its own admission rather than inheriting one.
-  const earlyFolderPath = extractSynchronousCommitPushFolderPathV1(explicitArg);
+  // whenever the target folder is known synchronously — either directly from
+  // `explicitArg` (see `extractSynchronousCommitPushFolderPathV1`'s doc
+  // comment for why this command needs its own admission rather than
+  // inheriting one) or, for a canonicalId-only/true no-arg invocation, via
+  // `peekTaskFolderPathSynchronouslyV1`'s in-memory inventory/current-task
+  // lookup (2026-09-09 review completion blocker: those two shapes used to
+  // fall through to "late" admission AFTER `waitUntilReady()`/task
+  // resolution, leaving the setup-phase watchdog race open). The peek is a
+  // best-effort guess, corrected below once `resolveCommitPushTargetTaskV1`
+  // returns the authoritative target.
+  const earlyFolderPath =
+    extractSynchronousCommitPushFolderPathV1(explicitArg) ??
+    peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
@@ -2778,17 +2787,15 @@ export async function commitAndPushTask(
   }
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
   try {
@@ -2799,6 +2806,13 @@ export async function commitAndPushTask(
     const resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore);
     if (!resolvedTask) {
       return;
+    }
+    // The early guess above can target the wrong task when it came from the
+    // peek rather than a direct explicit-arg folder path (stale cache, or a
+    // persisted current-task pointer resolution itself corrected). Release
+    // it and fall through to ordinary late acquisition for the real target.
+    if (handle && handle.taskFolderPath !== resolvedTask.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
     }
     if (!handle) {
       const late = await acquireWorkAdmissionV1({
@@ -2822,7 +2836,7 @@ export async function commitAndPushTask(
       chatViewProvider,
     });
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
     releaseCommitPushToken();
   }
 }
@@ -2853,7 +2867,20 @@ export async function completeCommitAndPushTask(
   // command's setup (stage transition, completion, next-task selection) all
   // runs inside the single `runTrackedOperation` root below, so admission is
   // held across the whole function, released only in the outer `finally`.
-  const earlyFolderPath = extractSynchronousCommitPushFolderPathV1(explicitArg);
+  //
+  // 2026-09-09 review completion blocker: a canonicalId-only/true no-arg
+  // invocation used to acquire admission only AFTER `waitUntilReady()` and
+  // `resolveTaskContext` below resolved with `allowPaused: false` — meaning a
+  // watchdog pause landing during that unprotected setup window would fail
+  // resolution itself (the task now reads as paused) before ever reaching the
+  // point where holding admission would have reversed it. Peeking the likely
+  // target synchronously, via the same in-memory inventory/current-task
+  // lookup `commitAndPushTask` uses, closes this for the dominant case (the
+  // target is already in the live inventory cache); a genuine cold-cache miss
+  // still falls through to late acquisition below, same as before.
+  const earlyFolderPath =
+    extractSynchronousCommitPushFolderPathV1(explicitArg) ??
+    peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
@@ -2868,17 +2895,15 @@ export async function completeCommitAndPushTask(
   }
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
   try {
@@ -2903,6 +2928,13 @@ export async function completeCommitAndPushTask(
         );
       }
       return;
+    }
+
+    // The early guess above can target the wrong task when it came from the
+    // peek rather than a direct explicit-arg folder path. Release it and fall
+    // through to ordinary late acquisition for the real target.
+    if (handle && handle.taskFolderPath !== resolvedTask.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
     }
 
     if (!handle) {
@@ -3062,7 +3094,7 @@ export async function completeCommitAndPushTask(
       }
     );
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
     releaseCommitPushToken();
   }
 }

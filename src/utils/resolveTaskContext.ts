@@ -144,6 +144,76 @@ function lookupInInventory(
 }
 
 /**
+ * Best-effort, SYNCHRONOUS mirror of `resolveTaskContext`'s two cheapest
+ * resolution steps — an explicit canonicalId/taskFolderPath, or (with no
+ * explicit target) the persisted current-task pointer — using only in-memory
+ * reads (`inventory.getTaskById`/`getVisibleTaskForSuppressedId`,
+ * `currentTaskStore.get()`), never `inventory.refresh()`, which performs real
+ * I/O.
+ *
+ * 2026-09-09 review completion blocker ("publish/complete actions" route):
+ * `runPublishChecks`/`commitAndPushTask`/`completeCommitAndPushTask` can only
+ * acquire work admission before their first awaited setup step
+ * (`TaskCreationStartupReconcilerV1.waitUntilReady()`) when a folder path is
+ * known synchronously from the command argument — but a canonicalId-only or
+ * true no-arg invocation (the keyboard shortcut acting on "the current task")
+ * carries no folder path at all, only a canonicalId or nothing. This function
+ * closes that gap for the dominant case (the target task is already present
+ * in the live inventory cache) AND for a genuine cold-cache miss: every
+ * `canonicalId` in this codebase is constructed FROM a task's folder path
+ * (`taskRoot.ts`'s discovery pass sets `canonicalId: normalizePath(taskFolderPath)`;
+ * every other construction site — draftTaskWithAI.ts, commitAndPushTask.ts,
+ * etc. — likewise derives it from an already-known `taskFolderPath` or
+ * `folderUri.fsPath`), so an inventory miss on a canonicalId/persisted-id
+ * lookup can still fall back to using that id AS the folder path guess,
+ * rather than admitting nothing at all. On Windows this guess may be
+ * lower-cased/case-normalized relative to the real on-disk casing (Windows
+ * filesystem I/O is case-insensitive, so this never fails to find the real
+ * admission directory on disk), and it may differ in exact string form from
+ * what `resolveTaskContext` authoritatively returns — the caller's existing
+ * "compare and reacquire on mismatch" correction handles both.
+ *
+ * The id-as-path fallback is gated on `fs.existsSync`, a cheap synchronous
+ * check consistent with this function staying I/O-free of anything blocking:
+ * a stale persisted/explicit id can point at a task that was genuinely
+ * DELETED, not merely absent from the in-memory cache, and work admission's
+ * own `mkdir(dir, { recursive: true })` genesis step would otherwise
+ * resurrect that deleted folder on disk just to hold an admission marker
+ * nothing will ever consume.
+ */
+export function peekTaskFolderPathSynchronouslyV1(
+  inventory: TaskInventory,
+  explicitTask?: { canonicalId?: string; taskFolderPath?: string },
+  currentTaskStore?: CurrentTaskStore
+): string | undefined {
+  if (explicitTask?.taskFolderPath) {
+    return explicitTask.taskFolderPath;
+  }
+  if (explicitTask?.canonicalId) {
+    const found =
+      inventory.getTaskById(explicitTask.canonicalId) ??
+      inventory.getVisibleTaskForSuppressedId(explicitTask.canonicalId);
+    if (found) {
+      return found.taskFolderPath;
+    }
+    return fs.existsSync(explicitTask.canonicalId) ? explicitTask.canonicalId : undefined;
+  }
+  if (!explicitTask && currentTaskStore) {
+    const persistedId = currentTaskStore.get();
+    if (persistedId) {
+      const found =
+        inventory.getTaskById(persistedId) ??
+        inventory.getVisibleTaskForSuppressedId(persistedId);
+      if (found) {
+        return found.taskFolderPath;
+      }
+      return fs.existsSync(persistedId) ? persistedId : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Shared command-side task resolver. Resolves the target task from explicit
  * arguments or the persisted current task, or fails consistently.
  *

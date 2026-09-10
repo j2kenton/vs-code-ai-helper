@@ -1,8 +1,9 @@
 import * as vscode from "vscode";
 import * as crypto from "node:crypto";
 import { TaskInventory } from "../state/taskInventory";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../types/incompleteTask";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { runCompletionLint, resolvePublishScopeFolder } from "../utils/completionLint";
@@ -24,7 +25,7 @@ import {
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import {
-  acquireWorkAdmissionV1,
+  acquireOrAdoptWorkAdmissionV1,
   describeWorkAdmissionRefusalV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
@@ -64,10 +65,16 @@ export function queuePublishChecksRunV1<T>(
  * Accepted argument shapes for runPublishChecks.
  * - Tree-view task node passes { task: IncompleteTask }
  * - Resolver-aware callers pass { canonicalId?, taskFolderPath? }
+ * - `applyCurrentStageAction` (and through it `scheduleTaskResume.ts`'s
+ *   `fire()`) dispatches { canonicalId, taskFolderPath, task: { progress },
+ *   admissionHandoffTokenV1? } — explicit fields plus a PARTIAL task with no
+ *   `folderUri` (2026-09-09 review completion blocker; see
+ *   `extractSynchronousPublishChecksFolderPathV1` and
+ *   `extractAdmissionHandoffTokenV1` below).
  */
 type RunPublishChecksArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string };
+  | { canonicalId?: string; taskFolderPath?: string; admissionHandoffTokenV1?: string };
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
@@ -108,16 +115,48 @@ export function normalizeRunPublishChecksArg(node: RunPublishChecksArg | undefin
  * (`TaskCreationStartupReconcilerV1.waitUntilReady()`) for the dominant
  * invocation (the Publish stage's tree-row/inline button), rather than only
  * after `resolveTaskContext` resolves a bare canonicalId.
+ *
+ * Explicit `taskFolderPath` (or a resolvable `canonicalId`'s sibling field)
+ * MUST win over the `task` shape, and `task.folderUri` MUST be read with
+ * optional chaining (2026-09-09 review completion blocker): unlike a
+ * tree-row button, which passes a REAL `IncompleteTask` with a live
+ * `folderUri`, `applyCurrentStageAction` dispatches
+ * `{ canonicalId, taskFolderPath, task: { progress } }` — a partial `task`
+ * carrying no `folderUri` at all. Reading `node.task.folderUri.fsPath`
+ * unconditionally, before checking the explicit fields, threw on every
+ * Publish dispatch through that router (including scheduled firing),
+ * mirroring `normalizeRunPublishChecksArg`'s own already-correct precedence.
  */
 function extractSynchronousPublishChecksFolderPathV1(node: RunPublishChecksArg | undefined): string | undefined {
   if (!node) {
     return undefined;
   }
-  if ("task" in node && node.task) {
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  if (n.taskFolderPath) {
+    return n.taskFolderPath;
+  }
+  if ("task" in node && node.task?.folderUri?.fsPath) {
     return node.task.folderUri.fsPath;
   }
-  const n = node as { canonicalId?: string; taskFolderPath?: string };
-  return n.taskFolderPath;
+  return undefined;
+}
+
+/**
+ * Extract `admissionHandoffTokenV1` from `explicitArg`, when present —
+ * mirrors `reviewActions.ts`'s identically-named helper (2026-09-09 review
+ * completion blocker: this route previously never accepted or adopted the
+ * token `applyCurrentStageAction`/`scheduleTaskResume.ts`'s `fire()` forward,
+ * so a scheduled Publish dispatch always raced a fresh genesis against the
+ * caller's own already-live marker and observed `busy`). Only the
+ * `{ canonicalId?, taskFolderPath?, admissionHandoffTokenV1? }` shape ever
+ * carries it — the tree-row `{ task }` shape never does, so a UI-originated
+ * invocation can never accidentally supply one and trigger adoption.
+ */
+function extractAdmissionHandoffTokenV1(node: RunPublishChecksArg | undefined): string | undefined {
+  if (!node || !("admissionHandoffTokenV1" in node)) {
+    return undefined;
+  }
+  return typeof node.admissionHandoffTokenV1 === "string" ? node.admissionHandoffTokenV1 : undefined;
 }
 
 /**
@@ -131,7 +170,8 @@ function extractSynchronousPublishChecksFolderPathV1(node: RunPublishChecksArg |
 export async function runPublishChecks(
   inventory: TaskInventory,
   explicitArg?: RunPublishChecksArg,
-  parentOperation?: TaskOperationHandle
+  parentOperation?: TaskOperationHandle,
+  currentTaskStore?: CurrentTaskStore
 ): Promise<boolean> {
   // Whether this call actually reached and began the protected checks run —
   // as opposed to refusing during an earlier guard clause (no task, wrong
@@ -141,22 +181,49 @@ export async function runPublishChecks(
   // started real work can restore its schedule instead of losing it.
   let dispatched = false;
 
+  // Computed up front (pure/synchronous) so it can feed BOTH the early
+  // admission guess below and the authoritative resolution inside the try
+  // block, without normalizing `explicitArg` twice.
+  const resolverArg = normalizeRunPublishChecksArg(explicitArg);
+
   // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
   // actions" route) ──────────────────────────────────────────────────────
   // Acquire durable admission BEFORE the startup activation-order barrier
   // below — this command's first awaited setup step — whenever the target
-  // folder is known synchronously from `explicitArg` (the dominant
-  // invocation: the Publish stage's tree-row/inline button), mirroring
-  // `runLintingFixes.ts`. Publish checks run real lint/type/test work
+  // folder is known synchronously: directly from `explicitArg` (the
+  // dominant invocation: the Publish stage's tree-row/inline button), or
+  // else via `peekTaskFolderPathSynchronouslyV1`'s in-memory inventory/
+  // current-task lookup (2026-09-09 review completion blocker: a
+  // canonicalId-only or true no-arg invocation used to fall through to
+  // "late" admission AFTER `waitUntilReady()`/`resolveTaskContext`, leaving
+  // the exact setup-phase race Part 1a exists to close, open for those two
+  // shapes). Publish checks run real lint/type/test work
   // (`runCompletionLint`/`runPublishScopeCheck`) that can take long enough
   // for the watchdog sweep to observe an `active` task with nothing durable
-  // yet recorded, exactly the setup-phase race Part 1a closes.
-  const earlyFolderPath = extractSynchronousPublishChecksFolderPathV1(explicitArg);
+  // yet recorded.
+  //
+  // The peek is a best-effort GUESS (stale cache, or a persisted current-task
+  // pointer that no longer matches what `resolveTaskContext` authoritatively
+  // resolves to) — corrected below, once the real resolution is in, by
+  // releasing a wrong guess and reacquiring for the right target.
+  //
+  // 2026-09-09 review completion blocker: this command's own registration
+  // never threaded a `CurrentTaskStore` through at all — so a true no-arg
+  // invocation (`resolverArg` undefined) never had the persisted current-task
+  // pointer available to either this peek or the authoritative
+  // `resolveTaskContext` call below, and always resolved as "no task found"
+  // instead of acting on the current task. `registerRunPublishChecksCommand`
+  // and its `extension.ts` call site now pass the shared `currentTaskStore`,
+  // matching every other lifecycle command's registration.
+  const earlyFolderPath =
+    extractSynchronousPublishChecksFolderPathV1(explicitArg) ??
+    peekTaskFolderPathSynchronouslyV1(inventory, resolverArg, currentTaskStore);
   const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
+    ? await acquireOrAdoptWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
         commandId: "runPublishChecks",
+        handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
@@ -165,23 +232,22 @@ export async function runPublishChecks(
   }
 
   // Single mutable admission slot for the whole command — filled either by
-  // the early acquisition above or, once a target is resolved (a bare
-  // canonicalId or no-arg invocation), right after `resolveTaskContext`
-  // below. Released in `finally` regardless of which branch of this command
-  // returns.
+  // the early acquisition above or, once the authoritative target is
+  // resolved, right after `resolveTaskContext` below (a genuine cold-cache
+  // miss, or a corrected reacquisition when the early guess above turns out
+  // to have targeted the wrong folder). Released in `finally` regardless of
+  // which branch of this command returns.
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
 
@@ -189,11 +255,10 @@ export async function runPublishChecks(
   // Activation-order barrier (plan §1.4): never read task state while the
   // startup creating-folder classification pass is still running.
   await TaskCreationStartupReconcilerV1.waitUntilReady();
-  const resolverArg = normalizeRunPublishChecksArg(explicitArg);
 
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
-  });
+  }, currentTaskStore);
 
   if (!resolvedTask) {
     NotificationRouter.showInformation(
@@ -202,11 +267,21 @@ export async function runPublishChecks(
     return dispatched;
   }
 
+  // The early guess above (when it came from the peek, not a direct
+  // explicit-arg folder path) can target the wrong task — a stale inventory
+  // cache entry, or a persisted current-task pointer that resolution itself
+  // corrected. Release it and fall through to the ordinary late-acquisition
+  // path below, which acquires for the AUTHORITATIVE folder.
+  if (handle && handle.taskFolderPath !== resolvedTask.taskFolderPath) {
+    await releaseCurrentAdmissionV1();
+  }
+
   if (!handle) {
-    const late = await acquireWorkAdmissionV1({
+    const late = await acquireOrAdoptWorkAdmissionV1({
       taskFolderPath: resolvedTask.taskFolderPath,
       purpose: "admission",
       commandId: "runPublishChecks",
+      handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
@@ -370,7 +445,7 @@ export async function runPublishChecks(
   dispatched = ranTrackedOperation === true;
   return dispatched;
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
   }
 }
 
@@ -379,11 +454,12 @@ export async function runPublishChecks(
  */
 export function registerRunPublishChecksCommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  currentTaskStore?: CurrentTaskStore
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runPublishChecks",
-    (arg?: RunPublishChecksArg) => runPublishChecks(inventory, arg)
+    (arg?: RunPublishChecksArg) => runPublishChecks(inventory, arg, undefined, currentTaskStore)
   );
   context.subscriptions.push(disposable);
 }
