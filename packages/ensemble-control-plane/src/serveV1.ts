@@ -381,7 +381,16 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   // CreateProductionRunHostOptionsV1.sandboxContextCache.
   const sandboxContextsByTask = new Map<string, SandboxExecutionContextV1>();
   const engineAdapters = createDefaultEngineAdaptersV1({ fetch: globalThis.fetch });
-  const sandboxFactory = createSdkSandboxClientFactoryV1();
+  // The provisioned sandbox image (docker/sandbox.Dockerfile). Unset means
+  // the Docker client's bare default image, which has no Claude Code CLI:
+  // fine for API-keyed models, useless for `claude-cli:*` selections — so
+  // an operator who wants the subscription path must build and name it.
+  const dockerSandboxImage = process.env["ENSEMBLE_DOCKER_SANDBOX_IMAGE"];
+  const sandboxFactory = createSdkSandboxClientFactoryV1({
+    ...(dockerSandboxImage !== undefined && dockerSandboxImage.length > 0
+      ? { dockerImage: dockerSandboxImage }
+      : {}),
+  });
   const jobSupervisor = createEngineJobSupervisorV1({
     store,
     hub,

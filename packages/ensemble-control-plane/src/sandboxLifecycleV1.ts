@@ -75,12 +75,24 @@ export function createFetchSandboxClientFactoryV1(fetchImpl: FetchLikeV1): Sandb
   };
 }
 
+export interface CreateSdkSandboxClientFactoryOptionsV1 {
+  /**
+   * Image for `docker` sandboxes. The deployment should point this at the
+   * provisioned image (`docker/sandbox.Dockerfile`: Claude Code CLI baked
+   * in) — the client's own default is a bare `node` image in which no
+   * `claude-cli` round can run.
+   */
+  readonly dockerImage?: string;
+}
+
 /**
  * SDK-backed factory over the real `e2b` / `@daytona/sdk` vendor SDKs plus
  * the local Docker daemon — the deployment default (plan Part 5's E2B/Daytona
  * SDK integration item, plus the self-hosted `docker` provider).
  */
-export function createSdkSandboxClientFactoryV1(): SandboxClientFactoryV1 {
+export function createSdkSandboxClientFactoryV1(
+  options?: CreateSdkSandboxClientFactoryOptionsV1
+): SandboxClientFactoryV1 {
   return {
     clientFor(provider: SandboxProviderV1, apiKey: string): SandboxClientV1 {
       if (provider === "e2b") {
@@ -89,7 +101,10 @@ export function createSdkSandboxClientFactoryV1(): SandboxClientFactoryV1 {
       if (provider === "daytona") {
         return createDaytonaSdkSandboxClientV1({ apiKey });
       }
-      return createLocalDockerSandboxClientV1({ apiKey });
+      return createLocalDockerSandboxClientV1({
+        apiKey,
+        ...(options?.dockerImage !== undefined ? { image: options.dockerImage } : {}),
+      });
     },
   };
 }
