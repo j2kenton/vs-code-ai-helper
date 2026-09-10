@@ -186,6 +186,19 @@ test("a signed-out CLI (exit 0, 'Not logged in' on stdout) is a terminal auth fa
     code: "authenticationFailed",
     retryable: false,
   });
+
+  // The fresh-sandbox variant, also captured live: same stdout text, exit 1,
+  // stderr empty. The words are in the redirected stdout FILE, not in the
+  // command's captured tail — a runner that only reads stderr on a non-zero
+  // exit sees nothing and reports a bare cliExit1.
+  const freshSandbox = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({ exitCode: 1, stderr: "", frame: () => "Not logged in · Please run /login\n" }),
+  });
+  assert.deepEqual(await makeRunner(freshSandbox).invoke(invocation("impl")), {
+    kind: "failed",
+    code: "authenticationFailed",
+    retryable: false,
+  });
 });
 
 test("output without the result frame is a retryable malformed-result failure, never promoted content", async () => {

@@ -345,7 +345,14 @@ export function createSandboxCliProviderRunnerV1(
 
         const stderr = (await client.readFileUtf8(sandboxId, stderrPath)) ?? captured.stderrTail;
         if (captured.exitCode !== 0) {
-          const errorMessage = tail(`${stderr}\n${captured.stdoutTail}`);
+          // The command's stdout is REDIRECTED to the output file, so the
+          // captured `stdoutTail` is empty by construction — the CLI's own
+          // words about why it failed are in that file. Confirmed live: a
+          // fresh sandbox's signed-out CLI exits 1 with "Not logged in ·
+          // Please run /login" on stdout and nothing on stderr, which
+          // classified as a bare `cliExit1` until the file was read here.
+          const stdout = (await client.readFileUtf8(sandboxId, outputPath)) ?? captured.stdoutTail;
+          const errorMessage = tail(`${stderr}\n${stdout}`);
           const classified = classifyEngineProviderFailureV1({
             errorMessage,
             authFailure: isAuthenticationFailureV1(errorMessage),
