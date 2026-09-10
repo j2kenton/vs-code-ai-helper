@@ -594,6 +594,25 @@ export async function draftTaskWithAI(
     }
   };
 
+  // 2026-09-10 review completion blocker fix: `endTargetResolutionV1` was
+  // only ever reached via the `finally` wrapped around `resolveTaskContext`
+  // below — a declined/failed consent gate returned BEFORE that `finally`
+  // ever ran, leaking this call's target-resolution counter, durable root
+  // marker, and background retry timer for the rest of the process's life
+  // and permanently standing every subsequent watchdog sweep down for every
+  // task root candidate it touched. `endTargetResolutionOnceV1` is called
+  // from both the inner `finally` (the normal path) AND the outer `finally`
+  // below (covering consent decline and any other early return before that
+  // point), guarded so it never ends the same handle twice.
+  let targetResolutionEnded = false;
+  const endTargetResolutionOnceV1 = async (): Promise<void> => {
+    if (targetResolutionEnded) {
+      return;
+    }
+    targetResolutionEnded = true;
+    await endTargetResolutionV1(targetResolutionHandle);
+  };
+
   try {
     // ── Consent gate ─────────────────────────────────────────────────────────
     const consented = await ensureAiConsent(context);
@@ -607,7 +626,7 @@ export async function draftTaskWithAI(
         allowPaused: false,
       });
     } finally {
-      await endTargetResolutionV1(targetResolutionHandle);
+      await endTargetResolutionOnceV1();
     }
 
     if (!resolvedTask) {
@@ -671,6 +690,10 @@ export async function draftTaskWithAI(
     );
     return result?.succeeded || undefined;
   } finally {
+    // Safety net for the consent-decline / early-return leak fixed above:
+    // guaranteed to be a no-op on the normal path, where the inner `finally`
+    // already ended target resolution.
+    await endTargetResolutionOnceV1();
     await releaseCurrentAdmissionV1();
   }
 }
