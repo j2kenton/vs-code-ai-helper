@@ -1,0 +1,326 @@
+/**
+ * Sandbox CLI provider runner: an `EngineProviderRunnerV1` that runs the REAL
+ * Claude Code CLI inside the task's sandbox for each round, instead of
+ * calling a model's HTTP API directly (`providerDispatchV1.ts`).
+ *
+ * This is the "as close as possible to running it locally" path. Locally,
+ * the extension's implementation stage launches `claude -p --permission-mode
+ * acceptEdits` as a child of the extension host, and that CLI — with its own
+ * tools — reads files, edits files, runs commands, and iterates. Here the
+ * very same CLI, with the very same flags, runs inside the sandbox through
+ * `SandboxClientV1.runCommand`, authenticated by whatever the CLI itself
+ * persisted in that sandbox (the subscription login `cliLoginSessionsV1.ts`
+ * drives) or by an env file the composition supplies. Nothing here calls a
+ * model API, and nothing here executes anything locally: this module only
+ * ever hands argv to the sandbox client.
+ *
+ * Shape, mirrored from `src/runners/providers.ts`'s Claude Code definition:
+ *  - `impl` rounds run in EDIT mode (`--permission-mode acceptEdits`) — the
+ *    CLI actually writes files. Every other stage runs in PLAN mode
+ *    (`--permission-mode plan` plus the same headless system prompt the
+ *    extension appends) — read-only, exactly as the extension's text mode.
+ *  - The prompt is the engine's own round prompt (`buildEngineRoundPromptV1`:
+ *    plan of record, answers, and the result-frame contract) delivered via
+ *    a file redirected onto the CLI's stdin — `runCommand` has no stdin of
+ *    its own, and a file avoids argv size limits entirely.
+ *  - The CLI's final text is read back from a file the command's stdout is
+ *    redirected to, because `runCommand` returns only bounded output TAILS
+ *    by design and a round summary can exceed them. It is then parsed with
+ *    the same strict `parseAiResultEnvelopeV1` frame contract the direct-API
+ *    path uses, so the engine's loop (checklist merge, questions pause,
+ *    failure routing) is byte-for-byte the same downstream of either runner.
+ *  - Output uses `--output-format text` in BOTH modes (the extension uses
+ *    `stream-json` for its text mode); the frame contract makes structured
+ *    event parsing unnecessary, and one parser for both modes is one fewer
+ *    way to be wrong. The CLI's structural rate-limit signals that
+ *    `stream-json` would expose are instead classified from its stderr text.
+ *
+ * Crash safety: the CLI run is a sandbox-mutating external effect, so it
+ * runs under `EngineGateMachineryV1.runUngatedEffect` with a step id unique
+ * to the invocation (its correlation attempt id). A worker that crashes
+ * mid-round leaves the standard pending attempt record for recovery; a
+ * recovery that cannot recover the CLI's output (adopted outcome,
+ * indeterminate re-offer) reports a non-retryable failed round rather than
+ * running the CLI — and its edits — a second time.
+ */
+import type { TaskStage } from "../../ensemble-core/src/taskProgressV1";
+import {
+  classifyEngineProviderFailureV1,
+  isAuthenticationFailureV1,
+} from "./failureClassificationV1";
+import type { EngineGateMachineryV1 } from "./gateMachineryV1";
+import { buildEngineRoundPromptV1, ENGINE_ROUND_MAX_RESPONSE_BYTES_V1 } from "./providerDispatchV1";
+import { parseAiResultEnvelopeV1 } from "./resultEnvelopeV1";
+import { quotePosixShellArgV1, type SandboxClientV1, type SandboxCommandResultV1 } from "./sandboxClientV1";
+import type {
+  EngineProviderInvocationV1,
+  EngineProviderRunnerV1,
+  EngineRoundResultV1,
+} from "./taskLoopV1";
+
+/**
+ * Verbatim copy of the extension's `CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT`
+ * (`src/runners/providers.ts`): the extension package depends on `vscode`
+ * and cannot be imported here, and this text is part of the CLI contract
+ * the sandbox path must reproduce exactly.
+ */
+export const CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT_V1 =
+  "This is a non-interactive, headless run. The ExitPlanMode and " +
+  "AskUserQuestion tools are not available in this session — do not " +
+  "attempt to call them, and do not write your plan or any partial " +
+  "output to a file (including anywhere under ~/.claude/plans). Instead, " +
+  "write your complete plan, review, or answer directly as this " +
+  "response's final text, including any open questions, decisions, or " +
+  "assumptions inline in that text.";
+
+export type SandboxCliRoundModeV1 = "edit" | "plan";
+
+/** Only the implementation stage may write; every other stage is read-only, as locally. */
+export function sandboxCliModeForStageV1(stage: TaskStage): SandboxCliRoundModeV1 {
+  return stage === "impl" ? "edit" : "plan";
+}
+
+export interface SandboxCliArgvOptionsV1 {
+  readonly mode: SandboxCliRoundModeV1;
+  /** Provider-native model id (e.g. `claude-opus-5`); undefined runs the CLI default. */
+  readonly model?: string;
+  /** The CLI executable; default `claude`. */
+  readonly command?: string;
+}
+
+/** Mirrors `providers.ts`'s Claude Code `buildArgs` for the sandbox path. */
+export function buildClaudeCliArgvV1(options: SandboxCliArgvOptionsV1): readonly string[] {
+  const argv: string[] = [options.command ?? "claude", "-p", "--output-format", "text"];
+  if (options.mode === "edit") {
+    argv.push("--permission-mode", "acceptEdits");
+  } else {
+    argv.push(
+      "--permission-mode",
+      "plan",
+      "--append-system-prompt",
+      CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT_V1
+    );
+  }
+  if (options.model !== undefined && options.model.length > 0) {
+    argv.push("--model", options.model);
+  }
+  return argv;
+}
+
+export interface CreateSandboxCliProviderRunnerOptionsV1 {
+  readonly client: SandboxClientV1;
+  readonly sandboxId: string;
+  /** The binding's confined root; the CLI's working directory. */
+  readonly workingDirectoryRoot: string;
+  /** This task's gate machinery — the CLI run is an attempt-recorded effect. */
+  readonly machinery: EngineGateMachineryV1;
+  readonly model?: string;
+  readonly command?: string;
+  /**
+   * Environment for the CLI process, written to a mode-0600 file inside the
+   * sandbox and sourced by the wrapper script — never placed on the command
+   * line, where `ps`/`docker top` would expose it. The place for an
+   * `ANTHROPIC_API_KEY` when the sandbox has no subscription login.
+   */
+  readonly env?: Readonly<Record<string, string>>;
+  /** Where the per-round prompt/output/env files live; default `/tmp/ensemble-cli`. */
+  readonly scratchDir?: string;
+  readonly maxOutputBytes?: number;
+}
+
+/** Exported for tests: the failure codes this runner can report. */
+export const SANDBOX_CLI_ROUND_FAILURE_CODES_V1 = {
+  outputUnavailable: "cliRoundOutputUnavailable",
+  outputMissing: "cliRoundOutputMissing",
+  outputTooLarge: "cliRoundOutputTooLarge",
+  alreadyExecuted: "cliRoundAlreadyExecuted",
+  indeterminate: "cliRoundIndeterminate",
+  leaseUnavailable: "cliRoundLeaseUnavailable",
+} as const;
+
+const ENV_NAME_PATTERN_V1 = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_DIAGNOSTIC_CHARS_V1 = 2000;
+
+function tail(text: string, max = MAX_DIAGNOSTIC_CHARS_V1): string {
+  return text.length > max ? text.slice(-max) : text;
+}
+
+/** `export NAME='value'` lines, every value strictly single-quoted; names validated. */
+export function renderEnvFileV1(env: Readonly<Record<string, string>>): string {
+  const lines: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!ENV_NAME_PATTERN_V1.test(name)) {
+      throw new Error(`invalid environment variable name for the sandbox CLI: ${JSON.stringify(name)}`);
+    }
+    lines.push(`export ${name}=${quotePosixShellArgV1(value)}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The wrapper the sandbox actually runs. Every dynamic piece is strictly
+ * quoted, so nothing from the prompt, the model id, or the paths can become
+ * shell syntax; the CLI's own argv is passed through the same quoting.
+ */
+export function buildSandboxCliScriptV1(input: {
+  readonly argv: readonly string[];
+  readonly promptPath: string;
+  readonly outputPath: string;
+  readonly stderrPath: string;
+  readonly envPath?: string;
+}): string {
+  const command = input.argv.map((arg) => quotePosixShellArgV1(arg)).join(" ");
+  const source = input.envPath !== undefined ? `. ${quotePosixShellArgV1(input.envPath)} && ` : "";
+  return (
+    `${source}${command} ` +
+    `< ${quotePosixShellArgV1(input.promptPath)} ` +
+    `> ${quotePosixShellArgV1(input.outputPath)} ` +
+    `2> ${quotePosixShellArgV1(input.stderrPath)}`
+  );
+}
+
+export function createSandboxCliProviderRunnerV1(
+  options: CreateSandboxCliProviderRunnerOptionsV1
+): EngineProviderRunnerV1 {
+  const { client, sandboxId, workingDirectoryRoot, machinery } = options;
+  const scratchDir = (options.scratchDir ?? "/tmp/ensemble-cli").replace(/\/$/, "");
+  const maxOutputBytes = options.maxOutputBytes ?? ENGINE_ROUND_MAX_RESPONSE_BYTES_V1;
+
+  async function cleanup(paths: readonly string[]): Promise<void> {
+    for (const path of paths) {
+      try {
+        await client.deleteFile(sandboxId, path);
+      } catch {
+        // Best-effort: a stale scratch file never masks the round's real outcome.
+      }
+    }
+  }
+
+  function failed(code: string, retryable: boolean): EngineRoundResultV1 {
+    return { kind: "failed", code, retryable };
+  }
+
+  return {
+    async invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
+      const id = input.correlation.attemptId;
+      const promptPath = `${scratchDir}/${id}.prompt.md`;
+      const outputPath = `${scratchDir}/${id}.out`;
+      const stderrPath = `${scratchDir}/${id}.err`;
+      const envPath = options.env !== undefined ? `${scratchDir}/${id}.env` : undefined;
+      const scratch = [promptPath, outputPath, stderrPath, ...(envPath !== undefined ? [envPath] : [])];
+
+      try {
+        await client.writeFile(sandboxId, promptPath, buildEngineRoundPromptV1(input));
+        if (envPath !== undefined && options.env !== undefined) {
+          await client.writeFile(sandboxId, envPath, renderEnvFileV1(options.env));
+        }
+
+        const argv = buildClaudeCliArgvV1({
+          mode: sandboxCliModeForStageV1(input.stage),
+          ...(options.model !== undefined ? { model: options.model } : {}),
+          ...(options.command !== undefined ? { command: options.command } : {}),
+        });
+        const script = buildSandboxCliScriptV1({
+          argv,
+          promptPath,
+          outputPath,
+          stderrPath,
+          ...(envPath !== undefined ? { envPath } : {}),
+        });
+
+        // The captured command result only exists on a fresh execution (or
+        // a reconciled re-issue); every other recovery outcome has no output
+        // to parse and is reported as such below.
+        let captured: SandboxCommandResultV1 | undefined;
+        const effect = await machinery.runUngatedEffect(`cli-round/${id}`, {
+          effectKind: "sandboxCommand",
+          supportsIdempotentReplay: false,
+          async execute(attemptKey: string) {
+            captured = await client.runCommand({
+              sandboxId,
+              argv: ["sh", "-c", script],
+              cwd: workingDirectoryRoot,
+              attemptKey,
+            });
+            return {
+              status: captured.exitCode === 0 ? ("succeeded" as const) : ("failed" as const),
+              code: `cliExit${captured.exitCode}`,
+            };
+          },
+          reconcile(attemptKey: string) {
+            return client.findCommandByAttemptKey(sandboxId, attemptKey);
+          },
+        });
+
+        switch (effect.kind) {
+          case "alreadyExecuted":
+            return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.alreadyExecuted, false);
+          case "indeterminate":
+            return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.indeterminate, false);
+          case "leaseUnavailable":
+            return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.leaseUnavailable, true);
+          case "recovered":
+            if (effect.method !== "reconciledReissued" || captured === undefined) {
+              return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputUnavailable, false);
+            }
+            break;
+          case "executed":
+            break;
+        }
+        if (captured === undefined) {
+          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputUnavailable, false);
+        }
+
+        const stderr = (await client.readFileUtf8(sandboxId, stderrPath)) ?? captured.stderrTail;
+        if (captured.exitCode !== 0) {
+          const errorMessage = tail(`${stderr}\n${captured.stdoutTail}`);
+          const classified = classifyEngineProviderFailureV1({
+            errorMessage,
+            authFailure: isAuthenticationFailureV1(errorMessage),
+          });
+          const code =
+            classified.failureKind === "quota"
+              ? "quotaExhausted"
+              : classified.failureKind === "temporarily-unavailable"
+                ? "temporarilyUnavailable"
+                : classified.failureKind === "model-entitlement"
+                  ? "modelEntitlementBlocked"
+                  : classified.authFailure === true
+                    ? "authenticationFailed"
+                    : `cliExit${captured.exitCode}`;
+          // Same discipline as the direct-API dispatch: auth never retries,
+          // capacity-shaped failures do, anything else is terminal.
+          return failed(code, classified.authFailure !== true && classified.failureKind !== "generic");
+        }
+
+        const output = await client.readFileUtf8(sandboxId, outputPath);
+        if (output === undefined) {
+          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputMissing, true);
+        }
+        if (Buffer.byteLength(output, "utf8") > maxOutputBytes) {
+          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputTooLarge, false);
+        }
+
+        const envelope = parseAiResultEnvelopeV1(output, input.correlation);
+        if (envelope.kind === "malformed") {
+          return failed(`malformedResult.${envelope.code}`, true);
+        }
+        if (envelope.kind === "questions") {
+          return { kind: "questions", questions: envelope.questions };
+        }
+        if (envelope.kind === "completed") {
+          if (envelope.content.contentType !== "markdown-artifact.v1") {
+            return failed("unexpectedContentType", true);
+          }
+          return { kind: "completed", summaryMarkdown: envelope.content.markdown };
+        }
+        if (envelope.kind === "cancelled") {
+          return failed("cancelled", false);
+        }
+        return failed(envelope.code, envelope.retryable);
+      } finally {
+        await cleanup(scratch);
+      }
+    },
+  };
+}
