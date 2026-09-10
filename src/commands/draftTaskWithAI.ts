@@ -1,6 +1,4 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
-import * as path from "path";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";

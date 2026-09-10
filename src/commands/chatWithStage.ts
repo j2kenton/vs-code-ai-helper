@@ -1,6 +1,4 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
-import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
@@ -8,7 +6,6 @@ import {
   PLAN_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
-  TASK_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
