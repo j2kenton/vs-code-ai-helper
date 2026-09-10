@@ -25,11 +25,17 @@ ARG CLAUDE_CODE_VERSION=2.1.267
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
   && claude --version
 
-# A writable workspace root for the non-root uid the control plane runs
-# containers as. `node` is uid 1000 in this image — the same uid the
-# control plane's own `ubuntu` service user has on the host — so this is
-# owned by the user that will actually run inside.
-RUN mkdir -p /workspace && chown node:node /workspace
+# The control plane runs containers as ITS OWN host uid (see
+# localDockerSandboxClientV1.ts), and that uid is not knowable at build
+# time — on the first real box it was 1001, which exists in no passwd entry
+# of this image, so the runtime gave it HOME=/ and it could write nowhere:
+# `claude auth login` had no place to persist, and no task could touch
+# /workspace (confirmed live). So: a home and a workspace any uid can write,
+# rather than directories owned by a uid we guessed. 0777 is acceptable
+# here because a sandbox is single-tenant by construction — one user, one
+# container — there is nobody inside to protect these from.
+RUN mkdir -p /workspace /home/sandbox && chmod 0777 /workspace /home/sandbox
+ENV HOME=/home/sandbox
 WORKDIR /workspace
 
 # No ENTRYPOINT/CMD on purpose: the control plane starts containers with
