@@ -47,8 +47,17 @@ const CLAUDE_AUTH_LOGIN_ARGV_V1 = ["claude", "auth", "login"] as const;
 
 /** How long to watch output before answering — tuned to real observed latency, not a guess. */
 const DEFAULT_CAPTURE_WINDOW_MS_V1 = 4000;
-/** How long a started-but-abandoned login session is kept alive before being killed and forgotten. */
-const DEFAULT_SESSION_TTL_MS_V1 = 5 * 60 * 1000;
+/**
+ * How long a started-but-abandoned login session is kept alive before being
+ * killed and forgotten. 15 minutes, not 5: the first live run (2026-09-10)
+ * lost a real login because the human round-trip — open the URL, sign in,
+ * copy the code, paste it into a client — took longer than 5 minutes, and
+ * the code is bound to that session's PKCE challenge, so a late code is
+ * unusable rather than merely slow. OAuth authorization codes themselves
+ * are typically good for ~10 minutes, so anything shorter than that just
+ * throws away logins the provider would still have accepted.
+ */
+const DEFAULT_SESSION_TTL_MS_V1 = 15 * 60 * 1000;
 
 interface CliLoginSessionRecordV1 {
   readonly loginSessionId: string;
