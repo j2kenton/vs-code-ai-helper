@@ -57,14 +57,36 @@ injected-transport discipline.
   specific (never wildcard) `Access-Control-Allow-Origin` +
   `Access-Control-Allow-Credentials`, and an `OPTIONS` preflight from an
   allowlisted origin is answered directly with 204 — see `cors.test.ts`.
-- **`sandboxLifecycleV1.ts`** — E2B/Daytona client factory: two
+- **`sandboxLifecycleV1.ts`** — sandbox client factory for the three
+  providers (`docker` self-hosted, `e2b`/`daytona` BYOS): two
   interchangeable factories behind `SandboxClientV1`
   (`createFetchSandboxClientFactoryV1` over the engine's fetch adapters, used
   by this package's own tests; `createSdkSandboxClientFactoryV1` over the
   real vendor SDKs — see `sandboxSdkAdaptersV1.ts` — the deployment default),
-  fail-closed binding reachability, split-lineage source acquisition, and
+  fail-closed binding reachability, split-lineage source acquisition,
   teardown routed through `runUngatedEffect` so the destroy is
-  attempt-recorded (and a user-managed workspace is never destroyed).
+  attempt-recorded (and a persistent workspace is never destroyed), and
+  `ensureUserSandboxV1` — the ONE persistent sandbox per (user, provider)
+  behind the `user-owned-managed` binding lifecycle, created on first use
+  and reused by every later task.
+- **`localDockerSandboxClientV1.ts`** — the self-hosted `docker` provider:
+  `SandboxClientV1` over the local Docker daemon (dockerode, host-side —
+  the engine's no-child-process rule still holds). Containers run as the
+  control plane's own uid (never root, by default), and it is the one
+  provider implementing `createInteractiveSession` (a real TTY exec, which
+  isatty-gated CLIs require before they print anything).
+  **`docker/sandbox.Dockerfile`** is the image those containers should run:
+  `node` plus the Claude Code CLI baked in at build time — installing per
+  container was rejected (the non-root uid cannot `npm install -g`). Build
+  it on the host and name it via `ENSEMBLE_DOCKER_SANDBOX_IMAGE`.
+- **`cliLoginSessionsV1.ts`** — the bring-your-own-subscription sign-in:
+  runs `claude auth login` inside the caller's persistent sandbox through
+  an interactive session, relays the printed authorization URL, accepts
+  the pasted code, and reports a verdict — never any captured output after
+  the code (it may be credential material). `claude setup-token` was the
+  first attempt and persists nothing; `auth login` leaves the login in the
+  sandbox's own `~/.claude`, which is what the engine's `claude-cli` rounds
+  authenticate with. Abandoned sessions are killed after 15 minutes.
 - **`sandboxSdkAdaptersV1.ts`** — SDK-backed `SandboxClientV1` for E2B
   (`e2b`) and Daytona (`@daytona/sdk`): the ONLY file that imports either
   vendor SDK. Outcome discipline matches the fetch adapters exactly (a
@@ -104,7 +126,41 @@ injected-transport discipline.
   the engine's resolve-then-check rule, write-only key records with masked
   metadata) plus a thin node:http adapter that also carries the WS upgrade.
   With a `runs` host configured, task creation starts the hosted engine run
-  and structured answers route into the paused run.
+  and structured answers route into the paused run. A task DTO carries the
+  run's own state as `run.{status,failureCode}` — the core progress
+  vocabulary has no failed state, so this is where a client learns a run
+  stopped and why.
+- **`serveV1.ts`** — the composition root and the only place anything
+  listens on a port. What a hosted task can actually DO depends on its model
+  selection: a direct-API model (`anthropic:…`, `openai:…`, `google:…`)
+  only "thinks" (nothing turns its rounds into file changes); a
+  `claude-cli:<model>` selection runs the real Claude Code CLI inside the
+  task's sandbox for every round (`@ensemble/engine`'s
+  `sandboxCliRunnerV1.ts`, dispatched through `cliRunnerFor`) —
+  implementation rounds edit files and run commands there, review stages
+  run read-only — on the subscription signed in to that sandbox.
+
+## Running it
+
+```
+ENSEMBLE_KEK_SECRET=…                      # required; envelope KEK boot secret
+ENSEMBLE_GITHUB_CLIENT_ID/SECRET=…         # at least one identity provider
+ENSEMBLE_GOOGLE_CLIENT_ID/SECRET=…
+ENSEMBLE_PORT=8787                         # default
+ENSEMBLE_DATABASE_PATH=control-plane.sqlite
+ENSEMBLE_CORS_ORIGINS=http://localhost:8081
+ENSEMBLE_DOCKER_SANDBOX_IMAGE=ensemble-sandbox:latest   # docker/sandbox.Dockerfile; unset = bare node image, no CLI
+ENSEMBLE_WORKER_ID=…                       # optional stable lease-holder id
+pnpm --filter @ensemble/control-plane serve   # reads .env.local if present
+```
+
+The end-to-end subscription path, as verified live (2026-09-10) on a
+self-hosted box: enable Docker sandboxes (one stored `sandbox:docker`
+record; the value is ignored), sign Claude Code in to your persistent
+sandbox (`POST /v1/user-sandbox/login` → browser → `…/code`), create a task
+with model `claude-cli:sonnet` and a `user-owned-managed` Docker binding —
+all eight stages ran through the CLI in the sandbox and wrote the requested
+files in about three minutes, with no API key anywhere.
 
 ## Still to come (plan order)
 
@@ -112,7 +168,13 @@ injected-transport discipline.
   tests; the swap is confined to `storeV1.ts`) — blocked on workspace
   dependency installation.
 - Validating `sandboxSdkAdaptersV1.ts` against the LIVE E2B/Daytona SDKs
-  (today it is proven against an injected fake factory, per above).
+  (today it is proven against an injected fake factory, per above), and
+  `createInteractiveSession` for them (today only `docker` has it, so the
+  in-sandbox CLI sign-in is Docker-only; the route answers
+  `userSandboxLoginUnsupported` for the others).
+- Per-stage model selection through the API (a task record carries one
+  `modelId`, which becomes the general chain; the engine already resolves
+  per-stage chains, the contract just does not carry them yet).
 - The Parts 6–10 Playwright web smoke checks and the Part 11
   react-native-web hardening pass, native/web e2e smoke suite, and app
   store / web deploy packaging.
