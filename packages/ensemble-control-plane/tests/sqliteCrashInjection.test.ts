@@ -152,7 +152,7 @@ test("sqlite boundary 2 — crash AFTER persist, BEFORE the call: reconcile prov
 
   // The terminal outcome is durable: a third instance reads it back.
   const reread = openStore(path);
-  const attempts = await reread.attempts.listForGate(gateId);
+  const attempts = await reread.attempts.listForGate(TASK, gateId);
   assert.equal(attempts[0]?.state, "succeeded");
   reread.close();
 });

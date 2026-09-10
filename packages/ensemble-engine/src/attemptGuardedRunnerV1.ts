@@ -44,7 +44,7 @@ export function createAttemptGuardedProviderRunnerV1(
   return {
     async invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
       const stepId = providerRoundStepIdV1(input);
-      const lineage = (await options.attemptStore.listForGate(stepId)).length;
+      const lineage = (await options.attemptStore.listForGate(input.taskId, stepId)).length;
       const attemptKey = deriveExecutionAttemptKeyV1({
         taskId: input.taskId,
         gateId: stepId,

@@ -109,7 +109,7 @@ function completeCrashingStore(): {
       },
       markIndeterminate: (attemptKey) => inner.markIndeterminate(attemptKey),
       read: (attemptKey) => inner.read(attemptKey),
-      listForGate: (gateId) => inner.listForGate(gateId),
+      listForGate: (taskId, gateId) => inner.listForGate(taskId, gateId),
       listOpenForTask: (taskId) => inner.listOpenForTask(taskId),
     },
   };

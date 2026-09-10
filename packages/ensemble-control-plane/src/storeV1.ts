@@ -529,10 +529,10 @@ export function createControlPlaneStoreV1(
       return Promise.resolve(document.attempts[attemptKey]);
     },
 
-    listForGate(gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
+    listForGate(taskId: string, gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
       return Promise.resolve(
         Object.values(document.attempts)
-          .filter((record) => record.gateId === gateId)
+          .filter((record) => record.taskId === taskId && record.gateId === gateId)
           .sort((a, b) => a.lineage - b.lineage)
       );
     },

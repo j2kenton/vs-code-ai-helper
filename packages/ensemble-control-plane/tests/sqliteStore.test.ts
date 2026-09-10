@@ -178,7 +178,7 @@ test("sqlite execution attempts: begin is idempotent by key; the first terminal 
 
   const open = await store.attempts.listOpenForTask("t");
   assert.equal(open.length, 0);
-  const forGate = await store.attempts.listForGate("g");
+  const forGate = await store.attempts.listForGate("t", "g");
   assert.equal(forGate.length, 1);
   store.close();
 });

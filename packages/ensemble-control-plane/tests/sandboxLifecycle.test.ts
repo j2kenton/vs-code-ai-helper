@@ -94,7 +94,7 @@ test("teardown runs through the attempt protocol exactly once; policies gate BEF
     client,
   });
   assert.equal(skipped.kind, "skipped");
-  assert.equal((await store.attempts.listForGate(SANDBOX_TEARDOWN_STEP_ID_V1)).length, 0);
+  assert.equal((await store.attempts.listForGate("task-1", SANDBOX_TEARDOWN_STEP_ID_V1)).length, 0);
   assert.equal(client.destroyedSandboxIds.length, 0);
 
   const ephemeral: SandboxExecutionContextV1 = {

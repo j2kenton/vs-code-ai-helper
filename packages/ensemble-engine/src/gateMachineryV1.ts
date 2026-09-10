@@ -406,7 +406,7 @@ export function createEngineGateMachineryV1(
     }
 
     // RECOVERY FIRST: read persisted attempt records before doing anything.
-    const attempts = await attemptStore.listForGate(gateId);
+    const attempts = await attemptStore.listForGate(taskId, gateId);
     const open = attempts.find((record) => record.state === "pending");
     if (open !== undefined) {
       return recoverOpenAttempt(gate, open, effect);
@@ -473,7 +473,7 @@ export function createEngineGateMachineryV1(
     effect: EngineExternalEffectV1
   ): Promise<EngineUngatedEffectResultV1> {
     // RECOVERY FIRST: the step's persisted attempt records decide everything.
-    const attempts = await attemptStore.listForGate(stepId);
+    const attempts = await attemptStore.listForGate(taskId, stepId);
     const open = attempts.find((record) => record.state === "pending");
     if (open !== undefined) {
       const recovery = await recoverViaAttemptProtocol(open, effect);

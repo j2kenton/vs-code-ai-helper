@@ -94,8 +94,15 @@ export interface EngineExecutionAttemptStoreV1 {
   /** Mark a pending attempt indeterminate (recovery could not prove it ran). */
   markIndeterminate(attemptKey: string): Promise<ExecutionAttemptRecordV1>;
   read(attemptKey: string): Promise<ExecutionAttemptRecordV1 | undefined>;
-  /** All attempts under a gate, ordered by lineage. */
-  listForGate(gateId: string): Promise<readonly ExecutionAttemptRecordV1[]>;
+  /**
+   * All attempts under one task's gate, ordered by lineage. Scoped by BOTH
+   * ids: gate/step-id strings (e.g. `"source-acquisition/clone"`,
+   * `"sandbox-teardown"`) are literal constants shared across every task
+   * that runs that kind of effect — gateId alone is not unique, so a
+   * taskId-less lookup would return another task's attempt history and
+   * misread it as this task's own recovery state.
+   */
+  listForGate(taskId: string, gateId: string): Promise<readonly ExecutionAttemptRecordV1[]>;
   /** Every still-open (`pending`) attempt for a task — the recovery worklist. */
   listOpenForTask(taskId: string): Promise<readonly ExecutionAttemptRecordV1[]>;
 }
@@ -168,10 +175,10 @@ export function createInMemoryExecutionAttemptStoreV1(options?: {
       return Promise.resolve(attempts.get(attemptKey));
     },
 
-    listForGate(gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
+    listForGate(taskId: string, gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
       const matches: ExecutionAttemptRecordV1[] = [];
       for (const record of attempts.values()) {
-        if (record.gateId === gateId) {
+        if (record.taskId === taskId && record.gateId === gateId) {
           matches.push(record);
         }
       }

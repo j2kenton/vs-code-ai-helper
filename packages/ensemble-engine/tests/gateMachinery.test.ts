@@ -48,12 +48,13 @@ const OWNER_ID = "user-owner-1";
 function machineryWith(overrides?: {
   readonly attemptStore?: EngineExecutionAttemptStoreV1;
   readonly workerId?: string;
+  readonly taskId?: string;
   readonly shared?: Pick<EngineGateMachineryV1, "gateStore" | "attemptStore" | "leaseStore">;
 }): EngineGateMachineryV1 & { readonly sink: ReturnType<typeof createRecordingEventSinkV1> } {
   const now = testClock();
   const sink = createRecordingEventSinkV1();
   const machinery = createEngineGateMachineryV1({
-    taskId: TASK_ID,
+    taskId: overrides?.taskId ?? TASK_ID,
     ownerId: OWNER_ID,
     workerId: overrides?.workerId ?? "worker-a",
     sink,
@@ -307,7 +308,7 @@ test("crash before attempt persist: recovery re-runs from scratch with the same 
   await assert.rejects(() => machinery.resumeApproved(gateId, ledger.effect), /before the attempt record/);
   // The protocol persists BEFORE calling: no record ⇒ no call went out.
   assert.equal(ledger.executions.length, 0);
-  assert.equal((await machinery.attemptStore.listForGate(gateId)).length, 0);
+  assert.equal((await machinery.attemptStore.listForGate(TASK_ID, gateId)).length, 0);
 
   // Recovery: a fresh drive derives the IDENTICAL deterministic key and runs once.
   const recovered = await machinery.resumeApproved(gateId, ledger.effect);
@@ -329,7 +330,7 @@ test("crash after persist / before call (idempotent platform): recovery replays 
 
   ledger.crashNextBeforeSideEffect();
   await assert.rejects(() => machinery.resumeApproved(gateId, ledger.effect), /injected crash/);
-  const open = await machinery.attemptStore.listForGate(gateId);
+  const open = await machinery.attemptStore.listForGate(TASK_ID, gateId);
   assert.equal(open.length, 1);
   assert.equal(open[0]!.state, "pending");
   assert.equal(ledger.executions.length, 0);
@@ -395,7 +396,7 @@ test("crash after call / before outcome persist (idempotent platform): replay wi
   await assert.rejects(() => machinery.resumeApproved(gateId, ledger.effect), /before the outcome/);
   // The call DID go out; the outcome never persisted.
   assert.equal(ledger.executions.length, 1);
-  assert.equal((await machinery.attemptStore.listForGate(gateId))[0]!.state, "pending");
+  assert.equal((await machinery.attemptStore.listForGate(TASK_ID, gateId))[0]!.state, "pending");
 
   const recovered = await machinery.resumeApproved(gateId, ledger.effect);
   assert.equal(recovered.kind, "recovered");
@@ -511,7 +512,7 @@ test("guarded runner: the attempt record persists BEFORE the provider runs and c
   assert.equal(result.kind, "completed");
   assert.ok(recordVisibleDuringInvoke, "attempt record was not persisted before the provider ran");
   const stepId = providerRoundStepIdV1(invocation);
-  const records = await attemptStore.listForGate(stepId);
+  const records = await attemptStore.listForGate(invocation.taskId, stepId);
   assert.equal(records.length, 1);
   assert.equal(records[0]!.state, "succeeded");
   assert.equal(records[0]!.outcomeCode, "completed");
@@ -757,6 +758,34 @@ test("runUngatedEffect: a step executes exactly once, replays as alreadyExecuted
   assert.equal(recovered.method, "reconciledReissued");
   assert.notEqual(recovered.attemptKey, first.attemptKey);
   assert.equal(ledger.executions.length, 2);
+});
+
+test("runUngatedEffect: two tasks running the SAME literal step id are independent — no cross-task collision", async () => {
+  // source-acquisition/teardown step ids are literal constants shared by
+  // EVERY task (sandboxExecutionV1.ts, sandboxLifecycleV1.ts) — a taskId-less
+  // attempt lookup would find another task's terminal record under the same
+  // gate/step id and wrongly report "alreadyExecuted" without ever calling
+  // execute() for the second task. Regression for that exact bug.
+  const sharedAttemptStore = createInMemoryExecutionAttemptStoreV1({ now: testClock() });
+  const machineryA = machineryWith({ taskId: "task-a", attemptStore: sharedAttemptStore });
+  const machineryB = machineryWith({ taskId: "task-b", attemptStore: sharedAttemptStore });
+  const ledgerA = createEffectLedger({ platformIdempotent: false });
+  const ledgerB = createEffectLedger({ platformIdempotent: false });
+
+  const resultA = await machineryA.runUngatedEffect("source-acquisition/clone", ledgerA.effect);
+  assert.equal(resultA.kind, "executed");
+  assert.equal(ledgerA.executions.length, 1);
+
+  // Task B's SAME step id must run its OWN effect, not read task A's outcome.
+  const resultB = await machineryB.runUngatedEffect("source-acquisition/clone", ledgerB.effect);
+  assert.equal(resultB.kind, "executed");
+  assert.equal(ledgerB.executions.length, 1, "task B's clone must actually execute, not no-op");
+  assert.notEqual(resultB.attemptKey, resultA.attemptKey);
+
+  // Each task's own replay still correctly short-circuits as alreadyExecuted.
+  const replayA = await machineryA.runUngatedEffect("source-acquisition/clone", ledgerA.effect);
+  assert.equal(replayA.kind, "alreadyExecuted");
+  assert.equal(ledgerA.executions.length, 1);
 });
 
 test("runUngatedEffect: an indeterminate step re-enters the gate flow as a re-offer gate", async () => {

@@ -498,10 +498,12 @@ export function createSqliteControlPlaneStoreV1(
       return Promise.resolve(readAttemptRow(attemptKey));
     },
 
-    listForGate(gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
+    listForGate(taskId: string, gateId: string): Promise<readonly ExecutionAttemptRecordV1[]> {
       const rows = db
-        .prepare("SELECT * FROM execution_attempts WHERE gate_id = ? ORDER BY lineage")
-        .all(gateId) as Parameters<typeof attemptFromRow>[0][];
+        .prepare(
+          "SELECT * FROM execution_attempts WHERE task_id = ? AND gate_id = ? ORDER BY lineage"
+        )
+        .all(taskId, gateId) as Parameters<typeof attemptFromRow>[0][];
       return Promise.resolve(rows.map(attemptFromRow));
     },
 
