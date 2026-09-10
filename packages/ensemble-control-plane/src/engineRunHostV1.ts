@@ -149,7 +149,8 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
   function checkpoint(
     state: RunStateV1,
     status: "running" | "questionsPaused" | "completed" | "failed",
-    pausedInteraction?: EngineJobPausedInteractionV1
+    pausedInteraction?: EngineJobPausedInteractionV1,
+    failureCode?: string
   ): void {
     store.upsertJob({
       jobId: state.task.taskId,
@@ -157,6 +158,7 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
       ownerUserId: state.task.ownerUserId,
       status,
       ...(pausedInteraction !== undefined ? { pausedInteraction } : {}),
+      ...(failureCode !== undefined ? { failureCode } : {}),
       updatedAt: now().toISOString(),
     });
   }
@@ -196,9 +198,25 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
     };
   }
 
-  function fail(state: RunStateV1, code: string): EngineRunOutcomeV1 {
+  /**
+   * End the run on a typed failure. The code is recorded twice, on purpose:
+   * on the job (the durable "why did this stop" a task DTO surfaces as
+   * `run.failureCode`) and as the task's final round record (so the round
+   * history a client already shows ends with the failure rather than
+   * simply stopping short — the first live signed-out-CLI run read as an
+   * "active" task with no rounds at all).
+   */
+  function fail(state: RunStateV1, code: string, startedAt?: string): EngineRunOutcomeV1 {
     state.pendingRef = undefined;
-    checkpoint(state, "failed");
+    const at = now().toISOString();
+    store.appendTaskRound(state.task.taskId, {
+      roundId: allocateHex128IdV1(),
+      stage: state.engineTask.progress.currentStage,
+      startedAt: startedAt ?? at,
+      completedAt: at,
+      summary: `failed: ${code}`,
+    });
+    checkpoint(state, "failed", undefined, code);
     return { kind: "failed", code };
   }
 
@@ -224,7 +242,7 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
       return { kind: "questionsPaused", interactionId: result.ref.interactionId };
     }
     if (result.kind === "failed") {
-      return fail(state, result.code);
+      return fail(state, result.code, startedAt);
     }
     store.appendTaskRound(state.task.taskId, {
       roundId: allocateHex128IdV1(),

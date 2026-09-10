@@ -73,6 +73,54 @@ export function latestRoundProgressV1(
   return null;
 }
 
+export interface TaskStatusSourceV1 {
+  readonly progress: { readonly status?: string };
+  readonly run?: { readonly status: string; readonly failureCode?: string };
+}
+
+/**
+ * The status a task should be SHOWN with. The core `progress.status` has no
+ * failed state — a task whose hosted run stopped on a typed failure is still
+ * "active" there, which is what the first live signed-out run looked like:
+ * an active task with nothing happening. The run's own state wins when it
+ * has stopped (failed) or is waiting on the user (paused); an in-flight or
+ * completed run defers to the task's own status, which already says so.
+ */
+export function effectiveTaskStatusV1(task: TaskStatusSourceV1): string | undefined {
+  const run = task.run?.status;
+  if (run === 'failed') {
+    return 'failed';
+  }
+  if (run === 'gatePaused' || run === 'questionsPaused') {
+    return 'paused';
+  }
+  return task.progress.status;
+}
+
+/** A one-line explanation of a stopped run, or null when there is nothing to explain. */
+export function taskFailureNoteV1(task: TaskStatusSourceV1): string | null {
+  if (task.run?.status !== 'failed') {
+    return null;
+  }
+  const code = task.run.failureCode;
+  switch (code) {
+    case undefined:
+      return 'The run stopped on a failure.';
+    case 'authenticationFailed':
+      return 'The run stopped: the model provider rejected the credentials. For claude-cli, sign Claude Code in to your sandbox from Settings; for API models, check the stored key.';
+    case 'quotaExhausted':
+      return 'The run stopped: the model provider reported its quota or rate limit exhausted, and no backup model was configured.';
+    case 'cliRunnerUnavailable':
+      return 'The run stopped: the task has no sandbox the Claude Code CLI can run in. Use "My sandbox" (the persistent one) for claude-cli models.';
+    case 'sandboxProviderKeyMissing':
+      return 'The run stopped: no sandbox provider is enabled for this task\'s provider. Enable it in Settings.';
+    case 'sourceAcquisitionFailed':
+      return 'The run stopped: the source could not be cloned or attached inside the sandbox.';
+    default:
+      return `The run stopped: ${code}.`;
+  }
+}
+
 export type StatusBadgeToneV1 = 'accent' | 'success' | 'warning' | 'danger' | 'muted';
 
 export interface StatusBadgeV1 {

@@ -7,12 +7,46 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  effectiveTaskStatusV1,
   humanizeTaskFolderNameV1,
   latestRoundProgressV1,
   parseRoundProgressSummaryV1,
   statusBadgeV1,
   taskDisplayNameV1,
+  taskFailureNoteV1,
 } from '../src/tasks/taskPresentationV1';
+
+test('a failed or paused hosted run overrides the core status; running/completed defer to it', () => {
+  // The live shape that motivated this: core says "active", the run says failed.
+  assert.equal(
+    effectiveTaskStatusV1({ progress: { status: 'active' }, run: { status: 'failed', failureCode: 'authenticationFailed' } }),
+    'failed'
+  );
+  assert.equal(effectiveTaskStatusV1({ progress: { status: 'active' }, run: { status: 'questionsPaused' } }), 'paused');
+  assert.equal(effectiveTaskStatusV1({ progress: { status: 'active' }, run: { status: 'gatePaused' } }), 'paused');
+  assert.equal(effectiveTaskStatusV1({ progress: { status: 'active' }, run: { status: 'running' } }), 'active');
+  assert.equal(effectiveTaskStatusV1({ progress: { status: 'completed' }, run: { status: 'completed' } }), 'completed');
+  assert.equal(effectiveTaskStatusV1({ progress: { status: 'creating' } }), 'creating');
+  assert.equal(effectiveTaskStatusV1({ progress: {} }), undefined);
+});
+
+test('the failure note explains known engine codes and never hides an unknown one', () => {
+  assert.equal(taskFailureNoteV1({ progress: {}, run: { status: 'running' } }), null);
+  assert.equal(taskFailureNoteV1({ progress: {} }), null);
+  assert.match(
+    taskFailureNoteV1({ progress: {}, run: { status: 'failed', failureCode: 'authenticationFailed' } }) ?? '',
+    /sign Claude Code in/
+  );
+  assert.match(
+    taskFailureNoteV1({ progress: {}, run: { status: 'failed', failureCode: 'cliRunnerUnavailable' } }) ?? '',
+    /My sandbox/
+  );
+  assert.equal(
+    taskFailureNoteV1({ progress: {}, run: { status: 'failed', failureCode: 'somethingNew' } }),
+    'The run stopped: somethingNew.'
+  );
+  assert.equal(taskFailureNoteV1({ progress: {}, run: { status: 'failed' } }), 'The run stopped on a failure.');
+});
 
 test('displayName wins when present and non-blank', () => {
   assert.equal(

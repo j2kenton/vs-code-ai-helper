@@ -153,6 +153,16 @@ export interface TaskDtoV1 {
    * `history` endpoint remains the source for the complete per-round list.
    */
   readonly latestRound?: TaskRoundDtoV1;
+  /**
+   * The hosted run's own state, present once a run has started. Distinct
+   * from `progress.status` (the core task vocabulary, which has no
+   * "failed"): a run that stopped on a typed failure reports it here, with
+   * the engine's code (`authenticationFailed`, `quotaExhausted`, …).
+   */
+  readonly run?: {
+    readonly status: 'running' | 'gatePaused' | 'questionsPaused' | 'completed' | 'failed' | string;
+    readonly failureCode?: string;
+  };
 }
 
 export interface TaskRoundDtoV1 {

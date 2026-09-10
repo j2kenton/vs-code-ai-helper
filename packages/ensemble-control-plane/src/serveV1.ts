@@ -262,12 +262,24 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
   }
 
   function markFailed(task: ControlPlaneTaskRecordV1, code: string): EngineRunOutcomeV1 {
+    const at = new Date().toISOString();
+    // Same durable shape as the run host's own `fail`: the code on the job
+    // AND a terminal round record, so a task that never got a round still
+    // shows WHY in the history a client already renders.
+    store.appendTaskRound(task.taskId, {
+      roundId: randomUUID().replace(/-/g, ""),
+      stage: task.progress.currentStage,
+      startedAt: at,
+      completedAt: at,
+      summary: `failed: ${code}`,
+    });
     store.upsertJob({
       jobId: task.taskId,
       taskId: task.taskId,
       ownerUserId: task.ownerUserId,
       status: "failed",
-      updatedAt: new Date().toISOString(),
+      failureCode: code,
+      updatedAt: at,
     });
     return { kind: "failed", code };
   }

@@ -14,9 +14,11 @@ import { Body, Card, Heading, Row, Screen, SegmentedControl, Stack, TextField, T
 import { getAppServicesV1 } from '../services/appServicesV1';
 import { useAppStore } from '../state/appStore';
 import {
+  effectiveTaskStatusV1,
   latestRoundProgressV1,
   statusBadgeV1,
   taskDisplayNameV1,
+  taskFailureNoteV1,
   type RoundProgressV1,
   type StatusBadgeToneV1,
 } from '../tasks/taskPresentationV1';
@@ -100,7 +102,7 @@ function TaskList(props: TaskListProps): React.JSX.Element {
               <Stack gap={2}>
                 <Row style={styles.spaceBetween}>
                   <Heading>{taskDisplayNameV1(task.progress)}</Heading>
-                  <StatusBadge status={task.progress.status} />
+                  <StatusBadge status={effectiveTaskStatusV1(task)} />
                 </Row>
                 <Body muted>
                   {`Stage: ${task.progress.currentStage}${progressLabel !== null ? ` · ${progressLabel}` : ''}`}
@@ -165,8 +167,9 @@ function TaskDetail({ client, taskId, onBack }: TaskDetailProps): React.JSX.Elem
           <Stack gap={2}>
             <Row style={styles.spaceBetween}>
               <Heading>Status</Heading>
-              <StatusBadge status={task.progress.status} />
+              <StatusBadge status={effectiveTaskStatusV1(task)} />
             </Row>
+            {taskFailureNoteV1(task) !== null ? <Body>{taskFailureNoteV1(task)}</Body> : null}
             <Body>{`Stage: ${task.progress.currentStage}`}</Body>
             {progressLabel !== null ? <Body>{`Progress: ${progressLabel}`}</Body> : null}
             <Body muted>{`Sandbox binding: ${task.bindingId}`}</Body>

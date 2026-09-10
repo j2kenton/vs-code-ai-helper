@@ -199,6 +199,14 @@ export interface EngineJobRecordV1 {
   readonly taskId: string;
   readonly ownerUserId: string;
   readonly status: EngineJobStatusV1;
+  /**
+   * Present once `failed`: the engine's typed failure code for the round or
+   * step that ended the run (`authenticationFailed`, `quotaExhausted`,
+   * `sourceAcquisitionFailed`, …). The task's core `progress.status` has no
+   * failed state — a failed run is not an archived task, it is one whose
+   * last attempt stopped — so this is where a client learns WHY it stopped.
+   */
+  readonly failureCode?: string;
   /** Present while gate-paused: the gate the job is waiting on. */
   readonly pausedGateId?: string;
   /** Present while question-paused: the durable resume point. */

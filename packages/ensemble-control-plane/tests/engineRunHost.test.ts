@@ -307,7 +307,17 @@ test("a non-retryable provider failure checkpoints the job failed", async () => 
 
   const outcome = await host.start(task);
   assert.deepEqual(outcome, { kind: "failed", code: "authenticationFailed" });
-  assert.equal(world.store.readJob(task.taskId)?.status, "failed");
+  const job = world.store.readJob(task.taskId);
+  assert.equal(job?.status, "failed");
+  // The reason is durable in two places a client reads: the job (surfaced
+  // as the task DTO's `run.failureCode`) and a terminal round record — a
+  // failed run must never look like an active task with no rounds.
+  assert.equal(job?.failureCode, "authenticationFailed");
+  const rounds = world.store.readTask(task.taskId)?.rounds ?? [];
+  assert.equal(rounds.length, 1);
+  assert.equal(rounds[0]?.summary, "failed: authenticationFailed");
+  assert.equal(rounds[0]?.stage, "desc");
+  assert.ok(rounds[0]?.completedAt !== undefined);
 });
 
 test("HTTP surface: task creation starts the hosted run; structured answers route into it", async () => {

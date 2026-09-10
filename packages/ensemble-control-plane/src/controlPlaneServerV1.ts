@@ -61,7 +61,12 @@ import {
 } from "./webSessionCookieV1";
 import type { SandboxClientFactoryV1 } from "./sandboxLifecycleV1";
 import { ensureUserSandboxV1, validateBindingReachabilityV1 } from "./sandboxLifecycleV1";
-import type { ChatTurnRecordV1, ControlPlaneStoreV1, ControlPlaneTaskRecordV1 } from "./storeV1";
+import type {
+  ChatTurnRecordV1,
+  ControlPlaneStoreV1,
+  ControlPlaneTaskRecordV1,
+  EngineJobRecordV1,
+} from "./storeV1";
 import type { EngineRunHostV1 } from "./engineRunHostV1";
 import type { WsHubV1 } from "./wsHubV1";
 import { attachWsEventsTransportV1 } from "./wsTransportV1";
@@ -204,7 +209,13 @@ function bearerToken(request: ControlPlaneHttpRequestV1): string | undefined {
  * N+1 `getTaskHistory` fetch per task; `getTaskHistory` remains the source
  * for the full per-round history shown on the task detail screen.
  */
-function taskDto(record: ControlPlaneTaskRecordV1): Record<string, unknown> {
+/**
+ * `run` is the hosted run's own state, distinct from the task's core
+ * `progress.status`: the core vocabulary has no "failed" (a task whose run
+ * stopped is still an active task that can be retried), so without this a
+ * failed run reads as "active" forever with nothing to say why.
+ */
+function taskDto(record: ControlPlaneTaskRecordV1, job: EngineJobRecordV1 | undefined): Record<string, unknown> {
   const latestRound = record.rounds[record.rounds.length - 1];
   return {
     taskId: record.taskId,
@@ -212,6 +223,14 @@ function taskDto(record: ControlPlaneTaskRecordV1): Record<string, unknown> {
     bindingId: record.binding.bindingId,
     progress: record.progress,
     ...(latestRound !== undefined ? { latestRound } : {}),
+    ...(job !== undefined
+      ? {
+          run: {
+            status: job.status,
+            ...(job.failureCode !== undefined ? { failureCode: job.failureCode } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -338,7 +357,10 @@ export function createControlPlaneHandlerV1(
     }
 
     if (method === "GET" && path === "/v1/tasks") {
-      return { status: 200, body: store.listTasksForOwner(userId).map(taskDto) };
+      return {
+        status: 200,
+        body: store.listTasksForOwner(userId).map((task) => taskDto(task, store.readJob(task.taskId))),
+      };
     }
 
     if (method === "POST" && path === "/v1/tasks") {
@@ -514,7 +536,7 @@ export function createControlPlaneHandlerV1(
         // and the WS feed, never awaited by task creation.
         void runs.start(record);
       }
-      return { status: 201, body: taskDto(record) };
+      return { status: 201, body: taskDto(record, store.readJob(record.taskId)) };
     }
 
     const taskMatch = /^\/v1\/tasks\/([^/]+)(?:\/(history|chat|gates|files|file|diff))?$/.exec(path);
@@ -528,7 +550,7 @@ export function createControlPlaneHandlerV1(
       }
 
       if (sub === undefined && method === "GET") {
-        return { status: 200, body: taskDto(task) };
+        return { status: 200, body: taskDto(task, store.readJob(task.taskId)) };
       }
       if (sub === "history" && method === "GET") {
         return { status: 200, body: task.rounds };
