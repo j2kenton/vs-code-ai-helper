@@ -2875,9 +2875,13 @@ export async function completeCommitAndPushTask(
   // resolution itself (the task now reads as paused) before ever reaching the
   // point where holding admission would have reversed it. Peeking the likely
   // target synchronously, via the same in-memory inventory/current-task
-  // lookup `commitAndPushTask` uses, closes this for the dominant case (the
-  // target is already in the live inventory cache); a genuine cold-cache miss
-  // still falls through to late acquisition below, same as before.
+  // lookup `commitAndPushTask` uses — including `peekTaskFolderPathSynchronouslyV1`'s
+  // unique-active-task mirror of `resolveTaskContext`'s own step 3 (2026-09-10:
+  // closes the no-persisted-pointer/stale-pointer/paused-pointer redirect case
+  // too, not only the populated-pointer cache hit) — closes this for every
+  // case `resolveTaskContext` can unambiguously resolve; a genuine cold-cache
+  // miss with no unique active-task fallback still falls through to late
+  // acquisition below, same as before.
   const earlyFolderPath =
     extractSynchronousCommitPushFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);

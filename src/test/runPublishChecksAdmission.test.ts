@@ -338,6 +338,188 @@ void describe("runPublishChecks — true no-arg invocation with a CurrentTaskSto
   });
 });
 
+/**
+ * A multi-task fake inventory, for exercising `peekTaskFolderPathSynchronouslyV1`'s
+ * unique-active-task mirror of `resolveTaskContext`'s step 3 — an inventory
+ * with more than one entry, distinguished by `progress.status`.
+ */
+function makeMultiTaskInventory(
+  entries: { taskFolderPath: string; progress: TaskProgress }[]
+): TaskInventory {
+  const tasks = entries.map(({ taskFolderPath, progress }) => ({
+    canonicalId: taskFolderPath,
+    taskFolderPath,
+    folderName: path.basename(taskFolderPath),
+    sourceScopeKey: taskFolderPath,
+    progress,
+  }));
+  return {
+    getTaskById: (id: string) => tasks.find((t) => t.canonicalId === id),
+    getTaskByPath: (p: string) => tasks.find((t) => t.taskFolderPath === p),
+    getVisibleTaskForSuppressedId: () => undefined,
+    getVisibleTaskForSuppressedPath: () => undefined,
+    getTasks: () => tasks,
+    refresh: () => Promise.resolve(undefined),
+  } as unknown as TaskInventory;
+}
+
+void describe("peekTaskFolderPathSynchronouslyV1 — unique-active-task fallback (2026-09-10 review completion blocker, narrowed)", () => {
+  void it("falls back to the sole active task when there is no persisted current-task pointer at all", () => {
+    const activeFolderPath = makeTaskFolder("peek-fallback-no-pointer-active");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: activeFolderPath, progress: fixtureProgress(activeFolderPath, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => undefined } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(result, activeFolderPath);
+  });
+
+  void it("redirects from a persisted pointer that resolves to a PAUSED task to the sole active task elsewhere in the inventory", () => {
+    const pausedFolderPath = makeTaskFolder("peek-fallback-paused-pointer-redirect-paused");
+    const activeFolderPath = makeTaskFolder("peek-fallback-paused-pointer-redirect-active");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: pausedFolderPath, progress: fixtureProgress(pausedFolderPath, { status: "paused" }) },
+      { taskFolderPath: activeFolderPath, progress: fixtureProgress(activeFolderPath, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => pausedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(result, activeFolderPath, "must mirror resolveTaskContext's redirect away from a paused persisted task");
+  });
+
+  void it("falls back to the persisted PAUSED task itself when no unique active task exists to redirect to", () => {
+    const pausedFolderPath = makeTaskFolder("peek-fallback-paused-pointer-no-redirect");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: pausedFolderPath, progress: fixtureProgress(pausedFolderPath, { status: "paused" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => pausedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(
+      result,
+      pausedFolderPath,
+      "must mirror `resolved` staying the paused task when resolveTaskContext finds no onlyActiveTask override (allowPaused:true callers, e.g. Publish checks, still need it)"
+    );
+  });
+
+  void it("falls back to the sole active task when the persisted pointer is a cold-cache miss with no folder on disk", () => {
+    const activeFolderPath = makeTaskFolder("peek-fallback-cache-miss-active");
+    const deletedFolderPath = path.join(REAL_ROOT, "tasks", "peek-fallback-cache-miss-deleted-pointer");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: activeFolderPath, progress: fixtureProgress(activeFolderPath, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => deletedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(
+      result,
+      activeFolderPath,
+      "a genuinely-gone persisted pointer (not just an uncached one) must still redirect to an unambiguous active task, mirroring resolveTaskContext's clear()-then-fallback path"
+    );
+  });
+
+  void it("returns undefined when more than one active task makes the fallback ambiguous", () => {
+    const activeA = makeTaskFolder("peek-fallback-ambiguous-a");
+    const activeB = makeTaskFolder("peek-fallback-ambiguous-b");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: activeA, progress: fixtureProgress(activeA, { status: "active" }) },
+      { taskFolderPath: activeB, progress: fixtureProgress(activeB, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => undefined } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(result, undefined, "must fail closed rather than guess between two active tasks, matching resolveTaskContext's own ambiguity rule");
+  });
+});
+
+void describe("peekTaskFolderPathSynchronouslyV1 — refresh-repopulated persisted target beats a stale cached active task (2026-09-10 review completion blocker, second pass)", () => {
+  void it("returns the cache-missed persisted task, not a different cached active task, when the persisted task exists on disk and is not paused", () => {
+    // The exact scenario the review reproduced: `resolveTaskContext`'s step 2
+    // awaits `inventory.refresh()` on this same cache miss and, once refresh
+    // finds the persisted task non-paused, uses it DIRECTLY — its own step-3
+    // active-task fallback (which would have picked `cachedActiveFolderPath`)
+    // is never even reached. This peek must not admit the wrong task here.
+    const persistedFolderPath = makeTaskFolder("peek-refresh-beats-stale-active-persisted");
+    writeProgress(persistedFolderPath, fixtureProgress(persistedFolderPath, { status: "active" }));
+    const cachedActiveFolderPath = makeTaskFolder("peek-refresh-beats-stale-active-cached");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: cachedActiveFolderPath, progress: fixtureProgress(cachedActiveFolderPath, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => persistedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(
+      result,
+      persistedFolderPath,
+      "the on-disk, non-paused persisted task must win over a stale cached active task, mirroring what resolveTaskContext's refresh finds"
+    );
+  });
+
+  void it("falls back to a different cached active task when the cache-missed persisted task exists on disk but is paused", () => {
+    const persistedFolderPath = makeTaskFolder("peek-refresh-paused-persisted-redirects");
+    writeProgress(persistedFolderPath, fixtureProgress(persistedFolderPath, { status: "paused" }));
+    const cachedActiveFolderPath = makeTaskFolder("peek-refresh-paused-persisted-redirects-active");
+    const inventory = makeMultiTaskInventory([
+      { taskFolderPath: cachedActiveFolderPath, progress: fixtureProgress(cachedActiveFolderPath, { status: "active" }) },
+    ]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => persistedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(
+      result,
+      cachedActiveFolderPath,
+      "a paused on-disk persisted task must still redirect to an unambiguous active task, same as the already-cached paused-pointer case"
+    );
+  });
+
+  void it("falls back to the cache-missed persisted task itself when it exists on disk, is paused, and no active task exists to redirect to", () => {
+    const persistedFolderPath = makeTaskFolder("peek-refresh-paused-persisted-no-redirect");
+    writeProgress(persistedFolderPath, fixtureProgress(persistedFolderPath, { status: "paused" }));
+    const inventory = makeMultiTaskInventory([]);
+
+    const result = peekTaskFolderPathSynchronouslyV1(
+      inventory,
+      undefined,
+      { get: () => persistedFolderPath } as unknown as CurrentTaskStore
+    );
+
+    assert.equal(
+      result,
+      persistedFolderPath,
+      "must mirror `resolved` staying the on-disk paused persisted task when resolveTaskContext finds no onlyActiveTask override"
+    );
+  });
+});
+
 void describe("peekTaskFolderPathSynchronouslyV1 — cold-cache-miss id-as-path fallback (2026-09-09 review completion blocker)", () => {
   void it("falls back to the canonicalId as the folder-path guess when it still exists on disk", () => {
     const taskFolderPath = makeTaskFolder("peek-cold-miss-existing-folder");

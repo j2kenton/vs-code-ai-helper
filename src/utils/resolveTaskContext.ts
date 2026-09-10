@@ -6,6 +6,7 @@ import * as path from "path";
 import { taskRefFromResolved, TaskRef } from "../types/taskRef";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskRootCandidates } from "./taskRoot";
+import { migrateStatus, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 
 /**
  * Normalize a path for comparison: on Windows, path.resolve/normalize
@@ -144,6 +145,28 @@ function lookupInInventory(
 }
 
 /**
+ * Best-effort, synchronous peek at a task's on-disk `status`, for the
+ * cold-cache-miss branch of `peekTaskFolderPathSynchronouslyV1` below.
+ * `resolveTaskContext`'s awaited `inventory.refresh()` would decode this same
+ * file properly; this is a cheap approximation consistent with the existing
+ * `fs.existsSync` synchronous check in the same function (and with the
+ * `fs.readFileSync`-based best-effort peeks already used for tree-item
+ * tooltips in `taskTreeProvider.ts`). Any read/parse failure (file missing,
+ * corrupt JSON, mid-write) is indistinguishable here from a task whose
+ * `status` field is absent — both default to "active" via `migrateStatus`,
+ * matching the real decoder's own default for a missing/invalid status.
+ */
+function peekTaskStatusSynchronouslyBestEffortV1(taskFolderPath: string): ReturnType<typeof migrateStatus> {
+  try {
+    const raw = fs.readFileSync(path.join(taskFolderPath, TASK_PROGRESS_FILENAME), "utf8");
+    const parsed = JSON.parse(raw) as { status?: unknown };
+    return migrateStatus(parsed?.status);
+  } catch {
+    return migrateStatus(undefined);
+  }
+}
+
+/**
  * Best-effort, SYNCHRONOUS mirror of `resolveTaskContext`'s two cheapest
  * resolution steps — an explicit canonicalId/taskFolderPath, or (with no
  * explicit target) the persisted current-task pointer — using only in-memory
@@ -180,6 +203,55 @@ function lookupInInventory(
  * own `mkdir(dir, { recursive: true })` genesis step would otherwise
  * resurrect that deleted folder on disk just to hold an admission marker
  * nothing will ever consume.
+ *
+ * 2026-09-10 review completion blocker ("publish/complete actions" route,
+ * narrowed): the no-persisted-pointer / stale-pointer / paused-pointer case
+ * was entirely unmirrored — this function returned `undefined` whenever the
+ * persisted current-task pointer was absent, could not be found in the
+ * in-memory inventory, or resolved to a PAUSED task, even though
+ * `resolveTaskContext`'s own step 3 (below) unambiguously redirects exactly
+ * those cases to the sole "active" task in the inventory when there is
+ * precisely one. That left the actual authoritative target — the task
+ * `resolveTaskContext` goes on to select — completely unprotected during
+ * `TaskCreationStartupReconcilerV1.waitUntilReady()` and `resolveTaskContext`
+ * itself, the two awaited setup steps between this peek and late admission.
+ * Mirrored here using the same in-memory-only reads (`inventory.getTasks()`),
+ * matching resolution order exactly:
+ *   1. persisted pointer resolves to a non-paused task -> that task (unchanged
+ *      dominant case)
+ *   2. otherwise (pointer absent, cache-miss, OR resolves to a PAUSED task) ->
+ *      the unique "active"-status task in the inventory, if there is exactly
+ *      one (mirrors `resolveTaskContext`'s unambiguous-only fallback)
+ *   3. otherwise, if the pointer resolved to a paused task -> that paused
+ *      task's folder (mirrors `resolved` staying the paused task when no
+ *      `onlyActiveTask` override applies; needed because some callers, e.g.
+ *      Publish checks, pass `allowPaused: true`)
+ *   4. otherwise, if a pointer was set but not found in the inventory at all
+ *      -> the existing id-as-path existence-gated guess (genuine cold-cache
+ *      miss vs. a deleted task, same as the explicit-arg branch above)
+ *   5. otherwise -> `undefined`
+ *
+ * 2026-09-10 review, second pass — narrowed again: step 2's cache-miss
+ * branch fell straight to the cached "sole active task" fallback WITHOUT
+ * first checking whether the pointer itself still exists on disk. But
+ * `resolveTaskContext`'s step 2 runs `inventory.refresh()` on exactly that
+ * cache miss and retries the persisted id BEFORE it ever reaches its own
+ * step-3 active-task fallback — so a persisted id that refresh would find
+ * and that turns out to be non-paused is used DIRECTLY, and the resolver's
+ * active-task fallback (built from the POST-refresh inventory) is never even
+ * consulted. A cold-cache persisted task B, alongside a different task A that
+ * is the sole "active" entry in the STALE pre-refresh cache, therefore
+ * resolves to B — while the old code here guessed A, leaving B (the actual
+ * authoritative target) unprotected through the two awaited setup steps this
+ * peek exists to cover. Fixed by checking disk existence — and, best-effort,
+ * on-disk status via `peekTaskStatusSynchronouslyBestEffortV1` — for a
+ * cache-missed pointer BEFORE the active-task fallback: a pointer found on
+ * disk and not paused wins immediately, exactly mirroring what refresh would
+ * do; a pointer found on disk but paused (or with unreadable status treated
+ * as paused-or-not per that helper) still falls through to the active-task
+ * fallback first, matching the resolver's own paused-redirect step, with the
+ * on-disk pointer itself as the final fallback if no unambiguous active task
+ * exists — the same outcome as the pre-existing `persistedFound` paused case.
  */
 export function peekTaskFolderPathSynchronouslyV1(
   inventory: TaskInventory,
@@ -200,14 +272,46 @@ export function peekTaskFolderPathSynchronouslyV1(
   }
   if (!explicitTask && currentTaskStore) {
     const persistedId = currentTaskStore.get();
-    if (persistedId) {
-      const found =
-        inventory.getTaskById(persistedId) ??
-        inventory.getVisibleTaskForSuppressedId(persistedId);
-      if (found) {
-        return found.taskFolderPath;
+    const persistedFound = persistedId
+      ? inventory.getTaskById(persistedId) ?? inventory.getVisibleTaskForSuppressedId(persistedId)
+      : undefined;
+
+    if (persistedFound && persistedFound.progress.status !== "paused") {
+      return persistedFound.taskFolderPath;
+    }
+
+    // Cache-missed pointer that still exists on disk: this is exactly what
+    // `resolveTaskContext`'s awaited `inventory.refresh()` would find and use
+    // DIRECTLY if non-paused, before its own active-task fallback is ever
+    // consulted. Check it here, before the active-task fallback below, so
+    // this peek does not admit the wrong task when a stale cached "sole
+    // active" entry differs from the persisted pointer refresh would surface.
+    let diskPersistedPath: string | undefined;
+    if (!persistedFound && persistedId && fs.existsSync(persistedId)) {
+      diskPersistedPath = persistedId;
+      if (peekTaskStatusSynchronouslyBestEffortV1(persistedId) !== "paused") {
+        return diskPersistedPath;
       }
-      return fs.existsSync(persistedId) ? persistedId : undefined;
+    }
+
+    // Mirror `resolveTaskContext` step 3: an absent/cache-missed/paused
+    // pointer falls back to the sole "active" task, when unambiguous.
+    const activeTasks = inventory.getTasks().filter((t) => t.progress.status === "active");
+    if (activeTasks.length === 1 && activeTasks[0]) {
+      return activeTasks[0].taskFolderPath;
+    }
+
+    if (persistedFound) {
+      // Found but paused, and no unambiguous active alternative: this is
+      // what `resolved` remains in `resolveTaskContext` (no override).
+      return persistedFound.taskFolderPath;
+    }
+    if (diskPersistedPath) {
+      // On disk but paused (or the id was never found at all above), and no
+      // unambiguous active alternative: same outcome as the `persistedFound`
+      // paused case just above, mirroring what `resolveTaskContext` would do
+      // once its own refresh resolves this same task.
+      return diskPersistedPath;
     }
   }
   return undefined;
