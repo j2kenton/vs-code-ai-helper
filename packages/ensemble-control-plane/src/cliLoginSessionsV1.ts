@@ -7,21 +7,26 @@
  * the printed authorization URL, accept the code the user pastes back after
  * completing it in their own browser, and report whether it succeeded.
  *
- * Confirmed live against the real `claude setup-token` command on the real
- * box: with a TTY (`createInteractiveSession`'s own fix), it prints a real
- * OAuth URL and a "paste code here" prompt; the resulting long-lived token
- * is what makes the CLI usable non-interactively afterward.
+ * The command is `claude auth login` (Claude Code 2.1.267, confirmed live on
+ * the real box 2026-09-10): with a TTY (`createInteractiveSession`'s own
+ * fix) it prints a real OAuth URL and a "Paste code here if prompted >"
+ * prompt, and on success PERSISTS the login in the sandbox's own
+ * `~/.claude` — which is the whole point, since that is what a later
+ * `claude -p` round (`sandboxCliRunnerV1.ts`) authenticates with. It was
+ * first built on `claude setup-token`, which has the same URL+code shape
+ * but persists NOTHING: it only prints a long-lived token meant for a
+ * `CLAUDE_CODE_OAUTH_TOKEN` env var, so a sandbox "logged in" that way
+ * still reported `Not logged in · Please run /login` afterwards.
  *
- * SECURITY: `claude setup-token`'s whole purpose is to PRINT that token to
- * the terminal — meaning output captured after the code is submitted may
- * contain the secret material itself. `startLogin`'s output (a URL and a
+ * SECURITY: output captured after the code is submitted is treated as if it
+ * may contain secret material (`setup-token` literally printed the token;
+ * `auth login` prints account details). `startLogin`'s output (a URL and a
  * prompt) is safe to return; `submitCode` deliberately returns NOTHING from
  * the captured output — only a structured completed/success verdict — so
- * the token never reaches an HTTP response body, a log line, or a client
- * that might display or store it verbatim. What the sandboxed CLI does with
- * the token after printing it (persist it into its own config, export it
- * for the calling shell) is between the CLI and that sandbox; this module
- * never reads, stores, or transmits it.
+ * nothing the CLI prints reaches an HTTP response body, a log line, or a
+ * client that might display or store it verbatim. What the CLI persists
+ * stays inside that user's sandbox; this module never reads, stores, or
+ * transmits it.
  *
  * NOT under the Part 4c attempt-record protocol, matching
  * `createInteractiveSession`'s own documented scope decision: a login
@@ -37,8 +42,8 @@ import type {
   SandboxClientV1,
 } from "../../ensemble-engine/src/sandboxClientV1";
 
-/** The one CLI login command this module knows how to drive. */
-const CLAUDE_SETUP_TOKEN_ARGV_V1 = ["claude", "setup-token"] as const;
+/** The one CLI login command this module knows how to drive — the persisting one (see the header). */
+const CLAUDE_AUTH_LOGIN_ARGV_V1 = ["claude", "auth", "login"] as const;
 
 /** How long to watch output before answering — tuned to real observed latency, not a guess. */
 const DEFAULT_CAPTURE_WINDOW_MS_V1 = 4000;
@@ -129,7 +134,7 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
 
       record.handle = await input.client.createInteractiveSession({
         sandboxId: input.sandboxId,
-        argv: [...CLAUDE_SETUP_TOKEN_ARGV_V1],
+        argv: [...CLAUDE_AUTH_LOGIN_ARGV_V1],
         cwd: input.workingDirectoryRoot,
         onOutput: (chunk) => {
           record.output += chunk;

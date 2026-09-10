@@ -3,9 +3,9 @@
  * login inside the sandbox, relay the prompt, accept the pasted code, report
  * completion" flow. The one property enforced hardest here is the security
  * one documented on the module itself: `submitCode`'s result NEVER carries
- * captured output text — `claude setup-token`'s whole purpose is to print
- * the resulting secret token, so anything captured after the code goes in
- * could be that token, and it must never reach a response body.
+ * captured output text — whatever the CLI prints after the code goes in
+ * (account details today; the literal token under the `setup-token`
+ * command this was first built on) must never reach a response body.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
