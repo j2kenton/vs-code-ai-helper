@@ -59,6 +59,7 @@ import { createDefaultEngineAdaptersV1 } from "../../ensemble-engine/src/provide
 import { ENGINE_PROVIDERS_V1, type EngineProviderIdV1 } from "../../ensemble-engine/src/providerCatalogV1";
 import { createEngineProviderRunnerV1 } from "../../ensemble-engine/src/providerDispatchV1";
 import { createControlPlaneHandlerV1, createControlPlaneNodeServerV1 } from "./controlPlaneServerV1";
+import { createCliLoginServiceV1 } from "./cliLoginSessionsV1";
 import { createEngineJobSupervisorV1 } from "./engineJobsV1";
 import { createEngineRunHostV1, type EngineRunHostV1, type EngineRunOutcomeV1 } from "./engineRunHostV1";
 import {
@@ -377,6 +378,7 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     allowEphemeralSandboxWithoutRunHost,
     runs,
     engineAdapters,
+    cliLogin: createCliLoginServiceV1(),
     log,
   });
 

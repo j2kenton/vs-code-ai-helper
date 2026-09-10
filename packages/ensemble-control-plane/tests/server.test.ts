@@ -20,6 +20,7 @@ import type {
   EngineTextInvocationV1,
 } from "../../ensemble-engine/src/providerAdaptersV1";
 import type { EngineProviderIdV1 } from "../../ensemble-engine/src/providerCatalogV1";
+import { createCliLoginServiceV1, type CliLoginServiceV1 } from "../src/cliLoginSessionsV1";
 import {
   ControlPlaneHandlerV1,
   ControlPlaneHttpRequestV1,
@@ -66,6 +67,7 @@ async function makeWorld(options?: {
   readonly log?: (line: string) => void;
   readonly allowEphemeralSandboxWithoutRunHost?: boolean;
   readonly engineAdapters?: ReadonlyMap<EngineProviderIdV1, EngineModelProviderAdapterV1>;
+  readonly cliLogin?: CliLoginServiceV1;
 }): Promise<World> {
   const clock = makeClock();
   const store = createControlPlaneStoreV1({ now: clock.now });
@@ -95,6 +97,7 @@ async function makeWorld(options?: {
       : {}),
     ...(options?.log !== undefined ? { log: options.log } : {}),
     ...(options?.engineAdapters !== undefined ? { engineAdapters: options.engineAdapters } : {}),
+    ...(options?.cliLogin !== undefined ? { cliLogin: options.cliLogin } : {}),
   });
   const a = await sessions.exchange({ provider: "github", authorizationCode: "code-a", ...BASE });
   const b = await sessions.exchange({ provider: "github", authorizationCode: "code-b", ...BASE });
@@ -808,6 +811,61 @@ test("user-owned-managed binding: the control plane creates the sandbox once and
     },
   });
   assert.equal(withId.status, 422);
+});
+
+test("POST /v1/user-sandbox/login: 404 with no cliLogin configured; requires auth and a stored key", async () => {
+  const noLogin = await makeWorld();
+  const notConfigured = await noLogin.call(noLogin.tokenA, "POST", "/v1/user-sandbox/login", {
+    body: { provider: "docker" },
+  });
+  assert.equal(notConfigured.status, 404);
+
+  const world = await makeWorld({ cliLogin: createCliLoginServiceV1() });
+
+  const unauthenticated = await world.call("not-a-real-token", "POST", "/v1/user-sandbox/login", {
+    body: { provider: "docker" },
+  });
+  assert.equal(unauthenticated.status, 401);
+
+  // The in-memory reference sandbox client (used throughout these tests)
+  // has no createInteractiveSession — the route must report that cleanly,
+  // not throw, once it gets far enough to ask the client for one.
+  await world.call(world.tokenA, "PUT", "/v1/keys/sandbox:docker", { body: { key: "unused" } });
+  const unsupported = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login", {
+    body: { provider: "docker" },
+  });
+  assert.equal(unsupported.status, 422);
+  assert.equal((unsupported.body as { code: string }).code, "userSandboxLoginUnsupported");
+
+  const badProvider = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login", {
+    body: { provider: "not-a-provider" },
+  });
+  assert.equal(badProvider.status, 422);
+
+  const noKey = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login", {
+    body: { provider: "e2b" },
+  });
+  assert.equal(noKey.status, 422);
+  assert.equal((noKey.body as { code: string }).code, "sandboxProviderKeyMissing");
+});
+
+test("POST /v1/user-sandbox/login/:id/code: 404 without cliLogin, unknown session reads as not found", async () => {
+  const noLogin = await makeWorld();
+  const notConfigured = await noLogin.call(noLogin.tokenA, "POST", "/v1/user-sandbox/login/anything/code", {
+    body: { code: "123" },
+  });
+  assert.equal(notConfigured.status, 404);
+
+  const world = await makeWorld({ cliLogin: createCliLoginServiceV1() });
+  const unknown = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login/not-real/code", {
+    body: { code: "123" },
+  });
+  assert.equal(unknown.status, 404);
+
+  const missingCode = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login/not-real/code", {
+    body: {},
+  });
+  assert.equal(missingCode.status, 422);
 });
 
 test("POST /v1/provider-calls: a stateless single-shot proxy over stored model-key custody", async () => {

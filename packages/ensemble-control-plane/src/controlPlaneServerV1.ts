@@ -33,6 +33,7 @@ import { allocateHex128IdV1, isHex128IdV1 } from "../../ensemble-core/src/action
 import type { PersistedTaskProgressV1 } from "../../ensemble-core/src/taskProgressDecoderV1";
 import {
   SandboxBindingV1,
+  SandboxProviderV1,
   validateSandboxBindingRequestV1,
 } from "../../ensemble-contract/src/sandboxBindingV1";
 import {
@@ -41,6 +42,7 @@ import {
   type EngineProviderIdV1,
 } from "../../ensemble-engine/src/providerCatalogV1";
 import type { EngineModelProviderAdapterV1 } from "../../ensemble-engine/src/providerAdaptersV1";
+import type { CliLoginServiceV1 } from "./cliLoginSessionsV1";
 import {
   resolveConfinedSandboxPathV1,
   SandboxExecutionContextV1,
@@ -127,6 +129,13 @@ export interface CreateControlPlaneHandlerOptionsV1 {
    * custody and adapters a hosted run already uses. Absent, the route 404s.
    */
   readonly engineAdapters?: ReadonlyMap<EngineProviderIdV1, EngineModelProviderAdapterV1>;
+  /**
+   * CLI subscription login inside the caller's `user-owned-managed`
+   * sandbox (`POST /v1/user-sandbox/login` + `.../code`). Absent, both
+   * routes 404 — a deployment with no interactive-session-capable sandbox
+   * provider configured has nothing for them to drive.
+   */
+  readonly cliLogin?: CliLoginServiceV1;
   readonly now?: () => Date;
   /**
    * Diagnostic log sink (plan Part 11). Every line is passed through
@@ -138,6 +147,8 @@ export interface CreateControlPlaneHandlerOptionsV1 {
 }
 
 const KEY_KIND_PATTERN_V1 = /^(sandbox|model):[A-Za-z0-9._-]{1,64}$/;
+/** Mirrors the contract's own (package-private) provider set. */
+const SANDBOX_PROVIDERS_V1: ReadonlySet<string> = new Set(["e2b", "daytona", "docker"]);
 /** Server-side defense in depth; the caller's own bounded writer enforces the real cap. */
 const MAX_PROVIDER_CALL_PROMPT_CHARS_V1 = 2 * 1024 * 1024;
 
@@ -217,7 +228,7 @@ function chatTurnDto(turn: ChatTurnRecordV1): Record<string, unknown> {
 export function createControlPlaneHandlerV1(
   options: CreateControlPlaneHandlerOptionsV1
 ): ControlPlaneHandlerV1 {
-  const { store, sessions, hub, kekProvider, sandboxFactory, runs, engineAdapters } = options;
+  const { store, sessions, hub, kekProvider, sandboxFactory, runs, engineAdapters, cliLogin } = options;
   const allowEphemeralSandboxWithoutRunHost = options.allowEphemeralSandboxWithoutRunHost === true;
   const now = options.now ?? ((): Date => new Date());
   const log = options.log === undefined ? undefined : createRedactingLogSinkV1(options.log);
@@ -799,6 +810,80 @@ export function createControlPlaneHandlerV1(
         );
       }
       return { status: 200, body: { text: result.text } };
+    }
+
+    if (method === "POST" && path === "/v1/user-sandbox/login") {
+      if (cliLogin === undefined) {
+        return typed(404, "notFound", "this deployment does not support in-sandbox CLI login");
+      }
+      const body = request.body;
+      if (!isRecord(body) || typeof body.provider !== "string" || !SANDBOX_PROVIDERS_V1.has(body.provider)) {
+        return typed(422, "userSandboxLoginInvalid", 'provider must be "e2b", "daytona", or "docker"');
+      }
+      if (body.workingDirectoryRoot !== undefined && typeof body.workingDirectoryRoot !== "string") {
+        return typed(422, "userSandboxLoginInvalid", "workingDirectoryRoot must be a string when present");
+      }
+      const provider = body.provider as SandboxProviderV1;
+      const workingDirectoryRoot =
+        typeof body.workingDirectoryRoot === "string" ? body.workingDirectoryRoot : "/";
+      const keyRecord = store.readKeyRecord(userId, `sandbox:${provider}`);
+      if (keyRecord === undefined) {
+        return typed(422, "sandboxProviderKeyMissing", "no stored key for the requested provider");
+      }
+      let apiKey: string;
+      try {
+        apiKey = await decryptKeyMaterialV1(kekProvider, keyRecord.envelope);
+      } catch (error) {
+        if (error instanceof KeyCustodyUnavailableErrorV1) {
+          return typed(503, error.code, error.message);
+        }
+        throw error;
+      }
+      const client = sandboxFactory.clientFor(provider, apiKey);
+      let userSandbox;
+      try {
+        userSandbox = await ensureUserSandboxV1(store, client, userId, provider, workingDirectoryRoot, now);
+      } catch {
+        return typed(422, "sandboxUnreachable", "could not create or resolve this user's sandbox");
+      }
+      const started = await cliLogin.startLogin({
+        ownerUserId: userId,
+        client,
+        sandboxId: userSandbox.sandboxId,
+        workingDirectoryRoot: userSandbox.workingDirectoryRoot,
+      });
+      if (!started.ok) {
+        return typed(
+          422,
+          "userSandboxLoginUnsupported",
+          `provider "${provider}" does not support interactive sandbox sessions`
+        );
+      }
+      return {
+        status: 201,
+        body: { loginSessionId: started.loginSessionId, promptOutput: started.promptOutput },
+      };
+    }
+
+    const loginCodeMatch = /^\/v1\/user-sandbox\/login\/([^/]+)\/code$/.exec(path);
+    if (loginCodeMatch !== null && method === "POST") {
+      if (cliLogin === undefined) {
+        return typed(404, "notFound", "this deployment does not support in-sandbox CLI login");
+      }
+      const loginSessionId = loginCodeMatch[1] as string;
+      const body = request.body;
+      if (!isRecord(body) || typeof body.code !== "string" || body.code.length === 0) {
+        return typed(422, "userSandboxLoginCodeInvalid", "code is required");
+      }
+      const result = await cliLogin.submitCode(userId, loginSessionId, body.code);
+      if (!result.ok) {
+        // Absent and foreign-owned read identically — no confirmation that a
+        // login session with this id exists for someone else.
+        return typed(404, result.code, "no such login session");
+      }
+      return result.completed
+        ? { status: 200, body: { completed: true, success: result.success } }
+        : { status: 200, body: { completed: false } };
     }
 
     if (method === "GET" && path === "/v1/keys") {
