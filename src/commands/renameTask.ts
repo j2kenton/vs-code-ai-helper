@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
 import { TaskInventory } from "../state/taskInventory";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -393,8 +394,18 @@ export async function renameTaskWithAI(
   const targetResolutionHandle = await beginTargetResolutionV1(
     resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
   );
+  // 2026-09-10 round: `earlyFolderPath` is a raw, unvalidated caller-supplied
+  // path — `resolve()`'s `resolveTaskContext` call below performs the real
+  // ownership/containment/workspace-binding validation, but this early guess
+  // runs BEFORE any of that. Gating on `fs.existsSync` here does not replace
+  // that validation, but it stops `acquireWorkAdmissionV1`'s genesis
+  // `mkdir(dir, { recursive: true })` from creating admission bookkeeping
+  // directories under a path that is not even an existing directory on disk
+  // — narrowing (not fully closing) the raw-path admission-before-validation
+  // blocker until the shared admission helper itself enforces this.
   const earlyFolderPath = extractSynchronousRenameFolderPathV1(arg);
-  const early = earlyFolderPath
+  const earlyFolderPathExists = earlyFolderPath ? fs.existsSync(earlyFolderPath) : false;
+  const early = earlyFolderPath && earlyFolderPathExists
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",

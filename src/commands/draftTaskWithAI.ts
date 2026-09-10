@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
@@ -566,8 +568,19 @@ export async function draftTaskWithAI(
   const targetResolutionHandle = await beginTargetResolutionV1(
     resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
   );
+  // 2026-09-10 round: `earlyFolderPath` is a raw, unvalidated caller-supplied
+  // path — `resolveTaskContext`'s `onResolvedCandidate` hook below performs
+  // the real ownership/containment/workspace-binding validation, but this
+  // early guess runs BEFORE any of that. Gating on `fs.existsSync` here does
+  // not replace that validation, but it stops `acquireWorkAdmissionV1`'s
+  // genesis `mkdir(dir, { recursive: true })` from creating admission
+  // bookkeeping directories under a path that is not even an existing
+  // directory on disk (a stale id, a bogus argument, or a deleted task) —
+  // narrowing (not fully closing) the raw-path admission-before-validation
+  // blocker until the shared admission helper itself enforces this.
   const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
-  const early = earlyFolderPath
+  const earlyFolderPathExists = earlyFolderPath ? fs.existsSync(earlyFolderPath) : false;
+  const early = earlyFolderPath && earlyFolderPathExists
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",

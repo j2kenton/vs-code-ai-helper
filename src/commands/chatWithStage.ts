@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
@@ -408,8 +409,19 @@ export async function chatWithStage(
   const targetResolutionHandle = wantsSend
     ? await beginTargetResolutionV1(resolveTaskRootCandidates().map((candidate) => candidate.absolutePath))
     : undefined;
+  // 2026-09-10 round: `resolverArg?.taskFolderPath` is a raw, unvalidated
+  // caller-supplied path — `validateChatSendV1`'s `resolveTaskContext` call
+  // performs the real ownership/containment/workspace-binding validation,
+  // but this early guess runs BEFORE any of that. Gating on `fs.existsSync`
+  // here does not replace that validation, but it stops
+  // `acquireWorkAdmissionV1`'s genesis `mkdir(dir, { recursive: true })`
+  // from creating admission bookkeeping directories under a path that is
+  // not even an existing directory on disk — narrowing (not fully closing)
+  // the raw-path admission-before-validation blocker until the shared
+  // admission helper itself enforces this.
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
-  const early = earlyFolderPath
+  const earlyFolderPathExists = earlyFolderPath ? fs.existsSync(earlyFolderPath) : false;
+  const early = earlyFolderPath && earlyFolderPathExists
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
