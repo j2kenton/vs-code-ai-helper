@@ -58,7 +58,7 @@ import {
   serializeWebRefreshCookieV1,
 } from "./webSessionCookieV1";
 import type { SandboxClientFactoryV1 } from "./sandboxLifecycleV1";
-import { validateBindingReachabilityV1 } from "./sandboxLifecycleV1";
+import { ensureUserSandboxV1, validateBindingReachabilityV1 } from "./sandboxLifecycleV1";
 import type { ChatTurnRecordV1, ControlPlaneStoreV1, ControlPlaneTaskRecordV1 } from "./storeV1";
 import type { EngineRunHostV1 } from "./engineRunHostV1";
 import type { WsHubV1 } from "./wsHubV1";
@@ -396,10 +396,32 @@ export function createControlPlaneHandlerV1(
       let sandboxId: string;
       // Set only when THIS request created the sandbox, so a later failure can
       // destroy it. A user-managed sandbox is never destroyed here — it is not
-      // ours to reclaim.
+      // ours to reclaim. A user-owned-managed sandbox is deliberately treated
+      // the same way EVEN on first creation: it is meant to survive across
+      // tasks, so a failure later in THIS request must not tear it down —
+      // only task-owned-ephemeral's throwaway sandbox gets that treatment.
       let createdSandboxId: string | undefined;
       if (validated.binding.lifecycle === "user-managed-persistent") {
         sandboxId = validated.binding.sandboxId;
+      } else if (validated.binding.lifecycle === "user-owned-managed") {
+        try {
+          sandboxId = (
+            await ensureUserSandboxV1(
+              store,
+              client,
+              userId,
+              validated.binding.provider,
+              validated.binding.workingDirectoryRoot,
+              now
+            )
+          ).sandboxId;
+        } catch {
+          return typed(
+            422,
+            "sandboxUnreachable",
+            "the sandbox provider could not create or resolve this user's sandbox"
+          );
+        }
       } else {
         try {
           sandboxId = (await client.createSandbox()).sandboxId;

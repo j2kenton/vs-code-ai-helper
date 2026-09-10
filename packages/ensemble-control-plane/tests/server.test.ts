@@ -733,6 +733,83 @@ test("key custody over HTTP: write-only, masked metadata, deletable, never echoe
   assert.equal(badKind.status, 422);
 });
 
+test("user-owned-managed binding: the control plane creates the sandbox once and reuses it across tasks", async () => {
+  const world = await makeWorld();
+  await world.call(world.tokenA, "PUT", "/v1/keys/sandbox:e2b", { body: { key: "e2b_key" } });
+
+  const first = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: {
+      request: "first task",
+      sandboxBinding: {
+        provider: "e2b",
+        source: { kind: "attachExisting", path: "/workspace" },
+        workingDirectoryRoot: "/workspace",
+        lifecycle: "user-owned-managed",
+        cleanup: "retain",
+      },
+    },
+  });
+  assert.equal(first.status, 201);
+  const firstTask = world.store.readTask((first.body as { taskId: string }).taskId);
+  assert.ok(firstTask !== undefined);
+  const resolvedSandboxId = firstTask.binding.sandboxId;
+  assert.equal(firstTask.binding.lifecycle, "user-owned-managed");
+
+  // A second task, same user, same provider: reuses the SAME sandboxId —
+  // the control plane never creates a second one for this user.
+  const second = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: {
+      request: "second task",
+      sandboxBinding: {
+        provider: "e2b",
+        source: { kind: "attachExisting", path: "/workspace" },
+        workingDirectoryRoot: "/workspace",
+        lifecycle: "user-owned-managed",
+        cleanup: "retain",
+      },
+    },
+  });
+  assert.equal(second.status, 201);
+  const secondTask = world.store.readTask((second.body as { taskId: string }).taskId);
+  assert.ok(secondTask !== undefined);
+  assert.equal(secondTask.binding.sandboxId, resolvedSandboxId);
+
+  // A different user gets their OWN sandbox, never the first user's.
+  await world.call(world.tokenB, "PUT", "/v1/keys/sandbox:e2b", { body: { key: "e2b_key_b" } });
+  const foreign = await world.call(world.tokenB, "POST", "/v1/tasks", {
+    body: {
+      request: "foreign task",
+      sandboxBinding: {
+        provider: "e2b",
+        source: { kind: "attachExisting", path: "/workspace" },
+        workingDirectoryRoot: "/workspace",
+        lifecycle: "user-owned-managed",
+        cleanup: "retain",
+      },
+    },
+  });
+  assert.equal(foreign.status, 201);
+  const foreignTask = world.store.readTask((foreign.body as { taskId: string }).taskId);
+  assert.ok(foreignTask !== undefined);
+  assert.notEqual(foreignTask.binding.sandboxId, resolvedSandboxId);
+
+  // Rejected the same way task-owned-ephemeral is: the client cannot supply an id.
+  const withId = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: {
+      request: "third task",
+      sandboxBinding: {
+        provider: "e2b",
+        sandboxId: "sbx-not-allowed",
+        source: { kind: "attachExisting", path: "/workspace" },
+        workingDirectoryRoot: "/workspace",
+        lifecycle: "user-owned-managed",
+        cleanup: "retain",
+      },
+    },
+  });
+  assert.equal(withId.status, 422);
+});
+
 test("POST /v1/provider-calls: a stateless single-shot proxy over stored model-key custody", async () => {
   const seenPrompts: string[] = [];
   const fakeAdapter: EngineModelProviderAdapterV1 = {

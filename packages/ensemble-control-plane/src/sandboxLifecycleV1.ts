@@ -47,6 +47,7 @@ import {
   acquireSourcePerBindingV1,
   SandboxExecutionContextV1,
 } from "../../ensemble-engine/src/sandboxExecutionV1";
+import type { ControlPlaneUserSandboxRecordV1 } from "./storeV1";
 
 /** Hands out provider clients; keys arrive already decrypted (custody). */
 export interface SandboxClientFactoryV1 {
@@ -129,6 +130,50 @@ export async function validateBindingReachabilityV1(
       reason: "the sandbox provider API did not respond",
     };
   }
+}
+
+export interface UserSandboxStoreV1 {
+  readUserSandbox(
+    ownerUserId: string,
+    provider: SandboxProviderV1
+  ): ControlPlaneUserSandboxRecordV1 | undefined;
+  writeUserSandbox(record: ControlPlaneUserSandboxRecordV1): void;
+}
+
+/**
+ * Resolve the caller's `user-owned-managed` sandbox for (user, provider) —
+ * create it ONCE, on first use, and reuse the same one for every later call.
+ * `workingDirectoryRoot` is only meaningful on first creation (a task later
+ * asking for a different root against an EXISTING record gets the root the
+ * sandbox was actually created with — the confined root cannot silently
+ * change out from under a sandbox that already has content at the old one).
+ */
+export async function ensureUserSandboxV1(
+  store: UserSandboxStoreV1,
+  client: SandboxClientV1,
+  ownerUserId: string,
+  provider: SandboxProviderV1,
+  workingDirectoryRoot: string,
+  now: () => Date = () => new Date()
+): Promise<ControlPlaneUserSandboxRecordV1> {
+  const existing = store.readUserSandbox(ownerUserId, provider);
+  if (existing !== undefined) {
+    const touched: ControlPlaneUserSandboxRecordV1 = { ...existing, lastUsedAt: now().toISOString() };
+    store.writeUserSandbox(touched);
+    return touched;
+  }
+  const created = await client.createSandbox();
+  const at = now().toISOString();
+  const record: ControlPlaneUserSandboxRecordV1 = {
+    ownerUserId,
+    provider,
+    sandboxId: created.sandboxId,
+    workingDirectoryRoot,
+    createdAt: at,
+    lastUsedAt: at,
+  };
+  store.writeUserSandbox(record);
+  return record;
 }
 
 /** Stable step id for the attempt-recorded teardown effect. */

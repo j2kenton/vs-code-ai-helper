@@ -39,7 +39,20 @@ export type SandboxLifecycleOwnershipV1 =
   /** Created for this task; the control plane tears it down per cleanup policy. */
   | "task-owned-ephemeral"
   /** Pre-existing user-managed workspace; never destroyed by the control plane. */
-  | "user-managed-persistent";
+  | "user-managed-persistent"
+  /**
+   * The control plane creates this ONCE per (user, provider) on first use
+   * and reuses the SAME sandbox for every later task — unlike
+   * `task-owned-ephemeral` (fresh every task, destroyed after) and unlike
+   * `user-managed-persistent` (the client already owns and names an
+   * existing sandbox). The motivating case: a CLI logged in once via its
+   * own subscription inside the sandbox should stay logged in across
+   * tasks — an ephemeral sandbox throws that login away every time, and
+   * `user-managed-persistent` requires the client to already know a
+   * sandbox id, which a first-time mobile/web user has no way to obtain.
+   * Never destroyed by the control plane, the same as `user-managed-persistent`.
+   */
+  | "user-owned-managed";
 
 /** What happens to a task-owned sandbox when the task settles. */
 export type SandboxCleanupPolicyV1 = "destroy-on-completion" | "retain";
@@ -85,6 +98,11 @@ export type SandboxBindingRequestV1 =
     })
   | (Omit<SandboxBindingV1, "bindingId" | "ownerUserId" | "lifecycle"> & {
       readonly lifecycle: "user-managed-persistent";
+    })
+  | (Omit<SandboxBindingV1, "bindingId" | "ownerUserId" | "sandboxId" | "lifecycle"> & {
+      readonly lifecycle: "user-owned-managed";
+      /** Never submitted: resolved from the caller's (user, provider) sandbox record. */
+      readonly sandboxId?: undefined;
     });
 
 /**
@@ -112,6 +130,7 @@ const PROVIDERS_V1: ReadonlySet<string> = new Set(["e2b", "daytona", "docker"]);
 const LIFECYCLES_V1: ReadonlySet<string> = new Set([
   "task-owned-ephemeral",
   "user-managed-persistent",
+  "user-owned-managed",
 ]);
 const CLEANUPS_V1: ReadonlySet<string> = new Set(["destroy-on-completion", "retain"]);
 
@@ -174,7 +193,7 @@ export function validateSandboxBindingRequestV1(raw: unknown): SandboxBindingVal
     }
   }
   if (typeof raw.provider !== "string" || !PROVIDERS_V1.has(raw.provider)) {
-    return { ok: false, code: "sandboxBindingInvalid", reason: 'provider must be "e2b" or "daytona"' };
+    return { ok: false, code: "sandboxBindingInvalid", reason: 'provider must be "e2b", "daytona", or "docker"' };
   }
   if (typeof raw.lifecycle !== "string" || !LIFECYCLES_V1.has(raw.lifecycle)) {
     return { ok: false, code: "sandboxBindingInvalid", reason: "lifecycle must be a recognized ownership mode" };
@@ -195,17 +214,20 @@ export function validateSandboxBindingRequestV1(raw: unknown): SandboxBindingVal
       ok: false,
       code: "sandboxBindingInvalid",
       reason:
-        "sandboxId must be omitted for a task-owned ephemeral sandbox — the control plane creates it and assigns the id",
+        "sandboxId must be omitted for a task-owned-ephemeral or user-owned-managed sandbox — the control plane creates or resolves it and assigns the id",
     };
   }
   if (typeof raw.cleanup !== "string" || !CLEANUPS_V1.has(raw.cleanup)) {
     return { ok: false, code: "sandboxBindingInvalid", reason: "cleanup must be a recognized cleanup policy" };
   }
-  if (raw.lifecycle === "user-managed-persistent" && raw.cleanup !== "retain") {
+  if (
+    (raw.lifecycle === "user-managed-persistent" || raw.lifecycle === "user-owned-managed") &&
+    raw.cleanup !== "retain"
+  ) {
     return {
       ok: false,
       code: "sandboxBindingInvalid",
-      reason: "a user-managed persistent workspace can only carry the retain cleanup policy",
+      reason: "a persistent workspace (user-managed or user-owned-managed) can only carry the retain cleanup policy",
     };
   }
   if (!isWellFormedAbsoluteRootV1(raw.workingDirectoryRoot)) {
@@ -252,13 +274,16 @@ export function validateSandboxBindingRequestV1(raw: unknown): SandboxBindingVal
     workingDirectoryRoot: raw.workingDirectoryRoot as string,
     cleanup: raw.cleanup as SandboxCleanupPolicyV1,
   };
-  return {
-    ok: true,
-    binding:
-      raw.lifecycle === "user-managed-persistent"
-        ? { ...common, lifecycle: "user-managed-persistent", sandboxId: raw.sandboxId as string }
-        : { ...common, lifecycle: "task-owned-ephemeral" },
-  };
+  if (raw.lifecycle === "user-managed-persistent") {
+    return {
+      ok: true,
+      binding: { ...common, lifecycle: "user-managed-persistent", sandboxId: raw.sandboxId as string },
+    };
+  }
+  if (raw.lifecycle === "user-owned-managed") {
+    return { ok: true, binding: { ...common, lifecycle: "user-owned-managed" } };
+  }
+  return { ok: true, binding: { ...common, lifecycle: "task-owned-ephemeral" } };
 }
 
 export type ConfinedPathResultV1 =

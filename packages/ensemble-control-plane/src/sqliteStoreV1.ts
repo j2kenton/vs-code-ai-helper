@@ -65,12 +65,14 @@ import type {
   ControlPlaneStoreV1,
   ControlPlaneTaskRecordV1,
   ControlPlaneUserRecordV1,
+  ControlPlaneUserSandboxRecordV1,
   EngineJobRecordV1,
   EngineJobStatusV1,
   RefreshFamilyRecordV1,
   RefreshTokenRecordV1,
   TaskRoundRecordV1,
 } from "./storeV1";
+import type { SandboxProviderV1 } from "../../ensemble-contract/src/sandboxBindingV1";
 
 const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -159,6 +161,12 @@ const SCHEMA_STATEMENTS = [
      key_kind TEXT NOT NULL,
      record TEXT NOT NULL,
      PRIMARY KEY (owner_user_id, key_kind)
+   )`,
+  `CREATE TABLE IF NOT EXISTS user_sandboxes (
+     owner_user_id TEXT NOT NULL,
+     provider TEXT NOT NULL,
+     record TEXT NOT NULL,
+     PRIMARY KEY (owner_user_id, provider)
    )`,
   `CREATE TABLE IF NOT EXISTS engine_transactions (
      operation_id TEXT PRIMARY KEY,
@@ -921,6 +929,22 @@ export function createSqliteControlPlaneStoreV1(
         .prepare("SELECT record FROM key_records WHERE owner_user_id = ? ORDER BY rowid")
         .all(ownerUserId) as { record: string }[];
       return rows.map((row) => JSON.parse(row.record) as ControlPlaneKeyRecordV1);
+    },
+
+    writeUserSandbox(record: ControlPlaneUserSandboxRecordV1): void {
+      db.prepare(
+        "INSERT INTO user_sandboxes (owner_user_id, provider, record) VALUES (?, ?, ?) ON CONFLICT (owner_user_id, provider) DO UPDATE SET record = excluded.record"
+      ).run(record.ownerUserId, record.provider, JSON.stringify(record));
+    },
+
+    readUserSandbox(
+      ownerUserId: string,
+      provider: SandboxProviderV1
+    ): ControlPlaneUserSandboxRecordV1 | undefined {
+      const row = db
+        .prepare("SELECT record FROM user_sandboxes WHERE owner_user_id = ? AND provider = ?")
+        .get(ownerUserId, provider) as { record: string } | undefined;
+      return row === undefined ? undefined : (JSON.parse(row.record) as ControlPlaneUserSandboxRecordV1);
     },
 
     close(): void {

@@ -39,7 +39,7 @@ import {
   gateStateForDecisionV1,
 } from "../../ensemble-core/src/gateV1";
 import type { PersistedTaskProgressV1 } from "../../ensemble-core/src/taskProgressDecoderV1";
-import type { SandboxBindingV1 } from "../../ensemble-contract/src/sandboxBindingV1";
+import type { SandboxBindingV1, SandboxProviderV1 } from "../../ensemble-contract/src/sandboxBindingV1";
 import type {
   CreateEngineGateInputV1,
   EngineGateDecideResultV1,
@@ -216,6 +216,22 @@ export interface ControlPlaneKeyRecordV1 {
   readonly updatedAt: string;
 }
 
+/**
+ * The ONE sandbox the control plane resolves for a `user-owned-managed`
+ * binding, per (user, provider): created once on first use, reused for
+ * every later task — never destroyed automatically. `workingDirectoryRoot`
+ * is recorded here (not re-derived per task) so every task that resolves
+ * this record agrees on the same confined root.
+ */
+export interface ControlPlaneUserSandboxRecordV1 {
+  readonly ownerUserId: string;
+  readonly provider: SandboxProviderV1;
+  readonly sandboxId: string;
+  readonly workingDirectoryRoot: string;
+  readonly createdAt: string;
+  readonly lastUsedAt: string;
+}
+
 interface ControlPlaneDocumentV1 {
   users: Record<string, ControlPlaneUserRecordV1>;
   usersByIdentity: Record<string, string>;
@@ -230,6 +246,7 @@ interface ControlPlaneDocumentV1 {
   leases: Record<string, { workerId: string; expiresAtMs: number }>;
   jobs: Record<string, EngineJobRecordV1>;
   keys: Record<string, ControlPlaneKeyRecordV1>;
+  userSandboxes: Record<string, ControlPlaneUserSandboxRecordV1>;
   /** Engine chat-transaction records, canonical JSON text per operation. */
   engineTransactions: Record<string, string>;
   /** Invocation-once claims per operation (claimedAt ISO timestamp). */
@@ -251,6 +268,7 @@ function emptyDocument(): ControlPlaneDocumentV1 {
     leases: {},
     jobs: {},
     keys: {},
+    userSandboxes: {},
     engineTransactions: {},
     engineTransactionClaims: {},
   };
@@ -262,6 +280,10 @@ function identityKey(provider: string, subjectId: string): string {
 
 function keyRecordKey(userId: string, keyKind: string): string {
   return `${userId}\n${keyKind}`;
+}
+
+function userSandboxKey(userId: string, provider: string): string {
+  return `${userId}\n${provider}`;
 }
 
 export interface ControlPlaneStoreV1 {
@@ -326,6 +348,13 @@ export interface ControlPlaneStoreV1 {
   readKeyRecord(ownerUserId: string, keyKind: string): ControlPlaneKeyRecordV1 | undefined;
   deleteKeyRecord(ownerUserId: string, keyKind: string): boolean;
   listKeyRecordsForOwner(ownerUserId: string): readonly ControlPlaneKeyRecordV1[];
+
+  // The one `user-owned-managed` sandbox per (user, provider).
+  writeUserSandbox(record: ControlPlaneUserSandboxRecordV1): void;
+  readUserSandbox(
+    ownerUserId: string,
+    provider: SandboxProviderV1
+  ): ControlPlaneUserSandboxRecordV1 | undefined;
 }
 
 export interface CreateControlPlaneStoreOptionsV1 {
@@ -802,6 +831,18 @@ export function createControlPlaneStoreV1(
       return Object.values(document.keys).filter(
         (record) => record.ownerUserId === ownerUserId
       );
+    },
+
+    writeUserSandbox(record: ControlPlaneUserSandboxRecordV1): void {
+      document.userSandboxes[userSandboxKey(record.ownerUserId, record.provider)] = record;
+      persist();
+    },
+
+    readUserSandbox(
+      ownerUserId: string,
+      provider: SandboxProviderV1
+    ): ControlPlaneUserSandboxRecordV1 | undefined {
+      return document.userSandboxes[userSandboxKey(ownerUserId, provider)];
     },
   };
 }

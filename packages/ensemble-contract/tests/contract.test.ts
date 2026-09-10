@@ -319,6 +319,28 @@ test("sandbox binding validation: typed errors, no unbound path", () => {
   assert.equal(attach.ok, true);
 });
 
+test("sandbox binding validation: user-owned-managed omits sandboxId like ephemeral, retains like persistent", () => {
+  const validUserOwnedManaged = {
+    ...validBinding,
+    lifecycle: "user-owned-managed",
+    cleanup: "retain",
+  };
+  const ok = validateSandboxBindingRequestV1(validUserOwnedManaged);
+  assert.equal(ok.ok, true);
+  assert.ok(ok.ok && ok.binding.lifecycle === "user-owned-managed");
+
+  // Like task-owned-ephemeral: the client cannot know the id yet.
+  const withId = validateSandboxBindingRequestV1({ ...validUserOwnedManaged, sandboxId: "sbx_123" });
+  assert.ok(!withId.ok && withId.code === "sandboxBindingInvalid");
+
+  // Like user-managed-persistent: never destroyed, so only retain is valid.
+  const badCleanup = validateSandboxBindingRequestV1({
+    ...validUserOwnedManaged,
+    cleanup: "destroy-on-completion",
+  });
+  assert.ok(!badCleanup.ok && badCleanup.code === "sandboxBindingInvalid");
+});
+
 test("path confinement: escapes are rejected, clean paths resolve under the root", () => {
   const root = "/workspace/repo";
   const good = confinePathToBindingRootV1(root, "src/app/main.ts");
