@@ -73,13 +73,13 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 601,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved from 589 to 601 by the 2026-09-10 admission-registration edits to this route; call is unchanged.)"
+      "line": 612,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 by the 2026-09-10 admission-registration edits to this route; call is unchanged.)"
     },
     {
       "file": "src/commands/draftTaskWithAI.ts",
-      "line": 385,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved from 384 to 385 by the 2026-09-10 admission-registration edits to this route; call is unchanged.)"
+      "line": 386,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved 384 → 385 → 386 by the 2026-09-10 admission-registration edits to this route; call is unchanged.)"
     },
     {
       "file": "src/commands/generatePlanWithAI.ts",
