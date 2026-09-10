@@ -45,6 +45,7 @@ import {
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
@@ -579,27 +580,19 @@ export async function draftTaskWithAI(
   // narrowing (not fully closing) the raw-path admission-before-validation
   // blocker until the shared admission helper itself enforces this.
   const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
-  // 2026-09-10 round: narrow the raw-path admission-before-validation gap
-  // further than a bare `fs.existsSync` — that only proved SOME filesystem
-  // entry exists at the caller-supplied path, not that it is genuinely a
-  // task folder. Requiring `task.md` to exist alongside it rules out
-  // `acquireWorkAdmissionV1`'s genesis `mkdir(dir, { recursive: true })`
-  // creating admission bookkeeping under an arbitrary non-task directory
-  // (e.g. a stale/bogus id that happens to collide with an unrelated real
-  // path). This still does not perform ownership/containment/workspace-
-  // binding validation — only `resolveTaskContext` below does that — so the
-  // underlying architectural blocker (validation must live in the shared
-  // admission helper) remains open; this only shrinks its blast radius.
-  const earlyFolderPathIsTaskFolder = earlyFolderPath
-    ? fs.existsSync(earlyFolderPath) && fs.existsSync(path.join(earlyFolderPath, TASK_FILENAME))
-    : false;
-  const early = earlyFolderPath && earlyFolderPathIsTaskFolder
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "draftTaskWithAI",
-      })
-    : undefined;
+  // 2026-09-10 round (re-fixed per review directive "fix these in the shared
+  // admission helper, not per route"): the validation-before-bookkeeping
+  // check (candidate path exists AND contains task.md) now lives once in
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` instead of being
+  // duplicated here — this still does not perform ownership/containment/
+  // workspace-binding validation (only `resolveTaskContext` below does
+  // that), so the underlying architectural blocker only shrinks in blast
+  // radius, but the duplicated-per-route instance of it is now removed.
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "draftTaskWithAI",
+  });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));

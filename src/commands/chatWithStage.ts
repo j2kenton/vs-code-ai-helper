@@ -61,6 +61,7 @@ import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/ch
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
@@ -422,23 +423,18 @@ export async function chatWithStage(
   // the raw-path admission-before-validation blocker until the shared
   // admission helper itself enforces this.
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
-  // 2026-09-10 round: narrow the raw-path admission-before-validation gap
-  // further than a bare `fs.existsSync` — see draftTaskWithAI.ts's identical
-  // fix for the full reasoning. Requiring `task.md` alongside the caller-
-  // supplied path rules out creating admission bookkeeping under an
-  // arbitrary non-task directory; it does not replace the real ownership/
-  // containment/workspace-binding validation `validateChatSendV1` performs
-  // below, so the underlying architectural blocker remains open.
-  const earlyFolderPathIsTaskFolder = earlyFolderPath
-    ? fs.existsSync(earlyFolderPath) && fs.existsSync(path.join(earlyFolderPath, TASK_FILENAME))
-    : false;
-  const early = earlyFolderPath && earlyFolderPathIsTaskFolder
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "chatWithStage",
-      })
-    : undefined;
+  // 2026-09-10 round (re-fixed per review directive "fix these in the shared
+  // admission helper, not per route"): the validation-before-bookkeeping
+  // check now lives once in `acquireEarlyWorkAdmissionForCandidatePathV1`
+  // instead of being duplicated per route — see draftTaskWithAI.ts's
+  // identical call site. It does not replace the real ownership/containment/
+  // workspace-binding validation `validateChatSendV1` performs below, so the
+  // underlying architectural blocker only shrinks in blast radius.
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "chatWithStage",
+  });
   if (early && early.outcome !== "acquired") {
     if (targetResolutionHandle) {
       await endTargetResolutionV1(targetResolutionHandle);

@@ -401,6 +401,61 @@ function admissionDirV1(taskFolderPath: string): string {
   return path.join(root, ADMISSION_DIRNAME_V1);
 }
 
+/**
+ * Shared validation-before-bookkeeping check for an EARLY (pre-authoritative-
+ * resolution) admission attempt against a raw, caller-supplied path.
+ *
+ * 2026-09-10 review directive ("fix these in the shared admission helper, not
+ * per route"): this exact `fs.existsSync(dir) && fs.existsSync(join(dir,
+ * TASK_FILENAME))` check was independently duplicated in `draftTaskWithAI.ts`
+ * and `chatWithStage.ts` (and, before that, in the publish/commit routes). It
+ * is centralized here so every future early-admission caller inherits the
+ * same rule instead of re-implementing it, and so a fix to the rule itself
+ * lands once. This is still only a NARROWING of the raw-path admission-
+ * before-validation gap (module doc comment) — it proves "some directory with
+ * a task.md exists at this path", not ownership, containment, or workspace
+ * binding, which remain the job of `resolveTaskContext`'s authoritative
+ * resolution. Callers must still treat any early acquisition made against
+ * this check as provisional and reconcile it against the authoritative
+ * target once resolved (release-and-reacquire on mismatch), exactly as
+ * `draftTaskWithAI.ts` and `chatWithStage.ts` already do.
+ */
+export function looksLikeTaskFolderPathV1(candidatePath: string): boolean {
+  try {
+    return (
+      fs.existsSync(candidatePath) &&
+      fs.existsSync(path.join(candidatePath, "task.md"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared early-admission attempt for a raw, caller-supplied candidate path:
+ * runs `looksLikeTaskFolderPathV1` first (validation-before-bookkeeping) and
+ * only calls `acquireWorkAdmissionV1` — which is what actually creates the
+ * `admission-v1/` directory on disk — when that check passes. Returns
+ * `undefined` when the candidate does not look like a task folder, so a
+ * caller never creates admission bookkeeping beneath an arbitrary,
+ * unvalidated path. See `looksLikeTaskFolderPathV1`'s doc comment for what
+ * this does and does not guarantee.
+ */
+export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
+  readonly candidatePath: string | undefined;
+  readonly purpose: WorkAdmissionPurposeV1;
+  readonly commandId: string;
+}): Promise<WorkAdmissionResultV1 | undefined> {
+  if (!params.candidatePath || !looksLikeTaskFolderPathV1(params.candidatePath)) {
+    return undefined;
+  }
+  return acquireWorkAdmissionV1({
+    taskFolderPath: params.candidatePath,
+    purpose: params.purpose,
+    commandId: params.commandId,
+  });
+}
+
 function freshEpochV1(): string {
   return `${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
 }
