@@ -59,11 +59,14 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
 import {
   acquireWorkAdmissionV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -390,6 +393,21 @@ export async function chatWithStage(
   // shared admission acquisition ahead of every resume handler, so only this
   // direct-invocation path needs its own.
   const wantsSend = !!message?.trim();
+  // 2026-09-10 review blockers (new), mirroring runPublishChecks/
+  // commitAndPushTask's already-fixed shape:
+  //  - a `wantsSend` invocation whose folder is not known synchronously
+  //    (canonicalId-only, or a resolver-aware caller with no explicit path)
+  //    previously ran `validateChatSendV1`'s `resolveTaskContext` call with
+  //    NO protection at all. `beginTargetResolutionV1` now stands the whole
+  //    sweep pass down across that resolution, whether or not an early guess
+  //    exists.
+  //  - `resolverArg?.taskFolderPath` is an UNVALIDATED raw path; if it
+  //    targets a different folder than `validateChatSendV1` authoritatively
+  //    resolves to, the early admission is released and reacquired for the
+  //    REAL target instead of protecting the wrong one.
+  const targetResolutionHandle = wantsSend
+    ? await beginTargetResolutionV1(resolveTaskRootCandidates().map((candidate) => candidate.absolutePath))
+    : undefined;
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
@@ -399,29 +417,37 @@ export async function chatWithStage(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
+    if (targetResolutionHandle) {
+      await endTargetResolutionV1(targetResolutionHandle);
+    }
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
 
   let dispatch: ChatSendDispatchV1 | undefined;
   try {
-    const validated = await validateChatSendV1(inventory, resolverArg, stage);
+    let validated: ChatSendValidationResultV1;
+    try {
+      validated = await validateChatSendV1(inventory, resolverArg, stage);
+    } finally {
+      if (targetResolutionHandle) {
+        await endTargetResolutionV1(targetResolutionHandle);
+      }
+    }
     if (!validated.ok) {
       NotificationRouter.showWarning(validated.reason);
       return;
@@ -437,6 +463,13 @@ export async function chatWithStage(
       return;
     }
     if (!(await ensureAiConsent(context))) return;
+
+    // The early guess above can target the wrong task — release it and fall
+    // through to the ordinary late-acquisition path below, which acquires
+    // for the AUTHORITATIVE, now-validated folder.
+    if (handle && handle.taskFolderPath !== task.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
+    }
 
     if (!handle) {
       const late = await acquireWorkAdmissionV1({
@@ -455,11 +488,22 @@ export async function chatWithStage(
     // Admission is now guaranteed live for this exact target — reverse a
     // watchdog-provenance pause (never a user pause) before any further
     // setup, exactly like runReviewWithAI/runLintingFixes.
-    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+    //
+    // 2026-09-10 review completion blocker (new): the reconciliation result
+    // was previously discarded — a genuine `userPaused`/`unreadable` outcome
+    // must stop this command, exactly as runPublishChecks/
+    // completeCommitAndPushTask already do.
+    const chatReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+    if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Chat send is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
 
     dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message);
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
   }
 
   // Dispatched AFTER admission is released, deliberately: a proposed stage

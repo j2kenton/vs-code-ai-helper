@@ -30,11 +30,14 @@ import {
 } from "../services/workflowRuntimeServicesV1";
 import {
   acquireWorkAdmissionV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
 
@@ -377,6 +380,19 @@ export async function renameTaskWithAI(
   // real provider dispatch below (`requestAiNameV1`'s `coordinator.executeAction`)
   // ran with no durable evidence this task was doing anything, so a watchdog
   // sweep could pause it mid-run.
+  //
+  // 2026-09-10 review blockers (new), mirroring runPublishChecks/
+  // commitAndPushTask's already-fixed shape:
+  //  - a canonicalId-only or true no-arg invocation left NO protection at
+  //    all across `resolve()` below. `beginTargetResolutionV1` now stands
+  //    the whole sweep pass down across that resolution regardless of
+  //    whether an early guess exists.
+  //  - `earlyFolderPath` is an UNVALIDATED raw path; if it targets a
+  //    different folder than `resolve()` authoritatively resolves to, the
+  //    early admission is released and reacquired for the REAL target.
+  const targetResolutionHandle = await beginTargetResolutionV1(
+    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
+  );
   const earlyFolderPath = extractSynchronousRenameFolderPathV1(arg);
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
@@ -386,23 +402,22 @@ export async function renameTaskWithAI(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
 
@@ -410,9 +425,21 @@ export async function renameTaskWithAI(
     // Same activation-barrier contract as renameTask above (plan §1.4).
     await TaskCreationStartupReconcilerV1.waitUntilReady();
 
-    const task = await resolve(inventory, arg);
+    let task: Awaited<ReturnType<typeof resolve>>;
+    try {
+      task = await resolve(inventory, arg);
+    } finally {
+      await endTargetResolutionV1(targetResolutionHandle);
+    }
     if (!task) return;
     if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+
+    // The early guess above can target the wrong task — release it and fall
+    // through to the ordinary late-acquisition path below, which acquires
+    // for the AUTHORITATIVE, now-validated folder.
+    if (handle && handle.taskFolderPath !== task.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
+    }
 
     if (!handle) {
       const late = await acquireWorkAdmissionV1({
@@ -431,7 +458,18 @@ export async function renameTaskWithAI(
     // Admission is now guaranteed live for this exact target — reverse a
     // watchdog-provenance pause (never a user pause) before any further
     // setup, exactly like runReviewWithAI/runLintingFixes.
-    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+    //
+    // 2026-09-10 review completion blocker (new): the reconciliation result
+    // was previously discarded — a genuine `userPaused`/`unreadable` outcome
+    // must stop this command, exactly as runPublishChecks/
+    // completeCommitAndPushTask already do.
+    const renameReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+    if (renameReconcileOutcome.outcome === "userPaused" || renameReconcileOutcome.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Rename Task with AI is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
 
   const readText = async (fileName: string): Promise<string> => {
     try {
@@ -548,7 +586,7 @@ export async function renameTaskWithAI(
     }
   );
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
   }
 }
 

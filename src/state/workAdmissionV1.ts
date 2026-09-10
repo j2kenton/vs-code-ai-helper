@@ -590,23 +590,49 @@ let resolutionInFlightCountV1 = 0;
  * other for it — `purpose: "admission"` always blocks another `admission`
  * acquisition at the same path, including this module's own, so a second
  * concurrent `beginTargetResolutionV1` call in this window would otherwise
- * see its own root marker as `busy`. A DIFFERENT window's concurrent
- * resolution can still see `busy` here and end up holding no durable marker
- * of its own — accepted as a rare, narrow residual gap (documented on
- * `beginTargetResolutionV1` itself): that other window's own
- * `resolutionInFlightCountV1` still protects ITS sweep, and by the time a
- * cross-window pause could land, this marker (acquired by whichever window
- * got there first) is very likely still held, since resolution windows are
- * short and release only after the acquiring window's own resolution ends.
+ * see its own root marker as `busy`.
+ *
+ * 2026-09-10 review completion blocker (narrowed further): a DIFFERENT
+ * window's concurrent resolution seeing `busy` (or a transient write
+ * failure) here used to hold NO durable marker of its own for the REST of
+ * its resolution, even after the original holder released — so a third
+ * window's sweep landing in that now-unprotected gap could pause whatever
+ * this window's resolution was about to admit. A single acquisition attempt
+ * is no longer the whole story: `beginTargetResolutionV1` now keeps retrying
+ * every unclaimed root in the background (`RESOLUTION_MARKER_RETRY_INTERVAL_MS_V1`)
+ * for as long as this window's resolution is still in flight, so the moment
+ * a blocking marker is released (or a transient write failure clears), this
+ * window picks up real durable protection instead of going without it for
+ * the remainder of its own resolution. This still does not GUARANTEE
+ * durable protection at every instant — true cross-window exclusion is
+ * Part 1b's pause-fence — but it closes the specific "holds nothing for the
+ * rest of resolution" gap the review observed, consistent with the 1a
+ * interim policy (module doc comment on `beginTargetResolutionV1`): a missed
+ * window of durable protection here degrades to the same-process
+ * `resolutionInFlightCountV1` stand-down, never to a stranded task.
  */
 const durableResolutionMarkersV1 = new Map<string, { handle: WorkAdmissionHandleV1; refCount: number }>();
+
+/** How often `beginTargetResolutionV1` retries a root it could not acquire a
+ * durable marker for on its first attempt (busy, or a transient write
+ * failure) — see `durableResolutionMarkersV1`'s doc comment. Short enough
+ * that a released marker is picked up promptly relative to typical
+ * resolution durations (sub-second to a few seconds), long enough to be a
+ * negligible filesystem load. */
+const RESOLUTION_MARKER_RETRY_INTERVAL_MS_V1 = 500;
 
 /** Opaque handle returned by `beginTargetResolutionV1`, threaded back into
  * the matching `endTargetResolutionV1` call so it releases exactly the
  * durable root markers this call acquired (or reused) — never a different
- * caller's. */
+ * caller's. `rootPaths` is intentionally the SAME mutable array the
+ * background retry loop appends to, so `endTargetResolutionV1` always
+ * releases whatever was actually acquired by the time it runs, including
+ * roots picked up after the initial synchronous return. */
 export interface TargetResolutionHandleV1 {
   readonly rootPaths: readonly string[];
+  /** @internal stops the background retry loop; called by
+   * `endTargetResolutionV1` before it reads `rootPaths` for release. */
+  readonly stopRetryingV1: () => void;
 }
 
 /**
@@ -621,10 +647,12 @@ export interface TargetResolutionHandleV1 {
  * each one, this best-effort acquires (or reuses, if this window already
  * holds one) a durable admission marker at that root, so a SECOND window's
  * sweep can observe resolution-in-flight on disk, not just in this process.
- * A root whose marker could not be acquired (busy, or a real write failure)
- * is silently skipped — this cross-window signal is pure defense-in-depth
- * layered on the durable `resolutionInFlightCountV1` bump above, which always
- * happens synchronously regardless of what happens here, and it must never
+ * A root whose marker could not be acquired on the first attempt (busy, or a
+ * real write failure) is retried in the background for as long as this
+ * resolution window remains open (see `durableResolutionMarkersV1`'s doc
+ * comment) — this cross-window signal is defense-in-depth layered on the
+ * durable `resolutionInFlightCountV1` bump above, which always happens
+ * synchronously regardless of what happens here, and none of this may ever
  * block or fail the caller's own resolution.
  */
 export async function beginTargetResolutionV1(
@@ -632,43 +660,99 @@ export async function beginTargetResolutionV1(
 ): Promise<TargetResolutionHandleV1> {
   resolutionInFlightCountV1 += 1;
   const acquiredRoots: string[] = [];
-  for (const rootPath of taskRootPaths) {
+  const pendingRoots = new Set<string>();
+  // Guards against the retry timer firing a second attempt for the same
+  // root while an earlier attempt is still awaiting `acquireWorkAdmissionV1`
+  // (filesystem latency can outlast one retry tick) — without this, two
+  // concurrent attempts for the same root could both "succeed" from this
+  // window's perspective and double-count into `durableResolutionMarkersV1`.
+  const inFlightRoots = new Set<string>();
+  let stopped = false;
+  let retryTimer: ReturnType<typeof setInterval> | undefined;
+
+  const tryAcquireRootV1 = async (rootPath: string): Promise<void> => {
+    if (stopped || acquiredRoots.includes(rootPath) || inFlightRoots.has(rootPath)) {
+      return;
+    }
     const existing = durableResolutionMarkersV1.get(rootPath);
     if (existing) {
       existing.refCount += 1;
+      pendingRoots.delete(rootPath);
       acquiredRoots.push(rootPath);
-      continue;
+      return;
     }
+    inFlightRoots.add(rootPath);
     try {
       const result = await acquireWorkAdmissionV1({
         taskFolderPath: rootPath,
         purpose: "admission",
         commandId: "resolutionInFlight",
       });
+      if (stopped) {
+        // The resolution window closed while this attempt was in flight —
+        // release immediately rather than leaving an orphaned marker no
+        // `endTargetResolutionV1` call will ever know to release.
+        if (result.outcome === "acquired") {
+          await result.handle.release().catch(() => undefined);
+        }
+        return;
+      }
       if (result.outcome === "acquired") {
         durableResolutionMarkersV1.set(rootPath, { handle: result.handle, refCount: 1 });
+        pendingRoots.delete(rootPath);
         acquiredRoots.push(rootPath);
       }
+      // busy: left in `pendingRoots`, retried on the next tick.
     } catch {
-      // Best-effort — never let a durable-marker failure block resolution.
+      // Real write failure — left in `pendingRoots`, retried on the next
+      // tick rather than treated as permanent (the failure may be
+      // transient, e.g. a momentarily locked filesystem).
+    } finally {
+      inFlightRoots.delete(rootPath);
     }
+  };
+
+  for (const rootPath of taskRootPaths) {
+    pendingRoots.add(rootPath);
+    await tryAcquireRootV1(rootPath);
   }
-  return { rootPaths: acquiredRoots };
+
+  if (pendingRoots.size > 0) {
+    retryTimer = setInterval(() => {
+      for (const rootPath of Array.from(pendingRoots)) {
+        void tryAcquireRootV1(rootPath);
+      }
+    }, RESOLUTION_MARKER_RETRY_INTERVAL_MS_V1);
+  }
+
+  return {
+    rootPaths: acquiredRoots,
+    stopRetryingV1: (): void => {
+      stopped = true;
+      if (retryTimer) {
+        clearInterval(retryTimer);
+        retryTimer = undefined;
+      }
+    },
+  };
 }
 
 /**
  * Ends one `beginTargetResolutionV1()` window: always decrements the
  * same-process counter (clamped at zero, so a caller need not track whether
- * `begin` ran on every exit path), and — when `handle` is the value that
- * call returned — releases this caller's share of each durable root marker,
- * actually removing it from disk only once every concurrent same-window
- * holder has released its own share.
+ * `begin` ran on every exit path), stops that call's background retry loop,
+ * and — when `handle` is the value that call returned — releases this
+ * caller's share of each durable root marker it ended up holding (including
+ * any picked up by a background retry after the initial synchronous
+ * return), actually removing a marker from disk only once every concurrent
+ * same-window holder has released its own share.
  */
 export async function endTargetResolutionV1(handle?: TargetResolutionHandleV1): Promise<void> {
   resolutionInFlightCountV1 = Math.max(0, resolutionInFlightCountV1 - 1);
   if (!handle) {
     return;
   }
+  handle.stopRetryingV1();
   for (const rootPath of handle.rootPaths) {
     const entry = durableResolutionMarkersV1.get(rootPath);
     if (!entry) {

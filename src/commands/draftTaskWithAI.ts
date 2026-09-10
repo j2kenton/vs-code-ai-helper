@@ -44,11 +44,14 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
 import {
   acquireWorkAdmissionV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 import {
   buildTaskDocument,
@@ -543,6 +546,26 @@ export async function draftTaskWithAI(
   // resume-then-dispatch flow currently targets this command directly (Chat
   // Resume of a `draft.v1` question goes through chatView.ts's own shared
   // admission acquisition instead, see resumeDraftInteractionV1's caller).
+  //
+  // 2026-09-10 review blockers (new): two gaps mirroring what
+  // runPublishChecks/commitAndPushTask already closed for their own routes.
+  //  - A true no-arg (or canonicalId-only) invocation left NO protection at
+  //    all across the consent wait and `resolveTaskContext` below — the
+  //    checked "route every command..." checklist item overstated this
+  //    route's coverage. `beginTargetResolutionV1` now stands the whole
+  //    sweep pass down for that window regardless of whether an early guess
+  //    exists, exactly like runPublishChecks.
+  //  - `earlyFolderPath` is an UNVALIDATED raw path from the caller-supplied
+  //    argument — `resolveTaskContext` below performs the real
+  //    ownership/containment/workspace-binding validation. If the early
+  //    guess turns out to target a different folder than the authoritative
+  //    resolution (stale arg, wrong id, or a path resolveTaskContext would
+  //    reject outright), the early admission is now released and
+  //    reacquired for the REAL target, instead of being held on the wrong
+  //    (possibly bogus) path while the real target goes unprotected.
+  const targetResolutionHandle = await beginTargetResolutionV1(
+    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
+  );
   const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
   const early = earlyFolderPath
     ? await acquireWorkAdmissionV1({
@@ -552,23 +575,22 @@ export async function draftTaskWithAI(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
   let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
     if (handle) {
-      await handle.release();
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
     }
   };
 
@@ -579,15 +601,28 @@ export async function draftTaskWithAI(
       return;
     }
 
-    const resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
-      allowPaused: false,
-    });
+    let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
+    try {
+      resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
+        allowPaused: false,
+      });
+    } finally {
+      await endTargetResolutionV1(targetResolutionHandle);
+    }
 
     if (!resolvedTask) {
       NotificationRouter.showInformation(
         "No active task found at the Task Description stage."
       );
       return;
+    }
+
+    // The early guess above can target the wrong task (a stale/incorrect
+    // raw path) — release it and fall through to the ordinary
+    // late-acquisition path below, which acquires for the AUTHORITATIVE,
+    // now-validated folder.
+    if (handle && handle.taskFolderPath !== resolvedTask.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
     }
 
     if (!handle) {
@@ -607,7 +642,21 @@ export async function draftTaskWithAI(
     // Admission is now guaranteed live for this exact target — reverse a
     // watchdog-provenance pause (never a user pause) before any further
     // setup, exactly like runReviewWithAI/runLintingFixes.
-    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+    //
+    // 2026-09-10 review completion blocker (new): the reconciliation result
+    // was previously discarded — a genuine `userPaused` (a real user pause,
+    // not a watchdog one) or `unreadable` outcome must stop this command
+    // from continuing, exactly as runPublishChecks/completeCommitAndPushTask
+    // already do.
+    const draftReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
+      vscode.Uri.file(resolvedTask.taskFolderPath)
+    );
+    if (draftReconcileOutcome.outcome === "userPaused" || draftReconcileOutcome.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Draft Task with AI is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
 
     const lockKey = resolvedTask.taskFolderPath;
     const result = await runTrackedOperation(
@@ -622,7 +671,7 @@ export async function draftTaskWithAI(
     );
     return result?.succeeded || undefined;
   } finally {
-    await releaseAdmissionV1();
+    await releaseCurrentAdmissionV1();
   }
 }
 
