@@ -33,6 +33,7 @@ import {
   createDaytonaSandboxClientV1,
   createE2bSandboxClientV1,
 } from "../../ensemble-engine/src/sandboxProviderAdaptersV1";
+import { createLocalDockerSandboxClientV1 } from "./localDockerSandboxClientV1";
 import {
   createDaytonaSdkSandboxClientV1,
   createE2bSdkSandboxClientV1,
@@ -52,27 +53,42 @@ export interface SandboxClientFactoryV1 {
   clientFor(provider: SandboxProviderV1, apiKey: string): SandboxClientV1;
 }
 
-/** Fetch-based reference-transport factory (dependency-free; used by this package's tests). */
+/**
+ * Fetch-based reference-transport factory (dependency-free; used by this
+ * package's tests). `docker` has no fetch-based reference transport — it
+ * routes to the same local-daemon client the SDK factory uses, since there's
+ * only one way to talk to a local Docker daemon, not a "reference vs. SDK"
+ * choice the way E2B/Daytona have a plain-HTTP vs. vendor-SDK distinction.
+ */
 export function createFetchSandboxClientFactoryV1(fetchImpl: FetchLikeV1): SandboxClientFactoryV1 {
   return {
     clientFor(provider: SandboxProviderV1, apiKey: string): SandboxClientV1 {
-      return provider === "e2b"
-        ? createE2bSandboxClientV1({ fetch: fetchImpl, apiKey })
-        : createDaytonaSandboxClientV1({ fetch: fetchImpl, apiKey });
+      if (provider === "e2b") {
+        return createE2bSandboxClientV1({ fetch: fetchImpl, apiKey });
+      }
+      if (provider === "daytona") {
+        return createDaytonaSandboxClientV1({ fetch: fetchImpl, apiKey });
+      }
+      return createLocalDockerSandboxClientV1({ apiKey });
     },
   };
 }
 
 /**
- * SDK-backed factory over the real `e2b` / `@daytona/sdk` vendor SDKs — the
- * deployment default (plan Part 5's E2B/Daytona SDK integration item).
+ * SDK-backed factory over the real `e2b` / `@daytona/sdk` vendor SDKs plus
+ * the local Docker daemon — the deployment default (plan Part 5's E2B/Daytona
+ * SDK integration item, plus the self-hosted `docker` provider).
  */
 export function createSdkSandboxClientFactoryV1(): SandboxClientFactoryV1 {
   return {
     clientFor(provider: SandboxProviderV1, apiKey: string): SandboxClientV1 {
-      return provider === "e2b"
-        ? createE2bSdkSandboxClientV1({ apiKey })
-        : createDaytonaSdkSandboxClientV1({ apiKey });
+      if (provider === "e2b") {
+        return createE2bSdkSandboxClientV1({ apiKey });
+      }
+      if (provider === "daytona") {
+        return createDaytonaSdkSandboxClientV1({ apiKey });
+      }
+      return createLocalDockerSandboxClientV1({ apiKey });
     },
   };
 }

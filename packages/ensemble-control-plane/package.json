@@ -13,7 +13,11 @@
   },
   "dependencies": {
     "@daytona/sdk": "^0.204.0",
+    "dockerode": "^4.0.9",
     "e2b": "^2.38.3",
     "shiki": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.34"
   }
 }

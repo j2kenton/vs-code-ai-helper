@@ -10,8 +10,13 @@
  * authorization, and any resolved target outside the root is rejected.
  */
 
-/** Supported sandbox execution platforms (BYOS). */
-export type SandboxProviderV1 = "e2b" | "daytona";
+/**
+ * Supported sandbox execution platforms. `e2b`/`daytona` are BYOS (bring your
+ * own provider account, billed by them). `docker` is self-hosted: a local
+ * Docker daemon on the same host as the control plane, free and unmetered
+ * but bounded by that host's own resources — the default for routine use.
+ */
+export type SandboxProviderV1 = "e2b" | "daytona" | "docker";
 
 /** How the task's source tree gets into the sandbox. */
 export type SandboxSourceAcquisitionV1 =
@@ -103,7 +108,7 @@ export type SandboxBindingErrorCodeV1 =
   /** A path's provider-resolved real target lies outside the binding root. */
   | "symlinkEscapesBindingRoot";
 
-const PROVIDERS_V1: ReadonlySet<string> = new Set(["e2b", "daytona"]);
+const PROVIDERS_V1: ReadonlySet<string> = new Set(["e2b", "daytona", "docker"]);
 const LIFECYCLES_V1: ReadonlySet<string> = new Set([
   "task-owned-ephemeral",
   "user-managed-persistent",
