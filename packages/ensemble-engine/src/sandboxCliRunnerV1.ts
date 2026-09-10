@@ -51,6 +51,7 @@ import {
 import type { EngineGateMachineryV1 } from "./gateMachineryV1";
 import {
   buildEngineRoundPromptV1,
+  ENGINE_CLASSIFIED_FAILURE_CODES_V1,
   ENGINE_ROUND_MAX_RESPONSE_BYTES_V1,
   engineFailureCodeForKindV1,
   type EngineCliTransportRunnerV1,
@@ -369,6 +370,15 @@ export function createSandboxCliProviderRunnerV1(
 
         const envelope = parseAiResultEnvelopeV1(output, input.correlation);
         if (envelope.kind === "malformed") {
+          // A signed-out CLI does not fail: `claude -p` prints
+          // "Not logged in · Please run /login" to STDOUT and exits 0
+          // (confirmed live, Claude Code 2.1.267). Without this check that
+          // reads as a malformed frame — retryable — and the loop would
+          // burn its whole round budget re-running a CLI that can never
+          // answer. Credential problems are terminal and must surface.
+          if (isAuthenticationFailureV1(tail(output))) {
+            return failed(ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication, false);
+          }
           return failed(`malformedResult.${envelope.code}`, true);
         }
         if (envelope.kind === "questions") {

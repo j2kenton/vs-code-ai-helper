@@ -174,6 +174,20 @@ test("a non-zero exit is classified like the direct-API path: quota retries, aut
   });
 });
 
+test("a signed-out CLI (exit 0, 'Not logged in' on stdout) is a terminal auth failure, not a retryable malformed frame", async () => {
+  // The real shape, captured live from `claude -p` in a sandbox with no
+  // persisted login: nothing on stderr, exit code 0, and only this on stdout.
+  const client = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({ exitCode: 0, frame: () => "Not logged in · Please run /login\n" }),
+  });
+
+  assert.deepEqual(await makeRunner(client).invoke(invocation("impl")), {
+    kind: "failed",
+    code: "authenticationFailed",
+    retryable: false,
+  });
+});
+
 test("output without the result frame is a retryable malformed-result failure, never promoted content", async () => {
   const client = createInMemorySandboxClientV1({
     onCommand: scriptedCli({ frame: () => "I edited the files and everything is great.\n" }),
