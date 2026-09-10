@@ -38,7 +38,9 @@ import {
 import {
   parseEngineModelSelectionV1,
   toEngineQualifiedModelIdV1,
+  type EngineProviderIdV1,
 } from "../../ensemble-engine/src/providerCatalogV1";
+import type { EngineModelProviderAdapterV1 } from "../../ensemble-engine/src/providerAdaptersV1";
 import {
   resolveConfinedSandboxPathV1,
   SandboxExecutionContextV1,
@@ -114,6 +116,17 @@ export interface CreateControlPlaneHandlerOptionsV1 {
    * cleanup (integration smokes exercising binding custody and reachability).
    */
   readonly allowEphemeralSandboxWithoutRunHost?: boolean;
+  /**
+   * Single-shot direct-API model dispatch (`POST /v1/provider-calls`), for a
+   * CLIENT-DRIVEN caller that wants ONE provider call made from this server
+   * rather than from wherever the client itself runs — e.g. a VS Code
+   * extension's own per-stage orchestration loop, unchanged, delegating just
+   * the network hop for one round to this deployment instead of calling the
+   * provider directly. Distinct from `runs`: this makes no task, opens no
+   * gate, persists nothing — it is a stateless proxy over the same key
+   * custody and adapters a hosted run already uses. Absent, the route 404s.
+   */
+  readonly engineAdapters?: ReadonlyMap<EngineProviderIdV1, EngineModelProviderAdapterV1>;
   readonly now?: () => Date;
   /**
    * Diagnostic log sink (plan Part 11). Every line is passed through
@@ -125,6 +138,8 @@ export interface CreateControlPlaneHandlerOptionsV1 {
 }
 
 const KEY_KIND_PATTERN_V1 = /^(sandbox|model):[A-Za-z0-9._-]{1,64}$/;
+/** Server-side defense in depth; the caller's own bounded writer enforces the real cap. */
+const MAX_PROVIDER_CALL_PROMPT_CHARS_V1 = 2 * 1024 * 1024;
 
 const LANGUAGE_BY_EXTENSION_V1: Readonly<Record<string, string>> = {
   ts: "typescript",
@@ -202,7 +217,7 @@ function chatTurnDto(turn: ChatTurnRecordV1): Record<string, unknown> {
 export function createControlPlaneHandlerV1(
   options: CreateControlPlaneHandlerOptionsV1
 ): ControlPlaneHandlerV1 {
-  const { store, sessions, hub, kekProvider, sandboxFactory, runs } = options;
+  const { store, sessions, hub, kekProvider, sandboxFactory, runs, engineAdapters } = options;
   const allowEphemeralSandboxWithoutRunHost = options.allowEphemeralSandboxWithoutRunHost === true;
   const now = options.now ?? ((): Date => new Date());
   const log = options.log === undefined ? undefined : createRedactingLogSinkV1(options.log);
@@ -712,6 +727,56 @@ export function createControlPlaneHandlerV1(
           },
         };
       }
+    }
+
+    if (method === "POST" && path === "/v1/provider-calls") {
+      if (engineAdapters === undefined) {
+        return typed(404, "notFound", "this deployment does not accept direct provider calls");
+      }
+      const body = request.body;
+      if (
+        !isRecord(body) ||
+        typeof body.provider !== "string" ||
+        typeof body.prompt !== "string" ||
+        body.prompt.length === 0 ||
+        (body.model !== undefined && typeof body.model !== "string")
+      ) {
+        return typed(422, "providerCallInvalid", "provider and prompt are required");
+      }
+      if (body.prompt.length > MAX_PROVIDER_CALL_PROMPT_CHARS_V1) {
+        return typed(422, "providerCallPromptTooLarge", "prompt exceeds the size this endpoint accepts");
+      }
+      const provider = body.provider as EngineProviderIdV1;
+      const adapter = engineAdapters.get(provider);
+      if (adapter === undefined) {
+        return typed(422, "providerCallProviderUnknown", `no adapter for provider "${provider}"`);
+      }
+      const keyRecord = store.readKeyRecord(userId, `model:${provider}`);
+      if (keyRecord === undefined) {
+        return typed(422, "providerCallKeyMissing", `no stored key for provider "${provider}"`);
+      }
+      let apiKey: string;
+      try {
+        apiKey = await decryptKeyMaterialV1(kekProvider, keyRecord.envelope);
+      } catch (error) {
+        if (error instanceof KeyCustodyUnavailableErrorV1) {
+          return typed(503, error.code, error.message);
+        }
+        throw error;
+      }
+      const result = await adapter.invokeText({
+        prompt: body.prompt,
+        model: body.model,
+        apiKey,
+      });
+      if (result.status === "failed") {
+        return typed(
+          result.authFailure === true ? 401 : 502,
+          result.authFailure === true ? "providerCallAuthFailed" : "providerCallFailed",
+          result.errorMessage
+        );
+      }
+      return { status: 200, body: { text: result.text } };
     }
 
     if (method === "GET" && path === "/v1/keys") {

@@ -376,6 +376,7 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     sandboxFactory,
     allowEphemeralSandboxWithoutRunHost,
     runs,
+    engineAdapters,
     log,
   });
 

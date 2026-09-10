@@ -15,6 +15,11 @@ import {
   InMemorySandboxClientV1,
 } from "../../ensemble-engine/src/sandboxClientV1";
 import type { SandboxClientV1 } from "../../ensemble-engine/src/sandboxClientV1";
+import type {
+  EngineModelProviderAdapterV1,
+  EngineTextInvocationV1,
+} from "../../ensemble-engine/src/providerAdaptersV1";
+import type { EngineProviderIdV1 } from "../../ensemble-engine/src/providerCatalogV1";
 import {
   ControlPlaneHandlerV1,
   ControlPlaneHttpRequestV1,
@@ -60,6 +65,7 @@ async function makeWorld(options?: {
   readonly kekDown?: boolean;
   readonly log?: (line: string) => void;
   readonly allowEphemeralSandboxWithoutRunHost?: boolean;
+  readonly engineAdapters?: ReadonlyMap<EngineProviderIdV1, EngineModelProviderAdapterV1>;
 }): Promise<World> {
   const clock = makeClock();
   const store = createControlPlaneStoreV1({ now: clock.now });
@@ -88,6 +94,7 @@ async function makeWorld(options?: {
       ? { allowEphemeralSandboxWithoutRunHost: true }
       : {}),
     ...(options?.log !== undefined ? { log: options.log } : {}),
+    ...(options?.engineAdapters !== undefined ? { engineAdapters: options.engineAdapters } : {}),
   });
   const a = await sessions.exchange({ provider: "github", authorizationCode: "code-a", ...BASE });
   const b = await sessions.exchange({ provider: "github", authorizationCode: "code-b", ...BASE });
@@ -724,6 +731,87 @@ test("key custody over HTTP: write-only, masked metadata, deletable, never echoe
     body: { key: "x" },
   });
   assert.equal(badKind.status, 422);
+});
+
+test("POST /v1/provider-calls: a stateless single-shot proxy over stored model-key custody", async () => {
+  const seenPrompts: string[] = [];
+  const fakeAdapter: EngineModelProviderAdapterV1 = {
+    providerId: "anthropic",
+    invokeText(input: EngineTextInvocationV1) {
+      seenPrompts.push(input.prompt);
+      if (input.prompt === "fail me") {
+        return Promise.resolve({ status: "failed" as const, errorMessage: "provider refused" });
+      }
+      if (input.prompt === "bad key") {
+        return Promise.resolve({
+          status: "failed" as const,
+          errorMessage: "invalid api key",
+          authFailure: true,
+        });
+      }
+      return Promise.resolve({ status: "completed" as const, text: `echo: ${input.prompt}` });
+    },
+  };
+  const world = await makeWorld({
+    engineAdapters: new Map<EngineProviderIdV1, EngineModelProviderAdapterV1>([
+      ["anthropic", fakeAdapter],
+    ]),
+  });
+
+  // No stored key yet: fail-closed, never reaches the adapter.
+  const noKey = await world.call(world.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "hello" },
+  });
+  assert.equal(noKey.status, 422);
+  assert.equal((noKey.body as { code: string }).code, "providerCallKeyMissing");
+  assert.equal(seenPrompts.length, 0);
+
+  const put = await world.call(world.tokenA, "PUT", "/v1/keys/model:anthropic", {
+    body: { key: "sk-ant-test-key" },
+  });
+  assert.equal(put.status, 204);
+
+  const ok = await world.call(world.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "hello" },
+  });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { text: "echo: hello" });
+  assert.deepEqual(seenPrompts, ["hello"]);
+
+  // Cross-user denial: user B has no stored key, sees the same fail-closed 422.
+  const foreign = await world.call(world.tokenB, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "hello" },
+  });
+  assert.equal(foreign.status, 422);
+  assert.equal((foreign.body as { code: string }).code, "providerCallKeyMissing");
+
+  // Unknown provider: rejected before ever touching custody or the adapter.
+  const unknownProvider = await world.call(world.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "openai", prompt: "hello" },
+  });
+  assert.equal(unknownProvider.status, 422);
+  assert.equal((unknownProvider.body as { code: string }).code, "providerCallProviderUnknown");
+
+  // A generic provider failure maps to 502; an auth-classified one to 401 —
+  // the same distinction AgentTransportExitV1 needs on the caller's side.
+  const generic = await world.call(world.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "fail me" },
+  });
+  assert.equal(generic.status, 502);
+  assert.equal((generic.body as { code: string }).code, "providerCallFailed");
+
+  const authFailed = await world.call(world.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "bad key" },
+  });
+  assert.equal(authFailed.status, 401);
+  assert.equal((authFailed.body as { code: string }).code, "providerCallAuthFailed");
+
+  // With no engineAdapters configured at all, the route doesn't exist.
+  const noAdapters = await makeWorld();
+  const notFound = await noAdapters.call(noAdapters.tokenA, "POST", "/v1/provider-calls", {
+    body: { provider: "anthropic", prompt: "hello" },
+  });
+  assert.equal(notFound.status, 404);
 });
 
 test("fail-closed custody: with the KEK unavailable, key writes and key-dependent reads refuse", async () => {
