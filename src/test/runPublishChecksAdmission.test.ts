@@ -659,6 +659,72 @@ void describe(
       assert.equal(resolved, undefined);
       assert.equal(called, false);
     });
+
+    void it(
+      "never fires for a candidate whose folder does not exist on disk (2026-09-10 review architectural blocker fix)",
+      async () => {
+        // Deliberately never created via `makeTaskFolder`/`fs.mkdirSync` — a
+        // stale inventory entry for a folder that no longer exists. Before
+        // the fix, the hook fired BEFORE this exact existence check, so a
+        // caller's admission acquisition (`mkdir(dir, { recursive: true })`)
+        // could resurrect a directory under a candidate resolveTaskContext
+        // was about to reject.
+        const missingFolderPath = path.join(REAL_ROOT, "tasks", "resolve-hook-never-created");
+        const progress = fixtureProgress(missingFolderPath, { status: "active" });
+        const inventory = makeInventory(missingFolderPath, progress);
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        const ws = installWorkspaceFoldersStub();
+
+        let called = false;
+        try {
+          const resolved = await resolveTaskContext(inventory, { canonicalId: missingFolderPath, taskFolderPath: missingFolderPath }, {
+            allowPaused: true,
+            onResolvedCandidate: () => {
+              called = true;
+              return Promise.resolve();
+            },
+          }, currentTaskStore);
+
+          assert.equal(resolved, undefined, "a missing folder must still fail resolution");
+          assert.equal(called, false, "the admission hook must never fire for a candidate that fails the existence check");
+          assert.equal(fs.existsSync(missingFolderPath), false, "the hook must not have resurrected the folder via admission's mkdir");
+        } finally {
+          ws.restore();
+        }
+      }
+    );
+
+    void it(
+      "never fires for a candidate outside every open workspace folder (2026-09-10 review architectural blocker fix)",
+      async () => {
+        const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-outside-workspace-"));
+        const outsideFolderPath = path.join(outsideRoot, "some-task");
+        fs.mkdirSync(outsideFolderPath, { recursive: true });
+        const progress = fixtureProgress(outsideFolderPath, { status: "active" });
+        const inventory = makeInventory(outsideFolderPath, progress);
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        // REAL_ROOT is the only open workspace folder — `outsideFolderPath`
+        // sits entirely outside it.
+        const ws = installWorkspaceFoldersStub();
+
+        let called = false;
+        try {
+          const resolved = await resolveTaskContext(inventory, { canonicalId: outsideFolderPath, taskFolderPath: outsideFolderPath }, {
+            allowPaused: true,
+            onResolvedCandidate: () => {
+              called = true;
+              return Promise.resolve();
+            },
+          }, currentTaskStore);
+
+          assert.equal(resolved, undefined, "a task outside every open workspace folder must still fail resolution");
+          assert.equal(called, false, "the admission hook must never fire for a candidate that fails workspace containment");
+        } finally {
+          ws.restore();
+          fs.rmSync(outsideRoot, { recursive: true, force: true });
+        }
+      }
+    );
   }
 );
 
@@ -789,6 +855,60 @@ void describe(
 
           assert.equal(surface.entries.length, 1);
           assert.match(surface.entries[0]?.message ?? "", /No active task found to complete, commit, and push/);
+        } finally {
+          rf.restore();
+          ws.restore();
+          deactivateNotificationRouter();
+        }
+      }
+    );
+
+    void it(
+      "still reports 'No active task found' when a genuine user pause lands on disk AFTER the resolved snapshot was read but BEFORE reconciliation observes it (2026-09-10 review completion blocker, new)",
+      async () => {
+        // The review's exact scenario: `resolveTaskContext`'s in-memory
+        // resolution snapshot says "active" (the inventory's own copy,
+        // captured before any pause landed), but the ON-DISK file — which is
+        // what `reconcileWatchdogPauseAgainstAdmissionV1` freshly reads
+        // inside the `onResolvedCandidate` hook — already carries a genuine,
+        // non-watchdog pause by the time reconciliation runs. The stale
+        // "active" snapshot must never override that fresh, authoritative
+        // read.
+        const taskFolderPath = makeTaskFolder("ccpt-user-pause-races-stale-active-snapshot");
+        const activeSnapshot = fixtureProgress(taskFolderPath, {
+          status: "active",
+          currentStage: "plan",
+        });
+        // The in-memory inventory (what resolveTaskContext resolves against)
+        // says active — but the disk file (what reconciliation reads) is
+        // already genuinely paused by the user, simulating the race.
+        writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, {
+          status: "paused",
+          pausedReason: "Paused by the user",
+          currentStage: "plan",
+        }));
+
+        const surface = new RecordingSurface();
+        initNotificationRouter(surface);
+        const ws = installWorkspaceFoldersStub();
+        const rf = installReadFileBridge();
+
+        const currentTaskStore = new CurrentTaskStore(fakeStatefulMemento());
+        await currentTaskStore.set(taskFolderPath);
+
+        try {
+          await completeCommitAndPushTask(
+            makeInventory(taskFolderPath, activeSnapshot),
+            undefined,
+            currentTaskStore
+          );
+
+          assert.equal(surface.entries.length, 1);
+          assert.match(
+            surface.entries[0]?.message ?? "",
+            /No active task found to complete, commit, and push/,
+            "a fresh userPaused reconciliation result must win over the stale 'active' snapshot, not be masked by it"
+          );
         } finally {
           rf.restore();
           ws.restore();

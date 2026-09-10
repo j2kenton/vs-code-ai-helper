@@ -26,7 +26,9 @@ import {
 } from "../utils/publishChecksFreshness";
 import {
   acquireOrAdoptWorkAdmissionV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
@@ -254,6 +256,19 @@ export async function runPublishChecks(
   try {
   // Activation-order barrier (plan §1.4): never read task state while the
   // startup creating-folder classification pass is still running.
+  //
+  // 2026-09-10 review completion blocker (narrowed further): per-task
+  // admission cannot protect a target that is not yet known — the earlier
+  // peek above can miss a refresh-discovered actual target entirely (its
+  // guess predates the refresh that first reveals such a target). Stand the
+  // watchdog's whole pause pass down for the length of this barrier plus
+  // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
+  // (see that pair's doc comment in `workAdmissionV1.ts`), so a task the
+  // command is about to admit and start work on can never be paused
+  // underneath it during this specific gap.
+  beginTargetResolutionV1();
+  let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
+  try {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
 
   // 2026-09-10 review completion blocker ("publish/complete actions" route,
@@ -285,10 +300,13 @@ export async function runPublishChecks(
     }
   };
 
-  const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
+  resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
     onResolvedCandidate: admitCandidateV1,
   }, currentTaskStore);
+  } finally {
+    endTargetResolutionV1();
+  }
 
   if (!resolvedTask) {
     NotificationRouter.showInformation(

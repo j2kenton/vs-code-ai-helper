@@ -57,7 +57,9 @@ import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import {
   acquireWorkAdmissionV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
@@ -2815,33 +2817,47 @@ export async function commitAndPushTask(
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
     // before the core's first task-state read (plan §1.4).
-    await TaskCreationStartupReconcilerV1.waitUntilReady();
-    // 2026-09-10 review completion blocker ("publish/complete actions"
-    // route, narrowed further): upgrade admission the INSTANT
-    // `resolveTaskContext` (inside `resolveCommitPushTargetTaskV1`) settles
-    // on its final candidate, rather than waiting for it to fully return —
-    // see `ResolveTaskOptions.onResolvedCandidate`'s doc comment for why a
-    // real target can otherwise go unprotected for the length of
-    // resolveTaskContext's own awaited `inventory.refresh()` plus every line
-    // after it. The block below the call remains as a defense-in-depth
-    // no-op for the ordinary case where this already ran.
-    const admitCandidateV1 = async (candidate: TaskWithProgress): Promise<void> => {
-      if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
-        await releaseCurrentAdmissionV1();
-      }
-      if (!handle) {
-        const late = await acquireWorkAdmissionV1({
-          taskFolderPath: candidate.taskFolderPath,
-          purpose: "admission",
-          commandId: "commitAndPushTask",
-        });
-        if (late.outcome === "acquired") {
-          handle = late.handle;
-          heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    //
+    // 2026-09-10 review completion blocker (narrowed further): per-task
+    // admission cannot protect a target that is not yet known — the peek
+    // above can miss a refresh-discovered actual target entirely (its guess
+    // predates the refresh that first reveals such a target). Stand the
+    // watchdog's whole pause pass down for the length of this barrier plus
+    // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
+    // (see that pair's doc comment in `workAdmissionV1.ts`).
+    beginTargetResolutionV1();
+    let resolvedTask: Awaited<ReturnType<typeof resolveCommitPushTargetTaskV1>>;
+    try {
+      await TaskCreationStartupReconcilerV1.waitUntilReady();
+      // 2026-09-10 review completion blocker ("publish/complete actions"
+      // route, narrowed further): upgrade admission the INSTANT
+      // `resolveTaskContext` (inside `resolveCommitPushTargetTaskV1`) settles
+      // on its final candidate, rather than waiting for it to fully return —
+      // see `ResolveTaskOptions.onResolvedCandidate`'s doc comment for why a
+      // real target can otherwise go unprotected for the length of
+      // resolveTaskContext's own awaited `inventory.refresh()` plus every line
+      // after it. The block below the call remains as a defense-in-depth
+      // no-op for the ordinary case where this already ran.
+      const admitCandidateV1 = async (candidate: TaskWithProgress): Promise<void> => {
+        if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+          await releaseCurrentAdmissionV1();
         }
-      }
-    };
-    const resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore, admitCandidateV1);
+        if (!handle) {
+          const late = await acquireWorkAdmissionV1({
+            taskFolderPath: candidate.taskFolderPath,
+            purpose: "admission",
+            commandId: "commitAndPushTask",
+          });
+          if (late.outcome === "acquired") {
+            handle = late.handle;
+            heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+          }
+        }
+      };
+      resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore, admitCandidateV1);
+    } finally {
+      endTargetResolutionV1();
+    }
     if (!resolvedTask) {
       return;
     }
@@ -2952,7 +2968,15 @@ export async function completeCommitAndPushTask(
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
     // before this callback's first task-state read (plan §1.4).
-    await TaskCreationStartupReconcilerV1.waitUntilReady();
+    //
+    // 2026-09-10 review completion blocker (narrowed further): per-task
+    // admission cannot protect a target that is not yet known — the peek
+    // above can miss a refresh-discovered actual target entirely (its guess
+    // predates the refresh that first reveals such a target). Stand the
+    // watchdog's whole pause pass down for the length of this barrier plus
+    // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
+    // (see that pair's doc comment in `workAdmissionV1.ts`).
+    beginTargetResolutionV1();
     const resolverArg = normalizeArg(explicitArg);
     // 2026-09-10 review completion blocker ("publish/complete actions"
     // route, narrowed further): this call used to pass `allowPaused: false`,
@@ -2991,15 +3015,35 @@ export async function completeCommitAndPushTask(
         reconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(candidate.taskFolderPath));
       }
     };
-    const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
-      allowPaused: true,
-      onResolvedCandidate: admitCandidateV1,
-    }, currentTaskStore);
+    let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
+    try {
+      await TaskCreationStartupReconcilerV1.waitUntilReady();
+      resolvedTask = await resolveTaskContext(inventory, resolverArg, {
+        allowPaused: true,
+        onResolvedCandidate: admitCandidateV1,
+      }, currentTaskStore);
+    } finally {
+      endTargetResolutionV1();
+    }
 
+    // 2026-09-10 review completion blocker (new): `resolvedTask.progress.status`
+    // is the snapshot `resolveTaskContext` read BEFORE `admitCandidateV1` ran
+    // its reconciliation — if a GENUINE user pause landed in that narrow gap
+    // (between the read and reconciliation observing it), the snapshot still
+    // says "active" even though reconciliation just found the task paused by
+    // a user. `reconcileOutcome`, when present, is a FRESH read taken at
+    // reconciliation time and must win over the stale snapshot: `userPaused`
+    // means genuinely paused right now regardless of what the snapshot says;
+    // `unreadable` means the state could not be confirmed at all and must be
+    // treated the same as "could not resolve". Only when reconciliation never
+    // ran at all (`reconcileOutcome === undefined` — admission itself could
+    // not be acquired for this candidate) does the snapshot remain the only
+    // available signal.
     const stillGenuinelyPaused =
       !!resolvedTask &&
-      resolvedTask.progress.status === "paused" &&
-      reconcileOutcome?.outcome !== "reversed";
+      (reconcileOutcome
+        ? reconcileOutcome.outcome === "userPaused" || reconcileOutcome.outcome === "unreadable"
+        : resolvedTask.progress.status === "paused");
 
     if (!resolvedTask || stillGenuinelyPaused) {
       if (resolverArg) {

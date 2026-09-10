@@ -20,7 +20,12 @@ import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
-import { setWorkAdmissionRootOverrideForTestV1 } from "../state/workAdmissionV1";
+import {
+  beginTargetResolutionV1,
+  endTargetResolutionV1,
+  resetTargetResolutionForTestV1,
+  setWorkAdmissionRootOverrideForTestV1,
+} from "../state/workAdmissionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /**
@@ -742,6 +747,52 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     });
     assert.equal(watchdogDecision?.gating?.holdsTaskPaused, true);
   } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's watchdog stands its whole pause pass down while a command elsewhere in this window is resolving which task it targets (2026-09-10 review completion blocker, narrowed further)", async () => {
+  // Per-task admission cannot protect a target whose identity is not yet
+  // known — this coarse, same-process gate (`beginTargetResolutionV1`/
+  // `hasResolutionInFlightBestEffortV1`) is what covers that window instead:
+  // the watchdog must never commit a pause anywhere while it is up, even for
+  // a task that has nothing at all to do with the resolution in flight.
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  resetTargetResolutionForTestV1();
+  try {
+    beginTargetResolutionV1();
+    try {
+      await scheduler.armAll();
+      const duringResolution = state.current();
+      assert.equal(duringResolution.status, "active", "the sweep must not pause any task while a resolution is in flight");
+      assert.equal(duringResolution.pausedReason, undefined);
+      const escalationDuring = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
+      assert.equal(escalationDuring, undefined, "no stalled-task escalation must be posted while the gate is up");
+    } finally {
+      endTargetResolutionV1();
+    }
+
+    // Once resolution ends, the very next sweep must catch the same
+    // impossible state normally — the gate is a temporary stand-down, never a
+    // permanent suppression.
+    await scheduler.armAll();
+    const afterResolution = state.current();
+    assert.equal(afterResolution.status, "paused");
+    assert.equal(afterResolution.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+  } finally {
+    resetTargetResolutionForTestV1();
     fakeContext.restore();
     deactivateNotificationRouter();
     scheduler.dispose();

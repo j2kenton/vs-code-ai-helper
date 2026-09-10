@@ -7,9 +7,13 @@ import {
   acquireOrAdoptWorkAdmissionV1,
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  beginTargetResolutionV1,
   describeWorkAdmissionBlockerV1,
+  endTargetResolutionV1,
   hasLiveWorkAdmissionBestEffortV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
+  hasResolutionInFlightBestEffortV1,
+  resetTargetResolutionForTestV1,
   revokeWorkAdmissionHandoffV1,
   setWorkAdmissionClockForTestV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
@@ -1493,3 +1497,51 @@ void test(
     }
   }
 );
+
+/**
+ * 2026-09-10 review completion blocker (narrowed further): per-task admission
+ * cannot protect a target whose identity is not yet known — the coarse,
+ * same-process "resolution in flight" gate that stands the watchdog's whole
+ * pause pass down for that window (see `beginTargetResolutionV1`'s doc
+ * comment).
+ */
+void test("hasResolutionInFlightBestEffortV1 reflects begin/end pairing, including nested calls", () => {
+  resetTargetResolutionForTestV1();
+  try {
+    assert.equal(hasResolutionInFlightBestEffortV1(), false);
+
+    beginTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), true);
+
+    // A second, concurrent resolution (a different command in the same
+    // window) must keep the gate up until BOTH have ended — nesting must not
+    // let the inner end() clear a still-outstanding outer resolution.
+    beginTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), true);
+
+    endTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), true, "one of two concurrent resolutions ending must not clear the gate");
+
+    endTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), false);
+  } finally {
+    resetTargetResolutionForTestV1();
+  }
+});
+
+void test("endTargetResolutionV1 clamps at zero — an extra end() (e.g. a caller with no matching begin()) never makes the counter negative or 'more ended than begun'", () => {
+  resetTargetResolutionForTestV1();
+  try {
+    endTargetResolutionV1();
+    endTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), false);
+
+    beginTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), true);
+    endTargetResolutionV1();
+    endTargetResolutionV1();
+    assert.equal(hasResolutionInFlightBestEffortV1(), false);
+  } finally {
+    resetTargetResolutionForTestV1();
+  }
+});

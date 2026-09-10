@@ -73,18 +73,32 @@ export interface ResolveTaskOptions {
    * resolving and when the caller's own post-return "compare and
    * reacquire" correction runs.
    *
-   * This hook narrows that span to its architectural minimum: it fires
-   * (awaited) the INSTANT a final candidate is settled — immediately after
-   * step 3's paused/fallback logic below, before the ownership/workspace
-   * path-safety checks and before the `allowPaused` gate — so a caller can
+   * This hook narrows that span close to its architectural minimum: it fires
+   * (awaited) immediately AFTER the ownership/workspace path-safety checks
+   * below have passed, but before the `allowPaused` gate — so a caller can
    * acquire/upgrade admission for the authoritative target, and reconcile
    * any watchdog-provenance pause on it, before this function's own
    * `allowPaused` check would otherwise reject a transiently-paused
-   * resolution outright. It does not eliminate the fundamental fact that
-   * `inventory.refresh()` must complete before a brand-new candidate is
-   * knowable at all — no synchronous peek can do that — but it removes
-   * every avoidable line of additional resolveTaskContext/caller execution
-   * that used to sit between "candidate known" and "admission requested".
+   * resolution outright.
+   *
+   * 2026-09-10 review architectural blocker fix: this used to fire right
+   * after step 3 settled on `resolved`, BEFORE the path-existence,
+   * ownership-resolution, and workspace-containment checks that follow. A
+   * resolved inventory entry is untrusted input at this point — possibly a
+   * stale cache entry for a deleted folder, an unresolved/cross-project
+   * owner, or a path outside every open workspace — and the hook's own
+   * contract is to call work admission, whose genesis step performs
+   * `mkdir(dir, { recursive: true })` on disk. Firing before validation let
+   * admission create or touch a directory under a candidate that validation
+   * was about to reject. All of those checks below are synchronous
+   * (`fs.existsSync`, path comparisons) except the opt-in
+   * `promptForOwnershipResolution` rebind flow, which no admission-hook
+   * caller in this codebase currently sets — so moving the hook past them
+   * costs no meaningful additional span for the callers this hook serves,
+   * while ensuring it only ever runs for a candidate this function has
+   * already committed to trusting. It does not eliminate the fundamental
+   * fact that `inventory.refresh()` must complete before a brand-new
+   * candidate is knowable at all — no synchronous peek can do that.
    */
   onResolvedCandidate?: (candidate: TaskWithProgress) => Promise<void>;
 }
@@ -476,15 +490,6 @@ export async function resolveTaskContext(
     }
   }
 
-  // Fire the earliest-possible-admission hook (see `ResolveTaskOptions.onResolvedCandidate`)
-  // now — the final candidate is settled, but none of the ownership/path
-  // safety checks or the `allowPaused` gate below have run yet. Skipped
-  // entirely when nothing resolved; the "no fallback heuristics" return
-  // immediately below handles that case exactly as before.
-  if (resolved && options?.onResolvedCandidate) {
-    await options.onResolvedCandidate(resolved);
-  }
-
   // ----------------------------------------------------------------
   // No fallback heuristics — if nothing resolved, return undefined.
   // Callers show their own "no active task" message.
@@ -551,6 +556,18 @@ export async function resolveTaskContext(
     !insideConfiguredTaskRoot &&
     !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))
   ) return undefined;
+
+  // Fire the admission hook (see `ResolveTaskOptions.onResolvedCandidate`) now
+  // — `resolved` has passed every path-existence, ownership-resolution, and
+  // workspace-containment check above, so it is no longer untrusted input:
+  // this is the earliest point at which acquiring work admission (whose
+  // genesis step touches disk under `resolved.taskFolderPath`) is safe to do
+  // for it. Still fires before the `allowPaused` gate below, so a caller can
+  // reconcile a watchdog-provenance pause before that gate would otherwise
+  // reject a transiently-paused resolution outright.
+  if (options?.onResolvedCandidate) {
+    await options.onResolvedCandidate(resolved);
+  }
 
   // Check paused status
   if (!options?.allowPaused && resolved.progress.status === "paused") {

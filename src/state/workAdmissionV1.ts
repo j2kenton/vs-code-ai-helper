@@ -547,6 +547,61 @@ export function hasLiveWorkAdmissionExcludingOwnerV1(taskFolderPath: string, exc
   }
 }
 
+/**
+ * Same-process count of commands currently resolving WHICH task they target,
+ * before that target is known — the window `runPublishChecks.ts`,
+ * `commitAndPushTask.ts` and `completeCommitAndPushTask` all cross between
+ * `TaskCreationStartupReconcilerV1.waitUntilReady()` and the moment
+ * `resolveTaskContext`'s `onResolvedCandidate` hook fires (2026-09-10 review,
+ * narrowed completion blocker: a refresh-discovered actual target — one no
+ * synchronous pre-refresh peek could have guessed — has no task folder path
+ * to admit until resolution itself, including its own awaited
+ * `inventory.refresh()`, has already run). Per-task admission cannot protect
+ * a task whose identity is not yet known; this is a coarser, same-process-
+ * only stand-down that covers the whole window regardless of which task
+ * turns out to be the target, in exchange for pausing the sweep's ENTIRE
+ * pass rather than just one task's. Never durable and never consulted
+ * cross-window — the setup-phase race this closes is a same-window race
+ * (the file watcher and the 5-minute timer both arm the sweep in the same
+ * extension host the resolving command is running in), exactly like the
+ * `localPendingIntentsV1` gap this mirrors.
+ */
+let resolutionInFlightCountV1 = 0;
+
+/** Call before `waitUntilReady()`/`resolveTaskContext` when the eventual
+ * target folder path is not yet known synchronously. Always pair with
+ * `endTargetResolutionV1()` in a `finally` — see that function's doc
+ * comment. */
+export function beginTargetResolutionV1(): void {
+  resolutionInFlightCountV1 += 1;
+}
+
+/** Ends one `beginTargetResolutionV1()` window. Safe to call more times than
+ * `begin` (clamped at zero) so a caller need not track whether `begin` ran on
+ * every exit path. */
+export function endTargetResolutionV1(): void {
+  resolutionInFlightCountV1 = Math.max(0, resolutionInFlightCountV1 - 1);
+}
+
+/** True while ANY same-process command is between `beginTargetResolutionV1()`
+ * and `endTargetResolutionV1()` — see the counter's own doc comment. The
+ * watchdog sweep (`scheduleTaskResume.ts`'s `detectAndRepairStalledActiveTasksV1`)
+ * stands its ENTIRE pause pass down while this is true, the same fail-open
+ * direction as every other watchdog exemption in this module: an extra
+ * skipped sweep costs nothing (the very next sweep re-evaluates from
+ * scratch), while pausing mid-resolution is the exact trap this task exists
+ * to close. */
+export function hasResolutionInFlightBestEffortV1(): boolean {
+  return resolutionInFlightCountV1 > 0;
+}
+
+/** Test-only reset, mirroring this module's other `*ForTestV1` escape
+ * hatches — clears the counter between tests regardless of how many
+ * begin/end calls a failed assertion left unbalanced. */
+export function resetTargetResolutionForTestV1(): void {
+  resolutionInFlightCountV1 = 0;
+}
+
 /** Build a `busy` diagnostic directly from a known marker file, bypassing
  * `describeWorkAdmissionBlockerV1`'s claim-before-marker priority. Used where
  * the caller already positively knows the REAL blocker is a marker (not its

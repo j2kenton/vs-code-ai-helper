@@ -39,6 +39,7 @@ import {
   authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
+  hasResolutionInFlightBestEffortV1,
   revokeWorkAdmissionHandoffV1,
   withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
@@ -763,6 +764,18 @@ export class TaskActionScheduler implements vscode.Disposable {
    * resolved) state again next time.
    */
   private async detectAndRepairStalledActiveTasksV1(): Promise<void> {
+    // 2026-09-10 review completion blocker, narrowed further: a command
+    // resolving WHICH task it targets (`runPublishChecks.ts`,
+    // `commitAndPushTask.ts`/`completeCommitAndPushTask`, between
+    // `waitUntilReady()` and the moment its target settles) has no task
+    // folder path to admit yet — per-task admission cannot protect a task
+    // whose identity isn't known. Stand this whole pass down while any such
+    // resolution is in flight in this window, rather than risk pausing the
+    // very task that resolution is about to settle on and start work for.
+    // See `hasResolutionInFlightBestEffortV1`'s doc comment.
+    if (hasResolutionInFlightBestEffortV1()) {
+      return;
+    }
     for (const task of this.inventory.getTasks()) {
       if (!isImpossibleActiveStateV1({ progress: task.progress, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
         this.stalledActiveNotified.delete(task.taskFolderPath);
