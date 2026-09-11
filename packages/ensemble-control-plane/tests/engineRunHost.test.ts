@@ -320,6 +320,50 @@ test("a non-retryable provider failure checkpoints the job failed", async () => 
   assert.ok(rounds[0]?.completedAt !== undefined);
 });
 
+test("one malformed reply is retried, not fatal: a retryable failure followed by a good round completes the run", async () => {
+  // Live 2026-09-11: a round's reply put raw line breaks inside its frame's
+  // JSON (malformedResult.invalidFrame, retryable) and the whole task died.
+  const world = await makeHostWorld();
+  const runner = scriptedRunner((_invocation, count) =>
+    count === 1
+      ? { kind: "failed", code: "malformedResult.invalidFrame", retryable: true }
+      : { kind: "completed", summaryMarkdown: TICK_BOTH }
+  );
+  const host = world.makeHost(runner);
+  const task = { ...makeTaskRecord("task-retry-1", world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
+  world.store.createTask(task);
+
+  const outcome = await host.start(task);
+
+  assert.deepEqual(outcome, { kind: "completed" });
+  const summaries = (world.store.readTask(task.taskId)?.rounds ?? []).map((round) => round.summary);
+  assert.equal(summaries[0], "retrying: malformedResult.invalidFrame", "the retry is visible in the history");
+});
+
+test("retries are bounded: a provider that keeps failing retryably still fails the run with its own code", async () => {
+  const world = await makeHostWorld();
+  const runner = scriptedRunner(() => ({ kind: "failed", code: "malformedResult.invalidFrame", retryable: true }));
+  const host = world.makeHost(runner);
+  const task = { ...makeTaskRecord("task-retry-2", world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
+  world.store.createTask(task);
+
+  const outcome = await host.start(task);
+
+  assert.deepEqual(outcome, { kind: "failed", code: "malformedResult.invalidFrame" });
+  assert.equal(runner.invocations.length, 3, "one attempt plus two retries");
+});
+
+test("an exhausted quota is not retried in place (an immediate re-run cannot fix it)", async () => {
+  const world = await makeHostWorld();
+  const runner = scriptedRunner(() => ({ kind: "failed", code: "quotaExhausted", retryable: true }));
+  const host = world.makeHost(runner);
+  const task = { ...makeTaskRecord("task-retry-3", world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
+  world.store.createTask(task);
+
+  assert.deepEqual(await host.start(task), { kind: "failed", code: "quotaExhausted" });
+  assert.equal(runner.invocations.length, 1);
+});
+
 test("HTTP surface: task creation starts the hosted run; structured answers route into it", async () => {
   const world = await makeHostWorld();
   const runner = scriptedRunner((invocation) =>

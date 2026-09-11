@@ -121,7 +121,22 @@ interface RunStateV1 {
   readonly answered: Map<string, Promise<EngineRunOutcomeV1>>;
   settled: Promise<EngineRunOutcomeV1>;
   roundsThisStage: number;
+  /** Consecutive retryable round failures; any completed round resets it. */
+  consecutiveRetries: number;
 }
+
+/**
+ * How many times in a row a RETRYABLE round failure is retried before the
+ * run fails. Live (2026-09-11), a review round's reply put raw line breaks
+ * inside its result frame's JSON — `malformedResult.invalidFrame`, flagged
+ * retryable — and the host ended the whole task on it, because it treated
+ * every failed round as terminal. Model output varies; one bad reply is not
+ * a dead task. Bounded so a provider that is consistently broken still
+ * fails, and capacity failures are excluded: an immediate re-run cannot fix
+ * an exhausted quota (dispatch already spent any configured backup).
+ */
+const MAX_CONSECUTIVE_ROUND_RETRIES_V1 = 2;
+const NON_RETRIED_ROUND_FAILURE_CODES_V1: ReadonlySet<string> = new Set(["quotaExhausted"]);
 
 export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): EngineRunHostV1 {
   const { store, hub, providerRunnerFor } = options;
@@ -242,8 +257,26 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
       return { kind: "questionsPaused", interactionId: result.ref.interactionId };
     }
     if (result.kind === "failed") {
+      if (
+        result.retryable &&
+        !NON_RETRIED_ROUND_FAILURE_CODES_V1.has(result.code) &&
+        state.consecutiveRetries < MAX_CONSECUTIVE_ROUND_RETRIES_V1
+      ) {
+        state.consecutiveRetries += 1;
+        // Recorded, so the round history shows the retry rather than a
+        // silent gap; the stage's round budget still bounds the whole loop.
+        store.appendTaskRound(state.task.taskId, {
+          roundId: allocateHex128IdV1(),
+          stage: state.engineTask.progress.currentStage,
+          startedAt,
+          completedAt: now().toISOString(),
+          summary: `retrying: ${result.code}`,
+        });
+        return undefined;
+      }
       return fail(state, result.code, startedAt);
     }
+    state.consecutiveRetries = 0;
     store.appendTaskRound(state.task.taskId, {
       roundId: allocateHex128IdV1(),
       stage: state.engineTask.progress.currentStage,
@@ -316,6 +349,7 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
       answered: new Map(),
       settled: Promise.resolve({ kind: "failed", code: "notStarted" }),
       roundsThisStage: 0,
+      consecutiveRetries: 0,
     };
     runs.set(task.taskId, state);
     return state;
