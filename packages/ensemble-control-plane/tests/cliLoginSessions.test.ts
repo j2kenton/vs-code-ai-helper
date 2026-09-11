@@ -184,6 +184,122 @@ test("submitCode: an unknown or foreign-owned session id reads identically as no
   assert.deepEqual(foreignUser, { ok: false, code: "loginSessionNotFound" });
 });
 
+/** A client whose interactive sessions are scripted per test; records what was killed. */
+function makeScriptedClient(options: {
+  readonly failStart?: boolean;
+  readonly killRejects?: boolean;
+}): { client: SandboxClientV1; killedSandboxes: string[]; started: number } {
+  const state = { killedSandboxes: [] as string[], started: 0 };
+  const client: SandboxClientV1 = {
+    provider: "docker",
+    createSandbox: () => Promise.resolve({ sandboxId: "sbx-1" }),
+    destroySandbox: () => Promise.resolve(),
+    runCommand: () => Promise.reject(new Error("not used")),
+    resolveRealPath: () => Promise.resolve(undefined),
+    writeFile: () => Promise.resolve(),
+    deleteFile: () => Promise.resolve(),
+    readFileUtf8: () => Promise.resolve(undefined),
+    listDirectory: () => Promise.resolve(undefined),
+    findCommandByAttemptKey: () => Promise.resolve("unknown"),
+    createInteractiveSession: (request: InteractiveSessionRequestV1) => {
+      if (options.failStart === true) {
+        return Promise.reject(new Error("OCI runtime exec failed: chdir: no such file or directory"));
+      }
+      state.started += 1;
+      request.onOutput("paste code:");
+      const handle: InteractiveSessionHandleV1 = {
+        sendInput: () => Promise.resolve(),
+        wait: () => new Promise(() => undefined),
+        kill: () => {
+          state.killedSandboxes.push(request.sandboxId);
+          return options.killRejects === true
+            ? Promise.reject(new Error("no such container"))
+            : Promise.resolve();
+        },
+      };
+      return Promise.resolve(handle);
+    },
+  };
+  return {
+    client,
+    get killedSandboxes() {
+      return state.killedSandboxes;
+    },
+    get started() {
+      return state.started;
+    },
+  };
+}
+
+/** Run `body` and fail if it (or anything it leaves behind) produces an unhandled rejection. */
+async function withoutUnhandledRejections(body: () => Promise<void>): Promise<void> {
+  const escaped: unknown[] = [];
+  const onRejection = (reason: unknown): void => {
+    escaped.push(reason);
+  };
+  process.on("unhandledRejection", onRejection);
+  try {
+    await body();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+  assert.deepEqual(escaped, [], "an unhandled rejection would terminate the control plane");
+}
+
+test("a failed start returns a typed error and leaves no session or timer behind (it used to crash the process at TTL)", async () => {
+  await withoutUnhandledRejections(async () => {
+    const service = createCliLoginServiceV1({ captureWindowMs: 5, sessionTtlMs: 15 });
+    const { client } = makeScriptedClient({ failStart: true });
+    const started = await service.startLogin({ ownerUserId: "user-a", client, sandboxId: "sbx-1", workingDirectoryRoot: "/nope" });
+    assert.deepEqual(started, { ok: false, code: "loginSessionStartFailed" });
+    // Past the TTL: before the fix, the orphaned timer called .kill() on undefined here.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
+});
+
+test("a TTL kill that rejects (container already gone) is contained, never an unhandled rejection", async () => {
+  await withoutUnhandledRejections(async () => {
+    const service = createCliLoginServiceV1({ captureWindowMs: 5, sessionTtlMs: 15 });
+    const scripted = makeScriptedClient({ killRejects: true });
+    const started = await service.startLogin({ ownerUserId: "user-a", client: scripted.client, sandboxId: "sbx-1", workingDirectoryRoot: "/" });
+    assert.ok(started.ok);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(scripted.killedSandboxes, ["sbx-1"]);
+    const late = await service.submitCode("user-a", started.ok ? started.loginSessionId : "", "code");
+    assert.deepEqual(late, { ok: false, code: "loginSessionNotFound" });
+  });
+});
+
+test("one sign-in per user: a new start stops the earlier one; a global cap bounds live processes", async () => {
+  const service = createCliLoginServiceV1({ captureWindowMs: 1, sessionTtlMs: 60_000, maxConcurrentSessions: 2 });
+  const scripted = makeScriptedClient({});
+  const input = (ownerUserId: string, sandboxId: string) => ({
+    ownerUserId,
+    client: scripted.client,
+    sandboxId,
+    workingDirectoryRoot: "/",
+  });
+
+  const first = await service.startLogin(input("user-a", "sbx-a"));
+  const second = await service.startLogin(input("user-a", "sbx-a"));
+  assert.ok(first.ok && second.ok);
+  assert.deepEqual(scripted.killedSandboxes, ["sbx-a"], "the superseded sign-in's process was stopped");
+  const stale = await service.submitCode("user-a", first.ok ? first.loginSessionId : "", "code");
+  assert.deepEqual(stale, { ok: false, code: "loginSessionNotFound" });
+
+  const otherUser = await service.startLogin(input("user-b", "sbx-b"));
+  assert.ok(otherUser.ok);
+  const overCap = await service.startLogin(input("user-c", "sbx-c"));
+  assert.deepEqual(overCap, { ok: false, code: "tooManyLoginSessions" });
+  assert.equal(scripted.started, 3, "the refused start never created a process");
+
+  // Resetting a sandbox ends the sign-ins inside it.
+  await service.cancelForSandbox("user-b", "sbx-b");
+  assert.deepEqual(scripted.killedSandboxes, ["sbx-a", "sbx-b"]);
+  assert.ok((await service.startLogin(input("user-c", "sbx-c"))).ok, "the freed slot is usable");
+});
+
 test("an abandoned session is killed and forgotten after its TTL, so a late code submission reads as not found", async () => {
   let killed = false;
   const client: SandboxClientV1 = {

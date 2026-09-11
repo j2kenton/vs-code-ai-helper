@@ -59,12 +59,17 @@ const DEFAULT_CAPTURE_WINDOW_MS_V1 = 4000;
  */
 const DEFAULT_SESSION_TTL_MS_V1 = 15 * 60 * 1000;
 
+/** Relayed prompt output past this is dropped: the prompt is a URL and one line, never megabytes. */
+const MAX_CAPTURED_OUTPUT_CHARS_V1 = 64 * 1024;
+/** Concurrent sign-ins across ALL users — each one is a live process on the host. */
+const DEFAULT_MAX_CONCURRENT_SESSIONS_V1 = 8;
+
 interface CliLoginSessionRecordV1 {
   readonly loginSessionId: string;
   readonly ownerUserId: string;
-  handle: InteractiveSessionHandleV1;
+  readonly sandboxId: string;
+  readonly handle: InteractiveSessionHandleV1;
   output: string;
-  settled: boolean;
   ttlTimer: ReturnType<typeof setTimeout>;
 }
 
@@ -77,7 +82,10 @@ export interface StartCliLoginInputV1 {
 
 export type StartCliLoginResultV1 =
   | { readonly ok: true; readonly loginSessionId: string; readonly promptOutput: string }
-  | { readonly ok: false; readonly code: "interactiveSessionsUnsupported" };
+  | {
+      readonly ok: false;
+      readonly code: "interactiveSessionsUnsupported" | "loginSessionStartFailed" | "tooManyLoginSessions";
+    };
 
 export type SubmitCliLoginCodeResultV1 =
   | { readonly ok: true; readonly completed: false }
@@ -91,17 +99,27 @@ export interface CliLoginServiceV1 {
     loginSessionId: string,
     code: string
   ): Promise<SubmitCliLoginCodeResultV1>;
+  /**
+   * End every login session this user has in `sandboxId` (the sandbox is
+   * about to be destroyed): their processes go with it, so nothing may be
+   * left to time out against a container that no longer exists.
+   */
+  cancelForSandbox(ownerUserId: string, sandboxId: string): Promise<void>;
 }
 
 export interface CreateCliLoginServiceOptionsV1 {
   readonly captureWindowMs?: number;
   readonly sessionTtlMs?: number;
+  readonly maxConcurrentSessions?: number;
 }
 
 export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1): CliLoginServiceV1 {
   const captureWindowMs = options?.captureWindowMs ?? DEFAULT_CAPTURE_WINDOW_MS_V1;
   const sessionTtlMs = options?.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS_V1;
+  const maxConcurrent = options?.maxConcurrentSessions ?? DEFAULT_MAX_CONCURRENT_SESSIONS_V1;
   const sessions = new Map<string, CliLoginSessionRecordV1>();
+  /** Starts in flight, counted against the global cap before they have a record. */
+  let starting = 0;
 
   function forget(loginSessionId: string): void {
     const record = sessions.get(loginSessionId);
@@ -112,45 +130,94 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
     sessions.delete(loginSessionId);
   }
 
+  /**
+   * Stop and forget one session. Never throws and never leaves a rejected
+   * promise behind: this runs from timers and from other requests, where
+   * an escaped rejection would terminate the whole process (review
+   * finding, 2026-09-11 — the TTL timer used to fire-and-forget `kill()`).
+   */
+  async function end(record: CliLoginSessionRecordV1): Promise<void> {
+    forget(record.loginSessionId);
+    try {
+      await record.handle.kill();
+    } catch {
+      // The process or its container is already gone: nothing left to stop.
+    }
+  }
+
   function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   return {
     async startLogin(input: StartCliLoginInputV1): Promise<StartCliLoginResultV1> {
-      if (input.client.createInteractiveSession === undefined) {
+      const createSession = input.client.createInteractiveSession;
+      if (createSession === undefined) {
         return { ok: false, code: "interactiveSessionsUnsupported" };
       }
+      // One sign-in per user at a time: a new start supersedes any earlier
+      // one, whose process is stopped rather than left for its TTL.
+      for (const existing of [...sessions.values()]) {
+        if (existing.ownerUserId === input.ownerUserId) {
+          await end(existing);
+        }
+      }
+      if (sessions.size + starting >= maxConcurrent) {
+        return { ok: false, code: "tooManyLoginSessions" };
+      }
+
       const loginSessionId = allocateHex128IdV1();
+      let output = "";
+      let handle: InteractiveSessionHandleV1;
+      starting += 1;
+      try {
+        // The handle exists BEFORE anything is published or timed: a failed
+        // start leaves no record and no timer (the old order registered both
+        // first, and a failed start armed a timer that later called
+        // `.kill()` on `undefined`, crashing the process).
+        handle = await createSession.call(input.client, {
+          sandboxId: input.sandboxId,
+          argv: [...CLAUDE_AUTH_LOGIN_ARGV_V1],
+          cwd: input.workingDirectoryRoot,
+          onOutput: (chunk) => {
+            const record = sessions.get(loginSessionId);
+            if (record !== undefined) {
+              if (record.output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
+                record.output = (record.output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
+              }
+            } else if (output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
+              output = (output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
+            }
+          },
+        });
+      } catch {
+        return { ok: false, code: "loginSessionStartFailed" };
+      } finally {
+        starting -= 1;
+      }
+
       const record: CliLoginSessionRecordV1 = {
         loginSessionId,
         ownerUserId: input.ownerUserId,
-        // Real handle assigned immediately below; TypeScript needs a value
-        // now, and this record is never read before that assignment lands.
-        handle: undefined as unknown as InteractiveSessionHandleV1,
-        output: "",
-        settled: false,
+        sandboxId: input.sandboxId,
+        handle,
+        output,
         ttlTimer: setTimeout(() => {
           const stillPending = sessions.get(loginSessionId);
-          if (stillPending !== undefined && !stillPending.settled) {
-            void stillPending.handle.kill();
-            forget(loginSessionId);
+          if (stillPending !== undefined) {
+            void end(stillPending);
           }
         }, sessionTtlMs),
       };
       record.ttlTimer.unref?.();
       sessions.set(loginSessionId, record);
+      // The exit promise is observed from the start: a stream error rejects
+      // it, and a rejection nobody is awaiting yet (the user has not
+      // submitted a code) would otherwise be unhandled — fatal to Node.
+      handle.wait().catch(() => void end(record));
 
-      record.handle = await input.client.createInteractiveSession({
-        sandboxId: input.sandboxId,
-        argv: [...CLAUDE_AUTH_LOGIN_ARGV_V1],
-        cwd: input.workingDirectoryRoot,
-        onOutput: (chunk) => {
-          record.output += chunk;
-        },
-      });
       await sleep(captureWindowMs);
-      return { ok: true, loginSessionId, promptOutput: record.output };
+      return { ok: true, loginSessionId, promptOutput: sessions.get(loginSessionId)?.output ?? record.output };
     },
 
     async submitCode(
@@ -164,17 +231,33 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
         // that a login session with this id exists for a different user.
         return { ok: false, code: "loginSessionNotFound" };
       }
-      await record.handle.sendInput(`${code}\n`);
+      try {
+        await record.handle.sendInput(`${code}\n`);
+      } catch {
+        // The process is gone (its container too, possibly): the session is dead.
+        await end(record);
+        return { ok: false, code: "loginSessionNotFound" };
+      }
       const exited = await Promise.race([
-        record.handle.wait().then((result) => ({ exited: true as const, exitCode: result.exitCode })),
+        record.handle.wait().then(
+          (result) => ({ exited: true as const, exitCode: result.exitCode }),
+          () => ({ exited: true as const, exitCode: -1 })
+        ),
         sleep(captureWindowMs).then(() => ({ exited: false as const })),
       ]);
       if (!exited.exited) {
         return { ok: true, completed: false };
       }
-      record.settled = true;
       forget(loginSessionId);
       return { ok: true, completed: true, success: exited.exitCode === 0 };
+    },
+
+    async cancelForSandbox(ownerUserId: string, sandboxId: string): Promise<void> {
+      for (const record of [...sessions.values()]) {
+        if (record.ownerUserId === ownerUserId && record.sandboxId === sandboxId) {
+          await end(record);
+        }
+      }
     },
   };
 }

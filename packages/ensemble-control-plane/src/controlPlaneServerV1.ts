@@ -32,6 +32,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { allocateHex128IdV1, isHex128IdV1 } from "../../ensemble-core/src/actionCorrelationV1";
 import type { PersistedTaskProgressV1 } from "../../ensemble-core/src/taskProgressDecoderV1";
 import {
+  isWellFormedAbsoluteRootV1,
   SandboxBindingV1,
   SandboxProviderV1,
   validateSandboxBindingRequestV1,
@@ -156,6 +157,14 @@ const KEY_KIND_PATTERN_V1 = /^(sandbox|model):[A-Za-z0-9._-]{1,64}$/;
 const SANDBOX_PROVIDERS_V1: ReadonlySet<string> = new Set(["e2b", "daytona", "docker"]);
 /** Server-side defense in depth; the caller's own bounded writer enforces the real cap. */
 const MAX_PROVIDER_CALL_PROMPT_CHARS_V1 = 2 * 1024 * 1024;
+/**
+ * Hard cap on any request body, enforced while streaming (413): above the
+ * largest legitimate body (a provider-call prompt, JSON-escaped) with room
+ * to spare, and far below anything that could pressure the heap.
+ */
+const MAX_REQUEST_BODY_BYTES_V1 = 8 * 1024 * 1024;
+/** How much of a refused body is read and discarded (never stored) so the 413 reaches the client. */
+const MAX_REJECTED_BODY_DRAIN_BYTES_V1 = 32 * 1024 * 1024;
 
 const LANGUAGE_BY_EXTENSION_V1: Readonly<Record<string, string>> = {
   ts: "typescript",
@@ -407,6 +416,20 @@ export function createControlPlaneHandlerV1(
             "manage, or run a control plane with a run host configured."
         );
       }
+      if (validated.binding.provider === "docker" && validated.binding.lifecycle === "user-managed-persistent") {
+        // "Attach mine" means "a sandbox at MY provider account, named by
+        // me" — and for E2B/Daytona the caller's own API key scopes that to
+        // their account. Docker has no account: every caller's client talks
+        // to the same host daemon, so a caller-named id would be ANY
+        // container on the host, anyone's (review finding, confirmed live
+        // 2026-09-11). The persistent sandbox for Docker is
+        // `user-owned-managed`, whose id comes from this server's own record.
+        return typed(
+          422,
+          "sandboxBindingInvalid",
+          'Docker sandboxes cannot be attached by id; use the "user-owned-managed" lifecycle (your persistent sandbox) instead'
+        );
+      }
       const keyRecord = store.readKeyRecord(userId, `sandbox:${validated.binding.provider}`);
       if (keyRecord === undefined) {
         return typed(422, "sandboxProviderKeyMissing", "no stored key for the binding's provider");
@@ -533,8 +556,12 @@ export function createControlPlaneHandlerV1(
       if (runs !== undefined) {
         // The hosted engine run drives in the background; its settlement is
         // observable through the store (progress, rounds, job checkpoints)
-        // and the WS feed, never awaited by task creation.
-        void runs.start(record);
+        // and the WS feed, never awaited by task creation. A throw from the
+        // background run must never become an unhandled rejection — Node
+        // would terminate the whole control plane for it.
+        runs.start(record).catch((error: unknown) => {
+          log?.(`engine run for a task threw: ${error instanceof Error ? error.name : "unknown error"}`);
+        });
       }
       return { status: 201, body: taskDto(record, store.readJob(record.taskId)) };
     }
@@ -842,8 +869,12 @@ export function createControlPlaneHandlerV1(
       if (!isRecord(body) || typeof body.provider !== "string" || !SANDBOX_PROVIDERS_V1.has(body.provider)) {
         return typed(422, "userSandboxLoginInvalid", 'provider must be "e2b", "daytona", or "docker"');
       }
-      if (body.workingDirectoryRoot !== undefined && typeof body.workingDirectoryRoot !== "string") {
-        return typed(422, "userSandboxLoginInvalid", "workingDirectoryRoot must be a string when present");
+      if (body.workingDirectoryRoot !== undefined && !isWellFormedAbsoluteRootV1(body.workingDirectoryRoot)) {
+        return typed(
+          422,
+          "userSandboxLoginInvalid",
+          "workingDirectoryRoot must be a canonical absolute path when present"
+        );
       }
       const provider = body.provider as SandboxProviderV1;
       const workingDirectoryRoot =
@@ -875,6 +906,12 @@ export function createControlPlaneHandlerV1(
         workingDirectoryRoot: userSandbox.workingDirectoryRoot,
       });
       if (!started.ok) {
+        if (started.code === "tooManyLoginSessions") {
+          return typed(429, started.code, "too many sign-ins are in progress; try again in a few minutes");
+        }
+        if (started.code === "loginSessionStartFailed") {
+          return typed(422, started.code, "the sign-in could not be started inside the sandbox");
+        }
         return typed(
           422,
           "userSandboxLoginUnsupported",
@@ -940,6 +977,9 @@ export function createControlPlaneHandlerV1(
         }
         throw error;
       }
+      // A sign-in in progress inside this sandbox dies with it; end it first
+      // so nothing is left waiting to time out against a missing container.
+      await cliLogin?.cancelForSandbox(userId, record.sandboxId);
       try {
         await sandboxFactory.clientFor(provider as SandboxProviderV1, apiKey).destroySandbox(record.sandboxId);
       } catch {
@@ -1097,8 +1137,46 @@ export function createControlPlaneNodeServerV1(
       return;
     }
     const chunks: Buffer[] = [];
-    incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let received = 0;
+    let rejected = false;
+    const respond = (status: number, body: unknown, extra?: Readonly<Record<string, string>>): void => {
+      if (outgoing.headersSent) {
+        outgoing.end();
+        return;
+      }
+      outgoing.writeHead(status, { "content-type": "application/json", ...cors, ...extra });
+      outgoing.end(body === undefined ? "" : JSON.stringify(body));
+    };
+    incoming.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+      if (rejected) {
+        // Draining, not storing: closing a socket with unread data makes the
+        // OS send a reset that DISCARDS the 413 already on its way (observed
+        // on Windows). Past the drain ceiling the sender is not a client
+        // waiting for an answer, and the connection is simply cut.
+        if (received > MAX_REQUEST_BODY_BYTES_V1 + MAX_REJECTED_BODY_DRAIN_BYTES_V1) {
+          incoming.destroy();
+        }
+        return;
+      }
+      if (received > MAX_REQUEST_BODY_BYTES_V1) {
+        // Refused while streaming, before the body is ever held in full.
+        rejected = true;
+        chunks.length = 0;
+        respond(413, { code: "requestBodyTooLarge", message: "request body too large" }, { connection: "close" });
+        return;
+      }
+      chunks.push(chunk);
+    });
     incoming.on("end", () => {
+      if (rejected) {
+        return;
+      }
+      // EVERY failure in here ends as a 500 on this one request. Before this
+      // catch existed, a throw anywhere in any route became an unhandled
+      // rejection — which terminates the whole Node process by default, so
+      // one bad request took down every run in flight (review finding,
+      // 2026-09-11). The message is not echoed: it can carry internals.
       void (async (): Promise<void> => {
         const url = new URL(incoming.url ?? "/", "http://localhost");
         const query: Record<string, string> = {};
@@ -1127,14 +1205,10 @@ export function createControlPlaneNodeServerV1(
           headers,
           ...(body !== undefined ? { body } : {}),
         });
-        const payload = response.body === undefined ? "" : JSON.stringify(response.body);
-        outgoing.writeHead(response.status, {
-          "content-type": "application/json",
-          ...cors,
-          ...response.headers,
-        });
-        outgoing.end(payload);
-      })();
+        respond(response.status, response.body, response.headers);
+      })().catch(() => {
+        respond(500, { code: "internalError", message: "the request could not be completed" });
+      });
     });
   });
   if (options?.hub !== undefined) {

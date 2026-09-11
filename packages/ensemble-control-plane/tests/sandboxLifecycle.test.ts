@@ -22,6 +22,7 @@ import {
 } from "../../ensemble-engine/src/sandboxExecutionV1";
 import {
   acquireTaskSourceV1,
+  ensureUserSandboxV1,
   SANDBOX_TEARDOWN_STEP_ID_V1,
   teardownTaskSandboxV1,
   validateBindingReachabilityV1,
@@ -199,4 +200,39 @@ test("the checkout observable-state probe: .git/HEAD proves or disproves a sha c
 
   const branchEffect = createGitCheckoutEffectV1(contextFor("main"));
   assert.equal(await branchEffect.reconcile?.("f".repeat(64)), "unknown");
+});
+
+test("concurrent first use provisions ONE persistent sandbox; nothing is orphaned", async () => {
+  // Before the fix: read-then-await-create-then-upsert, so a burst of
+  // first-use requests each created a sandbox and all but the last write
+  // were left running with no record — unreachable by reset or teardown.
+  const store = createControlPlaneStoreV1();
+  const client = createInMemorySandboxClientV1();
+  let creates = 0;
+  const counting = {
+    ...client,
+    createSandbox: async () => {
+      creates += 1;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return client.createSandbox();
+    },
+  };
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => ensureUserSandboxV1(store, counting, "owner-a", "docker", "/workspace"))
+  );
+  assert.equal(creates, 1);
+  assert.equal(new Set(results.map((record) => record.sandboxId)).size, 1);
+  assert.equal(store.readUserSandbox("owner-a", "docker")?.sandboxId, results[0]?.sandboxId);
+});
+
+test("a sandbox whose record cannot be written is given back, not left running unrecorded", async () => {
+  const client = createInMemorySandboxClientV1();
+  const failingStore = {
+    readUserSandbox: () => undefined,
+    writeUserSandbox: () => {
+      throw new Error("disk full");
+    },
+  };
+  await assert.rejects(ensureUserSandboxV1(failingStore, client, "owner-b", "docker", "/workspace"), /disk full/);
+  assert.equal(client.destroyedSandboxIds.length, 1);
 });

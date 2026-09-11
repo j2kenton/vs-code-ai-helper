@@ -71,6 +71,24 @@ export interface CreateSessionServiceOptionsV1 {
   readonly now?: () => Date;
   /** Access-token lifetime; default 15 minutes (short-lived by design). */
   readonly accessTtlMs?: number;
+  /**
+   * Who may hold a session at all, as `"<provider>:<providerSubjectId>"`
+   * (e.g. `"github:9324248"` — the stable numeric id, never a login name,
+   * which can be renamed and re-registered by someone else). Absent means
+   * open sign-up, which only tests and deliberately multi-tenant
+   * deployments should use: a self-hosted control plane is ONE person's,
+   * and every identity-provider account on earth can otherwise sign in and
+   * start containers on that person's host (review finding, 2026-09-11).
+   *
+   * Enforced at every point an identity turns into access — exchange,
+   * refresh, and every authenticate — so removing someone from the list
+   * cuts off their existing sessions too, not only their next sign-in.
+   */
+  readonly allowedIdentities?: ReadonlySet<string>;
+}
+
+export function identityKeyV1(provider: string, providerSubjectId: string): string {
+  return `${provider}:${providerSubjectId}`;
 }
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1000;
@@ -90,6 +108,16 @@ export function createSessionServiceV1(options: CreateSessionServiceOptionsV1): 
   const validators = new Map<IdentityProviderNameV1, IdentityValidatorV1>(
     options.validators.map((validator) => [validator.provider, validator])
   );
+  const allowed = options.allowedIdentities;
+
+  /** True when this user may hold a session (always, with no allowlist configured). */
+  function userAllowed(userId: string): boolean {
+    if (allowed === undefined) {
+      return true;
+    }
+    const user = store.readUser(userId);
+    return user !== undefined && allowed.has(identityKeyV1(user.identityProvider, user.providerSubjectId));
+  }
 
   function issueTokens(
     userId: string,
@@ -141,6 +169,15 @@ export function createSessionServiceV1(options: CreateSessionServiceOptionsV1): 
             : "identity validation failed";
         return { ok: false, code: "identityValidationFailed", reason };
       }
+      if (allowed !== undefined && !allowed.has(identityKeyV1(identity.provider, identity.providerSubjectId))) {
+        // Refused BEFORE any user record exists: a stranger who signs in
+        // leaves nothing behind on this control plane, not even an id.
+        return {
+          ok: false,
+          code: "identityValidationFailed",
+          reason: "this control plane does not accept sign-ins from that account",
+        };
+      }
       const user = store.upsertUserByIdentity(identity.provider, identity.providerSubjectId);
       const familyId = randomBytes(16).toString("hex");
       const family: RefreshFamilyRecordV1 = {
@@ -168,6 +205,13 @@ export function createSessionServiceV1(options: CreateSessionServiceOptionsV1): 
           ok: false,
           code: "refreshTokenInvalid",
           reason: "the refresh token's family is revoked",
+        };
+      }
+      if (!userAllowed(record.userId)) {
+        return {
+          ok: false,
+          code: "refreshTokenInvalid",
+          reason: "this account is no longer allowed on this control plane",
         };
       }
       if (record.status === "rotated") {
@@ -207,6 +251,9 @@ export function createSessionServiceV1(options: CreateSessionServiceOptionsV1): 
       }
       const family = store.readFamily(record.familyId);
       if (family === undefined || family.revokedAt !== undefined) {
+        return undefined;
+      }
+      if (!userAllowed(record.userId)) {
         return undefined;
       }
       return { userId: record.userId };

@@ -248,6 +248,48 @@ test("sign-out revokes the session: neither the access nor the refresh token sur
   assert.equal(refreshAfter.ok, false);
 });
 
+test("allowlist: a stranger's valid sign-in is refused; the listed identity signs in normally", async () => {
+  const clock = makeClock(NOW_ISO);
+  const store = createControlPlaneStoreV1({ now: clock.now });
+  const sessions = createSessionServiceV1({
+    store,
+    validators: [makeFakeValidator("github", { "owner-code": "9324248", "stranger-code": "555" })],
+    now: clock.now,
+    allowedIdentities: new Set(["github:9324248"]),
+  });
+
+  const stranger = await sessions.exchange({ provider: "github", ...BASE, authorizationCode: "stranger-code" });
+  assert.deepEqual(
+    { ok: stranger.ok, code: stranger.ok ? "" : stranger.code },
+    { ok: false, code: "identityValidationFailed" }
+  );
+
+  const owner = await sessions.exchange({ provider: "github", ...BASE, authorizationCode: "owner-code" });
+  assert.ok(owner.ok);
+  assert.deepEqual(await sessions.authenticate(owner.tokens.accessToken), { userId: owner.userId });
+  const refreshed = await sessions.refresh(owner.tokens.refreshToken);
+  assert.equal(refreshed.ok, true);
+});
+
+test("allowlist: dropping an identity cuts off its EXISTING sessions — access and refresh both", async () => {
+  const clock = makeClock(NOW_ISO);
+  const store = createControlPlaneStoreV1({ now: clock.now });
+  const validators = [makeFakeValidator("github", { "code-x": "777" })];
+  const open = createSessionServiceV1({ store, validators, now: clock.now });
+  const issued = await open.exchange({ provider: "github", ...BASE, authorizationCode: "code-x" });
+  assert.ok(issued.ok);
+
+  // The same durable store, restarted with an allowlist that no longer names this account.
+  const locked = createSessionServiceV1({
+    store,
+    validators,
+    now: clock.now,
+    allowedIdentities: new Set(["github:9324248"]),
+  });
+  assert.equal(await locked.authenticate(issued.tokens.accessToken), undefined);
+  assert.equal((await locked.refresh(issued.tokens.refreshToken)).ok, false);
+});
+
 test("access tokens are short-lived: authentication fails past expiry", async () => {
   const { sessions, clock } = makeService();
   const exchange = await sessions.exchange({ provider: "github", ...BASE });

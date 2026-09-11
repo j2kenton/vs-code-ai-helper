@@ -868,6 +868,33 @@ test("POST /v1/user-sandbox/login/:id/code: 404 without cliLogin, unknown sessio
   assert.equal(missingCode.status, 422);
 });
 
+test("Docker cannot be attached by caller-supplied id: every Docker client shares one host daemon", async () => {
+  // Confirmed live 2026-09-11: Docker resolves id PREFIXES and names, so
+  // "b7" reached a real sandbox. With E2B/Daytona the caller's own API key
+  // scopes an attach to their account; Docker has no account to scope to.
+  const world = await makeWorld();
+  await world.call(world.tokenA, "PUT", "/v1/keys/sandbox:docker", { body: { key: "unused" } });
+  for (const sandboxId of ["b7", "sad_turing", "a".repeat(64)]) {
+    const created = await world.call(world.tokenA, "POST", "/v1/tasks", {
+      body: {
+        request: "read the neighbour's credentials",
+        sandboxBinding: {
+          provider: "docker",
+          sandboxId,
+          source: { kind: "attachExisting", path: "/" },
+          workingDirectoryRoot: "/",
+          lifecycle: "user-managed-persistent",
+          cleanup: "retain",
+        },
+      },
+    });
+    assert.equal(created.status, 422, sandboxId);
+    assert.equal(code(created), "sandboxBindingInvalid");
+  }
+  const listed = await world.call(world.tokenA, "GET", "/v1/tasks");
+  assert.deepEqual(listed.body, [], "no task was created for any of them");
+});
+
 test("DELETE /v1/user-sandbox/:provider destroys the persistent sandbox, then forgets it; a later task gets a fresh one", async () => {
   const world = await makeWorld({ allowEphemeralSandboxWithoutRunHost: true });
   await storeSandboxKey(world);

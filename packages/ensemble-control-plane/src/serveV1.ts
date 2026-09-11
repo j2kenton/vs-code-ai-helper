@@ -126,6 +126,38 @@ function optionalPair(
   return { clientId, clientSecret };
 }
 
+/**
+ * `ENSEMBLE_ALLOWED_IDENTITIES`: comma-separated `<provider>:<subjectId>`
+ * (GitHub's numeric user id, e.g. `github:9324248` — `gh api user --jq .id`).
+ * Required: a self-hosted control plane belongs to one person, and without
+ * a list every GitHub/Google account on earth can sign in and start
+ * containers on that person's host. `ENSEMBLE_OPEN_SIGNUP=1` is the only
+ * way to run without one, and it has to be typed on purpose.
+ */
+export function buildAllowedIdentitiesV1(): ReadonlySet<string> | undefined {
+  const raw = process.env["ENSEMBLE_ALLOWED_IDENTITIES"];
+  const entries = (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (entries.length === 0) {
+    if (process.env["ENSEMBLE_OPEN_SIGNUP"] === "1") {
+      return undefined;
+    }
+    throw new Error(
+      "ENSEMBLE_ALLOWED_IDENTITIES is required (e.g. github:9324248 — your numeric GitHub id). " +
+        "Without it anyone with a GitHub or Google account could sign in and run containers on this host. " +
+        "Set ENSEMBLE_OPEN_SIGNUP=1 only if open sign-up is really what you want."
+    );
+  }
+  for (const entry of entries) {
+    if (!/^(github|google|apple):[^\s:]+$/.test(entry)) {
+      throw new Error(`ENSEMBLE_ALLOWED_IDENTITIES entry ${JSON.stringify(entry)} is not "<provider>:<subjectId>".`);
+    }
+  }
+  return new Set(entries);
+}
+
 export function buildIdentityValidatorsV1(): readonly IdentityValidatorV1[] {
   const validators: IdentityValidatorV1[] = [];
 
@@ -300,6 +332,19 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
     return undefined;
   }
 
+  /** Drop every decrypted credential this task's run was holding. */
+  function evictCredentials(taskId: string): void {
+    cache.delete(taskId);
+    sandboxContextCache.delete(taskId);
+  }
+
+  /**
+   * Tear down on a terminal outcome and ALWAYS evict the task's cached
+   * credentials when the run is over — the model keys too, which used to
+   * stay decrypted in memory for the life of the process. Never throws: it
+   * runs from background continuations, where an escaped rejection would
+   * terminate the whole control plane.
+   */
   async function teardownIfTerminal(
     task: ControlPlaneTaskRecordV1,
     outcome: EngineRunOutcomeV1
@@ -307,28 +352,36 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
     if (outcome.kind !== "completed" && outcome.kind !== "failed") {
       return;
     }
-    const context = await sandboxContextFor(task);
-    // Whatever happens below, a settled run must not keep a client (and
-    // the decrypted provider key inside it) alive in the cache.
-    sandboxContextCache.delete(task.taskId);
-    if (context === undefined) {
-      // No key to tear down with — the same key was needed to acquire the
-      // source in the first place, so this only happens if it was revoked
-      // mid-run. Leaves the sandbox for manual cleanup; nothing else to do.
-      return;
+    try {
+      const context = await sandboxContextFor(task);
+      evictCredentials(task.taskId);
+      if (context === undefined) {
+        // No key to tear down with — the same key was needed to acquire the
+        // source in the first place, so this only happens if it was revoked
+        // mid-run. Leaves the sandbox for manual cleanup; nothing else to do.
+        return;
+      }
+      const machinery = jobSupervisor.machineryFor(task.taskId, task.ownerUserId);
+      await teardownTaskSandboxV1(machinery, context);
+    } catch {
+      log?.("engine run host: sandbox teardown failed — the sandbox may need manual cleanup");
+    } finally {
+      evictCredentials(task.taskId);
     }
-    const machinery = jobSupervisor.machineryFor(task.taskId, task.ownerUserId);
-    await teardownTaskSandboxV1(machinery, context);
   }
 
   return {
     async start(task) {
-      await prefetchModelKeys(task);
-      const acquisitionFailure = await acquireSource(task);
-      if (acquisitionFailure !== undefined) {
-        return acquisitionFailure;
+      let outcome: EngineRunOutcomeV1;
+      try {
+        await prefetchModelKeys(task);
+        // An acquisition failure is as terminal as any other: it goes
+        // through the same teardown, so a bad repo URL no longer leaves a
+        // destroy-on-completion sandbox running forever.
+        outcome = (await acquireSource(task)) ?? (await realHost.start(task));
+      } catch {
+        outcome = markFailed(task, "engineRunThrew");
       }
-      const outcome = await realHost.start(task);
       await teardownIfTerminal(task, outcome);
       return outcome;
     },
@@ -348,7 +401,10 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
       const result = await realHost.submitAnswers(taskId, interactionId, rawAnswers, answerIdempotencyId);
       if (result.ok && task !== undefined) {
         const capturedTask = task;
-        void result.settled.then((outcome) => teardownIfTerminal(capturedTask, outcome));
+        result.settled.then(
+          (outcome) => teardownIfTerminal(capturedTask, outcome),
+          () => teardownIfTerminal(capturedTask, { kind: "failed", code: "engineRunThrew" })
+        );
       }
       return result;
     },
@@ -377,7 +433,12 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   });
 
   const store = createSqliteControlPlaneStoreV1({ databasePath });
-  const sessions = createSessionServiceV1({ store, validators: buildIdentityValidatorsV1() });
+  const allowedIdentities = buildAllowedIdentitiesV1();
+  const sessions = createSessionServiceV1({
+    store,
+    validators: buildIdentityValidatorsV1(),
+    ...(allowedIdentities !== undefined ? { allowedIdentities } : {}),
+  });
   const hub = createWsHubV1({ sessions, store });
 
   // Every line is redacted before it reaches stdout — the sanctioned route for
@@ -471,6 +532,11 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   log(`control plane listening on http://127.0.0.1:${port}`);
   log(`  database: ${databasePath}`);
   log(`  cors origins: ${corsOrigins.join(", ")}`);
+  log(
+    allowedIdentities === undefined
+      ? "  sign-in: OPEN (ENSEMBLE_OPEN_SIGNUP=1) — any identity-provider account can sign in"
+      : `  sign-in: restricted to ${allowedIdentities.size} identit${allowedIdentities.size === 1 ? "y" : "ies"}`
+  );
   log("  engine run host: active — provider dispatch and sandbox source acquisition/teardown wired.");
   log("    claude-cli:* selections run the real Claude Code CLI inside the task's sandbox (edits + commands);");
   log("    direct-API selections only think — nothing turns their rounds into file changes/commands.");

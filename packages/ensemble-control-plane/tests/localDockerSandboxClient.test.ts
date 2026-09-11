@@ -15,7 +15,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duplex } from "node:stream";
-import { createLocalDockerSandboxClientV1 } from "../src/localDockerSandboxClientV1";
+import {
+  createLocalDockerSandboxClientV1,
+  DEFAULT_DOCKER_SANDBOX_LIMITS_V1,
+  DOCKER_SANDBOX_LABEL_V1,
+  DockerSandboxNotManagedErrorV1,
+} from "../src/localDockerSandboxClientV1";
+
+/** A real-shaped full container id (the only form the adapter accepts). */
+const SANDBOX_ID = "a".repeat(64);
+const MANAGED_INSPECT = {
+  Id: SANDBOX_ID,
+  Config: { Image: "ensemble-sandbox:latest", Labels: { [DOCKER_SANDBOX_LABEL_V1]: "1" } },
+};
 
 /**
  * A scriptable fake exec stream: `_write` (the container's "stdin") is
@@ -74,6 +86,7 @@ function makeFakeDocker(options: {
       },
     },
     getContainer: () => ({
+      inspect: () => Promise.resolve(MANAGED_INSPECT),
       exec: (opts: { Cmd: readonly string[]; WorkingDir: string }) => {
         execCalls.push(opts);
         return Promise.resolve(exec);
@@ -110,7 +123,7 @@ test("createInteractiveSession: sendInput reaches the running process, streamed 
 
   const chunks: string[] = [];
   const sessionPromise = client.createInteractiveSession({
-    sandboxId: "sbx-1",
+    sandboxId: SANDBOX_ID,
     argv: ["sh", "-c", "read code; echo GOT_CODE:$code"],
     cwd: "/",
     onOutput: (chunk) => chunks.push(chunk),
@@ -152,7 +165,7 @@ test("createInteractiveSession: kill() signals the process's real HOST pid via p
 
   const client = createLocalDockerSandboxClientV1({ docker: docker as never });
   const session = await client.createInteractiveSession!({
-    sandboxId: "sbx-1",
+    sandboxId: SANDBOX_ID,
     argv: ["sleep", "99"],
     cwd: "/",
     onOutput: () => undefined,
@@ -199,4 +212,231 @@ test("createSandbox: an explicit empty user override falls back to the image's o
   await client.createSandbox();
 
   assert.equal(createContainerCalls[0]?.User, undefined);
+});
+
+/**
+ * A fake daemon holding a set of containers by FULL id, resolving lookups
+ * the way the real Docker API does: an exact id, any unique id prefix, or a
+ * container name. That resolution is the attack surface — confirmed live
+ * (2026-09-11): `b7` resolved to a real sandbox on the box.
+ */
+function makeDaemon(
+  containers: Record<string, { readonly name: string; readonly image: string; readonly labelled: boolean }>
+): { docker: unknown; removed: string[]; execsOn: string[] } {
+  const removed: string[] = [];
+  const execsOn: string[] = [];
+  const resolve = (ref: string): string | undefined => {
+    const ids = Object.keys(containers);
+    if (ids.includes(ref)) {
+      return ref;
+    }
+    const byName = ids.find((id) => containers[id]?.name === ref);
+    if (byName !== undefined) {
+      return byName;
+    }
+    const byPrefix = ids.filter((id) => id.startsWith(ref));
+    return byPrefix.length === 1 ? byPrefix[0] : undefined;
+  };
+  const notFound = (): Error & { statusCode: number } =>
+    Object.assign(new Error("no such container"), { statusCode: 404 });
+  const docker = {
+    modem: { demuxStream: () => undefined },
+    getContainer: (ref: string) => ({
+      inspect: () => {
+        const id = resolve(ref);
+        const found = id === undefined ? undefined : containers[id];
+        return id === undefined || found === undefined
+          ? Promise.reject(notFound())
+          : Promise.resolve({
+              Id: id,
+              Config: { Image: found.image, Labels: found.labelled ? { [DOCKER_SANDBOX_LABEL_V1]: "1" } : {} },
+            });
+      },
+      exec: () => {
+        execsOn.push(ref);
+        return Promise.reject(new Error("exec reached — the guard did not stop this"));
+      },
+      remove: () => {
+        const id = resolve(ref);
+        if (id === undefined) {
+          return Promise.reject(notFound());
+        }
+        removed.push(id);
+        delete containers[id];
+        return Promise.resolve();
+      },
+      top: () => Promise.resolve({ Processes: [] }),
+    }),
+  };
+  return { docker, removed, execsOn };
+}
+
+const MINE = "b7".padEnd(64, "1");
+const SERVICE = "c3".padEnd(64, "2");
+
+test("ownership guard: prefixes, names, and unlabelled host containers are refused before any exec", async () => {
+  const { docker, execsOn, removed } = makeDaemon({
+    [MINE]: { name: "sad_turing", image: "ensemble-sandbox:latest", labelled: true },
+    [SERVICE]: { name: "postgres", image: "postgres:17", labelled: false },
+  });
+  const client = createLocalDockerSandboxClientV1({ docker: docker as never, image: "ensemble-sandbox:latest" });
+
+  for (const ref of ["b7", "sad_turing", SERVICE, "postgres", "../etc", ""]) {
+    await assert.rejects(client.readFileUtf8(ref, "/etc/passwd"), DockerSandboxNotManagedErrorV1, ref);
+    await assert.rejects(
+      client.runCommand({ sandboxId: ref, argv: ["id"], cwd: "/", attemptKey: "abc123abc123abc1" }),
+      DockerSandboxNotManagedErrorV1,
+      ref
+    );
+    await assert.rejects(client.destroySandbox(ref), DockerSandboxNotManagedErrorV1, ref);
+    assert.equal(await client.findCommandByAttemptKey(ref, "k"), "unknown");
+  }
+  assert.deepEqual(execsOn, [], "no exec may reach a container that failed the guard");
+  assert.deepEqual(removed, [], "no container that failed the guard may be destroyed");
+
+  // The real sandbox, by its full id, passes the guard (the exec itself is faked to fail after it).
+  await assert.rejects(client.readFileUtf8(MINE, "/x"), /exec reached/);
+  assert.deepEqual(execsOn, [MINE]);
+});
+
+test("ownership guard: an unlabelled pre-label sandbox is accepted only on the configured sandbox image", async () => {
+  const legacy = "d4".padEnd(64, "3");
+  const generic = "e5".padEnd(64, "4");
+  const { docker } = makeDaemon({
+    [legacy]: { name: "old", image: "ensemble-sandbox:latest", labelled: false },
+    [generic]: { name: "node", image: "node:24-bookworm", labelled: false },
+  });
+  const configured = createLocalDockerSandboxClientV1({ docker: docker as never, image: "ensemble-sandbox:latest" });
+  await assert.rejects(configured.readFileUtf8(legacy, "/x"), /exec reached/);
+  await assert.rejects(configured.readFileUtf8(generic, "/x"), DockerSandboxNotManagedErrorV1);
+
+  // With no configured image there is no legacy grace at all — a bare node
+  // container proves nothing about who made it.
+  const unconfigured = createLocalDockerSandboxClientV1({ docker: docker as never });
+  await assert.rejects(unconfigured.readFileUtf8(legacy, "/x"), DockerSandboxNotManagedErrorV1);
+});
+
+test("destroy is replay-safe: an already-removed sandbox reads as destroyed, not as a permanent failure", async () => {
+  const { docker, removed } = makeDaemon({
+    [MINE]: { name: "mine", image: "ensemble-sandbox:latest", labelled: true },
+  });
+  const client = createLocalDockerSandboxClientV1({ docker: docker as never, image: "ensemble-sandbox:latest" });
+  await client.destroySandbox(MINE);
+  assert.deepEqual(removed, [MINE]);
+  // Crash recovery (or a reset after a manual `docker rm`) re-issues it:
+  await client.destroySandbox(MINE);
+  assert.deepEqual(removed, [MINE]);
+});
+
+test("createSandbox: labelled, resource-limited, no capabilities, no privilege escalation", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const fakeDocker = {
+    createContainer: (opts: Record<string, unknown>) => {
+      calls.push(opts);
+      return Promise.resolve({ id: SANDBOX_ID, start: () => Promise.resolve() });
+    },
+  };
+  const client = createLocalDockerSandboxClientV1({ docker: fakeDocker as never });
+  await client.createSandbox();
+
+  const opts = calls[0] as {
+    Labels: Record<string, string>;
+    HostConfig: Record<string, unknown>;
+  };
+  assert.equal(opts.Labels[DOCKER_SANDBOX_LABEL_V1], "1");
+  assert.equal(opts.HostConfig["Memory"], DEFAULT_DOCKER_SANDBOX_LIMITS_V1.memoryBytes);
+  assert.equal(opts.HostConfig["MemorySwap"], DEFAULT_DOCKER_SANDBOX_LIMITS_V1.memoryBytes);
+  assert.equal(opts.HostConfig["NanoCpus"], DEFAULT_DOCKER_SANDBOX_LIMITS_V1.cpus * 1e9);
+  assert.equal(opts.HostConfig["PidsLimit"], DEFAULT_DOCKER_SANDBOX_LIMITS_V1.pids);
+  assert.deepEqual(opts.HostConfig["CapDrop"], ["ALL"]);
+  assert.deepEqual(opts.HostConfig["SecurityOpt"], ["no-new-privileges"]);
+});
+
+/**
+ * A daemon whose one managed container runs a scripted exec (`produce`
+ * writes to its output stream), with `process.kill` captured so the
+ * adapter's host-pid kill is observable. Call `restore` when done.
+ */
+function makeExecDaemon(produce: (stream: Duplex) => void): {
+  readonly docker: unknown;
+  readonly killed: number[];
+  restore(): void;
+} {
+  const killed: number[] = [];
+  let running = true;
+  const docker = {
+    modem: {
+      demuxStream: (stream: Duplex, stdout: Duplex) => {
+        stream.on("data", (chunk: Buffer) => stdout.write(chunk));
+      },
+    },
+    getContainer: () => ({
+      inspect: () => Promise.resolve(MANAGED_INSPECT),
+      exec: () =>
+        Promise.resolve({
+          start: () => {
+            const stream = new Duplex({
+              read() {
+                // Output is pushed by `produce`.
+              },
+              write(_chunk, _encoding, callback) {
+                callback();
+              },
+            });
+            setImmediate(() => produce(stream));
+            return Promise.resolve(stream);
+          },
+          inspect: () => Promise.resolve({ ExitCode: 0, Running: running, Pid: 777 }),
+        }),
+    }),
+  };
+  const originalKill = process.kill;
+  (process as unknown as { kill: typeof process.kill }).kill = ((pid: number) => {
+    killed.push(pid);
+    running = false;
+    return true;
+  }) as typeof process.kill;
+  return {
+    docker,
+    killed,
+    restore(): void {
+      (process as unknown as { kill: typeof process.kill }).kill = originalKill;
+    },
+  };
+}
+
+test("exec capture: a command that floods output is killed at the byte cap instead of filling the control plane's heap", async () => {
+  const daemon = makeExecDaemon((stream) => {
+    const chunk = Buffer.alloc(1024 * 1024, 0x61);
+    for (let i = 0; i < 40; i++) {
+      stream.push(chunk);
+    }
+  });
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never });
+    const result = await client.runCommand({ sandboxId: SANDBOX_ID, argv: ["yes"], cwd: "/", attemptKey: "abc123abc123abc1" });
+    assert.equal(result.exitCode, 124);
+    assert.match(result.stderrTail, /command stopped: output exceeded/);
+    assert.deepEqual(daemon.killed, [777]);
+  } finally {
+    daemon.restore();
+  }
+});
+
+test("exec capture: a command that never exits is killed at its deadline", async () => {
+  const daemon = makeExecDaemon(() => undefined);
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never, commandTimeoutMs: 50 });
+    const result = await client.runCommand({
+      sandboxId: SANDBOX_ID,
+      argv: ["sleep", "infinity"],
+      cwd: "/",
+      attemptKey: "abc123abc123abc1",
+    });
+    assert.equal(result.exitCode, 124);
+    assert.match(result.stderrTail, /command stopped: timed out/);
+    assert.deepEqual(daemon.killed, [777]);
+  } finally {
+    daemon.restore();
+  }
 });
