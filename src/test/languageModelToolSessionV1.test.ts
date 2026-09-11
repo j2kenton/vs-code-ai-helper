@@ -238,6 +238,145 @@ void describe("languageModelToolSessionV1", () => {
     }
   });
 
+  /**
+   * A fake Copilot model that advertises `maxInputTokens` and keeps a copy of
+   * every request's message list (the session edits earlier entries in place
+   * when it sheds a result, so a live reference would show only the end state).
+   */
+  function installBudgetedModel(
+    maxInputTokens: number,
+    rounds: ReadonlyArray<readonly object[]>
+  ): { restore: () => void; sent: Array<Array<{ role: string; content: unknown }>> } {
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const sent: Array<Array<{ role: string; content: unknown }>> = [];
+    let round = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens,
+          sendRequest: (messages: ReadonlyArray<{ role: string; content: unknown }>) => {
+            sent.push([...messages]);
+            const parts = rounds[Math.min(round, rounds.length - 1)]!;
+            round += 1;
+            return Promise.resolve({
+              stream: (function* (): Generator<object> {
+                yield* parts;
+              })(),
+            });
+          },
+        },
+      ]);
+    return {
+      restore: (): void => {
+        lm.selectChatModels = original;
+      },
+      sent,
+    };
+  }
+
+  const toolCall = (callId: string): object =>
+    new stubClasses.LanguageModelToolCallPart(callId, "ensemble_readFile", { rootId: "r", relativePath: callId });
+
+  void it("sheds the oldest tool results rather than letting the provider prune the conversation", async () => {
+    // v1 fixes 2, item 17 (2026-09-11): over its prompt budget, Copilot's LM
+    // provider prunes the conversation oldest-first — the prompt, then the
+    // first assistant turn — so a tool result survives its own tool call and
+    // the API rejects it: "400 No tool call found for function call output".
+    // The session must stay under budget itself, and when it sheds, it must
+    // keep every call/result pair intact.
+    const model = installBudgetedModel(1000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [toolCall("call-3")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    // ~500 estimated tokens each against a ~700-token session budget: any two
+    // unshed results together are over it.
+    const handler = recordingHandler(() => "x".repeat(1500));
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(model.sent.length, 4);
+
+      const last = model.sent[3]!;
+      assert.equal(last[0]!.content, "preflight the change", "the original prompt must survive");
+
+      const resultText = (callId: string): string => {
+        for (const message of last) {
+          if (!Array.isArray(message.content)) {
+            continue;
+          }
+          for (const part of message.content as Array<{ callId?: string; content?: Array<{ value: string }> }>) {
+            if (part.callId === callId && Array.isArray(part.content)) {
+              return part.content.map((chunk) => chunk.value).join("");
+            }
+          }
+        }
+        throw new Error(`no tool result for ${callId}`);
+      };
+      assert.match(resultText("call-1"), /Ensemble removed this tool result \(1500 bytes\)/);
+      assert.match(resultText("call-2"), /Ensemble removed this tool result \(1500 bytes\)/);
+      assert.equal(resultText("call-3"), "x".repeat(1500), "the newest result must reach the model intact");
+
+      // Every tool call is immediately followed by a message answering it.
+      for (let i = 0; i < last.length; i++) {
+        const message = last[i]!;
+        if (message.role !== "assistant" || !Array.isArray(message.content)) {
+          continue;
+        }
+        const callIds = (message.content as Array<{ callId?: string; name?: string }>)
+          .filter((part) => part.name !== undefined && part.callId !== undefined)
+          .map((part) => part.callId);
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
+          (part) => part.callId
+        );
+        assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by message ${i + 1}`);
+      }
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("stops with a readable reason when even the newest result cannot fit, instead of sending", async () => {
+    const model = installBudgetedModel(100, [[toolCall("call-1")]]);
+    const handler = recordingHandler(() => "x".repeat(3000));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "toolSessionContextBudgetExceeded");
+      assert.match(
+        (exit.kind === "transportFailure" && exit.detail) || "",
+        /100-token input limit.*silently drop the start of the conversation/
+      );
+      // The over-budget second request was never sent.
+      assert.equal(model.sent.length, 1);
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("refuses to send a prompt that alone exceeds the budget", async () => {
+    const model = installBudgetedModel(5, [[new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)]]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "toolSessionContextBudgetExceeded");
+      assert.equal(model.sent.length, 0);
+    } finally {
+      model.restore();
+    }
+  });
+
   void it("aborts with toolProtocolViolation once the handler's violation cap is exceeded", async () => {
     const model = installModel([
       [new stubClasses.LanguageModelToolCallPart("call-x", "not.a.tool", {})],

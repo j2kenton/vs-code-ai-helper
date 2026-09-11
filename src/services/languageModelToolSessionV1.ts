@@ -160,6 +160,66 @@ export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
  */
 const MAX_NARRATION_NUDGES_V1 = 2;
 
+/**
+ * Share of the model's advertised `maxInputTokens` this session lets its own
+ * conversation occupy before it starts shedding old tool results.
+ *
+ * Why the session must police this itself (v1 fixes 2, item 17): Copilot's LM
+ * provider renders every request through prompt-tsx under the model's prompt
+ * budget, and when the conversation is over budget it does NOT fail — it
+ * prunes, oldest message first. The first casualty is the original prompt;
+ * the next is the first assistant turn, whose tool calls vanish while their
+ * tool results survive. The Responses API then rejects the orphaned result:
+ * `400 No tool call found for function call output with call_id …`.
+ * Observed 2026-09-11 on two consecutive High-Level Code Reviews
+ * (gpt-5.6-sol@high) of a change spanning ~1.3 MB of source; the same model
+ * had succeeded 45 minutes earlier on a review that read less. It looked
+ * like quota and was not.
+ *
+ * The remainder of the limit is headroom for what the provider adds on top
+ * of these messages (its own system prompt, the tool schemas, a reply
+ * reserve) and for the estimate below being approximate.
+ */
+export const TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1 = 0.7;
+
+/**
+ * Deliberately pessimistic bytes-per-token for estimating conversation size.
+ * Source code and JSON-escaped file content tokenize at roughly 3.5–4 bytes
+ * per token; assuming 3 overestimates, so the session sheds a little early
+ * rather than letting the provider prune silently.
+ */
+const ESTIMATED_BYTES_PER_TOKEN_V1 = 3;
+
+export function estimateLmTokensV1(text: string): number {
+  return Math.ceil(Buffer.byteLength(text, "utf8") / ESTIMATED_BYTES_PER_TOKEN_V1);
+}
+
+/**
+ * Replacement for a tool result shed to keep the conversation under budget.
+ * It keeps the result's `callId`, so the call/result pairing the provider
+ * validates stays intact — only the payload is gone, and the model is told
+ * how to get it back.
+ */
+export function elidedToolResultTextV1(originalBytes: number): string {
+  return (
+    `[Ensemble removed this tool result (${originalBytes} bytes) from the conversation ` +
+    "to stay within the model's input limit. Call the tool again if you still need it.]"
+  );
+}
+
+/** One tool result as sent, tracked so it can be shed later. */
+interface TrackedToolResultV1 {
+  readonly callId: string;
+  readonly text: string;
+  elided: boolean;
+}
+
+/** The user message carrying one round's tool results, by index into `messages`. */
+interface TrackedToolResultMessageV1 {
+  readonly messageIndex: number;
+  readonly results: TrackedToolResultV1[];
+}
+
 
 /** One round's activity, reported for observability. Never affects behaviour. */
 export interface LmToolSessionRoundV1 {
@@ -313,14 +373,94 @@ export function createCopilotLmToolSessionTransportV1(
       let totalResultBytes = 0;
       let narrationNudges = 0;
 
+      // Conversation-size budget (see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1).
+      // Unenforced when the host reports no usable limit.
+      const advertisedInputTokens = (resolved.model as { maxInputTokens?: unknown }).maxInputTokens;
+      const contextBudgetTokens =
+        typeof advertisedInputTokens === "number" && advertisedInputTokens > 0
+          ? Math.floor(advertisedInputTokens * TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1)
+          : undefined;
+      // Everything except tool results, which are the only thing ever shed.
+      let fixedTokens = estimateLmTokensV1(request.prompt);
+      const trackedResultMessages: TrackedToolResultMessageV1[] = [];
+
+      const conversationTokens = (): number =>
+        trackedResultMessages.reduce(
+          (sum, message) =>
+            sum +
+            message.results.reduce(
+              (inner, result) =>
+                inner +
+                estimateLmTokensV1(
+                  result.elided ? elidedToolResultTextV1(Buffer.byteLength(result.text, "utf8")) : result.text
+                ),
+              0
+            ),
+          fixedTokens
+        );
+
+      const contextBudgetExceededExit = (estimate: number, rounds: number): AgentTransportExitV1 => ({
+        kind: "transportFailure",
+        code: "toolSessionContextBudgetExceeded",
+        detail:
+          `the conversation is ~${estimate} tokens after ${rounds} round(s) even with every earlier ` +
+          `tool result removed — over this session's ~${contextBudgetTokens} token share of the ` +
+          `model's ${String(advertisedInputTokens)}-token input limit. Sending it anyway would let ` +
+          "the provider silently drop the start of the conversation. Narrow the prompt or pick a " +
+          "model with a larger context.",
+      });
+
+      /**
+       * Shed the oldest tool results until the conversation fits the budget.
+       * The most recent round's results are never shed — the model has not
+       * seen them yet. Returns false when even that is not enough.
+       */
+      const fitConversationToBudget = (): boolean => {
+        if (contextBudgetTokens === undefined) {
+          return true;
+        }
+        for (let i = 0; i < trackedResultMessages.length - 1; i++) {
+          if (conversationTokens() <= contextBudgetTokens) {
+            return true;
+          }
+          const tracked = trackedResultMessages[i]!;
+          if (tracked.results.every((result) => result.elided)) {
+            continue;
+          }
+          for (const result of tracked.results) {
+            result.elided = true;
+          }
+          messages[tracked.messageIndex] = createLmUserMessageWithPartsV1(
+            vscodeModule,
+            tracked.results.map((result) =>
+              createLmToolResultPartV1(
+                vscodeModule,
+                result.callId,
+                elidedToolResultTextV1(Buffer.byteLength(result.text, "utf8"))
+              )
+            )
+          );
+        }
+        return conversationTokens() <= contextBudgetTokens;
+      };
+
+      if (!fitConversationToBudget()) {
+        return contextBudgetExceededExit(conversationTokens(), 0);
+      }
+
       for (let round = 0; round < maxRounds; round++) {
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
+        }
+        if (!fitConversationToBudget()) {
+          return contextBudgetExceededExit(conversationTokens(), round);
         }
 
         let roundText = "";
         const assistantRawParts: unknown[] = [];
         const toolResultParts: unknown[] = [];
+        const roundResults: TrackedToolResultV1[] = [];
+        let roundToolCallBytes = 0;
         const roundToolNames: string[] = [];
         let roundResultBytes = 0;
         let sawToolCall = false;
@@ -396,6 +536,8 @@ export function createCopilotLmToolSessionTransportV1(
             roundResultBytes += resultBytes;
             totalResultBytes += resultBytes;
             toolResultParts.push(createLmToolResultPartV1(vscodeModule, part.callId, resultText));
+            roundResults.push({ callId: part.callId, text: resultText, elided: false });
+            roundToolCallBytes += Buffer.byteLength(part.name + JSON.stringify(part.input), "utf8");
             if (options.toolHandler.violationCount() > MAX_TOOL_PROTOCOL_VIOLATIONS_V1) {
               // Report BEFORE returning: a terminal round is the most
               // diagnostically valuable one, and returning straight out left
@@ -514,6 +656,7 @@ export function createCopilotLmToolSessionTransportV1(
             messages.push(
               vscode.LanguageModelChatMessage.User(RESULT_FRAME_NUDGE_MESSAGE_V1)
             );
+            fixedTokens += estimateLmTokensV1(roundText) + estimateLmTokensV1(RESULT_FRAME_NUDGE_MESSAGE_V1);
             continue;
           }
           // Final round: only THIS round's text is the provider result —
@@ -529,6 +672,9 @@ export function createCopilotLmToolSessionTransportV1(
 
         messages.push(createLmAssistantMessageWithPartsV1(vscodeModule, assistantRawParts));
         messages.push(createLmUserMessageWithPartsV1(vscodeModule, toolResultParts));
+        fixedTokens +=
+          estimateLmTokensV1(roundText) + Math.ceil(roundToolCallBytes / ESTIMATED_BYTES_PER_TOKEN_V1);
+        trackedResultMessages.push({ messageIndex: messages.length - 1, results: roundResults });
       }
 
       return { kind: "transportFailure", code: "toolRoundLimitExceeded" };
