@@ -295,6 +295,15 @@ export function attachWsEventsTransportV1(
     let inboundChain: Promise<void> = Promise.resolve();
     let fragmentOpcode: number | undefined;
     let fragmentParts: Buffer[] = [];
+    /**
+     * The frame reader caps each FRAME, but a fragmented message is many
+     * frames: with no cap on their sum, an unauthenticated client (a socket
+     * subscribes by message, so none of this is behind sign-in) could stream
+     * continuation frames until the process ran out of memory (review lead,
+     * 2026-09-11). The whole reassembled message gets the same limit.
+     */
+    let fragmentBytes = 0;
+    const maxMessageBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES_V1;
 
     function deliverText(text: string): void {
       let parsed: unknown;
@@ -356,10 +365,19 @@ export function attachWsEventsTransportV1(
             }
             fragmentOpcode = frame.opcode;
             fragmentParts = [frame.payload];
+            fragmentBytes = frame.payload.length;
             return;
           }
           if (fragmentOpcode === undefined) {
             closeSocket(1002, "continuation without a started message");
+            return;
+          }
+          fragmentBytes += frame.payload.length;
+          if (fragmentBytes > maxMessageBytes) {
+            fragmentOpcode = undefined;
+            fragmentParts = [];
+            fragmentBytes = 0;
+            closeSocket(1009, "message exceeds the payload limit");
             return;
           }
           fragmentParts.push(frame.payload);
@@ -367,6 +385,7 @@ export function attachWsEventsTransportV1(
             const text = Buffer.concat(fragmentParts).toString("utf8");
             fragmentOpcode = undefined;
             fragmentParts = [];
+            fragmentBytes = 0;
             deliverText(text);
           }
           return;

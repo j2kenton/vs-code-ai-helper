@@ -120,6 +120,14 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
   const sessions = new Map<string, CliLoginSessionRecordV1>();
   /** Starts in flight, counted against the global cap before they have a record. */
   let starting = 0;
+  /**
+   * Users with a start in flight. "One sign-in per user" was only checked
+   * BEFORE the slow session creation, so two concurrent starts from one
+   * user both passed it (review lead, 2026-09-11). A second start while one
+   * is being created is refused; once created, a later start supersedes it
+   * as before.
+   */
+  const startingUsers = new Set<string>();
 
   function forget(loginSessionId: string): void {
     const record = sessions.get(loginSessionId);
@@ -155,69 +163,27 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
       if (createSession === undefined) {
         return { ok: false, code: "interactiveSessionsUnsupported" };
       }
-      // One sign-in per user at a time: a new start supersedes any earlier
-      // one, whose process is stopped rather than left for its TTL.
-      for (const existing of [...sessions.values()]) {
-        if (existing.ownerUserId === input.ownerUserId) {
-          await end(existing);
-        }
-      }
-      if (sessions.size + starting >= maxConcurrent) {
+      if (startingUsers.has(input.ownerUserId)) {
         return { ok: false, code: "tooManyLoginSessions" };
       }
-
-      const loginSessionId = allocateHex128IdV1();
-      let output = "";
-      let handle: InteractiveSessionHandleV1;
-      starting += 1;
+      // Claimed synchronously, before the first await, so a concurrent start
+      // from the same user sees it.
+      startingUsers.add(input.ownerUserId);
       try {
-        // The handle exists BEFORE anything is published or timed: a failed
-        // start leaves no record and no timer (the old order registered both
-        // first, and a failed start armed a timer that later called
-        // `.kill()` on `undefined`, crashing the process).
-        handle = await createSession.call(input.client, {
-          sandboxId: input.sandboxId,
-          argv: [...CLAUDE_AUTH_LOGIN_ARGV_V1],
-          cwd: input.workingDirectoryRoot,
-          onOutput: (chunk) => {
-            const record = sessions.get(loginSessionId);
-            if (record !== undefined) {
-              if (record.output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
-                record.output = (record.output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
-              }
-            } else if (output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
-              output = (output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
-            }
-          },
-        });
-      } catch {
-        return { ok: false, code: "loginSessionStartFailed" };
-      } finally {
-        starting -= 1;
-      }
-
-      const record: CliLoginSessionRecordV1 = {
-        loginSessionId,
-        ownerUserId: input.ownerUserId,
-        sandboxId: input.sandboxId,
-        handle,
-        output,
-        ttlTimer: setTimeout(() => {
-          const stillPending = sessions.get(loginSessionId);
-          if (stillPending !== undefined) {
-            void end(stillPending);
+        // One sign-in per user at a time: a new start supersedes any earlier
+        // one, whose process is stopped rather than left for its TTL.
+        for (const existing of [...sessions.values()]) {
+          if (existing.ownerUserId === input.ownerUserId) {
+            await end(existing);
           }
-        }, sessionTtlMs),
-      };
-      record.ttlTimer.unref?.();
-      sessions.set(loginSessionId, record);
-      // The exit promise is observed from the start: a stream error rejects
-      // it, and a rejection nobody is awaiting yet (the user has not
-      // submitted a code) would otherwise be unhandled — fatal to Node.
-      handle.wait().catch(() => void end(record));
-
-      await sleep(captureWindowMs);
-      return { ok: true, loginSessionId, promptOutput: sessions.get(loginSessionId)?.output ?? record.output };
+        }
+        if (sessions.size + starting >= maxConcurrent) {
+          return { ok: false, code: "tooManyLoginSessions" };
+        }
+        return await startFresh(input, createSession);
+      } finally {
+        startingUsers.delete(input.ownerUserId);
+      }
     },
 
     async submitCode(
@@ -225,31 +191,7 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
       loginSessionId: string,
       code: string
     ): Promise<SubmitCliLoginCodeResultV1> {
-      const record = sessions.get(loginSessionId);
-      if (record === undefined || record.ownerUserId !== ownerUserId) {
-        // Ownership failure reads identically to absence — no confirmation
-        // that a login session with this id exists for a different user.
-        return { ok: false, code: "loginSessionNotFound" };
-      }
-      try {
-        await record.handle.sendInput(`${code}\n`);
-      } catch {
-        // The process is gone (its container too, possibly): the session is dead.
-        await end(record);
-        return { ok: false, code: "loginSessionNotFound" };
-      }
-      const exited = await Promise.race([
-        record.handle.wait().then(
-          (result) => ({ exited: true as const, exitCode: result.exitCode }),
-          () => ({ exited: true as const, exitCode: -1 })
-        ),
-        sleep(captureWindowMs).then(() => ({ exited: false as const })),
-      ]);
-      if (!exited.exited) {
-        return { ok: true, completed: false };
-      }
-      forget(loginSessionId);
-      return { ok: true, completed: true, success: exited.exitCode === 0 };
+      return submit(ownerUserId, loginSessionId, code);
     },
 
     async cancelForSandbox(ownerUserId: string, sandboxId: string): Promise<void> {
@@ -260,4 +202,94 @@ export function createCliLoginServiceV1(options?: CreateCliLoginServiceOptionsV1
       }
     },
   };
+
+  async function startFresh(
+    input: StartCliLoginInputV1,
+    createSession: NonNullable<SandboxClientV1["createInteractiveSession"]>
+  ): Promise<StartCliLoginResultV1> {
+    const loginSessionId = allocateHex128IdV1();
+    let output = "";
+    let handle: InteractiveSessionHandleV1;
+    starting += 1;
+    try {
+      // The handle exists BEFORE anything is published or timed: a failed
+      // start leaves no record and no timer (the old order registered both
+      // first, and a failed start armed a timer that later called
+      // `.kill()` on `undefined`, crashing the process).
+      handle = await createSession.call(input.client, {
+        sandboxId: input.sandboxId,
+        argv: [...CLAUDE_AUTH_LOGIN_ARGV_V1],
+        cwd: input.workingDirectoryRoot,
+        onOutput: (chunk) => {
+          const record = sessions.get(loginSessionId);
+          if (record !== undefined) {
+            if (record.output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
+              record.output = (record.output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
+            }
+          } else if (output.length < MAX_CAPTURED_OUTPUT_CHARS_V1) {
+            output = (output + chunk).slice(0, MAX_CAPTURED_OUTPUT_CHARS_V1);
+          }
+        },
+      });
+    } catch {
+      return { ok: false, code: "loginSessionStartFailed" };
+    } finally {
+      starting -= 1;
+    }
+
+    const record: CliLoginSessionRecordV1 = {
+      loginSessionId,
+      ownerUserId: input.ownerUserId,
+      sandboxId: input.sandboxId,
+      handle,
+      output,
+      ttlTimer: setTimeout(() => {
+        const stillPending = sessions.get(loginSessionId);
+        if (stillPending !== undefined) {
+          void end(stillPending);
+        }
+      }, sessionTtlMs),
+    };
+    record.ttlTimer.unref?.();
+    sessions.set(loginSessionId, record);
+    // The exit promise is observed from the start: a stream error rejects
+    // it, and a rejection nobody is awaiting yet (the user has not
+    // submitted a code) would otherwise be unhandled — fatal to Node.
+    handle.wait().catch(() => void end(record));
+
+    await sleep(captureWindowMs);
+    return { ok: true, loginSessionId, promptOutput: sessions.get(loginSessionId)?.output ?? record.output };
+  }
+
+  async function submit(
+    ownerUserId: string,
+    loginSessionId: string,
+    code: string
+  ): Promise<SubmitCliLoginCodeResultV1> {
+    const record = sessions.get(loginSessionId);
+    if (record === undefined || record.ownerUserId !== ownerUserId) {
+      // Ownership failure reads identically to absence — no confirmation
+      // that a login session with this id exists for a different user.
+      return { ok: false, code: "loginSessionNotFound" };
+    }
+    try {
+      await record.handle.sendInput(`${code}\n`);
+    } catch {
+      // The process is gone (its container too, possibly): the session is dead.
+      await end(record);
+      return { ok: false, code: "loginSessionNotFound" };
+    }
+    const exited = await Promise.race([
+      record.handle.wait().then(
+        (result) => ({ exited: true as const, exitCode: result.exitCode }),
+        () => ({ exited: true as const, exitCode: -1 })
+      ),
+      sleep(captureWindowMs).then(() => ({ exited: false as const })),
+    ]);
+    if (!exited.exited) {
+      return { ok: true, completed: false };
+    }
+    forget(loginSessionId);
+    return { ok: true, completed: true, success: exited.exitCode === 0 };
+  }
 }

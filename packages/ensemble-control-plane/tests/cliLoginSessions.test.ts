@@ -300,6 +300,18 @@ test("one sign-in per user: a new start stops the earlier one; a global cap boun
   assert.ok((await service.startLogin(input("user-c", "sbx-c"))).ok, "the freed slot is usable");
 });
 
+test("two CONCURRENT starts from one user cannot both get through (one-per-user holds across the slow create)", async () => {
+  const service = createCliLoginServiceV1({ captureWindowMs: 1, sessionTtlMs: 60_000 });
+  const scripted = makeScriptedClient({});
+  const input = { ownerUserId: "user-a", client: scripted.client, sandboxId: "sbx-a", workingDirectoryRoot: "/" };
+
+  const [first, second] = await Promise.all([service.startLogin(input), service.startLogin(input)]);
+
+  assert.equal([first, second].filter((result) => result.ok).length, 1, "exactly one start wins");
+  assert.deepEqual([first, second].find((result) => !result.ok), { ok: false, code: "tooManyLoginSessions" });
+  assert.equal(scripted.started, 1, "only one sign-in process was created");
+});
+
 test("an abandoned session is killed and forgotten after its TTL, so a late code submission reads as not found", async () => {
   let killed = false;
   const client: SandboxClientV1 = {

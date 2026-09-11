@@ -247,6 +247,32 @@ test("an unmasked client frame violates the RFC and closes with 1002", async () 
   }
 });
 
+test("an unauthenticated client cannot grow a fragmented message past the payload limit: 1009, connection closed", async () => {
+  // Each frame is under the per-frame cap, so the frame reader accepts every
+  // one; before the fix their SUM was unbounded — and a socket subscribes by
+  // message, so this needs no token at all (review lead, 2026-09-11).
+  const world = await makeWireWorld();
+  try {
+    const client = await openWireClient(world.port);
+    const piece = Buffer.alloc(512 * 1024, 0x20);
+    const clearFin = (frame: Buffer): Buffer => {
+      const copy = Buffer.from(frame);
+      copy[0] = (copy[0] as number) & 0x7f;
+      return copy;
+    };
+    client.sendRaw(clearFin(encodeMaskedClientFrameV1(WS_OPCODE_V1.text, piece)));
+    for (let index = 0; index < 4; index += 1) {
+      client.sendRaw(clearFin(encodeMaskedClientFrameV1(WS_OPCODE_V1.continuation, piece)));
+    }
+    const closeFrame = await client.nextFrame();
+    assert.equal(closeFrame.opcode, WS_OPCODE_V1.close);
+    assert.equal(closeFrame.payload.readUInt16BE(0), 1009);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
 test("ping is answered with a pong echoing the payload", async () => {
   const world = await makeWireWorld();
   try {
