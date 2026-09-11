@@ -222,6 +222,8 @@ interface TaskCreateFormProps {
   readonly defaultModel: string;
   readonly onCancel: () => void;
   readonly onCreated: (task: TaskDtoV1) => void;
+  /** A create the user cancelled out of finished anyway: the list must show it. */
+  readonly onCreatedAfterCancel: () => void;
 }
 
 function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
@@ -324,8 +326,13 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
       return;
     }
     if (cancelledRef.current) {
-      // The user left while it was in flight. The task (if created) shows up
-      // in the list; it is not opened out from under them.
+      // The user left while it was in flight. The task (if created) is put
+      // in the list — not opened out from under them. Without the refresh it
+      // stayed invisible until a manual Refresh, and a user who saw nothing
+      // and tried again created a duplicate running task.
+      if (result.ok) {
+        props.onCreatedAfterCancel();
+      }
       return;
     }
     setSubmitting(false);
@@ -580,6 +587,7 @@ export function TasksScreen(): React.JSX.Element {
             void refreshTasks();
             openTask(task.taskId);
           }}
+          onCreatedAfterCancel={() => void refreshTasks()}
         />
       ) : null}
     </Screen>

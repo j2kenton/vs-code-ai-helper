@@ -289,11 +289,13 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
       baseUrl: "https://orchestrator.example.com",
       provider: "anthropic",
       model: undefined,
-      getAccessToken: () => Promise.reject(new Error("refresh failed for refresh_token cprt_0123456789abcdef0123")),
+      getAccessToken: () =>
+        Promise.reject(new Error("refresh failed for refresh_token cprt_0123456789abcdef0123 (x_cpat_abcdef0123456789)")),
     });
     const exit = await leaky.invoke(makeRequest(), makeWriter());
     assert.ok(exit.kind === "transportFailure");
     assert.equal(exit.detail?.includes("cprt_0123"), false, exit.detail);
+    assert.equal(exit.detail?.includes("cpat_abc"), false, exit.detail);
 
     let fetched = false;
     const empty = createRemoteOrchestratorTextTransportV1({
@@ -310,6 +312,43 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
     assert.ok(emptyExit.kind === "transportFailure");
     assert.equal(emptyExit.code, "remoteOrchestratorNotSignedIn");
     assert.equal(fetched, false);
+  });
+
+  void it("a response that arrives after the deadline is abandoned without an unhandled rejection", async () => {
+    const escaped: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      escaped.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      const transport = createRemoteOrchestratorTextTransportV1({
+        baseUrl: "https://orchestrator.example.com",
+        provider: "anthropic",
+        model: undefined,
+        getAccessToken: () => Promise.resolve("cpat_test_token"),
+        // A fetch that ignores the abort signal and answers late, with a body
+        // whose read then fails.
+        fetchImpl: (() =>
+          new Promise((resolve) =>
+            setTimeout(
+              () =>
+                resolve({
+                  status: 200,
+                  text: () => Promise.reject(new Error("stream aborted")),
+                } as unknown as Response),
+              60
+            )
+          )) as unknown as typeof fetch,
+        requestTimeoutMs: 20,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.ok(exit.kind === "transportFailure");
+      assert.equal(exit.code, "remoteOrchestratorTimeout");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.deepEqual(escaped, []);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 
   void it("Cancel and the deadline also cover a session lookup that hangs (a token refresh over the network)", async () => {

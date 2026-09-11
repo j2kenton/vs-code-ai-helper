@@ -129,17 +129,40 @@ export function SettingsScreen(): React.JSX.Element {
   const sessionKey = JSON.stringify([controlPlaneUrl, signedIn]);
   const sessionGenerationRef = React.useRef(0);
   const [resetArmedFor, setResetArmedFor] = React.useState<string | null>(null);
-  /** Kept per sandbox: a reset's outcome is reported for the sandbox it was for, even after a provider switch. */
-  const [resetNotice, setResetNoticeFor] = React.useState<{ readonly target: string; readonly message: string } | null>(
-    null
-  );
   /**
-   * The sandbox a confirmed reset is in flight for. Per sandbox, not one
-   * flag for the screen: an E2B reset in flight used to show the Docker card
-   * as "Resetting…" with its controls disabled.
+   * Kept per sandbox: a reset's outcome is reported on the card of the
+   * sandbox it was for, even after a provider switch, and arming a reset
+   * clears only that card's notice.
    */
-  const [resettingFor, setResettingFor] = React.useState<string | null>(null);
-  const resetting = resettingFor === sandboxTarget;
+  const [resetNotices, setResetNotices] = React.useState<Readonly<Record<string, string>>>({});
+  const resetNotice = resetNotices[sandboxTarget] ?? null;
+  /**
+   * Resets still running on the server, COUNTED per sandbox (URL +
+   * provider). Deliberately not tied to the session or cleared by anything
+   * but the request settling: the server is destroying that sandbox until
+   * it answers, and while it does no sign-in or second reset may start for
+   * it. A single "resetting" slot was overwritten by a second provider's
+   * reset (unblocking the first while it still ran), and clearing it on a
+   * sign-out or a URL edit re-enabled the buttons mid-destroy (review of
+   * the previous fix).
+   */
+  const resetKey = JSON.stringify([controlPlaneUrl, sandboxProvider]);
+  const [resetsInFlight, setResetsInFlight] = React.useState<Readonly<Record<string, number>>>({});
+  const resetting = (resetsInFlight[resetKey] ?? 0) > 0;
+  function setNoticeFor(target: string, message: string | null): void {
+    setResetNotices((current) => {
+      const next = { ...current };
+      if (message === null) {
+        delete next[target];
+      } else {
+        next[target] = message;
+      }
+      return next;
+    });
+  }
+  function countReset(key: string, delta: 1 | -1): void {
+    setResetsInFlight((current) => ({ ...current, [key]: Math.max(0, (current[key] ?? 0) + delta) }));
+  }
   /**
    * Only the Docker provider can run an interactive sign-in. The server
    * provisions the persistent sandbox BEFORE it finds that out, so offering
@@ -156,8 +179,7 @@ export function SettingsScreen(): React.JSX.Element {
   React.useEffect(() => {
     // A different session (or server) owns nothing the previous one started.
     sessionGenerationRef.current += 1;
-    setResetNoticeFor(null);
-    setResettingFor(null);
+    setResetNotices({});
   }, [sessionKey]);
 
   React.useEffect(() => services.session.onChange(setSession), [services, setSession]);
@@ -391,16 +413,20 @@ export function SettingsScreen(): React.JSX.Element {
    */
   const resetArmed = resetArmedFor === sandboxTarget;
   async function resetSandbox(): Promise<void> {
+    if (resetting) {
+      return;
+    }
     if (!resetArmed) {
       setResetArmedFor(sandboxTarget);
-      setResetNoticeFor(null);
+      setNoticeFor(sandboxTarget, null);
       return;
     }
     setResetArmedFor(null);
     const captured = captureTarget();
+    const inFlightKey = resetKey;
     const sessionGeneration = sessionGenerationRef.current;
     const sameSession = (): boolean => sessionGenerationRef.current === sessionGeneration;
-    setResettingFor(captured.target);
+    countReset(inFlightKey, 1);
     let message: string;
     try {
       const result = await services.client.resetUserSandbox(sandboxProvider);
@@ -417,14 +443,13 @@ export function SettingsScreen(): React.JSX.Element {
     } catch (error) {
       message = `Could not reset: ${String(error)}`;
     } finally {
-      if (sameSession()) {
-        setResettingFor((current) => (current === captured.target ? null : current));
-      }
+      // Always: only the request settling ends "resetting" for its sandbox.
+      countReset(inFlightKey, -1);
     }
     if (sameSession()) {
       // Reported for the sandbox it was for — visible on that provider's
       // card even if the picker has moved on — and never to another session.
-      setResetNoticeFor({ target: captured.target, message });
+      setNoticeFor(captured.target, message);
     }
   }
 
@@ -631,9 +656,7 @@ export function SettingsScreen(): React.JSX.Element {
                   ) : null}
                 </Row>
               ) : null}
-              {resetNotice !== null && resetNotice.target === sandboxTarget ? (
-                <Body muted>{resetNotice.message}</Body>
-              ) : null}
+              {resetNotice !== null ? <Body muted>{resetNotice}</Body> : null}
             </Stack>
           ) : cliLogin.kind === 'starting' ? (
             <Body muted>Starting the CLI sign-in in your sandbox…</Body>

@@ -65,6 +65,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * body stream that does not (an injected fetch, a stalled proxy stream).
  */
 function readBodyOrAbort(response: Response, signal: AbortSignal): Promise<string> {
+  // Checked BEFORE starting the read: once aborted, raceAbortV1 would return
+  // without ever handling the read's promise — an unhandled rejection when
+  // that read then fails.
+  if (signal.aborted) {
+    return Promise.reject(new Error("aborted"));
+  }
   return raceAbortV1(
     response.text().catch((error: unknown) => {
       throw error instanceof Error ? error : new Error("body read failed");
@@ -88,7 +94,8 @@ function safeTransportDetailV1(value: unknown): string | undefined {
     // A thrown object whose own toString throws: nothing safe to show.
     return undefined;
   }
-  return detail?.replace(/\bcp(?:at|rt)_[A-Za-z0-9_-]+/g, "[redacted-token]");
+  // No word boundary: `\b` does not fire after "_", so "x_cpat_…" slipped through.
+  return detail?.replace(/cp(?:at|rt)_[A-Za-z0-9_-]+/g, "[redacted-token]");
 }
 
 /** `runnerId` distinguishes this transport in logs/telemetry from local CLI/Copilot runner ids. */
