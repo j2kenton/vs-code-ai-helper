@@ -282,7 +282,7 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             source,
             workingDirectoryRoot,
             lifecycle: 'user-managed-persistent',
-            cleanup: effectiveCleanup,
+            cleanup: 'retain',
           }
         : lifecycle === 'user-owned-managed'
           ? {
@@ -324,7 +324,10 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
     <>
       <Row style={styles.spaceBetween}>
         <Title>New task</Title>
-        <TouchButton label="Cancel" variant="secondary" onPress={props.onCancel} />
+        {/* Not while a create is in flight: it cannot be aborted, and the
+            task would be created anyway and then opened out from under the
+            list the user just went back to. */}
+        <TouchButton label="Cancel" variant="secondary" onPress={props.onCancel} disabled={submitting} />
       </Row>
       <Card>
         <Stack>

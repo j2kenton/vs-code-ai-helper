@@ -224,6 +224,47 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
     assert.deepEqual(await invocation, { kind: "callerCancelled" });
   });
 
+  void it("an already-cancelled request never reaches the network (the server would bill the call)", async () => {
+    let fetched = false;
+    const transport = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.resolve("cpat_test_token"),
+      fetchImpl: (() => {
+        fetched = true;
+        return Promise.resolve(jsonResponse(200, { text: "x" }));
+      }) as unknown as typeof fetch,
+    });
+    const exit = await transport.invoke(makeRequest({ cancellationToken: fakeToken(true) }), makeWriter());
+    assert.deepEqual(exit, { kind: "callerCancelled" });
+    assert.equal(fetched, false);
+  });
+
+  void it("a throwing session lookup and a non-string error message become failures, never a rejected invoke", async () => {
+    const throwing = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.reject(new Error("keychain unavailable")),
+      fetchImpl: (() => Promise.resolve(jsonResponse(200, { text: "x" }))) as typeof fetch,
+    });
+    const first = await throwing.invoke(makeRequest(), makeWriter());
+    assert.equal(first.kind, "transportFailure");
+
+    const oddBody = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.resolve("cpat_test_token"),
+      fetchImpl: (() => Promise.resolve(jsonResponse(502, { code: 7, message: { nested: true } }))) as typeof fetch,
+    });
+    const second = await oddBody.invoke(makeRequest(), makeWriter());
+    assert.equal(second.kind, "transportFailure");
+    assert.ok(second.kind === "transportFailure");
+    assert.equal(second.code, "remoteOrchestratorHttp502");
+  });
+
   void it("a call past its deadline is a distinct timeout failure, never an indefinite wait", async () => {
     const transport = createRemoteOrchestratorTextTransportV1({
       baseUrl: "https://orchestrator.example.com",

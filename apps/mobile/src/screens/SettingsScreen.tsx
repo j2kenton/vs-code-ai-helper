@@ -108,11 +108,23 @@ export function SettingsScreen(): React.JSX.Element {
    * sign-in finishing under the Daytona card. Every such action records its
    * target when it starts and is dropped if the target has moved.
    */
-  const sandboxTarget = JSON.stringify([controlPlaneUrl, sandboxProvider]);
+  // The session is part of the target: a sign-out (or a different account
+  // signing in on the same URL and provider) must drop an armed reset and a
+  // pending sign-in card, not hand them to whoever is signed in next.
+  const sandboxTarget = JSON.stringify([controlPlaneUrl, sandboxProvider, signedIn]);
   const sandboxTargetRef = React.useRef(sandboxTarget);
   sandboxTargetRef.current = sandboxTarget;
   const [resetArmedFor, setResetArmedFor] = React.useState<string | null>(null);
   const [resetNotice, setResetNotice] = React.useState<string | null>(null);
+  /** A confirmed reset is in flight: nothing else may touch this sandbox until it lands. */
+  const [resetting, setResetting] = React.useState(false);
+  /**
+   * Only the Docker provider can run an interactive sign-in. The server
+   * provisions the persistent sandbox BEFORE it finds that out, so offering
+   * the button for E2B/Daytona created a billable sandbox for a sign-in that
+   * could never work (final review).
+   */
+  const interactiveSignInSupported = sandboxProvider === 'docker';
   React.useEffect(() => {
     setCliLogin({ kind: 'idle' });
     setCliCodeDraft('');
@@ -215,7 +227,14 @@ export function SettingsScreen(): React.JSX.Element {
    * a verdict only (see `SandboxLoginCodeResultDtoV1`).
    */
   async function startCliLogin(): Promise<void> {
+    if (resetting || !interactiveSignInSupported) {
+      return;
+    }
     const target = sandboxTarget;
+    // Starting a sign-in abandons a half-confirmed reset: coming back to an
+    // already-armed reset after signing in would let one press destroy the
+    // login just made.
+    setResetArmedFor(null);
     setCliLogin({ kind: 'starting' });
     setCliCodeDraft('');
     const started = await services.client.startSandboxLogin(sandboxProvider);
@@ -307,7 +326,13 @@ export function SettingsScreen(): React.JSX.Element {
     }
     setResetArmedFor(null);
     const target = sandboxTarget;
-    const result = await services.client.resetUserSandbox(sandboxProvider);
+    setResetting(true);
+    let result: Awaited<ReturnType<typeof services.client.resetUserSandbox>>;
+    try {
+      result = await services.client.resetUserSandbox(sandboxProvider);
+    } finally {
+      setResetting(false);
+    }
     if (sandboxTargetRef.current !== target) {
       // The picker moved while the reset was in flight: its result belongs
       // to a sandbox this card no longer shows, and must not clear a
@@ -497,22 +522,29 @@ export function SettingsScreen(): React.JSX.Element {
                 <TouchButton
                   label={cliLogin.kind === 'signedIn' ? 'Sign in again' : 'Sign in Claude Code'}
                   variant={cliLogin.kind === 'signedIn' ? 'secondary' : 'primary'}
-                  disabled={!sandboxEnabled}
+                  disabled={!sandboxEnabled || !interactiveSignInSupported || resetting}
                   onPress={() => void startCliLogin()}
                 />
               </Row>
-              {!sandboxEnabled ? (
+              {!interactiveSignInSupported ? (
+                <Body muted>
+                  {`The in-sandbox sign-in works with Docker sandboxes only — choose Docker above.`}
+                </Body>
+              ) : !sandboxEnabled ? (
                 <Body muted>{`Enable ${sandboxProviderLabel} sandboxes above first.`}</Body>
               ) : null}
               {sandboxEnabled ? (
                 <Row>
                   <TouchButton
                     label={
-                      resetArmed
-                        ? `Really destroy your ${sandboxProviderLabel} sandbox? Press again`
-                        : 'Reset sandbox'
+                      resetting
+                        ? 'Resetting…'
+                        : resetArmed
+                          ? `Really destroy your ${sandboxProviderLabel} sandbox? Press again`
+                          : 'Reset sandbox'
                     }
                     variant="secondary"
+                    disabled={resetting}
                     onPress={() => void resetSandbox()}
                   />
                   {resetArmed ? (

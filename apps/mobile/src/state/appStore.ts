@@ -114,7 +114,9 @@ export const useAppStore = create<AppState>()(
       chatStreamRevisionByTask: {},
       session: { status: 'signedOut' },
       controlPlaneUrl: DEFAULT_CONTROL_PLANE_URL_V1,
-      sandboxProvider: 'e2b',
+      // Docker: the self-hosted default everything else assumes (the only
+      // provider the in-sandbox Claude Code sign-in works with).
+      sandboxProvider: 'docker',
       keyRecords: [],
       modelPrimary: 'anthropic:claude-sonnet-5',
       gateApprovalRequired: true,

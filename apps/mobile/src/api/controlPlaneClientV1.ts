@@ -99,7 +99,8 @@ export type SandboxBindingRequestV1 =
       readonly source: SandboxSourceAcquisitionV1;
       readonly workingDirectoryRoot: string;
       readonly lifecycle: 'user-managed-persistent';
-      readonly cleanup: 'destroy-on-completion' | 'retain';
+      /** A workspace you brought is never destroyed; the server rejects anything else. */
+      readonly cleanup: 'retain';
     }
   | {
       readonly provider: SandboxProviderV1;

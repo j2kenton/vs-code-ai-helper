@@ -2,6 +2,7 @@ import {
   AgentExecutionRequestV1,
   AgentTransportExitV1,
   AgentTransportV1,
+  boundedTransportDetailV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
 
@@ -52,11 +53,6 @@ const DEFAULT_REQUEST_TIMEOUT_MS_V1 = 15 * 60 * 1000;
 
 interface ProviderCallSuccessBodyV1 {
   readonly text: string;
-}
-
-interface ProviderCallErrorBodyV1 {
-  readonly code: string;
-  readonly message: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -119,7 +115,25 @@ export function createRemoteOrchestratorTextTransportV1(
         };
       }
 
-      const accessToken = await getAccessToken();
+      // Checked before ANY network work: a token that is already cancelled
+      // fires its listener only asynchronously, after the POST — and the
+      // server would run (and bill) the provider call anyway.
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "callerCancelled" };
+      }
+      let accessToken: string | undefined;
+      try {
+        accessToken = await getAccessToken();
+      } catch (error) {
+        return {
+          kind: "transportFailure",
+          code: "remoteOrchestratorNotSignedIn",
+          detail: boundedTransportDetailV1(error) ?? "the Ensemble Cloud session could not be read",
+        };
+      }
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "callerCancelled" };
+      }
       if (accessToken === undefined) {
         return {
           kind: "transportFailure",
@@ -170,7 +184,7 @@ export function createRemoteOrchestratorTextTransportV1(
         return {
           kind: "transportFailure",
           code: "remoteOrchestratorTransportError",
-          detail: error instanceof Error ? error.message.slice(0, 200) : "network error",
+          detail: boundedTransportDetailV1(error) ?? "network error",
           networkFault: true,
         };
       } finally {
@@ -198,13 +212,21 @@ export function createRemoteOrchestratorTextTransportV1(
         return { kind: "completed" };
       }
 
-      const errorBody = isRecord(parsed) ? (parsed as unknown as ProviderCallErrorBodyV1) : undefined;
+      // The body is untrusted: fields are used only when they are strings (a
+      // non-string `message` used to make `.slice` throw out of invoke), and
+      // the detail goes through the shared bounded, redacting formatter the
+      // AgentTransportExitV1 contract requires.
+      const errorBody = isRecord(parsed) ? parsed : undefined;
+      const errorCode = typeof errorBody?.["code"] === "string" ? errorBody["code"] : undefined;
+      const errorMessage = typeof errorBody?.["message"] === "string" ? errorBody["message"] : undefined;
       const code =
-        errorBody?.code !== undefined
-          ? `remoteOrchestrator.${errorBody.code}`
+        errorCode !== undefined && /^[A-Za-z0-9._-]{1,64}$/.test(errorCode)
+          ? `remoteOrchestrator.${errorCode}`
           : `remoteOrchestratorHttp${response.status}`;
-      const detail = errorBody?.message ?? `remote orchestrator returned ${response.status}`;
-      return { kind: "transportFailure", code, detail: detail.slice(0, 200) };
+      const detail =
+        boundedTransportDetailV1(errorMessage ?? `remote orchestrator returned ${response.status}`) ??
+        `remote orchestrator returned ${response.status}`;
+      return { kind: "transportFailure", code, detail };
     },
   };
 }
