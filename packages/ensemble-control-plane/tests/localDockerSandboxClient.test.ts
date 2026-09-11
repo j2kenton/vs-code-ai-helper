@@ -502,6 +502,112 @@ test("exec capture: a command that never exits is killed at its deadline", async
   }
 });
 
+/**
+ * A one-container daemon recording each exec's command, the bytes written
+ * to its stdin, and whether the container was started. Execs succeed
+ * (exit 0) once their stdin has ended, like `base64 -d > file` would.
+ */
+function makeRecordingDaemon(options: { readonly running: boolean }): {
+  readonly docker: unknown;
+  readonly execs: Array<{ readonly cmd: readonly string[]; readonly attachStdin: boolean; stdin: string }>;
+  readonly starts: number[];
+} {
+  const execs: Array<{ cmd: readonly string[]; attachStdin: boolean; stdin: string }> = [];
+  const starts: number[] = [];
+  let running = options.running;
+  const docker = {
+    modem: {
+      demuxStream: (stream: Duplex, stdout: Duplex) => {
+        // Consume like the real demuxer does, so 'end' can fire.
+        stream.on("data", (chunk: Buffer) => stdout.write(chunk));
+        stream.on("end", () => stdout.end());
+      },
+    },
+    getContainer: () => ({
+      inspect: () =>
+        Promise.resolve({ ...MANAGED_INSPECT, State: { Running: running } }),
+      start: () => {
+        starts.push(Date.now());
+        running = true;
+        return Promise.resolve();
+      },
+      remove: () => Promise.resolve(),
+      exec: (opts: { Cmd: readonly string[]; AttachStdin?: boolean }) => {
+        const record = { cmd: opts.Cmd, attachStdin: opts.AttachStdin === true, stdin: "" };
+        execs.push(record);
+        let finished = false;
+        return Promise.resolve({
+          start: () => {
+            const stream: Duplex = new Duplex({
+              read() {
+                // No output.
+              },
+              write(chunk: Buffer, _encoding, callback) {
+                record.stdin += chunk.toString("utf8");
+                callback();
+              },
+              final(callback) {
+                finished = true;
+                callback();
+                setImmediate(() => stream.push(null));
+              },
+            });
+            if (!record.attachStdin) {
+              finished = true;
+              setImmediate(() => stream.push(null));
+            }
+            return Promise.resolve(stream);
+          },
+          inspect: () => Promise.resolve({ ExitCode: finished ? 0 : null, Running: !finished, Pid: 0 }),
+        });
+      },
+    }),
+  };
+  return { docker, execs, starts };
+}
+
+test("writeFile: content travels over stdin, never the command line — a 300 KB file writes (ARG_MAX was 128 KiB)", async () => {
+  const daemon = makeRecordingDaemon({ running: true });
+  const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never });
+  const content = `API_KEY=sk-secret-value\n${"x".repeat(300 * 1024)}`;
+
+  await client.writeFile(SANDBOX_ID, "/tmp/ensemble-cli/round.env", content);
+
+  assert.equal(daemon.execs.length, 1);
+  const [write] = daemon.execs;
+  assert.ok(write !== undefined);
+  const commandLine = write.cmd.join(" ");
+  assert.equal(commandLine.includes("sk-secret-value"), false, "content must not appear in any argument");
+  assert.equal(commandLine.includes(Buffer.from("API_KEY").toString("base64").slice(0, 8)), false);
+  assert.ok(commandLine.length < 1024, "the command line stays tiny whatever the file size");
+  assert.match(commandLine, /umask 077/, "files are written owner-only");
+  assert.equal(write.attachStdin, true);
+  assert.equal(Buffer.from(write.stdin, "base64").toString("utf8"), content);
+});
+
+test("a stopped sandbox (host reboot) is started on use instead of failing as unreachable — but not started just to be destroyed", async () => {
+  const stopped = makeRecordingDaemon({ running: false });
+  const client = createLocalDockerSandboxClientV1({ docker: stopped.docker as never });
+  await client.deleteFile(SANDBOX_ID, "/tmp/x");
+  assert.equal(stopped.starts.length, 1);
+
+  const toDestroy = makeRecordingDaemon({ running: false });
+  await createLocalDockerSandboxClientV1({ docker: toDestroy.docker as never }).destroySandbox(SANDBOX_ID);
+  assert.equal(toDestroy.starts.length, 0);
+});
+
+test("createSandbox: persistent sandboxes survive a daemon restart (restart policy)", async () => {
+  const calls: Array<{ HostConfig: { RestartPolicy?: { Name: string } } }> = [];
+  const fakeDocker = {
+    createContainer: (opts: { HostConfig: { RestartPolicy?: { Name: string } } }) => {
+      calls.push(opts);
+      return Promise.resolve({ id: SANDBOX_ID, start: () => Promise.resolve() });
+    },
+  };
+  await createLocalDockerSandboxClientV1({ docker: fakeDocker as never }).createSandbox();
+  assert.deepEqual(calls[0]?.HostConfig.RestartPolicy, { Name: "unless-stopped" });
+});
+
 test("exec capture: a stop that cannot be PROVEN (marked processes survive) throws, never a terminal exit code", async () => {
   // Returning 124 while children kept running is how a 'stopped' round kept
   // editing files. An unprovable stop leaves the attempt open for recovery.

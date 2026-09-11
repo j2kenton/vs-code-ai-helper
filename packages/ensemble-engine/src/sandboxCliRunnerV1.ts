@@ -178,10 +178,13 @@ export interface CreateSandboxCliProviderRunnerOptionsV1 {
   readonly model?: string;
   readonly command?: string;
   /**
-   * Environment for the CLI process, written to a mode-0600 file inside the
-   * sandbox and sourced by the wrapper script — never placed on the command
-   * line, where `ps`/`docker top` would expose it. The place for an
-   * `ANTHROPIC_API_KEY` when the sandbox has no subscription login.
+   * Environment for the CLI process, written to a file inside the sandbox
+   * and sourced by the wrapper script — never placed on the command line,
+   * where `ps`/`docker top` would expose it. Owner-only permissions and
+   * off-the-command-line delivery of the FILE CONTENT are the sandbox
+   * client's `writeFile` contract (the Docker client writes over stdin
+   * under umask 077). The place for an `ANTHROPIC_API_KEY` when the
+   * sandbox has no subscription login.
    */
   readonly env?: Readonly<Record<string, string>>;
   /** Where the per-round prompt/output/env files live; default `/tmp/ensemble-cli`. */
@@ -408,7 +411,14 @@ export function createSandboxCliProviderRunnerV1(
 
         const output = await client.readFileUtf8(sandboxId, outputPath);
         if (output === undefined) {
-          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputMissing, true);
+          // A provider may refuse to read back an oversized file (Docker's
+          // client does, past 8 MB) — that is "too large", which a retry
+          // cannot fix, not "missing", which it might. Retrying used to
+          // re-run a whole edit-mode CLI round for nothing.
+          const present = await client.resolveRealPath(sandboxId, outputPath);
+          return present !== undefined
+            ? failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputTooLarge, false)
+            : failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputMissing, true);
         }
         if (Buffer.byteLength(output, "utf8") > maxOutputBytes) {
           return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputTooLarge, false);

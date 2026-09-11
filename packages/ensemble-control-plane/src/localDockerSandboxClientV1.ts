@@ -173,6 +173,14 @@ interface ExecCaptureOptionsV1 {
    * it and verifies none remain.
    */
   readonly processMarker?: string;
+  /**
+   * Bytes fed to the command's stdin, then EOF. How file CONTENT reaches a
+   * sandbox: an argument is capped by Linux at 128 KiB (MAX_ARG_STRLEN) and
+   * is visible to anyone who can list processes — content embedded in the
+   * `sh -c` string failed for any file over ~96 KB and exposed whatever it
+   * contained (Claude-side review, 2026-09-11).
+   */
+  readonly stdin?: Buffer;
 }
 
 /**
@@ -193,10 +201,16 @@ async function execCaptureV1(
   const exec = await container.exec({
     Cmd: ["/bin/sh", "-c", shellCommand],
     ...(options.cwd !== undefined ? { WorkingDir: options.cwd } : {}),
+    ...(options.stdin !== undefined ? { AttachStdin: true } : {}),
     AttachStdout: true,
     AttachStderr: true,
   });
-  const stream = await exec.start({ hijack: true, stdin: false });
+  const stream = await exec.start({ hijack: true, stdin: options.stdin !== undefined });
+  if (options.stdin !== undefined) {
+    // Half-close after the content: the command sees EOF, and its output
+    // keeps flowing back on the read side.
+    stream.end(options.stdin);
+  }
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
   let collected = 0;
@@ -388,7 +402,7 @@ export function createLocalDockerSandboxClientV1(
    * attaching to unrelated host containers. Verified ids are remembered
    * for the life of this client; a destroyed one is forgotten.
    */
-  async function assertManaged(sandboxId: string): Promise<void> {
+  async function assertManaged(sandboxId: string, startIfStopped = true): Promise<void> {
     if (verified.has(sandboxId)) {
       return;
     }
@@ -405,6 +419,20 @@ export function createLocalDockerSandboxClientV1(
     const legacy = legacyIds.has(inspected.Id) && meetsSecurityProfile(inspected);
     if (inspected.Id !== sandboxId || !(labelled || legacy)) {
       throw new DockerSandboxNotManagedErrorV1();
+    }
+    if (startIfStopped && inspected.State?.Running === false) {
+      // One of ours, stopped (a host reboot, a manual `docker stop`, or a
+      // container created before the restart policy existed): bring it back
+      // rather than failing every operation until the owner resets it and
+      // loses the CLI login inside.
+      try {
+        await docker.getContainer(sandboxId).start();
+      } catch (error) {
+        // 304: already started by someone else between inspect and start.
+        if ((error as { statusCode?: unknown }).statusCode !== 304) {
+          throw error;
+        }
+      }
     }
     verified.add(sandboxId);
   }
@@ -436,6 +464,10 @@ export function createLocalDockerSandboxClientV1(
         Labels: { [DOCKER_SANDBOX_LABEL_V1]: "1" },
         HostConfig: {
           AutoRemove: false,
+          // A persistent sandbox holds its owner's CLI login; a daemon
+          // restart or host reboot must not leave it stopped (it used to,
+          // and every later task and sign-in failed as unreachable).
+          RestartPolicy: { Name: "unless-stopped" },
           Memory: limits.memoryBytes,
           MemorySwap: limits.memoryBytes,
           NanoCpus: Math.round(limits.cpus * 1e9),
@@ -454,7 +486,8 @@ export function createLocalDockerSandboxClientV1(
 
     async destroySandbox(sandboxId: string): Promise<void> {
       try {
-        await assertManaged(sandboxId);
+        // Ownership is checked, but a stopped sandbox is not started just to be removed.
+        await assertManaged(sandboxId, false);
       } catch (error) {
         // An id that no longer resolves at all is already destroyed — the
         // replay-safe answer crash recovery and reset both need. A container
@@ -506,14 +539,15 @@ export function createLocalDockerSandboxClientV1(
 
     async writeFile(sandboxId: string, absolutePath: string, contentUtf8: string): Promise<void> {
       const quotedPath = quotePosixShellArgV1(absolutePath);
-      // Base64 carries no shell-special characters, so the content is safe to
-      // embed directly in single quotes without further escaping — the same
-      // reason envelope encryption elsewhere in this codebase base64s ciphertext.
-      const encoded = Buffer.from(contentUtf8, "utf8").toString("base64");
-      const quotedEncoded = quotePosixShellArgV1(encoded);
+      // Content goes over STDIN, never the command line (size limit and
+      // process-list exposure — see `ExecCaptureOptionsV1.stdin`). Written
+      // owner-only (umask 077): these are prompts and, when the CLI runner's
+      // `env` option is used, credentials. Base64 keeps the stream framing
+      // out of the content's way.
       const result = await capture(
         sandboxId,
-        `mkdir -p "$(dirname ${quotedPath})" && printf '%s' ${quotedEncoded} | base64 -d > ${quotedPath}`
+        `umask 077 && mkdir -p "$(dirname ${quotedPath})" && base64 -d > ${quotedPath}`,
+        { stdin: Buffer.from(Buffer.from(contentUtf8, "utf8").toString("base64"), "utf8") }
       );
       if (result.exitCode !== 0) {
         throw new Error(`writeFile failed (exit ${result.exitCode}): ${tail(result.stderr)}`);

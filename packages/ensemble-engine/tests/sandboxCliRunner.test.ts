@@ -270,6 +270,29 @@ test("cascade candidates get their own crash-safe step: a second model on the sa
   assert.equal(client.executedCommands.length, 2, "the backup must not be reported as already executed");
 });
 
+test("output the provider will not read back (oversized) is a terminal 'too large', not a retryable 'missing'", async () => {
+  // Docker's client refuses to read files over 8 MB; the output file EXISTS.
+  // Reporting it as missing (retryable) re-ran a whole edit-mode round.
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const refusing = { ...client, readFileUtf8: () => Promise.resolve(undefined) };
+  const runner = createSandboxCliProviderRunnerV1({
+    client: refusing,
+    sandboxId: SANDBOX,
+    workingDirectoryRoot: ROOT,
+    machinery: createEngineGateMachineryV1({
+      taskId: "task-1",
+      ownerId: "owner-1",
+      workerId: "worker-1",
+      sink: createRecordingEventSinkV1(),
+    }),
+  });
+  assert.deepEqual(await runner.invoke(invocation("impl")), {
+    kind: "failed",
+    code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputTooLarge,
+    retryable: false,
+  });
+});
+
 test("a step id is unique per invocation, so a second round never reads as alreadyExecuted", async () => {
   const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
   const runner = makeRunner(client);
