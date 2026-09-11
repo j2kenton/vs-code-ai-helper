@@ -144,6 +144,8 @@ injected-transport discipline.
 
 ```
 ENSEMBLE_KEK_SECRET=…                      # required; envelope KEK boot secret
+ENSEMBLE_ALLOWED_IDENTITIES=github:9324248 # required; who may sign in (provider:numericId, comma-separated)
+                                           #   `gh api user --jq .id`; ENSEMBLE_OPEN_SIGNUP=1 to deliberately skip
 ENSEMBLE_GITHUB_CLIENT_ID/SECRET=…         # at least one identity provider
 ENSEMBLE_GOOGLE_CLIENT_ID/SECRET=…
 ENSEMBLE_PORT=8787                         # default
@@ -161,6 +163,27 @@ sandbox (`POST /v1/user-sandbox/login` → browser → `…/code`), create a tas
 with model `claude-cli:sonnet` and a `user-owned-managed` Docker binding —
 all eight stages ran through the CLI in the sandbox and wrote the requested
 files in about three minutes, with no API key anywhere.
+
+## Security posture (after the 2026-09-11 review)
+
+A four-way Codex review found a critical cross-tenant hole (any signed-in
+user could attach a task to any Docker container on the host by id prefix)
+plus several crash and resource paths; all confirmed findings are fixed and
+regression-tested. What still holds and what does not:
+
+- One person per control plane is the model, enforced: sign-in requires
+  `ENSEMBLE_ALLOWED_IDENTITIES`.
+- The Docker adapter touches only containers it created (label + full id),
+  with memory/CPU/pid limits, no capabilities, no privilege escalation, and
+  bounded exec output and time.
+- **Open:** sandbox network egress is unrestricted — AI-generated code in a
+  sandbox can reach the host's network. Closing it needs host firewall rules
+  or a separate sandbox host (E2B/Daytona, or a second VM), not a container
+  flag. With sign-in restricted to the owner, the exposure is the owner's
+  own generated code, not other users.
+- **Open:** leases are not renewed during long rounds and provisioning is
+  serialized in-process — both correct for one control-plane process, both
+  need durable versions before running more than one.
 
 ## Still to come (plan order)
 
