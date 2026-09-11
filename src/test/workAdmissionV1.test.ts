@@ -2104,11 +2104,51 @@ void test("finishPauseRevocationBarrierV1 is idempotent: calling it twice for th
   await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
   const fenceAfterFirst = await readOrInitPauseFenceGenerationV1(task);
   // The barrier file is already gone; a second call for the same path must
-  // not throw (ENOENT on the unlink is tolerated), and merely advances the
-  // fence one generation further — harmless, since "past the revoked claim's
-  // original generation" remains true regardless.
+  // not throw (ENOENT on the unlink is tolerated) and must NOT advance the
+  // fence again — a duplicate/delayed finish that outlives its own barrier
+  // must be a true no-op, or it could invalidate a brand-new, unrelated
+  // pause that captured the generation this barrier's completion already
+  // published (2026-09-11 review completion blocker).
   await assert.doesNotReject(() => finishPauseRevocationBarrierV1(task, revoked.barrierPath));
-  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceAfterFirst + 1);
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceAfterFirst);
+});
+
+void test("finishPauseRevocationBarrierV1 never advances the fence for a barrier it did not itself observe present (no unrelated-pause invalidation)", async () => {
+  const task = freshTaskFolder("finish-barrier-no-phantom-advance");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-phantom");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+
+  // A prompt claimant finishes the barrier for real.
+  await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
+  const fenceAfterRealFinish = await readOrInitPauseFenceGenerationV1(task);
+
+  // A brand-new, unrelated pauseCommit acquisition now captures the current
+  // (post-revocation) generation, exactly as a legitimate late pause would.
+  const newPauseCommit = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "pauseCommit",
+    commandId: "sweep-2",
+  });
+  assert.equal(newPauseCommit.outcome, "acquired");
+
+  // A stray, delayed finish call for the ORIGINAL (already-gone) barrier path
+  // must not advance the fence past the generation the new pause just relied
+  // on being current.
+  await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceAfterRealFinish,
+    "a finish call for an already-completed barrier must never advance the fence further"
+  );
+
+  if (newPauseCommit.outcome === "acquired") {
+    await newPauseCommit.handle.release();
+  }
 });
 
 void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 give a caller a seam to run cleanup between fence-advance and barrier-removal", async () => {
@@ -2153,6 +2193,46 @@ void test("removePauseRevocationBarrierV1 tolerates an already-removed barrier (
 
   await removePauseRevocationBarrierV1(revoked.barrierPath);
   await assert.doesNotReject(() => removePauseRevocationBarrierV1(revoked.barrierPath));
+});
+
+void test("a new acquisition automatically advances the fence past a pending revocation barrier, without removing it (Part 1b step 12 wiring)", async () => {
+  const task = freshTaskFolder("acquire-advances-pending-barrier");
+  const stale = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(stale.outcome, "acquired");
+  if (stale.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-wiring");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBeforeNewAcquisition = await readOrInitPauseFenceGenerationV1(task);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 1);
+
+  // A completely unrelated later acquisition — neither the revoker nor an
+  // explicit `finishPauseRevocationBarrierV1` caller — must still see the
+  // fence advanced as a side effect of it starting, per plan step 12: "every
+  // later claimant must complete the barrier ... before publishing admission
+  // or starting another pause."
+  const next = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "real-work" });
+  assert.equal(next.outcome, "acquired");
+  if (next.outcome !== "acquired") return;
+
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceBeforeNewAcquisition + 1,
+    "the new acquisition must advance the fence past the pending barrier's generation before publishing"
+  );
+  // The fence-advance half is automatic; the barrier itself is NOT removed by
+  // mere acquisition — removal still requires the owning caller's
+  // task-progress.json cleanup to have run first (this module cannot perform
+  // that cleanup itself; see `finishPauseRevocationBarrierV1`'s doc comment).
+  assert.equal(
+    listPendingPauseRevocationBarriersV1(task).length,
+    1,
+    "acquisition advances the fence but must not remove the barrier itself"
+  );
+
+  await next.handle.release();
+  await assert.doesNotReject(() => stale.handle.release());
 });
 
 void test("purpose-aware likelyStale threshold: a pauseCommit marker is flagged stale at 5 minutes; an admission marker at the same age is not", async () => {

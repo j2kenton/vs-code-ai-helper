@@ -803,6 +803,30 @@ const RESOLUTION_MARKER_RETRY_INTERVAL_MS_V1 = 500;
  * enough that this never reads to a user as a hang. */
 const RESOLUTION_MARKER_SYNC_RETRY_ATTEMPTS_V1 = 4;
 
+/**
+ * 2026-09-11 review completion blocker (`b5a1f851...-0`) — tried and reverted
+ * THIS round: a second, longer retry tier that kept waiting (instead of
+ * conceding to same-process-only protection) for as long as a pending root's
+ * blocking marker was NOT `likelyStale`, on the reasoning that "no positive
+ * evidence of staleness" approximates "another window's own resolution,
+ * about to release". Bounced off `workAdmissionV1.test.ts`'s own "root
+ * marker acquisition is best-effort" test: that test's contending marker is
+ * an ordinary, intentionally long-held per-task `admission` marker for real
+ * unrelated work (`purpose: "admission"`, not a resolution marker), and
+ * freshness alone cannot tell that apart from a short-lived resolution
+ * contender about to clear — both are simply "not yet stale" for up to
+ * `WORK_ADMISSION_LIKELY_STALE_MS_V1` (20 minutes). Waiting on that signal
+ * would have made this call block for many extra seconds against exactly the
+ * kind of legitimate, long-lived contention a command must never be made to
+ * wait out — reproducing, one layer up, the same hang risk this module's own
+ * interim policy exists to avoid, not narrowing it. No cheap, reliable signal
+ * distinguishes "will clear soon" from "won't" without either the pause-fence
+ * (which durable admission markers do not use) or an unbounded wait, so this
+ * is left as the documented, evaluated, and REJECTED attempt at closing the
+ * remainder of this blocker within 1a/1b's own tools — see this task's
+ * Remaining Blockers for why it is carried forward for a human decision
+ * rather than retried a third way this round. */
+
 /** Opaque handle returned by `beginTargetResolutionV1`, threaded back into
  * the matching `endTargetResolutionV1` call so it releases exactly the
  * durable root markers this call acquired (or reused) — never a different
@@ -1498,6 +1522,54 @@ async function acquireWorkAdmissionCoreV1(
 ): Promise<WorkAdmissionResultV1> {
   const { taskFolderPath, purpose, commandId } = params;
   const dir = admissionDirV1(taskFolderPath);
+
+  // Part 1b step 12 ("Require every later claimant to complete the barrier
+  // ... before publishing admission or starting another pause"): advance the
+  // durable pause-fence generation past any pending revocation barrier for
+  // this task BEFORE this acquisition can publish a new admission marker or
+  // start a new `pauseCommit` claim. This is the fence-advance half of
+  // finishing a barrier (`finishPauseRevocationBarrierV1`'s doc comment) —
+  // deliberately NOT the removal half, which requires the corresponding
+  // stale-watchdog-pause cleanup in `task-progress.json` this VS-Code-API-free
+  // module has no access to (module doc comment). Advancing without removing
+  // is safe and sufficient here: it is idempotent/harmless to repeat (a
+  // pending barrier may see several acquisitions each advance the fence
+  // further — the only invariant that matters, "the fence is past the
+  // revoked claim's original generation," only strengthens), and it leaves
+  // the barrier file in place as the durable signal that its
+  // task-progress.json cleanup is still owed — the centralized
+  // effective-pause-status resolver (plan step 13, not yet built) or the
+  // manual escape path removes it once that cleanup actually runs. Best
+  // effort: a failure here must never block or fail this acquisition, the
+  // same fail-open direction every other diagnostic-only check in this
+  // module takes.
+  try {
+    for (const barrierPath of listPendingPauseRevocationBarriersV1(taskFolderPath)) {
+      try {
+        await advancePauseFenceForRevocationV1(taskFolderPath);
+      } catch (error) {
+        console.error(
+          `acquireWorkAdmissionCoreV1: failed to advance the pause fence for pending revocation barrier ` +
+            `"${barrierPath}" — proceeding with acquisition regardless.`,
+          error
+        );
+      }
+    }
+  } catch (error) {
+    // `listPendingPauseRevocationBarriersV1` itself throws on a real,
+    // non-ENOENT filesystem error (e.g. the admission directory's parent
+    // path is not actually a directory) rather than treating it as "no
+    // barriers" — correct for a caller that needs to distinguish real
+    // failures, but this diagnostic-only check must never let such a failure
+    // pre-empt this acquisition's OWN (also fail-open-consistent) handling of
+    // the exact same underlying obstruction a few lines below.
+    console.error(
+      `acquireWorkAdmissionCoreV1: failed to list pending revocation barriers for "${taskFolderPath}" — ` +
+        "proceeding with acquisition regardless.",
+      error
+    );
+  }
+
   const hostId = await resolveHostIdentityV1();
   const claimInfo: WorkAdmissionClaimInfoV1 = {
     claimId: crypto.randomUUID(),
@@ -2462,8 +2534,32 @@ export async function removePauseRevocationBarrierV1(barrierPath: string): Promi
  * perform that cleanup, THEN `removePauseRevocationBarrierV1` instead, or the
  * fence-advance-then-cleanup ordering plan step 12 requires is violated (this
  * function's own two calls happen back-to-back with no seam for it).
+ *
+ * 2026-09-11 review completion blocker (new, fixed): a call for a barrier
+ * that some OTHER actor (or an earlier call by this same caller) has already
+ * finished — the barrier file no longer exists — used to still advance the
+ * fence one generation further before discovering the removal was a no-op.
+ * That is unsound, not merely wasteful: the fence has no memory of WHICH
+ * barrier it was last advanced for, so a duplicate/delayed finish landing
+ * after a brand-new, legitimate `pauseCommit` has already captured the
+ * generation this barrier's completion published would silently invalidate
+ * that unrelated, current pause. Completion must first win ownership of the
+ * barrier that still exists — established here by checking its presence
+ * before touching the fence — and be a true no-op once it is gone, exactly
+ * like `removePauseRevocationBarrierV1`'s own ENOENT tolerance. A benign
+ * TOCTOU remains (the barrier could vanish between this check and the
+ * fence advance below), but that only means two genuinely concurrent
+ * finishers of the SAME still-present barrier both advance the fence —
+ * harmless, per this section's doc comment — never a finish that outlives
+ * its own barrier.
  */
 export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
+  if (!fs.existsSync(barrierPath)) {
+    // Already finished by someone else (or by an earlier call from this same
+    // caller) — nothing left to do, and critically, nothing left to advance
+    // the fence FOR.
+    return;
+  }
   await advancePauseFenceForRevocationV1(taskFolderPath);
   await removePauseRevocationBarrierV1(barrierPath);
 }
