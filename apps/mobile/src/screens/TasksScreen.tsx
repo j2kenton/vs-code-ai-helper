@@ -250,6 +250,8 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
   const persistentLifecycle = lifecycle !== 'task-owned-ephemeral';
   const effectiveCleanup = persistentLifecycle ? 'retain' : cleanup;
   const [submitting, setSubmitting] = React.useState(false);
+  /** Set when the user cancels mid-create: the in-flight result is then ignored. */
+  const cancelledRef = React.useRef(false);
   const [error, setError] = React.useState<string | null>(null);
 
   function selectProvider(next: SandboxProviderV1): void {
@@ -302,14 +304,30 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
     const trimmedName = displayName.trim();
     const trimmedModel = model.trim();
     setSubmitting(true);
-    const result = await props.client.createTask({
-      request,
-      ...(trimmedName.length > 0 ? { displayName: trimmedName } : {}),
-      // Part 9: the selection round-trips through the contract to the
-      // engine; the server validates it (typed modelSelectionInvalid).
-      ...(trimmedModel.length > 0 ? { model: trimmedModel } : {}),
-      sandboxBinding,
-    });
+    let result: Awaited<ReturnType<typeof props.client.createTask>>;
+    try {
+      result = await props.client.createTask({
+        request,
+        ...(trimmedName.length > 0 ? { displayName: trimmedName } : {}),
+        // Part 9: the selection round-trips through the contract to the
+        // engine; the server validates it (typed modelSelectionInvalid).
+        ...(trimmedModel.length > 0 ? { model: trimmedModel } : {}),
+        sandboxBinding,
+      });
+    } catch (thrown) {
+      // A token refresh that fails (a keystore error) rejects instead of
+      // resolving: without this the form stayed on "Creating…" for good.
+      if (!cancelledRef.current) {
+        setSubmitting(false);
+        setError(`Could not create the task: ${String(thrown)}`);
+      }
+      return;
+    }
+    if (cancelledRef.current) {
+      // The user left while it was in flight. The task (if created) shows up
+      // in the list; it is not opened out from under them.
+      return;
+    }
     setSubmitting(false);
     if (result.ok) {
       props.onCreated(result.body);
@@ -324,10 +342,18 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
     <>
       <Row style={styles.spaceBetween}>
         <Title>New task</Title>
-        {/* Not while a create is in flight: it cannot be aborted, and the
-            task would be created anyway and then opened out from under the
-            list the user just went back to. */}
-        <TouchButton label="Cancel" variant="secondary" onPress={props.onCancel} disabled={submitting} />
+        {/* Always available — a hung request must not trap the user here.
+            Cancelling mid-create cannot abort it: the task may still be
+            created, and then appears in the list instead of being opened
+            out from under the user. */}
+        <TouchButton
+          label="Cancel"
+          variant="secondary"
+          onPress={() => {
+            cancelledRef.current = true;
+            props.onCancel();
+          }}
+        />
       </Row>
       <Card>
         <Stack>

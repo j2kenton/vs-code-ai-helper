@@ -65,23 +65,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * body stream that does not (an injected fetch, a stalled proxy stream).
  */
 function readBodyOrAbort(response: Response, signal: AbortSignal): Promise<string> {
-  if (signal.aborted) {
-    return Promise.reject(new Error("aborted"));
+  return raceAbortV1(
+    response.text().catch((error: unknown) => {
+      throw error instanceof Error ? error : new Error("body read failed");
+    }),
+    signal
+  );
+}
+
+/**
+ * The shared bounded formatter, made safe for anything a `catch` can hold,
+ * with this transport's OWN credentials redacted on top: a control-plane
+ * access (`cpat_…`) or refresh (`cprt_…`) token in an error message — a
+ * failed refresh naming its token, say — is not a shape the shared
+ * formatter knows, and the detail reaches the VS Code UI and logs.
+ */
+function safeTransportDetailV1(value: unknown): string | undefined {
+  let detail: string | undefined;
+  try {
+    detail = boundedTransportDetailV1(value);
+  } catch {
+    // A thrown object whose own toString throws: nothing safe to show.
+    return undefined;
   }
-  return new Promise<string>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error("aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    response.text().then(
-      (text) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(text);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error instanceof Error ? error : new Error("body read failed"));
-      }
-    );
-  });
+  return detail?.replace(/\bcp(?:at|rt)_[A-Za-z0-9_-]+/g, "[redacted-token]");
 }
 
 /** `runnerId` distinguishes this transport in logs/telemetry from local CLI/Copilot runner ids. */
@@ -121,31 +128,12 @@ export function createRemoteOrchestratorTextTransportV1(
       if (request.cancellationToken.isCancellationRequested) {
         return { kind: "callerCancelled" };
       }
-      let accessToken: string | undefined;
-      try {
-        accessToken = await getAccessToken();
-      } catch (error) {
-        return {
-          kind: "transportFailure",
-          code: "remoteOrchestratorNotSignedIn",
-          detail: boundedTransportDetailV1(error) ?? "the Ensemble Cloud session could not be read",
-        };
-      }
-      if (request.cancellationToken.isCancellationRequested) {
-        return { kind: "callerCancelled" };
-      }
-      if (accessToken === undefined) {
-        return {
-          kind: "transportFailure",
-          code: "remoteOrchestratorNotSignedIn",
-          detail: "no active Ensemble Cloud session — sign in to run this stage on the cloud box",
-        };
-      }
-
-      // Cancellation and the deadline cover the WHOLE call, body included.
-      // They used to be released as soon as headers arrived, so a proxy that
-      // sent headers and then stalled left the stage hung with Cancel no
-      // longer able to stop it (review finding, 2026-09-11).
+      // Cancellation and the deadline cover the WHOLE call: the session
+      // lookup (which may refresh the token over the network), the request
+      // and the body. They used to start only after the lookup — a lookup
+      // that hung ignored Cancel and the deadline both — and to be released
+      // once headers arrived, so a proxy that sent headers and then stalled
+      // left the stage hung (reviews, 2026-09-11).
       const controller = new AbortController();
       let timedOut = false;
       const cancelListener = request.cancellationToken.onCancellationRequested(() => {
@@ -155,78 +143,139 @@ export function createRemoteOrchestratorTextTransportV1(
         timedOut = true;
         controller.abort();
       }, options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS_V1);
-
-      let response: Response;
-      let bodyText: string;
       try {
-        response = await fetchImpl(`${baseUrl}/v1/provider-calls`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({ provider, model, prompt: request.prompt }),
-          signal: controller.signal,
-        });
-        bodyText = await readBodyOrAbort(response, controller.signal);
-      } catch (error) {
-        if (request.cancellationToken.isCancellationRequested) {
-          return { kind: "callerCancelled" };
-        }
-        if (timedOut) {
-          return {
-            kind: "transportFailure",
-            code: "remoteOrchestratorTimeout",
-            detail: "the remote orchestrator did not finish the call in time",
-            networkFault: true,
-          };
-        }
-        return {
-          kind: "transportFailure",
-          code: "remoteOrchestratorTransportError",
-          detail: boundedTransportDetailV1(error) ?? "network error",
-          networkFault: true,
-        };
+        return await invokeUnderDeadline(controller, () => timedOut);
       } finally {
         clearTimeout(deadline);
         cancelListener.dispose();
       }
-      const parsed: unknown = ((): unknown => {
-        try {
-          return JSON.parse(bodyText) as unknown;
-        } catch {
-          return undefined;
-        }
-      })();
 
-      if (response.status === 200) {
-        const success = isRecord(parsed) ? (parsed as unknown as ProviderCallSuccessBodyV1) : undefined;
-        if (success === undefined || typeof success.text !== "string") {
+      async function invokeUnderDeadline(
+        controller: AbortController,
+        didTimeOut: () => boolean
+      ): Promise<AgentTransportExitV1> {
+        let accessToken: string | undefined;
+        try {
+          accessToken = await raceAbortV1(getAccessToken(), controller.signal);
+        } catch (error) {
+          if (request.cancellationToken.isCancellationRequested) {
+            return { kind: "callerCancelled" };
+          }
+          if (didTimeOut()) {
+            return {
+              kind: "transportFailure",
+              code: "remoteOrchestratorTimeout",
+              detail: "the Ensemble Cloud session could not be read in time",
+            };
+          }
           return {
             kind: "transportFailure",
-            code: "remoteOrchestratorMalformedResponse",
-            detail: "the remote orchestrator's response had no text field",
+            code: "remoteOrchestratorNotSignedIn",
+            detail: safeTransportDetailV1(error) ?? "the Ensemble Cloud session could not be read",
           };
         }
-        output.write(success.text);
-        return { kind: "completed" };
-      }
+        if (request.cancellationToken.isCancellationRequested) {
+          return { kind: "callerCancelled" };
+        }
+        // An empty token is no session either — never send a bare "Bearer ".
+        if (accessToken === undefined || accessToken.length === 0) {
+          return {
+            kind: "transportFailure",
+            code: "remoteOrchestratorNotSignedIn",
+            detail: "no active Ensemble Cloud session — sign in to run this stage on the cloud box",
+          };
+        }
 
-      // The body is untrusted: fields are used only when they are strings (a
-      // non-string `message` used to make `.slice` throw out of invoke), and
-      // the detail goes through the shared bounded, redacting formatter the
-      // AgentTransportExitV1 contract requires.
-      const errorBody = isRecord(parsed) ? parsed : undefined;
-      const errorCode = typeof errorBody?.["code"] === "string" ? errorBody["code"] : undefined;
-      const errorMessage = typeof errorBody?.["message"] === "string" ? errorBody["message"] : undefined;
-      const code =
-        errorCode !== undefined && /^[A-Za-z0-9._-]{1,64}$/.test(errorCode)
-          ? `remoteOrchestrator.${errorCode}`
-          : `remoteOrchestratorHttp${response.status}`;
-      const detail =
-        boundedTransportDetailV1(errorMessage ?? `remote orchestrator returned ${response.status}`) ??
-        `remote orchestrator returned ${response.status}`;
-      return { kind: "transportFailure", code, detail };
+        let response: Response;
+        let bodyText: string;
+        try {
+          response = await fetchImpl(`${baseUrl}/v1/provider-calls`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({ provider, model, prompt: request.prompt }),
+            signal: controller.signal,
+          });
+          bodyText = await readBodyOrAbort(response, controller.signal);
+        } catch (error) {
+          if (request.cancellationToken.isCancellationRequested) {
+            return { kind: "callerCancelled" };
+          }
+          if (didTimeOut()) {
+            return {
+              kind: "transportFailure",
+              code: "remoteOrchestratorTimeout",
+              detail: "the remote orchestrator did not finish the call in time",
+              networkFault: true,
+            };
+          }
+          return {
+            kind: "transportFailure",
+            code: "remoteOrchestratorTransportError",
+            detail: safeTransportDetailV1(error) ?? "network error",
+            networkFault: true,
+          };
+        }
+        const parsed: unknown = ((): unknown => {
+          try {
+            return JSON.parse(bodyText) as unknown;
+          } catch {
+            return undefined;
+          }
+        })();
+
+        if (response.status === 200) {
+          const success = isRecord(parsed) ? (parsed as unknown as ProviderCallSuccessBodyV1) : undefined;
+          if (success === undefined || typeof success.text !== "string") {
+            return {
+              kind: "transportFailure",
+              code: "remoteOrchestratorMalformedResponse",
+              detail: "the remote orchestrator's response had no text field",
+            };
+          }
+          output.write(success.text);
+          return { kind: "completed" };
+        }
+
+        // The body is untrusted: fields are used only when they are strings (a
+        // non-string `message` used to make `.slice` throw out of invoke), and
+        // the detail goes through the shared bounded, redacting formatter the
+        // AgentTransportExitV1 contract requires.
+        const errorBody = isRecord(parsed) ? parsed : undefined;
+        const errorCode = typeof errorBody?.["code"] === "string" ? errorBody["code"] : undefined;
+        const errorMessage = typeof errorBody?.["message"] === "string" ? errorBody["message"] : undefined;
+        const code =
+          errorCode !== undefined && /^[A-Za-z0-9._-]{1,64}$/.test(errorCode)
+            ? `remoteOrchestrator.${errorCode}`
+            : `remoteOrchestratorHttp${response.status}`;
+        const detail =
+          safeTransportDetailV1(errorMessage ?? `remote orchestrator returned ${response.status}`) ??
+          `remote orchestrator returned ${response.status}`;
+        return { kind: "transportFailure", code, detail };
+      }
     },
   };
+}
+
+/** `promise`, or a rejection as soon as `signal` aborts (whichever comes first). */
+function raceAbortV1<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
 }

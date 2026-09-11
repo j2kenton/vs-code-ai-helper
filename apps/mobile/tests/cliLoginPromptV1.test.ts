@@ -15,8 +15,29 @@ import {
   describeCliLoginVerdictV1,
   extractCliLoginUrlV1,
   isClaudeSignInUrlV1,
+  parseSandboxLoginCodeBodyV1,
+  parseSandboxLoginStartBodyV1,
   stripTerminalControlV1,
 } from '../src/sandbox/cliLoginPromptV1';
+
+test('sign-in replies are checked: a host that is not a control plane cannot strand the card', () => {
+  // A 2xx body is only CAST by the API client; these used to be read blindly.
+  for (const junk of ['<html>ok</html>', '', null, {}, [], { loginSessionId: 7 }, { loginSessionId: '' }]) {
+    assert.equal(parseSandboxLoginStartBodyV1(junk), undefined, JSON.stringify(junk));
+  }
+  assert.deepEqual(parseSandboxLoginStartBodyV1({ loginSessionId: 'abc', promptOutput: 'x' }), {
+    loginSessionId: 'abc',
+    promptOutput: 'x',
+  });
+  // A missing prompt is not fatal: the card says no link was printed.
+  assert.deepEqual(parseSandboxLoginStartBodyV1({ loginSessionId: 'abc' }), { loginSessionId: 'abc', promptOutput: '' });
+
+  for (const junk of ['<html>ok</html>', null, {}, { completed: 'yes' }]) {
+    assert.equal(parseSandboxLoginCodeBodyV1(junk), undefined, JSON.stringify(junk));
+  }
+  assert.deepEqual(parseSandboxLoginCodeBodyV1({ completed: true, success: true }), { completed: true, success: true });
+  assert.deepEqual(parseSandboxLoginCodeBodyV1({ completed: false, success: 'no' }), { completed: false });
+});
 
 const URL =
   'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=YSq5QGZrF0N0KgFUss7-DewSM5uW7xl5gon6T-9baAE&code_challenge_method=S256&state=f53MBYvOlJQx6PG0xkI2JflXIFPkNjQt2Nv1TmL8bZE';

@@ -93,6 +93,45 @@ export type CliLoginVerdictV1 =
   | { readonly kind: 'rejected' }
   | { readonly kind: 'stillWorking' };
 
+/**
+ * The start-sign-in reply, checked. The API client only casts a 2xx body to
+ * its declared type, so a control-plane URL pointing at something that is
+ * not a control plane (a host answering every path with 200 HTML) handed the
+ * screen a string, and reading `.promptOutput` off it threw — leaving the
+ * card on "Starting…" with no way out (review of the final-review fixes).
+ */
+export function parseSandboxLoginStartBodyV1(
+  body: unknown
+): { readonly loginSessionId: string; readonly promptOutput: string } | undefined {
+  if (typeof body !== 'object' || body === null) {
+    return undefined;
+  }
+  const record = body as Record<string, unknown>;
+  if (typeof record.loginSessionId !== 'string' || record.loginSessionId.length === 0) {
+    return undefined;
+  }
+  return {
+    loginSessionId: record.loginSessionId,
+    promptOutput: typeof record.promptOutput === 'string' ? record.promptOutput : '',
+  };
+}
+
+/** The code-submission reply, checked (see `parseSandboxLoginStartBodyV1`). */
+export function parseSandboxLoginCodeBodyV1(
+  body: unknown
+): { readonly completed: boolean; readonly success?: boolean } | undefined {
+  if (typeof body !== 'object' || body === null) {
+    return undefined;
+  }
+  const record = body as Record<string, unknown>;
+  if (typeof record.completed !== 'boolean') {
+    return undefined;
+  }
+  return typeof record.success === 'boolean'
+    ? { completed: record.completed, success: record.success }
+    : { completed: record.completed };
+}
+
 /** The user-facing meaning of the code-submission body. */
 export function cliLoginVerdictV1(result: {
   readonly completed: boolean;

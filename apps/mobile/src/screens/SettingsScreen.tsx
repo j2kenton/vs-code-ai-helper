@@ -22,6 +22,8 @@ import {
   cliLoginVerdictV1,
   describeCliLoginVerdictV1,
   extractCliLoginUrlV1,
+  parseSandboxLoginCodeBodyV1,
+  parseSandboxLoginStartBodyV1,
 } from '../sandbox/cliLoginPromptV1';
 import { getAppServicesV1 } from '../services/appServicesV1';
 import { useAppStore, type ThemePreference } from '../state/appStore';
@@ -114,10 +116,30 @@ export function SettingsScreen(): React.JSX.Element {
   const sandboxTarget = JSON.stringify([controlPlaneUrl, sandboxProvider, signedIn]);
   const sandboxTargetRef = React.useRef(sandboxTarget);
   sandboxTargetRef.current = sandboxTarget;
+  /**
+   * Bumped on EVERY target change. The string alone could not tell "still
+   * the same sandbox" from "signed out, and someone else signed in on the
+   * same URL and provider" — the key returns to the identical value, and a
+   * sign-in started by the first account landed on the second's screen
+   * (review of the final-review fixes). An action captures the generation
+   * when it starts and is dropped if it has moved.
+   */
+  const targetGenerationRef = React.useRef(0);
+  /** The same, for the SESSION alone (URL or sign-in state): a provider switch keeps it. */
+  const sessionKey = JSON.stringify([controlPlaneUrl, signedIn]);
+  const sessionGenerationRef = React.useRef(0);
   const [resetArmedFor, setResetArmedFor] = React.useState<string | null>(null);
-  const [resetNotice, setResetNotice] = React.useState<string | null>(null);
-  /** A confirmed reset is in flight: nothing else may touch this sandbox until it lands. */
-  const [resetting, setResetting] = React.useState(false);
+  /** Kept per sandbox: a reset's outcome is reported for the sandbox it was for, even after a provider switch. */
+  const [resetNotice, setResetNoticeFor] = React.useState<{ readonly target: string; readonly message: string } | null>(
+    null
+  );
+  /**
+   * The sandbox a confirmed reset is in flight for. Per sandbox, not one
+   * flag for the screen: an E2B reset in flight used to show the Docker card
+   * as "Resetting…" with its controls disabled.
+   */
+  const [resettingFor, setResettingFor] = React.useState<string | null>(null);
+  const resetting = resettingFor === sandboxTarget;
   /**
    * Only the Docker provider can run an interactive sign-in. The server
    * provisions the persistent sandbox BEFORE it finds that out, so offering
@@ -126,11 +148,17 @@ export function SettingsScreen(): React.JSX.Element {
    */
   const interactiveSignInSupported = sandboxProvider === 'docker';
   React.useEffect(() => {
+    targetGenerationRef.current += 1;
     setCliLogin({ kind: 'idle' });
     setCliCodeDraft('');
     setResetArmedFor(null);
-    setResetNotice(null);
   }, [sandboxTarget]);
+  React.useEffect(() => {
+    // A different session (or server) owns nothing the previous one started.
+    sessionGenerationRef.current += 1;
+    setResetNoticeFor(null);
+    setResettingFor(null);
+  }, [sessionKey]);
 
   React.useEffect(() => services.session.onChange(setSession), [services, setSession]);
 
@@ -226,22 +254,41 @@ export function SettingsScreen(): React.JSX.Element {
    * receives inside the sandbox, and the server's code-submission reply is
    * a verdict only (see `SandboxLoginCodeResultDtoV1`).
    */
+  /** Captured when an action starts; `isCurrent()` is false once the card shows another sandbox or session. */
+  function captureTarget(): { readonly target: string; isCurrent(): boolean } {
+    const target = sandboxTarget;
+    const generation = targetGenerationRef.current;
+    return {
+      target,
+      isCurrent: () => sandboxTargetRef.current === target && targetGenerationRef.current === generation,
+    };
+  }
+
   async function startCliLogin(): Promise<void> {
     if (resetting || !interactiveSignInSupported) {
       return;
     }
-    const target = sandboxTarget;
+    const captured = captureTarget();
     // Starting a sign-in abandons a half-confirmed reset: coming back to an
     // already-armed reset after signing in would let one press destroy the
     // login just made.
     setResetArmedFor(null);
     setCliLogin({ kind: 'starting' });
     setCliCodeDraft('');
-    const started = await services.client.startSandboxLogin(sandboxProvider);
-    if (sandboxTargetRef.current !== target) {
-      // The picker moved while the server was starting it: this sign-in
-      // belongs to a sandbox the card no longer shows. The effect above has
-      // already reset the card; the orphaned server session times out.
+    let started: Awaited<ReturnType<typeof services.client.startSandboxLogin>>;
+    try {
+      started = await services.client.startSandboxLogin(sandboxProvider);
+    } catch (error) {
+      if (captured.isCurrent()) {
+        setCliLogin({ kind: 'failed', message: `Could not start the sign-in: ${String(error)}` });
+      }
+      return;
+    }
+    if (!captured.isCurrent()) {
+      // The picker moved (or the session changed) while the server was
+      // starting it: this sign-in belongs to a sandbox the card no longer
+      // shows. The effect above has already reset the card; the orphaned
+      // server session times out.
       return;
     }
     if (!started.ok) {
@@ -256,10 +303,18 @@ export function SettingsScreen(): React.JSX.Element {
       });
       return;
     }
-    const url = extractCliLoginUrlV1(started.body.promptOutput);
+    const body = parseSandboxLoginStartBodyV1(started.body);
+    if (body === undefined) {
+      setCliLogin({
+        kind: 'failed',
+        message: 'The server answered, but not like a control plane. Check the control-plane URL.',
+      });
+      return;
+    }
+    const url = extractCliLoginUrlV1(body.promptOutput);
     setCliLogin({
       kind: 'awaitingCode',
-      loginSessionId: started.body.loginSessionId,
+      loginSessionId: body.loginSessionId,
       url,
       submitting: false,
       notice:
@@ -274,10 +329,18 @@ export function SettingsScreen(): React.JSX.Element {
       return;
     }
     const pending = cliLogin;
-    const target = sandboxTarget;
+    const captured = captureTarget();
     setCliLogin({ ...pending, submitting: true, notice: null });
-    const result = await services.client.submitSandboxLoginCode(pending.loginSessionId, cliCodeDraft.trim());
-    if (sandboxTargetRef.current !== target) {
+    let result: Awaited<ReturnType<typeof services.client.submitSandboxLoginCode>>;
+    try {
+      result = await services.client.submitSandboxLoginCode(pending.loginSessionId, cliCodeDraft.trim());
+    } catch (error) {
+      if (captured.isCurrent()) {
+        setCliLogin({ ...pending, submitting: false, notice: `Could not submit the code: ${String(error)}` });
+      }
+      return;
+    }
+    if (!captured.isCurrent()) {
       // The verdict is for a sandbox this card no longer shows: never let
       // it switch the model default for the one it does.
       return;
@@ -292,7 +355,16 @@ export function SettingsScreen(): React.JSX.Element {
       });
       return;
     }
-    const verdict = cliLoginVerdictV1(result.body);
+    const body = parseSandboxLoginCodeBodyV1(result.body);
+    if (body === undefined) {
+      setCliLogin({
+        ...pending,
+        submitting: false,
+        notice: 'The server answered, but not like a control plane. Check the control-plane URL.',
+      });
+      return;
+    }
+    const verdict = cliLoginVerdictV1(body);
     const message = describeCliLoginVerdictV1(verdict);
     if (verdict.kind === 'signedIn') {
       setCliCodeDraft('');
@@ -321,31 +393,38 @@ export function SettingsScreen(): React.JSX.Element {
   async function resetSandbox(): Promise<void> {
     if (!resetArmed) {
       setResetArmedFor(sandboxTarget);
-      setResetNotice(null);
+      setResetNoticeFor(null);
       return;
     }
     setResetArmedFor(null);
-    const target = sandboxTarget;
-    setResetting(true);
-    let result: Awaited<ReturnType<typeof services.client.resetUserSandbox>>;
+    const captured = captureTarget();
+    const sessionGeneration = sessionGenerationRef.current;
+    const sameSession = (): boolean => sessionGenerationRef.current === sessionGeneration;
+    setResettingFor(captured.target);
+    let message: string;
     try {
-      result = await services.client.resetUserSandbox(sandboxProvider);
+      const result = await services.client.resetUserSandbox(sandboxProvider);
+      message = result.ok
+        ? 'Sandbox destroyed. The next task or sign-in creates a fresh one.'
+        : result.code === 'userSandboxNotFound'
+          ? 'No persistent sandbox exists yet — nothing to reset.'
+          : `Could not reset: ${result.message}`;
+      if (result.ok && captured.isCurrent()) {
+        // Only the card still showing THIS sandbox loses its sign-in state;
+        // a sign-in since started for another provider is left alone.
+        setCliLogin({ kind: 'idle' });
+      }
+    } catch (error) {
+      message = `Could not reset: ${String(error)}`;
     } finally {
-      setResetting(false);
+      if (sameSession()) {
+        setResettingFor((current) => (current === captured.target ? null : current));
+      }
     }
-    if (sandboxTargetRef.current !== target) {
-      // The picker moved while the reset was in flight: its result belongs
-      // to a sandbox this card no longer shows, and must not clear a
-      // sign-in the user has since started for the new one.
-      return;
-    }
-    if (result.ok) {
-      setResetNotice('Sandbox destroyed. The next task or sign-in creates a fresh one.');
-      setCliLogin({ kind: 'idle' });
-    } else if (result.code === 'userSandboxNotFound') {
-      setResetNotice('No persistent sandbox exists yet — nothing to reset.');
-    } else {
-      setResetNotice(`Could not reset: ${result.message}`);
+    if (sameSession()) {
+      // Reported for the sandbox it was for — visible on that provider's
+      // card even if the picker has moved on — and never to another session.
+      setResetNoticeFor({ target: captured.target, message });
     }
   }
 
@@ -552,7 +631,9 @@ export function SettingsScreen(): React.JSX.Element {
                   ) : null}
                 </Row>
               ) : null}
-              {resetNotice !== null ? <Body muted>{resetNotice}</Body> : null}
+              {resetNotice !== null && resetNotice.target === sandboxTarget ? (
+                <Body muted>{resetNotice.message}</Body>
+              ) : null}
             </Stack>
           ) : cliLogin.kind === 'starting' ? (
             <Body muted>Starting the CLI sign-in in your sandbox…</Body>

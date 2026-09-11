@@ -250,7 +250,9 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
       fetchImpl: (() => Promise.resolve(jsonResponse(200, { text: "x" }))) as typeof fetch,
     });
     const first = await throwing.invoke(makeRequest(), makeWriter());
-    assert.equal(first.kind, "transportFailure");
+    assert.ok(first.kind === "transportFailure");
+    assert.equal(first.code, "remoteOrchestratorNotSignedIn");
+    assert.ok(first.detail?.includes("keychain unavailable"), first.detail);
 
     const oddBody = createRemoteOrchestratorTextTransportV1({
       baseUrl: "https://orchestrator.example.com",
@@ -280,5 +282,65 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
     assert.equal(exit.kind, "transportFailure");
     assert.ok(exit.kind === "transportFailure");
     assert.equal(exit.code, "remoteOrchestratorTimeout");
+  });
+
+  void it("control-plane tokens never reach the failure detail; an empty token is no session", async () => {
+    const leaky = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.reject(new Error("refresh failed for refresh_token cprt_0123456789abcdef0123")),
+    });
+    const exit = await leaky.invoke(makeRequest(), makeWriter());
+    assert.ok(exit.kind === "transportFailure");
+    assert.equal(exit.detail?.includes("cprt_0123"), false, exit.detail);
+
+    let fetched = false;
+    const empty = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.resolve(""),
+      fetchImpl: (() => {
+        fetched = true;
+        return Promise.resolve(jsonResponse(200, { text: "x" }));
+      }) as unknown as typeof fetch,
+    });
+    const emptyExit = await empty.invoke(makeRequest(), makeWriter());
+    assert.ok(emptyExit.kind === "transportFailure");
+    assert.equal(emptyExit.code, "remoteOrchestratorNotSignedIn");
+    assert.equal(fetched, false);
+  });
+
+  void it("Cancel and the deadline also cover a session lookup that hangs (a token refresh over the network)", async () => {
+    let fetched = false;
+    const hungLookup = {
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: (): Promise<string | undefined> => new Promise<string | undefined>(() => undefined),
+      fetchImpl: (() => {
+        fetched = true;
+        return Promise.resolve(jsonResponse(200, { text: "x" }));
+      }) as unknown as typeof fetch,
+    };
+
+    const token = fakeToken();
+    const cancelled = createRemoteOrchestratorTextTransportV1(hungLookup).invoke(
+      makeRequest({ cancellationToken: token }),
+      makeWriter()
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    (token as unknown as { isCancellationRequested: boolean }).isCancellationRequested = true;
+    token.fireCancel();
+    assert.deepEqual(await cancelled, { kind: "callerCancelled" });
+
+    const timedOut = await createRemoteOrchestratorTextTransportV1({ ...hungLookup, requestTimeoutMs: 30 }).invoke(
+      makeRequest(),
+      makeWriter()
+    );
+    assert.ok(timedOut.kind === "transportFailure");
+    assert.equal(timedOut.code, "remoteOrchestratorTimeout");
+    assert.equal(fetched, false, "nothing reaches the network once the call is abandoned");
   });
 });

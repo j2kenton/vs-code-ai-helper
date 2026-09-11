@@ -52,23 +52,27 @@ test('Settings tab renders sign-in options and the BYOS controls', async ({ page
   await expect(page.getByPlaceholder('https://control-plane.example.com')).toBeVisible();
 });
 
-test('Settings sandbox provider selection toggles between E2B and Daytona', async ({ page }) => {
+test('Settings sandbox provider selection defaults to Docker and toggles between providers', async ({ page }) => {
   await page.getByTestId('tab-settings').click();
+  const docker = page.getByRole('radio', { name: 'Docker' });
   const e2b = page.getByRole('radio', { name: 'E2B' });
   const daytona = page.getByRole('radio', { name: 'Daytona' });
 
   // The selection is now an ARIA state rather than a colour, so this asserts
   // WHICH provider is selected — previously it could only check that both
-  // options were still visible and clickable after a change.
-  await expect(e2b).toBeChecked();
+  // options were still visible and clickable after a change. A fresh install
+  // defaults to Docker, the self-hosted provider.
+  await expect(docker).toBeChecked();
+  await expect(e2b).not.toBeChecked();
   await expect(daytona).not.toBeChecked();
 
   await daytona.click();
   await expect(daytona).toBeChecked();
-  await expect(e2b).not.toBeChecked();
+  await expect(docker).not.toBeChecked();
 
   await e2b.click();
   await expect(e2b).toBeChecked();
+  await expect(daytona).not.toBeChecked();
 });
 
 test('Settings gate policy toggle flips its state without a network dependency', async ({ page }) => {
