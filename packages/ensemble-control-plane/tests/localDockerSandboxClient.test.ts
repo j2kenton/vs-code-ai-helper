@@ -649,6 +649,31 @@ test("createSandbox: a container that fails to start is removed, not left behind
   assert.equal(created[0]?.HostConfig.Init, true);
 });
 
+test("findCommandByAttemptKey: a running command is found by the marker in its ENVIRONMENT, and never killed", async () => {
+  // argv alone misses a shell that exec'd its command (bash does for
+  // `sh -c 'A=1 cmd'`): the marker then lives only in the environment.
+  const daemon = makeExecDaemon(() => undefined);
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never });
+    assert.equal(await client.findCommandByAttemptKey(SANDBOX_ID, "abc123abc123abc1"), "executed");
+    assert.equal(await client.findCommandByAttemptKey(SANDBOX_ID, "abc123abc123abc1"), "unknown", "none running proves nothing");
+    assert.equal(daemon.markerScans.length, 2);
+    for (const script of daemon.markerScans) {
+      assert.ok(script.includes("/environ") && script.includes("abc123abc123abc1"));
+      assert.equal(script.includes("kill"), false, "a lookup must not kill what it finds");
+    }
+  } finally {
+    daemon.restore();
+  }
+  const broken = makeExecDaemon(() => undefined, { scanBroken: true });
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: broken.docker as never });
+    assert.equal(await client.findCommandByAttemptKey(SANDBOX_ID, "abc123abc123abc1"), "unknown");
+  } finally {
+    broken.restore();
+  }
+});
+
 test("exec capture: a stop that cannot be PROVEN (marked processes survive) throws, never a terminal exit code", async () => {
   // Returning 124 while children kept running is how a 'stopped' round kept
   // editing files. An unprovable stop leaves the attempt open for recovery.

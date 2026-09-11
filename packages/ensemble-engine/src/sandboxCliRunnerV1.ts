@@ -202,6 +202,8 @@ export const SANDBOX_CLI_ROUND_FAILURE_CODES_V1 = {
   leaseUnavailable: "cliRoundLeaseUnavailable",
   /** The command's fate could not be established (broken stream, unprovable stop). */
   outcomeUnknown: "cliRoundOutcomeUnknown",
+  /** Bookkeeping failed before the command was handed to the sandbox — nothing ran. */
+  notStarted: "cliRoundNotStarted",
 } as const;
 
 const ENV_NAME_PATTERN_V1 = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -345,17 +347,20 @@ export function createSandboxCliProviderRunnerV1(
         // a reconciled re-issue); every other recovery outcome has no output
         // to parse and is reported as such below.
         let captured: SandboxCommandResultV1 | undefined;
+        /** Set the moment the CLI command is handed to the sandbox. */
+        let commandStarted = false;
         // The step id carries the model as well as the invocation: dispatch
         // hands the SAME invocation to each cascade candidate, and with the
         // attempt id alone a `claude-cli:opus` backup found the failed
         // `claude-cli:sonnet` primary's attempt record and reported
         // "already executed" without ever running (review finding, 2026-09-11).
-        let effect: Awaited<ReturnType<EngineGateMachineryV1["runUngatedEffect"]>>;
+        let effect: Awaited<ReturnType<EngineGateMachineryV1["runUngatedEffect"]>> | undefined;
         try {
           effect = await machinery.runUngatedEffect(`cli-round/${id}/${selectedModel ?? "cli-default"}`, {
             effectKind: "sandboxCommand",
             supportsIdempotentReplay: false,
             async execute(attemptKey: string) {
+              commandStarted = true;
               captured = await client.runCommand({
                 sandboxId,
                 argv: ["sh", "-c", script],
@@ -372,16 +377,30 @@ export function createSandboxCliProviderRunnerV1(
             },
           });
         } catch {
-          // The CLI's fate is UNKNOWN: the exec stream broke, or a stop could
-          // not be proven (the sandbox client throws for exactly that). The
-          // CLI may still be editing files. Terminal, never retryable: a
-          // retry runs under a fresh attempt id and would start a SECOND
-          // edit-mode CLI next to it (final review — the task loop used to
-          // turn this throw into a retryable providerInvocationFailed).
-          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outcomeUnknown, false);
+          // Where the throw came from decides what it means (second final
+          // review — one blanket answer both ended tasks over a passing store
+          // error and threw away rounds whose edits had already landed):
+          if (!commandStarted) {
+            // Lease or attempt bookkeeping failed before the CLI was handed
+            // to the sandbox: nothing ran, so a retry is safe.
+            return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.notStarted, true);
+          }
+          if (captured === undefined) {
+            // The CLI's fate is UNKNOWN: the exec stream broke, or a stop
+            // could not be proven (the sandbox client throws for exactly
+            // that). It may still be editing files. Terminal: a retry runs
+            // under a fresh attempt id and would start a SECOND edit-mode CLI
+            // next to it.
+            return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outcomeUnknown, false);
+          }
+          // The CLI finished and its result is in hand; only the bookkeeping
+          // after it (recording completion, releasing the lease) failed. The
+          // round's work is real — read it below like any executed round.
         }
 
-        switch (effect.kind) {
+        switch (effect?.kind) {
+          case undefined:
+            break;
           case "alreadyExecuted":
             return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.alreadyExecuted, false);
           case "indeterminate":
@@ -405,9 +424,13 @@ export function createSandboxCliProviderRunnerV1(
           // the CLI's own words; the captured tail can carry the SANDBOX
           // CLIENT's note on top (e.g. Docker's "[ensemble] command stopped:
           // timed out"), which the file alone lost.
-          const stderrFile = (await client.readFileUtf8(sandboxId, stderrPath)) ?? "";
-          const clientNote = captured.stderrTail.includes("[ensemble]") ? captured.stderrTail : "";
-          const stderr = [stderrFile, clientNote].filter((part) => part.length > 0).join("\n");
+          const stderrFile = await client.readFileUtf8(sandboxId, stderrPath);
+          // No stderr file means the CLI never started (the shell could not
+          // open the prompt or env file): the shell's own message is then
+          // only in the captured tail, which is kept whole.
+          const clientNote =
+            stderrFile === undefined || captured.stderrTail.includes("[ensemble]") ? captured.stderrTail : "";
+          const stderr = [stderrFile ?? "", clientNote].filter((part) => part.length > 0).join("\n");
           // The command's stdout is REDIRECTED to the output file, so the
           // captured `stdoutTail` is empty by construction — the CLI's own
           // words about why it failed are in that file. Confirmed live: a

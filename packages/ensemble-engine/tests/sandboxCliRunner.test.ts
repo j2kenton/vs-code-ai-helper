@@ -15,7 +15,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { allocateHex128IdV1, type ActionCorrelationV1 } from "../../ensemble-core/src/actionCorrelationV1";
 import { createRecordingEventSinkV1 } from "../src/engineEventsV1";
+import { createInMemoryExecutionAttemptStoreV1 } from "../src/executionAttemptStoreV1";
 import { createEngineGateMachineryV1 } from "../src/gateMachineryV1";
+import { createInMemoryLeaseStoreV1 } from "../src/leaseStoreV1";
 import {
   createInMemorySandboxClientV1,
   SANDBOX_ATTEMPT_KEY_MARKER_V1,
@@ -315,6 +317,57 @@ test("a sandbox client that THROWS (broken stream, unprovable stop) is a termina
     code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outcomeUnknown,
     retryable: false,
   });
+});
+
+test("a bookkeeping throw BEFORE the CLI starts is retryable (nothing ran); one AFTER it finished keeps the round's result", async () => {
+  // Second final review: a blanket catch ended the task over a passing
+  // store error, and threw away a finished round whose edits had landed.
+  const leaseStore = createInMemoryLeaseStoreV1({});
+  const before = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const beforeRunner = createSandboxCliProviderRunnerV1({
+    client: before,
+    sandboxId: SANDBOX,
+    workingDirectoryRoot: ROOT,
+    machinery: createEngineGateMachineryV1({
+      taskId: "task-1",
+      ownerId: "owner-1",
+      workerId: "worker-1",
+      sink: createRecordingEventSinkV1(),
+      leaseStore: { ...leaseStore, acquire: () => Promise.reject(new Error("SQLITE_BUSY")) },
+    }),
+  });
+  assert.deepEqual(await beforeRunner.invoke(invocation("impl")), {
+    kind: "failed",
+    code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.notStarted,
+    retryable: true,
+  });
+  assert.equal(before.executedCommands.length, 0);
+
+  const attempts = createInMemoryExecutionAttemptStoreV1({});
+  const after = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const afterRunner = createSandboxCliProviderRunnerV1({
+    client: after,
+    sandboxId: SANDBOX,
+    workingDirectoryRoot: ROOT,
+    machinery: createEngineGateMachineryV1({
+      taskId: "task-1",
+      ownerId: "owner-1",
+      workerId: "worker-1",
+      sink: createRecordingEventSinkV1(),
+      attemptStore: { ...attempts, complete: () => Promise.reject(new Error("SQLITE_BUSY")) },
+    }),
+  });
+  assert.deepEqual(await afterRunner.invoke(invocation("impl")), { kind: "completed", summaryMarkdown: SUMMARY });
+  assert.equal(after.executedCommands.length, 1);
+});
+
+test("a CLI that never started (no stderr file) still reports the shell's own error", async () => {
+  const client = createInMemorySandboxClientV1({
+    onCommand: () => ({ exitCode: 2, stdoutTail: "", stderrTail: "sh: 1: cannot open /tmp/x.prompt.md: No such file" }),
+  });
+  const outcome = await makeRunner(client).invokeWithModel(invocation("impl"), undefined);
+  assert.equal(outcome.result.kind, "failed");
+  assert.ok(outcome.classification?.errorMessage.includes("cannot open"), outcome.classification?.errorMessage);
 });
 
 test("a model-reported failure is never classified from its prose: 'credits'/'rate limit' wording cannot trigger a cascade", async () => {

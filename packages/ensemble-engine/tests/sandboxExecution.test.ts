@@ -449,7 +449,8 @@ test("split-lineage clone: a still-running original THROWS (record stays pending
   const liveClient = { ...running.client, findCommandByAttemptKey: () => Promise.resolve("executed" as const) };
   const effect = createGitCloneEffectV1({ ...running, client: liveClient });
   assert.equal(effect.supportsIdempotentReplay, true, "the clone step is replayed on recovery, not reconciled");
-  await assert.rejects(effect.execute("0123456789abcdef"), /still running/);
+  assert.deepEqual(await effect.execute("0123456789abcdef"), { status: "failed", code: "gitCloneStillRunning" });
+  assert.equal(running.client.executedCommands.length, 0, "nothing may race the original clone");
 
   // A persistent sandbox that already holds a clone of the same origin: fetch, never re-clone.
   const reused = contextWith({
@@ -477,6 +478,14 @@ test("split-lineage checkout: replay-safe, and a ref that looks like a git optio
     contextWith({ binding: { source: { kind: "gitClone", repoUrl: "https://example.com/repo.git", ref: "-f" } } })
   );
   assert.deepEqual(await hostile.execute("0123456789abcdef"), { status: "failed", code: "gitRefInvalid" });
+
+  // The composite clone+checkout effect carries the same guard, before any command runs.
+  const hostileContext = contextWith({
+    binding: { source: { kind: "gitClone", repoUrl: "https://example.com/repo.git", ref: "-f" } },
+  });
+  const composite = createSourceAcquisitionEffectV1(hostileContext);
+  assert.deepEqual(await composite.execute("0123456789abcdef"), { status: "failed", code: "gitRefInvalid" });
+  assert.equal(hostileContext.client.executedCommands.length, 0);
 });
 
 test("no child-process, eval, or Function-constructor usage exists anywhere in the engine sources", () => {

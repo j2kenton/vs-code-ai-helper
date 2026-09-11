@@ -461,7 +461,8 @@ type ScriptedBehavior =
   | { readonly kind: "quota" }
   | { readonly kind: "unavailable" }
   | { readonly kind: "entitlement" }
-  | { readonly kind: "malformed" };
+  | { readonly kind: "malformed" }
+  | { readonly kind: "modelFailed"; readonly message: string };
 
 function scriptedAdapter(
   providerId: "anthropic" | "openai" | "google",
@@ -512,6 +513,18 @@ function scriptedAdapter(
           };
         case "malformed":
           return { status: "completed", text: "no frame here at all" };
+        case "modelFailed":
+          return {
+            status: "completed",
+            text: frame({
+              version: 1,
+              correlation: correlationFromPrompt(input.prompt),
+              kind: "failed",
+              code: "testsFailing",
+              message: scripted.message,
+              retryable: true,
+            }),
+          };
       }
     },
   };
@@ -699,6 +712,19 @@ test("dispatch: a malformed frame is a typed retryable failure that never cascad
     retryable: true,
   });
   assert.equal(openai.invocations.length, 0);
+});
+
+test("dispatch: a model-reported failure is reported as-is — its prose never reads as quota, never cascades", async () => {
+  // "credits" + "fail" read as quota to the classifier: this ran the paid
+  // backup and made it the stage's sticky route (second final review).
+  const anthropic = scriptedAdapter("anthropic", () => ({
+    kind: "modelFailed",
+    message: "The credits page tests fail after my change; the rate limit middleware is flaky.",
+  }));
+  const openai = scriptedAdapter("openai", () => ({ kind: "completed", markdown: "x" }));
+  const result = await runner({ anthropic, openai }).invoke(invocation());
+  assert.deepEqual(result, { kind: "failed", code: "testsFailing", retryable: true });
+  assert.equal(openai.invocations.length, 0, "no backup may run on model-written prose");
 });
 
 test("dispatch: every non-impl stage's prompt says it is read-only; impl's says to edit and tick", async () => {

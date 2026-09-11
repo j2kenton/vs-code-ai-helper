@@ -495,21 +495,15 @@ export function createEngineProviderRunnerV1(
       };
     }
     // envelope.kind === "failed": the model itself reported a typed failure.
-    // Its message still participates in quota classification so a provider
-    // that reports its own rate limiting through the frame cascades too.
-    const classified = classifyEngineProviderFailureV1({ errorMessage: envelope.message });
-    if (classified.failureKind === "generic") {
-      return {
-        kind: "round",
-        result: { kind: "failed", code: envelope.code, retryable: envelope.retryable },
-      };
-    }
+    // It is reported as-is and never cascades — the same rule as the CLI
+    // path. Frame text is model-written, and the capacity classifier reads
+    // ordinary prose as quota: "The credits page tests fail after my change"
+    // ran the paid backup and made it the stage's sticky route (second final
+    // review, confirmed). A provider's REAL rate limiting arrives as a failed
+    // request (classified above), never as a well-formed frame.
     return {
-      kind: "failure",
-      failureKind: classified.failureKind,
-      authFailure: false,
-      code: envelope.code,
-      errorMessage: envelope.message,
+      kind: "round",
+      result: { kind: "failed", code: envelope.code, retryable: envelope.retryable },
     };
   }
 

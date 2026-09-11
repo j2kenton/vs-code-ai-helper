@@ -314,6 +314,10 @@ export function createSourceAcquisitionEffectV1(
     effectKind: "sandboxCommand",
     supportsIdempotentReplay: false,
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
+      if (source.ref.startsWith("-")) {
+        // Same guard as the split path: `checkout --detach -f` is an option.
+        return { status: "failed", code: "gitRefInvalid" };
+      }
       const clone = await client.runCommand({
         sandboxId: binding.sandboxId,
         argv: ["git", "clone", "--", source.repoUrl, binding.workingDirectoryRoot],
@@ -395,13 +399,15 @@ export function createGitCloneEffectV1(context: SandboxExecutionContextV1): Engi
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
       // A replay after a crash may find the ORIGINAL command still running
       // in the sandbox (the control plane died, the container did not).
-      // Racing it would corrupt the clone. THROW rather than return a failed
-      // outcome: a failure is recorded as the step's terminal result and the
-      // step could never run again for this task, even after the original
-      // finished (final review) — a throw leaves the record pending, so a
-      // later drive replays it once the original is gone.
+      // Racing it would corrupt the clone, so the step refuses with its own
+      // code. The production clients (Docker, E2B, Daytona) can only see
+      // LIVE processes, so "executed" from them means running now; the
+      // in-memory reference client also reports finished commands, where
+      // refusing is still the safe answer. Nothing re-drives a thrown step,
+      // so throwing here only blurred the task's failure code into
+      // `engineRunThrew` (second final review).
       if ((await client.findCommandByAttemptKey(binding.sandboxId, attemptKey)) === "executed") {
-        throw new Error("the previous clone attempt is still running in the sandbox; retry once it finishes");
+        return { status: "failed", code: "gitCloneStillRunning" };
       }
       // A PERSISTENT sandbox keeps its working tree between tasks, so the
       // second task on the same repo used to fail here: `git clone` refuses

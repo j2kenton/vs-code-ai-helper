@@ -20,9 +20,9 @@
  *   the open attempt record for 4c recovery.
  * - `resolveRealPath` is fail-closed (`readlink -f` through the exec API,
  *   mirroring Daytona's approach — trusts only a 0-exit absolute result).
- * - `findCommandByAttemptKey` uses `container.top()` (the daemon's OWN
- *   process introspection via `/proc`, not an in-container binary) to check
- *   for a currently-running process whose command line carries the marker.
+ * - `findCommandByAttemptKey` scans the container's `/proc/<pid>/environ`
+ *   for a currently-running process carrying the marker (the same scan the
+ *   process-tree stop uses; argv alone misses a shell that exec'd its command).
  *   Like E2B/Daytona, only LIVE processes are visible this way, so absence
  *   proves nothing — `"unknown"`, never `"notExecuted"`.
  *
@@ -132,6 +132,22 @@ async function killMarkedProcessesV1(
   containerId: string,
   envEntry: string
 ): Promise<number | undefined> {
+  return scanMarkedProcessesV1(docker, containerId, envEntry, true);
+}
+
+/**
+ * Count (and with `kill`, kill) the container's processes carrying
+ * `envEntry` in their ENVIRONMENT. The environment, not the command line:
+ * a shell that execs its last command (bash does for `sh -c 'A=1 cmd'`)
+ * leaves the marker assignment in no process's argv, so an argv search
+ * would miss a command that is running right now (final review).
+ */
+async function scanMarkedProcessesV1(
+  docker: Docker,
+  containerId: string,
+  envEntry: string,
+  kill: boolean
+): Promise<number | undefined> {
   const quoted = quotePosixShellArgV1(envEntry);
   // The count is printed LAST, on its own line, after an "ok" sentinel: a
   // scan that could not run to the end (a fork failure under the pid limit
@@ -140,7 +156,8 @@ async function killMarkedProcessesV1(
   const script =
     `n=0; for p in /proc/[0-9]*; do ` +
     `if tr '\\0' '\\n' < "$p/environ" 2>/dev/null | grep -qxF -- ${quoted}; then ` +
-    `kill -9 "\${p##*/}" 2>/dev/null; n=$((n+1)); fi; done; echo "ok $n"`;
+    (kill ? `kill -9 "\${p##*/}" 2>/dev/null; ` : "") +
+    `n=$((n+1)); fi; done; echo "ok $n"`;
   try {
     const exec = await docker.getContainer(containerId).exec({
       Cmd: ["/bin/sh", "-c", script],
@@ -659,16 +676,15 @@ export function createLocalDockerSandboxClientV1(
     ): Promise<EngineEffectReconcileVerdictV1> {
       try {
         await assertManaged(sandboxId);
-        const top = await docker.getContainer(sandboxId).top({ ps_args: "aux" });
-        const marker = `${SANDBOX_ATTEMPT_KEY_MARKER_V1}=${attemptKey}`;
-        for (const row of (top.Processes ?? []) as readonly string[][]) {
-          if (row.some((field: string) => field.includes(marker) || field.includes(attemptKey))) {
-            return "executed";
-          }
-        }
+        const running = await scanMarkedProcessesV1(
+          docker,
+          sandboxId,
+          `${SANDBOX_ATTEMPT_KEY_MARKER_V1}=${attemptKey}`,
+          false
+        );
         // Only currently-running processes are visible this way (the same
         // limitation the E2B/Daytona adapters accept): absence proves nothing.
-        return "unknown";
+        return running !== undefined && running > 0 ? "executed" : "unknown";
       } catch {
         return "unknown";
       }

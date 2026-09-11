@@ -374,6 +374,18 @@ function createProductionRunHostV1(options: CreateProductionRunHostOptionsV1): E
     async start(task) {
       let outcome: EngineRunOutcomeV1;
       try {
+        // Checkpoint BEFORE source acquisition: a clone can take minutes, and
+        // a crash during it used to leave no job record at all — boot
+        // reconciliation only sees `running` jobs, so the task read as
+        // "creating" forever (second final review). The real host
+        // re-checkpoints the same job when it starts.
+        store.upsertJob({
+          jobId: task.taskId,
+          taskId: task.taskId,
+          ownerUserId: task.ownerUserId,
+          status: "running",
+          updatedAt: new Date().toISOString(),
+        });
         await prefetchModelKeys(task);
         // An acquisition failure is as terminal as any other: it goes
         // through the same teardown, so a bad repo URL no longer leaves a
