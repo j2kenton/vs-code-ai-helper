@@ -196,8 +196,10 @@ export function createSqliteControlPlaneStoreV1(
   const now = options.now ?? ((): Date => new Date());
   const db = new DatabaseSync(options.databasePath);
   // Wait briefly on a lock another process holds (an external backup, a
-  // `sqlite3` shell) instead of failing at once with SQLITE_BUSY.
-  db.prepare("PRAGMA busy_timeout = 5000").get();
+  // `sqlite3` shell) instead of failing at once with SQLITE_BUSY. Kept
+  // short: node:sqlite is synchronous, so the wait blocks the event loop —
+  // a 5 s timeout froze the whole process per blocked statement.
+  db.prepare("PRAGMA busy_timeout = 1000").get();
   for (const statement of SCHEMA_STATEMENTS) {
     db.prepare(statement).run();
   }

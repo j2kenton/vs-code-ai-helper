@@ -260,6 +260,16 @@ export const ENGINE_CLASSIFIED_FAILURE_CODES_V1 = {
   authentication: "authenticationFailed",
 } as const;
 
+/**
+ * The code a MODEL-written failure frame is reported under. Namespaced so a
+ * model can never speak a transport's code: a frame saying `quotaExhausted`
+ * would otherwise end the run under that code (the run host does not retry
+ * capacity codes) as if the provider itself had refused (second final review).
+ */
+export function modelReportedFailureCodeV1(code: string): string {
+  return `modelReported.${code}`;
+}
+
 /** The failure code for a classified provider failure; `genericCode` when it is neither capacity- nor auth-shaped. */
 export function engineFailureCodeForKindV1(
   failureKind: EngineFailureKindV1,
@@ -503,7 +513,7 @@ export function createEngineProviderRunnerV1(
     // request (classified above), never as a well-formed frame.
     return {
       kind: "round",
-      result: { kind: "failed", code: envelope.code, retryable: envelope.retryable },
+      result: { kind: "failed", code: modelReportedFailureCodeV1(envelope.code), retryable: envelope.retryable },
     };
   }
 

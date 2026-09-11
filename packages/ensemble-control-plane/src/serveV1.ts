@@ -556,7 +556,9 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   // reachable around the tunnel, including from sandbox containers through
   // the Docker bridge gateway — kept out today only by the host firewall
   // (final review). ENSEMBLE_BIND_HOST overrides for a different topology.
-  const bindHost = process.env["ENSEMBLE_BIND_HOST"] ?? "127.0.0.1";
+  // Blank counts as unset: `listen(port, "")` binds EVERY interface, the
+  // opposite of what an empty value suggests (second final review).
+  const bindHost = process.env["ENSEMBLE_BIND_HOST"]?.trim() || "127.0.0.1";
   server.listen(port, bindHost);
   log(`control plane listening on http://${bindHost}:${port}`);
   log(`  database: ${databasePath}`);

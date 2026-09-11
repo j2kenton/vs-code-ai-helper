@@ -462,7 +462,7 @@ type ScriptedBehavior =
   | { readonly kind: "unavailable" }
   | { readonly kind: "entitlement" }
   | { readonly kind: "malformed" }
-  | { readonly kind: "modelFailed"; readonly message: string };
+  | { readonly kind: "modelFailed"; readonly message: string; readonly code?: string };
 
 function scriptedAdapter(
   providerId: "anthropic" | "openai" | "google",
@@ -520,7 +520,7 @@ function scriptedAdapter(
               version: 1,
               correlation: correlationFromPrompt(input.prompt),
               kind: "failed",
-              code: "testsFailing",
+              code: scripted.code ?? "testsFailing",
               message: scripted.message,
               retryable: true,
             }),
@@ -723,8 +723,14 @@ test("dispatch: a model-reported failure is reported as-is — its prose never r
   }));
   const openai = scriptedAdapter("openai", () => ({ kind: "completed", markdown: "x" }));
   const result = await runner({ anthropic, openai }).invoke(invocation());
-  assert.deepEqual(result, { kind: "failed", code: "testsFailing", retryable: true });
+  assert.deepEqual(result, { kind: "failed", code: "modelReported.testsFailing", retryable: true });
   assert.equal(openai.invocations.length, 0, "no backup may run on model-written prose");
+
+  // Nor may a model speak a transport's code: the run host treats
+  // `quotaExhausted` as the provider refusing, and does not retry it.
+  const forging = scriptedAdapter("anthropic", () => ({ kind: "modelFailed", message: "x", code: "quotaExhausted" }));
+  const forged = await runner({ anthropic: forging, openai }).invoke(invocation());
+  assert.deepEqual(forged, { kind: "failed", code: "modelReported.quotaExhausted", retryable: true });
 });
 
 test("dispatch: every non-impl stage's prompt says it is read-only; impl's says to edit and tick", async () => {

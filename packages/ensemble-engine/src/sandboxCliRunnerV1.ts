@@ -55,6 +55,7 @@ import {
   ENGINE_CLASSIFIED_FAILURE_CODES_V1,
   ENGINE_ROUND_MAX_RESPONSE_BYTES_V1,
   engineFailureCodeForKindV1,
+  modelReportedFailureCodeV1,
   type EngineCliRoundOutcomeV1,
   type EngineCliTransportRunnerV1,
 } from "./providerDispatchV1";
@@ -501,7 +502,7 @@ export function createSandboxCliProviderRunnerV1(
         // arrives as a frame at all (the CLI exits non-zero, classified
         // above), so classifying the message could only ever misfire. It is
         // the round's own verdict, reported as-is.
-        return failed(envelope.code, envelope.retryable);
+        return failed(modelReportedFailureCodeV1(envelope.code), envelope.retryable);
       } finally {
         await cleanup(scratch);
       }

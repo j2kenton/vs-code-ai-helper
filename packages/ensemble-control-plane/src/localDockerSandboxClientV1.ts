@@ -181,9 +181,12 @@ async function scanMarkedProcessesV1(
       stream.destroy();
       return undefined;
     }
-    const inspected = await exec.inspect();
+    // The stream can end before the daemon records the exit (`Running: true`,
+    // `ExitCode: null`) — read too early, a real "none remain" was reported
+    // as unprovable and failed a stopped round (second final review).
+    const inspected = await waitExecStoppedV1(exec, 5000);
     const match = /^ok (\d+)$/m.exec(Buffer.concat(chunks).toString("utf8"));
-    if (inspected.ExitCode !== 0 || match === null) {
+    if (inspected === undefined || inspected.ExitCode !== 0 || match === null) {
       return undefined;
     }
     return Number.parseInt(match[1] as string, 10);
@@ -426,9 +429,10 @@ export function createLocalDockerSandboxClientV1(
 
   /** A pre-label sandbox must still meet today's profile: non-root, memory- and pid-limited. */
   function meetsSecurityProfile(inspected: Docker.ContainerInspectInfo): boolean {
-    const user = (inspected.Config?.User ?? "").split(":")[0] ?? "";
-    // The USER part alone decides it: "root:1000" and "0:0" are both root.
-    const runsAsRoot = user === "" || user === "root" || user === "0";
+    const user = ((inspected.Config?.User ?? "").split(":")[0] ?? "").trim();
+    // The USER part alone decides it: "root:1000" and "0:0" are both root,
+    // and so is any numeric spelling of uid 0 ("00", "+0").
+    const runsAsRoot = user === "" || user === "root" || (/^\+?\d+$/.test(user) && Number(user) === 0);
     const memory = inspected.HostConfig?.Memory ?? 0;
     const pids = inspected.HostConfig?.PidsLimit ?? 0;
     return !runsAsRoot && memory > 0 && pids !== null && pids > 0;

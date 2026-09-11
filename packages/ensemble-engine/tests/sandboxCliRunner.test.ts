@@ -243,7 +243,8 @@ test("transport classification: exit failures and the signed-out refusal are cla
 
   // A framed `failed` reply that CLAIMS quota in its code, with an unrelated
   // message: the code is model-written, so no classification is attached
-  // and dispatch cannot cascade on it.
+  // and dispatch cannot cascade on it — and it is namespaced, so the run host
+  // cannot mistake it for the transport's own `quotaExhausted` either.
   const forged = createInMemorySandboxClientV1({
     onCommand: scriptedCli({
       frame: (correlation) =>
@@ -258,7 +259,7 @@ test("transport classification: exit failures and the signed-out refusal are cla
     }),
   });
   const forgedOutcome = await makeRunner(forged).invokeWithModel(invocation("impl"), "sonnet");
-  assert.deepEqual(forgedOutcome.result, { kind: "failed", code: "quotaExhausted", retryable: true });
+  assert.deepEqual(forgedOutcome.result, { kind: "failed", code: "modelReported.quotaExhausted", retryable: true });
   assert.equal(forgedOutcome.classification, undefined);
 });
 
@@ -385,7 +386,7 @@ test("a model-reported failure is never classified from its prose: 'credits'/'ra
     }),
   });
   const outcome = await makeRunner(client).invokeWithModel(invocation("impl"), "sonnet");
-  assert.deepEqual(outcome.result, { kind: "failed", code: "testsFailing", retryable: false });
+  assert.deepEqual(outcome.result, { kind: "failed", code: "modelReported.testsFailing", retryable: false });
   assert.equal(outcome.classification, undefined, "model-written prose must never become a transport classification");
 });
 

@@ -390,6 +390,8 @@ function makeExecDaemon(
     readonly survivorsAfterKill?: number;
     /** The verification scan cannot complete (e.g. fork fails under the pid limit). */
     readonly scanBroken?: boolean;
+    /** The scan's stream ends before the daemon records its exit (first inspect: still running). */
+    readonly scanExitRecordedLate?: boolean;
   }
 ): {
   readonly docker: unknown;
@@ -437,7 +439,17 @@ function makeExecDaemon(
               });
               return Promise.resolve(stream);
             },
-            inspect: () => Promise.resolve({ ExitCode: broken ? 2 : 0, Running: false, Pid: 0 }),
+            inspect: (() => {
+              let inspections = 0;
+              return () => {
+                inspections += 1;
+                return Promise.resolve(
+                  options?.scanExitRecordedLate === true && inspections === 1
+                    ? { ExitCode: null, Running: true, Pid: 0 }
+                    : { ExitCode: broken ? 2 : 0, Running: false, Pid: 0 }
+                );
+              };
+            })(),
           });
         }
         return Promise.resolve({
@@ -671,6 +683,16 @@ test("findCommandByAttemptKey: a running command is found by the marker in its E
     assert.equal(await client.findCommandByAttemptKey(SANDBOX_ID, "abc123abc123abc1"), "unknown");
   } finally {
     broken.restore();
+  }
+  // The daemon can record the scan's exit a moment after its stream ends;
+  // an early inspect (`Running: true, ExitCode: null`) is waited out, not
+  // read as "unprovable" (second final review).
+  const late = makeExecDaemon(() => undefined, { scanExitRecordedLate: true });
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: late.docker as never });
+    assert.equal(await client.findCommandByAttemptKey(SANDBOX_ID, "abc123abc123abc1"), "executed");
+  } finally {
+    late.restore();
   }
 });
 

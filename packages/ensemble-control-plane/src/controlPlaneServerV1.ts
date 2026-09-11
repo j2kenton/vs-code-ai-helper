@@ -1182,20 +1182,20 @@ export function createControlPlaneNodeServerV1(
       respond(status, body);
     };
 
-    let requestPath: string;
+    let requestPath: string | undefined;
     try {
       requestPath = new URL(incoming.url ?? "/", "http://localhost").pathname;
     } catch {
-      refuse(400, { code: "badRequest", message: "malformed request target" });
-      return;
+      requestPath = undefined;
     }
     // Before sign-in, only these routes take a body — small ones. Every
     // other route's token is checked BEFORE its body is read, so an
     // anonymous client can no longer make the process buffer and parse
     // 8 MB (≈190 MB of heap and ~0.8 s of blocked event loop per request,
     // measured in the final review) just by sending it.
-    const preAuthRoute = PRE_AUTH_ROUTES_V1.has(requestPath);
-    const bodyLimit = preAuthRoute ? MAX_PRE_AUTH_BODY_BYTES_V1 : MAX_REQUEST_BODY_BYTES_V1;
+    const preAuthRoute = requestPath !== undefined && PRE_AUTH_ROUTES_V1.has(requestPath);
+    const bodyLimit =
+      preAuthRoute || requestPath === undefined ? MAX_PRE_AUTH_BODY_BYTES_V1 : MAX_REQUEST_BODY_BYTES_V1;
 
     incoming.on("data", (chunk: Buffer) => {
       received += chunk.length;
@@ -1212,25 +1212,50 @@ export function createControlPlaneNodeServerV1(
       }
       chunks.push(chunk);
     });
+    if (requestPath === undefined) {
+      // Refused only AFTER the data listener exists, so the drain ceiling
+      // applies to this body too (second final review).
+      refuse(400, { code: "badRequest", message: "malformed request target" });
+      return;
+    }
     // Reading starts only once the request is allowed to have its body read.
     incoming.pause();
-    void (async (): Promise<void> => {
+    /**
+     * The gate, kept as a promise: a request with NO body (a GET, a
+     * `DELETE`, `Content-Length: 0`) has already ended, so 'end' fires even
+     * while paused — it must wait for this verdict, or a body-less mutation
+     * could run while the client is told 401 (second final review).
+     */
+    const admitted = (async (): Promise<boolean> => {
       if (!preAuthRoute && options?.authenticateBearer !== undefined) {
         const header = incoming.headers.authorization;
         // Same parsing as the handler's bearerToken(), so the two never disagree.
         const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-        const allowed = token.length > 0 && (await options.authenticateBearer(token).catch(() => false));
+        let allowed: boolean;
+        try {
+          allowed = token.length > 0 && (await options.authenticateBearer(token));
+        } catch {
+          // A store failure (e.g. SQLITE_BUSY) is not "signed out": a 401
+          // would send the client through a pointless re-authentication.
+          refuse(503, { code: "temporarilyUnavailable", message: "the request could not be checked; retry shortly" });
+          return false;
+        }
         if (!allowed) {
           refuse(401, { code: "unauthorized", message: "a valid control-plane access token is required" });
-          return;
+          return false;
         }
       }
       incoming.resume();
+      return true;
     })();
     incoming.on("end", () => {
-      if (rejected) {
-        return;
-      }
+      void admitted.then((ok) => {
+        if (ok && !rejected) {
+          handleEnded();
+        }
+      });
+    });
+    const handleEnded = (): void => {
       // EVERY failure in here ends as a 500 on this one request. Before this
       // catch existed, a throw anywhere in any route became an unhandled
       // rejection — which terminates the whole Node process by default, so
@@ -1268,7 +1293,7 @@ export function createControlPlaneNodeServerV1(
       })().catch(() => {
         respond(500, { code: "internalError", message: "the request could not be completed" });
       });
-    });
+    };
   });
   if (options?.hub !== undefined) {
     attachWsEventsTransportV1(server, { hub: options.hub });

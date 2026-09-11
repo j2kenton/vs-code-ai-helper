@@ -45,7 +45,11 @@ interface WireWorld {
 }
 
 async function makeWireWorld(
-  wsOptions?: { readonly subscribeDeadlineMs?: number; readonly maxOpenConnections?: number }
+  wsOptions?: {
+    readonly subscribeDeadlineMs?: number;
+    readonly maxOpenConnections?: number;
+    readonly maxAnonymousConnections?: number;
+  }
 ): Promise<WireWorld> {
   const clock = makeClock();
   const store = createControlPlaneStoreV1({ now: clock.now });
@@ -420,26 +424,67 @@ test("a subscribed connection outlives the subscribe deadline", async () => {
   }
 });
 
-test("open connections are capped (503), and a closed one frees its slot", async () => {
-  const world = await makeWireWorld({ maxOpenConnections: 1 });
+test("anonymous sockets cannot lock the owner out: past their small budget the OLDEST is evicted, never the newcomer", async () => {
+  // Second final review: one shared cap let 256 never-subscribing sockets
+  // (re-opened each deadline) answer the owner with 503.
+  const world = await makeWireWorld({ maxAnonymousConnections: 2, maxOpenConnections: 1 });
   try {
-    const first = await openWireClient(world.port);
-    await assert.rejects(openWireClient(world.port), /HTTP 503/);
-    first.socket.destroy();
-    await first.closed();
-    // The server sees the close asynchronously; retry briefly.
-    let second: WireClient | undefined;
-    for (let attempt = 0; attempt < 20 && second === undefined; attempt += 1) {
-      second = await openWireClient(world.port).catch(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        return undefined;
-      });
-    }
-    assert.ok(second !== undefined, "the freed slot is usable again");
-    second.socket.destroy();
+    const squatter1 = await openWireClient(world.port);
+    const squatter2 = await openWireClient(world.port);
+    const owner = await openWireClient(world.port);
+    await squatter1.closed(); // evicted to make room
+    owner.sendText(JSON.stringify({ type: "subscribe", accessToken: world.token }));
+    assert.equal((await owner.nextEvent()).type, "subscribed");
+
+    // Signed-in sockets have their own cap: past it, a subscribe is closed with 1013.
+    const second = await openWireClient(world.port);
+    second.sendText(JSON.stringify({ type: "subscribe", accessToken: world.token }));
+    assert.equal((await second.nextEvent()).type, "subscribed");
+    const refused = await second.nextFrame();
+    assert.equal(refused.opcode, WS_OPCODE_V1.close);
+    assert.equal(refused.payload.readUInt16BE(0), 1013);
+    squatter2.socket.destroy();
+    owner.socket.destroy();
   } finally {
     await world.close();
   }
+});
+
+test("before subscribe, frames are limited to 16 KB: an anonymous socket cannot make the server hold megabyte frames", async () => {
+  const world = await makeWireWorld();
+  try {
+    const client = await openWireClient(world.port);
+    client.sendRaw(encodeMaskedClientFrameV1(WS_OPCODE_V1.text, Buffer.alloc(20 * 1024, 0x20)));
+    const frame = await client.nextFrame();
+    assert.equal(frame.opcode, WS_OPCODE_V1.close);
+    assert.equal(frame.payload.readUInt16BE(0), 1009);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
+test("frame reader: a frame dribbled one byte at a time, then a second frame in the same chunk, reassembles exactly", () => {
+  const reader = createWsFrameReaderV1();
+  const big = Buffer.alloc(70_000);
+  for (let index = 0; index < big.length; index += 1) {
+    big[index] = index % 251;
+  }
+  const first = encodeMaskedClientFrameV1(WS_OPCODE_V1.text, big);
+  const second = encodeMaskedClientFrameV1(WS_OPCODE_V1.text, Buffer.from("next", "utf8"));
+  const frames: WsFrameV1[] = [];
+  for (let index = 0; index < first.length - 1; index += 1) {
+    const fed = reader.feed(first.subarray(index, index + 1));
+    assert.ok(fed.ok);
+    frames.push(...fed.frames);
+  }
+  // The last byte of the first frame arrives together with the whole second frame.
+  const fed = reader.feed(Buffer.concat([first.subarray(first.length - 1), second]));
+  assert.ok(fed.ok);
+  frames.push(...fed.frames);
+  assert.equal(frames.length, 2);
+  assert.ok(frames[0]!.payload.equals(big));
+  assert.equal(frames[1]!.payload.toString("utf8"), "next");
 });
 
 test("unsubscribe closes the socket cleanly and drops the hub subscription", async () => {

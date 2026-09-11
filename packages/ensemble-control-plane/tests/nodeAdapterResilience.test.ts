@@ -150,6 +150,62 @@ test("with authenticateBearer, a request without a valid token is refused 401 be
   }
 });
 
+test("a request with NO body waits for the token verdict too — the handler never runs beside a 401", async () => {
+  // Second final review: a GET/DELETE has already ended, so 'end' fired while
+  // the check was still pending and the handler ran anyway.
+  let reached = 0;
+  const server = await listen(
+    {
+      handle: () => {
+        reached += 1;
+        return Promise.resolve({ status: 204 });
+      },
+    },
+    { authenticateBearer: () => new Promise((resolve) => setTimeout(() => resolve(false), 30)) }
+  );
+  try {
+    assert.equal((await send(server.port, "/v1/tasks", undefined, "bad")).status, 401);
+    assert.equal(reached, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a token check that FAILS (store error) answers 503, not a misleading 401", async () => {
+  let reached = false;
+  const server = await listen(
+    {
+      handle: () => {
+        reached = true;
+        return Promise.resolve({ status: 200 });
+      },
+    },
+    { authenticateBearer: () => Promise.reject(new Error("SQLITE_BUSY")) }
+  );
+  try {
+    assert.equal((await send(server.port, "/v1/tasks", Buffer.from("{}"), "any")).status, 503);
+    assert.equal(reached, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a malformed request target is answered 400 and never reaches the handler", async () => {
+  let reached = false;
+  const server = await listen({
+    handle: () => {
+      reached = true;
+      return Promise.resolve({ status: 200 });
+    },
+  });
+  try {
+    assert.equal((await send(server.port, "//a:99999", Buffer.from("{}"))).status, 400);
+    assert.equal(reached, false);
+  } finally {
+    await server.close();
+  }
+});
+
 test("the sign-in routes skip the token check but their bodies are capped at 16 KB", async () => {
   const bodies: unknown[] = [];
   const server = await listen(
