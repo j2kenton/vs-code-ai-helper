@@ -255,8 +255,11 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
   function selectProvider(next: SandboxProviderV1): void {
     setProvider(next);
     // Follow the provider's natural default unless the user already chose a
-    // lifecycle that still makes sense for it.
-    if (lifecycle === defaultLifecycleFor(provider)) {
+    // lifecycle that still makes sense for it ("Attach mine" does not, for Docker).
+    if (
+      lifecycle === defaultLifecycleFor(provider) ||
+      (next === 'docker' && lifecycle === 'user-managed-persistent')
+    ) {
       setLifecycle(defaultLifecycleFor(next));
     }
   }
@@ -362,7 +365,9 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             options={[
               { value: 'user-owned-managed', label: 'My sandbox' },
               { value: 'task-owned-ephemeral', label: 'Create for me' },
-              { value: 'user-managed-persistent', label: 'Attach mine' },
+              // Docker has no provider account to scope an id to — every
+              // client shares one host daemon — so the server refuses it.
+              { value: 'user-managed-persistent', label: 'Attach mine', disabled: provider === 'docker' },
             ]}
           />
           {lifecycle === 'user-owned-managed' ? (

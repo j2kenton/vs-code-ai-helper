@@ -14,6 +14,7 @@ import {
   cliLoginVerdictV1,
   describeCliLoginVerdictV1,
   extractCliLoginUrlV1,
+  isClaudeSignInUrlV1,
   stripTerminalControlV1,
 } from '../src/sandbox/cliLoginPromptV1';
 
@@ -44,6 +45,23 @@ test('a prompt with no URL yields undefined rather than a garbage token', () => 
 
 test('a plain single URL (no hyperlink wrapper) is returned as-is', () => {
   assert.equal(extractCliLoginUrlV1(`visit: ${URL}\nPaste code here > `), URL);
+});
+
+test('only a genuine Claude sign-in host is ever returned — look-alikes and credential tricks are refused', () => {
+  const lookalikes = [
+    'https://claude.com.evil.example/cai/oauth/authorize?code=true',
+    'https://claude.com@evil.example/cai/oauth/authorize',
+    'https://evil.example/?next=https://claude.com',
+    'https://claude.com:8443/cai/oauth/authorize',
+    'https://xclaude.com/cai/oauth/authorize',
+  ];
+  for (const url of lookalikes) {
+    assert.equal(extractCliLoginUrlV1(`If the browser didn't open, visit: ${url}\nPaste code here > `), undefined, url);
+    assert.equal(isClaudeSignInUrlV1(url), false, url);
+  }
+  // Plain http is not a sign-in link either.
+  assert.equal(isClaudeSignInUrlV1('http://claude.com/cai/oauth/authorize'), false);
+  assert.equal(isClaudeSignInUrlV1(URL), true);
 });
 
 test('awaiting-code detection reads the prompt line, not the control bytes around it', () => {

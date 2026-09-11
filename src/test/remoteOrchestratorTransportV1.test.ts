@@ -189,4 +189,55 @@ void describe("createRemoteOrchestratorTextTransportV1", () => {
     assert.equal(observedAbort, true);
     assert.deepEqual(exit, { kind: "callerCancelled" });
   });
+
+  /** A 200 whose headers arrive but whose body never finishes — the stalled-proxy shape. */
+  function stalledBodyFetch(): typeof fetch {
+    return (() =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller): void {
+              controller.enqueue(new TextEncoder().encode('{"text":"partial'));
+              // Never closes.
+            },
+          }),
+          { status: 200 }
+        )
+      )) as unknown as typeof fetch;
+  }
+
+  void it("Cancel still works after headers arrive: a stalled body no longer hangs the stage", async () => {
+    const token = fakeToken();
+    const transport = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.resolve("cpat_test_token"),
+      fetchImpl: stalledBodyFetch(),
+    });
+
+    const invocation = transport.invoke(makeRequest({ cancellationToken: token }), makeWriter());
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    (token as unknown as { isCancellationRequested: boolean }).isCancellationRequested = true;
+    token.fireCancel();
+
+    assert.deepEqual(await invocation, { kind: "callerCancelled" });
+  });
+
+  void it("a call past its deadline is a distinct timeout failure, never an indefinite wait", async () => {
+    const transport = createRemoteOrchestratorTextTransportV1({
+      baseUrl: "https://orchestrator.example.com",
+      provider: "anthropic",
+      model: undefined,
+      getAccessToken: () => Promise.resolve("cpat_test_token"),
+      fetchImpl: stalledBodyFetch(),
+      requestTimeoutMs: 30,
+    });
+
+    const exit = await transport.invoke(makeRequest(), makeWriter());
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.ok(exit.kind === "transportFailure");
+    assert.equal(exit.code, "remoteOrchestratorTimeout");
+  });
 });

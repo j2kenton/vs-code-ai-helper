@@ -100,6 +100,26 @@ export function SettingsScreen(): React.JSX.Element {
   const sandboxProviderLabel = SANDBOX_PROVIDER_LABELS_V1[sandboxProvider];
   const sandboxEnabled = keyRecords.some((record) => record.keyKind === `sandbox:${sandboxProvider}`);
 
+  /**
+   * WHICH sandbox the sign-in and reset controls currently act on. Both
+   * flows span an await or a second press, and the provider picker (or the
+   * control-plane URL) can change in between — the review reproduced a
+   * Docker reset confirmation deleting the Daytona sandbox, and a Docker
+   * sign-in finishing under the Daytona card. Every such action records its
+   * target when it starts and is dropped if the target has moved.
+   */
+  const sandboxTarget = JSON.stringify([controlPlaneUrl, sandboxProvider]);
+  const sandboxTargetRef = React.useRef(sandboxTarget);
+  sandboxTargetRef.current = sandboxTarget;
+  const [resetArmedFor, setResetArmedFor] = React.useState<string | null>(null);
+  const [resetNotice, setResetNotice] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    setCliLogin({ kind: 'idle' });
+    setCliCodeDraft('');
+    setResetArmedFor(null);
+    setResetNotice(null);
+  }, [sandboxTarget]);
+
   React.useEffect(() => services.session.onChange(setSession), [services, setSession]);
 
   const refreshKeyRecords = React.useCallback(async () => {
@@ -195,9 +215,16 @@ export function SettingsScreen(): React.JSX.Element {
    * a verdict only (see `SandboxLoginCodeResultDtoV1`).
    */
   async function startCliLogin(): Promise<void> {
+    const target = sandboxTarget;
     setCliLogin({ kind: 'starting' });
     setCliCodeDraft('');
     const started = await services.client.startSandboxLogin(sandboxProvider);
+    if (sandboxTargetRef.current !== target) {
+      // The picker moved while the server was starting it: this sign-in
+      // belongs to a sandbox the card no longer shows. The effect above has
+      // already reset the card; the orphaned server session times out.
+      return;
+    }
     if (!started.ok) {
       setCliLogin({
         kind: 'failed',
@@ -228,8 +255,14 @@ export function SettingsScreen(): React.JSX.Element {
       return;
     }
     const pending = cliLogin;
+    const target = sandboxTarget;
     setCliLogin({ ...pending, submitting: true, notice: null });
     const result = await services.client.submitSandboxLoginCode(pending.loginSessionId, cliCodeDraft.trim());
+    if (sandboxTargetRef.current !== target) {
+      // The verdict is for a sandbox this card no longer shows: never let
+      // it switch the model default for the one it does.
+      return;
+    }
     if (!result.ok) {
       setCliLogin({
         kind: 'failed',
@@ -261,18 +294,18 @@ export function SettingsScreen(): React.JSX.Element {
 
   /**
    * Two presses on purpose: the persistent sandbox holds the user's files
-   * and the CLI login, and there is no undo. The first press only re-labels
-   * the button with what it will do; only the second does it.
+   * and the CLI login, and there is no undo. The first press arms the reset
+   * FOR the sandbox currently shown; the second only fires if that is still
+   * the sandbox shown (a provider switch in between disarms it).
    */
-  const [resetArmed, setResetArmed] = React.useState(false);
-  const [resetNotice, setResetNotice] = React.useState<string | null>(null);
+  const resetArmed = resetArmedFor === sandboxTarget;
   async function resetSandbox(): Promise<void> {
     if (!resetArmed) {
-      setResetArmed(true);
+      setResetArmedFor(sandboxTarget);
       setResetNotice(null);
       return;
     }
-    setResetArmed(false);
+    setResetArmedFor(null);
     const result = await services.client.resetUserSandbox(sandboxProvider);
     if (result.ok) {
       setResetNotice('Sandbox destroyed. The next task or sign-in creates a fresh one.');
@@ -467,12 +500,16 @@ export function SettingsScreen(): React.JSX.Element {
               {sandboxEnabled ? (
                 <Row>
                   <TouchButton
-                    label={resetArmed ? 'Really destroy it? Press again' : 'Reset sandbox'}
+                    label={
+                      resetArmed
+                        ? `Really destroy your ${sandboxProviderLabel} sandbox? Press again`
+                        : 'Reset sandbox'
+                    }
                     variant="secondary"
                     onPress={() => void resetSandbox()}
                   />
                   {resetArmed ? (
-                    <TouchButton label="Keep it" variant="secondary" onPress={() => setResetArmed(false)} />
+                    <TouchButton label="Keep it" variant="secondary" onPress={() => setResetArmedFor(null)} />
                   ) : null}
                 </Row>
               ) : null}

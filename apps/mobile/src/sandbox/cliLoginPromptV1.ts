@@ -34,7 +34,40 @@ export function stripTerminalControlV1(text: string): string {
     .replace(/\r\n?/g, '\n');
 }
 
-/** The first `https://` URL in the relayed prompt, or undefined when the CLI printed none. */
+/**
+ * Hosts a Claude Code sign-in link may point at. The app opens this link
+ * under a "sign in to Claude" button, so it must be Anthropic's — the text
+ * comes from a sandbox, where AI-generated code runs, and anything else
+ * that printed an https link there must not get a trusted button.
+ */
+const CLAUDE_SIGN_IN_HOSTS_V1: ReadonlySet<string> = new Set([
+  'claude.com',
+  'claude.ai',
+  'platform.claude.com',
+  'console.anthropic.com',
+]);
+
+/** True for an https URL on an allowed host — parsed, never prefix-matched (`claude.com.evil.example`, `claude.com@evil.example`). */
+export function isClaudeSignInUrlV1(candidate: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return false;
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.username === '' &&
+    parsed.password === '' &&
+    parsed.port === '' &&
+    CLAUDE_SIGN_IN_HOSTS_V1.has(parsed.hostname)
+  );
+}
+
+/**
+ * The first `https://` URL in the relayed prompt that is a genuine Claude
+ * sign-in link, or undefined when the CLI printed none.
+ */
 export function extractCliLoginUrlV1(promptOutput: string): string | undefined {
   const plain = stripTerminalControlV1(promptOutput);
   const match = /https:\/\/[^\s"'<>]+/.exec(plain);
@@ -46,7 +79,8 @@ export function extractCliLoginUrlV1(promptOutput: string): string | undefined {
   // scheme if the match swallowed both.
   const url = match[0];
   const second = url.indexOf('https://', 1);
-  return second > 0 ? url.slice(0, second) : url;
+  const candidate = second > 0 ? url.slice(0, second) : url;
+  return isClaudeSignInUrlV1(candidate) ? candidate : undefined;
 }
 
 /** Whether the CLI's prompt has reached the point where a code can be pasted. */

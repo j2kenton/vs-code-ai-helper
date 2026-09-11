@@ -41,7 +41,14 @@ export interface RemoteOrchestratorTransportOptionsV1 {
   readonly getAccessToken: () => Promise<string | undefined>;
   /** Test seam: overrides the runtime's global fetch. Production callers never set it. */
   fetchImpl?: typeof fetch;
+  /**
+   * Hard deadline for one whole call — headers AND body. Default 15
+   * minutes: a single model round, generously; never unbounded.
+   */
+  readonly requestTimeoutMs?: number;
 }
+
+const DEFAULT_REQUEST_TIMEOUT_MS_V1 = 15 * 60 * 1000;
 
 interface ProviderCallSuccessBodyV1 {
   readonly text: string;
@@ -54,6 +61,31 @@ interface ProviderCallErrorBodyV1 {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read the response body, rejecting as soon as `signal` aborts. A real
+ * fetch body already honours the request's signal; this also holds for a
+ * body stream that does not (an injected fetch, a stalled proxy stream).
+ */
+function readBodyOrAbort(response: Response, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) {
+    return Promise.reject(new Error("aborted"));
+  }
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    response.text().then(
+      (text) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(text);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error("body read failed"));
+      }
+    );
+  });
 }
 
 /** `runnerId` distinguishes this transport in logs/telemetry from local CLI/Copilot runner ids. */
@@ -96,12 +128,22 @@ export function createRemoteOrchestratorTextTransportV1(
         };
       }
 
+      // Cancellation and the deadline cover the WHOLE call, body included.
+      // They used to be released as soon as headers arrived, so a proxy that
+      // sent headers and then stalled left the stage hung with Cancel no
+      // longer able to stop it (review finding, 2026-09-11).
       const controller = new AbortController();
+      let timedOut = false;
       const cancelListener = request.cancellationToken.onCancellationRequested(() => {
         controller.abort();
       });
+      const deadline = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS_V1);
 
       let response: Response;
+      let bodyText: string;
       try {
         response = await fetchImpl(`${baseUrl}/v1/provider-calls`, {
           method: "POST",
@@ -112,10 +154,18 @@ export function createRemoteOrchestratorTextTransportV1(
           body: JSON.stringify({ provider, model, prompt: request.prompt }),
           signal: controller.signal,
         });
+        bodyText = await readBodyOrAbort(response, controller.signal);
       } catch (error) {
-        cancelListener.dispose();
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
+        }
+        if (timedOut) {
+          return {
+            kind: "transportFailure",
+            code: "remoteOrchestratorTimeout",
+            detail: "the remote orchestrator did not finish the call in time",
+            networkFault: true,
+          };
         }
         return {
           kind: "transportFailure",
@@ -123,10 +173,10 @@ export function createRemoteOrchestratorTextTransportV1(
           detail: error instanceof Error ? error.message.slice(0, 200) : "network error",
           networkFault: true,
         };
+      } finally {
+        clearTimeout(deadline);
+        cancelListener.dispose();
       }
-      cancelListener.dispose();
-
-      const bodyText = await response.text();
       const parsed: unknown = ((): unknown => {
         try {
           return JSON.parse(bodyText) as unknown;
