@@ -273,6 +273,67 @@ test("an unauthenticated client cannot grow a fragmented message past the payloa
   }
 });
 
+test("zero-length continuation frames are bounded too: a flood of empty pieces closes with 1009", async () => {
+  // The byte cap alone missed this: empty pieces add no bytes but each one
+  // was still retained (second-round review).
+  const world = await makeWireWorld();
+  try {
+    const client = await openWireClient(world.port);
+    const clearFin = (frame: Buffer): Buffer => {
+      const copy = Buffer.from(frame);
+      copy[0] = (copy[0] as number) & 0x7f;
+      return copy;
+    };
+    const empty = clearFin(encodeMaskedClientFrameV1(WS_OPCODE_V1.continuation, Buffer.alloc(0)));
+    client.sendRaw(clearFin(encodeMaskedClientFrameV1(WS_OPCODE_V1.text, Buffer.from("{", "utf8"))));
+    client.sendRaw(Buffer.concat(Array.from({ length: 2000 }, () => empty)));
+    const closeFrame = await client.nextFrame();
+    assert.equal(closeFrame.opcode, WS_OPCODE_V1.close);
+    assert.equal(closeFrame.payload.readUInt16BE(0), 1009);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
+test("a malformed upgrade target (GET //%5B) gets a 400 and the process keeps serving", async () => {
+  // Confirmed in review: `new URL("//%5B", base)` throws, and the throw used
+  // to escape the upgrade listener — one unauthenticated request killed the
+  // process. Sent over a raw socket so no client library normalizes it.
+  const { connect } = await import("node:net");
+  const world = await makeWireWorld();
+  const escaped: unknown[] = [];
+  const onException = (error: unknown): void => {
+    escaped.push(error);
+  };
+  process.on("uncaughtException", onException);
+  try {
+    const reply = await new Promise<string>((resolve, reject) => {
+      const raw = connect(world.port, "127.0.0.1", () => {
+        raw.write(
+          "GET //%5B HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+            `Sec-WebSocket-Key: ${CLIENT_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+        );
+      });
+      let text = "";
+      raw.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+      });
+      raw.on("close", () => resolve(text));
+      raw.on("error", reject);
+    });
+    assert.match(reply, /^HTTP\/1\.1 400/);
+    assert.deepEqual(escaped, [], "the malformed target must not escape as an uncaught exception");
+
+    // Still serving: a normal client can connect afterwards.
+    const client = await openWireClient(world.port);
+    client.socket.destroy();
+  } finally {
+    process.off("uncaughtException", onException);
+    await world.close();
+  }
+});
+
 test("ping is answered with a pong echoing the payload", async () => {
   const world = await makeWireWorld();
   try {

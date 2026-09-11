@@ -100,10 +100,79 @@ async function killExecV1(exec: Docker.Exec): Promise<void> {
   }
 }
 
+/** The exec's inspect once it has stopped, or undefined if it is still running after `withinMs`. */
+async function waitExecStoppedV1(
+  exec: Docker.Exec,
+  withinMs: number
+): Promise<Docker.ExecInspectInfo | undefined> {
+  const deadline = Date.now() + withinMs;
+  for (;;) {
+    const inspected = await exec.inspect();
+    if (!inspected.Running) {
+      return inspected;
+    }
+    if (Date.now() >= deadline) {
+      return undefined;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * Kill every process in the container carrying `envEntry` (e.g. the
+ * attempt marker) in its environment, and report how many remained before
+ * the kill. The marker is an env assignment on the command, so every
+ * descendant inherits it — killing the exec's own pid alone left children
+ * running: a stopped `sh -c '… claude …'` round kept its `claude` editing
+ * files after the engine had recorded the round as over (second-round
+ * review).
+ */
+async function killMarkedProcessesV1(
+  docker: Docker,
+  containerId: string,
+  envEntry: string
+): Promise<number> {
+  const quoted = quotePosixShellArgV1(envEntry);
+  const script =
+    `n=0; for p in /proc/[0-9]*; do ` +
+    `if tr '\\0' '\\n' < "$p/environ" 2>/dev/null | grep -qxF -- ${quoted}; then ` +
+    `kill -9 "\${p##*/}" 2>/dev/null; n=$((n+1)); fi; done; echo "$n"`;
+  const exec = await docker.getContainer(containerId).exec({
+    Cmd: ["/bin/sh", "-c", script],
+    AttachStdout: true,
+    AttachStderr: true,
+  });
+  const stream = await exec.start({ hijack: true, stdin: false });
+  const chunks: Buffer[] = [];
+  const sink = new PassThrough();
+  sink.on("data", (chunk: Buffer) => chunks.push(chunk));
+  docker.modem.demuxStream(stream, sink, new PassThrough());
+  await new Promise<void>((resolve) => {
+    stream.on("end", resolve);
+    stream.on("close", resolve);
+    stream.on("error", () => resolve());
+  });
+  const count = Number.parseInt(Buffer.concat(chunks).toString("utf8").trim(), 10);
+  return Number.isInteger(count) ? count : 0;
+}
+
+export class DockerExecNotStoppedErrorV1 extends Error {
+  constructor(reason: string) {
+    super(`a sandbox command could not be proven stopped after it was stopped for: ${reason}`);
+    this.name = "DockerExecNotStoppedErrorV1";
+  }
+}
+
 interface ExecCaptureOptionsV1 {
   readonly cwd?: string;
   readonly timeoutMs: number;
   readonly maxBytes: number;
+  /**
+   * An `NAME=value` env entry every process of this command carries (the
+   * attempt marker). When present, a stop kills the whole process tree by
+   * it and verifies none remain.
+   */
+  readonly processMarker?: string;
 }
 
 /**
@@ -169,13 +238,29 @@ async function execCaptureV1(
   const stdout = Buffer.concat(stdoutChunks).toString("utf8");
   const stderr = Buffer.concat(stderrChunks).toString("utf8");
   if (stoppedReason !== undefined) {
+    // A stopped command is only reported stopped once that is PROVEN: its
+    // whole tree killed (by marker) and the exec no longer running. If it
+    // cannot be proven, this throws — the attempt record stays open for
+    // recovery instead of a terminal result for work still in progress.
+    if (options.processMarker !== undefined) {
+      await killMarkedProcessesV1(docker, containerId, options.processMarker);
+      const remaining = await killMarkedProcessesV1(docker, containerId, options.processMarker);
+      if (remaining > 0) {
+        throw new DockerExecNotStoppedErrorV1(stoppedReason);
+      }
+    }
+    if ((await waitExecStoppedV1(exec, 5000)) === undefined) {
+      throw new DockerExecNotStoppedErrorV1(stoppedReason);
+    }
     return {
       exitCode: DOCKER_EXEC_STOPPED_EXIT_CODE_V1,
       stdout,
       stderr: `${stderr}\n[ensemble] command stopped: ${stoppedReason}`,
     };
   }
-  const inspected = await exec.inspect();
+  // The stream can close a moment before the daemon records the exit;
+  // reading ExitCode while still Running used to yield null (reported -1).
+  const inspected = (await waitExecStoppedV1(exec, 5000)) ?? (await exec.inspect());
   return { exitCode: inspected.ExitCode ?? -1, stdout, stderr };
 }
 
@@ -260,13 +345,15 @@ export interface CreateLocalDockerSandboxClientOptionsV1 {
   readonly user?: string;
   readonly limits?: DockerSandboxLimitsV1;
   /**
-   * Images whose containers predate `DOCKER_SANDBOX_LABEL_V1` and are
-   * still accepted as sandboxes (labels cannot be added to an existing
-   * container, and replacing a signed-in sandbox costs its owner a fresh
-   * CLI login). Default: the configured `image` only — never a general
-   * image like `node:*` that unrelated containers could also run.
+   * EXACT full ids of sandboxes that predate `DOCKER_SANDBOX_LABEL_V1` and
+   * are still accepted (labels cannot be added to an existing container,
+   * and replacing a signed-in sandbox costs its owner a fresh CLI login).
+   * Named one by one, by the operator: an image match is never evidence of
+   * who created a container — any container can run any image (second-round
+   * review). Each is ALSO required to meet the current security profile
+   * (non-root user, memory and pid limits) before it is used. Default: none.
    */
-  readonly legacyUnlabelledImages?: readonly string[];
+  readonly legacyUnlabelledSandboxIds?: readonly string[];
   /** Command deadline for `runCommand`; default one hour. */
   readonly commandTimeoutMs?: number;
   /** DI seam for tests — production callers never override it. */
@@ -282,13 +369,17 @@ export function createLocalDockerSandboxClientV1(
   const containerUser = options?.user ?? DEFAULT_CONTAINER_USER_V1;
   const limits = options?.limits ?? DEFAULT_DOCKER_SANDBOX_LIMITS_V1;
   const commandTimeoutMs = options?.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS_V1;
-  // A legacy grace for the configured sandbox image only, and only when it
-  // is not the generic default (a bare `node:*` container is not evidence
-  // of anything).
-  const legacyImages = new Set(
-    options?.legacyUnlabelledImages ?? (options?.image !== undefined ? [options.image] : [])
-  );
+  const legacyIds = new Set(options?.legacyUnlabelledSandboxIds ?? []);
   const verified = new Set<string>();
+
+  /** A pre-label sandbox must still meet today's profile: non-root, memory- and pid-limited. */
+  function meetsSecurityProfile(inspected: Docker.ContainerInspectInfo): boolean {
+    const user = inspected.Config?.User ?? "";
+    const runsAsRoot = user === "" || user === "root" || /^0(:|$)/.test(user);
+    const memory = inspected.HostConfig?.Memory ?? 0;
+    const pids = inspected.HostConfig?.PidsLimit ?? 0;
+    return !runsAsRoot && memory > 0 && pids !== null && pids > 0;
+  }
 
   /**
    * Refuse anything but a container this adapter created, addressed by its
@@ -311,7 +402,7 @@ export function createLocalDockerSandboxClientV1(
       throw new DockerSandboxNotManagedErrorV1();
     }
     const labelled = inspected.Config?.Labels?.[DOCKER_SANDBOX_LABEL_V1] === "1";
-    const legacy = legacyImages.has(inspected.Config?.Image ?? "");
+    const legacy = legacyIds.has(inspected.Id) && meetsSecurityProfile(inspected);
     if (inspected.Id !== sandboxId || !(labelled || legacy)) {
       throw new DockerSandboxNotManagedErrorV1();
     }
@@ -394,6 +485,7 @@ export function createLocalDockerSandboxClientV1(
       const result = await capture(request.sandboxId, commandText, {
         ...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
         timeoutMs: commandTimeoutMs,
+        processMarker: `${SANDBOX_ATTEMPT_KEY_MARKER_V1}=${request.attemptKey}`,
       });
       return {
         exitCode: result.exitCode,

@@ -232,7 +232,26 @@ export function attachWsEventsTransportV1(
   const { hub } = options;
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const url = new URL(request.url ?? "/", "http://localhost");
+    // Everything on this path runs BEFORE any token check, so nothing here
+    // may be able to throw out of the listener or leave an 'error' event
+    // unlistened — either one terminates the whole process (second-round
+    // review, confirmed: `GET //%5B` made `new URL` throw here).
+    let socketErrorSeen = false;
+    socket.on("error", () => {
+      socketErrorSeen = true;
+      socket.destroy();
+    });
+    let url: URL;
+    try {
+      url = new URL(request.url ?? "/", "http://localhost");
+    } catch {
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (socketErrorSeen) {
+      return;
+    }
     const upgradeHeader = request.headers.upgrade?.toLowerCase();
     const key = request.headers["sec-websocket-key"];
     const version = request.headers["sec-websocket-version"];
@@ -304,6 +323,14 @@ export function attachWsEventsTransportV1(
      */
     let fragmentBytes = 0;
     const maxMessageBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES_V1;
+    /**
+     * Bytes alone are not a bound: zero-length continuation frames add
+     * nothing to the byte count but still cost a frame each (second-round
+     * review). The number of pieces is capped too, and empty pieces are
+     * never retained.
+     */
+    let fragmentCount = 0;
+    const MAX_FRAGMENTS_PER_MESSAGE_V1 = 1024;
 
     function deliverText(text: string): void {
       let parsed: unknown;
@@ -328,6 +355,10 @@ export function attachWsEventsTransportV1(
         if (connection.closed && !socketClosed) {
           closeSocket(1000, "unsubscribed");
         }
+      }).catch(() => {
+        // A failing hub handler must not become an unhandled rejection (fatal
+        // to Node) nor jam the chain: this connection ends, the process lives.
+        closeSocket(1011, "internal error");
       });
     }
 
@@ -364,8 +395,9 @@ export function attachWsEventsTransportV1(
               return;
             }
             fragmentOpcode = frame.opcode;
-            fragmentParts = [frame.payload];
+            fragmentParts = frame.payload.length > 0 ? [frame.payload] : [];
             fragmentBytes = frame.payload.length;
+            fragmentCount = 1;
             return;
           }
           if (fragmentOpcode === undefined) {
@@ -373,19 +405,24 @@ export function attachWsEventsTransportV1(
             return;
           }
           fragmentBytes += frame.payload.length;
-          if (fragmentBytes > maxMessageBytes) {
+          fragmentCount += 1;
+          if (fragmentBytes > maxMessageBytes || fragmentCount > MAX_FRAGMENTS_PER_MESSAGE_V1) {
             fragmentOpcode = undefined;
             fragmentParts = [];
             fragmentBytes = 0;
+            fragmentCount = 0;
             closeSocket(1009, "message exceeds the payload limit");
             return;
           }
-          fragmentParts.push(frame.payload);
+          if (frame.payload.length > 0) {
+            fragmentParts.push(frame.payload);
+          }
           if (frame.fin) {
             const text = Buffer.concat(fragmentParts).toString("utf8");
             fragmentOpcode = undefined;
             fragmentParts = [];
             fragmentBytes = 0;
+            fragmentCount = 0;
             deliverText(text);
           }
           return;
@@ -399,16 +436,22 @@ export function attachWsEventsTransportV1(
       if (socketClosed) {
         return;
       }
-      const result = reader.feed(chunk);
-      if (!result.ok) {
-        closeSocket(result.closeCode, result.reason);
-        return;
-      }
-      for (const frame of result.frames) {
-        if (socketClosed) {
+      try {
+        const result = reader.feed(chunk);
+        if (!result.ok) {
+          closeSocket(result.closeCode, result.reason);
           return;
         }
-        handleFrame(frame);
+        for (const frame of result.frames) {
+          if (socketClosed) {
+            return;
+          }
+          handleFrame(frame);
+        }
+      } catch {
+        // A 'data' listener that throws takes the process down; a bad frame
+        // must only ever cost its own connection.
+        closeSocket(1011, "internal error");
       }
     }
 

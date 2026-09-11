@@ -83,6 +83,8 @@ export interface CreateSdkSandboxClientFactoryOptionsV1 {
    * `claude-cli` round can run.
    */
   readonly dockerImage?: string;
+  /** See `CreateLocalDockerSandboxClientOptionsV1.legacyUnlabelledSandboxIds`. */
+  readonly dockerLegacySandboxIds?: readonly string[];
 }
 
 /**
@@ -104,6 +106,9 @@ export function createSdkSandboxClientFactoryV1(
       return createLocalDockerSandboxClientV1({
         apiKey,
         ...(options?.dockerImage !== undefined ? { image: options.dockerImage } : {}),
+        ...(options?.dockerLegacySandboxIds !== undefined
+          ? { legacyUnlabelledSandboxIds: options.dockerLegacySandboxIds }
+          : {}),
       });
     },
   };
@@ -207,8 +212,25 @@ export async function ensureUserSandboxV1(
     try {
       store.writeUserSandbox(record);
     } catch (error) {
-      // Not recorded means unreachable forever: give the sandbox back now.
-      await client.destroySandbox(created.sandboxId).catch(() => undefined);
+      // Not recorded means unreachable forever: give the sandbox back now,
+      // retrying a transient provider failure. If every attempt fails, the
+      // id goes into the thrown error's message — the only place it still
+      // exists — rather than being dropped silently (second-round review).
+      let destroyed = false;
+      for (let attempt = 0; attempt < 3 && !destroyed; attempt += 1) {
+        try {
+          await client.destroySandbox(created.sandboxId);
+          destroyed = true;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+      if (!destroyed) {
+        throw new Error(
+          `the ${provider} sandbox ${created.sandboxId} was created but could neither be recorded nor destroyed; ` +
+            "remove it at the provider manually"
+        );
+      }
       throw error;
     }
     return record;

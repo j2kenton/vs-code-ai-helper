@@ -202,6 +202,45 @@ test("a persistent sandbox: the second task on the same repo reuses and fetches 
   assert.deepEqual(cloneStep.outcome, { status: "failed", code: "gitCloneWorkspaceOccupied" });
 });
 
+test("a crash before a reused clone's fetch recovers by FETCHING — the earlier task's .git is never adopted as this task's work", async () => {
+  // Second-round review: reconciliation saw the pre-existing .git (left by an
+  // earlier task) and marked this task's clone step done, skipping the fetch.
+  const REPO = "https://example.com/repo.git";
+  const store = createControlPlaneStoreV1();
+  let crashNextRemoteCheck = true;
+  const client = createInMemorySandboxClientV1({
+    onCommand: (request) => {
+      const [git, flag, , verb] = request.argv;
+      if (git === "git" && flag === "-C" && verb === "remote") {
+        if (crashNextRemoteCheck) {
+          crashNextRemoteCheck = false;
+          throw new Error("control plane died mid-step");
+        }
+        return { exitCode: 0, stdoutTail: `${REPO}\n`, stderrTail: "" };
+      }
+      return { exitCode: 0, stdoutTail: "", stderrTail: "" };
+    },
+  });
+  // The persistent sandbox already holds an earlier task's clone.
+  client.addDirectory("sbx-1", "/workspace/.git");
+  const context: SandboxExecutionContextV1 = {
+    binding: makeBinding("owner-a", {
+      source: { kind: "gitClone", repoUrl: REPO, ref: "main" },
+      lifecycle: "user-owned-managed",
+      cleanup: "retain",
+    }),
+    client,
+  };
+  const machinery = makeMachinery(store);
+
+  await assert.rejects(acquireTaskSourceV1(machinery, context), /died mid-step/);
+  const recovered = await acquireTaskSourceV1(machinery, context);
+
+  assert.equal(recovered.acquired, true);
+  const fetches = client.executedCommands.filter((entry) => entry.argv.includes("fetch"));
+  assert.equal(fetches.length, 1, "recovery must actually fetch, not adopt the stale clone");
+});
+
 test("suggestion-7 scenario: a crash between clone and checkout recovers onto the PINNED ref, no duplicate clone", async () => {
   const store = createControlPlaneStoreV1();
   const machinery = makeMachinery(store);

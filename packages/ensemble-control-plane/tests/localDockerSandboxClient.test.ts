@@ -19,6 +19,7 @@ import {
   createLocalDockerSandboxClientV1,
   DEFAULT_DOCKER_SANDBOX_LIMITS_V1,
   DOCKER_SANDBOX_LABEL_V1,
+  DockerExecNotStoppedErrorV1,
   DockerSandboxNotManagedErrorV1,
 } from "../src/localDockerSandboxClientV1";
 
@@ -220,8 +221,18 @@ test("createSandbox: an explicit empty user override falls back to the image's o
  * container name. That resolution is the attack surface — confirmed live
  * (2026-09-11): `b7` resolved to a real sandbox on the box.
  */
+interface FakeContainerV1 {
+  readonly name: string;
+  readonly image: string;
+  readonly labelled: boolean;
+  /** Defaults: a non-root, memory- and pid-limited container (today's profile). */
+  readonly user?: string;
+  readonly memory?: number;
+  readonly pids?: number;
+}
+
 function makeDaemon(
-  containers: Record<string, { readonly name: string; readonly image: string; readonly labelled: boolean }>
+  containers: Record<string, FakeContainerV1>
 ): { docker: unknown; removed: string[]; execsOn: string[] } {
   const removed: string[] = [];
   const execsOn: string[] = [];
@@ -249,7 +260,12 @@ function makeDaemon(
           ? Promise.reject(notFound())
           : Promise.resolve({
               Id: id,
-              Config: { Image: found.image, Labels: found.labelled ? { [DOCKER_SANDBOX_LABEL_V1]: "1" } : {} },
+              Config: {
+                Image: found.image,
+                User: found.user ?? "1001:1001",
+                Labels: found.labelled ? { [DOCKER_SANDBOX_LABEL_V1]: "1" } : {},
+              },
+              HostConfig: { Memory: found.memory ?? 4 * 1024 ** 3, PidsLimit: found.pids ?? 1024 },
             });
       },
       exec: () => {
@@ -299,20 +315,30 @@ test("ownership guard: prefixes, names, and unlabelled host containers are refus
   assert.deepEqual(execsOn, [MINE]);
 });
 
-test("ownership guard: an unlabelled pre-label sandbox is accepted only on the configured sandbox image", async () => {
+test("ownership guard: a pre-label sandbox is accepted only by exact listed id AND today's security profile — never by image", async () => {
   const legacy = "d4".padEnd(64, "3");
-  const generic = "e5".padEnd(64, "4");
+  const sameImageStranger = "e5".padEnd(64, "4");
+  const legacyAsRoot = "f6".padEnd(64, "5");
+  const legacyUnlimited = "a7".padEnd(64, "6");
   const { docker } = makeDaemon({
     [legacy]: { name: "old", image: "ensemble-sandbox:latest", labelled: false },
-    [generic]: { name: "node", image: "node:24-bookworm", labelled: false },
+    // Same image, not listed: an image match proves nothing about who created it.
+    [sameImageStranger]: { name: "other", image: "ensemble-sandbox:latest", labelled: false },
+    [legacyAsRoot]: { name: "root", image: "ensemble-sandbox:latest", labelled: false, user: "" },
+    [legacyUnlimited]: { name: "nolimit", image: "ensemble-sandbox:latest", labelled: false, memory: 0 },
   });
-  const configured = createLocalDockerSandboxClientV1({ docker: docker as never, image: "ensemble-sandbox:latest" });
-  await assert.rejects(configured.readFileUtf8(legacy, "/x"), /exec reached/);
-  await assert.rejects(configured.readFileUtf8(generic, "/x"), DockerSandboxNotManagedErrorV1);
+  const client = createLocalDockerSandboxClientV1({
+    docker: docker as never,
+    image: "ensemble-sandbox:latest",
+    legacyUnlabelledSandboxIds: [legacy, legacyAsRoot, legacyUnlimited],
+  });
+  await assert.rejects(client.readFileUtf8(legacy, "/x"), /exec reached/);
+  await assert.rejects(client.readFileUtf8(sameImageStranger, "/x"), DockerSandboxNotManagedErrorV1);
+  await assert.rejects(client.readFileUtf8(legacyAsRoot, "/x"), DockerSandboxNotManagedErrorV1, "root fails the profile");
+  await assert.rejects(client.readFileUtf8(legacyUnlimited, "/x"), DockerSandboxNotManagedErrorV1, "no memory limit fails the profile");
 
-  // With no configured image there is no legacy grace at all — a bare node
-  // container proves nothing about who made it.
-  const unconfigured = createLocalDockerSandboxClientV1({ docker: docker as never });
+  // No list configured: no legacy grace at all, whatever the image.
+  const unconfigured = createLocalDockerSandboxClientV1({ docker: docker as never, image: "ensemble-sandbox:latest" });
   await assert.rejects(unconfigured.readFileUtf8(legacy, "/x"), DockerSandboxNotManagedErrorV1);
 });
 
@@ -357,37 +383,68 @@ test("createSandbox: labelled, resource-limited, no capabilities, no privilege e
  * writes to its output stream), with `process.kill` captured so the
  * adapter's host-pid kill is observable. Call `restore` when done.
  */
-function makeExecDaemon(produce: (stream: Duplex) => void): {
+function makeExecDaemon(
+  produce: (stream: Duplex) => void,
+  options?: {
+    /** Processes still carrying the marker after the tree kill (a kill that did not take). */
+    readonly survivorsAfterKill?: number;
+  }
+): {
   readonly docker: unknown;
   readonly killed: number[];
+  /** Marker scans the adapter ran (each one kills whatever carries the marker). */
+  readonly markerScans: string[];
   restore(): void;
 } {
   const killed: number[] = [];
+  const markerScans: string[] = [];
   let running = true;
+  const newStream = (): Duplex =>
+    new Duplex({
+      read() {
+        // Output is pushed explicitly.
+      },
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
   const docker = {
     modem: {
       demuxStream: (stream: Duplex, stdout: Duplex) => {
         stream.on("data", (chunk: Buffer) => stdout.write(chunk));
+        stream.on("end", () => stdout.end());
       },
     },
     getContainer: () => ({
       inspect: () => Promise.resolve(MANAGED_INSPECT),
-      exec: () =>
-        Promise.resolve({
+      exec: (opts: { Cmd: readonly string[] }) => {
+        const script = opts.Cmd[2] ?? "";
+        if (script.includes("/proc/[0-9]*")) {
+          // The adapter's tree kill: first scan finds the tree, second
+          // verifies it is gone (or, if scripted, that some survived).
+          markerScans.push(script);
+          const found = markerScans.length % 2 === 1 ? 2 : (options?.survivorsAfterKill ?? 0);
+          return Promise.resolve({
+            start: () => {
+              const stream = newStream();
+              setImmediate(() => {
+                stream.push(`${found}\n`);
+                stream.push(null);
+              });
+              return Promise.resolve(stream);
+            },
+            inspect: () => Promise.resolve({ ExitCode: 0, Running: false, Pid: 0 }),
+          });
+        }
+        return Promise.resolve({
           start: () => {
-            const stream = new Duplex({
-              read() {
-                // Output is pushed by `produce`.
-              },
-              write(_chunk, _encoding, callback) {
-                callback();
-              },
-            });
+            const stream = newStream();
             setImmediate(() => produce(stream));
             return Promise.resolve(stream);
           },
           inspect: () => Promise.resolve({ ExitCode: 0, Running: running, Pid: 777 }),
-        }),
+        });
+      },
     }),
   };
   const originalKill = process.kill;
@@ -399,6 +456,7 @@ function makeExecDaemon(produce: (stream: Duplex) => void): {
   return {
     docker,
     killed,
+    markerScans,
     restore(): void {
       (process as unknown as { kill: typeof process.kill }).kill = originalKill;
     },
@@ -436,6 +494,24 @@ test("exec capture: a command that never exits is killed at its deadline", async
     assert.equal(result.exitCode, 124);
     assert.match(result.stderrTail, /command stopped: timed out/);
     assert.deepEqual(daemon.killed, [777]);
+    // The whole tree is killed by the attempt marker, then verified gone.
+    assert.equal(daemon.markerScans.length, 2);
+    assert.ok(daemon.markerScans[0]?.includes("'ENSEMBLE_ATTEMPT_KEY_V1=abc123abc123abc1'"));
+  } finally {
+    daemon.restore();
+  }
+});
+
+test("exec capture: a stop that cannot be PROVEN (marked processes survive) throws, never a terminal exit code", async () => {
+  // Returning 124 while children kept running is how a 'stopped' round kept
+  // editing files. An unprovable stop leaves the attempt open for recovery.
+  const daemon = makeExecDaemon(() => undefined, { survivorsAfterKill: 1 });
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never, commandTimeoutMs: 50 });
+    await assert.rejects(
+      client.runCommand({ sandboxId: SANDBOX_ID, argv: ["sleep", "infinity"], cwd: "/", attemptKey: "abc123abc123abc1" }),
+      DockerExecNotStoppedErrorV1
+    );
   } finally {
     daemon.restore();
   }

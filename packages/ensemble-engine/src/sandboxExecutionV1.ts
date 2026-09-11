@@ -385,8 +385,20 @@ export function createGitCloneEffectV1(context: SandboxExecutionContextV1): Engi
     binding.workingDirectoryRoot === "/" ? "/.git" : `${binding.workingDirectoryRoot}/.git`;
   return {
     effectKind: "sandboxCommand",
-    supportsIdempotentReplay: false,
+    // Replay-safe BY CONSTRUCTION rather than by provider key-dedupe:
+    // "same-origin clone present → fetch, absent → clone" converges on the
+    // same state however many times it runs. Recovery therefore re-runs it
+    // instead of reconciling — reconciliation could not tell THIS attempt's
+    // work from a clone an earlier task left in a persistent sandbox, and
+    // adopted a skipped fetch as done (second-round review).
+    supportsIdempotentReplay: true,
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
+      // A replay after a crash may find the ORIGINAL command still running
+      // in the sandbox (the control plane died, the container did not).
+      // Racing it would corrupt the clone; fail loudly instead.
+      if ((await client.findCommandByAttemptKey(binding.sandboxId, attemptKey)) === "executed") {
+        return { status: "failed", code: "gitCloneStillRunning" };
+      }
       // A PERSISTENT sandbox keeps its working tree between tasks, so the
       // second task on the same repo used to fail here: `git clone` refuses
       // a non-empty destination (review finding, 2026-09-11). An existing

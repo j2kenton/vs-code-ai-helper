@@ -459,10 +459,17 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   // fine for API-keyed models, useless for `claude-cli:*` selections — so
   // an operator who wants the subscription path must build and name it.
   const dockerSandboxImage = process.env["ENSEMBLE_DOCKER_SANDBOX_IMAGE"];
+  // Exact full ids of sandboxes created before containers were labelled —
+  // accepted one by one, never by image (see localDockerSandboxClientV1).
+  const dockerLegacySandboxIds = (process.env["ENSEMBLE_DOCKER_LEGACY_SANDBOX_IDS"] ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => /^[0-9a-f]{64}$/.test(id));
   const sandboxFactory = createSdkSandboxClientFactoryV1({
     ...(dockerSandboxImage !== undefined && dockerSandboxImage.length > 0
       ? { dockerImage: dockerSandboxImage }
       : {}),
+    ...(dockerLegacySandboxIds.length > 0 ? { dockerLegacySandboxIds } : {}),
   });
   const jobSupervisor = createEngineJobSupervisorV1({
     store,

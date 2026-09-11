@@ -306,7 +306,14 @@ export function SettingsScreen(): React.JSX.Element {
       return;
     }
     setResetArmedFor(null);
+    const target = sandboxTarget;
     const result = await services.client.resetUserSandbox(sandboxProvider);
+    if (sandboxTargetRef.current !== target) {
+      // The picker moved while the reset was in flight: its result belongs
+      // to a sandbox this card no longer shows, and must not clear a
+      // sign-in the user has since started for the new one.
+      return;
+    }
     if (result.ok) {
       setResetNotice('Sandbox destroyed. The next task or sign-in creates a fresh one.');
       setCliLogin({ kind: 'idle' });
