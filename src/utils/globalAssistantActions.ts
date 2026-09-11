@@ -44,6 +44,25 @@ export interface GlobalAssistantContext {
   /** Persisted pending-operation records (workspaceState). Repairs and
    * archives clear a task's records through this store. */
   pendingOperations?: PendingOperationsStore;
+  /**
+   * Single-use work-admission handoff token (2026-09-10 review completion
+   * blocker: stage chat's `triggerStageAI` dispatch released its own live
+   * admission before this operation's confirmation modal and downstream
+   * `applyCurrentStageAction` dispatch, leaving that work-starting
+   * continuation unprotected for the whole of the (unbounded) confirmation
+   * wait). Set ONLY by a caller that already holds live durable admission for
+   * the SAME task this operation is about to act on and wants the downstream
+   * dispatch to adopt it (`workAdmissionV1.ts`'s
+   * `authorizeWorkAdmissionHandoffV1`/`acquireOrAdoptWorkAdmissionV1`) —
+   * currently `chatWithStage.ts`'s `dispatchProposedStageActionV1`, whose
+   * proposal is always pinned to the chat's own task (never a caller-chosen
+   * target), so forwarding this token is safe for `triggerStageAI` even
+   * though the same operation id is also reachable from the general global
+   * assistant (where this field is always undefined, since that path targets
+   * an arbitrary task named by the model and holds no admission of its own to
+   * hand off).
+   */
+  admissionHandoffTokenV1?: string;
 }
 
 /**
@@ -702,6 +721,16 @@ const triggerStageAI: GlobalAssistantOperation = {
     try {
       await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
         taskFolderPath: task.taskFolderPath,
+        // Forward the caller's handoff token (see GlobalAssistantContext's
+        // doc comment) ONLY when it targets this exact task — stage chat's
+        // proposal is always pinned to its own task, but the general global
+        // assistant path can direct triggerStageAI at any task named by the
+        // model, and a token minted for a different task must never be
+        // presented here.
+        admissionHandoffTokenV1:
+          ctx.admissionHandoffTokenV1 && ctx.assistantFolderUri.fsPath === task.taskFolderPath
+            ? ctx.admissionHandoffTokenV1
+            : undefined,
       });
       return {
         summary: `Started the current stage's AI action for "${label}" (progress appears in Notifications).`,

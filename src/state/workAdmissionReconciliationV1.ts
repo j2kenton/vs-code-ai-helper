@@ -80,8 +80,11 @@ export async function reconcileWatchdogPauseAgainstAdmissionV1(
       // would let a stale `watchdogPauseClaimId` survive on an `active`
       // task, contrary to `updateTaskStatus`'s own default-clear behavior for
       // every other transition away from `paused` (see
-      // `taskProgressFieldPolicyV1.ts`).
+      // `taskProgressFieldPolicyV1.ts`). Its Part 1b companion
+      // (`watchdogPauseFenceGeneration`) is cleared in the same step, for the
+      // same reason.
       watchdogPauseClaimId: undefined,
+      watchdogPauseFenceGeneration: undefined,
       updatedAt: new Date().toISOString(),
     };
   });

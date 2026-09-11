@@ -297,7 +297,7 @@ void describe("TaskCreationStartupReconcilerV1 activation-barrier wiring", () =>
     { file: "src/commands/scheduleTaskResume.ts", fn: "export async function scheduleTaskResume(", firstRead: "resolveTaskContext(" },
     { file: "src/commands/scheduleTaskResume.ts", fn: "export async function cancelScheduledTaskAction(", firstRead: "resolveTaskContext(" },
     { file: "src/commands/renameTask.ts", fn: "export async function renameTask(", firstRead: "await resolve(inventory, arg)" },
-    { file: "src/commands/renameTask.ts", fn: "export async function renameTaskWithAI(", firstRead: "await resolve(inventory, arg)" },
+    { file: "src/commands/renameTask.ts", fn: "export async function renameTaskWithAI(", firstRead: "await resolve(inventory, arg," },
     { file: "src/commands/applyCurrentStageAction.ts", fn: "export async function applyCurrentStageAction(", firstRead: "resolveTaskContext(" },
     { file: "src/commands/commitAndPushTask.ts", fn: "export async function commitAndPushTask(", firstRead: "resolveCommitPushTargetTaskV1(" },
     { file: "src/commands/commitAndPushTask.ts", fn: "export async function completeCommitAndPushTask(", firstRead: "resolveTaskContext(" },

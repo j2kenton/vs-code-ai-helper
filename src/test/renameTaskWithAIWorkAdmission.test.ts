@@ -29,6 +29,12 @@ const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-rename-task-ad
 function makeTaskFolder(name: string): string {
   const dir = path.join(REAL_ROOT, name);
   fs.mkdirSync(dir, { recursive: true });
+  // The shared early-admission helper (`looksLikeTaskFolderPathV1`) requires
+  // a `task.md` to exist before it will even attempt admission — a bare
+  // directory silently short-circuits the early-acquisition path (returns
+  // `undefined` rather than a refusal), letting execution fall through to
+  // task resolution instead of the busy check this test exercises.
+  fs.writeFileSync(path.join(dir, "task.md"), "# Test task\n");
   return dir;
 }
 

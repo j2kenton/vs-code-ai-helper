@@ -60,9 +60,11 @@ import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
 import {
   acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
   beginTargetResolutionV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
+  revokeWorkAdmissionHandoffV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
@@ -406,19 +408,33 @@ export async function chatWithStage(
   //    targets a different folder than `validateChatSendV1` authoritatively
   //    resolves to, the early admission is released and reacquired for the
   //    REAL target instead of protecting the wrong one.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
   const targetResolutionHandle = wantsSend
-    ? await beginTargetResolutionV1(resolveTaskRootCandidates().map((candidate) => candidate.absolutePath))
+    ? await beginTargetResolutionV1(taskRootCandidatePathsV1)
     : undefined;
   // 2026-09-10 round: `resolverArg?.taskFolderPath` is a raw, unvalidated
   // caller-supplied path — `validateChatSendV1`'s `resolveTaskContext` call
   // performs the real ownership/containment/workspace-binding validation,
-  // but this early guess runs BEFORE any of that. Gating on `fs.existsSync`
-  // here does not replace that validation, but it stops
-  // `acquireWorkAdmissionV1`'s genesis `mkdir(dir, { recursive: true })`
-  // from creating admission bookkeeping directories under a path that is
-  // not even an existing directory on disk — narrowing (not fully closing)
-  // the raw-path admission-before-validation blocker until the shared
-  // admission helper itself enforces this.
+  // but this early guess runs BEFORE any of that. A synchronous containment
+  // check against `resolveTaskRootCandidates()` was tried here and reverted
+  // the same round: it depends on `vscode.workspace.workspaceFolders` being
+  // configured exactly in step with wherever the caller's raw path actually
+  // points, which real callers (and this route's own unit tests, using a
+  // bare temp directory with no configured workspace folder) are not
+  // guaranteed to be — it silently skipped early admission for legitimate
+  // candidates, reopening exactly the unprotected setup-phase window this
+  // helper exists to close, which is worse than the narrower gap it aimed to
+  // close. `acquireEarlyWorkAdmissionForCandidatePathV1` still does not
+  // replace the real ownership/containment/workspace-binding validation
+  // `validateChatSendV1` performs below, so the underlying architectural
+  // blocker only shrinks in blast radius.
+  //
+  // 2026-09-11 round (review architectural blocker `d620c877...-1`,
+  // narrowed further): passing `taskRootCandidatePathsV1` as
+  // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
+  // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
+  // repeating the reverted gate — admission is still always acquired for a
+  // path that looks like a task folder, never left unprotected.
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
   // 2026-09-10 round (re-fixed per review directive "fix these in the shared
   // admission helper, not per route"): the validation-before-bookkeeping
@@ -431,6 +447,7 @@ export async function chatWithStage(
     candidatePath: earlyFolderPath,
     purpose: "admission",
     commandId: "chatWithStage",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
   });
   if (early && early.outcome !== "acquired") {
     if (targetResolutionHandle) {
@@ -454,22 +471,35 @@ export async function chatWithStage(
     }
   };
 
+  // 2026-09-10 review completion blocker fix (`d620c877...-2`): resolution
+  // protection used to end as soon as `validateChatSendV1` settled — BEFORE
+  // the (unbounded) consent modal and the late per-task admission
+  // acquisition that both follow it — so a canonical-ID/no-path invocation
+  // (no early guess) had NO protection at all for the whole consent window.
+  // Protection now stays live, guarded so it ends exactly once, until either
+  // this command decides it will not enter the send path (validation failed,
+  // no message to send, consent declined) or per-task admission has taken
+  // over for the authoritative target.
+  let targetResolutionEnded = !targetResolutionHandle;
+  const endTargetResolutionOnceV1 = async (): Promise<void> => {
+    if (targetResolutionEnded) {
+      return;
+    }
+    targetResolutionEnded = true;
+    await endTargetResolutionV1(targetResolutionHandle);
+  };
+
   let dispatch: ChatSendDispatchV1 | undefined;
   try {
-    let validated: ChatSendValidationResultV1;
-    try {
-      validated = await validateChatSendV1(inventory, resolverArg, stage);
-    } finally {
-      if (targetResolutionHandle) {
-        await endTargetResolutionV1(targetResolutionHandle);
-      }
-    }
+    const validated: ChatSendValidationResultV1 = await validateChatSendV1(inventory, resolverArg, stage);
     if (!validated.ok) {
+      await endTargetResolutionOnceV1();
       NotificationRouter.showWarning(validated.reason);
       return;
     }
     const { task, targetStage } = validated;
     if (!message?.trim()) {
+      await endTargetResolutionOnceV1();
       await chatViewProvider.open({
         canonicalId: task.canonicalId,
         taskFolderPath: task.taskFolderPath,
@@ -478,7 +508,10 @@ export async function chatWithStage(
       });
       return;
     }
-    if (!(await ensureAiConsent(context))) return;
+    if (!(await ensureAiConsent(context))) {
+      await endTargetResolutionOnceV1();
+      return;
+    }
 
     // The early guess above can target the wrong task — release it and fall
     // through to the ordinary late-acquisition path below, which acquires
@@ -494,12 +527,18 @@ export async function chatWithStage(
         commandId: "chatWithStage",
       });
       if (late.outcome !== "acquired") {
+        await endTargetResolutionOnceV1();
         NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
         return;
       }
       handle = late.handle;
       heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
+
+    // Per-task admission is now live for the authoritative target — the
+    // best-effort cross-window resolution guard has served its purpose and
+    // can end; per-task admission takes over protection from here.
+    await endTargetResolutionOnceV1();
 
     // Admission is now guaranteed live for this exact target — reverse a
     // watchdog-provenance pause (never a user pause) before any further
@@ -518,37 +557,60 @@ export async function chatWithStage(
     }
 
     dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message);
-  } finally {
-    await releaseCurrentAdmissionV1();
-  }
 
-  // Dispatched AFTER admission is released, deliberately: a proposed stage
-  // action (e.g. `applyReviewWithAI` via `executeProposedAction`) acquires
-  // its OWN admission for this same task, and this call site mints no
-  // handoff token for it — so this command's marker must already be gone, or
-  // that downstream acquisition would see it as a live foreign marker and
-  // refuse `busy` against itself.
-  if (dispatch?.proposedAction) {
-    await dispatchProposedStageActionV1(
-      context,
-      inventory,
-      currentTaskStore,
-      chatViewProvider,
-      dispatch.task.taskFolderPath,
-      dispatch.task.canonicalId,
-      dispatch.targetStage,
-      dispatch.proposedAction
-    );
-  }
-  if (dispatch?.proposedBlockerSupersessionEdit) {
-    await dispatchProposedBlockerSupersessionEditV1(
-      chatViewProvider,
-      dispatch.task.taskFolderPath,
-      dispatch.task.canonicalId,
-      dispatch.targetStage,
-      dispatch.proposedBlockerSupersessionEdit,
-      dispatch.proposedBlockerSupersessionEditAt
-    );
+    // 2026-09-10 review completion blocker fix (`d620c877...-2`): `triggerStageAI`
+    // is the one pinned stage action that starts real work — it goes through
+    // an (unbounded) confirmation modal and a downstream
+    // `applyCurrentStageAction` dispatch before the actual admission-wired
+    // stage command ever gets a chance to acquire its own, so that whole
+    // window used to run with NO admission for this task at all. Kept alive
+    // through this dispatch ONLY for that action id, and handed off via a
+    // single-use token (`dispatchProposedStageActionV1`'s own
+    // `authorizeWorkAdmissionHandoffV1` call) instead of racing a fresh
+    // genesis against it. The other three pinned actions
+    // (`completeStage`/`setTaskStage`/`completeTask`) are deterministic
+    // status writes with no admission-wired route of their own
+    // (`workAdmissionRouteInventoryV1.ts`) — except `completeStage`, which
+    // can reach `scheduleAutomationChain` and, through it, an
+    // admission-wired review/implementation dispatch with no handoff token
+    // threaded that deep. Admission is released before those, exactly as
+    // before this fix, so an already-admission-wired downstream command
+    // never sees this call's marker as a live foreign `busy` owner.
+    const proposedActionNeedsAdmissionHandoffV1 = dispatch?.proposedAction?.id === "triggerStageAI";
+    if (!proposedActionNeedsAdmissionHandoffV1) {
+      await releaseCurrentAdmissionV1();
+    }
+    if (dispatch?.proposedAction) {
+      await dispatchProposedStageActionV1(
+        context,
+        inventory,
+        currentTaskStore,
+        chatViewProvider,
+        dispatch.task.taskFolderPath,
+        dispatch.task.canonicalId,
+        dispatch.targetStage,
+        dispatch.proposedAction
+      );
+    }
+    if (dispatch?.proposedBlockerSupersessionEdit) {
+      await dispatchProposedBlockerSupersessionEditV1(
+        chatViewProvider,
+        dispatch.task.taskFolderPath,
+        dispatch.task.canonicalId,
+        dispatch.targetStage,
+        dispatch.proposedBlockerSupersessionEdit,
+        dispatch.proposedBlockerSupersessionEditAt
+      );
+    }
+  } finally {
+    // Safety net: any exception path above that did not reach one of the
+    // explicit `endTargetResolutionOnceV1()` calls (e.g. a thrown error from
+    // `validateChatSendV1` or the consent gate) must still release the
+    // resolution guard here, exactly like draftTaskWithAI.ts's identical
+    // outer-finally safety net. Admission itself is released only now, after
+    // both dispatch calls above have settled.
+    await endTargetResolutionOnceV1();
+    await releaseCurrentAdmissionV1();
   }
 }
 
@@ -815,18 +877,33 @@ export async function dispatchProposedStageActionV1(
     );
     return;
   }
-  const outcome = await executeProposedAction(
-    {
-      inventory,
-      currentTaskStore,
-      assistantFolderUri: vscode.Uri.file(taskFolderPath),
-      pendingOperations: new PendingOperationsStore(context.workspaceState),
-    },
-    {
-      operationId: action.id,
-      payload: buildStageActionPayload(action, taskFolderPath, proposedAction.payload),
-    }
-  );
+  // 2026-09-10 review completion blocker fix (`d620c877...-2`): this call's
+  // caller (`chatWithStage`) keeps its own live admission for `taskFolderPath`
+  // open through this whole dispatch instead of releasing it beforehand, and
+  // hands that admission off here rather than leaving `triggerStageAI`'s
+  // confirmation modal and downstream `applyCurrentStageAction` dispatch
+  // unprotected. Mint immediately before the call that can adopt it and
+  // revoke once it settles, mirroring `resumeThenDispatchV1`'s identical
+  // mint/dispatch/revoke shape.
+  const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
+  let outcome: string;
+  try {
+    outcome = await executeProposedAction(
+      {
+        inventory,
+        currentTaskStore,
+        assistantFolderUri: vscode.Uri.file(taskFolderPath),
+        pendingOperations: new PendingOperationsStore(context.workspaceState),
+        admissionHandoffTokenV1: handoffToken,
+      },
+      {
+        operationId: action.id,
+        payload: buildStageActionPayload(action, taskFolderPath, proposedAction.payload),
+      }
+    );
+  } finally {
+    revokeWorkAdmissionHandoffV1(taskFolderPath);
+  }
   await chatViewProvider.append("assistant", outcome, targetStage, chatTarget);
 }
 

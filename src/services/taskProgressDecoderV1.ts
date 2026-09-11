@@ -161,6 +161,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "incompleteRoundContinuations",
   "pausedReason",
   "watchdogPauseClaimId",
+  "watchdogPauseFenceGeneration",
   "implRecovery",
   "quotaParkRecord",
 ] as const satisfies readonly (keyof TaskProgress)[];
@@ -2279,6 +2280,19 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.watchdogPauseClaimId = value;
+        break;
+      }
+      case "watchdogPauseFenceGeneration": {
+        // The durable pause-fence generation (workAdmissionV1.ts) captured
+        // when this pause's committing claim was acquired — a plain
+        // generation counter, never negative, never fractional.
+        if (!isNonNegativeInteger(value)) {
+          return recovery(
+            "invalidFieldValue",
+            "watchdogPauseFenceGeneration must be a non-negative integer"
+          );
+        }
+        draft.watchdogPauseFenceGeneration = value;
         break;
       }
       case "lintPayload": {

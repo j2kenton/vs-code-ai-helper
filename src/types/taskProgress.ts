@@ -582,6 +582,27 @@ export interface TaskProgress {
   watchdogPauseClaimId?: string;
 
   /**
+   * The durable pause-fence generation (`workAdmissionV1.ts`'s
+   * `readOrInitPauseFenceGenerationV1`/`advancePauseFenceGenerationV1`) that
+   * was current at the moment this watchdog pause's committing claim was
+   * acquired (v1 fixes item 1, Part 1b step 1). Captured exactly once, before
+   * the progress mutation that writes this pause begins, and carried
+   * unchanged through pre-write and post-write currency checks
+   * (`isWatchdogPauseFenceCurrentV1`) — a pause is only EFFECTIVE while this
+   * value still equals the task's current durable generation; once a
+   * revocation advances the fence past it, every reader must treat this pause
+   * as stale (ignored and repaired), never as a real block, regardless of
+   * what `status`/`pausedReason` still say on disk. Absent for a pause
+   * committed before this field existed (shipped Part 1a builds) or one not
+   * committed through the claim protocol at all (a user pause, a quota park)
+   * — an absent value is always treated as current (there is no fence to have
+   * fallen behind). Cleared by the same rule as `watchdogPauseClaimId`: any
+   * status change away from paused, or a later unrelated pause overwriting
+   * it.
+   */
+  watchdogPauseFenceGeneration?: number;
+
+  /**
    * Durable record that an implementation round finished without a usable
    * report and a recovery continuation is owed — the ONE transition every
    * unreported round lands on (deferred, cut short, or a stamped-unusable

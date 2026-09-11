@@ -41,6 +41,8 @@ import {
   hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
+  isWatchdogPauseFenceCurrentV1,
+  readOrInitPauseFenceGenerationV1,
   revokeWorkAdmissionHandoffV1,
   withWorkAdmissionV1,
 } from "../state/workAdmissionV1";
@@ -662,7 +664,8 @@ export class TaskActionScheduler implements vscode.Disposable {
     attemptId: string | undefined,
     reason: string,
     claimId: string,
-    claimOwnerToken: string
+    claimOwnerToken: string,
+    fenceGeneration: number
   ): Promise<{ readonly progress: TaskProgress | undefined; readonly transitioned: boolean }> {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
     // `excludeWorkAdmissionOwnerToken` is this call's OWN `pauseCommit` claim
@@ -707,13 +710,14 @@ export class TaskActionScheduler implements vscode.Disposable {
           }
           liveRowTransitioned = true;
           const cleared = clearImplRecovery ? { ...current, implRecovery: undefined } : current;
-          return pauseTaskWithReasonForClaimV1(cleared, reason, claimId);
+          return pauseTaskWithReasonForClaimV1(cleared, reason, claimId, fenceGeneration);
         },
         whenNoLiveRow: {
           reason,
           clearImplRecovery,
           isStillImpossible,
           claimId,
+          fenceGeneration,
           patch: (folder, transform) => this.store.patch(folder, transform),
         },
       }
@@ -815,6 +819,26 @@ export class TaskActionScheduler implements vscode.Disposable {
         if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
           continue;
         }
+        // v1 fixes item 1, Part 1b step 1: capture the durable pause-fence
+        // generation exactly once here, before this attempt's progress
+        // mutation begins — every subsequent step (the write below, and both
+        // currency checks) carries this SAME captured value, never a
+        // re-read, so a concurrent revocation's later fence advance is
+        // unambiguously "after" this attempt's own snapshot rather than
+        // something this attempt could race into observing halfway.
+        const fenceGeneration = await readOrInitPauseFenceGenerationV1(task.taskFolderPath);
+        // Pre-write currency check: nothing can have advanced the fence
+        // between the capture immediately above and here (no `await` runs in
+        // between), so this is a no-op today — there is no revocation
+        // protocol yet to race it. It exists so the write below never fires
+        // without this check having run at least once ahead of it, matching
+        // the plan's literal "pre-write and post-write checks" pairing; once
+        // revocation (Part 1b's remaining steps) can advance the fence
+        // asynchronously, inserting real work ahead of the write, this check
+        // starts actually doing something.
+        if (!(await isWatchdogPauseFenceCurrentV1(task.taskFolderPath, fenceGeneration))) {
+          continue;
+        }
         const recovery = task.progress.implRecovery;
         const stuckRecovery =
           recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
@@ -826,7 +850,8 @@ export class TaskActionScheduler implements vscode.Disposable {
           stuckRecovery ? recovery?.attemptId : undefined,
           expectedReason,
           claimId,
-          ownerToken
+          ownerToken,
+          fenceGeneration
         );
         if (!transitioned || patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
           // Either nothing changed, or the task was already paused by a
@@ -835,15 +860,21 @@ export class TaskActionScheduler implements vscode.Disposable {
           // escalation, so this one must not post a second copy of it.
           continue;
         }
-        // Post-write check, again excluding this claim's own marker: a
+        // Post-write checks, again excluding this claim's own marker: a
         // command's genesis that started AFTER our pre-write check but
         // BEFORE our write landed on disk must still be found here and
         // reversed, never announced as a pause — the mirror case of
         // `reconcileWatchdogPauseAgainstAdmissionV1`, which covers the same
         // race from the ADMITTING side. `watchdogPauseClaimId` is checked
         // alongside status/reason so this reversal can only ever clear the
-        // EXACT pause attempt this call itself just committed.
-        if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
+        // EXACT pause attempt this call itself just committed. The fence
+        // currency check (Part 1b step 1) is the same idea for revocation,
+        // once it exists: a revoke-and-advance that lands during the awaited
+        // write above must be found here too, not just a live admission
+        // marker.
+        const admissionArrivedDuringWrite = hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken);
+        const fenceAdvancedDuringWrite = !(await isWatchdogPauseFenceCurrentV1(task.taskFolderPath, fenceGeneration));
+        if (admissionArrivedDuringWrite || fenceAdvancedDuringWrite) {
           await this.store.patch(vscode.Uri.file(task.taskFolderPath), (current) => {
             if (
               current.status !== "paused" ||
@@ -858,6 +889,7 @@ export class TaskActionScheduler implements vscode.Disposable {
               status: "active",
               pausedReason: undefined,
               watchdogPauseClaimId: undefined,
+              watchdogPauseFenceGeneration: undefined,
               updatedAt: new Date(this.clock.now()).toISOString(),
             };
           });

@@ -404,6 +404,11 @@ export interface TerminalizeRoundOptionsV1 {
      * Omitted by callers with no claim to bind (falls back to the plain
      * `pauseTaskWithReason`). */
     readonly claimId?: string;
+    /** The durable pause-fence generation (Part 1b step 1) the caller
+     * captured at the same moment it acquired `claimId` above — required
+     * whenever `claimId` is supplied, since every claim-bound pause must
+     * carry one (`pauseTaskWithReasonForClaimV1`'s own signature). */
+    readonly fenceGeneration?: number;
     /** Injectable durable write primitive for this branch, matching
      * `SchedulerProgressStore.patch`'s signature — real disk in production,
      * swappable in tests. Defaults to `patchTaskProgressStrictV1`. */
@@ -528,8 +533,8 @@ async function runWhenNoLiveRowV1(
     }
     transitioned = true;
     const cleared = whenNoLiveRow.clearImplRecovery ? { ...current, implRecovery: undefined } : current;
-    return whenNoLiveRow.claimId !== undefined
-      ? pauseTaskWithReasonForClaimV1(cleared, whenNoLiveRow.reason, whenNoLiveRow.claimId)
+    return whenNoLiveRow.claimId !== undefined && whenNoLiveRow.fenceGeneration !== undefined
+      ? pauseTaskWithReasonForClaimV1(cleared, whenNoLiveRow.reason, whenNoLiveRow.claimId, whenNoLiveRow.fenceGeneration)
       : pauseTaskWithReason(cleared, whenNoLiveRow.reason);
   });
   return { ok: true, noLiveRow: true, transitioned, progress };

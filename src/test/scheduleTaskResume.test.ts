@@ -21,11 +21,15 @@ import {
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
 import {
+  acquireWorkAdmissionV1,
   beginTargetResolutionV1,
   endTargetResolutionV1,
   resetTargetResolutionForTestV1,
+  setWorkAdmissionFsFailureInjectionForTestV1,
   setWorkAdmissionRootOverrideForTestV1,
+  WorkAdmissionResultV1,
 } from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /**
@@ -719,6 +723,10 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     const after = state.current();
     assert.equal(after.status, "paused");
     assert.equal(after.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+    // v1 fixes item 1, Part 1b step 1: every watchdog pause carries the
+    // durable pause-fence generation captured at commit time — a fresh task
+    // (no prior fence activity) captures generation 0.
+    assert.equal(after.watchdogPauseFenceGeneration, 0);
     const escalation = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
     assert.ok(escalation, `expected a stalled-task escalation; got: ${JSON.stringify(surface.entries)}`);
     // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
@@ -1017,5 +1025,348 @@ void test("armAll's watchdog GENERIC route (no implRecovery, no open round-ledge
     schedulerA.dispose();
     schedulerB.dispose();
     folder.cleanup();
+  }
+});
+
+// ── Ordinary pause-ordering invariant (v1 fixes 2, Part 1a, plan step 10 /
+// Verification: "force pause-first, marker-first, and simultaneous claim
+// acquisition ... no final state contains both an effective watchdog pause
+// and admitted work") ───────────────────────────────────────────────────────
+//
+// These three tests exercise the REAL, disk-backed sweep commit protocol
+// (`detectAndRepairStalledActiveTasksV1`'s `pauseCommit` claim, re-list, and
+// post-write reversal check in scheduleTaskResume.ts) against the REAL,
+// disk-backed admission genesis and reconciliation (`acquireWorkAdmissionV1`,
+// `reconcileWatchdogPauseAgainstAdmissionV1`) a work-starting command actually
+// uses — reusing the exact real-task-folder harness the GENERIC-route
+// cross-window race test above already proved safe, rather than the
+// in-memory `memoryStore` the earlier declarative armAll() tests use (which
+// cannot exercise `reconcileWatchdogPauseAgainstAdmissionV1`, since that
+// function always writes through the real `patchTaskProgressStrictV1`, not an
+// injectable store).
+
+void test("ordinary pause-ordering invariant: marker-first — a live admission marker already held for the task means the sweep never commits a pause", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, "window-A");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  const genesis = await acquireWorkAdmissionV1({
+    taskFolderPath: folder.taskFolderPath,
+    purpose: "admission",
+    commandId: "test-marker-first",
+  });
+  assert.equal(genesis.outcome, "acquired");
+
+  try {
+    await scheduler.armAll();
+
+    const after = readPersistedProgress(folder.progressPath);
+    assert.equal(after.status, "active", "a live admission marker must stand the sweep down before it even attempts a pauseCommit claim");
+    assert.equal(after.pausedReason, undefined);
+    const escalation = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
+    assert.equal(escalation, undefined, "no stalled-task escalation must be posted while admission is live");
+  } finally {
+    if (genesis.outcome === "acquired") {
+      await genesis.handle.release();
+    }
+    deactivateNotificationRouter();
+    realFs.restore();
+    fakeContext.restore();
+    scheduler.dispose();
+    folder.cleanup();
+  }
+});
+
+void test("ordinary pause-ordering invariant: pause-first — a watchdog pause the sweep already committed is durably reconciled once a work-starting command's admission genesis arrives", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, "window-A");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    // Pause commits first: no admission exists yet anywhere for this task.
+    await scheduler.armAll();
+    const paused = readPersistedProgress(folder.progressPath);
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+
+    // A work-starting command now arrives — exactly like every real
+    // admission-wired route, it acquires durable admission FIRST, then
+    // reconciles the watchdog pause it just proved it is doing the very work
+    // the pause complained was missing.
+    const genesis = await acquireWorkAdmissionV1({
+      taskFolderPath: folder.taskFolderPath,
+      purpose: "admission",
+      commandId: "test-pause-first",
+    });
+    assert.equal(genesis.outcome, "acquired");
+    try {
+      const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(folder.taskFolderPath));
+      assert.equal(reconciled.outcome, "reversed");
+
+      const afterReconcile = readPersistedProgress(folder.progressPath);
+      assert.equal(afterReconcile.status, "active", "a watchdog-provenance pause must be durably reversed once admission is live");
+      assert.equal(afterReconcile.pausedReason, undefined);
+
+      // Closing the loop: with admission still held, a SECOND sweep pass must
+      // not re-pause the task — no final state may contain both an effective
+      // watchdog pause and admitted work.
+      const inventoryAfterReconcile = stubInventory(folder.taskFolderPath, "task-id", afterReconcile);
+      const secondScheduler = new TaskActionScheduler(inventoryAfterReconcile, clock, undefined, "window-A");
+      try {
+        await secondScheduler.armAll();
+        const afterSecondSweep = readPersistedProgress(folder.progressPath);
+        assert.equal(afterSecondSweep.status, "active", "the sweep must not re-pause a task whose admission is still live");
+      } finally {
+        secondScheduler.dispose();
+      }
+    } finally {
+      await genesis.handle.release();
+    }
+  } finally {
+    deactivateNotificationRouter();
+    realFs.restore();
+    fakeContext.restore();
+    scheduler.dispose();
+    folder.cleanup();
+  }
+});
+
+/**
+ * 2026-09-10 review completion blocker: the previous single test merely
+ * repeated an UNCONTROLLED `Promise.all` race 8 times and hoped both
+ * orderings occurred — replaced by two tests below that each force one
+ * specific ordering to actually happen, every run, plus a third that forces
+ * genuine (unmediated) contention without picking a winner.
+ *
+ * A first attempt at forcing this raced the sweep's `armAll()` against an
+ * INDEPENDENTLY started admission genesis via `Promise.all`, gated only at
+ * the shared `admission.claim` exclusive-create. That deadlocked: the
+ * admission side's `acquireWorkAdmissionV1` call registers its same-process
+ * pending-intent marker (`registerPendingIntentV1`) SYNCHRONOUSLY, before
+ * its own first `await` — almost always before `armAll()`'s per-task
+ * pre-check (`isImpossibleActiveStateV1`, which itself consults that same
+ * pending-intent registry via `hasLiveWorkAdmissionBestEffortV1`) ever runs.
+ * With the intent already visible, the sweep's pre-check reads the task as
+ * having live work and skips it WITHOUT ever attempting the `pauseCommit`
+ * claim write — so a gate installed only at the claim-write step never
+ * fires for `purpose: "pauseCommit"` at all, and the admission side (the
+ * gate's "loser" in the pauseCommit-wins direction) waits forever.
+ *
+ * The fix: only start the admission side's genesis call FROM INSIDE the
+ * sweep's own `onBeforeClaimWriteAsync` callback for `purpose: "pauseCommit"`
+ * — i.e. only once the sweep has already reached the point of attempting
+ * its claim write, which means its pre-check has already run and found no
+ * interference. This reproduces the real production race precisely: both
+ * sides' pre-checks pass independently (each seeing "no interference yet"),
+ * and only THEN do they actually contend for the same exclusive-create.
+ */
+function kickOffSimultaneousAdmissionGenesisV1(
+  folder: ReturnType<typeof createRealTaskFolderV1>
+): { readonly start: () => void; readonly result: () => Promise<WorkAdmissionResultV1> } {
+  let genesisPromise: Promise<WorkAdmissionResultV1> | undefined;
+  return {
+    start: (): void => {
+      if (genesisPromise) {
+        return;
+      }
+      genesisPromise = (async () => {
+        const result = await acquireWorkAdmissionV1({
+          taskFolderPath: folder.taskFolderPath,
+          purpose: "admission",
+          commandId: "test-simultaneous",
+        });
+        if (result.outcome === "acquired") {
+          // Mirrors every real admission-wired route: reconcile immediately
+          // after genesis, closing the gap left by any pause the sweep
+          // committed after its own pre-check but before this genesis landed.
+          await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(folder.taskFolderPath));
+        }
+        return result;
+      })();
+    },
+    result: async (): Promise<WorkAdmissionResultV1> => {
+      if (!genesisPromise) {
+        throw new Error("kickOffSimultaneousAdmissionGenesisV1: start() was never called (the sweep never reached its claim-write attempt)");
+      }
+      return genesisPromise;
+    },
+  };
+}
+
+/** A real, wall-clock delay comfortably longer than a same-disk small-file
+ * `wx` write, used to deterministically sequence which side's exclusive-
+ * create is issued first (see `kickOffSimultaneousAdmissionGenesisV1`'s doc
+ * comment for why the actual write attempts must be triggered this way
+ * rather than raced via `Promise.all`). */
+const SIMULTANEOUS_CLAIM_LOSER_DELAY_MS_V1 = 75;
+
+function delayMsV1(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runSimultaneousClaimRaceCaseV1(
+  winnerPurpose: "admission" | "pauseCommit"
+): Promise<{ readonly genesisOutcome: string; readonly after: TaskProgress }> {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, "window-simultaneous");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const admission = kickOffSimultaneousAdmissionGenesisV1(folder);
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeClaimWriteAsync: async (ctx) => {
+      if (ctx.purpose === "pauseCommit") {
+        admission.start();
+        if (winnerPurpose === "admission") {
+          await delayMsV1(SIMULTANEOUS_CLAIM_LOSER_DELAY_MS_V1);
+        }
+        return;
+      }
+      if (winnerPurpose === "pauseCommit") {
+        await delayMsV1(SIMULTANEOUS_CLAIM_LOSER_DELAY_MS_V1);
+      }
+    },
+  });
+
+  try {
+    await scheduler.armAll();
+    const genesis = await admission.result();
+    try {
+      return { genesisOutcome: genesis.outcome, after: readPersistedProgress(folder.progressPath) };
+    } finally {
+      if (genesis.outcome === "acquired") {
+        await genesis.handle.release();
+      }
+    }
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    folder.cleanup();
+  }
+}
+
+void test("ordinary pause-ordering invariant: simultaneous claim acquisition, forced so the sweep's pauseCommit claim wins the shared exclusive-create — admission still ends up live and the task never ends up effectively paused", async () => {
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    const { genesisOutcome, after } = await runSimultaneousClaimRaceCaseV1("pauseCommit");
+    assert.equal(
+      genesisOutcome,
+      "acquired",
+      `admission must still succeed even though the sweep's pauseCommit claim won the shared exclusive-create first — got progress=${JSON.stringify(after)}`
+    );
+    assert.equal(after.status, "active");
+    assert.equal(after.pausedReason, undefined);
+  } finally {
+    realFs.restore();
+    fakeContext.restore();
+  }
+});
+
+void test("ordinary pause-ordering invariant: simultaneous claim acquisition, forced so the work-starting command's admission genesis wins the shared exclusive-create — the sweep's pauseCommit is blocked outright and the task never ends up effectively paused", async () => {
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    const { genesisOutcome, after } = await runSimultaneousClaimRaceCaseV1("admission");
+    assert.equal(genesisOutcome, "acquired");
+    assert.equal(after.status, "active");
+    assert.equal(
+      after.pausedReason,
+      undefined,
+      `the sweep's pauseCommit claim must be blocked by the already-won admission claim, never commit a pause — got progress=${JSON.stringify(after)}`
+    );
+  } finally {
+    realFs.restore();
+    fakeContext.restore();
+  }
+});
+
+void test("ordinary pause-ordering invariant: simultaneous claim acquisition — repeated genuine contention (both sides' pre-checks pass independently, neither ordering forced) never leaves both an effective pause and admitted work", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    // Supplementary to the two forced-ordering tests above: this exercises
+    // the real, unmediated filesystem race — both sides are released at the
+    // shared exclusive-create via a two-arrival barrier, with no injected
+    // winner — so the invariant is also checked against whichever ordering
+    // the real OS/filesystem happens to produce.
+    for (let iteration = 0; iteration < 6; iteration++) {
+      const folder = createRealTaskFolderV1("impl");
+      const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+      fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+      const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+      const scheduler = new TaskActionScheduler(inventory, clock, undefined, `window-${iteration}`);
+      const surface = new RecordingSurfaceV1();
+      initNotificationRouter(surface);
+      const admission = kickOffSimultaneousAdmissionGenesisV1(folder);
+
+      let arrivals = 0;
+      let releaseBarrier: (() => void) | undefined;
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      setWorkAdmissionFsFailureInjectionForTestV1({
+        onBeforeClaimWriteAsync: async (ctx) => {
+          if (ctx.purpose === "pauseCommit") {
+            admission.start();
+          }
+          arrivals += 1;
+          if (arrivals >= 2) {
+            releaseBarrier?.();
+          }
+          await barrier;
+        },
+      });
+
+      try {
+        await scheduler.armAll();
+        const genesis = await admission.result();
+
+        try {
+          const after = readPersistedProgress(folder.progressPath);
+          const admitted = genesis.outcome === "acquired";
+          const effectivelyPaused = after.status === "paused" && after.pausedReason === STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
+          assert.ok(
+            !(admitted && effectivelyPaused),
+            `iteration ${iteration}: admission was acquired but the task still shows an effective watchdog pause — ` +
+              `admitted=${admitted}, progress=${JSON.stringify(after)}`
+          );
+        } finally {
+          if (genesis.outcome === "acquired") {
+            await genesis.handle.release();
+          }
+        }
+      } finally {
+        setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+        deactivateNotificationRouter();
+        scheduler.dispose();
+        folder.cleanup();
+      }
+    }
+  } finally {
+    realFs.restore();
+    fakeContext.restore();
   }
 });

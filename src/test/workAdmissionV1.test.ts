@@ -4,21 +4,32 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireOrAdoptWorkAdmissionV1,
   acquireWorkAdmissionV1,
+  advancePauseFenceForRevocationV1,
+  advancePauseFenceGenerationV1,
   authorizeWorkAdmissionHandoffV1,
   beginTargetResolutionV1,
   describeWorkAdmissionBlockerV1,
   endTargetResolutionV1,
+  finishPauseRevocationBarrierV1,
+  removePauseRevocationBarrierV1,
   hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionBestEffortV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
+  isPathOutsideAllTaskRootsV1,
+  isWatchdogPauseFenceCurrentV1,
+  listPendingPauseRevocationBarriersV1,
+  readOrInitPauseFenceGenerationV1,
   resetTargetResolutionForTestV1,
+  revokeStalePauseCommitClaimV1,
   revokeWorkAdmissionHandoffV1,
   setWorkAdmissionClockForTestV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
+  PAUSE_COMMIT_LIKELY_STALE_MS_V1,
   WORK_ADMISSION_LIKELY_STALE_MS_V1,
 } from "../state/workAdmissionV1";
 import {
@@ -45,6 +56,92 @@ void test("hasLiveWorkAdmissionBestEffortV1 is false before any acquisition and 
   const task = freshTaskFolder("no-admission-yet");
   assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
   assert.equal(hasLiveWorkAdmissionBestEffortV1(path.join(TEST_ROOT, "does-not-exist")), false);
+});
+
+// ── isPathOutsideAllTaskRootsV1 / early-admission containment diagnostic ────
+// (2026-09-11 review architectural blocker `d620c877...-1`, narrowed)
+
+void test("isPathOutsideAllTaskRootsV1 fails open (false) when no root candidates are known", () => {
+  const task = freshTaskFolder("containment-no-roots-known");
+  assert.equal(isPathOutsideAllTaskRootsV1(task, []), false);
+});
+
+void test("isPathOutsideAllTaskRootsV1 is false for a path nested under a known root, and for the root itself", () => {
+  const root = freshTaskFolder("containment-root");
+  const nested = path.join(root, "2026-09-11_task_1");
+  assert.equal(isPathOutsideAllTaskRootsV1(nested, [root]), false);
+  assert.equal(isPathOutsideAllTaskRootsV1(root, [root]), false);
+});
+
+void test("isPathOutsideAllTaskRootsV1 is true for a path that is a sibling of, not nested under, every known root", () => {
+  const root = freshTaskFolder("containment-root-2");
+  const sibling = freshTaskFolder("containment-sibling-2");
+  assert.equal(isPathOutsideAllTaskRootsV1(sibling, [root]), true);
+});
+
+void test("isPathOutsideAllTaskRootsV1 does not false-positive on a root name that is merely a string prefix of the candidate (e.g. '.ensemble' vs '.ensemble-extra')", () => {
+  const root = path.join(TEST_ROOT, "containment-prefix", ".ensemble");
+  const lookalike = path.join(TEST_ROOT, "containment-prefix", ".ensemble-extra", "task_1");
+  assert.equal(isPathOutsideAllTaskRootsV1(lookalike, [root]), true);
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission for an out-of-root candidate, only logging a diagnostic (never refuses/skips protection)", async () => {
+  const root = freshTaskFolder("early-admission-containment-root");
+  const outOfRootTask = freshTaskFolder("early-admission-containment-outside");
+  fs.writeFileSync(path.join(outOfRootTask, "task.md"), "# Test task\n");
+  const realWarn = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args: unknown[]): void => {
+    warnings.push(args);
+  };
+  try {
+    const result = await acquireEarlyWorkAdmissionForCandidatePathV1({
+      candidatePath: outOfRootTask,
+      purpose: "admission",
+      commandId: "test-command",
+      taskRootCandidatePaths: [root],
+    });
+    assert.equal(result?.outcome, "acquired", "admission must still be granted — never skipped for an unverified/out-of-root path");
+    assert.ok(
+      warnings.some((args) => String(args[0]).includes("outside every currently known task root")),
+      "the containment gap must be logged for investigation"
+    );
+    if (result?.outcome === "acquired") {
+      await result.handle.release();
+    }
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 logs no containment diagnostic for an in-root candidate", async () => {
+  const root = freshTaskFolder("early-admission-containment-root-2");
+  const inRootTask = path.join(root, "2026-09-11_task_2");
+  fs.mkdirSync(inRootTask, { recursive: true });
+  fs.writeFileSync(path.join(inRootTask, "task.md"), "# Test task\n");
+  const realWarn = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args: unknown[]): void => {
+    warnings.push(args);
+  };
+  try {
+    const result = await acquireEarlyWorkAdmissionForCandidatePathV1({
+      candidatePath: inRootTask,
+      purpose: "admission",
+      commandId: "test-command",
+      taskRootCandidatePaths: [root],
+    });
+    assert.equal(result?.outcome, "acquired");
+    assert.ok(
+      !warnings.some((args) => String(args[0]).includes("outside every currently known task root")),
+      "no containment diagnostic should fire for a properly-nested candidate"
+    );
+    if (result?.outcome === "acquired") {
+      await result.handle.release();
+    }
+  } finally {
+    console.warn = realWarn;
+  }
 });
 
 void test("acquireWorkAdmissionV1 publishes exactly one marker file, written once", async () => {
@@ -1595,7 +1692,7 @@ void test("beginTargetResolutionV1 root markers are reference-counted per proces
   assert.equal(hasDurableResolutionInFlightV1([root]), false);
 });
 
-void test("beginTargetResolutionV1 root marker acquisition is best-effort: a root it cannot acquire (already busy) is silently skipped, never thrown", async () => {
+void test("beginTargetResolutionV1 root marker acquisition is best-effort: a root it cannot acquire (already busy) is retried but never blocks or throws, and (2026-09-11 review completion blocker `b5a1f851...-0`, narrowed) the resulting unprotected window is now logged rather than silent", async () => {
   const root = freshTaskFolder("resolution-in-flight-busy-root");
   const otherOwner = await acquireWorkAdmissionV1({
     taskFolderPath: root,
@@ -1603,6 +1700,11 @@ void test("beginTargetResolutionV1 root marker acquisition is best-effort: a roo
     commandId: "unrelated-admission-holder",
   });
   assert.equal(otherOwner.outcome, "acquired");
+  const realWarn = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args: unknown[]): void => {
+    warnings.push(args);
+  };
   try {
     const handle = await beginTargetResolutionV1([root]);
     try {
@@ -1615,7 +1717,15 @@ void test("beginTargetResolutionV1 root marker acquisition is best-effort: a roo
     }
     // The other owner's marker must be untouched by the failed attempt.
     assert.equal(hasDurableResolutionInFlightV1([root]), true);
+    // The still-contended-after-retries case must now be diagnosable, the
+    // same way a real write failure already was — previously nothing was
+    // logged for ordinary contention at all.
+    assert.ok(
+      warnings.some((args) => String(args[0]).includes("still contended after") && String(args[0]).includes(root)),
+      `the unprotected-after-retries window must be logged — got warnings: ${JSON.stringify(warnings)}`
+    );
   } finally {
+    console.warn = realWarn;
     if (otherOwner.outcome === "acquired") {
       await otherOwner.handle.release();
     }
@@ -1626,4 +1736,441 @@ void test("beginTargetResolutionV1's durable root marker path is classified work
   const root = freshTaskFolder("resolution-in-flight-classification");
   const markerPath = path.join(root, ADMISSION_DIRNAME_V1, "admission.some-owner.g1.abc123");
   assert.equal(classifyWorkflowPathV1(markerPath), "workflowControl");
+});
+
+// ── Part 1b: durable pause-fence generation allocator ───────────────────────
+
+void test("readOrInitPauseFenceGenerationV1 lazily publishes generation 0 for a task with no fence yet", async () => {
+  const task = freshTaskFolder("pause-fence-lazy-init");
+  const generation = await readOrInitPauseFenceGenerationV1(task);
+  assert.equal(generation, 0);
+  assert.equal(
+    fs.existsSync(path.join(task, ADMISSION_DIRNAME_V1, "pause-fence.g0")),
+    true,
+    "generation 0 must be durably published on disk, not merely returned in memory"
+  );
+});
+
+void test("readOrInitPauseFenceGenerationV1 returns the existing highest generation without creating a new one", async () => {
+  const task = freshTaskFolder("pause-fence-read-existing");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "pause-fence.g0"), "");
+  fs.writeFileSync(path.join(dir, "pause-fence.g3"), "");
+  const generation = await readOrInitPauseFenceGenerationV1(task);
+  assert.equal(generation, 3);
+  assert.equal(fs.existsSync(path.join(dir, "pause-fence.g4")), false);
+});
+
+void test("readOrInitPauseFenceGenerationV1 initialization races: concurrent first callers converge on one published generation, never throw", async () => {
+  const task = freshTaskFolder("pause-fence-init-race");
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () => readOrInitPauseFenceGenerationV1(task))
+  );
+  assert.ok(
+    results.every((g) => g === 0),
+    `every racing first-caller must observe the same published generation 0 — got ${JSON.stringify(results)}`
+  );
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const fenceFiles = fs.readdirSync(dir).filter((name) => /^pause-fence\.g\d+$/.test(name));
+  assert.deepEqual(fenceFiles, ["pause-fence.g0"], "exactly one generation-0 file must exist, never duplicated");
+});
+
+void test("readOrInitPauseFenceGenerationV1 racing a concurrent advancePauseFenceGenerationV1 on a virgin directory never returns a stale generation (2026-09-11 review completion blocker)", async () => {
+  const task = freshTaskFolder("pause-fence-init-advance-race");
+  // Both calls see an empty directory and race their own exclusive-create:
+  // `readOrInit` targets `g0`, `advance` targets `g1` — different filenames,
+  // so both writes can succeed. Before the fix, `readOrInit` returned its own
+  // successful `0` unconditionally, even when `advance`'s `g1` had already
+  // landed as the true authoritative generation. An uncontrolled
+  // `Promise.all` of the two calls might never actually sample that exact
+  // ordering, so this forces it deterministically: `readOrInit` is held
+  // immediately before its own `g0` write until `advance`'s `g1` has fully
+  // landed on disk, then released — reproducing precisely the interleaving
+  // the bug required.
+  let releaseInit: (() => void) | undefined;
+  const initHeld = new Promise<void>((resolve) => {
+    releaseInit = resolve;
+  });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeFenceInitWriteAsync: async () => {
+      await initHeld;
+    },
+  });
+  try {
+    const initPromise = readOrInitPauseFenceGenerationV1(task);
+    const advanceResult = await advancePauseFenceGenerationV1(task);
+    assert.equal(advanceResult, 1, "the lone advancer on a virgin directory must publish generation 1");
+    releaseInit!();
+    const initResult = await initPromise;
+    assert.equal(
+      initResult,
+      1,
+      `readOrInit must converge on the true current maximum (1), never report a stale 0 — got ${initResult}`
+    );
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+  // A second, later call must also observe the same durable maximum.
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 1);
+});
+
+void test("readOrInitPauseFenceGenerationV1 called many times concurrently while a single advance races it converges on the advancer's generation", async () => {
+  const task = freshTaskFolder("pause-fence-init-advance-race-many");
+  let releaseInits: (() => void) | undefined;
+  const initsHeld = new Promise<void>((resolve) => {
+    releaseInits = resolve;
+  });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeFenceInitWriteAsync: async () => {
+      await initsHeld;
+    },
+  });
+  try {
+    const initPromises = Array.from({ length: 5 }, () => readOrInitPauseFenceGenerationV1(task));
+    const advanceResult = await advancePauseFenceGenerationV1(task);
+    assert.equal(advanceResult, 1);
+    releaseInits!();
+    const initResults = await Promise.all(initPromises);
+    assert.ok(
+      initResults.every((g) => g === 1),
+      `every readOrInit racing the advancer must converge on generation 1, never a stale 0 — got ${JSON.stringify(initResults)}`
+    );
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  assert.ok(fs.existsSync(path.join(dir, "pause-fence.g1")), "the advancer's generation 1 must be durably published");
+});
+
+void test("advancePauseFenceGenerationV1 publishes strictly the next generation past whatever currently exists", async () => {
+  const task = freshTaskFolder("pause-fence-advance-basic");
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 0);
+  assert.equal(await advancePauseFenceGenerationV1(task), 1);
+  assert.equal(await advancePauseFenceGenerationV1(task), 2);
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 2);
+});
+
+void test("advancePauseFenceGenerationV1 lazily establishes generation 0 before publishing a later generation on a virgin directory (2026-09-11 review completion blocker)", async () => {
+  const task = freshTaskFolder("pause-fence-advance-virgin-init");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  // No `readOrInitPauseFenceGenerationV1` call at all — `advance` is the
+  // FIRST fence operation this task ever sees, on a directory that does not
+  // even exist yet. Before the fix, this published `pause-fence.g1` directly,
+  // skipping the fence's own documented base state.
+  const result = await advancePauseFenceGenerationV1(task);
+  assert.equal(result, 1, "a lone advance on a virgin directory still publishes generation 1");
+  assert.ok(
+    fs.existsSync(path.join(dir, "pause-fence.g0")),
+    "generation 0 must be durably established before generation 1 is published, not skipped"
+  );
+  assert.ok(fs.existsSync(path.join(dir, "pause-fence.g1")), "generation 1 must also be published");
+  const fenceFiles = fs.readdirSync(dir).filter((name) => /^pause-fence\.g\d+$/.test(name));
+  assert.deepEqual(
+    [...fenceFiles].sort(),
+    ["pause-fence.g0", "pause-fence.g1"],
+    "exactly generations 0 and 1 must exist, nothing skipped or duplicated"
+  );
+});
+
+void test("advancePauseFenceGenerationV1 never regresses or reuses a generation under concurrent advancers", async () => {
+  const task = freshTaskFolder("pause-fence-advance-concurrent");
+  await readOrInitPauseFenceGenerationV1(task);
+  const CONCURRENT_ADVANCERS = 8;
+  const published = await Promise.all(
+    Array.from({ length: CONCURRENT_ADVANCERS }, () => advancePauseFenceGenerationV1(task))
+  );
+  const sorted = [...published].sort((a, b) => a - b);
+  const expected = Array.from({ length: CONCURRENT_ADVANCERS }, (_, i) => i + 1);
+  assert.deepEqual(sorted, expected, `concurrent advancers must publish a contiguous, non-duplicated run of generations — got ${JSON.stringify(sorted)}`);
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const fenceFiles = fs.readdirSync(dir).filter((name) => /^pause-fence\.g\d+$/.test(name));
+  assert.equal(fenceFiles.length, CONCURRENT_ADVANCERS + 1, "generation 0 plus one file per successful advance, no more");
+});
+
+void test("a partially-written pause-fence file is still a valid fence by existence alone (there is no content to corrupt)", async () => {
+  const task = freshTaskFolder("pause-fence-existence-only");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  // Even an empty file (the only content this primitive ever writes) counts
+  // as a fully valid, currently-published generation — there is no partial-
+  // write ambiguity the way there is for `admission.claim`'s JSON body.
+  fs.writeFileSync(path.join(dir, "pause-fence.g2"), "");
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 2);
+});
+
+// ── isWatchdogPauseFenceCurrentV1 (v1 fixes item 1, Part 1b step 1) ─────────
+
+void test("isWatchdogPauseFenceCurrentV1 is true for an undefined recorded generation (pause predates the fence, or was never claim-bound)", async () => {
+  const task = freshTaskFolder("pause-fence-current-undefined");
+  assert.equal(await isWatchdogPauseFenceCurrentV1(task, undefined), true);
+});
+
+void test("isWatchdogPauseFenceCurrentV1 is true while the recorded generation still equals the current durable maximum", async () => {
+  const task = freshTaskFolder("pause-fence-current-match");
+  const generation = await readOrInitPauseFenceGenerationV1(task);
+  assert.equal(await isWatchdogPauseFenceCurrentV1(task, generation), true);
+});
+
+void test("isWatchdogPauseFenceCurrentV1 is false once the durable generation has advanced past the recorded one", async () => {
+  const task = freshTaskFolder("pause-fence-current-stale");
+  const recorded = await readOrInitPauseFenceGenerationV1(task);
+  await advancePauseFenceGenerationV1(task);
+  assert.equal(await isWatchdogPauseFenceCurrentV1(task, recorded), false);
+});
+
+void test("isWatchdogPauseFenceCurrentV1 lazily initializes generation 0 for a task with no fence file at all yet, and treats a freshly-captured 0 as current", async () => {
+  const task = freshTaskFolder("pause-fence-current-virgin");
+  assert.equal(await isWatchdogPauseFenceCurrentV1(task, 0), true);
+  assert.ok(fs.existsSync(path.join(task, ADMISSION_DIRNAME_V1, "pause-fence.g0")));
+});
+
+// ── revokeStalePauseCommitClaimV1 / pause-revocation barrier (Part 1b step 12) ─
+
+function markerFilePathV1(task: string): string {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const marker = fs.readdirSync(dir).find((name) => name.startsWith("admission."));
+  assert.ok(marker, "expected a live admission marker on disk");
+  return path.join(dir, marker);
+}
+
+function backdateV1(filePath: string, ageMs: number): void {
+  const old = new Date(Date.now() - ageMs);
+  fs.utimesSync(filePath, old, old);
+}
+
+/** Test-only: lists `pause-fence.g<N>` files directly, WITHOUT the lazy
+ * generation-0 initialization `readOrInitPauseFenceGenerationV1` performs as
+ * a side effect — needed to assert "no fence file exists yet" without that
+ * assertion itself creating one. */
+function listPauseFenceGenerationsForTestV1(task: string): readonly string[] {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return entries.filter((name) => /^pause-fence\.g\d+$/.test(name));
+}
+
+void test("revokeStalePauseCommitClaimV1 reports notApplicable when no marker exists at all", async () => {
+  const task = freshTaskFolder("revoke-no-marker");
+  const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(result.outcome, "notApplicable");
+});
+
+void test("revokeStalePauseCommitClaimV1 reports notApplicable for a live admission-purpose marker — never touches it or the fence", async () => {
+  const task = freshTaskFolder("revoke-admission-purpose");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "real-work" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+
+  const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(result.outcome, "notApplicable");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "the admission marker must be untouched");
+  assert.equal(
+    listPauseFenceGenerationsForTestV1(task).length,
+    0,
+    "an admission-purpose marker must never advance the fence"
+  );
+
+  await acquired.handle.release();
+});
+
+void test("revokeStalePauseCommitClaimV1 reports notStale for a fresh pauseCommit marker", async () => {
+  const task = freshTaskFolder("revoke-fresh-pausecommit");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+
+  const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(result.outcome, "notStale");
+
+  await acquired.handle.release();
+});
+
+void test("revokeStalePauseCommitClaimV1 revokes a stale pauseCommit marker into a pending barrier, without advancing the fence itself", async () => {
+  const task = freshTaskFolder("revoke-stale-pausecommit");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  const markerPath = markerFilePathV1(task);
+  backdateV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+
+  const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(result.outcome, "revoked");
+  if (result.outcome !== "revoked") return;
+  assert.equal(fs.existsSync(markerPath), false, "the original marker path must be gone");
+  assert.equal(fs.existsSync(result.barrierPath), true, "the barrier file must exist at the returned path");
+  assert.equal(path.basename(result.barrierPath), "pause-revocation.pending.revoker-1");
+  assert.equal(result.revokedClaim.purpose, "pauseCommit");
+  assert.equal(
+    listPendingPauseRevocationBarriersV1(task).length,
+    1,
+    "the barrier must be discoverable for a later claimant"
+  );
+  assert.equal(
+    listPauseFenceGenerationsForTestV1(task).length,
+    0,
+    "revoke alone must never advance the fence — only finishPauseRevocationBarrierV1 does"
+  );
+
+  // The original owner's own `release()` (simulating it eventually waking up)
+  // must be a harmless no-op against its now-displaced marker — ENOENT is
+  // "displaced", never an error, exactly like every other release path in
+  // this module.
+  await assert.doesNotReject(() => acquired.handle.release());
+});
+
+void test("revokeStalePauseCommitClaimV1 reports raced when the marker is released between observation and rename", async () => {
+  const task = freshTaskFolder("revoke-raced-release");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeRevocationRenameAsync: async () => {
+      await acquired.handle.release();
+    },
+  });
+  try {
+    const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+    assert.equal(result.outcome, "raced");
+    assert.equal(
+      listPendingPauseRevocationBarriersV1(task).length,
+      0,
+      "a raced revocation must never leave a barrier behind"
+    );
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+});
+
+void test("finishPauseRevocationBarrierV1 advances the fence and removes the barrier file", async () => {
+  const task = freshTaskFolder("finish-barrier-basic");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
+
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceBefore + 1);
+  assert.equal(fs.existsSync(revoked.barrierPath), false);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
+});
+
+void test("a later claimant can help finish an abandoned revocation barrier via listPendingPauseRevocationBarriersV1", async () => {
+  const task = freshTaskFolder("finish-barrier-abandoned");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "dying-revoker");
+  assert.equal(revoked.outcome, "revoked");
+  // Simulate the revoker dying here, before it ever calls
+  // `finishPauseRevocationBarrierV1` itself — the barrier is left pending.
+
+  const pending = listPendingPauseRevocationBarriersV1(task);
+  assert.equal(pending.length, 1);
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  // A completely different later claimant discovers and completes it.
+  for (const barrierPath of pending) {
+    await finishPauseRevocationBarrierV1(task, barrierPath);
+  }
+
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceBefore + 1);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
+});
+
+void test("finishPauseRevocationBarrierV1 is idempotent: calling it twice for the same barrier is harmless", async () => {
+  const task = freshTaskFolder("finish-barrier-idempotent");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-1");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+
+  await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
+  const fenceAfterFirst = await readOrInitPauseFenceGenerationV1(task);
+  // The barrier file is already gone; a second call for the same path must
+  // not throw (ENOENT on the unlink is tolerated), and merely advances the
+  // fence one generation further — harmless, since "past the revoked claim's
+  // original generation" remains true regardless.
+  await assert.doesNotReject(() => finishPauseRevocationBarrierV1(task, revoked.barrierPath));
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceAfterFirst + 1);
+});
+
+void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 give a caller a seam to run cleanup between fence-advance and barrier-removal", async () => {
+  const task = freshTaskFolder("revocation-two-step-seam");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-seam");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  const fenceAfterAdvance = await advancePauseFenceForRevocationV1(task);
+  assert.equal(fenceAfterAdvance, fenceBefore + 1);
+  // The fence has advanced, but the barrier must still be present — this is
+  // the seam a real caller uses to perform its own stale-pause cleanup in
+  // `task-progress.json` (plan step 12's required ordering) before the
+  // barrier — the only durable record that cleanup was still owed —
+  // disappears.
+  assert.equal(fs.existsSync(revoked.barrierPath), true, "barrier must survive the fence advance alone");
+  assert.deepEqual(listPendingPauseRevocationBarriersV1(task), [revoked.barrierPath]);
+
+  // Caller's cleanup would run here.
+
+  await removePauseRevocationBarrierV1(revoked.barrierPath);
+  assert.equal(fs.existsSync(revoked.barrierPath), false);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
+  // The fence must not have moved again — removal alone never advances it.
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceAfterAdvance);
+});
+
+void test("removePauseRevocationBarrierV1 tolerates an already-removed barrier (ENOENT)", async () => {
+  const task = freshTaskFolder("revocation-remove-idempotent");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-remove-twice");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+
+  await removePauseRevocationBarrierV1(revoked.barrierPath);
+  await assert.doesNotReject(() => removePauseRevocationBarrierV1(revoked.barrierPath));
+});
+
+void test("purpose-aware likelyStale threshold: a pauseCommit marker is flagged stale at 5 minutes; an admission marker at the same age is not", async () => {
+  const pauseCommitTask = freshTaskFolder("likely-stale-pausecommit");
+  const pcAcquired = await acquireWorkAdmissionV1({ taskFolderPath: pauseCommitTask, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(pcAcquired.outcome, "acquired");
+  if (pcAcquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(pauseCommitTask), 10 * 60 * 1000);
+  const pcBlocker = describeWorkAdmissionBlockerV1(pauseCommitTask);
+  assert.equal(pcBlocker?.likelyStale, true, "10 minutes exceeds the 5-minute pauseCommit threshold");
+  await pcAcquired.handle.release();
+
+  const admissionTask = freshTaskFolder("likely-stale-admission");
+  const admAcquired = await acquireWorkAdmissionV1({ taskFolderPath: admissionTask, purpose: "admission", commandId: "real-work" });
+  assert.equal(admAcquired.outcome, "acquired");
+  if (admAcquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(admissionTask), 10 * 60 * 1000);
+  const admBlocker = describeWorkAdmissionBlockerV1(admissionTask);
+  assert.equal(admBlocker?.likelyStale, false, "10 minutes is well under the 20-minute admission threshold");
+  await admAcquired.handle.release();
 });

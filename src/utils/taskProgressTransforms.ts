@@ -136,10 +136,13 @@ export function updateTaskStatus(
     // only — any transition away from paused (resume, completion, archive)
     // retires it, or a long-resolved "no provider available" banner would
     // reappear on the next unrelated pause. Its bound claim-commit provenance
-    // (`watchdogPauseClaimId`) is retired in the same step, for the same
-    // reason.
-    ...(status !== "paused" && (progress.pausedReason !== undefined || progress.watchdogPauseClaimId !== undefined)
-      ? { pausedReason: undefined, watchdogPauseClaimId: undefined }
+    // (`watchdogPauseClaimId`) and fence generation (`watchdogPauseFenceGeneration`,
+    // Part 1b) are retired in the same step, for the same reason.
+    ...(status !== "paused" &&
+      (progress.pausedReason !== undefined ||
+        progress.watchdogPauseClaimId !== undefined ||
+        progress.watchdogPauseFenceGeneration !== undefined)
+      ? { pausedReason: undefined, watchdogPauseClaimId: undefined, watchdogPauseFenceGeneration: undefined }
       : {}),
     // Unlike pausedReason, quotaParkRecord is a durable PREDICTION about
     // when a model/provider becomes usable again, not a description of the
@@ -175,31 +178,38 @@ export function pauseTaskWithReason(
     // must not leave a stale record from an earlier, unrelated pause behind.
     ...(quotaParkRecord !== undefined ? { quotaParkRecord } : { quotaParkRecord: undefined }),
     // Same replace-not-carry-over rule as quotaParkRecord above, for the
-    // claim-commit protocol's own provenance field: a plain (non-claim) pause
-    // must not leave a PRIOR watchdog pause's claimId attached to a reason
-    // that is no longer that pause. `pauseTaskWithReasonForClaimV1` stamps a
-    // fresh one back on top of this.
+    // claim-commit protocol's own provenance fields: a plain (non-claim)
+    // pause must not leave a PRIOR watchdog pause's claimId or fence
+    // generation attached to a reason that is no longer that pause.
+    // `pauseTaskWithReasonForClaimV1` stamps fresh ones back on top of this.
     watchdogPauseClaimId: undefined,
+    watchdogPauseFenceGeneration: undefined,
   };
 }
 
 /**
  * `pauseTaskWithReason`, additionally binding the `pauseCommit`-purpose
  * work-admission `claimId` (`workAdmissionV1.ts`) that the caller held while
- * committing this exact pause (v1 fixes item 1, Part 1a step 4). Used
- * exclusively by the watchdog sweep's claim-guarded commit path
- * (`scheduleTaskResume.ts`'s `detectAndRepairStalledActiveTasksV1`), never by
- * a user-initiated or quota pause — those have no claim to bind and use the
- * plain function above.
+ * committing this exact pause (v1 fixes item 1, Part 1a step 4), and the
+ * durable pause-fence generation (`workAdmissionV1.ts`'s
+ * `readOrInitPauseFenceGenerationV1`) that was current at the moment that
+ * claim was acquired (Part 1b step 1) — see `TaskProgress.watchdogPauseFenceGeneration`'s
+ * doc comment for what this lets a later reader do. Used exclusively by the
+ * watchdog sweep's claim-guarded commit path (`scheduleTaskResume.ts`'s
+ * `detectAndRepairStalledActiveTasksV1`), never by a user-initiated or quota
+ * pause — those have no claim or fence to bind and use the plain function
+ * above.
  */
 export function pauseTaskWithReasonForClaimV1(
   progress: TaskProgress,
   reason: string,
-  claimId: string
+  claimId: string,
+  fenceGeneration: number
 ): TaskProgress {
   return {
     ...pauseTaskWithReason(progress, reason),
     watchdogPauseClaimId: claimId,
+    watchdogPauseFenceGeneration: fenceGeneration,
   };
 }
 
