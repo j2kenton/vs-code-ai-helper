@@ -1,4 +1,12 @@
 import * as vscode from "vscode";
+// Side-effect only: registers `effectivePauseStatusV1.ts`'s pause-revocation
+// cleanup hook with `workAdmissionV1.ts` (2026-09-11 review completion
+// blocker `dceb2646...-2`). No other production module reaches this file yet
+// (plan step 13's full consumer audit is separate, later work), so without
+// this import the hook is never registered and a completed revocation
+// barrier never cleans up the stale `task-progress.json` pause fields it left
+// behind — see both modules' doc comments for the full wiring rationale.
+import "./state/effectivePauseStatusV1";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { TaskCreationStartupReconcilerV1 } from "./state/taskCreationStartupReconcilerV1";
 import { registerResumeTaskCommand } from "./commands/resumeTask";

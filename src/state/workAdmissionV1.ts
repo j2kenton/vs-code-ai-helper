@@ -2695,6 +2695,33 @@ export async function removePauseRevocationBarrierV1(barrierPath: string): Promi
  */
 const PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1 = ".finish-lock";
 
+/**
+ * 2026-09-11 review completion blocker (`dceb2646...-2`, fixed): the plan's
+ * "fence advance, then cleanup of any older-generation watchdog pause" is two
+ * separate obligations, and this module was only ever completing the first —
+ * `task-progress.json` field cleanup was never invoked anywhere in production,
+ * because this module deliberately has no dependency on that format or the
+ * VS Code API (see the section doc comment above). A caller that DOES own
+ * that dependency — currently only `effectivePauseStatusV1.ts`, which exists
+ * specifically to bridge this gap — self-registers here, once, on import.
+ * `finishPauseRevocationBarrierV1` invokes it (best-effort) between the fence
+ * advance and the barrier removal, so every acquisition that completes a
+ * pending barrier (`acquireWorkAdmissionCoreV1`'s loop) now also clears the
+ * stale pause fields it was left blocking on, not just the fence generation
+ * those fields are no longer the correctness-relevant guard for.
+ */
+type PauseRevocationCleanupHookV1 = (taskFolderPath: string, staleClaimId: string) => Promise<void>;
+let pauseRevocationCleanupHookV1: PauseRevocationCleanupHookV1 | undefined;
+
+export function registerPauseRevocationCleanupHookV1(hook: PauseRevocationCleanupHookV1 | undefined): void {
+  pauseRevocationCleanupHookV1 = hook;
+}
+
+// Bounded wait for a losing finisher (see the EEXIST branch below) — a
+// handful of fast filesystem calls (advance + optional cleanup + remove) in
+// the common case, so this almost always resolves in one or two polls.
+const PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 = 20;
+
 export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
   const lockPath = `${barrierPath}${PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1}`;
   try {
@@ -2703,19 +2730,55 @@ export async function finishPauseRevocationBarrierV1(taskFolderPath: string, bar
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       // Another caller already owns finishing this exact barrier right now
       // (or a crashed prior attempt left its lock behind — see the doc
-      // comment's known interim gap). Either way, not this call's job.
+      // comment's known interim gap).
+      //
+      // 2026-09-11 review completion blocker (`dceb2646...-2`, fixed):
+      // returning immediately here let THIS caller's own acquisition continue
+      // toward publishing a new marker/claim while the winner's fence-advance
+      // (and cleanup) might still be in flight — exactly the ordering plan
+      // step 12 forbids ("before publishing admission or starting another
+      // pause"). Wait, bounded, for the winner to finish (lock removed) or
+      // for the barrier itself to disappear (finished by a third party while
+      // we waited) before conceding. A genuinely crashed lock-holder (the
+      // documented interim gap) still falls through to "not my job" after the
+      // bound rather than blocking this acquisition indefinitely.
+      for (let attempt = 0; attempt < PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1; attempt++) {
+        await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
+        if (!fs.existsSync(lockPath) || !fs.existsSync(barrierPath)) {
+          return;
+        }
+      }
       return;
     }
     throw error;
   }
   try {
-    if (!fs.existsSync(barrierPath)) {
+    const infoBeforeAdvance = readClaimInfoSyncV1(barrierPath);
+    if (!infoBeforeAdvance) {
       // Already finished by someone else (or by an earlier call from this
       // same caller) before we won the lock — nothing left to advance the
       // fence FOR.
       return;
     }
     await advancePauseFenceForRevocationV1(taskFolderPath);
+    // Part 1b step 12's second half. Best-effort: a failure here must never
+    // block barrier removal — the fence has already durably advanced, which
+    // is what every pause-sensitive reader that consults it (once wired, plan
+    // step 13) actually depends on; the raw field cleanup is hygiene for
+    // readers still on raw `task-progress.json` fields, not a correctness
+    // dependency (see the section doc comment above).
+    if (pauseRevocationCleanupHookV1) {
+      try {
+        await pauseRevocationCleanupHookV1(taskFolderPath, infoBeforeAdvance.claimId);
+      } catch (error) {
+        console.error(
+          `finishPauseRevocationBarrierV1: pause cleanup hook failed for revoked claim ` +
+            `"${infoBeforeAdvance.claimId}" — removing the barrier regardless; the fence generation is already ` +
+            "the correctness-relevant guard.",
+          error
+        );
+      }
+    }
     await removePauseRevocationBarrierV1(barrierPath);
   } finally {
     // A failure to unlink our own lock (other than ENOENT, already gone)

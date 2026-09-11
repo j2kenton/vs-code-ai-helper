@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { isWatchdogPauseFenceCurrentV1 } from "./workAdmissionV1";
+import { isWatchdogPauseFenceCurrentV1, registerPauseRevocationCleanupHookV1 } from "./workAdmissionV1";
 import { TaskProgress } from "../types/taskProgress";
 
 /**
@@ -111,3 +111,21 @@ export async function repairRevokedWatchdogPauseV1(
     };
   });
 }
+
+/**
+ * Part 1b step 12/13 wiring (2026-09-11 review completion blocker
+ * `dceb2646...-2`, fixed): this is the one module with both a durable
+ * pause-fence read (`workAdmissionV1.ts`) and `task-progress.json` write
+ * access (this module's own doc comment above), so it is the correct place
+ * to self-register as `workAdmissionV1.ts`'s pause-cleanup hook — invoked
+ * (best-effort) after a revocation barrier's fence-advance completes, so the
+ * completing acquisition also clears the stale `watchdogPauseClaimId`/
+ * `pausedReason`/`status` fields left behind by the revoked pause, not just
+ * the fence generation. Registered once, at import time: every consumer of
+ * this module (the sweep, and any future pause-sensitive reader migrated
+ * under plan step 13) already imports it before it could possibly race a
+ * real acquisition.
+ */
+registerPauseRevocationCleanupHookV1(async (taskFolderPath, staleClaimId) => {
+  await repairRevokedWatchdogPauseV1(vscode.Uri.file(taskFolderPath), staleClaimId);
+});
