@@ -39,6 +39,8 @@ const MAX_WS_BUFFERED_BYTES_V1 = 4 * 1024 * 1024;
 const MAX_OPEN_WS_CONNECTIONS_V1 = 256;
 /** Connections that have not subscribed yet; the oldest is evicted past this. */
 const MAX_ANONYMOUS_WS_CONNECTIONS_V1 = 16;
+/** Connections whose subscribe is being verified; never evicted, briefly held. */
+const MAX_AUTHENTICATING_WS_CONNECTIONS_V1 = 16;
 /** Frame/message size limit until the connection has subscribed. */
 const MAX_PRE_SUBSCRIBE_PAYLOAD_BYTES_V1 = 16 * 1024;
 /** How long a new connection may stay without a successful subscribe. */
@@ -294,6 +296,14 @@ export function attachWsEventsTransportV1(
    * against the large cap.
    */
   const anonymousSockets = new Set<Duplex>();
+  /**
+   * Sockets whose `subscribe` is being checked. They leave the evictable
+   * set the moment a subscribe arrives: otherwise the owner's own socket,
+   * still oldest while its token was verified, was evicted by a stream of
+   * newer squatters and never subscribed (third review). A bogus token fails
+   * fast and closes, so squatters cannot sit in this set.
+   */
+  const authenticatingSockets = new Set<Duplex>();
   let subscribedSockets = 0;
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -340,6 +350,7 @@ export function attachWsEventsTransportV1(
     let subscribed = false;
     socket.once("close", () => {
       anonymousSockets.delete(socket);
+      authenticatingSockets.delete(socket);
       if (subscribed) {
         subscribed = false;
         subscribedSockets -= 1;
@@ -363,10 +374,11 @@ export function attachWsEventsTransportV1(
 
     /** Move this socket from the anonymous budget to the signed-in one. */
     function promote(): void {
-      if (subscribed || !anonymousSockets.has(socket)) {
+      if (subscribed || (!anonymousSockets.has(socket) && !authenticatingSockets.has(socket))) {
         return;
       }
       anonymousSockets.delete(socket);
+      authenticatingSockets.delete(socket);
       if (subscribedSockets >= (options.maxOpenConnections ?? MAX_OPEN_WS_CONNECTIONS_V1)) {
         closeSocket(1013, "too many connections");
         return;
@@ -471,6 +483,14 @@ export function attachWsEventsTransportV1(
         return;
       }
       const message = parsed;
+      if (message.type === "subscribe" && anonymousSockets.has(socket)) {
+        if (authenticatingSockets.size >= MAX_AUTHENTICATING_WS_CONNECTIONS_V1) {
+          closeSocket(1013, "too many sign-ins in progress");
+          return;
+        }
+        anonymousSockets.delete(socket);
+        authenticatingSockets.add(socket);
+      }
       inboundChain = inboundChain.then(async () => {
         if (socketClosed) {
           return;

@@ -431,8 +431,9 @@ export function createLocalDockerSandboxClientV1(
   function meetsSecurityProfile(inspected: Docker.ContainerInspectInfo): boolean {
     const user = ((inspected.Config?.User ?? "").split(":")[0] ?? "").trim();
     // The USER part alone decides it: "root:1000" and "0:0" are both root,
-    // and so is any numeric spelling of uid 0 ("00", "+0").
-    const runsAsRoot = user === "" || user === "root" || (/^\+?\d+$/.test(user) && Number(user) === 0);
+    // and so is any numeric spelling of uid 0 ("00", "+0", "-0" — runc parses
+    // the uid with Go's Atoi, which takes either sign).
+    const runsAsRoot = user === "" || user === "root" || (/^[+-]?\d+$/.test(user) && Number(user) === 0);
     const memory = inspected.HostConfig?.Memory ?? 0;
     const pids = inspected.HostConfig?.PidsLimit ?? 0;
     return !runsAsRoot && memory > 0 && pids !== null && pids > 0;

@@ -49,6 +49,8 @@ async function makeWireWorld(
     readonly subscribeDeadlineMs?: number;
     readonly maxOpenConnections?: number;
     readonly maxAnonymousConnections?: number;
+    /** Delay every token check by this much (holds a subscribe "in flight"). */
+    readonly authDelayMs?: number;
   }
 ): Promise<WireWorld> {
   const clock = makeClock();
@@ -58,7 +60,20 @@ async function makeWireWorld(
     validators: [makeFakeValidator("github", { "code-a": "subject-a", "code-b": "subject-b" })],
     now: clock.now,
   });
-  const hub = createWsHubV1({ sessions, store });
+  const authDelayMs = wsOptions?.authDelayMs;
+  const hub = createWsHubV1({
+    sessions:
+      authDelayMs === undefined
+        ? sessions
+        : {
+            ...sessions,
+            authenticate: async (token: string) => {
+              await new Promise((resolve) => setTimeout(resolve, authDelayMs));
+              return sessions.authenticate(token);
+            },
+          },
+    store,
+  });
   const handler = createControlPlaneHandlerV1({
     store,
     sessions,
@@ -74,7 +89,8 @@ async function makeWireWorld(
       ? createControlPlaneNodeServerV1(handler, { hub })
       : createControlPlaneNodeServerV1(handler);
   if (wsOptions !== undefined) {
-    attachWsEventsTransportV1(server, { hub, ...wsOptions });
+    const { authDelayMs: _delay, ...transportOptions } = wsOptions;
+    attachWsEventsTransportV1(server, { hub, ...transportOptions });
   }
   const sockets = new Set<Duplex>();
   server.on("connection", (socket) => {
@@ -444,6 +460,28 @@ test("anonymous sockets cannot lock the owner out: past their small budget the O
     assert.equal(refused.opcode, WS_OPCODE_V1.close);
     assert.equal(refused.payload.readUInt16BE(0), 1013);
     squatter2.socket.destroy();
+    owner.socket.destroy();
+  } finally {
+    await world.close();
+  }
+});
+
+test("a socket whose subscribe is being verified is never evicted by newer squatters", async () => {
+  // Third review: the owner's socket stayed evictable until its token check
+  // finished, so a stream of bare upgrades evicted it every time.
+  const world = await makeWireWorld({ maxAnonymousConnections: 2, authDelayMs: 150 });
+  try {
+    const owner = await openWireClient(world.port);
+    owner.sendText(JSON.stringify({ type: "subscribe", accessToken: world.token }));
+    await new Promise((resolve) => setTimeout(resolve, 20)); // the subscribe has arrived; its check is pending
+    const squatters: WireClient[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      squatters.push(await openWireClient(world.port));
+    }
+    assert.deepEqual(await owner.nextEvent(), { type: "subscribed", userId: world.userId });
+    for (const squatter of squatters) {
+      squatter.socket.destroy();
+    }
     owner.socket.destroy();
   } finally {
     await world.close();
