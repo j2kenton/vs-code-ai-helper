@@ -534,9 +534,19 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     log,
   });
 
-  const server = createControlPlaneNodeServerV1(handler, { hub, corsOrigins });
-  server.listen(port);
-  log(`control plane listening on http://127.0.0.1:${port}`);
+  const server = createControlPlaneNodeServerV1(handler, {
+    hub,
+    corsOrigins,
+    authenticateBearer: async (token) => (await sessions.authenticate(token)) !== undefined,
+  });
+  // Loopback by default: the public path is the tunnel (cloudflared connects
+  // to 127.0.0.1). Listening on every interface made the plain-HTTP API
+  // reachable around the tunnel, including from sandbox containers through
+  // the Docker bridge gateway — kept out today only by the host firewall
+  // (final review). ENSEMBLE_BIND_HOST overrides for a different topology.
+  const bindHost = process.env["ENSEMBLE_BIND_HOST"] ?? "127.0.0.1";
+  server.listen(port, bindHost);
+  log(`control plane listening on http://${bindHost}:${port}`);
   log(`  database: ${databasePath}`);
   log(`  cors origins: ${corsOrigins.join(", ")}`);
   log(

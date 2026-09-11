@@ -239,6 +239,8 @@ test("boot reconciliation fails stale running checkpoints and preserves question
     "failed",
     "the stale running checkpoint reconciled to failed at boot"
   );
+  // ...and says why, like every other failure.
+  assert.equal(after.store.readJob("task-recon-zombie")?.failureCode, "interruptedByRestart");
   assert.equal(
     after.store.readJob(pausedTask.taskId)?.status,
     "questionsPaused",

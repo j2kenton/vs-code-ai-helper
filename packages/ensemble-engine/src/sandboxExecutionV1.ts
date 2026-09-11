@@ -395,9 +395,13 @@ export function createGitCloneEffectV1(context: SandboxExecutionContextV1): Engi
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
       // A replay after a crash may find the ORIGINAL command still running
       // in the sandbox (the control plane died, the container did not).
-      // Racing it would corrupt the clone; fail loudly instead.
+      // Racing it would corrupt the clone. THROW rather than return a failed
+      // outcome: a failure is recorded as the step's terminal result and the
+      // step could never run again for this task, even after the original
+      // finished (final review) — a throw leaves the record pending, so a
+      // later drive replays it once the original is gone.
       if ((await client.findCommandByAttemptKey(binding.sandboxId, attemptKey)) === "executed") {
-        return { status: "failed", code: "gitCloneStillRunning" };
+        throw new Error("the previous clone attempt is still running in the sandbox; retry once it finishes");
       }
       // A PERSISTENT sandbox keeps its working tree between tasks, so the
       // second task on the same repo used to fail here: `git clone` refuses
@@ -478,8 +482,18 @@ export function createGitCheckoutEffectV1(
       : `${binding.workingDirectoryRoot}/.git/HEAD`;
   return {
     effectKind: "sandboxCommand",
-    supportsIdempotentReplay: false,
+    // Replay-safe by construction (probe the remote-tracking ref, then
+    // `checkout --detach` — the same result however often it runs). It must
+    // be: the step now runs TWO marked commands under one key, so a marker
+    // reconcile could adopt "the probe ran" as "the checkout ran" and leave
+    // the sandbox on the wrong ref (final review).
+    supportsIdempotentReplay: true,
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
+      // A ref is data, never an option: one starting with "-" would be read
+      // by git as a flag.
+      if (source.ref.startsWith("-")) {
+        return { status: "failed", code: "gitRefInvalid" };
+      }
       // A branch or tag name resolves to the LOCAL ref, which in a reused
       // clone is whatever an earlier task left — not what was just fetched.
       // Prefer the remote-tracking ref when one exists; a commit sha is
@@ -495,6 +509,7 @@ export function createGitCheckoutEffectV1(
             "rev-parse",
             "--verify",
             "--quiet",
+            "--end-of-options",
             `refs/remotes/origin/${source.ref}`,
           ],
           cwd: "/",
@@ -506,6 +521,8 @@ export function createGitCheckoutEffectV1(
       }
       const checkout = await client.runCommand({
         sandboxId: binding.sandboxId,
+        // No `--end-of-options` here: git 2.39's checkout takes it as a PATH
+        // (confirmed in the sandbox image). The "-" guard above is the defense.
         argv: ["git", "-C", binding.workingDirectoryRoot, "checkout", "--detach", target],
         cwd: "/",
         attemptKey,
@@ -514,6 +531,8 @@ export function createGitCheckoutEffectV1(
         ? { status: "succeeded", code: "checkedOut" }
         : { status: "failed", code: `gitCheckoutExit${checkout.exitCode}` };
     },
+    // Kept for callers that recover with reconcile; the split-lineage path
+    // replays instead (supportsIdempotentReplay above).
     async reconcile(attemptKey: string) {
       const byMarker = await client.findCommandByAttemptKey(binding.sandboxId, attemptKey);
       if (byMarker !== "unknown") {

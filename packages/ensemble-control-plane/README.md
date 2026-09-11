@@ -149,6 +149,7 @@ ENSEMBLE_ALLOWED_IDENTITIES=github:9324248 # required; who may sign in (provider
 ENSEMBLE_GITHUB_CLIENT_ID/SECRET=…         # at least one identity provider
 ENSEMBLE_GOOGLE_CLIENT_ID/SECRET=…
 ENSEMBLE_PORT=8787                         # default
+ENSEMBLE_BIND_HOST=127.0.0.1               # default: reach it through a tunnel/proxy; 0.0.0.0 to expose it directly
 ENSEMBLE_DATABASE_PATH=control-plane.sqlite
 ENSEMBLE_CORS_ORIGINS=http://localhost:8081
 ENSEMBLE_DOCKER_SANDBOX_IMAGE=ensemble-sandbox:latest   # docker/sandbox.Dockerfile; unset = bare node image, no CLI

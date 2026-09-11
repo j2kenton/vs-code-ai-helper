@@ -21,6 +21,7 @@ import { createSessionServiceV1 } from "../src/sessionServiceV1";
 import { createControlPlaneStoreV1 } from "../src/storeV1";
 import { createWsHubV1, WsHubV1 } from "../src/wsHubV1";
 import {
+  attachWsEventsTransportV1,
   computeWebSocketAcceptV1,
   createWsFrameReaderV1,
   encodeMaskedClientFrameV1,
@@ -43,7 +44,9 @@ interface WireWorld {
   close(): Promise<void>;
 }
 
-async function makeWireWorld(): Promise<WireWorld> {
+async function makeWireWorld(
+  wsOptions?: { readonly subscribeDeadlineMs?: number; readonly maxOpenConnections?: number }
+): Promise<WireWorld> {
   const clock = makeClock();
   const store = createControlPlaneStoreV1({ now: clock.now });
   const sessions = createSessionServiceV1({
@@ -60,7 +63,15 @@ async function makeWireWorld(): Promise<WireWorld> {
     sandboxFactory: { clientFor: () => createInMemorySandboxClientV1() },
     now: clock.now,
   });
-  const server = createControlPlaneNodeServerV1(handler, { hub });
+  // With test seams, the transport is attached directly (the node adapter
+  // always attaches it with production defaults).
+  const server =
+    wsOptions === undefined
+      ? createControlPlaneNodeServerV1(handler, { hub })
+      : createControlPlaneNodeServerV1(handler);
+  if (wsOptions !== undefined) {
+    attachWsEventsTransportV1(server, { hub, ...wsOptions });
+  }
   const sockets = new Set<Duplex>();
   server.on("connection", (socket) => {
     sockets.add(socket);
@@ -345,6 +356,87 @@ test("ping is answered with a pong echoing the payload", async () => {
     assert.equal(pong.opcode, WS_OPCODE_V1.pong);
     assert.equal(pong.payload.toString("utf8"), "heartbeat");
     client.socket.destroy();
+  } finally {
+    await world.close();
+  }
+});
+
+test("an oversized ping is refused with 1002, never echoed back as a pong", async () => {
+  const world = await makeWireWorld();
+  try {
+    const client = await openWireClient(world.port);
+    client.sendRaw(encodeMaskedClientFrameV1(WS_OPCODE_V1.ping, Buffer.alloc(126, 0x61)));
+    const frame = await client.nextFrame();
+    assert.equal(frame.opcode, WS_OPCODE_V1.close);
+    assert.equal(frame.payload.readUInt16BE(0), 1002);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
+test("a fragmented control frame is refused with 1002", async () => {
+  const world = await makeWireWorld();
+  try {
+    const client = await openWireClient(world.port);
+    const ping = encodeMaskedClientFrameV1(WS_OPCODE_V1.ping, Buffer.from("x", "utf8"));
+    ping[0] = (ping[0] as number) & 0x7f; // clear FIN
+    client.sendRaw(ping);
+    const frame = await client.nextFrame();
+    assert.equal(frame.opcode, WS_OPCODE_V1.close);
+    assert.equal(frame.payload.readUInt16BE(0), 1002);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
+test("a connection that never subscribes is closed with 1008 at the subscribe deadline", async () => {
+  const world = await makeWireWorld({ subscribeDeadlineMs: 50 });
+  try {
+    const client = await openWireClient(world.port);
+    const frame = await client.nextFrame();
+    assert.equal(frame.opcode, WS_OPCODE_V1.close);
+    assert.equal(frame.payload.readUInt16BE(0), 1008);
+    await client.closed();
+  } finally {
+    await world.close();
+  }
+});
+
+test("a subscribed connection outlives the subscribe deadline", async () => {
+  const world = await makeWireWorld({ subscribeDeadlineMs: 50 });
+  try {
+    const client = await openWireClient(world.port);
+    client.sendText(JSON.stringify({ type: "subscribe", accessToken: world.token }));
+    assert.equal((await client.nextEvent()).type, "subscribed");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    client.sendRaw(encodeMaskedClientFrameV1(WS_OPCODE_V1.ping, Buffer.from("alive", "utf8")));
+    const pong = await client.nextFrame();
+    assert.equal(pong.opcode, WS_OPCODE_V1.pong);
+    client.socket.destroy();
+  } finally {
+    await world.close();
+  }
+});
+
+test("open connections are capped (503), and a closed one frees its slot", async () => {
+  const world = await makeWireWorld({ maxOpenConnections: 1 });
+  try {
+    const first = await openWireClient(world.port);
+    await assert.rejects(openWireClient(world.port), /HTTP 503/);
+    first.socket.destroy();
+    await first.closed();
+    // The server sees the close asynchronously; retry briefly.
+    let second: WireClient | undefined;
+    for (let attempt = 0; attempt < 20 && second === undefined; attempt += 1) {
+      second = await openWireClient(world.port).catch(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return undefined;
+      });
+    }
+    assert.ok(second !== undefined, "the freed slot is usable again");
+    second.socket.destroy();
   } finally {
     await world.close();
   }

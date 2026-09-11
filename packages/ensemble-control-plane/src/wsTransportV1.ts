@@ -33,6 +33,12 @@ const WS_HANDSHAKE_GUID_V1 = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /** Frames larger than this close the connection with 1009 (message too big). */
 const DEFAULT_MAX_PAYLOAD_BYTES_V1 = 1024 * 1024;
+/** Unsent server→client bytes one socket may hold before the peer is dropped. */
+const MAX_WS_BUFFERED_BYTES_V1 = 4 * 1024 * 1024;
+/** Open WebSocket connections across the whole process (one owner; generous). */
+const MAX_OPEN_WS_CONNECTIONS_V1 = 256;
+/** How long a new connection may stay without a successful subscribe. */
+const WS_SUBSCRIBE_DEADLINE_MS_V1 = 30_000;
 
 export const WS_OPCODE_V1 = {
   continuation: 0x0,
@@ -130,9 +136,29 @@ export function createWsFrameReaderV1(options?: {
 }): WsFrameReaderV1 {
   const maxPayloadBytes = options?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES_V1;
   let pending: Buffer = Buffer.alloc(0);
+  // While a frame's body is still arriving, its chunks are only COLLECTED
+  // and joined once, when the whole frame is here. Re-concatenating the
+  // growing buffer on every chunk was quadratic: one 1 MB frame sent in
+  // 100-byte pieces cost ~3 s of event-loop CPU, pre-auth (final review).
+  let queued: Buffer[] = [];
+  let queuedBytes = 0;
+  let awaitingBytes: number | undefined;
   return {
     feed(chunk: Buffer): WsFrameFeedResultV1 {
-      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      if (awaitingBytes !== undefined) {
+        queued.push(chunk);
+        queuedBytes += chunk.length;
+        if (pending.length + queuedBytes < awaitingBytes) {
+          return { ok: true, frames: [] };
+        }
+        pending = Buffer.concat([pending, ...queued]);
+        queued = [];
+        queuedBytes = 0;
+        awaitingBytes = undefined;
+      } else {
+        // Only header bytes (at most 14) can be waiting here: cheap.
+        pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      }
       const frames: WsFrameV1[] = [];
       for (;;) {
         if (pending.length < 2) {
@@ -170,6 +196,7 @@ export function createWsFrameReaderV1(options?: {
         }
         const maskLength = masked ? 4 : 0;
         if (pending.length < offset + maskLength + payloadLength) {
+          awaitingBytes = offset + maskLength + payloadLength;
           return { ok: true, frames };
         }
         const maskKey = masked ? pending.subarray(offset, offset + 4) : undefined;
@@ -218,6 +245,9 @@ export interface AttachWsEventsTransportOptionsV1 {
   /** Defaults to the contract's `/v1/events`. */
   readonly path?: string;
   readonly maxPayloadBytes?: number;
+  /** Test seams; production uses the defaults. */
+  readonly subscribeDeadlineMs?: number;
+  readonly maxOpenConnections?: number;
 }
 
 /**
@@ -230,6 +260,8 @@ export function attachWsEventsTransportV1(
 ): void {
   const path = options.path ?? "/v1/events";
   const { hub } = options;
+  /** Open WebSocket connections, bounded — each is a file descriptor and a hub entry. */
+  let openSockets = 0;
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     // Everything on this path runs BEFORE any token check, so nothing here
@@ -266,6 +298,20 @@ export function attachWsEventsTransportV1(
       socket.destroy();
       return;
     }
+    if (openSockets >= (options.maxOpenConnections ?? MAX_OPEN_WS_CONNECTIONS_V1)) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    openSockets += 1;
+    let counted = true;
+    const release = (): void => {
+      if (counted) {
+        counted = false;
+        openSockets -= 1;
+      }
+    };
+    socket.once("close", release);
 
     socket.write(
       "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -281,15 +327,45 @@ export function attachWsEventsTransportV1(
         : {}
     );
 
+    /**
+     * Every server→client write goes through here. A peer that never reads
+     * lets unsent frames pile up in this process (pings echoed as pongs,
+     * events fanned out): 300 × 1 MB pings grew one socket's buffer to 312 MB,
+     * pre-auth, in the final review. Past the cap the peer is dropped.
+     */
+    function send(frame: Buffer): void {
+      if (socketClosed) {
+        return;
+      }
+      if (socket.writableLength + frame.length > MAX_WS_BUFFERED_BYTES_V1) {
+        socketClosed = true;
+        detachFromHub();
+        socket.destroy();
+        return;
+      }
+      socket.write(frame);
+    }
+
     const connection = hub.connect((event: WsServerEventV1): void => {
       if (socketClosed) {
         return;
       }
-      socket.write(encodeWsTextFrameV1(JSON.stringify(event)));
+      send(encodeWsTextFrameV1(JSON.stringify(event)));
       if (event.type === "subscriptionClosed") {
         closeSocket(1000, event.reason);
       }
     });
+
+    // A connection must subscribe (with a valid token) promptly; an
+    // anonymous socket may not idle here forever holding a descriptor and a
+    // hub entry (final review).
+    const subscribeDeadline = setTimeout(() => {
+      if (!socketClosed && connection.userId === undefined) {
+        closeSocket(1008, "subscribe required");
+      }
+    }, options.subscribeDeadlineMs ?? WS_SUBSCRIBE_DEADLINE_MS_V1);
+    subscribeDeadline.unref?.();
+    socket.once("close", () => clearTimeout(subscribeDeadline));
 
     function detachFromHub(): void {
       if (!connection.closed) {
@@ -307,6 +383,9 @@ export function attachWsEventsTransportV1(
       detachFromHub();
       socket.write(encodeWsCloseFrameV1(code, reason));
       socket.end();
+      // `end()` only half-closes: a peer that never closes its side kept the
+      // socket (and its descriptor) forever. Give it a moment, then cut it.
+      setTimeout(() => socket.destroy(), 5000).unref?.();
     }
 
     // Inbound messages apply strictly in arrival order even though the hub
@@ -368,15 +447,24 @@ export function attachWsEventsTransportV1(
         closeSocket(1002, "client frames must be masked");
         return;
       }
+      const isControl =
+        frame.opcode === WS_OPCODE_V1.close || frame.opcode === WS_OPCODE_V1.ping || frame.opcode === WS_OPCODE_V1.pong;
+      if (isControl && (!frame.fin || frame.payload.length > 125)) {
+        // RFC6455 §5.5: control frames are ≤125 bytes and never fragmented.
+        // Unchecked, 1 MB pings were echoed as 1 MB pongs (final review).
+        closeSocket(1002, "invalid control frame");
+        return;
+      }
       switch (frame.opcode) {
         case WS_OPCODE_V1.close:
           socketClosed = true;
           detachFromHub();
           socket.write(encodeWsCloseFrameV1(1000, ""));
           socket.end();
+          setTimeout(() => socket.destroy(), 5000).unref?.();
           return;
         case WS_OPCODE_V1.ping:
-          socket.write(encodeWsFrameV1(WS_OPCODE_V1.pong, frame.payload));
+          send(encodeWsFrameV1(WS_OPCODE_V1.pong, frame.payload));
           return;
         case WS_OPCODE_V1.pong:
           return;
@@ -457,6 +545,14 @@ export function attachWsEventsTransportV1(
 
     socket.on("data", consume);
     socket.on("error", () => {
+      socketClosed = true;
+      detachFromHub();
+      socket.destroy();
+    });
+    // node:http sockets allow half-open: a peer that drops TCP without a
+    // close frame only ends ITS side, and without this our side (its hub
+    // entry, descriptor and connection slot) stayed open indefinitely.
+    socket.on("end", () => {
       socketClosed = true;
       detachFromHub();
       socket.destroy();

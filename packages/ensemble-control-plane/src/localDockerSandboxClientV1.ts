@@ -131,29 +131,48 @@ async function killMarkedProcessesV1(
   docker: Docker,
   containerId: string,
   envEntry: string
-): Promise<number> {
+): Promise<number | undefined> {
   const quoted = quotePosixShellArgV1(envEntry);
+  // The count is printed LAST, on its own line, after an "ok" sentinel: a
+  // scan that could not run to the end (a fork failure under the pid limit
+  // — exactly the runaway case — or an exec that never started) produces
+  // no sentinel and is reported as UNKNOWN, never as "none remain".
   const script =
     `n=0; for p in /proc/[0-9]*; do ` +
     `if tr '\\0' '\\n' < "$p/environ" 2>/dev/null | grep -qxF -- ${quoted}; then ` +
-    `kill -9 "\${p##*/}" 2>/dev/null; n=$((n+1)); fi; done; echo "$n"`;
-  const exec = await docker.getContainer(containerId).exec({
-    Cmd: ["/bin/sh", "-c", script],
-    AttachStdout: true,
-    AttachStderr: true,
-  });
-  const stream = await exec.start({ hijack: true, stdin: false });
-  const chunks: Buffer[] = [];
-  const sink = new PassThrough();
-  sink.on("data", (chunk: Buffer) => chunks.push(chunk));
-  docker.modem.demuxStream(stream, sink, new PassThrough());
-  await new Promise<void>((resolve) => {
-    stream.on("end", resolve);
-    stream.on("close", resolve);
-    stream.on("error", () => resolve());
-  });
-  const count = Number.parseInt(Buffer.concat(chunks).toString("utf8").trim(), 10);
-  return Number.isInteger(count) ? count : 0;
+    `kill -9 "\${p##*/}" 2>/dev/null; n=$((n+1)); fi; done; echo "ok $n"`;
+  try {
+    const exec = await docker.getContainer(containerId).exec({
+      Cmd: ["/bin/sh", "-c", script],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
+    const stream = await exec.start({ hijack: true, stdin: false });
+    const chunks: Buffer[] = [];
+    const sink = new PassThrough();
+    sink.on("data", (chunk: Buffer) => chunks.push(chunk));
+    docker.modem.demuxStream(stream, sink, new PassThrough());
+    const finished = await Promise.race([
+      new Promise<boolean>((resolve) => {
+        stream.on("end", () => resolve(true));
+        stream.on("close", () => resolve(true));
+        stream.on("error", () => resolve(false));
+      }),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10_000).unref?.()),
+    ]);
+    if (!finished) {
+      stream.destroy();
+      return undefined;
+    }
+    const inspected = await exec.inspect();
+    const match = /^ok (\d+)$/m.exec(Buffer.concat(chunks).toString("utf8"));
+    if (inspected.ExitCode !== 0 || match === null) {
+      return undefined;
+    }
+    return Number.parseInt(match[1] as string, 10);
+  } catch {
+    return undefined;
+  }
 }
 
 export class DockerExecNotStoppedErrorV1 extends Error {
@@ -259,7 +278,9 @@ async function execCaptureV1(
     if (options.processMarker !== undefined) {
       await killMarkedProcessesV1(docker, containerId, options.processMarker);
       const remaining = await killMarkedProcessesV1(docker, containerId, options.processMarker);
-      if (remaining > 0) {
+      // `undefined` = the verification scan itself could not complete: that
+      // proves nothing, so it is treated exactly like survivors (final review).
+      if (remaining === undefined || remaining > 0) {
         throw new DockerExecNotStoppedErrorV1(stoppedReason);
       }
     }
@@ -388,8 +409,9 @@ export function createLocalDockerSandboxClientV1(
 
   /** A pre-label sandbox must still meet today's profile: non-root, memory- and pid-limited. */
   function meetsSecurityProfile(inspected: Docker.ContainerInspectInfo): boolean {
-    const user = inspected.Config?.User ?? "";
-    const runsAsRoot = user === "" || user === "root" || /^0(:|$)/.test(user);
+    const user = (inspected.Config?.User ?? "").split(":")[0] ?? "";
+    // The USER part alone decides it: "root:1000" and "0:0" are both root.
+    const runsAsRoot = user === "" || user === "root" || user === "0";
     const memory = inspected.HostConfig?.Memory ?? 0;
     const pids = inspected.HostConfig?.PidsLimit ?? 0;
     return !runsAsRoot && memory > 0 && pids !== null && pids > 0;
@@ -468,6 +490,11 @@ export function createLocalDockerSandboxClientV1(
           // restart or host reboot must not leave it stopped (it used to,
           // and every later task and sign-in failed as unreachable).
           RestartPolicy: { Name: "unless-stopped" },
+          // A real PID 1 that reaps orphans. `sleep infinity` never does, so
+          // every orphan (the children of a tree-killed round, anything a CLI
+          // backgrounds) stayed a zombie counted against PidsLimit, until the
+          // persistent sandbox could not fork at all (final review).
+          Init: true,
           Memory: limits.memoryBytes,
           MemorySwap: limits.memoryBytes,
           NanoCpus: Math.round(limits.cpus * 1e9),
@@ -479,7 +506,14 @@ export function createLocalDockerSandboxClientV1(
         },
         ...(containerUser !== undefined && containerUser.length > 0 ? { User: containerUser } : {}),
       });
-      await container.start();
+      try {
+        await container.start();
+      } catch (error) {
+        // Created but not started: nothing records this id yet, so if it is
+        // not removed here it is left on the host for good (final review).
+        await container.remove({ force: true }).catch(() => undefined);
+        throw error;
+      }
       verified.add(container.id);
       return { sandboxId: container.id };
     },

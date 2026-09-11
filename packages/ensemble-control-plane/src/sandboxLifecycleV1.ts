@@ -174,10 +174,11 @@ const provisioningV1 = new Map<string, Promise<ControlPlaneUserSandboxRecordV1>>
 /**
  * Resolve the caller's `user-owned-managed` sandbox for (user, provider) —
  * create it ONCE, on first use, and reuse the same one for every later call.
- * `workingDirectoryRoot` is only meaningful on first creation (a task later
- * asking for a different root against an EXISTING record gets the root the
- * sandbox was actually created with — the confined root cannot silently
- * change out from under a sandbox that already has content at the old one).
+ * The record's `workingDirectoryRoot` is informational (the root it was
+ * first created for). Each TASK confines to its own binding root inside the
+ * shared sandbox — that is what lets one persistent sandbox hold several
+ * projects side by side (/workspace/a, /workspace/b); callers use only the
+ * returned `sandboxId`.
  */
 export async function ensureUserSandboxV1(
   store: UserSandboxStoreV1,

@@ -183,10 +183,12 @@ export const ENGINE_STAGE_GUIDANCE_V1: Readonly<Record<TaskStage, string>> = {
     "unclear acceptance criteria, edge cases. Return the checklist (ticks preserved) followed by " +
     "your findings.",
   impl:
-    "This stage IMPLEMENTS the plan of record: edit files in the working directory and run the " +
-    "commands the work needs. When you stop, return the plan's checklist with every item you " +
-    "completed ticked (`- [x]`), untouched items left as they were, and a `<!-- progress: N/M -->` " +
-    "marker. Do not tick what you did not do.",
+    "This stage IMPLEMENTS the plan of record: edit files in the working directory. Shell commands " +
+    "may not be permitted in this environment; if one you need is blocked, that is expected — do " +
+    "not report a failure for it, finish the edits you can and say in your summary what you could " +
+    "not run. When you stop, return the plan's checklist with every item you completed ticked " +
+    "(`- [x]`), untouched items left as they were, and a `<!-- progress: N/M -->` marker. Do not " +
+    "tick what you did not do.",
   "impl-high-review":
     `${READ_ONLY_STAGE_RULE_V1}\n` +
     "Goal of this stage: review the implemented changes against the plan of record — correctness, " +
@@ -295,12 +297,12 @@ export interface EngineCliTransportRunnerV1 {
 
 /**
  * A finished CLI round, plus — separately — what the TRANSPORT itself
- * established about a failure: the CLI's exit status and its own words, or
- * a model-reported failure MESSAGE classified exactly as the direct-API
- * path classifies one. Dispatch cascades on `classification` only, never
- * on a result code, because a result code can be model-written: a reply
- * carrying `code: "quotaExhausted"` used to spend a paid backup on its say-so
- * (review finding, 2026-09-11).
+ * established about a failure: the CLI's exit status and its own words.
+ * Dispatch cascades on `classification` only, never on anything the model
+ * wrote: a reply carrying `code: "quotaExhausted"` used to spend a paid
+ * backup on its say-so, and so could ordinary prose in a model-reported
+ * failure message ("the credits page tests fail" reads as quota) — review
+ * findings, 2026-09-11.
  */
 export interface EngineCliRoundOutcomeV1 {
   readonly result: EngineRoundResultV1;

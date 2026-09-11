@@ -35,6 +35,8 @@ import {
   SANDBOX_ATTEMPT_KEY_MARKER_V1,
 } from "../src/sandboxClientV1";
 import {
+  createGitCheckoutEffectV1,
+  createGitCloneEffectV1,
   createSandboxCommandEffectV1,
   createSourceAcquisitionEffectV1,
   resolveConfinedSandboxPathV1,
@@ -437,6 +439,45 @@ test("teardown destroys only a task-owned ephemeral sandbox with destroy-on-comp
 });
 
 // ─── The engine never executes anything itself (criterion 6) ────────────────
+
+test("split-lineage clone: a still-running original THROWS (record stays pending), never a terminal failure; a reused clone is fetched", async () => {
+  // Final review: returning a failed outcome recorded the step terminally,
+  // so it could never run again for the task even after the original ended.
+  const running = contextWith({
+    client: { onCommand: () => ({ exitCode: 0, stdoutTail: "", stderrTail: "" }) },
+  });
+  const liveClient = { ...running.client, findCommandByAttemptKey: () => Promise.resolve("executed" as const) };
+  const effect = createGitCloneEffectV1({ ...running, client: liveClient });
+  assert.equal(effect.supportsIdempotentReplay, true, "the clone step is replayed on recovery, not reconciled");
+  await assert.rejects(effect.execute("0123456789abcdef"), /still running/);
+
+  // A persistent sandbox that already holds a clone of the same origin: fetch, never re-clone.
+  const reused = contextWith({
+    client: {
+      onCommand: (request) =>
+        request.argv.includes("remote")
+          ? { exitCode: 0, stdoutTail: "https://example.com/repo.git\n", stderrTail: "" }
+          : { exitCode: 0, stdoutTail: "", stderrTail: "" },
+    },
+  });
+  reused.client.addDirectory(SANDBOX_ID, `${ROOT}/.git`);
+  const outcome = await createGitCloneEffectV1(reused).execute("0123456789abcdef");
+  assert.deepEqual(outcome, { status: "succeeded", code: "reusedExistingClone" });
+  assert.equal(reused.client.executedCommands.some((command) => command.argv[1] === "clone"), false);
+});
+
+test("split-lineage checkout: replay-safe, and a ref that looks like a git option is refused", async () => {
+  const context = contextWith();
+  const checkout = createGitCheckoutEffectV1(context);
+  // Two marked commands (probe + checkout) share one key, so a marker
+  // reconcile could adopt "the probe ran" as "the checkout ran" (final review).
+  assert.equal(checkout.supportsIdempotentReplay, true);
+
+  const hostile = createGitCheckoutEffectV1(
+    contextWith({ binding: { source: { kind: "gitClone", repoUrl: "https://example.com/repo.git", ref: "-f" } } })
+  );
+  assert.deepEqual(await hostile.execute("0123456789abcdef"), { status: "failed", code: "gitRefInvalid" });
+});
 
 test("no child-process, eval, or Function-constructor usage exists anywhere in the engine sources", () => {
   // Tests run compiled from out-test; walk up to the package root that holds

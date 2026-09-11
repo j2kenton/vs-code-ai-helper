@@ -228,8 +228,9 @@ export interface ControlPlaneKeyRecordV1 {
  * The ONE sandbox the control plane resolves for a `user-owned-managed`
  * binding, per (user, provider): created once on first use, reused for
  * every later task — never destroyed automatically. `workingDirectoryRoot`
- * is recorded here (not re-derived per task) so every task that resolves
- * this record agrees on the same confined root.
+ * is informational (the root it was first created for): each task confines
+ * to its OWN binding root inside this shared sandbox, which is what lets it
+ * hold several projects side by side.
  */
 export interface ControlPlaneUserSandboxRecordV1 {
   readonly ownerUserId: string;

@@ -163,6 +163,9 @@ const MAX_PROVIDER_CALL_PROMPT_CHARS_V1 = 2 * 1024 * 1024;
  * to spare, and far below anything that could pressure the heap.
  */
 const MAX_REQUEST_BODY_BYTES_V1 = 8 * 1024 * 1024;
+/** The only routes reachable before sign-in; their bodies are a few hundred bytes. */
+const PRE_AUTH_ROUTES_V1: ReadonlySet<string> = new Set(["/v1/auth/exchange", "/v1/auth/refresh", "/v1/auth/revoke"]);
+const MAX_PRE_AUTH_BODY_BYTES_V1 = 16 * 1024;
 /** How much of a refused body is read and discarded (never stored) so the 413 reaches the client. */
 const MAX_REJECTED_BODY_DRAIN_BYTES_V1 = 32 * 1024 * 1024;
 
@@ -893,6 +896,16 @@ export function createControlPlaneHandlerV1(
         throw error;
       }
       const client = sandboxFactory.clientFor(provider, apiKey);
+      // Checked BEFORE provisioning: for a provider that cannot run an
+      // interactive session, ensureUserSandboxV1 used to create (and bill)
+      // a persistent sandbox for a sign-in that could never start (final review).
+      if (client.createInteractiveSession === undefined) {
+        return typed(
+          422,
+          "userSandboxLoginUnsupported",
+          `provider "${provider}" does not support interactive sandbox sessions`
+        );
+      }
       let userSandbox;
       try {
         userSandbox = await ensureUserSandboxV1(store, client, userId, provider, workingDirectoryRoot, now);
@@ -1119,6 +1132,12 @@ export function createControlPlaneNodeServerV1(
     readonly hub?: WsHubV1;
     /** Browser origins allowed to make credentialed cross-origin requests. */
     readonly corsOrigins?: readonly string[];
+    /**
+     * Checks a bearer token BEFORE any request body is read (everything but
+     * the sign-in routes). Absent, bodies are read first and the handler
+     * authenticates as before — the production composition always sets it.
+     */
+    readonly authenticateBearer?: (accessToken: string) => Promise<boolean>;
   }
 ): Server {
   const allowedOrigins = options?.corsOrigins ?? [];
@@ -1147,27 +1166,67 @@ export function createControlPlaneNodeServerV1(
       outgoing.writeHead(status, { "content-type": "application/json", ...cors, ...extra });
       outgoing.end(body === undefined ? "" : JSON.stringify(body));
     };
+    /**
+     * Refuse the request now and DRAIN (not store) what the client is still
+     * sending: closing a socket with unread data makes the OS send a reset
+     * that discards the response already on its way (observed on Windows).
+     * For the same reason there is no `connection: close`: Node closes right
+     * after the response, and a 401 sent before any of the body was read
+     * never arrived (final review). Past the drain ceiling the sender is not a client waiting for an
+     * answer, and the connection is cut.
+     */
+    const refuse = (status: number, body: unknown): void => {
+      rejected = true;
+      chunks.length = 0;
+      incoming.resume();
+      respond(status, body);
+    };
+
+    let requestPath: string;
+    try {
+      requestPath = new URL(incoming.url ?? "/", "http://localhost").pathname;
+    } catch {
+      refuse(400, { code: "badRequest", message: "malformed request target" });
+      return;
+    }
+    // Before sign-in, only these routes take a body — small ones. Every
+    // other route's token is checked BEFORE its body is read, so an
+    // anonymous client can no longer make the process buffer and parse
+    // 8 MB (≈190 MB of heap and ~0.8 s of blocked event loop per request,
+    // measured in the final review) just by sending it.
+    const preAuthRoute = PRE_AUTH_ROUTES_V1.has(requestPath);
+    const bodyLimit = preAuthRoute ? MAX_PRE_AUTH_BODY_BYTES_V1 : MAX_REQUEST_BODY_BYTES_V1;
+
     incoming.on("data", (chunk: Buffer) => {
       received += chunk.length;
       if (rejected) {
-        // Draining, not storing: closing a socket with unread data makes the
-        // OS send a reset that DISCARDS the 413 already on its way (observed
-        // on Windows). Past the drain ceiling the sender is not a client
-        // waiting for an answer, and the connection is simply cut.
-        if (received > MAX_REQUEST_BODY_BYTES_V1 + MAX_REJECTED_BODY_DRAIN_BYTES_V1) {
+        if (received > bodyLimit + MAX_REJECTED_BODY_DRAIN_BYTES_V1) {
           incoming.destroy();
         }
         return;
       }
-      if (received > MAX_REQUEST_BODY_BYTES_V1) {
+      if (received > bodyLimit) {
         // Refused while streaming, before the body is ever held in full.
-        rejected = true;
-        chunks.length = 0;
-        respond(413, { code: "requestBodyTooLarge", message: "request body too large" }, { connection: "close" });
+        refuse(413, { code: "requestBodyTooLarge", message: "request body too large" });
         return;
       }
       chunks.push(chunk);
     });
+    // Reading starts only once the request is allowed to have its body read.
+    incoming.pause();
+    void (async (): Promise<void> => {
+      if (!preAuthRoute && options?.authenticateBearer !== undefined) {
+        const header = incoming.headers.authorization;
+        // Same parsing as the handler's bearerToken(), so the two never disagree.
+        const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+        const allowed = token.length > 0 && (await options.authenticateBearer(token).catch(() => false));
+        if (!allowed) {
+          refuse(401, { code: "unauthorized", message: "a valid control-plane access token is required" });
+          return;
+        }
+      }
+      incoming.resume();
+    })();
     incoming.on("end", () => {
       if (rejected) {
         return;

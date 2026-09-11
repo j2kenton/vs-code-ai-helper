@@ -12,8 +12,11 @@ import { request } from "node:http";
 import type { Server } from "node:http";
 import { createControlPlaneNodeServerV1, type ControlPlaneHandlerV1 } from "../src/controlPlaneServerV1";
 
-async function listen(handler: ControlPlaneHandlerV1): Promise<{ port: number; close(): Promise<void> }> {
-  const server: Server = createControlPlaneNodeServerV1(handler);
+async function listen(
+  handler: ControlPlaneHandlerV1,
+  options?: { readonly authenticateBearer?: (accessToken: string) => Promise<boolean> }
+): Promise<{ port: number; close(): Promise<void> }> {
+  const server: Server = createControlPlaneNodeServerV1(handler, options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
@@ -23,7 +26,12 @@ async function listen(handler: ControlPlaneHandlerV1): Promise<{ port: number; c
   };
 }
 
-function send(port: number, path: string, body?: Buffer): Promise<{ status: number; text: string }> {
+function send(
+  port: number,
+  path: string,
+  body?: Buffer,
+  accessToken?: string
+): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const req = request(
@@ -32,7 +40,10 @@ function send(port: number, path: string, body?: Buffer): Promise<{ status: numb
         port,
         method: body === undefined ? "GET" : "POST",
         path,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(accessToken !== undefined ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -100,6 +111,62 @@ test("an oversized request body is refused with 413 while streaming, and never r
     const response = await send(server.port, "/v1/tasks", Buffer.alloc(9 * 1024 * 1024, 0x20));
     assert.equal(response.status, 413);
     assert.equal(reached, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("with authenticateBearer, a request without a valid token is refused 401 before its body is read", async () => {
+  let reached = false;
+  const checked: string[] = [];
+  const server = await listen(
+    {
+      handle: () => {
+        reached = true;
+        return Promise.resolve({ status: 200 });
+      },
+    },
+    {
+      authenticateBearer: (token) => {
+        checked.push(token);
+        return Promise.resolve(token === "good");
+      },
+    }
+  );
+  try {
+    // 4 MB is under the 8 MB authenticated cap: only the token check stops it.
+    const anonymous = await send(server.port, "/v1/tasks", Buffer.alloc(4 * 1024 * 1024, 0x20));
+    assert.equal(anonymous.status, 401);
+    const wrong = await send(server.port, "/v1/tasks", Buffer.from("{}"), "bad");
+    assert.equal(wrong.status, 401);
+    assert.equal(reached, false);
+
+    const allowed = await send(server.port, "/v1/tasks", Buffer.from("{}"), "good");
+    assert.equal(allowed.status, 200);
+    assert.equal(reached, true);
+    assert.deepEqual(checked, ["bad", "good"], "an absent header is refused without a lookup");
+  } finally {
+    await server.close();
+  }
+});
+
+test("the sign-in routes skip the token check but their bodies are capped at 16 KB", async () => {
+  const bodies: unknown[] = [];
+  const server = await listen(
+    {
+      handle: (request) => {
+        bodies.push(request.body);
+        return Promise.resolve({ status: 200 });
+      },
+    },
+    { authenticateBearer: () => Promise.resolve(false) }
+  );
+  try {
+    const small = await send(server.port, "/v1/auth/exchange", Buffer.from(JSON.stringify({ provider: "github" })));
+    assert.equal(small.status, 200);
+    const big = await send(server.port, "/v1/auth/exchange", Buffer.alloc(17 * 1024, 0x20));
+    assert.equal(big.status, 413);
+    assert.deepEqual(bodies, [{ provider: "github" }]);
   } finally {
     await server.close();
   }

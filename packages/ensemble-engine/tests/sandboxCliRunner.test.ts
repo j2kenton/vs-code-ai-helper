@@ -293,6 +293,84 @@ test("output the provider will not read back (oversized) is a terminal 'too larg
   });
 });
 
+test("a sandbox client that THROWS (broken stream, unprovable stop) is a terminal unknown outcome — never retried into a second CLI", async () => {
+  const base = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const throwing = {
+    ...base,
+    runCommand: () => Promise.reject(new Error("a sandbox command could not be proven stopped")),
+  };
+  const runner = createSandboxCliProviderRunnerV1({
+    client: throwing,
+    sandboxId: SANDBOX,
+    workingDirectoryRoot: ROOT,
+    machinery: createEngineGateMachineryV1({
+      taskId: "task-1",
+      ownerId: "owner-1",
+      workerId: "worker-1",
+      sink: createRecordingEventSinkV1(),
+    }),
+  });
+  assert.deepEqual(await runner.invoke(invocation("impl")), {
+    kind: "failed",
+    code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outcomeUnknown,
+    retryable: false,
+  });
+});
+
+test("a model-reported failure is never classified from its prose: 'credits'/'rate limit' wording cannot trigger a cascade", async () => {
+  const client = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({
+      frame: (correlation) =>
+        `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation,
+          kind: "failed",
+          code: "testsFailing",
+          message: "The credits page tests fail after my change; the rate limit middleware test is flaky too.",
+          retryable: false,
+        })}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`,
+    }),
+  });
+  const outcome = await makeRunner(client).invokeWithModel(invocation("impl"), "sonnet");
+  assert.deepEqual(outcome.result, { kind: "failed", code: "testsFailing", retryable: false });
+  assert.equal(outcome.classification, undefined, "model-written prose must never become a transport classification");
+});
+
+test("an output file that is genuinely absent is a retryable 'missing'", async () => {
+  const client = createInMemorySandboxClientV1({
+    onCommand: () => ({ exitCode: 0, stdoutTail: "", stderrTail: "" }), // wrote nothing
+  });
+  assert.deepEqual(await makeRunner(client).invoke(invocation("impl")), {
+    kind: "failed",
+    code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputMissing,
+    retryable: true,
+  });
+});
+
+test("every scratch file (prompt, output, stderr, env) is removed after the round", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  await makeRunner(client, { env: { ANTHROPIC_API_KEY: "sk-ant-x" } }).invoke(invocation("impl"));
+  const script = client.executedCommands[0]!.argv[2] as string;
+  const paths = [...script.matchAll(/'(\/tmp\/ensemble-cli\/[0-9a-f]+\.[a-z.]+)'/g)].map((match) => match[1] as string);
+  assert.equal(new Set(paths).size, 4, "prompt, out, err, env");
+  for (const path of paths) {
+    assert.equal(client.readFile(SANDBOX, path), undefined, `${path} outlived the round`);
+  }
+});
+
+test("a replayed invocation for the same model is a terminal alreadyExecuted — the CLI is never run twice", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const runner = makeRunner(client);
+  const shared = invocation("impl");
+  assert.equal((await runner.invokeWithModel(shared, "sonnet")).result.kind, "completed");
+  assert.deepEqual((await runner.invokeWithModel(shared, "sonnet")).result, {
+    kind: "failed",
+    code: SANDBOX_CLI_ROUND_FAILURE_CODES_V1.alreadyExecuted,
+    retryable: false,
+  });
+  assert.equal(client.executedCommands.length, 1);
+});
+
 test("a step id is unique per invocation, so a second round never reads as alreadyExecuted", async () => {
   const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
   const runner = makeRunner(client);

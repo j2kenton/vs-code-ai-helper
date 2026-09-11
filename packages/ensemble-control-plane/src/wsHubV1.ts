@@ -135,13 +135,20 @@ export function createWsHubV1(options: {
         continue;
       }
       // Revalidation on every delivery: an expired or revoked token closes
-      // the subscription instead of receiving the event.
-      const identity = await sessions.authenticate(state.accessToken);
-      if (identity === undefined || identity.userId !== ownerUserId) {
-        close(state, "tokenExpired");
-        continue;
+      // the subscription instead of receiving the event. A store error here
+      // (e.g. SQLITE_BUSY while an external backup holds the lock) skips this
+      // one delivery — it must never escape: this runs from a fire-and-forget
+      // sink, where a rejection would terminate the process (final review).
+      try {
+        const identity = await sessions.authenticate(state.accessToken);
+        if (identity === undefined || identity.userId !== ownerUserId) {
+          close(state, "tokenExpired");
+          continue;
+        }
+        state.send(event);
+      } catch {
+        // Skipped; the next event revalidates again.
       }
-      state.send(event);
     }
   }
 
@@ -165,7 +172,7 @@ export function createWsHubV1(options: {
     createEngineSink(ownerUserId: string): EngineEventSinkV1 {
       return {
         emit: (event: EngineEventV1): void => {
-          void publishToOwner(ownerUserId, event);
+          publishToOwner(ownerUserId, event).catch(() => undefined);
         },
       };
     },

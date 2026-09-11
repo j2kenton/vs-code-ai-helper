@@ -132,11 +132,17 @@ interface RunStateV1 {
  * retryable — and the host ended the whole task on it, because it treated
  * every failed round as terminal. Model output varies; one bad reply is not
  * a dead task. Bounded so a provider that is consistently broken still
- * fails, and capacity failures are excluded: an immediate re-run cannot fix
- * an exhausted quota (dispatch already spent any configured backup).
+ * fails, and capacity/entitlement failures are excluded: an immediate re-run
+ * cannot fix an exhausted quota, an outage, or a model the account is not
+ * entitled to — and each re-run would go through dispatch's paid backup
+ * cascade again (final review).
  */
 const MAX_CONSECUTIVE_ROUND_RETRIES_V1 = 2;
-const NON_RETRIED_ROUND_FAILURE_CODES_V1: ReadonlySet<string> = new Set(["quotaExhausted"]);
+const NON_RETRIED_ROUND_FAILURE_CODES_V1: ReadonlySet<string> = new Set([
+  "quotaExhausted",
+  "temporarilyUnavailable",
+  "modelEntitlementBlocked",
+]);
 
 export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): EngineRunHostV1 {
   const { store, hub, providerRunnerFor } = options;
@@ -158,7 +164,21 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
   // point — reconcile it to `failed` rather than letting it read as a
   // zombie running job forever.
   for (const job of store.listJobsByStatus("running")) {
-    store.upsertJob({ ...job, status: "failed", updatedAt: now().toISOString() });
+    const at = now().toISOString();
+    // Recorded like every other failure — a code on the job and a terminal
+    // round — so the client shows WHY the run stopped instead of a bare
+    // "failed" with nothing in its history (final review).
+    const task = store.readTask(job.taskId);
+    if (task !== undefined) {
+      store.appendTaskRound(job.taskId, {
+        roundId: allocateHex128IdV1(),
+        stage: task.progress.currentStage,
+        startedAt: at,
+        completedAt: at,
+        summary: "failed: interruptedByRestart",
+      });
+    }
+    store.upsertJob({ ...job, status: "failed", failureCode: "interruptedByRestart", updatedAt: at });
   }
 
   function checkpoint(
@@ -260,7 +280,11 @@ export function createEngineRunHostV1(options: CreateEngineRunHostOptionsV1): En
       if (
         result.retryable &&
         !NON_RETRIED_ROUND_FAILURE_CODES_V1.has(result.code) &&
-        state.consecutiveRetries < MAX_CONSECUTIVE_ROUND_RETRIES_V1
+        state.consecutiveRetries < MAX_CONSECUTIVE_ROUND_RETRIES_V1 &&
+        // No retry the stage's budget cannot pay for: it would be recorded
+        // as "retrying" and then fail as roundBudgetExhausted, hiding the
+        // real provider error behind a budget code (final review).
+        state.roundsThisStage < maxRoundsPerStage
       ) {
         state.consecutiveRetries += 1;
         // Recorded, so the round history shows the retry rather than a

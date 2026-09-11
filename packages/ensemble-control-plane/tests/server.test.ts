@@ -836,6 +836,8 @@ test("POST /v1/user-sandbox/login: 404 with no cliLogin configured; requires aut
   });
   assert.equal(unsupported.status, 422);
   assert.equal((unsupported.body as { code: string }).code, "userSandboxLoginUnsupported");
+  // Refused BEFORE provisioning: no sandbox was created just to be told no.
+  assert.equal(world.store.readUserSandbox(world.userA, "docker"), undefined);
 
   const badProvider = await world.call(world.tokenA, "POST", "/v1/user-sandbox/login", {
     body: { provider: "not-a-provider" },

@@ -324,7 +324,7 @@ test("ownership guard: a pre-label sandbox is accepted only by exact listed id A
     [legacy]: { name: "old", image: "ensemble-sandbox:latest", labelled: false },
     // Same image, not listed: an image match proves nothing about who created it.
     [sameImageStranger]: { name: "other", image: "ensemble-sandbox:latest", labelled: false },
-    [legacyAsRoot]: { name: "root", image: "ensemble-sandbox:latest", labelled: false, user: "" },
+    [legacyAsRoot]: { name: "root", image: "ensemble-sandbox:latest", labelled: false, user: "root:1000" },
     [legacyUnlimited]: { name: "nolimit", image: "ensemble-sandbox:latest", labelled: false, memory: 0 },
   });
   const client = createLocalDockerSandboxClientV1({
@@ -388,6 +388,8 @@ function makeExecDaemon(
   options?: {
     /** Processes still carrying the marker after the tree kill (a kill that did not take). */
     readonly survivorsAfterKill?: number;
+    /** The verification scan cannot complete (e.g. fork fails under the pid limit). */
+    readonly scanBroken?: boolean;
   }
 ): {
   readonly docker: unknown;
@@ -424,16 +426,18 @@ function makeExecDaemon(
           // verifies it is gone (or, if scripted, that some survived).
           markerScans.push(script);
           const found = markerScans.length % 2 === 1 ? 2 : (options?.survivorsAfterKill ?? 0);
+          const broken = options?.scanBroken === true;
           return Promise.resolve({
             start: () => {
               const stream = newStream();
               setImmediate(() => {
-                stream.push(`${found}\n`);
+                // A broken scan dies before its sentinel line, exit 2.
+                stream.push(broken ? "sh: fork: Resource temporarily unavailable\n" : `ok ${found}\n`);
                 stream.push(null);
               });
               return Promise.resolve(stream);
             },
-            inspect: () => Promise.resolve({ ExitCode: 0, Running: false, Pid: 0 }),
+            inspect: () => Promise.resolve({ ExitCode: broken ? 2 : 0, Running: false, Pid: 0 }),
           });
         }
         return Promise.resolve({
@@ -606,6 +610,43 @@ test("createSandbox: persistent sandboxes survive a daemon restart (restart poli
   };
   await createLocalDockerSandboxClientV1({ docker: fakeDocker as never }).createSandbox();
   assert.deepEqual(calls[0]?.HostConfig.RestartPolicy, { Name: "unless-stopped" });
+});
+
+test("exec capture: a verification scan that cannot complete proves nothing — it throws, never reads as 'none remain'", async () => {
+  // Final review: an unparseable scan used to count as 0 survivors — so the
+  // runaway-under-pid-limit case, where the scan itself cannot fork, was
+  // reported as proven stopped.
+  const daemon = makeExecDaemon(() => undefined, { scanBroken: true });
+  try {
+    const client = createLocalDockerSandboxClientV1({ docker: daemon.docker as never, commandTimeoutMs: 50 });
+    await assert.rejects(
+      client.runCommand({ sandboxId: SANDBOX_ID, argv: ["sleep", "infinity"], cwd: "/", attemptKey: "abc123abc123abc1" }),
+      DockerExecNotStoppedErrorV1
+    );
+  } finally {
+    daemon.restore();
+  }
+});
+
+test("createSandbox: a container that fails to start is removed, not left behind unrecorded; PID 1 reaps orphans", async () => {
+  const removed: string[] = [];
+  const created: Array<{ HostConfig: { Init?: boolean } }> = [];
+  const fakeDocker = {
+    createContainer: (opts: { HostConfig: { Init?: boolean } }) => {
+      created.push(opts);
+      return Promise.resolve({
+        id: SANDBOX_ID,
+        start: () => Promise.reject(new Error("OCI runtime create failed")),
+        remove: () => {
+          removed.push(SANDBOX_ID);
+          return Promise.resolve();
+        },
+      });
+    },
+  };
+  await assert.rejects(createLocalDockerSandboxClientV1({ docker: fakeDocker as never }).createSandbox(), /OCI runtime/);
+  assert.deepEqual(removed, [SANDBOX_ID]);
+  assert.equal(created[0]?.HostConfig.Init, true);
 });
 
 test("exec capture: a stop that cannot be PROVEN (marked processes survive) throws, never a terminal exit code", async () => {

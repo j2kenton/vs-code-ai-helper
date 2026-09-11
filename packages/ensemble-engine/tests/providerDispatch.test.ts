@@ -898,6 +898,20 @@ test("dispatch: a claude-cli PRIMARY and claude-cli BACKUP both really run (the 
   assert.deepEqual(cli.calls.map((call) => call.model), ["sonnet", "opus"]);
 });
 
+test("sticky route: a backup configured as 'claude-cli:' is recognized from its normalized record 'claude-cli:default'", () => {
+  // Recorded normalized, configured as typed: the raw `includes` check never
+  // matched, so routing fell back to the first — exhausted — backup.
+  const settings: ModelSettings = {
+    impl: {
+      primary: "anthropic:claude-sonnet-5",
+      backups: ["anthropic:claude-opus-5", "claude-cli:"],
+      strategy: "switch-to-backup",
+    },
+  };
+  const resolved = resolveEngineModelForStageV1(settings, "impl", { active: true, modelId: "claude-cli:default" });
+  assert.equal(resolved.modelId, "claude-cli:");
+});
+
 test("dispatch: an API primary's quota exhaustion can cascade INTO a claude-cli backup, which then becomes the sticky route", async () => {
   const anthropic = scriptedAdapter("anthropic", () => ({ kind: "quota" }));
   const cli = scriptedCliRunner(() => ({ kind: "completed", markdown: "# via the sandbox CLI\n" }));

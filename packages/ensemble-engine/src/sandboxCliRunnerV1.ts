@@ -200,6 +200,8 @@ export const SANDBOX_CLI_ROUND_FAILURE_CODES_V1 = {
   alreadyExecuted: "cliRoundAlreadyExecuted",
   indeterminate: "cliRoundIndeterminate",
   leaseUnavailable: "cliRoundLeaseUnavailable",
+  /** The command's fate could not be established (broken stream, unprovable stop). */
+  outcomeUnknown: "cliRoundOutcomeUnknown",
 } as const;
 
 const ENV_NAME_PATTERN_V1 = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -348,25 +350,36 @@ export function createSandboxCliProviderRunnerV1(
         // attempt id alone a `claude-cli:opus` backup found the failed
         // `claude-cli:sonnet` primary's attempt record and reported
         // "already executed" without ever running (review finding, 2026-09-11).
-        const effect = await machinery.runUngatedEffect(`cli-round/${id}/${selectedModel ?? "cli-default"}`, {
-          effectKind: "sandboxCommand",
-          supportsIdempotentReplay: false,
-          async execute(attemptKey: string) {
-            captured = await client.runCommand({
-              sandboxId,
-              argv: ["sh", "-c", script],
-              cwd: workingDirectoryRoot,
-              attemptKey,
-            });
-            return {
-              status: captured.exitCode === 0 ? ("succeeded" as const) : ("failed" as const),
-              code: `cliExit${captured.exitCode}`,
-            };
-          },
-          reconcile(attemptKey: string) {
-            return client.findCommandByAttemptKey(sandboxId, attemptKey);
-          },
-        });
+        let effect: Awaited<ReturnType<EngineGateMachineryV1["runUngatedEffect"]>>;
+        try {
+          effect = await machinery.runUngatedEffect(`cli-round/${id}/${selectedModel ?? "cli-default"}`, {
+            effectKind: "sandboxCommand",
+            supportsIdempotentReplay: false,
+            async execute(attemptKey: string) {
+              captured = await client.runCommand({
+                sandboxId,
+                argv: ["sh", "-c", script],
+                cwd: workingDirectoryRoot,
+                attemptKey,
+              });
+              return {
+                status: captured.exitCode === 0 ? ("succeeded" as const) : ("failed" as const),
+                code: `cliExit${captured.exitCode}`,
+              };
+            },
+            reconcile(attemptKey: string) {
+              return client.findCommandByAttemptKey(sandboxId, attemptKey);
+            },
+          });
+        } catch {
+          // The CLI's fate is UNKNOWN: the exec stream broke, or a stop could
+          // not be proven (the sandbox client throws for exactly that). The
+          // CLI may still be editing files. Terminal, never retryable: a
+          // retry runs under a fresh attempt id and would start a SECOND
+          // edit-mode CLI next to it (final review — the task loop used to
+          // turn this throw into a retryable providerInvocationFailed).
+          return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outcomeUnknown, false);
+        }
 
         switch (effect.kind) {
           case "alreadyExecuted":
@@ -387,8 +400,14 @@ export function createSandboxCliProviderRunnerV1(
           return failed(SANDBOX_CLI_ROUND_FAILURE_CODES_V1.outputUnavailable, false);
         }
 
-        const stderr = (await client.readFileUtf8(sandboxId, stderrPath)) ?? captured.stderrTail;
         if (captured.exitCode !== 0) {
+          // stderr only matters on failure (read nowhere else). The file is
+          // the CLI's own words; the captured tail can carry the SANDBOX
+          // CLIENT's note on top (e.g. Docker's "[ensemble] command stopped:
+          // timed out"), which the file alone lost.
+          const stderrFile = (await client.readFileUtf8(sandboxId, stderrPath)) ?? "";
+          const clientNote = captured.stderrTail.includes("[ensemble]") ? captured.stderrTail : "";
+          const stderr = [stderrFile, clientNote].filter((part) => part.length > 0).join("\n");
           // The command's stdout is REDIRECTED to the output file, so the
           // captured `stdoutTail` is empty by construction — the CLI's own
           // words about why it failed are in that file. Confirmed live: a
@@ -451,19 +470,15 @@ export function createSandboxCliProviderRunnerV1(
         if (envelope.kind === "cancelled") {
           return failed("cancelled", false);
         }
-        // The model reported a typed failure through the frame. Its `code`
-        // is model-written, so it never decides a cascade by itself (it used
-        // to: `code: "quotaExhausted"` alone spent a paid backup). Only its
-        // MESSAGE is classified — exactly the direct-API path's rule, which
-        // lets a provider report its own rate limiting through the frame.
-        const reported = classifyEngineProviderFailureV1({ errorMessage: envelope.message });
-        if (reported.failureKind === "generic") {
-          return failed(envelope.code, envelope.retryable);
-        }
-        return {
-          result: { kind: "failed", code: envelope.code, retryable: true },
-          classification: { failureKind: reported.failureKind, authFailure: false, errorMessage: envelope.message },
-        };
+        // The model reported a typed failure through the frame. Neither its
+        // code nor its message may decide a cascade: both are model-written,
+        // and the capacity classifier reads ordinary prose as quota ("the
+        // credits page tests fail", "the rate limit middleware is flaky" —
+        // final review, confirmed). For the CLI a real capacity failure never
+        // arrives as a frame at all (the CLI exits non-zero, classified
+        // above), so classifying the message could only ever misfire. It is
+        // the round's own verdict, reported as-is.
+        return failed(envelope.code, envelope.retryable);
       } finally {
         await cleanup(scratch);
       }

@@ -215,9 +215,19 @@ export function resolveEngineModelForStageV1(
     chain.strategy === "switch-to-backup" &&
     chain.backups.length > 0
   ) {
+    // The sticky route is RECORDED normalized (`claude-cli:default`) while
+    // backups are CONFIGURED as typed (`claude-cli:`); compare normalized, or
+    // a known-good backup is never recognized and routing falls back to the
+    // first — possibly exhausted — backup (final review).
     const active = fallbackState.modelId;
-    const modelId =
-      active !== undefined && chain.backups.includes(active) ? active : chain.backups[0];
+    const recorded =
+      active === undefined
+        ? undefined
+        : chain.backups.find(
+            (backup) =>
+              normalizeEngineQualifiedModelIdV1(backup) === normalizeEngineQualifiedModelIdV1(active)
+          );
+    const modelId = recorded ?? chain.backups[0];
     return modelId !== undefined ? { modelId, source } : { modelId: chain.primary, source };
   }
   return { modelId: chain.primary, source };

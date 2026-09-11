@@ -353,15 +353,33 @@ test("retries are bounded: a provider that keeps failing retryably still fails t
   assert.equal(runner.invocations.length, 3, "one attempt plus two retries");
 });
 
-test("an exhausted quota is not retried in place (an immediate re-run cannot fix it)", async () => {
+test("capacity and entitlement failures are not retried in place (an immediate re-run cannot fix them)", async () => {
+  for (const code of ["quotaExhausted", "temporarilyUnavailable", "modelEntitlementBlocked"]) {
+    const world = await makeHostWorld();
+    const runner = scriptedRunner(() => ({ kind: "failed", code, retryable: true }));
+    const host = world.makeHost(runner);
+    const task = { ...makeTaskRecord(`task-retry-${code}`, world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
+    world.store.createTask(task);
+
+    assert.deepEqual(await host.start(task), { kind: "failed", code }, code);
+    assert.equal(runner.invocations.length, 1, code);
+  }
+});
+
+test("a retryable failure on the stage's LAST budgeted round fails with its own code, not roundBudgetExhausted", async () => {
   const world = await makeHostWorld();
-  const runner = scriptedRunner(() => ({ kind: "failed", code: "quotaExhausted", retryable: true }));
-  const host = world.makeHost(runner);
-  const task = { ...makeTaskRecord("task-retry-3", world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
+  const runner = scriptedRunner(() => ({ kind: "failed", code: "malformedResult.invalidFrame", retryable: true }));
+  const host = createEngineRunHostV1({
+    store: world.store,
+    hub: world.hub,
+    providerRunnerFor: () => runner,
+    now: world.clock.now,
+    maxRoundsPerStage: 1,
+  });
+  const task = { ...makeTaskRecord("task-retry-budget", world.userId, world.clock.now().toISOString()), request: PLAN_OF_RECORD };
   world.store.createTask(task);
 
-  assert.deepEqual(await host.start(task), { kind: "failed", code: "quotaExhausted" });
-  assert.equal(runner.invocations.length, 1);
+  assert.deepEqual(await host.start(task), { kind: "failed", code: "malformedResult.invalidFrame" });
 });
 
 test("HTTP surface: task creation starts the hosted run; structured answers route into it", async () => {
