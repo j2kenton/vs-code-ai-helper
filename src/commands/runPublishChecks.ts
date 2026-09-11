@@ -27,6 +27,7 @@ import {
 import {
   acquireOrAdoptWorkAdmissionV1,
   beginTargetResolutionV1,
+  describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
@@ -232,6 +233,15 @@ export async function runPublishChecks(
   const targetResolutionHandle = await beginTargetResolutionV1(
     resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
   );
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return dispatched;
+  }
   const earlyFolderPath =
     extractSynchronousPublishChecksFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, resolverArg, currentTaskStore);

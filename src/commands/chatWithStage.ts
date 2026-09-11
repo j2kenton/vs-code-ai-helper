@@ -62,6 +62,7 @@ import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   beginTargetResolutionV1,
+  describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   revokeWorkAdmissionHandoffV1,
@@ -412,6 +413,15 @@ export async function chatWithStage(
   const targetResolutionHandle = wantsSend
     ? await beginTargetResolutionV1(taskRootCandidatePathsV1)
     : undefined;
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle && targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
   // 2026-09-10 round: `resolverArg?.taskFolderPath` is a raw, unvalidated
   // caller-supplied path — `validateChatSendV1`'s `resolveTaskContext` call
   // performs the real ownership/containment/workspace-binding validation,

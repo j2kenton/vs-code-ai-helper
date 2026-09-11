@@ -46,6 +46,7 @@ import {
   acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireOrAdoptWorkAdmissionV1,
   beginTargetResolutionV1,
+  describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
@@ -598,6 +599,15 @@ export async function draftTaskWithAI(
   //    (possibly bogus) path while the real target goes unprotected.
   const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
   const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
   // 2026-09-10 round: `earlyFolderPath` is a raw, unvalidated caller-supplied
   // path — `resolveTaskContext`'s `onResolvedCandidate` hook below performs
   // the real ownership/containment/workspace-binding validation, but this

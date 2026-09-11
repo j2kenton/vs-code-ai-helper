@@ -493,13 +493,13 @@ function normalizeForContainmentCompareV1(p: string): string {
  * watchdog trap this whole module exists to close, which is worse than the
  * narrower containment gap it aimed to close.
  *
- * This function exists to make that residual gap OBSERVABLE without
- * repeating the regressive gate: `acquireEarlyWorkAdmissionForCandidatePathV1`
- * calls this (fail-open when `rootCandidatePaths` is empty — i.e. workspace
- * roots are not yet known, exactly the case the earlier revert was fighting)
- * and logs rather than refuses, so a genuinely out-of-root candidate is now
- * diagnosable in the run log instead of silently indistinguishable from a
- * legitimate one.
+ * This function exists to let `acquireEarlyWorkAdmissionForCandidatePathV1`
+ * tell apart two cases the earlier revert could not: "containment is not yet
+ * knowable" (fail-open, `rootCandidatePaths` empty — exactly the case the
+ * earlier revert was fighting, where gating would have silently skipped
+ * protection for a legitimate candidate) from "containment IS knowable and
+ * says no" (refuse — see that caller's own doc comment for why refusing here
+ * is safe rather than regressive).
  */
 export function isPathOutsideAllTaskRootsV1(
   candidatePath: string,
@@ -524,6 +524,24 @@ export function isPathOutsideAllTaskRootsV1(
  * caller never creates admission bookkeeping beneath an arbitrary,
  * unvalidated path. See `looksLikeTaskFolderPathV1`'s doc comment for what
  * this does and does not guarantee.
+ *
+ * 2026-09-11 review architectural blocker (`d620c877...-1`, fixed): when
+ * `taskRootCandidatePaths` is non-empty (containment IS knowable — the
+ * earlier revert's concern was specifically about gating when it is NOT),
+ * and the candidate is positively outside every one of them, this now skips
+ * early acquisition entirely — same as "doesn't look like a task folder" —
+ * instead of creating `admission-v1/` bookkeeping there anyway. This is safe
+ * rather than a repeat of the reverted gate: a skipped early acquisition
+ * degrades to exactly the already-supported, already-tested "no early guess
+ * available" path every caller here already handles (no `handoffToken`
+ * adoption, no early marker, relying on `beginTargetResolutionV1`'s
+ * same-process/cross-window stand-down for the rest of the resolution
+ * window, then the real per-task admission once `resolveTaskContext`
+ * authoritatively resolves the target) — never an unprotected window, and
+ * never a false refusal of the command itself (only of the proactive early
+ * OPTIMIZATION for a guess already known to be wrong). A candidate this
+ * check cannot evaluate (`taskRootCandidatePaths` empty or omitted) is
+ * unaffected and still always acquires, exactly as before.
  */
 export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
   readonly candidatePath: string | undefined;
@@ -561,10 +579,11 @@ export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
     console.warn(
       `acquireEarlyWorkAdmissionForCandidatePathV1: candidate "${params.candidatePath}" (command ` +
         `"${params.commandId}") looks like a task folder but is outside every currently known task root ` +
-        `(${params.taskRootCandidatePaths.join(", ")}) — early admission still proceeds (never leaving setup ` +
-        "unprotected), but this is worth investigating: a stale/cross-project argument, or a task root that " +
-        "changed since this path was captured. Authoritative resolution below is unaffected."
+        `(${params.taskRootCandidatePaths.join(", ")}) — skipping early admission for it (authoritative ` +
+        "resolution below is unaffected and still protected via beginTargetResolutionV1); this is worth " +
+        "investigating: a stale/cross-project argument, or a task root that changed since this path was captured."
     );
+    return undefined;
   }
   return acquireOrAdoptWorkAdmissionV1({
     taskFolderPath: params.candidatePath,
@@ -836,6 +855,23 @@ const RESOLUTION_MARKER_SYNC_RETRY_ATTEMPTS_V1 = 4;
  * roots picked up after the initial synchronous return. */
 export interface TargetResolutionHandleV1 {
   readonly rootPaths: readonly string[];
+  /**
+   * Task roots still unprotected by a durable marker when this call returned
+   * BECAUSE the most recent attempt for that root hit a real filesystem write
+   * error — never because the root was merely `busy` (ordinary, expected
+   * cross-window contention, which the plan's own 1a risk note explicitly
+   * accepts degrading to same-process protection for). 2026-09-11 review
+   * completion blocker (`b5a1f851...-0`, narrowed further): the prior
+   * `console.warn`/`console.error`-only surfacing made a real write error
+   * observable only to someone reading logs, never to the caller itself, so
+   * nothing could act on "requires real write errors to fail dispatch before
+   * setup" (the review's own quote of the plan's per-task-admission
+   * contract). Callers that want to fail their OWN dispatch on a genuine
+   * write error (as every per-task `acquireWorkAdmissionV1` caller already
+   * does) now can, by checking this field; callers that don't check it keep
+   * today's fail-open behavior unchanged — this is purely additive.
+   */
+  readonly writeFailedRootPaths: readonly string[];
   /** @internal stops the background retry loop; called by
    * `endTargetResolutionV1` before it reads `rootPaths` for release. */
   readonly stopRetryingV1: () => void;
@@ -858,8 +894,14 @@ export interface TargetResolutionHandleV1 {
  * resolution window remains open (see `durableResolutionMarkersV1`'s doc
  * comment) — this cross-window signal is defense-in-depth layered on the
  * durable `resolutionInFlightCountV1` bump above, which always happens
- * synchronously regardless of what happens here, and none of this may ever
- * block or fail the caller's own resolution.
+ * synchronously regardless of what happens here; this call itself never
+ * blocks (beyond its bounded synchronous retry window) or throws. A genuine,
+ * still-unresolved write error IS surfaced to the caller via the returned
+ * handle's `writeFailedRootPaths` (2026-09-11, review completion blocker
+ * `b5a1f851...-0`), so a caller that wants to fail its own dispatch before
+ * setup on a real filesystem error — as every per-task `acquireWorkAdmissionV1`
+ * caller already does — can; a caller that does not check it keeps the prior
+ * fully fail-open behavior.
  */
 export async function beginTargetResolutionV1(
   taskRootPaths: readonly string[] = []
@@ -890,6 +932,12 @@ export async function beginTargetResolutionV1(
   // log; this stays a diagnostic only — it still never blocks or fails this
   // call, consistent with the plan's 1a risk note.
   const loggedWriteFailureRootsV1 = new Set<string>();
+  // Retains the actual Error for the MOST RECENT write failure per root
+  // (cleared the moment that root's acquisition later succeeds), so the
+  // returned handle can tell a caller exactly which still-pending roots are
+  // stuck behind a real filesystem error rather than ordinary `busy`
+  // contention — see `TargetResolutionHandleV1.writeFailedRootPaths`.
+  const lastWriteFailureByRootV1 = new Map<string, Error>();
 
   const tryAcquireRootV1 = async (rootPath: string): Promise<void> => {
     if (stopped || acquiredRoots.includes(rootPath) || inFlightRoots.has(rootPath)) {
@@ -901,6 +949,7 @@ export async function beginTargetResolutionV1(
       pendingRoots.delete(rootPath);
       acquiredRoots.push(rootPath);
       loggedWriteFailureRootsV1.delete(rootPath);
+      lastWriteFailureByRootV1.delete(rootPath);
       return;
     }
     inFlightRoots.add(rootPath);
@@ -924,14 +973,25 @@ export async function beginTargetResolutionV1(
         pendingRoots.delete(rootPath);
         acquiredRoots.push(rootPath);
         loggedWriteFailureRootsV1.delete(rootPath);
-      } else if (result.outcome === "writeFailed" && !loggedWriteFailureRootsV1.has(rootPath)) {
-        loggedWriteFailureRootsV1.add(rootPath);
-        console.error(
-          `beginTargetResolutionV1: durable admission marker write failed for root "${rootPath}" — ` +
-            "this window's target resolution proceeds unprotected against a concurrent window's sweep " +
-            "for as long as this persists; retrying in the background.",
-          result.error
-        );
+        lastWriteFailureByRootV1.delete(rootPath);
+      } else if (result.outcome === "writeFailed") {
+        lastWriteFailureByRootV1.set(rootPath, result.error);
+        if (!loggedWriteFailureRootsV1.has(rootPath)) {
+          loggedWriteFailureRootsV1.add(rootPath);
+          console.error(
+            `beginTargetResolutionV1: durable admission marker write failed for root "${rootPath}" — ` +
+              "this window's target resolution proceeds unprotected against a concurrent window's sweep " +
+              "for as long as this persists; retrying in the background.",
+            result.error
+          );
+        }
+      } else {
+        // busy: a real, expected owner exists — never a write error. Clear
+        // any PRIOR write failure recorded for this root so a root that
+        // recovers from a transient write error into ordinary contention is
+        // no longer reported as write-failed to `writeFailedRootPaths`
+        // (see that field's doc comment: busy must never surface there).
+        lastWriteFailureByRootV1.delete(rootPath);
       }
       // busy: left in `pendingRoots`, retried on the next tick.
     } catch (error) {
@@ -940,6 +1000,7 @@ export async function beginTargetResolutionV1(
       // write failure, still left in `pendingRoots` and retried (the failure
       // may be transient, e.g. a momentarily locked filesystem), but logged
       // for the same reason as the typed case above.
+      lastWriteFailureByRootV1.set(rootPath, error as Error);
       if (!loggedWriteFailureRootsV1.has(rootPath)) {
         loggedWriteFailureRootsV1.add(rootPath);
         console.error(
@@ -1012,8 +1073,20 @@ export async function beginTargetResolutionV1(
     }, RESOLUTION_MARKER_RETRY_INTERVAL_MS_V1);
   }
 
+  // Snapshot at return time — every current caller checks this field
+  // immediately after the awaited call settles, before setup, exactly where
+  // the plan's per-task-admission contract requires a real write error to
+  // fail dispatch (`TargetResolutionHandleV1.writeFailedRootPaths`'s doc
+  // comment). A root that later flips between write-failed and busy via the
+  // background retry timer is intentionally not reflected here after the
+  // fact — unlike `rootPaths`, which callers only ever consult via
+  // `endTargetResolutionV1`'s release bookkeeping, never to decide whether
+  // to proceed.
+  const writeFailedRootPaths = Array.from(pendingRoots).filter((rootPath) => lastWriteFailureByRootV1.has(rootPath));
+
   return {
     rootPaths: acquiredRoots,
+    writeFailedRootPaths,
     stopRetryingV1: (): void => {
       stopped = true;
       if (retryTimer) {
@@ -1058,6 +1131,20 @@ export async function endTargetResolutionV1(handle?: TargetResolutionHandleV1): 
       }
     }
   }
+}
+
+/**
+ * User-facing message for a `beginTargetResolutionV1` call that returned one
+ * or more `writeFailedRootPaths` — mirrors `describeWorkAdmissionRefusalV1`'s
+ * `writeFailed` branch so a real filesystem error surfaces the same way
+ * whether it happened at per-task admission or at root-level target
+ * resolution. Callers should show this and abort dispatch (after releasing
+ * the handle via `endTargetResolutionV1`) rather than proceed into setup —
+ * see `TargetResolutionHandleV1.writeFailedRootPaths`'s doc comment.
+ */
+export function describeTargetResolutionWriteFailureV1(handle: TargetResolutionHandleV1): string {
+  const [firstRoot] = handle.writeFailedRootPaths;
+  return `Could not start this stage action: failed to write task-admission bookkeeping for "${firstRoot}".`;
 }
 
 /** True while ANY same-process command is between `beginTargetResolutionV1()`
@@ -1524,32 +1611,41 @@ async function acquireWorkAdmissionCoreV1(
   const dir = admissionDirV1(taskFolderPath);
 
   // Part 1b step 12 ("Require every later claimant to complete the barrier
-  // ... before publishing admission or starting another pause"): advance the
-  // durable pause-fence generation past any pending revocation barrier for
+  // ... before publishing admission or starting another pause"): fully
+  // complete (fence-advance AND remove) any pending revocation barrier for
   // this task BEFORE this acquisition can publish a new admission marker or
-  // start a new `pauseCommit` claim. This is the fence-advance half of
-  // finishing a barrier (`finishPauseRevocationBarrierV1`'s doc comment) —
-  // deliberately NOT the removal half, which requires the corresponding
-  // stale-watchdog-pause cleanup in `task-progress.json` this VS-Code-API-free
-  // module has no access to (module doc comment). Advancing without removing
-  // is safe and sufficient here: it is idempotent/harmless to repeat (a
-  // pending barrier may see several acquisitions each advance the fence
-  // further — the only invariant that matters, "the fence is past the
-  // revoked claim's original generation," only strengthens), and it leaves
-  // the barrier file in place as the durable signal that its
-  // task-progress.json cleanup is still owed — the centralized
-  // effective-pause-status resolver (plan step 13, not yet built) or the
-  // manual escape path removes it once that cleanup actually runs. Best
-  // effort: a failure here must never block or fail this acquisition, the
-  // same fail-open direction every other diagnostic-only check in this
-  // module takes.
+  // start a new `pauseCommit` claim, via `finishPauseRevocationBarrierV1`
+  // (exclusive per barrier — see that function's doc comment).
+  //
+  // 2026-09-11 review completion blocker (fixed): this used to call only
+  // `advancePauseFenceForRevocationV1` and never remove the barrier, on the
+  // theory that removal must wait for a task-progress.json cleanup this
+  // VS-Code-API-free module cannot perform. That left every still-pending
+  // barrier being re-"helped" — and the fence re-advanced — by EVERY
+  // subsequent acquisition for the task, forever. Advancing is NOT harmless
+  // to repeat once other acquisitions are involved: a brand-new, legitimate
+  // `pauseCommit` can capture the fence generation this acquisition's advance
+  // just published, and the NEXT unrelated acquisition's repeat-advance (for
+  // the same still-present barrier) then invalidates that fresh, real pause.
+  // The fence only needs to move past the revoked claim's original
+  // generation ONCE; leaving the barrier around afterward only manufactures
+  // more chances to advance again. Removing it here — once the fence has
+  // durably advanced past it — does not skip any correctness-relevant
+  // cleanup: every pause-sensitive consumer's correctness depends on the
+  // fence generation (once the effective-pause-status resolver is wired,
+  // plan step 13, still open), never on the barrier FILE's continued
+  // presence; the file was always only a "someone still owes an advance"
+  // reminder, not a correctness requirement in itself. Best effort: a
+  // failure here must never block or fail this acquisition, the same
+  // fail-open direction every other diagnostic-only check in this module
+  // takes.
   try {
     for (const barrierPath of listPendingPauseRevocationBarriersV1(taskFolderPath)) {
       try {
-        await advancePauseFenceForRevocationV1(taskFolderPath);
+        await finishPauseRevocationBarrierV1(taskFolderPath, barrierPath);
       } catch (error) {
         console.error(
-          `acquireWorkAdmissionCoreV1: failed to advance the pause fence for pending revocation barrier ` +
+          `acquireWorkAdmissionCoreV1: failed to finish pending revocation barrier ` +
             `"${barrierPath}" — proceeding with acquisition regardless.`,
           error
         );
@@ -2354,22 +2450,28 @@ export async function isWatchdogPauseFenceCurrentV1(
  * claimant must notice and complete (`listPendingPauseRevocationBarriersV1` +
  * `finishPauseRevocationBarrierV1`) before publishing its own admission or
  * starting another pause, exactly like `pause-fence.g<N>`'s own
- * existence-alone-publishes-a-generation design. Splitting revoke (rename)
- * from finish (fence advance + barrier removal) into two separately callable,
- * idempotent steps is what lets ANY later actor — the original revoker,
- * moments later, or a completely different actor that merely finds the
- * barrier still present — complete it without needing to know which case it
- * is in: calling `finishPauseRevocationBarrierV1` again after the fence has
- * already been advanced just advances it one generation further, which is
- * harmless (the only invariant that matters, "the fence is past the revoked
- * claim's original generation," remains true no matter how many times this
- * runs).
+ * existence-alone-publishes-a-generation design. Every acquisition
+ * (`acquireWorkAdmissionCoreV1`) does exactly this before publishing its own
+ * claim or marker, so a barrier is completed no later than the next
+ * admission/pauseCommit attempt for the task — the original revoker, moments
+ * later, or a completely unrelated actor that merely finds the barrier still
+ * present may all complete it. Completion is exclusive per barrier
+ * (`finishPauseRevocationBarrierV1`'s doc comment): at most one caller ever
+ * advances the fence for a given still-present barrier, no matter how many
+ * race to finish it, so a duplicate/late/concurrent finish call is always a
+ * true no-op rather than a further advance.
  *
  * What this does NOT do: clean up the corresponding stale watchdog pause
- * inside `task-progress.json`. This module has no dependency on that format
- * or the VS Code API (module doc comment) — that cleanup, and wiring this
- * barrier into a real acquisition/pause-commit flow, is the centralized
- * effective-pause-status resolver's job (plan step 13, not built this round).
+ * FIELDS inside `task-progress.json` (clearing `status`/`pausedReason` so a
+ * consumer reading those raw fields directly, rather than through the
+ * resolver, also stops seeing the task as paused). This module has no
+ * dependency on that format or the VS Code API (module doc comment) — that
+ * field cleanup, and auditing every pause-sensitive reader to go through the
+ * centralized effective-pause-status resolver instead of raw fields, is plan
+ * step 13, not built this round. It is not required for CORRECTNESS of the
+ * fence-generation check itself (`resolveEffectivePauseStatusV1` only reads
+ * the durable fence, never the barrier file), only for hygiene of readers
+ * that still consult `task-progress.json` directly.
  */
 const PAUSE_REVOCATION_PENDING_PREFIX_V1 = "pause-revocation.pending.";
 
@@ -2535,31 +2637,101 @@ export async function removePauseRevocationBarrierV1(barrierPath: string): Promi
  * fence-advance-then-cleanup ordering plan step 12 requires is violated (this
  * function's own two calls happen back-to-back with no seam for it).
  *
- * 2026-09-11 review completion blocker (new, fixed): a call for a barrier
- * that some OTHER actor (or an earlier call by this same caller) has already
+ * 2026-09-11 review completion blocker (fixed): a call for a barrier that
+ * some OTHER actor (or an earlier call by this same caller) has already
  * finished — the barrier file no longer exists — used to still advance the
  * fence one generation further before discovering the removal was a no-op.
  * That is unsound, not merely wasteful: the fence has no memory of WHICH
  * barrier it was last advanced for, so a duplicate/delayed finish landing
  * after a brand-new, legitimate `pauseCommit` has already captured the
  * generation this barrier's completion published would silently invalidate
- * that unrelated, current pause. Completion must first win ownership of the
- * barrier that still exists — established here by checking its presence
- * before touching the fence — and be a true no-op once it is gone, exactly
- * like `removePauseRevocationBarrierV1`'s own ENOENT tolerance. A benign
- * TOCTOU remains (the barrier could vanish between this check and the
- * fence advance below), but that only means two genuinely concurrent
- * finishers of the SAME still-present barrier both advance the fence —
- * harmless, per this section's doc comment — never a finish that outlives
- * its own barrier.
+ * that unrelated, current pause.
+ *
+ * 2026-09-11 review completion blocker, round 2 (fixed): an `existsSync`
+ * presence check alone is NOT exclusive ownership — it only closes the
+ * already-fixed case above (a call arriving after completion). Two calls
+ * that both observe the barrier PRESENT at the same time (a genuinely
+ * concurrent race, not a delayed straggler) would previously both pass the
+ * check, both advance the fence, and both remove the file — a real
+ * double-advance, not a harmless repeat: if a brand-new legitimate
+ * `pauseCommit` captures the generation the FIRST advance published in the
+ * gap before the SECOND advance runs, that second advance invalidates the
+ * new pause exactly as the already-fixed case above does. "Two concurrent
+ * finishers of the same barrier both advancing the fence is harmless"
+ * (the section doc comment's original claim) is true only when nothing else
+ * can observe the fence in between the two advances — false in production,
+ * where a fresh `pauseCommit` acquisition can land in that window.
+ *
+ * The first attempted fix used an atomic RENAME of `barrierPath` to a fixed
+ * derived name as the exclusivity gate (mirroring
+ * `revokeStalePauseCommitClaimV1`'s own marker-claiming rename). A
+ * deterministic concurrency test on this exact platform disproved it: two
+ * truly concurrent `fs.promises.rename` calls racing the SAME source path
+ * both resolved successfully rather than one failing with ENOENT — measured
+ * as a real double fence-advance (`2 !== 1`), not merely theorized. Node's
+ * `rename` is not a safe MUTUAL-EXCLUSION primitive here; only this module's
+ * own EXCLUSIVE-CREATE primitive (`{ flag: "wx" }`, already load-bearing for
+ * `admission.claim` and every `pause-fence.g<N>` generation file) has an
+ * atomicity guarantee this module actually depends on elsewhere and has
+ * verified. The fix: gate finishing behind an exclusive-create lock file
+ * fixed name derived from `barrierPath`. `EEXIST` means another caller
+ * already owns finishing this exact barrier right now — treated as "not my
+ * job," never as a failure, exactly like every other claim contention in
+ * this module. Only the winner ever calls `advancePauseFenceForRevocationV1`,
+ * so at most one advance happens per still-present barrier no matter how
+ * many callers race to finish it.
+ *
+ * Known interim gap (consistent with this module's general stance: automatic
+ * reclamation of a stale claim is not this round's job — see the module's
+ * own step-2 interim policy for `admission.claim`/`pauseCommit`): if a
+ * caller crashes strictly between winning this lock and its own `finally`
+ * cleanup, the lock file is never removed, and the barrier can never be
+ * finished (fence never advances for it) until something manually clears the
+ * lock file. This is a narrower instance of the exact same accepted
+ * crash-window exposure every other claim in this module already carries —
+ * not a new class of risk — and, like those, is bounded to a short claim-to-
+ * completion window (advance-then-unlink, no awaited work in between other
+ * than those two fast filesystem calls).
  */
+const PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1 = ".finish-lock";
+
 export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
-  if (!fs.existsSync(barrierPath)) {
-    // Already finished by someone else (or by an earlier call from this same
-    // caller) — nothing left to do, and critically, nothing left to advance
-    // the fence FOR.
-    return;
+  const lockPath = `${barrierPath}${PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1}`;
+  try {
+    await fs.promises.writeFile(lockPath, "", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // Another caller already owns finishing this exact barrier right now
+      // (or a crashed prior attempt left its lock behind — see the doc
+      // comment's known interim gap). Either way, not this call's job.
+      return;
+    }
+    throw error;
   }
-  await advancePauseFenceForRevocationV1(taskFolderPath);
-  await removePauseRevocationBarrierV1(barrierPath);
+  try {
+    if (!fs.existsSync(barrierPath)) {
+      // Already finished by someone else (or by an earlier call from this
+      // same caller) before we won the lock — nothing left to advance the
+      // fence FOR.
+      return;
+    }
+    await advancePauseFenceForRevocationV1(taskFolderPath);
+    await removePauseRevocationBarrierV1(barrierPath);
+  } finally {
+    // A failure to unlink our own lock (other than ENOENT, already gone)
+    // must never mask whatever the `try` block above just did or threw —
+    // throwing here would violate that (`no-unsafe-finally`) and could
+    // silently swallow a real advance/removal error. Log and move on: the
+    // fence-advance and barrier-removal above, if they ran, already
+    // succeeded or already threw their own error; a lingering lock file is
+    // the documented, bounded interim gap above, not a new failure to
+    // surface here.
+    try {
+      await fs.promises.unlink(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`finishPauseRevocationBarrierV1: failed to remove finish-lock "${lockPath}"`, error);
+      }
+    }
+  }
 }

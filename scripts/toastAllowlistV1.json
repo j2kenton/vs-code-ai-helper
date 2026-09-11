@@ -5,18 +5,18 @@
   "entries": [
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 332,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision."
+      "line": 333,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision. (Line moved 332 -> 333 as the 2026-09-11 target-resolution write-failure fix added an import above it; call is unchanged.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 1793,
-      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round."
+      "line": 1794,
+      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794, see commitAndPushTask.ts:333's note.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 2187,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push."
+      "line": 2188,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push. (Line moved 2187 -> 2188, see commitAndPushTask.ts:333's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
@@ -73,13 +73,13 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 667,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 as admission-registration edits landed on this route; call is unchanged.)"
+      "line": 677,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 as admission-registration edits landed on this route; call is unchanged.)"
     },
     {
       "file": "src/commands/draftTaskWithAI.ts",
-      "line": 417,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved 384 → 385 → 386 → 385 → 417 as admission-registration edits landed on this route; call is unchanged.)"
+      "line": 418,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved 384 → 385 → 386 → 385 → 417 → 418 as admission-registration edits landed on this route; call is unchanged.)"
     },
     {
       "file": "src/commands/generatePlanWithAI.ts",

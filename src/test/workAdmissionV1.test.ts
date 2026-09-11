@@ -85,7 +85,7 @@ void test("isPathOutsideAllTaskRootsV1 does not false-positive on a root name th
   assert.equal(isPathOutsideAllTaskRootsV1(lookalike, [root]), true);
 });
 
-void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission for an out-of-root candidate, only logging a diagnostic (never refuses/skips protection)", async () => {
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 skips early admission for a candidate positively known to be outside every task root, logging a diagnostic (2026-09-11 review architectural blocker d620c877...-1, fixed)", async () => {
   const root = freshTaskFolder("early-admission-containment-root");
   const outOfRootTask = freshTaskFolder("early-admission-containment-outside");
   fs.writeFileSync(path.join(outOfRootTask, "task.md"), "# Test task\n");
@@ -101,16 +101,40 @@ void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission 
       commandId: "test-command",
       taskRootCandidatePaths: [root],
     });
-    assert.equal(result?.outcome, "acquired", "admission must still be granted — never skipped for an unverified/out-of-root path");
+    assert.equal(
+      result,
+      undefined,
+      "early admission must be skipped (never create admission-v1/ bookkeeping) for a candidate known to be outside every current task root"
+    );
     assert.ok(
       warnings.some((args) => String(args[0]).includes("outside every currently known task root")),
       "the containment gap must be logged for investigation"
     );
-    if (result?.outcome === "acquired") {
-      await result.handle.release();
-    }
+    assert.equal(
+      fs.existsSync(path.join(outOfRootTask, ADMISSION_DIRNAME_V1)),
+      false,
+      "no admission bookkeeping must be created beneath the out-of-root candidate"
+    );
   } finally {
     console.warn = realWarn;
+  }
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission for an out-of-root candidate when containment is not knowable (no taskRootCandidatePaths) — fail-open is preserved", async () => {
+  const outOfRootTask = freshTaskFolder("early-admission-containment-unknowable");
+  fs.writeFileSync(path.join(outOfRootTask, "task.md"), "# Test task\n");
+  const result = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: outOfRootTask,
+    purpose: "admission",
+    commandId: "test-command",
+  });
+  assert.equal(
+    result?.outcome,
+    "acquired",
+    "admission must still be granted when containment cannot be evaluated — never skipped just because no root list was passed"
+  );
+  if (result?.outcome === "acquired") {
+    await result.handle.release();
   }
 });
 
@@ -2151,6 +2175,48 @@ void test("finishPauseRevocationBarrierV1 never advances the fence for a barrier
   }
 });
 
+void test("finishPauseRevocationBarrierV1 is exclusive under genuine concurrency: two simultaneous finishers of the same still-present barrier advance the fence exactly once, never invalidating a pause that lands in between (2026-09-11 review completion blocker, round 2)", async () => {
+  const task = freshTaskFolder("finish-barrier-concurrent-exclusive");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-concurrent");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  // Two genuinely concurrent finishers race for the SAME still-present
+  // barrier — the case an `existsSync`-only guard cannot distinguish from
+  // two independent, sequential completions. Only one may ever win the
+  // exclusive rename and perform the advance.
+  await Promise.all([
+    finishPauseRevocationBarrierV1(task, revoked.barrierPath),
+    finishPauseRevocationBarrierV1(task, revoked.barrierPath),
+  ]);
+
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceBefore + 1,
+    "concurrent finishers of the same barrier must advance the fence exactly once, not twice"
+  );
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0, "the barrier must be fully removed exactly once");
+
+  // A brand-new, legitimate pauseCommit that captured the post-revocation
+  // generation right after the winning finisher's advance must survive —
+  // proving the losing finisher's no-op never invalidates it.
+  const freshPause = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep-3" });
+  assert.equal(freshPause.outcome, "acquired");
+  if (freshPause.outcome === "acquired") {
+    assert.equal(
+      await isWatchdogPauseFenceCurrentV1(task, fenceBefore + 1),
+      true,
+      "the fresh pause's captured generation must still be current — no phantom second advance behind it"
+    );
+    await freshPause.handle.release();
+  }
+});
+
 void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 give a caller a seam to run cleanup between fence-advance and barrier-removal", async () => {
   const task = freshTaskFolder("revocation-two-step-seam");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
@@ -2195,7 +2261,7 @@ void test("removePauseRevocationBarrierV1 tolerates an already-removed barrier (
   await assert.doesNotReject(() => removePauseRevocationBarrierV1(revoked.barrierPath));
 });
 
-void test("a new acquisition automatically advances the fence past a pending revocation barrier, without removing it (Part 1b step 12 wiring)", async () => {
+void test("a new acquisition automatically finishes a pending revocation barrier — advances the fence AND removes it (Part 1b step 12 wiring)", async () => {
   const task = freshTaskFolder("acquire-advances-pending-barrier");
   const stale = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
   assert.equal(stale.outcome, "acquired");
@@ -2209,9 +2275,13 @@ void test("a new acquisition automatically advances the fence past a pending rev
 
   // A completely unrelated later acquisition — neither the revoker nor an
   // explicit `finishPauseRevocationBarrierV1` caller — must still see the
-  // fence advanced as a side effect of it starting, per plan step 12: "every
-  // later claimant must complete the barrier ... before publishing admission
-  // or starting another pause."
+  // barrier fully COMPLETED as a side effect of it starting, per plan step
+  // 12: "every later claimant must complete the barrier ... before
+  // publishing admission or starting another pause." Completing means both
+  // halves (advance + remove) — see the acquisition-loop doc comment for why
+  // leaving the barrier behind (the previous, buggy behavior this test used
+  // to assert) lets every SUBSEQUENT acquisition re-advance the fence and
+  // invalidate a later legitimate pause.
   const next = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "real-work" });
   assert.equal(next.outcome, "acquired");
   if (next.outcome !== "acquired") return;
@@ -2221,14 +2291,10 @@ void test("a new acquisition automatically advances the fence past a pending rev
     fenceBeforeNewAcquisition + 1,
     "the new acquisition must advance the fence past the pending barrier's generation before publishing"
   );
-  // The fence-advance half is automatic; the barrier itself is NOT removed by
-  // mere acquisition — removal still requires the owning caller's
-  // task-progress.json cleanup to have run first (this module cannot perform
-  // that cleanup itself; see `finishPauseRevocationBarrierV1`'s doc comment).
   assert.equal(
     listPendingPauseRevocationBarriersV1(task).length,
-    1,
-    "acquisition advances the fence but must not remove the barrier itself"
+    0,
+    "acquisition must fully finish (advance AND remove) the barrier, not merely advance and leave it dangling"
   );
 
   await next.handle.release();
