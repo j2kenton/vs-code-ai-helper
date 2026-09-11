@@ -219,6 +219,25 @@ test("a decision replay for an already-resumed gate is a no-op: nothing re-execu
   assert.equal(ledger.executions.length, 1);
 });
 
+test("a gate is only resumable through its OWN task's machinery, even for the same owner", async () => {
+  // Attempt history is read under the machinery's task, so resuming task
+  // A's gate through task B's machinery would miss A's records and could
+  // execute the effect a second time (review, 2026-09-11).
+  const machineryA = machineryWith({ taskId: "task-a" });
+  const machineryB = machineryWith({ taskId: "task-b", shared: machineryA });
+  const ledger = createEffectLedger({ platformIdempotent: false, reconcilable: true });
+  const gate = await machineryA.openGate({ summary: "step" });
+  await machineryA.decide({ gateId: gate.gateId, decision: "approve", idempotencyKey: allocateHex128IdV1() });
+
+  const crossTask = await machineryB.resumeApproved(gate.gateId, ledger.effect);
+  assert.equal(crossTask.kind, "gateNotFound");
+  assert.equal(ledger.executions.length, 0);
+
+  const own = await machineryA.resumeApproved(gate.gateId, ledger.effect);
+  assert.equal(own.kind, "executed");
+  assert.equal(ledger.executions.length, 1);
+});
+
 test("a rejected gate never executes and consumes exactly once", async () => {
   const machinery = machineryWith();
   const ledger = createEffectLedger({ platformIdempotent: false });

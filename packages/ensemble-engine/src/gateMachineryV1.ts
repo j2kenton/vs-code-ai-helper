@@ -393,7 +393,11 @@ export function createEngineGateMachineryV1(
     effect: EngineExternalEffectV1
   ): Promise<EngineGateResumeResultV1> {
     const gate = await gateStore.read(gateId);
-    if (gate === undefined || gate.ownerId !== ownerId) {
+    // The attempt history below is read under THIS machinery's task, so a
+    // gate of another task (even one the same owner holds) would be
+    // recovered against the wrong records and could execute twice. No
+    // caller does that today; this keeps it impossible (review, 2026-09-11).
+    if (gate === undefined || gate.ownerId !== ownerId || gate.taskId !== taskId) {
       return { kind: "gateNotFound" };
     }
     if (gate.state === "pending") {
