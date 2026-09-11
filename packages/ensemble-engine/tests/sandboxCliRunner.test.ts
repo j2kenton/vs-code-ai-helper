@@ -213,6 +213,63 @@ test("output without the result frame is a retryable malformed-result failure, n
   });
 });
 
+test("an unframed reply that merely MENTIONS logging in is the model's malformed output, not an expired credential", async () => {
+  // The signed-out detection must match the CLI's own short refusal only: a
+  // model working on login code and forgetting the frame used to be
+  // indistinguishable from "Not logged in" and failed the task as auth.
+  const client = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({
+      frame: () =>
+        "I refactored the login form and the session refresh. Users who are not logged in are now redirected " +
+        "to /login, and the OAuth callback validates the state parameter. ".repeat(4),
+    }),
+  });
+  assert.deepEqual(await makeRunner(client).invoke(invocation("impl")), {
+    kind: "failed",
+    code: "malformedResult.invalidFrame",
+    retryable: true,
+  });
+});
+
+test("transport classification: exit failures and the signed-out refusal are classified; a model-reported failure is classified by its MESSAGE only", async () => {
+  const quota = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({ exitCode: 1, stderr: "API Error: 429 usage limit reached for this account" }),
+  });
+  const quotaOutcome = await makeRunner(quota).invokeWithModel(invocation("impl"), "sonnet");
+  assert.equal(quotaOutcome.classification?.failureKind, "quota");
+  assert.equal(quotaOutcome.classification?.authFailure, false);
+
+  // A framed `failed` reply that CLAIMS quota in its code, with an unrelated
+  // message: the code is model-written, so no classification is attached
+  // and dispatch cannot cascade on it.
+  const forged = createInMemorySandboxClientV1({
+    onCommand: scriptedCli({
+      frame: (correlation) =>
+        `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation,
+          kind: "failed",
+          code: "quotaExhausted",
+          message: "I could not find the file you mentioned.",
+          retryable: true,
+        })}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`,
+    }),
+  });
+  const forgedOutcome = await makeRunner(forged).invokeWithModel(invocation("impl"), "sonnet");
+  assert.deepEqual(forgedOutcome.result, { kind: "failed", code: "quotaExhausted", retryable: true });
+  assert.equal(forgedOutcome.classification, undefined);
+});
+
+test("cascade candidates get their own crash-safe step: a second model on the same invocation really runs", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  const runner = makeRunner(client);
+  const shared = invocation("impl");
+  assert.equal((await runner.invokeWithModel(shared, "sonnet")).result.kind, "completed");
+  // Same invocation (same attempt id), different candidate — as dispatch hands it to a backup.
+  assert.equal((await runner.invokeWithModel(shared, "opus")).result.kind, "completed");
+  assert.equal(client.executedCommands.length, 2, "the backup must not be reported as already executed");
+});
+
 test("a step id is unique per invocation, so a second round never reads as alreadyExecuted", async () => {
   const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
   const runner = makeRunner(client);
@@ -288,8 +345,8 @@ test("invokeWithModel binds the selection's model per call, overriding the runne
   const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
   const runner = makeRunner(client, { model: "sonnet" });
 
-  assert.equal((await runner.invokeWithModel(invocation("impl"), "opus@high")).kind, "completed");
-  assert.equal((await runner.invokeWithModel(invocation("impl"), undefined)).kind, "completed");
+  assert.equal((await runner.invokeWithModel(invocation("impl"), "opus@high")).result.kind, "completed");
+  assert.equal((await runner.invokeWithModel(invocation("impl"), undefined)).result.kind, "completed");
   assert.equal((await runner.invoke(invocation("impl"))).kind, "completed");
 
   const scripts = client.executedCommands.map((command) => command.argv[2] as string);

@@ -53,6 +53,7 @@ import {
 import {
   createEngineProviderRunnerV1,
   createInMemoryFallbackStateStoreV1,
+  EngineCliRoundOutcomeV1,
   EngineCliTransportRunnerV1,
 } from "../src/providerDispatchV1";
 import { EngineProviderInvocationV1 } from "../src/taskLoopV1";
@@ -740,7 +741,26 @@ test("dispatch: a resumed invocation's prompt carries the user's answers", async
 
 type ScriptedCliRound =
   | { readonly kind: "completed"; readonly markdown: string }
-  | { readonly kind: "failed"; readonly code: string; readonly retryable: boolean };
+  | {
+      readonly kind: "failed";
+      readonly code: string;
+      readonly retryable: boolean;
+      /** What the transport itself established; absent = a model-reported failure it could not classify. */
+      readonly classification?: EngineCliRoundOutcomeV1["classification"];
+    };
+
+const CLI_QUOTA = {
+  kind: "failed",
+  code: "quotaExhausted",
+  retryable: true,
+  classification: { failureKind: "quota", authFailure: false, errorMessage: "usage limit reached" },
+} as const;
+const CLI_SIGNED_OUT = {
+  kind: "failed",
+  code: "authenticationFailed",
+  retryable: false,
+  classification: { failureKind: "generic", authFailure: true, errorMessage: "Not logged in" },
+} as const;
 
 /** A scripted `EngineCliTransportRunnerV1` recording every (invocation, model) it was handed. */
 function scriptedCliRunner(
@@ -749,13 +769,16 @@ function scriptedCliRunner(
   const calls: { model: string | undefined; stage: string }[] = [];
   return {
     calls,
-    invokeWithModel(input, model) {
+    invokeWithModel(input, model): Promise<EngineCliRoundOutcomeV1> {
       calls.push({ model, stage: input.stage });
       const scripted = behavior(calls.length);
       return Promise.resolve(
         scripted.kind === "completed"
-          ? { kind: "completed", summaryMarkdown: scripted.markdown }
-          : { kind: "failed", code: scripted.code, retryable: scripted.retryable }
+          ? { result: { kind: "completed", summaryMarkdown: scripted.markdown } }
+          : {
+              result: { kind: "failed", code: scripted.code, retryable: scripted.retryable },
+              ...(scripted.classification !== undefined ? { classification: scripted.classification } : {}),
+            }
       );
     },
   };
@@ -820,7 +843,7 @@ test("dispatch: a CLI quota exhaustion cascades to the configured backup exactly
     impl: { primary: "claude-cli:sonnet", backups: ["anthropic:claude-sonnet-5"], strategy: "switch-to-backup" },
   };
 
-  const exhausted = scriptedCliRunner(() => ({ kind: "failed", code: "quotaExhausted", retryable: true }));
+  const exhausted = scriptedCliRunner(() => CLI_QUOTA);
   const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "# backup\n" }));
   const fallbackState = createInMemoryFallbackStateStoreV1();
   const cascaded = await cliRunner({ cli: exhausted, anthropic, settings, fallbackState }).invoke(invocation());
@@ -828,7 +851,7 @@ test("dispatch: a CLI quota exhaustion cascades to the configured backup exactly
   assert.equal(anthropic.invocations.length, 1);
   assert.deepEqual(await fallbackState.read("impl"), { active: true, modelId: "anthropic:claude-sonnet-5" });
 
-  const loggedOut = scriptedCliRunner(() => ({ kind: "failed", code: "authenticationFailed", retryable: false }));
+  const loggedOut = scriptedCliRunner(() => CLI_SIGNED_OUT);
   const untouched = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "x" }));
   const authResult = await cliRunner({ cli: loggedOut, anthropic: untouched, settings }).invoke(invocation());
   assert.deepEqual(authResult, { kind: "failed", code: "authenticationFailed", retryable: false });
@@ -844,6 +867,35 @@ test("dispatch: a CLI quota exhaustion cascades to the configured backup exactly
     retryable: false,
   });
   assert.equal(alsoUntouched.invocations.length, 0);
+});
+
+test("dispatch: a model-WRITTEN quotaExhausted code never spends a paid backup; only the transport's classification does", async () => {
+  // The review's reproduction: a framed `failed` reply carrying
+  // code "quotaExhausted" with an unrelated message used to cascade on the
+  // code string alone. With no transport classification it is the round's
+  // own verdict, reported as-is.
+  const settings: ModelSettings = {
+    impl: { primary: "claude-cli:sonnet", backups: ["anthropic:claude-sonnet-5"], strategy: "switch-to-backup" },
+  };
+  const forged = scriptedCliRunner(() => ({ kind: "failed", code: "quotaExhausted", retryable: true }));
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "completed", markdown: "paid for" }));
+  const fallbackState = createInMemoryFallbackStateStoreV1();
+
+  const result = await cliRunner({ cli: forged, anthropic, settings, fallbackState }).invoke(invocation());
+
+  assert.deepEqual(result, { kind: "failed", code: "quotaExhausted", retryable: true });
+  assert.equal(anthropic.invocations.length, 0, "a model-written code must not move the round onto an API key");
+  assert.deepEqual(await fallbackState.read("impl"), { active: false });
+});
+
+test("dispatch: a claude-cli PRIMARY and claude-cli BACKUP both really run (the backup is not 'already executed')", async () => {
+  const settings: ModelSettings = {
+    impl: { primary: "claude-cli:sonnet", backups: ["claude-cli:opus"], strategy: "switch-to-backup" },
+  };
+  const cli = scriptedCliRunner((count) => (count === 1 ? CLI_QUOTA : { kind: "completed", markdown: "# opus did it\n" }));
+  const result = await cliRunner({ cli, settings }).invoke(invocation());
+  assert.deepEqual(result, { kind: "completed", summaryMarkdown: "# opus did it\n" });
+  assert.deepEqual(cli.calls.map((call) => call.model), ["sonnet", "opus"]);
 });
 
 test("dispatch: an API primary's quota exhaustion can cascade INTO a claude-cli backup, which then becomes the sticky route", async () => {

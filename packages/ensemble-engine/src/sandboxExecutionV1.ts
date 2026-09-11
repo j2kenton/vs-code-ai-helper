@@ -381,10 +381,38 @@ export function createGitCloneEffectV1(context: SandboxExecutionContextV1): Engi
   if (source.kind !== "gitClone") {
     throw new Error("createGitCloneEffectV1 requires a gitClone source binding");
   }
+  const gitDirPath =
+    binding.workingDirectoryRoot === "/" ? "/.git" : `${binding.workingDirectoryRoot}/.git`;
   return {
     effectKind: "sandboxCommand",
     supportsIdempotentReplay: false,
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
+      // A PERSISTENT sandbox keeps its working tree between tasks, so the
+      // second task on the same repo used to fail here: `git clone` refuses
+      // a non-empty destination (review finding, 2026-09-11). An existing
+      // clone of the SAME repository is reused and fetched instead; a clone
+      // of a different one is refused with its own code rather than
+      // silently worked on.
+      if ((await client.resolveRealPath(binding.sandboxId, gitDirPath)) !== undefined) {
+        const origin = await client.runCommand({
+          sandboxId: binding.sandboxId,
+          argv: ["git", "-C", binding.workingDirectoryRoot, "remote", "get-url", "origin"],
+          cwd: "/",
+          attemptKey,
+        });
+        if (origin.exitCode !== 0 || origin.stdoutTail.trim() !== source.repoUrl) {
+          return { status: "failed", code: "gitCloneWorkspaceOccupied" };
+        }
+        const fetch = await client.runCommand({
+          sandboxId: binding.sandboxId,
+          argv: ["git", "-C", binding.workingDirectoryRoot, "fetch", "--quiet", "origin"],
+          cwd: "/",
+          attemptKey,
+        });
+        return fetch.exitCode === 0
+          ? { status: "succeeded", code: "reusedExistingClone" }
+          : { status: "failed", code: `gitFetchExit${fetch.exitCode}` };
+      }
       const clone = await client.runCommand({
         sandboxId: binding.sandboxId,
         argv: ["git", "clone", "--", source.repoUrl, binding.workingDirectoryRoot],
@@ -440,9 +468,33 @@ export function createGitCheckoutEffectV1(
     effectKind: "sandboxCommand",
     supportsIdempotentReplay: false,
     async execute(attemptKey: string): Promise<EngineEffectOutcomeV1> {
+      // A branch or tag name resolves to the LOCAL ref, which in a reused
+      // clone is whatever an earlier task left — not what was just fetched.
+      // Prefer the remote-tracking ref when one exists; a commit sha is
+      // absolute and needs no such step.
+      let target = source.ref;
+      if (!GIT_COMMIT_SHA_V1.test(source.ref)) {
+        const remote = await client.runCommand({
+          sandboxId: binding.sandboxId,
+          argv: [
+            "git",
+            "-C",
+            binding.workingDirectoryRoot,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            `refs/remotes/origin/${source.ref}`,
+          ],
+          cwd: "/",
+          attemptKey,
+        });
+        if (remote.exitCode === 0) {
+          target = `origin/${source.ref}`;
+        }
+      }
       const checkout = await client.runCommand({
         sandboxId: binding.sandboxId,
-        argv: ["git", "-C", binding.workingDirectoryRoot, "checkout", "--detach", source.ref],
+        argv: ["git", "-C", binding.workingDirectoryRoot, "checkout", "--detach", target],
         cwd: "/",
         attemptKey,
       });

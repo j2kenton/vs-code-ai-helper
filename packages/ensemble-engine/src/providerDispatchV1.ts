@@ -246,10 +246,10 @@ export function buildEngineRoundPromptV1(input: EngineProviderInvocationV1): str
 // ─── Failure codes shared by every transport ─────────────────────────────────
 
 /**
- * The round failure codes that carry capacity/credential meaning across the
- * dispatch boundary. Both transports report failures with these exact codes
- * so the cascade decision (`engineFailureKindForCodeV1`) reads the same
- * whether the round ran through an HTTP adapter or a sandboxed CLI.
+ * The round failure codes that carry capacity/credential meaning. Both
+ * transports REPORT failures with these exact codes, so a failed round reads
+ * the same whichever path ran it. The cascade decision itself never reads a
+ * code back — see `EngineCliRoundOutcomeV1.classification`.
  */
 export const ENGINE_CLASSIFIED_FAILURE_CODES_V1 = {
   quota: "quotaExhausted",
@@ -276,24 +276,6 @@ export function engineFailureCodeForKindV1(
   }
 }
 
-/** The inverse: which classification a transport-reported code stands for; undefined for any other code. */
-export function engineFailureKindForCodeV1(
-  code: string
-): { readonly failureKind: EngineFailureKindV1; readonly authFailure: boolean } | undefined {
-  switch (code) {
-    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.quota:
-      return { failureKind: "quota", authFailure: false };
-    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.temporarilyUnavailable:
-      return { failureKind: "temporarily-unavailable", authFailure: false };
-    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.modelEntitlement:
-      return { failureKind: "model-entitlement", authFailure: false };
-    case ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication:
-      return { failureKind: "generic", authFailure: true };
-    default:
-      return undefined;
-  }
-}
-
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
 /**
@@ -308,7 +290,25 @@ export interface EngineCliTransportRunnerV1 {
   invokeWithModel(
     input: EngineProviderInvocationV1,
     model: string | undefined
-  ): Promise<EngineRoundResultV1>;
+  ): Promise<EngineCliRoundOutcomeV1>;
+}
+
+/**
+ * A finished CLI round, plus — separately — what the TRANSPORT itself
+ * established about a failure: the CLI's exit status and its own words, or
+ * a model-reported failure MESSAGE classified exactly as the direct-API
+ * path classifies one. Dispatch cascades on `classification` only, never
+ * on a result code, because a result code can be model-written: a reply
+ * carrying `code: "quotaExhausted"` used to spend a paid backup on its say-so
+ * (review finding, 2026-09-11).
+ */
+export interface EngineCliRoundOutcomeV1 {
+  readonly result: EngineRoundResultV1;
+  readonly classification?: {
+    readonly failureKind: EngineFailureKindV1;
+    readonly authFailure: boolean;
+    readonly errorMessage: string;
+  };
 }
 
 export interface CreateEngineProviderRunnerOptionsV1 {
@@ -395,18 +395,17 @@ export function createEngineProviderRunnerV1(
             `${provider.label} runs inside the task's sandbox, and no sandbox is available to this run.`,
         };
       }
-      const result = await cliRunner.invokeWithModel(input, model);
-      // The CLI runner already classified its failure; lift the capacity-
-      // and credential-shaped ones back into cascade decisions so a CLI
-      // quota exhaustion spends a backup exactly as an API 429 would.
-      const lifted = result.kind === "failed" ? engineFailureKindForCodeV1(result.code) : undefined;
-      if (result.kind === "failed" && lifted !== undefined) {
+      const { result, classification } = await cliRunner.invokeWithModel(input, model);
+      // Only the transport's own classification turns a failed round into a
+      // cascade decision — so a CLI quota exhaustion spends a backup exactly
+      // as an API 429 would, and an expired login never does.
+      if (result.kind === "failed" && classification !== undefined) {
         return {
           kind: "failure",
-          failureKind: lifted.failureKind,
-          authFailure: lifted.authFailure,
+          failureKind: classification.failureKind,
+          authFailure: classification.authFailure,
           code: result.code,
-          errorMessage: `${provider.label} reported ${result.code}`,
+          errorMessage: classification.errorMessage,
         };
       }
       return { kind: "round", result };

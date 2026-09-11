@@ -47,6 +47,7 @@ import type { TaskStage } from "../../ensemble-core/src/taskProgressV1";
 import {
   classifyEngineProviderFailureV1,
   isAuthenticationFailureV1,
+  type EngineFailureKindV1,
 } from "./failureClassificationV1";
 import type { EngineGateMachineryV1 } from "./gateMachineryV1";
 import {
@@ -54,6 +55,7 @@ import {
   ENGINE_CLASSIFIED_FAILURE_CODES_V1,
   ENGINE_ROUND_MAX_RESPONSE_BYTES_V1,
   engineFailureCodeForKindV1,
+  type EngineCliRoundOutcomeV1,
   type EngineCliTransportRunnerV1,
 } from "./providerDispatchV1";
 import { parseAiResultEnvelopeV1 } from "./resultEnvelopeV1";
@@ -204,6 +206,17 @@ function tail(text: string, max = MAX_DIAGNOSTIC_CHARS_V1): string {
   return text.length > max ? text.slice(-max) : text;
 }
 
+/**
+ * The Claude Code CLI's own signed-out reply — a short line such as
+ * `Not logged in · Please run /login` (2.1.267) — and nothing else. Length-
+ * bounded on purpose: a long unframed reply that merely mentions logins is
+ * the model's work, not the CLI's refusal.
+ */
+export function isCliSignedOutMessageV1(output: string): boolean {
+  const trimmed = output.trim();
+  return trimmed.length > 0 && trimmed.length <= 300 && /not logged in|please run \/login/i.test(trimmed);
+}
+
 /** `export NAME='value'` lines, every value strictly single-quoted; names validated. */
 export function renderEnvFileV1(env: Readonly<Record<string, string>>): string {
   const lines: string[] = [];
@@ -258,18 +271,41 @@ export function createSandboxCliProviderRunnerV1(
     }
   }
 
-  function failed(code: string, retryable: boolean): EngineRoundResultV1 {
-    return { kind: "failed", code, retryable };
+  function failed(code: string, retryable: boolean): EngineCliRoundOutcomeV1 {
+    return { result: { kind: "failed", code, retryable } };
+  }
+
+  function round(result: EngineRoundResultV1): EngineCliRoundOutcomeV1 {
+    return { result };
+  }
+
+  /** A failure the TRANSPORT observed (exit status, the CLI's own words) — what dispatch may cascade on. */
+  function classifiedFailure(
+    failureKind: EngineFailureKindV1,
+    authFailure: boolean,
+    genericCode: string,
+    errorMessage: string
+  ): EngineCliRoundOutcomeV1 {
+    return {
+      result: {
+        kind: "failed",
+        code: engineFailureCodeForKindV1(failureKind, authFailure, genericCode),
+        // Same discipline as the direct-API dispatch: auth never retries,
+        // capacity-shaped failures do, anything else is terminal.
+        retryable: !authFailure && failureKind !== "generic",
+      },
+      classification: { failureKind, authFailure, errorMessage },
+    };
   }
 
   const runner: SandboxCliProviderRunnerV1 = {
-    invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
-      return runner.invokeWithModel(input, options.model);
+    async invoke(input: EngineProviderInvocationV1): Promise<EngineRoundResultV1> {
+      return (await runner.invokeWithModel(input, options.model)).result;
     },
     async invokeWithModel(
       input: EngineProviderInvocationV1,
       selectedModel: string | undefined
-    ): Promise<EngineRoundResultV1> {
+    ): Promise<EngineCliRoundOutcomeV1> {
       const id = input.correlation.attemptId;
       const selection = parseSandboxCliModelSelectionV1(selectedModel);
       const promptPath = `${scratchDir}/${id}.prompt.md`;
@@ -304,7 +340,12 @@ export function createSandboxCliProviderRunnerV1(
         // a reconciled re-issue); every other recovery outcome has no output
         // to parse and is reported as such below.
         let captured: SandboxCommandResultV1 | undefined;
-        const effect = await machinery.runUngatedEffect(`cli-round/${id}`, {
+        // The step id carries the model as well as the invocation: dispatch
+        // hands the SAME invocation to each cascade candidate, and with the
+        // attempt id alone a `claude-cli:opus` backup found the failed
+        // `claude-cli:sonnet` primary's attempt record and reported
+        // "already executed" without ever running (review finding, 2026-09-11).
+        const effect = await machinery.runUngatedEffect(`cli-round/${id}/${selectedModel ?? "cli-default"}`, {
           effectKind: "sandboxCommand",
           supportsIdempotentReplay: false,
           async execute(attemptKey: string) {
@@ -357,14 +398,12 @@ export function createSandboxCliProviderRunnerV1(
             errorMessage,
             authFailure: isAuthenticationFailureV1(errorMessage),
           });
-          const code = engineFailureCodeForKindV1(
+          return classifiedFailure(
             classified.failureKind,
             classified.authFailure === true,
-            `cliExit${captured.exitCode}`
+            `cliExit${captured.exitCode}`,
+            errorMessage
           );
-          // Same discipline as the direct-API dispatch: auth never retries,
-          // capacity-shaped failures do, anything else is terminal.
-          return failed(code, classified.authFailure !== true && classified.failureKind !== "generic");
         }
 
         const output = await client.readFileUtf8(sandboxId, outputPath);
@@ -382,25 +421,39 @@ export function createSandboxCliProviderRunnerV1(
           // (confirmed live, Claude Code 2.1.267). Without this check that
           // reads as a malformed frame — retryable — and the loop would
           // burn its whole round budget re-running a CLI that can never
-          // answer. Credential problems are terminal and must surface.
-          if (isAuthenticationFailureV1(tail(output))) {
-            return failed(ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication, false);
+          // answer. Matched narrowly — the CLI's own short message, not any
+          // output that mentions logging in (a model working ON login code
+          // must not have its unframed reply read as an expired credential).
+          if (isCliSignedOutMessageV1(output)) {
+            return classifiedFailure("generic", true, ENGINE_CLASSIFIED_FAILURE_CODES_V1.authentication, output.trim());
           }
           return failed(`malformedResult.${envelope.code}`, true);
         }
         if (envelope.kind === "questions") {
-          return { kind: "questions", questions: envelope.questions };
+          return round({ kind: "questions", questions: envelope.questions });
         }
         if (envelope.kind === "completed") {
           if (envelope.content.contentType !== "markdown-artifact.v1") {
             return failed("unexpectedContentType", true);
           }
-          return { kind: "completed", summaryMarkdown: envelope.content.markdown };
+          return round({ kind: "completed", summaryMarkdown: envelope.content.markdown });
         }
         if (envelope.kind === "cancelled") {
           return failed("cancelled", false);
         }
-        return failed(envelope.code, envelope.retryable);
+        // The model reported a typed failure through the frame. Its `code`
+        // is model-written, so it never decides a cascade by itself (it used
+        // to: `code: "quotaExhausted"` alone spent a paid backup). Only its
+        // MESSAGE is classified — exactly the direct-API path's rule, which
+        // lets a provider report its own rate limiting through the frame.
+        const reported = classifyEngineProviderFailureV1({ errorMessage: envelope.message });
+        if (reported.failureKind === "generic") {
+          return failed(envelope.code, envelope.retryable);
+        }
+        return {
+          result: { kind: "failed", code: envelope.code, retryable: true },
+          classification: { failureKind: reported.failureKind, authFailure: false, errorMessage: envelope.message },
+        };
       } finally {
         await cleanup(scratch);
       }

@@ -146,6 +146,62 @@ test("split-lineage gitClone acquisition: two steps, two attempt keys, exactly o
   assert.equal(client.executedCommands.length, 2);
 });
 
+test("a persistent sandbox: the second task on the same repo reuses and fetches the existing clone; another repo is refused", async () => {
+  // Before the fix every second "My sandbox" task failed: `git clone` into
+  // the retained, non-empty working directory (review finding, 2026-09-11).
+  const REPO = "https://example.com/repo.git";
+  const store = createControlPlaneStoreV1();
+  const client = createInMemorySandboxClientV1({
+    onCommand: (request, fake) => {
+      const [git, flag, , verb] = request.argv;
+      if (git === "git" && flag === "clone") {
+        const target = request.argv[request.argv.length - 1] as string;
+        fake.addDirectory(request.sandboxId, `${target}/.git`);
+      }
+      if (git === "git" && flag === "-C" && verb === "remote") {
+        return { exitCode: 0, stdoutTail: `${REPO}\n`, stderrTail: "" };
+      }
+      // clone, fetch, rev-parse (the remote-tracking ref exists), checkout: all succeed.
+      return { exitCode: 0, stdoutTail: "", stderrTail: "" };
+    },
+  });
+  const persistent = (repoUrl: string): SandboxExecutionContextV1 => ({
+    binding: makeBinding("owner-a", {
+      source: { kind: "gitClone", repoUrl, ref: "main" },
+      lifecycle: "user-owned-managed",
+      cleanup: "retain",
+    }),
+    client,
+  });
+  const machineryFor = (taskId: string) =>
+    createEngineGateMachineryV1({
+      taskId,
+      ownerId: "owner-a",
+      workerId: "w1",
+      sink: createRecordingEventSinkV1(),
+      gateStore: store.gates,
+      attemptStore: store.attempts,
+      leaseStore: store.leases,
+    });
+
+  const first = await acquireTaskSourceV1(machineryFor("task-1"), persistent(REPO));
+  assert.equal(first.acquired, true);
+  const second = await acquireTaskSourceV1(machineryFor("task-2"), persistent(REPO));
+  assert.equal(second.acquired, true, "the second task on the same repo must not fail on the retained clone");
+  const verbs = client.executedCommands.map((entry) => entry.argv.join(" "));
+  assert.equal(verbs.filter((verb) => verb.startsWith("git clone")).length, 1, "cloned once, then reused");
+  assert.ok(verbs.some((verb) => verb.includes("fetch --quiet origin")), "the reused clone is fetched");
+  // A branch ref checks out the FETCHED remote-tracking ref, not a stale local one.
+  const checkouts = client.executedCommands.filter((entry) => entry.argv.includes("checkout"));
+  assert.deepEqual(checkouts.map((entry) => entry.argv[entry.argv.length - 1]), ["origin/main", "origin/main"]);
+
+  const other = await acquireTaskSourceV1(machineryFor("task-3"), persistent("https://example.com/other.git"));
+  assert.equal(other.acquired, false);
+  const cloneStep = other.steps[0];
+  assert.ok(cloneStep !== undefined && cloneStep.kind === "executed");
+  assert.deepEqual(cloneStep.outcome, { status: "failed", code: "gitCloneWorkspaceOccupied" });
+});
+
 test("suggestion-7 scenario: a crash between clone and checkout recovers onto the PINNED ref, no duplicate clone", async () => {
   const store = createControlPlaneStoreV1();
   const machinery = makeMachinery(store);

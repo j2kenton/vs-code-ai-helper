@@ -88,14 +88,16 @@ test("a full engine sequence audits clean: every executed command is accounted f
   );
   assert.equal(resumed.kind, "executed");
 
-  // Clone + checkout + gated command: three executions, three attempt keys.
+  // Clone, then the checkout step (a remote-tracking-ref probe for the
+  // branch ref, then the checkout itself — both under the checkout step's
+  // key), then the gated command: four executions, three attempt keys.
   const commands = ledger();
-  assert.equal(commands.length, 3);
+  assert.equal(commands.length, 4);
   assert.equal(new Set(commands.map((command) => command.attemptKey)).size, 3);
 
   const report = await auditSandboxCommandAccountingV1(commands, machinery.attemptStore);
   assert.equal(report.ok, true, JSON.stringify(report.findings));
-  assert.equal(report.commandsAudited, 3);
+  assert.equal(report.commandsAudited, 4);
   assert.deepEqual(report.findings, []);
 });
 
