@@ -25,6 +25,7 @@ import {
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireOrAdoptWorkAdmissionV1,
   beginTargetResolutionV1,
   describeTargetResolutionWriteFailureV1,
@@ -230,9 +231,8 @@ export async function runPublishChecks(
   // it here closes that gap; `endTargetResolutionV1()` (in the inner
   // `finally` below, once resolution completes) balances this call on every
   // path, including the early-refusal return immediately below.
-  const targetResolutionHandle = await beginTargetResolutionV1(
-    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
-  );
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
   // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
   // write error protecting this resolution window must fail dispatch before
   // setup, same as a per-task admission write error already does — never
@@ -242,17 +242,22 @@ export async function runPublishChecks(
     await endTargetResolutionV1(targetResolutionHandle);
     return dispatched;
   }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`): route through
+  // the shared early-admission helper (validation-before-bookkeeping plus
+  // containment observability against `taskRootCandidatePathsV1`) instead of
+  // acquiring bookkeeping directly against an unvalidated raw/peeked path —
+  // `resolveTaskContext` below remains the sole authoritative
+  // ownership/workspace-binding check.
   const earlyFolderPath =
     extractSynchronousPublishChecksFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, resolverArg, currentTaskStore);
-  const early = earlyFolderPath
-    ? await acquireOrAdoptWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "runPublishChecks",
-        handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
-      })
-    : undefined;
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "runPublishChecks",
+    handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));

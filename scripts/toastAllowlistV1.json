@@ -5,18 +5,18 @@
   "entries": [
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 333,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision. (Line moved 332 -> 333 as the 2026-09-11 target-resolution write-failure fix added an import above it; call is unchanged.)"
+      "line": 334,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision. (Line moved 332 -> 333 -> 334 as the 2026-09-11 target-resolution write-failure fix and the shared early-admission-helper wiring fix each added an import above it; call is unchanged.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 1794,
-      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794, see commitAndPushTask.ts:333's note.)"
+      "line": 1795,
+      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794 -> 1795, see commitAndPushTask.ts:334's note.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 2188,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push. (Line moved 2187 -> 2188, see commitAndPushTask.ts:333's note.)"
+      "line": 2189,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push. (Line moved 2187 -> 2188 -> 2189, see commitAndPushTask.ts:334's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",

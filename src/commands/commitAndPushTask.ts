@@ -56,6 +56,7 @@ import { COMMIT_PUSH_ACTION_KEY_V1, CommitPushServicesV1 } from "../actions/rows
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
   describeTargetResolutionWriteFailureV1,
@@ -2799,9 +2800,8 @@ export async function commitAndPushTask(
   // gap; `endTargetResolutionV1()` (in the inner `finally` below, once
   // resolution completes) balances this call on every path, including the
   // early-refusal return immediately below.
-  const targetResolutionHandle = await beginTargetResolutionV1(
-    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
-  );
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
   // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
   // write error protecting this resolution window must fail dispatch before
   // setup, same as a per-task admission write error already does — never
@@ -2812,16 +2812,23 @@ export async function commitAndPushTask(
     releaseCommitPushToken();
     return;
   }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`): `earlyFolderPath`
+  // is a raw, unvalidated caller-supplied path (or a best-effort in-memory
+  // peek) — this now goes through the same shared
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` helper every other early-
+  // admission route uses, instead of acquiring bookkeeping directly against
+  // an unvalidated path (validation-before-bookkeeping, plus containment
+  // observability against `taskRootCandidatePathsV1`). `resolveCommitPushTargetTaskV1`
+  // below remains the sole authoritative ownership/workspace-binding check.
   const earlyFolderPath =
     extractSynchronousCommitPushFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
-  const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "commitAndPushTask",
-      })
-    : undefined;
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "commitAndPushTask",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
@@ -2995,9 +3002,8 @@ export async function completeCommitAndPushTask(
   // gap; `endTargetResolutionV1()` (in the inner `finally` below, once
   // resolution completes) balances this call on every path, including the
   // early-refusal return immediately below.
-  const targetResolutionHandle = await beginTargetResolutionV1(
-    resolveTaskRootCandidates().map((candidate) => candidate.absolutePath)
-  );
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
   // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
   // write error protecting this resolution window must fail dispatch before
   // setup, same as a per-task admission write error already does — never
@@ -3008,16 +3014,20 @@ export async function completeCommitAndPushTask(
     releaseCommitPushToken();
     return;
   }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`): route through
+  // the shared early-admission helper (validation-before-bookkeeping plus
+  // containment observability) instead of acquiring directly against an
+  // unvalidated raw/peeked path — see the sibling call site above for the
+  // full rationale.
   const earlyFolderPath =
     extractSynchronousCommitPushFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
-  const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "completeCommitAndPushTask",
-      })
-    : undefined;
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "completeCommitAndPushTask",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
