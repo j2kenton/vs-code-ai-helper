@@ -572,6 +572,28 @@ export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
   if (!params.candidatePath || !looksLikeTaskFolderPathV1(params.candidatePath)) {
     return undefined;
   }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`, narrowed):
+  // `taskRootCandidatePaths` explicitly provided but EMPTY is genuinely
+  // ambiguous — see `isPathOutsideAllTaskRootsV1`'s doc comment for why it
+  // fails open here (return `false`, "cannot evaluate") rather than treating
+  // an empty list as "the candidate is outside every root" (`workspaceFolders`
+  // being momentarily unpopulated is indistinguishable, at this call site,
+  // from a workspace that genuinely has none, and the earlier revert this
+  // module's own history records was specifically about silently skipping
+  // protection for a legitimate candidate caught in that ambiguity). This is
+  // NOT resolved this round — doing so safely needs a positive signal this
+  // call site does not have, which is why it is carried as a blocker rather
+  // than closed by observability alone — but it is now at least diagnosable,
+  // matching the sibling case just below.
+  if (params.taskRootCandidatePaths && params.taskRootCandidatePaths.length === 0) {
+    console.warn(
+      `acquireEarlyWorkAdmissionForCandidatePathV1: candidate "${params.candidatePath}" (command ` +
+        `"${params.commandId}") looks like a task folder, but the caller's task-root candidate list was empty — ` +
+        "proceeding with early admission bookkeeping WITHOUT a containment check (cannot distinguish 'no " +
+        "workspace open' from 'workspaceFolders not yet populated'; see isPathOutsideAllTaskRootsV1's doc " +
+        "comment). Authoritative resolution below is unaffected."
+    );
+  }
   if (
     params.taskRootCandidatePaths &&
     isPathOutsideAllTaskRootsV1(params.candidatePath, params.taskRootCandidatePaths)
@@ -2681,17 +2703,18 @@ export async function removePauseRevocationBarrierV1(barrierPath: string): Promi
  * so at most one advance happens per still-present barrier no matter how
  * many callers race to finish it.
  *
- * Known interim gap (consistent with this module's general stance: automatic
- * reclamation of a stale claim is not this round's job — see the module's
- * own step-2 interim policy for `admission.claim`/`pauseCommit`): if a
- * caller crashes strictly between winning this lock and its own `finally`
- * cleanup, the lock file is never removed, and the barrier can never be
- * finished (fence never advances for it) until something manually clears the
- * lock file. This is a narrower instance of the exact same accepted
- * crash-window exposure every other claim in this module already carries —
- * not a new class of risk — and, like those, is bounded to a short claim-to-
- * completion window (advance-then-unlink, no awaited work in between other
- * than those two fast filesystem calls).
+ * 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): a caller
+ * that crashes strictly between winning this lock and its own `finally`
+ * cleanup used to strand the barrier forever — the lock file is never
+ * removed, and nothing ever finishes the barrier (fence never advances for
+ * it) without a manual clear. `reclaimStaleFinishLockV1` (invoked by
+ * `attemptFinishPauseRevocationBarrierOnceV1` once its own bounded wait for a
+ * live winner is exhausted) now reclaims a lock whose age proves it can no
+ * longer be a legitimate in-progress hold, closing this within a bounded
+ * window instead of leaving it open indefinitely — see that function's doc
+ * comment for the mechanism and its one remaining, explicitly accepted
+ * residual risk (a live-but-pathologically-slow owner racing a reclaimer,
+ * not provable dead the way Part 1c's liveness probing proves it).
  */
 const PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1 = ".finish-lock";
 
@@ -2721,6 +2744,58 @@ export function registerPauseRevocationCleanupHookV1(hook: PauseRevocationCleanu
 // handful of fast filesystem calls (advance + optional cleanup + remove) in
 // the common case, so this almost always resolves in one or two polls.
 const PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 = 20;
+
+/**
+ * 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): a losing
+ * waiter that exhausted the wait loop above with the lock STILL present used
+ * to concede unconditionally ("not my job", falling through to `"done"`),
+ * which is correct for a winner that is merely a little slow but is silent
+ * data loss for a winner that suffered a genuine OS-level process crash (kill
+ * -9, power loss — anything that skips the winner's own `finally` entirely,
+ * as opposed to an in-process throw, which the `retryTakeover` branch above
+ * already handles because `finally` still runs for that). A crashed winner's
+ * lock then never disappears, so the barrier can NEVER be finished — the
+ * fence never advances past the revoked claim's generation, exactly the
+ * "later claimants cannot help" gap the plan's own step 12 ("the next
+ * claimant helps finish the idempotent steps") requires closed, not deferred.
+ *
+ * This is answered without full OS-level owner-liveness probing (Part 1c's
+ * job for `admission`/`pauseCommit` claims, which can legitimately be held
+ * for real, long-running work): this lock's ONLY legitimate hold duration is
+ * "a handful of fast filesystem calls" (its own doc comment, above) plus one
+ * caller-supplied cleanup-hook write (`repairRevokedWatchdogPauseV1`, a
+ * single lock-serialized, CAS-bounded local-disk write) — normally low
+ * milliseconds, essentially never past the
+ * `PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 * CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`
+ * (~2s) window already spent waiting. `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`
+ * below is a further, generous multiple past that, so a still-live-but-
+ * unusually-slow winner is never mistaken for a crashed one, while a
+ * genuinely crashed one is reclaimed within a bounded window instead of
+ * forever.
+ *
+ * Reclaim exclusivity deliberately does NOT use a rename of the stale lock
+ * path as its gate: the section doc comment above
+ * `PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1` records a measured, deterministic
+ * finding on this exact platform that two truly concurrent
+ * `fs.promises.rename` calls racing the SAME source path can BOTH resolve
+ * successfully rather than one failing with `ENOENT` — rename is not a safe
+ * mutual-exclusion primitive here. Reclaim instead uses this module's own
+ * verified-atomic primitive, exclusive create (`{ flag: "wx" }`, already
+ * load-bearing for `admission.claim`, every `pause-fence.g<N>` file, and this
+ * very lock), on a SEPARATE, uniquely-named reclaim-gate file — so two
+ * callers racing to reclaim the same stale lock can never both win, and
+ * therefore can never both run the finish sequence for the same barrier.
+ *
+ * Residual, accepted risk (recorded rather than hidden, matching this
+ * module's general disclosure practice): exclusivity between reclaimers is
+ * proven, but exclusivity between a reclaimer and a still-alive-but-
+ * pathologically-slow original owner is not — only Part 1c's PID/start-time
+ * liveness probing proves an owner is actually dead. The generous, multi-
+ * second margin above is this round's mitigation for that gap, not a claim
+ * that it is closed; see this task's Remaining Blockers if that residual
+ * risk needs to be closed by 1c before it is treated as fully resolved.
+ */
+export const PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 = 15000;
 
 // Bounded number of times a caller will attempt to TAKE OVER an
 // apparently-abandoned finish (lock released, barrier still present — see
@@ -2761,6 +2836,152 @@ export async function finishPauseRevocationBarrierV1(taskFolderPath: string, bar
  * conceding under the false assumption that "lock gone" always means
  * "someone else finished it".
  */
+/**
+ * Shared fence-advance -> best-effort task-progress cleanup -> barrier-removal
+ * sequence (plan step 12's "fence advance, then cleanup ... before publishing
+ * admission"), factored out so both the normal lock-winner path and the
+ * stale-lock reclaim path (`reclaimStaleFinishLockV1`, `dceb2646...-3`) apply
+ * exactly the same ordering rather than maintaining two copies of it. No-op
+ * when the barrier was already removed by someone else before this call ran.
+ */
+async function performPauseRevocationBarrierFinishSequenceV1(
+  taskFolderPath: string,
+  barrierPath: string
+): Promise<void> {
+  const infoBeforeAdvance = readClaimInfoSyncV1(barrierPath);
+  if (!infoBeforeAdvance) {
+    return;
+  }
+  await advancePauseFenceForRevocationV1(taskFolderPath);
+  // Part 1b step 12's second half. Best-effort: a failure here must never
+  // block barrier removal — the fence has already durably advanced, which is
+  // what every pause-sensitive reader that consults it (once wired, plan
+  // step 13) actually depends on; the raw field cleanup is hygiene for
+  // readers still on raw `task-progress.json` fields, not a correctness
+  // dependency (see the section doc comment above).
+  if (pauseRevocationCleanupHookV1) {
+    try {
+      await pauseRevocationCleanupHookV1(taskFolderPath, infoBeforeAdvance.claimId);
+    } catch (error) {
+      console.error(
+        `finishPauseRevocationBarrierV1: pause cleanup hook failed for revoked claim ` +
+          `"${infoBeforeAdvance.claimId}" — removing the barrier regardless; the fence generation is already ` +
+          "the correctness-relevant guard.",
+        error
+      );
+    }
+  }
+  await removePauseRevocationBarrierV1(barrierPath);
+}
+
+/**
+ * Reclaims a finish-lock that survived the full bounded wait in
+ * `attemptFinishPauseRevocationBarrierOnceV1` (~2s) AND whose own mtime shows
+ * it has been sitting for at least `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`
+ * — see that constant's doc comment for why this, rather than forever
+ * conceding, is the fix for `dceb2646...-3` (a genuine process crash, which
+ * skips the winner's own `finally`, otherwise strands the barrier
+ * permanently). Reclaim exclusivity is a single-winner exclusive-create
+ * (`{ flag: "wx" }`) of a separate, fixed-name reclaim-gate file derived from
+ * the lock path — NOT a rename of the lock path itself (see
+ * `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`'s doc comment for the measured
+ * finding that concurrent renames of the same source are not safely
+ * exclusive on this platform): only one racing reclaimer can ever win that
+ * exclusive create, so two callers can never both finish — and therefore
+ * never both advance the fence for — the same barrier.
+ */
+const PAUSE_REVOCATION_FINISH_LOCK_RECLAIM_GATE_SUFFIX_V1 = ".reclaim";
+
+/** Fresh classification of a finish-lock/barrier pair, used by
+ * `reclaimStaleFinishLockV1` both before and after it wins the reclaim gate
+ * — deliberately re-evaluated both times rather than reusing one earlier
+ * read, since either observation may be stale by the time it matters.
+ * `"barrierGone"` mirrors the wait loop's own `"done"` case (finished);
+ * `"lockGone"` mirrors its own `"retryTakeover"` case (released without
+ * finishing); `"notYetStale"` means a live owner may still legitimately be
+ * working; `"stale"` is the only outcome that authorizes reclaim. */
+function classifyFinishLockForReclaimV1(
+  lockPath: string,
+  barrierPath: string
+): "barrierGone" | "lockGone" | "notYetStale" | "stale" {
+  if (!fs.existsSync(barrierPath)) {
+    return "barrierGone";
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return "lockGone";
+    }
+    console.error(
+      `classifyFinishLockForReclaimV1: failed to stat finish-lock "${lockPath}" — treating as not (yet) stale.`,
+      error
+    );
+    return "notYetStale";
+  }
+  return Date.now() - stat.mtimeMs >= PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 ? "stale" : "notYetStale";
+}
+
+async function reclaimStaleFinishLockV1(
+  taskFolderPath: string,
+  barrierPath: string,
+  lockPath: string
+): Promise<"done" | "retryTakeover"> {
+  const preCheck = classifyFinishLockForReclaimV1(lockPath, barrierPath);
+  if (preCheck === "lockGone") {
+    return "retryTakeover";
+  }
+  if (preCheck !== "stale") {
+    // "barrierGone" (finished) or "notYetStale" (a live owner may still be
+    // legitimately working) — never reclaim in either case.
+    return "done";
+  }
+  const gatePath = `${lockPath}${PAUSE_REVOCATION_FINISH_LOCK_RECLAIM_GATE_SUFFIX_V1}`;
+  try {
+    await fs.promises.writeFile(gatePath, "", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // Another caller is already reclaiming this exact stale lock right now
+      // — not this call's job this pass; a later acquisition re-evaluates.
+      return "done";
+    }
+    console.error(
+      `reclaimStaleFinishLockV1: failed to acquire reclaim gate "${gatePath}" — conceding for now.`,
+      error
+    );
+    return "done";
+  }
+  try {
+    // Re-verify under exclusive ownership of the reclaim gate: the state
+    // this call observed above may already be stale itself by now.
+    const underGate = classifyFinishLockForReclaimV1(lockPath, barrierPath);
+    if (underGate === "lockGone") {
+      return "retryTakeover";
+    }
+    if (underGate !== "stale") {
+      return "done";
+    }
+    try {
+      await fs.promises.unlink(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`reclaimStaleFinishLockV1: failed to remove stale finish-lock "${lockPath}"`, error);
+      }
+    }
+    await performPauseRevocationBarrierFinishSequenceV1(taskFolderPath, barrierPath);
+    return "done";
+  } finally {
+    try {
+      await fs.promises.unlink(gatePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`reclaimStaleFinishLockV1: failed to remove reclaim gate "${gatePath}"`, error);
+      }
+    }
+  }
+}
+
 async function attemptFinishPauseRevocationBarrierOnceV1(
   taskFolderPath: string,
   barrierPath: string
@@ -2771,8 +2992,9 @@ async function attemptFinishPauseRevocationBarrierOnceV1(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       // Another caller already owns finishing this exact barrier right now
-      // (or a crashed prior attempt left its lock behind — see the doc
-      // comment's known interim gap).
+      // (or a crashed prior attempt left its lock behind — see
+      // `reclaimStaleFinishLockV1`'s doc comment for how that case is now
+      // resolved rather than left indefinitely stranded).
       //
       // 2026-09-11 review completion blocker (`dceb2646...-2`, fixed):
       // returning immediately here let THIS caller's own acquisition continue
@@ -2781,9 +3003,7 @@ async function attemptFinishPauseRevocationBarrierOnceV1(
       // step 12 forbids ("before publishing admission or starting another
       // pause"). Wait, bounded, for the winner to finish (lock removed) or
       // for the barrier itself to disappear (finished by a third party while
-      // we waited) before conceding. A genuinely crashed lock-holder (the
-      // documented interim gap) still falls through to "not my job" after the
-      // bound rather than blocking this acquisition indefinitely.
+      // we waited) before conceding.
       for (let attempt = 0; attempt < PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1; attempt++) {
         await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
         if (!fs.existsSync(barrierPath)) {
@@ -2797,38 +3017,18 @@ async function attemptFinishPauseRevocationBarrierOnceV1(
           return "retryTakeover";
         }
       }
-      return "done";
+      // 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): this
+      // used to concede unconditionally here ("not my job"), stranding the
+      // barrier forever against a genuinely crashed winner. Attempt a bounded,
+      // single-winner reclaim instead — see `reclaimStaleFinishLockV1`'s doc
+      // comment for why this is safe even though the wait above found the
+      // lock still present.
+      return reclaimStaleFinishLockV1(taskFolderPath, barrierPath, lockPath);
     }
     throw error;
   }
   try {
-    const infoBeforeAdvance = readClaimInfoSyncV1(barrierPath);
-    if (!infoBeforeAdvance) {
-      // Already finished by someone else (or by an earlier call from this
-      // same caller) before we won the lock — nothing left to advance the
-      // fence FOR.
-      return "done";
-    }
-    await advancePauseFenceForRevocationV1(taskFolderPath);
-    // Part 1b step 12's second half. Best-effort: a failure here must never
-    // block barrier removal — the fence has already durably advanced, which
-    // is what every pause-sensitive reader that consults it (once wired, plan
-    // step 13) actually depends on; the raw field cleanup is hygiene for
-    // readers still on raw `task-progress.json` fields, not a correctness
-    // dependency (see the section doc comment above).
-    if (pauseRevocationCleanupHookV1) {
-      try {
-        await pauseRevocationCleanupHookV1(taskFolderPath, infoBeforeAdvance.claimId);
-      } catch (error) {
-        console.error(
-          `finishPauseRevocationBarrierV1: pause cleanup hook failed for revoked claim ` +
-            `"${infoBeforeAdvance.claimId}" — removing the barrier regardless; the fence generation is already ` +
-            "the correctness-relevant guard.",
-          error
-        );
-      }
-    }
-    await removePauseRevocationBarrierV1(barrierPath);
+    await performPauseRevocationBarrierFinishSequenceV1(taskFolderPath, barrierPath);
     return "done";
   } finally {
     // A failure to unlink our own lock (other than ENOENT, already gone)
@@ -2836,9 +3036,9 @@ async function attemptFinishPauseRevocationBarrierOnceV1(
     // throwing here would violate that (`no-unsafe-finally`) and could
     // silently swallow a real advance/removal error. Log and move on: the
     // fence-advance and barrier-removal above, if they ran, already
-    // succeeded or already threw their own error; a lingering lock file is
-    // the documented, bounded interim gap above, not a new failure to
-    // surface here.
+    // succeeded or already threw their own error; a lingering lock file past
+    // this point is now bounded by `reclaimStaleFinishLockV1` above, not an
+    // unbounded interim gap.
     try {
       await fs.promises.unlink(lockPath);
     } catch (error) {
