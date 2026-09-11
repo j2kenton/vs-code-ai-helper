@@ -344,6 +344,127 @@ void describe("languageModelToolSessionV1", () => {
     }
   });
 
+  void it("does not trust a large advertised maxInputTokens — budgets against a fixed ceiling", async () => {
+    // 2026-09-11 15:42: the first fix budgeted 70% of `maxInputTokens` and the
+    // review still failed identically. Copilot advertises a model's full
+    // long-context maximum there, but VS Code fills the model's default
+    // "Context Size" (the smaller standard window) into every request, and
+    // that is the window Copilot prunes against.
+    const model = installBudgetedModel(1_000_000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [toolCall("call-3")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    // ~50k estimated tokens each: two together overrun the ceiling's budget,
+    // but not 70% of the advertised million.
+    const handler = recordingHandler(() => "y".repeat(150_000));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      const serialized = JSON.stringify(model.sent[3]);
+      assert.match(serialized, /Ensemble removed this tool result \(150000 bytes\)/);
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("sheds and resends the round when the provider still orphans a tool result", async () => {
+    // Even under budget, the provider's real window is unknowable from the
+    // extension API. If it prunes anyway, the 400 names an orphaned tool
+    // result; that is a request-size fault, so shed harder and resend the same
+    // round instead of failing the review.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const rounds: object[][] = [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ];
+    const sent: string[] = [];
+    let served = 0;
+    let rejected = false;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 1000,
+          sendRequest: (messages: readonly unknown[]) => {
+            sent.push(JSON.stringify(messages));
+            // The third request (carrying call-1's and call-2's results) is
+            // rejected once, exactly as Copilot rejected it on 2026-09-11.
+            if (served === 2 && !rejected) {
+              rejected = true;
+              return Promise.reject(
+                new Error(
+                  'Request Failed: 400 {"error":{"message":"No tool call found for function call output ' +
+                    'with call_id call-1.","code":"invalid_request_body"}}'
+                )
+              );
+            }
+            const parts = rounds[Math.min(served, rounds.length - 1)]!;
+            served += 1;
+            return Promise.resolve({ stream: (function* (): Generator<object> { yield* parts; })() });
+          },
+        },
+      ]);
+    // ~200 estimated tokens each: comfortably inside the ~700-token budget
+    // together, so only the rejection makes the session shed.
+    const handler = recordingHandler(() => "z".repeat(600));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(sent.length, 4, "the rejected round is sent again, once");
+      assert.doesNotMatch(sent[2]!, /Ensemble removed this tool result/, "nothing was shed before the rejection");
+      assert.match(sent[3]!, /Ensemble removed this tool result \(600 bytes\)/, "the resend sheds call-1");
+      assert.equal(handler.calls.length, 2, "no tool call is executed twice");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("reports the orphaned-result rejection when shedding cannot shrink the request", async () => {
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    let served = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 1000,
+          sendRequest: () => {
+            served += 1;
+            if (served === 1) {
+              return Promise.resolve({ stream: (function* (): Generator<object> { yield toolCall("call-1"); })() });
+            }
+            return Promise.reject(new Error("Request Failed: 400 No tool call found for function call output"));
+          },
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      // Only the newest round's result exists, and it is never shed — so a
+      // resend would be identical. Fail with the provider's own words.
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestFailed");
+      assert.match((exit.kind === "transportFailure" && exit.detail) || "", /No tool call found/);
+      assert.equal(served, 2);
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
   void it("stops with a readable reason when even the newest result cannot fit, instead of sending", async () => {
     const model = installBudgetedModel(100, [[toolCall("call-1")]]);
     const handler = recordingHandler(() => "x".repeat(3000));

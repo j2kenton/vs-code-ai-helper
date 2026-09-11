@@ -183,6 +183,50 @@ const MAX_NARRATION_NUDGES_V1 = 2;
 export const TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1 = 0.7;
 
 /**
+ * Ceiling on the input size the budget above is taken from, whatever the
+ * model advertises.
+ *
+ * `maxInputTokens` is NOT the limit Copilot enforces. For a model with
+ * long-context pricing, Copilot's model configuration offers a "Context
+ * Size" whose default is the smaller standard window; VS Code core
+ * (`sendChatRequest` → `getModelConfiguration`) fills schema defaults into
+ * every request, extension requests included, and Copilot's provider clones
+ * the endpoint down to that size before rendering. `maxInputTokens`, though,
+ * reports the full long-context maximum. Budgeting 70% of the advertised
+ * figure therefore still overran the real window, and the 2026-09-11 15:42
+ * review failed exactly as before, after 15 rounds, on a build that shed
+ * against the advertised number.
+ *
+ * The extension API exposes no way to read the effective window, so this
+ * is a fixed ceiling every Copilot chat model's default window clears.
+ *
+ * It applies to `@…+long` selections too, deliberately. That suffix becomes
+ * `modelOptions.model_context_window` (`buildCopilotRequestOptions`), but
+ * Copilot's LM provider never reads it: the window comes only from the
+ * request's `modelConfiguration.contextSize`, and the provider passes on just
+ * `stop`/`temperature`/`max_tokens`/penalty keys from `modelOptions`
+ * (checked in Copilot Chat 0.65.0). A `+long` session therefore runs in the
+ * default window like any other, and must be budgeted like one.
+ */
+export const MAX_TOOL_SESSION_CONTEXT_TOKENS_V1 = 128_000;
+
+/**
+ * How many times one round may be re-sent after the provider rejects it for
+ * an orphaned tool result. That rejection means the conversation was over
+ * the provider's real window despite the budget, so each retry first sheds
+ * down to half the conversation's current size.
+ */
+const MAX_ORPHANED_RESULT_RETRIES_V1 = 2;
+
+/**
+ * The provider's rejection when its own over-budget pruning removed a tool
+ * call but kept that call's result — see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1.
+ */
+export function isOrphanedToolResultRejectionV1(detail: string | undefined): boolean {
+  return detail !== undefined && /No tool call found for function call output/i.test(detail);
+}
+
+/**
  * Deliberately pessimistic bytes-per-token for estimating conversation size.
  * Source code and JSON-escaped file content tokenize at roughly 3.5–4 bytes
  * per token; assuming 3 overestimates, so the session sheds a little early
@@ -373,13 +417,18 @@ export function createCopilotLmToolSessionTransportV1(
       let totalResultBytes = 0;
       let narrationNudges = 0;
 
-      // Conversation-size budget (see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1).
-      // Unenforced when the host reports no usable limit.
-      const advertisedInputTokens = (resolved.model as { maxInputTokens?: unknown }).maxInputTokens;
-      const contextBudgetTokens =
-        typeof advertisedInputTokens === "number" && advertisedInputTokens > 0
-          ? Math.floor(advertisedInputTokens * TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1)
-          : undefined;
+      // Conversation-size budget (see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1
+      // and MAX_TOOL_SESSION_CONTEXT_TOKENS_V1). The advertised limit only
+      // ever lowers the ceiling, never raises it.
+      const advertisedRaw = (resolved.model as { maxInputTokens?: unknown }).maxInputTokens;
+      const advertisedInputTokens =
+        typeof advertisedRaw === "number" && advertisedRaw > 0 ? advertisedRaw : undefined;
+      const budgetBasisTokens = Math.min(
+        advertisedInputTokens ?? MAX_TOOL_SESSION_CONTEXT_TOKENS_V1,
+        MAX_TOOL_SESSION_CONTEXT_TOKENS_V1
+      );
+      let contextBudgetTokens = Math.floor(budgetBasisTokens * TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1);
+      let orphanedResultRetries = 0;
       // Everything except tool results, which are the only thing ever shed.
       let fixedTokens = estimateLmTokensV1(request.prompt);
       const trackedResultMessages: TrackedToolResultMessageV1[] = [];
@@ -404,8 +453,8 @@ export function createCopilotLmToolSessionTransportV1(
         code: "toolSessionContextBudgetExceeded",
         detail:
           `the conversation is ~${estimate} tokens after ${rounds} round(s) even with every earlier ` +
-          `tool result removed — over this session's ~${contextBudgetTokens} token share of the ` +
-          `model's ${String(advertisedInputTokens)}-token input limit. Sending it anyway would let ` +
+          `tool result removed — over this session's ~${contextBudgetTokens}-token budget ` +
+          `(from a ${budgetBasisTokens}-token input limit). Sending it anyway would let ` +
           "the provider silently drop the start of the conversation. Narrow the prompt or pick a " +
           "model with a larger context.",
       });
@@ -416,9 +465,6 @@ export function createCopilotLmToolSessionTransportV1(
        * seen them yet. Returns false when even that is not enough.
        */
       const fitConversationToBudget = (): boolean => {
-        if (contextBudgetTokens === undefined) {
-          return true;
-        }
         for (let i = 0; i < trackedResultMessages.length - 1; i++) {
           if (conversationTokens() <= contextBudgetTokens) {
             return true;
@@ -461,6 +507,7 @@ export function createCopilotLmToolSessionTransportV1(
         const toolResultParts: unknown[] = [];
         const roundResults: TrackedToolResultV1[] = [];
         let roundToolCallBytes = 0;
+        let orphanedRejectionDetail: string | undefined;
         const roundToolNames: string[] = [];
         let roundResultBytes = 0;
         let sawToolCall = false;
@@ -595,15 +642,46 @@ export function createCopilotLmToolSessionTransportV1(
           // a firewall/HTTP2 message) — the default 200-char bound cut those
           // mid-sentence, so this site gets a wider allowance.
           const detail = boundedTransportDetailV1(error, 800);
-          return {
-            kind: "transportFailure",
-            code: "copilotRequestFailed",
-            ...(detail !== undefined ? { detail } : {}),
-          };
+          // The provider pruned this conversation itself and orphaned a tool
+          // result (see MAX_TOOL_SESSION_CONTEXT_TOKENS_V1): the request, not
+          // the account, was the problem. Retryable only while nothing from
+          // this round has been acted on yet.
+          if (
+            isOrphanedToolResultRejectionV1(detail) &&
+            assistantRawParts.length === 0 &&
+            orphanedResultRetries < MAX_ORPHANED_RESULT_RETRIES_V1
+          ) {
+            orphanedRejectionDetail = detail;
+          } else {
+            return {
+              kind: "transportFailure",
+              code: "copilotRequestFailed",
+              ...(detail !== undefined ? { detail } : {}),
+            };
+          }
         } finally {
           clearTimeout(roundTimer);
           callerCancelSub.dispose();
           roundCts.dispose();
+        }
+        if (orphanedRejectionDetail !== undefined) {
+          // Halve the budget and shed to it, then resend the same round. If
+          // nothing could be shed the retry would send the identical request,
+          // so report the rejection instead.
+          orphanedResultRetries += 1;
+          const before = conversationTokens();
+          contextBudgetTokens = Math.floor(before / 2);
+          fitConversationToBudget();
+          const after = conversationTokens();
+          if (after >= before) {
+            return { kind: "transportFailure", code: "copilotRequestFailed", detail: orphanedRejectionDetail };
+          }
+          // Keep the tighter budget for the rest of the session, but no lower
+          // than what could actually be reached — otherwise the check at the
+          // top of the loop would reject the conversation just shed.
+          contextBudgetTokens = Math.max(contextBudgetTokens, after);
+          round -= 1;
+          continue;
         }
         // A stream that ENDS on cancellation rather than throwing would fall
         // through the try with a truncated round and no error, so the
