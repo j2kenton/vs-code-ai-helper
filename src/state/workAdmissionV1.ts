@@ -2722,7 +2722,49 @@ export function registerPauseRevocationCleanupHookV1(hook: PauseRevocationCleanu
 // the common case, so this almost always resolves in one or two polls.
 const PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 = 20;
 
+// Bounded number of times a caller will attempt to TAKE OVER an
+// apparently-abandoned finish (lock released, barrier still present — see
+// the "winner released without finishing" case below) before conceding to
+// the documented interim gap. Each takeover attempt is itself a full
+// acquire-or-wait cycle, so this is not a tight retry loop; it exists only
+// to stop one caller looping forever against a lock that keeps being won and
+// released-without-finishing by a persistently crashing competitor.
+const PAUSE_REVOCATION_FINISH_TAKEOVER_ATTEMPTS_V1 = 3;
+
 export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
+  for (let takeover = 0; takeover < PAUSE_REVOCATION_FINISH_TAKEOVER_ATTEMPTS_V1; takeover++) {
+    const outcome = await attemptFinishPauseRevocationBarrierOnceV1(taskFolderPath, barrierPath);
+    if (outcome !== "retryTakeover") {
+      return;
+    }
+  }
+}
+
+/**
+ * One acquire-or-wait cycle of `finishPauseRevocationBarrierV1`. Returns
+ * `"retryTakeover"` when this call observed the lock released WITHOUT the
+ * barrier being removed — i.e. the winner exited (successfully or not)
+ * without completing the fence-advance-then-cleanup-then-remove sequence —
+ * so the caller should attempt to become the new winner itself rather than
+ * concede. Every other exit (barrier gone, or the wait bound was exhausted
+ * with the lock still held) returns `"done"`.
+ *
+ * 2026-09-11 review completion blocker (`dceb2646...-2`, fixed): a losing
+ * waiter used to return the instant `!fs.existsSync(lockPath)` was observed,
+ * treating "lock gone" as synonymous with "finished". A winner that threw
+ * partway through `advancePauseFenceForRevocationV1` (or the cleanup hook)
+ * still unlinks its lock in its `finally` — so "lock gone" is also exactly
+ * what a CRASHED-BUT-CAUGHT winner produces, and the barrier is then left
+ * pending forever unless someone retries. Distinguishing the two by also
+ * checking `barrierPath` lets a waiter that sees "lock gone, barrier still
+ * present" take over and actually finish the barrier itself, instead of
+ * conceding under the false assumption that "lock gone" always means
+ * "someone else finished it".
+ */
+async function attemptFinishPauseRevocationBarrierOnceV1(
+  taskFolderPath: string,
+  barrierPath: string
+): Promise<"done" | "retryTakeover"> {
   const lockPath = `${barrierPath}${PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1}`;
   try {
     await fs.promises.writeFile(lockPath, "", { flag: "wx" });
@@ -2744,11 +2786,18 @@ export async function finishPauseRevocationBarrierV1(taskFolderPath: string, bar
       // bound rather than blocking this acquisition indefinitely.
       for (let attempt = 0; attempt < PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1; attempt++) {
         await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
-        if (!fs.existsSync(lockPath) || !fs.existsSync(barrierPath)) {
-          return;
+        if (!fs.existsSync(barrierPath)) {
+          return "done";
+        }
+        if (!fs.existsSync(lockPath)) {
+          // The lock is gone but the barrier is NOT — the winner released
+          // without finishing (threw mid-sequence, or crashed and something
+          // else already reclaimed/removed its lock). Take over rather than
+          // silently conceding as though the barrier were complete.
+          return "retryTakeover";
         }
       }
-      return;
+      return "done";
     }
     throw error;
   }
@@ -2758,7 +2807,7 @@ export async function finishPauseRevocationBarrierV1(taskFolderPath: string, bar
       // Already finished by someone else (or by an earlier call from this
       // same caller) before we won the lock — nothing left to advance the
       // fence FOR.
-      return;
+      return "done";
     }
     await advancePauseFenceForRevocationV1(taskFolderPath);
     // Part 1b step 12's second half. Best-effort: a failure here must never
@@ -2780,6 +2829,7 @@ export async function finishPauseRevocationBarrierV1(taskFolderPath: string, bar
       }
     }
     await removePauseRevocationBarrierV1(barrierPath);
+    return "done";
   } finally {
     // A failure to unlink our own lock (other than ENOENT, already gone)
     // must never mask whatever the `try` block above just did or threw —

@@ -2217,6 +2217,45 @@ void test("finishPauseRevocationBarrierV1 is exclusive under genuine concurrency
   }
 });
 
+void test("finishPauseRevocationBarrierV1 takes over when a prior finisher released its lock without completing the barrier (2026-09-11 review completion blocker `dceb2646...-2`)", async () => {
+  const task = freshTaskFolder("finish-barrier-takeover-after-abandoned-lock");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-abandoned-lock");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  // Simulate a winner that crashed (or threw) strictly between winning the
+  // finish-lock and completing the advance/cleanup/remove sequence: it
+  // unlinked its lock in `finally` (matching this module's own documented
+  // behavior on that path) but never advanced the fence or removed the
+  // barrier. Pre-create the lock, then release it shortly after — while the
+  // barrier is still present — to reproduce exactly that observable state
+  // for a waiter.
+  const lockPath = `${revoked.barrierPath}.finish-lock`;
+  fs.writeFileSync(lockPath, "");
+  setTimeout(() => {
+    fs.unlinkSync(lockPath);
+  }, 150);
+
+  // A previous implementation treated "lock gone" alone as "finished" and
+  // would have conceded here without ever advancing the fence or removing
+  // the barrier. The fix must instead notice the barrier is still present
+  // and take over.
+  await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
+
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceBefore + 1,
+    "a waiter that takes over after an abandoned lock must still advance the fence"
+  );
+  assert.equal(fs.existsSync(revoked.barrierPath), false, "a waiter that takes over must remove the barrier");
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
+});
+
 void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 give a caller a seam to run cleanup between fence-advance and barrier-removal", async () => {
   const task = freshTaskFolder("revocation-two-step-seam");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
