@@ -169,7 +169,7 @@ void test("acquireEarlyWorkAdmissionForCandidatePathV1 logs no containment diagn
   }
 });
 
-void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission when taskRootCandidatePaths is explicitly empty, but now logs a diagnostic naming the ambiguity (2026-09-11 review architectural blocker `d620c877...-1`, narrowed)", async () => {
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission when taskRootCandidatePaths is explicitly empty, but logs a diagnostic naming the ambiguity (2026-09-14 review architectural blocker `d620c877...-1`, attempted-and-reverted this round — see the call site's own doc comment for the regression evidence)", async () => {
   const task = freshTaskFolder("early-admission-containment-empty-root-list");
   fs.writeFileSync(path.join(task, "task.md"), "# Test task\n");
   const realWarn = console.warn;
@@ -187,14 +187,14 @@ void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission 
     assert.equal(
       result?.outcome,
       "acquired",
-      "an explicitly empty root list is still treated as 'cannot evaluate containment', not as 'outside every root' — see the call site's doc comment for why"
+      "an explicitly empty root list is still treated as 'cannot evaluate containment', not as 'outside every root' — a real, on-disk task folder must never lose early admission protection just because no VS Code workspace folder happens to be open (proven by the chatWithStage/renameTaskWithAI/draftTaskWithAI admission-wiring tests, which construct exactly this scenario)"
     );
     assert.ok(
       warnings.some(
         (args) =>
           String(args[0]).includes("task-root candidate list was empty") && String(args[0]).includes(task)
       ),
-      `the unresolved ambiguity must now be diagnosable — got warnings: ${JSON.stringify(warnings)}`
+      `the unresolved ambiguity must be diagnosable — got warnings: ${JSON.stringify(warnings)}`
     );
     if (result?.outcome === "acquired") {
       await result.handle.release();
@@ -1792,6 +1792,65 @@ void test("beginTargetResolutionV1 root marker acquisition is best-effort: a roo
   }
 });
 
+void test("beginTargetResolutionV1 reports a still-contended root as unprotected (never writeFailed) when nothing durable protects it by the time retries are exhausted, and a caller aborting dispatch on it never leaves a stuck resolution counter (2026-09-14 review architectural blocker `b5a1f851...-0`, fixed)", async () => {
+  const root = freshTaskFolder("resolution-in-flight-genuinely-unprotected");
+  const otherOwner = await acquireWorkAdmissionV1({
+    taskFolderPath: root,
+    purpose: "admission",
+    commandId: "unrelated-admission-holder",
+  });
+  assert.equal(otherOwner.outcome, "acquired");
+  if (otherOwner.outcome !== "acquired") return;
+  const realError = console.error;
+  const errors: unknown[][] = [];
+  console.error = (...args: unknown[]): void => {
+    errors.push(args);
+  };
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    // Release the only thing durably protecting `root` at the exact instant
+    // between the last synchronous retry and the unprotected-roots check —
+    // the narrow window the field's own doc comment describes, otherwise
+    // impractical to hit with real retry-interval timing.
+    onBeforeUnprotectedRootsCheckAsync: async () => {
+      await otherOwner.handle.release();
+    },
+  });
+  try {
+    const handle = await beginTargetResolutionV1([root]);
+    try {
+      assert.deepEqual(handle.rootPaths, [], "no marker of this window's own was ever granted for the contended root");
+      assert.deepEqual(handle.writeFailedRootPaths, [], "ordinary contention clearing is not a write failure");
+      assert.deepEqual(
+        handle.unprotectedRootPaths,
+        [root],
+        "nothing durable protects this root by the time retries are exhausted — it must be reported, not silently treated as protected"
+      );
+      assert.equal(
+        hasDurableResolutionInFlightV1([root]),
+        false,
+        "confirms the root really is unprotected on disk, not merely reported as such"
+      );
+      assert.ok(
+        errors.some((args) => String(args[0]).includes("genuinely unprotected") && String(args[0]).includes(root)),
+        `the genuinely-unprotected case must be logged distinctly from ordinary contention — got errors: ${JSON.stringify(errors)}`
+      );
+    } finally {
+      // Mirrors every real caller (chatWithStage.ts et al.): abort dispatch
+      // on a non-empty unprotectedRootPaths, releasing the handle via the
+      // same finally-path a real command uses.
+      await endTargetResolutionV1(handle);
+    }
+    assert.equal(
+      hasResolutionInFlightBestEffortV1(),
+      false,
+      "aborting dispatch after unprotectedRootPaths must not leave the same-process resolution-in-flight counter stuck"
+    );
+  } finally {
+    console.error = realError;
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+});
+
 void test("beginTargetResolutionV1's durable root marker path is classified workflowControl", () => {
   const root = freshTaskFolder("resolution-in-flight-classification");
   const markerPath = path.join(root, ADMISSION_DIRNAME_V1, "admission.some-owner.g1.abc123");
@@ -2441,6 +2500,71 @@ void test("a new acquisition automatically finishes a pending revocation barrier
 
   await next.handle.release();
   await assert.doesNotReject(() => stale.handle.release());
+});
+
+void test("a real failure finishing a pending revocation barrier fails the acquisition closed (writeFailed), never publishes admission over an unfinished barrier (2026-09-14 review completion blocker `dceb2646...-2`)", async () => {
+  const task = freshTaskFolder("barrier-finish-failure-fails-closed");
+  const stale = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(stale.outcome, "acquired");
+  if (stale.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-failure-case");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  // Release the revoked claim's own (same-process) handle now, simulating
+  // the real scenario the fence protocol targets: a SUSPENDED or crashed
+  // original owner, whose process-local bookkeeping is gone, not merely an
+  // on-disk record that happens to still be tracked in this same test
+  // process's `localHandlesV1`. Without this, `hasLiveWorkAdmissionBestEffortV1`
+  // below would report "live" purely because `stale`'s own handle is still
+  // held in-process — a same-process test artifact, not a signal about
+  // whether the NEW acquisition (under test) published anything. Safe to
+  // call after revocation: the marker was already renamed away, so this
+  // hits the handle's own ENOENT-is-displaced path, same as
+  // `assert.doesNotReject` below already expected at end-of-test.
+  await assert.doesNotReject(() => stale.handle.release());
+  const fenceBeforeAttempt = await readOrInitPauseFenceGenerationV1(task);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 1);
+
+  const injectedError = Object.assign(new Error("simulated EACCES finishing revocation barrier"), { code: "EACCES" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeBarrierFinishInAcquisition: () => injectedError,
+  });
+  try {
+    const next = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "real-work" });
+    assert.equal(next.outcome, "writeFailed", "a real barrier-finish failure must fail the acquisition closed, not proceed regardless");
+    if (next.outcome === "writeFailed") {
+      assert.equal(next.error, injectedError);
+    }
+    assert.equal(
+      await readOrInitPauseFenceGenerationV1(task),
+      fenceBeforeAttempt,
+      "a failed acquisition must never have advanced the fence past the still-unfinished barrier"
+    );
+    assert.equal(
+      listPendingPauseRevocationBarriersV1(task).length,
+      1,
+      "the barrier must survive a failed finish attempt, unfinished, for a later claimant to retry"
+    );
+    assert.equal(
+      hasLiveWorkAdmissionBestEffortV1(task),
+      false,
+      "the failed acquisition must not have published a marker while a pending barrier was unfinished"
+    );
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+
+  // With the injected failure cleared, a later acquisition must still be
+  // able to finish the barrier and proceed normally — the failure above was
+  // transient, not a permanent stranding of the task.
+  const retry = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "real-work-retry" });
+  assert.equal(retry.outcome, "acquired");
+  if (retry.outcome !== "acquired") return;
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceBeforeAttempt + 1);
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
+
+  await retry.handle.release();
 });
 
 void test("purpose-aware likelyStale threshold: a pauseCommit marker is flagged stale at 5 minutes; an admission marker at the same age is not", async () => {

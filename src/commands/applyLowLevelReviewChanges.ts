@@ -6,6 +6,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * Apply low-level review changes. This command provides a concrete entry point
@@ -83,7 +84,10 @@ export async function applyLowLevelReviewChanges(
   if (resolvedTask.progress.currentStage === "impl-low-review") {
     assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
 
-    if (resolvedTask.progress.status === "paused") {
+    // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+    // identical check for why this must use the resolver rather than the raw
+    // `status` field.
+    if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
       NotificationRouter.showWarning(
         "Task is paused. Resume it before applying review changes."
       );
@@ -104,7 +108,10 @@ export async function applyLowLevelReviewChanges(
     return editDispatched === true;
   }
 
-  if (resolvedTask.progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+  // identical check for why this must use the resolver rather than the raw
+  // `status` field.
+  if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
     NotificationRouter.showWarning(
       "Task is paused. Resume it before applying review changes."
     );

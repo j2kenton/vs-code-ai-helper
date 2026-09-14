@@ -5,28 +5,28 @@
   "entries": [
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 334,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision. (Line moved 332 -> 333 -> 334 as the 2026-09-11 target-resolution write-failure fix and the shared early-admission-helper wiring fix each added an import above it; call is unchanged.)"
+      "line": 336,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow — the modal preview of the exact commit message and destination before it ships, with an inline 'Regenerate' retry. Not a review/round workflow decision. (Line moved 332 -> 333 -> 334 -> 335 -> 336 as the 2026-09-11 target-resolution write-failure fix, the shared early-admission-helper wiring fix, the 2026-09-14 unprotectedRootPaths check, and the same day's pause-resolver import each added an import/block above it; call is unchanged.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 1795,
-      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794 -> 1795, see commitAndPushTask.ts:334's note.)"
+      "line": 1797,
+      "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794 -> 1795 -> 1796 -> 1797, see commitAndPushTask.ts:336's note.)"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
-      "line": 2189,
-      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push. (Line moved 2187 -> 2188 -> 2189, see commitAndPushTask.ts:334's note.)"
+      "line": 2191,
+      "reason": "Direct synchronous confirmation inside the user-invoked Commit & Push flow, offering to view the full file list before an outward-facing, largely irreversible push. (Line moved 2187 -> 2188 -> 2189 -> 2190 -> 2191, see commitAndPushTask.ts:336's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8010,
-      "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round."
+      "line": 8020,
+      "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round. (Line moved 8010 -> 8020 as the 2026-09-14 pause-resolver wiring fix added an import/blocks above it; call is unchanged.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 9181,
-      "reason": "Pre-run safety check synchronously inline in the user-invoked 'Run Implementation' command (unrelated uncommitted changes in the workspace) — a git-safety confirmation, not a review/round outcome."
+      "line": 9200,
+      "reason": "Pre-run safety check synchronously inline in the user-invoked 'Run Implementation' command (unrelated uncommitted changes in the workspace) — a git-safety confirmation, not a review/round outcome. (Line moved 9181 -> 9200, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/runLintingFixes.ts",
@@ -73,13 +73,13 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 677,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 as admission-registration edits landed on this route; call is unchanged.)"
+      "line": 689,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 → 689 as admission-registration edits, including the 2026-09-14 unprotectedRootPaths check, landed on this route; call is unchanged.)"
     },
     {
       "file": "src/commands/draftTaskWithAI.ts",
-      "line": 418,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved 384 → 385 → 386 → 385 → 417 → 418 as admission-registration edits landed on this route; call is unchanged.)"
+      "line": 419,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Draft with AI command when no model is configured for the Description stage — points to Ensemble Settings, not a review/round decision. (Line moved 384 → 385 → 386 → 385 → 417 → 418 → 419 as admission-registration edits, including the 2026-09-14 unprotectedRootPaths check, landed on this route; call is unchanged.)"
     },
     {
       "file": "src/commands/generatePlanWithAI.ts",
@@ -88,8 +88,8 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 11736,
-      "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision."
+      "line": 11762,
+      "reason": "Synchronous pre-dispatch gate inline in the create-implementation-checklist path when no model is configured for Implementation — points to Ensemble Settings, not a review/round decision. (Line moved 11736 -> 11762 as the 2026-09-14 pause-resolver wiring fix added imports/blocks above it; call is unchanged.)"
     },
     {
       "file": "src/commands/markTaskDone.ts",
@@ -98,18 +98,18 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8251,
-      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a required completion artifact is missing — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183."
+      "line": 8261,
+      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a required completion artifact is missing — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183. (Line moved 8251 -> 8261, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8285,
-      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a plan-review blocker is not recorded as resolved — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183."
+      "line": 8295,
+      "reason": "Direct synchronous 'Complete Anyway' gate inline in the stage-advance command when a plan-review blocker is not recorded as resolved — re-invokes the same command with an explicit override, the same pattern as markTaskDone.ts:183. (Line moved 8285 -> 8295, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2214,
-      "reason": "Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome."
+      "line": 2215,
+      "reason": "Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome. (Line moved 2214 -> 2215, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/runLintingFixes.ts",
@@ -123,23 +123,23 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 2954,
-      "reason": "Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15)."
+      "line": 2955,
+      "reason": "Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15). (Line moved 2954 -> 2955, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8484,
-      "reason": "Publish Anyway nudge pointing at commitAndPushTask when the Complete & Move On Publish review could not be started automatically (another review in progress) — the drop reason is already logged; this only offers the manual alternative."
+      "line": 8500,
+      "reason": "Publish Anyway nudge pointing at commitAndPushTask when the Complete & Move On Publish review could not be started automatically (another review in progress) — the drop reason is already logged; this only offers the manual alternative. (Line moved 8484 -> 8500, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8510,
-      "reason": "Publish Anyway nudge pointing at commitAndPushTask when the entry-owned publish preflight check failed — the failure reason is named in the message; this only offers the manual alternative."
+      "line": 8526,
+      "reason": "Publish Anyway nudge pointing at commitAndPushTask when the entry-owned publish preflight check failed — the failure reason is named in the message; this only offers the manual alternative. (Line moved 8510 -> 8526, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 8525,
-      "reason": "Publish nudge pointing at commitAndPushTask when the entry-owned publish preflight check passed — Commit and Push must only ever run from the user's own click, so this only nudges toward it."
+      "line": 8541,
+      "reason": "Publish nudge pointing at commitAndPushTask when the entry-owned publish preflight check passed — Commit and Push must only ever run from the user's own click, so this only nudges toward it. (Line moved 8525 -> 8541, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/setTaskStage.ts",
@@ -148,23 +148,23 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10096,
-      "reason": "Nudge to run this stage's review after an Implementation round reported nothing to fix — the round's own outcome is recorded in the run log and chat ledger; this toast only points at the single follow-up command (Run Review) already named in the message text."
+      "line": 10115,
+      "reason": "Nudge to run this stage's review after an Implementation round reported nothing to fix — the round's own outcome is recorded in the run log and chat ledger; this toast only points at the single follow-up command (Run Review) already named in the message text. (Line moved 10096 -> 10115, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10290,
-      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision (no activating extension context) — the checklist-under-recording case (the checklist still shows unfinished items even though the most recent review already scored full marks with zero blockers)."
+      "line": 10309,
+      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision (no activating extension context) — the checklist-under-recording case (the checklist still shows unfinished items even though the most recent review already scored full marks with zero blockers). (Line moved 10290 -> 10309, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 10547,
-      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — same fallback-of-a-migrated-decision pattern as copilotImplementationRunner.ts:794, just for the checklist-reconciliation decision instead of the round-limit gate."
+      "line": 10566,
+      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — same fallback-of-a-migrated-decision pattern as copilotImplementationRunner.ts:794, just for the checklist-reconciliation decision instead of the round-limit gate. (Line moved 10547 -> 10566, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "line": 11185,
-      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — the unverified-step-counts case."
+      "line": 11204,
+      "reason": "Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — the unverified-step-counts case. (Line moved 11185 -> 11204, see reviewActions.ts:8020's note.)"
     },
     {
       "file": "src/commands/startNewTask.ts",

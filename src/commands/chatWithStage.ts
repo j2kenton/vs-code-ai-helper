@@ -62,6 +62,7 @@ import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
@@ -419,6 +420,17 @@ export async function chatWithStage(
   // silently fall through to same-process-only protection.
   if (targetResolutionHandle && targetResolutionHandle.writeFailedRootPaths.length > 0) {
     NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): no durable
+  // protection at all (not even a foreign window's) could be confirmed for
+  // this resolution window after exhausting retries — see
+  // `TargetResolutionHandleV1.unprotectedRootPaths`'s doc comment for why
+  // this is a same-tick verification, not a new wait, and safe to fail
+  // dispatch on immediately rather than proceed into setup unprotected.
+  if (targetResolutionHandle && targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
     await endTargetResolutionV1(targetResolutionHandle);
     return;
   }

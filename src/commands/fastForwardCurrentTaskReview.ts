@@ -5,6 +5,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { checkEditActionProviderPathGateV1 } from "./runEditActionV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * Keyboard shortcut router: runs Fast Forward Review against the current
@@ -50,7 +51,13 @@ export async function fastForwardCurrentTaskReview(
     return;
   }
 
-  if (resolvedTask.progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+  // command self-checks"): a watchdog pause whose fence generation a
+  // revocation has since advanced past must not block this shortcut — the
+  // raw `status` field on disk can lag the durable revocation until some
+  // later admission acquisition finishes the barrier and repairs it. A user
+  // or quota pause is unaffected: the resolver always treats those as real.
+  if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
     NotificationRouter.showWarning(
       "Task is paused. Resume it before using this shortcut."
     );

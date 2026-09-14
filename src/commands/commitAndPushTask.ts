@@ -59,6 +59,7 @@ import {
   acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
@@ -69,6 +70,7 @@ import {
   reconcileWatchdogPauseAgainstAdmissionV1,
   WorkAdmissionPauseReconciliationV1,
 } from "../state/workAdmissionReconciliationV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 /**
@@ -2812,6 +2814,14 @@ export async function commitAndPushTask(
     releaseCommitPushToken();
     return;
   }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
   // 2026-09-11 review architectural blocker (`d620c877...-1`): `earlyFolderPath`
   // is a raw, unvalidated caller-supplied path (or a best-effort in-memory
   // peek) — this now goes through the same shared
@@ -3014,6 +3024,14 @@ export async function completeCommitAndPushTask(
     releaseCommitPushToken();
     return;
   }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
   // 2026-09-11 review architectural blocker (`d620c877...-1`): route through
   // the shared early-admission helper (validation-before-bookkeeping plus
   // containment observability) instead of acquiring directly against an
@@ -3123,11 +3141,19 @@ export async function completeCommitAndPushTask(
     // ran at all (`reconcileOutcome === undefined` — admission itself could
     // not be acquired for this candidate) does the snapshot remain the only
     // available signal.
+    // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+    // command self-checks"): the fallback branch (reconciliation never ran —
+    // admission itself could not be acquired) used to trust the raw `status`
+    // field directly, which wrongly reports "still paused" for a watchdog
+    // pause a revocation has already advanced the fence past but whose
+    // on-disk `status` some later admission acquisition has not yet repaired.
+    // The resolver's fence check is independent of admission acquisition, so
+    // it applies here exactly as well as it would have with a live marker.
     const stillGenuinelyPaused =
       !!resolvedTask &&
       (reconcileOutcome
         ? reconcileOutcome.outcome === "userPaused" || reconcileOutcome.outcome === "unreadable"
-        : resolvedTask.progress.status === "paused");
+        : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress));
 
     if (!resolvedTask || stillGenuinelyPaused) {
       if (resolverArg) {

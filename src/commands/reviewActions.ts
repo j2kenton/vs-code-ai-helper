@@ -26,6 +26,7 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
@@ -4044,7 +4045,16 @@ async function routeReviewOutcomeV1(
             // stale/hardcoded "not paused" here would let shouldAutoReview
             // fire anyway even though the task is now paused.
             const freshProgressForAdvance = await readTaskProgressAdvisoryV1(folderUri);
-            const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
+            // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive
+            // read ... automation gates"): a watchdog pause whose fence
+            // generation a revocation has already advanced past must not
+            // halt auto-advance — the raw `status` field on disk can lag the
+            // durable revocation until some later admission acquisition
+            // repairs it. A genuine user pause (the scenario this check
+            // exists for) is unaffected: the resolver always treats it as real.
+            const isPausedForAdvance = freshProgressForAdvance
+              ? await isEffectivelyPausedV1(folderUri.fsPath, freshProgressForAdvance)
+              : false;
             const transition = await advanceStageViaNextStageRowV1(
               folderUri,
               {
@@ -8328,13 +8338,19 @@ export async function nextStage(
   // recovery).
   let transitionResult: StageTransitionResult | undefined;
   try {
+    // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+    // automation gates"): `isPaused` here suppresses `shouldAutoReview` — a
+    // watchdog pause whose fence generation a revocation has already advanced
+    // past must not silently block auto-continuing into the next review, the
+    // same defect class as fastForwardCurrentTaskReview.ts's identical check.
+    const isPausedForTransition = await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress);
     transitionResult = await advanceStageViaNextStageRowV1(
       resolved.folderUri,
       resolved.progress,
       resolved.progress.status,
       resolved.progress.currentStage,
       next,
-      resolved.progress.status === "paused",
+      isPausedForTransition,
       // Completing a stage may start work in its destination only when
       // the workspace explicitly enables that behavior. Manual stage
       // selection deliberately does not use this path.
@@ -8813,7 +8829,10 @@ export async function generateImplementationWithAI(
   if (!resolved) {
     return;
   }
-  if (resolved.progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+  // identical check for why this must use the resolver rather than the raw
+  // `status` field.
+  if (await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress)) {
     NotificationRouter.showInformation("This task is paused. Resume it before generating implementation notes.");
     return;
   }
@@ -11327,7 +11346,14 @@ async function executeImplementationRun(
     if (isAutoAdvanceEnabled()) {
       try {
         const freshProgress = await readTaskProgressAdvisoryV1(folderUri);
-        if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
+        // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive
+        // read ... automation gates"): see fastForwardCurrentTaskReview.ts's
+        // identical check for why this must use the resolver rather than the
+        // raw `status` field.
+        if (
+          freshProgress?.currentStage === "impl" &&
+          !(await isEffectivelyPausedV1(folderUri.fsPath, freshProgress))
+        ) {
           const transition = await advanceStageViaNextStageRowV1(
             folderUri,
             freshProgress,
@@ -12972,7 +12998,10 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     return;
   }
   let progress: TaskProgress = strictRelease.decoded.progress;
-  if (progress.currentStage !== "publish" || progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+  // identical check for why this must use the resolver rather than the raw
+  // `status` field.
+  if (progress.currentStage !== "publish" || (await isEffectivelyPausedV1(candidateUri.fsPath, progress))) {
     NotificationRouter.showWarning("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
     return;
   }

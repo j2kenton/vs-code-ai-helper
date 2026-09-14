@@ -46,6 +46,7 @@ import {
   acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireOrAdoptWorkAdmissionV1,
   beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
@@ -605,6 +606,13 @@ export async function draftTaskWithAI(
   // silently fall through to same-process-only protection.
   if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
     NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
     await endTargetResolutionV1(targetResolutionHandle);
     return;
   }

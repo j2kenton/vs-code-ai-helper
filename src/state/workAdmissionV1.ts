@@ -563,35 +563,65 @@ export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
    * Currently known valid task-root candidates (`resolveTaskRootCandidates().map(c
    * => c.absolutePath)`), when the caller already has them computed — every
    * current caller does, immediately before this call, for `beginTargetResolutionV1`.
-   * Diagnostic only (see `isPathOutsideAllTaskRootsV1`'s doc comment for why
-   * this narrows observability rather than gating acquisition): an omitted or
-   * empty array disables the check entirely, exactly like today.
+   * Diagnostic only for the empty case (see `isPathOutsideAllTaskRootsV1`'s doc
+   * comment and the block below for why): an omitted or empty array disables
+   * the containment REFUSAL, exactly like today.
    */
   readonly taskRootCandidatePaths?: readonly string[];
 }): Promise<WorkAdmissionResultV1 | undefined> {
   if (!params.candidatePath || !looksLikeTaskFolderPathV1(params.candidatePath)) {
     return undefined;
   }
-  // 2026-09-11 review architectural blocker (`d620c877...-1`, narrowed):
-  // `taskRootCandidatePaths` explicitly provided but EMPTY is genuinely
-  // ambiguous — see `isPathOutsideAllTaskRootsV1`'s doc comment for why it
-  // fails open here (return `false`, "cannot evaluate") rather than treating
-  // an empty list as "the candidate is outside every root" (`workspaceFolders`
-  // being momentarily unpopulated is indistinguishable, at this call site,
-  // from a workspace that genuinely has none, and the earlier revert this
-  // module's own history records was specifically about silently skipping
-  // protection for a legitimate candidate caught in that ambiguity). This is
-  // NOT resolved this round — doing so safely needs a positive signal this
-  // call site does not have, which is why it is carried as a blocker rather
-  // than closed by observability alone — but it is now at least diagnosable,
-  // matching the sibling case just below.
+  // 2026-09-14 review architectural blocker (`d620c877...-1`): attempted this
+  // round to treat an explicitly EMPTY `taskRootCandidatePaths` as
+  // authoritative ("no workspace folder is open, so no legitimate task folder
+  // can exist here") and skip early acquisition, on the theory that a real
+  // `candidatePath` could only reach this call after the SAME
+  // `resolveTaskRootCandidates()` had already produced a non-empty list for
+  // something else (e.g. the tree that was clicked) to exist.
+  //
+  // REVERTED the same round: that theory is false, proven by running the
+  // full suite, not just re-reasoning about it. Three admission-wiring tests
+  // regressed the moment this shipped —
+  // `chatWithStageWorkAdmission.test.ts`'s and
+  // `renameTaskWithAIWorkAdmission.test.ts`'s "refuses with the busy
+  // diagnostic ... before task resolution", and
+  // `draftTaskWithAIWorkAdmission.test.ts`'s consent-modal-gating
+  // equivalent — because their fixtures construct a real, on-disk task
+  // folder (`task.md` present) and call the command directly with an
+  // explicit `taskFolderPath`, without needing (or configuring) an open
+  // VS Code workspace folder at all. That is not a test artifact to route
+  // around: `workflowRuntimeServicesV1.test.ts`'s own "accepts an
+  // ownership-backed folder with NO workspace open, containing against its
+  // own ownership.metaRoot" proves Ensemble already treats a task folder as
+  // legitimate purely via its own persisted ownership metadata, independent
+  // of whether any workspace folder is currently open — so "workspace
+  // closed" and "no legitimate task folder can exist" are NOT the same
+  // fact, contrary to this round's premise. Skipping early acquisition on
+  // that false premise reproduced exactly the failure mode this module's own
+  // history already records for the earlier, harder gate: silently skipping
+  // protection for a legitimate candidate and reopening the watchdog trap
+  // Part 1a exists to close — a worse outcome than the narrower containment
+  // gap the skip aimed to close. Restored to fail-open (still diagnosed) for
+  // the empty case; the positively-outside-every-KNOWN-root refusal just
+  // below is unaffected and remains safe, since it only fires when
+  // containment genuinely IS knowable.
+  //
+  // This blocker is NOT resolved. Closing it for real needs a positive,
+  // workspace-independent legitimacy signal at this synchronous, pre-await
+  // call site (e.g. reading the candidate's own persisted ownership record,
+  // mirroring `workflowRuntimeServicesV1`'s registration check) rather than
+  // inferring legitimacy from workspace-folder state, which this round
+  // demonstrated is unsound. Building and testing that signal is a real
+  // design task, carried forward rather than attempted again under time
+  // pressure that already produced one regression.
   if (params.taskRootCandidatePaths && params.taskRootCandidatePaths.length === 0) {
     console.warn(
       `acquireEarlyWorkAdmissionForCandidatePathV1: candidate "${params.candidatePath}" (command ` +
         `"${params.commandId}") looks like a task folder, but the caller's task-root candidate list was empty — ` +
         "proceeding with early admission bookkeeping WITHOUT a containment check (cannot distinguish 'no " +
-        "workspace open' from 'workspaceFolders not yet populated'; see isPathOutsideAllTaskRootsV1's doc " +
-        "comment). Authoritative resolution below is unaffected."
+        "workspace open' from a workspace-independent, ownership-backed task folder; see this call site's own " +
+        "doc comment). Authoritative resolution below is unaffected."
     );
   }
   if (
@@ -894,6 +924,43 @@ export interface TargetResolutionHandleV1 {
    * today's fail-open behavior unchanged — this is purely additive.
    */
   readonly writeFailedRootPaths: readonly string[];
+  /**
+   * Task roots still unprotected when this call returned because every
+   * synchronous retry saw ordinary `busy` contention (never a write error —
+   * that case is `writeFailedRootPaths` instead) — narrowed further, per
+   * root, to only those where NO durable protection exists for anyone:
+   * `hasLiveWorkAdmissionBestEffortV1(rootPath)` was checked and found
+   * nothing live on disk at all.
+   *
+   * 2026-09-14 review architectural blocker (`b5a1f851...-0`, fixed): ordinary
+   * `busy` contention almost never actually means "unprotected" — `busy` can
+   * only be returned when a real claim or marker exists on disk at that root
+   * right now, and that exact record is what `hasDurableResolutionInFlightV1`
+   * (the cross-window sweep's own check) also observes, regardless of
+   * whether THIS window's own attempt won it. So the common case — another
+   * window's own concurrent, legitimate resolution, or any other live
+   * admission at that root — is already durably protected the whole time,
+   * borrowed rather than owned; only excluding it from `writeFailedRootPaths`
+   * (as before) while leaving the caller no way to tell "busy-but-someone-
+   * else-durably-protects-it" apart from "busy-but-nothing-protects-it-at-all"
+   * was the actual gap. This field isolates the second, genuinely rare case:
+   * every retry found the shared claim or an existing marker, yet by the time
+   * this call re-checked, nothing was left on disk (the blocking record
+   * cleared in the narrow gap between the last failed attempt and this
+   * check). Unlike a longer wait (tried and reverted — see this function's
+   * own doc comment on `RESOLUTION_MARKER_SYNC_RETRY_ATTEMPTS_V1`'s sibling
+   * comment above), this is a same-tick verification, not a new wait, so it
+   * cannot reproduce that regression or hang a command: a caller that checks
+   * this field (mirroring `writeFailedRootPaths`'s already-established
+   * pattern) gets an immediate, bounded, user-visible refusal — never an
+   * indefinite block — exactly when durable protection is verifiably absent,
+   * satisfying "a command does not begin setup until durable admission
+   * succeeds; local-only protection is never sufficient" for the one case
+   * where that is actually true. A caller that does not check it keeps
+   * today's fail-open behavior unchanged — this is purely additive, like
+   * `writeFailedRootPaths` before it.
+   */
+  readonly unprotectedRootPaths: readonly string[];
   /** @internal stops the background retry loop; called by
    * `endTargetResolutionV1` before it reads `rootPaths` for release. */
   readonly stopRetryingV1: () => void;
@@ -1105,10 +1172,27 @@ export async function beginTargetResolutionV1(
   // `endTargetResolutionV1`'s release bookkeeping, never to decide whether
   // to proceed.
   const writeFailedRootPaths = Array.from(pendingRoots).filter((rootPath) => lastWriteFailureByRootV1.has(rootPath));
+  // `unprotectedRootPaths` (`b5a1f851...-0`, fixed): a same-tick disk check,
+  // not a further wait — see that field's own doc comment for why this is
+  // narrower than, and safe alongside, `writeFailedRootPaths`.
+  await fsFailureInjectionV1?.onBeforeUnprotectedRootsCheckAsync?.();
+  const unprotectedRootPaths = Array.from(pendingRoots).filter(
+    (rootPath) => !lastWriteFailureByRootV1.has(rootPath) && !hasLiveWorkAdmissionBestEffortV1(rootPath)
+  );
+  if (unprotectedRootPaths.length > 0) {
+    console.error(
+      `beginTargetResolutionV1: ${unprotectedRootPaths.length} task root(s) remain genuinely unprotected — ` +
+        "no durable claim or marker exists for them at all (not even a foreign one this window can rely on) " +
+        `after ${RESOLUTION_MARKER_SYNC_RETRY_ATTEMPTS_V1} synchronous retries: ${unprotectedRootPaths.join(", ")}. ` +
+        "Background retry continues; a caller checking TargetResolutionHandleV1.unprotectedRootPaths may abort " +
+        "its own dispatch on this, mirroring writeFailedRootPaths."
+    );
+  }
 
   return {
     rootPaths: acquiredRoots,
     writeFailedRootPaths,
+    unprotectedRootPaths,
     stopRetryingV1: (): void => {
       stopped = true;
       if (retryTimer) {
@@ -1167,6 +1251,21 @@ export async function endTargetResolutionV1(handle?: TargetResolutionHandleV1): 
 export function describeTargetResolutionWriteFailureV1(handle: TargetResolutionHandleV1): string {
   const [firstRoot] = handle.writeFailedRootPaths;
   return `Could not start this stage action: failed to write task-admission bookkeeping for "${firstRoot}".`;
+}
+
+/**
+ * User-facing message for a `beginTargetResolutionV1` call that returned one
+ * or more `unprotectedRootPaths` — see that field's doc comment. Callers
+ * should show this and abort dispatch (after releasing the handle via
+ * `endTargetResolutionV1`) rather than proceed into setup with no durable
+ * cross-window protection at all.
+ */
+export function describeTargetResolutionUnprotectedRootsV1(handle: TargetResolutionHandleV1): string {
+  const [firstRoot] = handle.unprotectedRootPaths;
+  return (
+    `Could not start this stage action: task-root admission for "${firstRoot}" is currently contended and no ` +
+    "durable protection could be confirmed. Please try again."
+  );
 }
 
 /** True while ANY same-process command is between `beginTargetResolutionV1()`
@@ -1531,6 +1630,37 @@ export interface WorkAdmissionFsFailureInjectionV1 {
    * tests; never used by production code paths.
    */
   readonly onBeforeRevocationRenameAsync?: () => Promise<void>;
+  /**
+   * 2026-09-14 review completion blocker (`dceb2646...-2`): a real filesystem
+   * failure while `acquireWorkAdmissionCoreV1` completes a pending revocation
+   * barrier (listing, or `finishPauseRevocationBarrierV1` itself) is otherwise
+   * impractical to force deterministically — it would require breaking a real
+   * `mkdir`/exclusive-create/`unlink` call inside `ensurePauseFenceAtLeastV1`
+   * or `removePauseRevocationBarrierV1` in a way that survives Windows file
+   * permission quirks. Checked once per pending barrier, immediately before
+   * `finishPauseRevocationBarrierV1` runs for it, so a test can force the
+   * acquisition's own fail-closed handling without depending on real broken
+   * filesystem state. `undefined` outside tests; never used by production
+   * code paths.
+   */
+  readonly onBeforeBarrierFinishInAcquisition?: () => Error | undefined;
+  /**
+   * 2026-09-14 review architectural blocker (`b5a1f851...-0`): deterministically
+   * reproduces `TargetResolutionHandleV1.unprotectedRootPaths`'s own narrow
+   * target case — "every retry saw `busy`, but the blocking record cleared in
+   * the gap between the last failed attempt and this check" — which is
+   * otherwise a same-tick race far too narrow to hit reliably with a real
+   * `setTimeout`-based test against `beginTargetResolutionV1`'s real
+   * `RESOLUTION_MARKER_SYNC_RETRY_ATTEMPTS_V1` retry spacing. Awaited once,
+   * immediately before `beginTargetResolutionV1` computes `unprotectedRootPaths`
+   * from whatever is left in `pendingRoots` after its synchronous retries are
+   * exhausted. A test uses this to release a blocking marker at exactly that
+   * instant, deterministically forcing the "still pending, but nothing
+   * durable protects it" branch instead of the far more common "still
+   * pending, and a live marker durably protects it either way" branch.
+   * `undefined` outside tests; never used by production code paths.
+   */
+  readonly onBeforeUnprotectedRootsCheckAsync?: () => Promise<void>;
 }
 let fsFailureInjectionV1: WorkAdmissionFsFailureInjectionV1 | undefined;
 export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmissionFsFailureInjectionV1 | undefined): void {
@@ -1657,35 +1787,44 @@ async function acquireWorkAdmissionCoreV1(
   // fence generation (once the effective-pause-status resolver is wired,
   // plan step 13, still open), never on the barrier FILE's continued
   // presence; the file was always only a "someone still owes an advance"
-  // reminder, not a correctness requirement in itself. Best effort: a
-  // failure here must never block or fail this acquisition, the same
-  // fail-open direction every other diagnostic-only check in this module
-  // takes.
+  // reminder, not a correctness requirement in itself.
+  //
+  // 2026-09-14 review completion blocker (`dceb2646...-2`, fixed): a REAL
+  // filesystem failure while listing or finishing a pending barrier used to
+  // be swallowed (logged, then acquisition proceeded regardless), which is
+  // exactly what let admission publish — or a new pause start — before every
+  // pending barrier had completed, violating plan step 12's "before
+  // publishing admission or starting another pause" precondition. This is
+  // NOT the same class of failure `performPauseRevocationBarrierFinishSequenceV1`
+  // treats as fail-open internally (an already-finished barrier, a
+  // concurrent finisher converging on the same target generation, a missing
+  // cleanup hook) — those are routine races the function already absorbs
+  // without throwing. What reaches this catch is a genuine write failure:
+  // `ensurePauseFenceAtLeastV1`'s own `mkdir`/exclusive-create calls, the
+  // barrier's `unlink`, or `listPendingPauseRevocationBarriersV1`'s
+  // `readdirSync` failing for a real, non-ENOENT reason. Treating that the
+  // same way every other real write failure in this function already does —
+  // `writeFailed`, aborting the acquisition before it publishes anything —
+  // is consistent with the existing mkdir/claim-write failure handling below,
+  // not a new failure mode: a task whose admission directory cannot durably
+  // record a fence advance already cannot durably record a claim or marker
+  // either, so this does not trade a working task for a broken one.
+  let pendingBarrierPaths: readonly string[];
   try {
-    for (const barrierPath of listPendingPauseRevocationBarriersV1(taskFolderPath)) {
-      try {
-        await finishPauseRevocationBarrierV1(taskFolderPath, barrierPath);
-      } catch (error) {
-        console.error(
-          `acquireWorkAdmissionCoreV1: failed to finish pending revocation barrier ` +
-            `"${barrierPath}" — proceeding with acquisition regardless.`,
-          error
-        );
-      }
-    }
+    pendingBarrierPaths = listPendingPauseRevocationBarriersV1(taskFolderPath);
   } catch (error) {
-    // `listPendingPauseRevocationBarriersV1` itself throws on a real,
-    // non-ENOENT filesystem error (e.g. the admission directory's parent
-    // path is not actually a directory) rather than treating it as "no
-    // barriers" — correct for a caller that needs to distinguish real
-    // failures, but this diagnostic-only check must never let such a failure
-    // pre-empt this acquisition's OWN (also fail-open-consistent) handling of
-    // the exact same underlying obstruction a few lines below.
-    console.error(
-      `acquireWorkAdmissionCoreV1: failed to list pending revocation barriers for "${taskFolderPath}" — ` +
-        "proceeding with acquisition regardless.",
-      error
-    );
+    return { outcome: "writeFailed", error: error as Error };
+  }
+  for (const barrierPath of pendingBarrierPaths) {
+    try {
+      const injected = fsFailureInjectionV1?.onBeforeBarrierFinishInAcquisition?.();
+      if (injected) {
+        throw injected;
+      }
+      await finishPauseRevocationBarrierV1(taskFolderPath, barrierPath);
+    } catch (error) {
+      return { outcome: "writeFailed", error: error as Error };
+    }
   }
 
   const hostId = await resolveHostIdentityV1();
