@@ -454,8 +454,13 @@ export async function renameTaskWithAI(
   // narrowed further): passing `taskRootCandidatePathsV1` as
   // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
   // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
-  // repeating the reverted gate — admission is still always acquired for a
-  // path that looks like a task folder, never left unprotected.
+  // repeating the reverted gate. 2026-09-14 (`d620c877...-1`, closed): when
+  // `taskRootCandidatePathsV1` is explicitly empty (no workspace open),
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` now verifies the
+  // candidate's own persisted ownership record before acquiring — see that
+  // function's own doc comment; the previously unconditional "always
+  // acquired" no longer applies to a candidate whose ownership does not
+  // verify.
   const earlyFolderPath = extractSynchronousRenameFolderPathV1(arg);
   const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
     candidatePath: earlyFolderPath,

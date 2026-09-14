@@ -24,6 +24,7 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { acquireWorkAdmissionV1, hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
+import { writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 import type { ChatViewProvider } from "../views/chatView";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-draft-task-admission-"));
@@ -38,6 +39,13 @@ function makeTaskFolder(name: string): string {
   // straight through to the unimplemented `showWarningMessage` consent stub,
   // which is not what these tests are exercising.
   fs.writeFileSync(path.join(dir, "task.md"), "# Test task\n");
+  // No workspace folder is stubbed open in this suite, so
+  // `taskRootCandidatePathsV1` is always `[]` at the call site — a real,
+  // ownership-backed `task-progress.json` (2026-09-14 review architectural
+  // blocker `d620c877...-1`, closed) is what makes
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` treat this folder as
+  // legitimate in that branch, exactly like a real task folder would be.
+  writeOwnershipBackedTaskProgress(dir);
   return dir;
 }
 

@@ -20,6 +20,7 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
+  hasWorkspaceIndependentOwnershipV1,
   isPathOutsideAllTaskRootsV1,
   isWatchdogPauseFenceCurrentV1,
   listPendingPauseRevocationBarriersV1,
@@ -41,6 +42,8 @@ import {
   setHostIdentityFsFailureInjectionForTestV1,
 } from "../state/hostIdentityV1";
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
+import { fixtureOwnershipFor, writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
+import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-work-admission-test-"));
 after(() => {
@@ -169,8 +172,57 @@ void test("acquireEarlyWorkAdmissionForCandidatePathV1 logs no containment diagn
   }
 });
 
-void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission when taskRootCandidatePaths is explicitly empty, but logs a diagnostic naming the ambiguity (2026-09-14 review architectural blocker `d620c877...-1`, attempted-and-reverted this round — see the call site's own doc comment for the regression evidence)", async () => {
-  const task = freshTaskFolder("early-admission-containment-empty-root-list");
+// ── hasWorkspaceIndependentOwnershipV1 / the positive legitimacy signal ─────
+// (2026-09-14 review architectural blocker `d620c877...-1`, closed)
+
+void test("hasWorkspaceIndependentOwnershipV1 is false for a candidate with no task-progress.json at all", () => {
+  const task = freshTaskFolder("ownership-signal-no-progress-file");
+  fs.writeFileSync(path.join(task, "task.md"), "# Test task\n");
+  assert.equal(hasWorkspaceIndependentOwnershipV1(task), false);
+});
+
+void test("hasWorkspaceIndependentOwnershipV1 is false when task-progress.json exists but carries no ownership", () => {
+  const task = freshTaskFolder("ownership-signal-no-ownership");
+  fs.writeFileSync(
+    path.join(task, TASK_PROGRESS_FILENAME),
+    JSON.stringify({ taskFolder: path.basename(task), currentStage: "impl" }, null, 2)
+  );
+  assert.equal(hasWorkspaceIndependentOwnershipV1(task), false);
+});
+
+void test("hasWorkspaceIndependentOwnershipV1 is false when ownership.workspaceRoot is set — it can never match with no workspace open", () => {
+  const task = freshTaskFolder("ownership-signal-workspace-root-set");
+  const ownership = { ...fixtureOwnershipFor(task), workspaceRoot: path.dirname(task) };
+  fs.writeFileSync(
+    path.join(task, TASK_PROGRESS_FILENAME),
+    JSON.stringify({ taskFolder: path.basename(task), currentStage: "impl", ownership }, null, 2)
+  );
+  assert.equal(hasWorkspaceIndependentOwnershipV1(task), false);
+});
+
+void test("hasWorkspaceIndependentOwnershipV1 is false when the folder sits outside its own ownership.metaRoot", () => {
+  const task = freshTaskFolder("ownership-signal-outside-metaroot");
+  const ownership = {
+    metaRoot: path.join(TEST_ROOT, "ownership-signal-somewhere-else"),
+    projectRoot: path.join(TEST_ROOT, "ownership-signal-somewhere-else"),
+    boundAt: "2026-07-01T09:00:00.000Z",
+    state: "resolved" as const,
+  };
+  fs.writeFileSync(
+    path.join(task, TASK_PROGRESS_FILENAME),
+    JSON.stringify({ taskFolder: path.basename(task), currentStage: "impl", ownership }, null, 2)
+  );
+  assert.equal(hasWorkspaceIndependentOwnershipV1(task), false);
+});
+
+void test("hasWorkspaceIndependentOwnershipV1 is true for a folder whose ownership.metaRoot is its own parent and carries no workspaceRoot", () => {
+  const task = freshTaskFolder("ownership-signal-valid");
+  writeOwnershipBackedTaskProgress(task);
+  assert.equal(hasWorkspaceIndependentOwnershipV1(task), true);
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 skips early admission when taskRootCandidatePaths is explicitly empty and the candidate's own ownership does not verify (2026-09-14 review architectural blocker `d620c877...-1`, closed)", async () => {
+  const task = freshTaskFolder("early-admission-empty-root-list-no-ownership");
   fs.writeFileSync(path.join(task, "task.md"), "# Test task\n");
   const realWarn = console.warn;
   const warnings: unknown[][] = [];
@@ -185,22 +237,66 @@ void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission 
       taskRootCandidatePaths: [],
     });
     assert.equal(
-      result?.outcome,
-      "acquired",
-      "an explicitly empty root list is still treated as 'cannot evaluate containment', not as 'outside every root' — a real, on-disk task folder must never lose early admission protection just because no VS Code workspace folder happens to be open (proven by the chatWithStage/renameTaskWithAI/draftTaskWithAI admission-wiring tests, which construct exactly this scenario)"
+      result,
+      undefined,
+      "an explicitly empty root list with no verifiable ownership must skip early admission — authoritative " +
+        "resolution would refuse this candidate too, so no admission-v1/ bookkeeping should be created for it"
     );
     assert.ok(
       warnings.some(
         (args) =>
           String(args[0]).includes("task-root candidate list was empty") && String(args[0]).includes(task)
       ),
-      `the unresolved ambiguity must be diagnosable — got warnings: ${JSON.stringify(warnings)}`
+      `the skip must be diagnosable — got warnings: ${JSON.stringify(warnings)}`
     );
-    if (result?.outcome === "acquired") {
-      await result.handle.release();
-    }
+    assert.equal(
+      fs.existsSync(path.join(task, ADMISSION_DIRNAME_V1)),
+      false,
+      "no admission bookkeeping must be created beneath a candidate whose ownership does not verify"
+    );
   } finally {
     console.warn = realWarn;
+  }
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission when taskRootCandidatePaths is explicitly empty but the candidate's own ownership verifies workspace-independently (2026-09-14 review architectural blocker `d620c877...-1`, closed)", async () => {
+  const task = freshTaskFolder("early-admission-empty-root-list-with-ownership");
+  writeOwnershipBackedTaskProgress(task);
+  fs.writeFileSync(path.join(task, "task.md"), "# Test task\n");
+  const result = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: task,
+    purpose: "admission",
+    commandId: "test-command",
+    taskRootCandidatePaths: [],
+  });
+  assert.equal(
+    result?.outcome,
+    "acquired",
+    "a real, ownership-backed task folder must never lose early admission protection just because no VS Code " +
+      "workspace folder happens to be open — proven directly from the candidate's own persisted ownership " +
+      "record rather than inferred from workspace-folder state"
+  );
+  if (result?.outcome === "acquired") {
+    await result.handle.release();
+  }
+});
+
+void test("acquireEarlyWorkAdmissionForCandidatePathV1 still acquires admission when taskRootCandidatePaths is omitted entirely — fail-open is preserved for the unevaluable case", async () => {
+  const task = freshTaskFolder("early-admission-omitted-root-list");
+  fs.writeFileSync(path.join(task, "task.md"), "# Test task\n");
+  const result = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: task,
+    purpose: "admission",
+    commandId: "test-command",
+  });
+  assert.equal(
+    result?.outcome,
+    "acquired",
+    "an OMITTED root list (never happens for a real caller) is a genuinely unevaluable case, distinct from an " +
+      "explicitly empty one, and must still fail open exactly as before"
+  );
+  if (result?.outcome === "acquired") {
+    await result.handle.release();
   }
 });
 

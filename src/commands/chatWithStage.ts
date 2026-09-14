@@ -455,8 +455,14 @@ export async function chatWithStage(
   // narrowed further): passing `taskRootCandidatePathsV1` as
   // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
   // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
-  // repeating the reverted gate — admission is still always acquired for a
-  // path that looks like a task folder, never left unprotected.
+  // repeating the reverted gate. 2026-09-14 (`d620c877...-1`, closed): when
+  // `taskRootCandidatePathsV1` is explicitly empty (no workspace open),
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` now verifies the
+  // candidate's own persisted ownership record before acquiring — see that
+  // function's own doc comment. A path this window's `workspaceFolders`
+  // snapshot has not caught up to is unaffected as long as its ownership
+  // verifies; the previously unconditional "always acquired" no longer
+  // applies to a candidate whose ownership does not.
   const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
   // 2026-09-10 round (re-fixed per review directive "fix these in the shared
   // admission helper, not per route"): the validation-before-bookkeeping

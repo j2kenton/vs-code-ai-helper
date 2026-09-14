@@ -3,6 +3,9 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveHostIdentityV1 } from "./hostIdentityV1";
+import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
+import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 
 /**
  * Work admission (v1 fixes item 1, Part 1a — 1.0.0 gate).
@@ -516,6 +519,69 @@ export function isPathOutsideAllTaskRootsV1(
 }
 
 /**
+ * Positive, workspace-independent legitimacy signal for
+ * `acquireEarlyWorkAdmissionForCandidatePathV1`'s empty-`taskRootCandidatePaths`
+ * case (2026-09-14 review architectural blocker `d620c877...-1`, closed).
+ * True only when `candidatePath`'s own persisted `task-progress.json`
+ * strictly decodes for that folder, carries a derivable ownership binding,
+ * and sits at-or-under its own `ownership.metaRoot` — mirroring, without
+ * importing, `workflowRuntimeServicesV1.ts`'s
+ * `verifyTaskFolderOwnershipBindingV1`. This module stays free of the VS
+ * Code API (see `looksLikeTaskFolderPathV1`'s doc comment), so this is a
+ * local reimplementation of the same contract, not a call into that module.
+ *
+ * This is NOT a weaker approximation of the authoritative check for the case
+ * it is used in. An empty `taskRootCandidatePaths` is exactly what
+ * `resolveTaskRootCandidates()` returns when no VS Code workspace folder is
+ * open (`taskRoot.ts`). In that exact condition the authoritative check's
+ * other two containment fallbacks (a configured task-root candidate, a
+ * currently open workspace folder) and its `ownership.workspaceRoot`
+ * open-folder match are ALL vacuously unsatisfiable too — `openRoots`/
+ * `workspaceRoots` are empty either way. `ownership.metaRoot` containment is
+ * therefore the only path EITHER check could ever take when
+ * `taskRootCandidatePaths` is empty, so this reproduces the authoritative
+ * `resolveTaskContext` outcome exactly for this one branch, not merely a
+ * heuristic proxy for it — closing the gap the prior round's doc comment
+ * left open ("a positive, workspace-independent legitimacy signal ... rather
+ * than inferring legitimacy from workspace-folder state").
+ *
+ * A candidate lacking `task-progress.json` (or whose progress doesn't decode
+ * for this folder, carries no `ownership`, records `ownership.workspaceRoot`
+ * — which can never match with no workspace open — or whose ownership binding
+ * does not derive) returns false: authoritative resolution would refuse it
+ * too, so skipping the early acquisition OPTIMIZATION for it is safe by the
+ * same reasoning `isPathOutsideAllTaskRootsV1` already documents for the
+ * positively-outside-every-known-root case just above.
+ */
+export function hasWorkspaceIndependentOwnershipV1(candidatePath: string): boolean {
+  let progressText: string;
+  try {
+    progressText = fs.readFileSync(path.join(candidatePath, TASK_PROGRESS_FILENAME), "utf8");
+  } catch {
+    return false;
+  }
+  const decoded = decodeTaskProgressTextV1(progressText, {
+    expectedTaskFolder: path.basename(candidatePath),
+  });
+  if (!decoded.ok) {
+    return false;
+  }
+  const { ownership, taskFolder } = decoded.decoded.progress;
+  if (ownership === undefined || ownership.workspaceRoot !== undefined) {
+    return false;
+  }
+  if (!deriveTaskBindingV1({ ownership, taskFolder }).ok) {
+    return false;
+  }
+  const normalizedCandidate = normalizeForContainmentCompareV1(candidatePath);
+  const normalizedMetaRoot = normalizeForContainmentCompareV1(ownership.metaRoot);
+  return (
+    normalizedCandidate === normalizedMetaRoot ||
+    normalizedCandidate.startsWith(normalizedMetaRoot + path.sep)
+  );
+}
+
+/**
  * Shared early-admission attempt for a raw, caller-supplied candidate path:
  * runs `looksLikeTaskFolderPathV1` first (validation-before-bookkeeping) and
  * only calls `acquireWorkAdmissionV1` — which is what actually creates the
@@ -540,8 +606,13 @@ export function isPathOutsideAllTaskRootsV1(
  * authoritatively resolves the target) — never an unprotected window, and
  * never a false refusal of the command itself (only of the proactive early
  * OPTIMIZATION for a guess already known to be wrong). A candidate this
- * check cannot evaluate (`taskRootCandidatePaths` empty or omitted) is
- * unaffected and still always acquires, exactly as before.
+ * check cannot evaluate because `taskRootCandidatePaths` was OMITTED
+ * entirely (never happens for a real caller — every current one always
+ * computes and passes it; only exercised directly by tests) is unaffected
+ * and still always acquires, exactly as before. When `taskRootCandidatePaths`
+ * is explicitly EMPTY instead — the real production condition, meaning no
+ * VS Code workspace folder is open — `hasWorkspaceIndependentOwnershipV1`
+ * below takes over as the legitimacy check (`d620c877...-1`, closed).
  */
 export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
   readonly candidatePath: string | undefined;
@@ -563,66 +634,57 @@ export async function acquireEarlyWorkAdmissionForCandidatePathV1(params: {
    * Currently known valid task-root candidates (`resolveTaskRootCandidates().map(c
    * => c.absolutePath)`), when the caller already has them computed — every
    * current caller does, immediately before this call, for `beginTargetResolutionV1`.
-   * Diagnostic only for the empty case (see `isPathOutsideAllTaskRootsV1`'s doc
-   * comment and the block below for why): an omitted or empty array disables
-   * the containment REFUSAL, exactly like today.
+   * An OMITTED array disables the containment refusal entirely (test-only —
+   * see `isPathOutsideAllTaskRootsV1`'s doc comment). An explicitly EMPTY
+   * array (the real "no VS Code workspace folder is open" condition) is
+   * handled differently: `hasWorkspaceIndependentOwnershipV1` decides,
+   * from the candidate's own persisted ownership record, whether early
+   * admission proceeds (`d620c877...-1`, closed) — see the block below.
    */
   readonly taskRootCandidatePaths?: readonly string[];
 }): Promise<WorkAdmissionResultV1 | undefined> {
   if (!params.candidatePath || !looksLikeTaskFolderPathV1(params.candidatePath)) {
     return undefined;
   }
-  // 2026-09-14 review architectural blocker (`d620c877...-1`): attempted this
-  // round to treat an explicitly EMPTY `taskRootCandidatePaths` as
-  // authoritative ("no workspace folder is open, so no legitimate task folder
-  // can exist here") and skip early acquisition, on the theory that a real
-  // `candidatePath` could only reach this call after the SAME
-  // `resolveTaskRootCandidates()` had already produced a non-empty list for
-  // something else (e.g. the tree that was clicked) to exist.
+  // 2026-09-14 review architectural blocker (`d620c877...-1`, closed): an
+  // earlier attempt this same day treated an explicitly EMPTY
+  // `taskRootCandidatePaths` itself as proof of illegitimacy ("no workspace
+  // folder is open, so no legitimate task folder can exist here") and was
+  // reverted — that inferred legitimacy from WORKSPACE-FOLDER STATE, which
+  // regressed three admission-wiring tests whose fixtures construct a real,
+  // ownership-independent, on-disk task folder with no workspace open at
+  // all (`workflowRuntimeServicesV1.test.ts`'s own "accepts an
+  // ownership-backed folder with NO workspace open" proves that scenario is
+  // legitimate production behavior, not a test artifact).
   //
-  // REVERTED the same round: that theory is false, proven by running the
-  // full suite, not just re-reasoning about it. Three admission-wiring tests
-  // regressed the moment this shipped —
-  // `chatWithStageWorkAdmission.test.ts`'s and
-  // `renameTaskWithAIWorkAdmission.test.ts`'s "refuses with the busy
-  // diagnostic ... before task resolution", and
-  // `draftTaskWithAIWorkAdmission.test.ts`'s consent-modal-gating
-  // equivalent — because their fixtures construct a real, on-disk task
-  // folder (`task.md` present) and call the command directly with an
-  // explicit `taskFolderPath`, without needing (or configuring) an open
-  // VS Code workspace folder at all. That is not a test artifact to route
-  // around: `workflowRuntimeServicesV1.test.ts`'s own "accepts an
-  // ownership-backed folder with NO workspace open, containing against its
-  // own ownership.metaRoot" proves Ensemble already treats a task folder as
-  // legitimate purely via its own persisted ownership metadata, independent
-  // of whether any workspace folder is currently open — so "workspace
-  // closed" and "no legitimate task folder can exist" are NOT the same
-  // fact, contrary to this round's premise. Skipping early acquisition on
-  // that false premise reproduced exactly the failure mode this module's own
-  // history already records for the earlier, harder gate: silently skipping
-  // protection for a legitimate candidate and reopening the watchdog trap
-  // Part 1a exists to close — a worse outcome than the narrower containment
-  // gap the skip aimed to close. Restored to fail-open (still diagnosed) for
-  // the empty case; the positively-outside-every-KNOWN-root refusal just
-  // below is unaffected and remains safe, since it only fires when
-  // containment genuinely IS knowable.
-  //
-  // This blocker is NOT resolved. Closing it for real needs a positive,
-  // workspace-independent legitimacy signal at this synchronous, pre-await
-  // call site (e.g. reading the candidate's own persisted ownership record,
-  // mirroring `workflowRuntimeServicesV1`'s registration check) rather than
-  // inferring legitimacy from workspace-folder state, which this round
-  // demonstrated is unsound. Building and testing that signal is a real
-  // design task, carried forward rather than attempted again under time
-  // pressure that already produced one regression.
+  // The actual fix is `hasWorkspaceIndependentOwnershipV1` above: it reads
+  // the candidate's own persisted ownership record instead of inferring
+  // anything from workspace-folder state, so it tells the two cases apart
+  // correctly rather than conflating them. When `taskRootCandidatePaths` is
+  // explicitly empty (containment via the root list is NOT knowable — see
+  // `isPathOutsideAllTaskRootsV1`'s doc comment), ownership verification
+  // stands in as the authoritative-equivalent legitimacy check for exactly
+  // this branch (see that function's own doc comment for why it reproduces
+  // `resolveTaskContext`'s outcome exactly here, not merely approximates
+  // it). A candidate whose ownership verifies keeps early admission
+  // protection even with no workspace open; a candidate whose ownership does
+  // NOT verify skips early acquisition — safe, not a repeat of the reverted
+  // gate, because authoritative resolution would refuse it too (same
+  // reasoning as the positively-outside-every-known-root case below).
   if (params.taskRootCandidatePaths && params.taskRootCandidatePaths.length === 0) {
-    console.warn(
-      `acquireEarlyWorkAdmissionForCandidatePathV1: candidate "${params.candidatePath}" (command ` +
-        `"${params.commandId}") looks like a task folder, but the caller's task-root candidate list was empty — ` +
-        "proceeding with early admission bookkeeping WITHOUT a containment check (cannot distinguish 'no " +
-        "workspace open' from a workspace-independent, ownership-backed task folder; see this call site's own " +
-        "doc comment). Authoritative resolution below is unaffected."
-    );
+    if (!hasWorkspaceIndependentOwnershipV1(params.candidatePath)) {
+      console.warn(
+        `acquireEarlyWorkAdmissionForCandidatePathV1: candidate "${params.candidatePath}" (command ` +
+          `"${params.commandId}") looks like a task folder, but the caller's task-root candidate list was empty ` +
+          "and its own persisted ownership record does not verify workspace-independently (missing/unreadable " +
+          "task-progress.json, a failed decode, no ownership, a recorded ownership.workspaceRoot that cannot " +
+          "match with no workspace open, or a location outside its own ownership.metaRoot) — skipping early " +
+          "admission for it (authoritative resolution below is unaffected and still protected via " +
+          "beginTargetResolutionV1); this is worth investigating: a stale/cross-project argument, or a task " +
+          "whose ownership was never bound."
+      );
+      return undefined;
+    }
   }
   if (
     params.taskRootCandidatePaths &&

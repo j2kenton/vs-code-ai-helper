@@ -73,8 +73,8 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 689,
-      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 → 689 as admission-registration edits, including the 2026-09-14 unprotectedRootPaths check, landed on this route; call is unchanged.)"
+      "line": 695,
+      "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 → 689 → 695 as admission-registration edits, including the 2026-09-14 ownership-legitimacy-signal doc-comment update, landed on this route; call is unchanged.)"
     },
     {
       "file": "src/commands/draftTaskWithAI.ts",
