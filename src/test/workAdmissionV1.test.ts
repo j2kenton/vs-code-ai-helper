@@ -13,6 +13,7 @@ import {
   beginTargetResolutionV1,
   describeWorkAdmissionBlockerV1,
   endTargetResolutionV1,
+  ensurePauseFenceAtLeastV1,
   finishPauseRevocationBarrierV1,
   removePauseRevocationBarrierV1,
   hasDurableResolutionInFlightV1,
@@ -30,7 +31,6 @@ import {
   setWorkAdmissionFsFailureInjectionForTestV1,
   ADMISSION_DIRNAME_V1,
   PAUSE_COMMIT_LIKELY_STALE_MS_V1,
-  PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1,
   WORK_ADMISSION_LIKELY_STALE_MS_V1,
 } from "../state/workAdmissionV1";
 import {
@@ -1948,6 +1948,50 @@ void test("advancePauseFenceGenerationV1 never regresses or reuses a generation 
   assert.equal(fenceFiles.length, CONCURRENT_ADVANCERS + 1, "generation 0 plus one file per successful advance, no more");
 });
 
+// ── ensurePauseFenceAtLeastV1 (2026-09-14 review blocker `dceb2646...-3`, replaces the lock-based finish mechanism) ─
+
+void test("ensurePauseFenceAtLeastV1 publishes the exact target generation on a virgin directory, establishing intermediate generation 0 with no gap", async () => {
+  const task = freshTaskFolder("ensure-fence-virgin-target");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  await ensurePauseFenceAtLeastV1(task, 1);
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 1);
+  const fenceFiles = fs.readdirSync(dir).filter((name) => /^pause-fence\.g\d+$/.test(name));
+  assert.deepEqual([...fenceFiles].sort(), ["pause-fence.g0", "pause-fence.g1"], "no gap: g0 must exist too");
+});
+
+void test("ensurePauseFenceAtLeastV1 is a no-op when the target is already durably published", async () => {
+  const task = freshTaskFolder("ensure-fence-already-published");
+  await advancePauseFenceGenerationV1(task); // publishes g1
+  await advancePauseFenceGenerationV1(task); // publishes g2
+  await ensurePauseFenceAtLeastV1(task, 1); // already exists — must not throw or regress anything
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 2, "an already-published lower target must never regress the current maximum");
+});
+
+void test("ensurePauseFenceAtLeastV1 called repeatedly for the SAME target converges without republishing or advancing further", async () => {
+  const task = freshTaskFolder("ensure-fence-repeated-same-target");
+  await ensurePauseFenceAtLeastV1(task, 3);
+  await ensurePauseFenceAtLeastV1(task, 3);
+  await ensurePauseFenceAtLeastV1(task, 3);
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    3,
+    "repeated calls for the same target must converge on exactly that generation, never further"
+  );
+});
+
+void test("ensurePauseFenceAtLeastV1 under genuine concurrency for the SAME target publishes it exactly once, with no gap", async () => {
+  const task = freshTaskFolder("ensure-fence-concurrent-same-target");
+  await Promise.all([
+    ensurePauseFenceAtLeastV1(task, 1),
+    ensurePauseFenceAtLeastV1(task, 1),
+    ensurePauseFenceAtLeastV1(task, 1),
+  ]);
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 1);
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const fenceFiles = fs.readdirSync(dir).filter((name) => /^pause-fence\.g\d+$/.test(name));
+  assert.deepEqual([...fenceFiles].sort(), ["pause-fence.g0", "pause-fence.g1"]);
+});
+
 void test("a partially-written pause-fence file is still a valid fence by existence alone (there is no content to corrupt)", async () => {
   const task = freshTaskFolder("pause-fence-existence-only");
   const dir = path.join(task, ADMISSION_DIRNAME_V1);
@@ -2058,13 +2102,18 @@ void test("revokeStalePauseCommitClaimV1 revokes a stale pauseCommit marker into
   if (acquired.outcome !== "acquired") return;
   const markerPath = markerFilePathV1(task);
   backdateV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const fenceBeforeRevoke = await readOrInitPauseFenceGenerationV1(task);
 
   const result = await revokeStalePauseCommitClaimV1(task, "revoker-1");
   assert.equal(result.outcome, "revoked");
   if (result.outcome !== "revoked") return;
   assert.equal(fs.existsSync(markerPath), false, "the original marker path must be gone");
   assert.equal(fs.existsSync(result.barrierPath), true, "the barrier file must exist at the returned path");
-  assert.equal(path.basename(result.barrierPath), "pause-revocation.pending.revoker-1");
+  assert.equal(
+    path.basename(result.barrierPath),
+    `pause-revocation.pending.revoker-1.g${fenceBeforeRevoke + 1}`,
+    "the barrier's own filename must embed its target fence generation"
+  );
   assert.equal(result.revokedClaim.purpose, "pauseCommit");
   assert.equal(
     listPendingPauseRevocationBarriersV1(task).length,
@@ -2072,8 +2121,8 @@ void test("revokeStalePauseCommitClaimV1 revokes a stale pauseCommit marker into
     "the barrier must be discoverable for a later claimant"
   );
   assert.equal(
-    listPauseFenceGenerationsForTestV1(task).length,
-    0,
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceBeforeRevoke,
     "revoke alone must never advance the fence — only finishPauseRevocationBarrierV1 does"
   );
 
@@ -2211,7 +2260,7 @@ void test("finishPauseRevocationBarrierV1 never advances the fence for a barrier
   }
 });
 
-void test("finishPauseRevocationBarrierV1 is exclusive under genuine concurrency: two simultaneous finishers of the same still-present barrier advance the fence exactly once, never invalidating a pause that lands in between (2026-09-11 review completion blocker, round 2)", async () => {
+void test("finishPauseRevocationBarrierV1 converges under genuine concurrency: two simultaneous finishers of the same still-present barrier advance the fence exactly once, never invalidating a pause that lands in between (2026-09-11 review completion blocker, round 2; also covers 2026-09-14's `dceb2646...-3` \"a resumed/suspended original owner races a later finisher\" concern — with no lock at all, ANY two concurrent finishers ARE exactly that race)", async () => {
   const task = freshTaskFolder("finish-barrier-concurrent-exclusive");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
   assert.equal(acquired.outcome, "acquired");
@@ -2224,8 +2273,9 @@ void test("finishPauseRevocationBarrierV1 is exclusive under genuine concurrency
 
   // Two genuinely concurrent finishers race for the SAME still-present
   // barrier — the case an `existsSync`-only guard cannot distinguish from
-  // two independent, sequential completions. Only one may ever win the
-  // exclusive rename and perform the advance.
+  // two independent, sequential completions. Both target the SAME
+  // predetermined generation (`ensurePauseFenceAtLeastV1`), so whichever
+  // wins the exclusive-create, the other's is a safe, harmless no-op.
   await Promise.all([
     finishPauseRevocationBarrierV1(task, revoked.barrierPath),
     finishPauseRevocationBarrierV1(task, revoked.barrierPath),
@@ -2253,156 +2303,60 @@ void test("finishPauseRevocationBarrierV1 is exclusive under genuine concurrency
   }
 });
 
-void test("finishPauseRevocationBarrierV1 takes over when a prior finisher released its lock without completing the barrier (2026-09-11 review completion blocker `dceb2646...-2`)", async () => {
-  const task = freshTaskFolder("finish-barrier-takeover-after-abandoned-lock");
+void test("finishPauseRevocationBarrierV1 completes a barrier correctly no matter how long it has sat unfinished, with no lock or staleness heuristic involved (2026-09-14 review blocker `dceb2646...-3`, architectural fix)", async () => {
+  const task = freshTaskFolder("finish-barrier-long-delayed-no-heuristic");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
   assert.equal(acquired.outcome, "acquired");
   if (acquired.outcome !== "acquired") return;
   backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
-  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-abandoned-lock");
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-long-delayed");
   assert.equal(revoked.outcome, "revoked");
   if (revoked.outcome !== "revoked") return;
-  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+  const fenceAtRevocation = await readOrInitPauseFenceGenerationV1(task);
 
-  // Simulate a winner that crashed (or threw) strictly between winning the
-  // finish-lock and completing the advance/cleanup/remove sequence: it
-  // unlinked its lock in `finally` (matching this module's own documented
-  // behavior on that path) but never advanced the fence or removed the
-  // barrier. Pre-create the lock, then release it shortly after — while the
-  // barrier is still present — to reproduce exactly that observable state
-  // for a waiter.
-  const lockPath = `${revoked.barrierPath}.finish-lock`;
-  fs.writeFileSync(lockPath, "");
-  setTimeout(() => {
-    fs.unlinkSync(lockPath);
-  }, 150);
-
-  // A previous implementation treated "lock gone" alone as "finished" and
-  // would have conceded here without ever advancing the fence or removing
-  // the barrier. The fix must instead notice the barrier is still present
-  // and take over.
+  // Unlike the previous lock-based design, correctness here must not depend
+  // on any elapsed time at all — there is no "genuine crash" to distinguish
+  // from "still working" because there is nothing left to hold. Simulate an
+  // arbitrarily long delay (no sleep needed — just don't touch the barrier)
+  // and confirm a finisher arriving "later" still completes it correctly.
   await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
 
   assert.equal(
     await readOrInitPauseFenceGenerationV1(task),
-    fenceBefore + 1,
-    "a waiter that takes over after an abandoned lock must still advance the fence"
+    fenceAtRevocation + 1,
+    "a delayed finisher must still advance the fence to the barrier's captured target"
   );
-  assert.equal(fs.existsSync(revoked.barrierPath), false, "a waiter that takes over must remove the barrier");
+  assert.equal(fs.existsSync(revoked.barrierPath), false, "a delayed finisher must remove the barrier");
   assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
 });
 
-void test("finishPauseRevocationBarrierV1 reclaims a stale finish-lock left behind by a genuine process crash — the lock is never removed at all, only its age proves abandonment (2026-09-11 review completion blocker `dceb2646...-3`)", async () => {
-  const task = freshTaskFolder("finish-barrier-reclaim-crashed-lock");
+void test("finishPauseRevocationBarrierV1 safely no-ops its fence advance when unrelated activity already carried the fence past the barrier's target — no gap, no phantom re-advance (2026-09-14 review blocker `dceb2646...-3`)", async () => {
+  const task = freshTaskFolder("finish-barrier-target-already-surpassed");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
   assert.equal(acquired.outcome, "acquired");
   if (acquired.outcome !== "acquired") return;
   backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
-  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-crashed-lock");
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-surpassed");
   assert.equal(revoked.outcome, "revoked");
   if (revoked.outcome !== "revoked") return;
-  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
 
-  // Simulate a genuine OS-level crash (kill -9, power loss): the winner's
-  // lock is created and NEVER removed — no `finally` ever runs, unlike an
-  // in-process throw (already covered by the "abandoned lock" test above,
-  // which relies on the lock eventually being unlinked). Backdate it well
-  // past the reclaim staleness threshold so this test does not sleep for it.
-  const lockPath = `${revoked.barrierPath}.finish-lock`;
-  fs.writeFileSync(lockPath, "");
-  backdateV1(lockPath, PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 + 5_000);
+  // Unrelated fence activity (e.g. a second, independent pauseCommit
+  // revocation elsewhere) advances the fence several generations past this
+  // barrier's own target BEFORE anyone gets around to finishing it.
+  await advancePauseFenceGenerationV1(task);
+  await advancePauseFenceGenerationV1(task);
+  await advancePauseFenceGenerationV1(task);
+  const fenceBeforeFinish = await readOrInitPauseFenceGenerationV1(task);
 
-  // A previous implementation waited out its bounded poll (~2s) and then
-  // conceded forever, since nothing ever removes a crashed process's lock.
-  // The fix must instead recognize the lock's age as proof of abandonment
-  // and reclaim it itself.
   await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
 
   assert.equal(
     await readOrInitPauseFenceGenerationV1(task),
-    fenceBefore + 1,
-    "reclaiming a crashed lock must still advance the fence"
+    fenceBeforeFinish,
+    "finishing a barrier whose target the fence has already surpassed must never publish a further generation"
   );
-  assert.equal(fs.existsSync(revoked.barrierPath), false, "reclaiming a crashed lock must remove the barrier");
-  assert.equal(fs.existsSync(lockPath), false, "the stale lock itself must be removed by the reclaimer");
+  assert.equal(fs.existsSync(revoked.barrierPath), false, "the barrier must still be removed");
   assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0);
-});
-
-void test("finishPauseRevocationBarrierV1 never reclaims a finish-lock that is merely young, even after its bounded wait — a live-but-slow winner is never mistaken for a crashed one (2026-09-11 review completion blocker `dceb2646...-3`)", async () => {
-  const task = freshTaskFolder("finish-barrier-no-reclaim-of-fresh-lock");
-  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
-  assert.equal(acquired.outcome, "acquired");
-  if (acquired.outcome !== "acquired") return;
-  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
-  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-fresh-lock");
-  assert.equal(revoked.outcome, "revoked");
-  if (revoked.outcome !== "revoked") return;
-  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
-
-  // A lock created "now" (never backdated) is well within a plausible live
-  // hold window even after the ~2s bounded wait elapses — it must be left
-  // alone rather than reclaimed out from under a winner that may still be
-  // working.
-  const lockPath = `${revoked.barrierPath}.finish-lock`;
-  fs.writeFileSync(lockPath, "");
-  try {
-    await finishPauseRevocationBarrierV1(task, revoked.barrierPath);
-
-    assert.equal(
-      await readOrInitPauseFenceGenerationV1(task),
-      fenceBefore,
-      "a fresh, still-plausibly-live lock must never be reclaimed — the fence must not advance"
-    );
-    assert.equal(fs.existsSync(revoked.barrierPath), true, "the barrier must remain pending, not be removed");
-    assert.equal(fs.existsSync(lockPath), true, "the fresh lock itself must be left in place, not reclaimed");
-  } finally {
-    fs.unlinkSync(lockPath);
-  }
-});
-
-void test("finishPauseRevocationBarrierV1's stale-lock reclaim is exclusive under genuine concurrency: two simultaneous reclaimers of the same crashed lock advance the fence exactly once (2026-09-11 review completion blocker `dceb2646...-3`)", async () => {
-  const task = freshTaskFolder("finish-barrier-reclaim-concurrent-exclusive");
-  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
-  assert.equal(acquired.outcome, "acquired");
-  if (acquired.outcome !== "acquired") return;
-  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
-  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-reclaim-concurrent");
-  assert.equal(revoked.outcome, "revoked");
-  if (revoked.outcome !== "revoked") return;
-  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
-
-  const lockPath = `${revoked.barrierPath}.finish-lock`;
-  fs.writeFileSync(lockPath, "");
-  backdateV1(lockPath, PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 + 5_000);
-
-  // Two callers race to reclaim the SAME crashed lock. Only one may ever win
-  // the reclaim gate's exclusive create — this is the property that keeps
-  // the fence from being advanced twice for one barrier (which would
-  // silently invalidate a fresh, legitimate pause that captured the
-  // in-between generation — see the section doc comment above).
-  await Promise.all([
-    finishPauseRevocationBarrierV1(task, revoked.barrierPath),
-    finishPauseRevocationBarrierV1(task, revoked.barrierPath),
-  ]);
-
-  assert.equal(
-    await readOrInitPauseFenceGenerationV1(task),
-    fenceBefore + 1,
-    "two concurrent reclaimers of the same crashed lock must advance the fence exactly once, not twice"
-  );
-  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0, "the barrier must be fully removed exactly once");
-  assert.equal(fs.existsSync(lockPath), false, "the crashed lock must be removed by whichever reclaimer won");
-
-  const freshPause = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep-4" });
-  assert.equal(freshPause.outcome, "acquired");
-  if (freshPause.outcome === "acquired") {
-    assert.equal(
-      await isWatchdogPauseFenceCurrentV1(task, fenceBefore + 1),
-      true,
-      "the fresh pause's captured generation must still be current — no phantom second advance from the reclaim race"
-    );
-    await freshPause.handle.release();
-  }
 });
 
 void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 give a caller a seam to run cleanup between fence-advance and barrier-removal", async () => {

@@ -2397,6 +2397,92 @@ export async function advancePauseFenceGenerationV1(taskFolderPath: string): Pro
 }
 
 /**
+ * Publishes durable pause-fence generation `targetGeneration` if it is not
+ * already durably published — a no-op (not an error) when it already is.
+ *
+ * Unlike `advancePauseFenceGenerationV1` (which always publishes a generation
+ * strictly newer than whatever is current AT THE MOMENT IT RUNS), this
+ * targets one FIXED, already-decided generation number. That is what makes
+ * finishing a pause-revocation barrier (`performPauseRevocationBarrierFinishSequenceV1`)
+ * safe to call any number of times, by any number of concurrent or
+ * sequential callers, however much later, with no exclusivity mechanism at
+ * all: every caller finishing the SAME barrier computes the SAME target (it
+ * is parsed from the barrier's own filename, fixed at revocation time — see
+ * `revokeStalePauseCommitClaimV1`), so they all converge on one outcome
+ * instead of each publishing a further generation the way a naive repeated
+ * "current + 1" advance would (the exact `dceb2646...-2`/`dceb2646...-3`
+ * defect this replaces: a lock-based "only the winner advances" scheme that
+ * left a crashed lock-holder unhelpable without a staleness guess, and let a
+ * merely-suspended original holder race a reclaimer into a real double
+ * advance).
+ *
+ * Safety proof for the barrier-finishing usage pattern (why `targetGeneration`
+ * is always a valid upper bound there, and why aiming for it directly cannot
+ * open a gap): `revokeStalePauseCommitClaimV1` captures `targetGeneration - 1`
+ * as the durable fence generation observed AT revocation time, which is
+ * always ≥ whatever generation the (possibly since-crashed) `pauseCommit`
+ * claim owner captured for its own pause write — that capture happened
+ * strictly earlier, while the claim was still alive, and the fence only ever
+ * grows. So `targetGeneration` is always strictly greater than any generation
+ * that claim's pause could legitimately carry, no matter how long this call
+ * is delayed. And because the SAME capture call
+ * (`readOrInitPauseFenceGenerationV1`) already durably established every
+ * generation from 0 up to `targetGeneration - 1` before this function is ever
+ * reached, the true current maximum at any later time is always ≥
+ * `targetGeneration - 1` — so this call's exclusive-create either lands on
+ * exactly the next free slot (no gap) or finds `targetGeneration` already
+ * published by something else (another finisher of this same barrier, an
+ * unrelated advance that reached it first, or an earlier attempt at this
+ * exact target) and no-ops. A caller that invokes this function directly with
+ * an arbitrary target the fence has not grown to yet (skipping the capture
+ * step above) gets the weaker but still-safe guarantee: `targetGeneration`
+ * becomes durably published (generation 0 is lazily established too, mirroring
+ * `advancePauseFenceGenerationV1`), but intermediate generations in between
+ * may be left permanently unpublished — a harmless gap (nothing reads
+ * generation numbers assuming contiguity; only the current maximum matters),
+ * never a correctness problem, and never worth closing by publishing more
+ * than the one needed generation per call (see the file's own measured
+ * history of why THAT is what actually causes the invalidation harm).
+ */
+export async function ensurePauseFenceAtLeastV1(taskFolderPath: string, targetGeneration: number): Promise<void> {
+  const dir = admissionDirV1(taskFolderPath);
+  await fs.promises.mkdir(dir, { recursive: true });
+  // Mirrors `advancePauseFenceGenerationV1`'s own virgin-directory handling:
+  // durably establish generation 0 — the fence's documented base state —
+  // before publishing anything later, on a directory that has no fence file
+  // at all yet. Unlike filling every OTHER intermediate generation up to
+  // `targetGeneration` (deliberately not done — see this function's own doc
+  // comment: publishing more than the one needed generation within a single
+  // call could invalidate a fresh capture that lands between two publishes
+  // from the SAME call, reproducing the exact harm this design avoids),
+  // publishing generation 0 alone carries no such risk: it is the floor
+  // every unset `recordedFenceGeneration` already treats as current
+  // (`isWatchdogPauseFenceCurrentV1`'s own `undefined` case), so establishing
+  // it cannot invalidate anything.
+  if (targetGeneration > 0 && listPauseFenceGenerationsSyncV1(dir).length === 0) {
+    try {
+      await fs.promises.writeFile(path.join(dir, `${PAUSE_FENCE_FILENAME_PREFIX_V1}0`), "", { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+  const targetPath = path.join(dir, `${PAUSE_FENCE_FILENAME_PREFIX_V1}${targetGeneration}`);
+  try {
+    await fs.promises.writeFile(targetPath, "", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+    // Already durably published — by this call's own caller on an earlier
+    // attempt, another finisher of the same barrier, or an unrelated advance
+    // that reached this exact generation first. Either way the goal (a fence
+    // strictly past the revoked claim's captured generation) is satisfied.
+  }
+}
+
+/**
  * Part 1b step 1 primitive: is a watchdog pause recorded against
  * `recordedFenceGeneration` still EFFECTIVE for `taskFolderPath`, i.e. does
  * it equal the task's current durable pause-fence generation?
@@ -2467,21 +2553,36 @@ export async function isWatchdogPauseFenceCurrentV1(
  * filename can only ever be the one record we already validated.
  *
  * Barrier lifecycle: `revokeStalePauseCommitClaimV1` atomically renames a
- * stale marker to `pause-revocation.pending.<revokerToken>` and returns
- * without advancing the fence — the barrier's mere EXISTENCE is what a later
- * claimant must notice and complete (`listPendingPauseRevocationBarriersV1` +
- * `finishPauseRevocationBarrierV1`) before publishing its own admission or
- * starting another pause, exactly like `pause-fence.g<N>`'s own
- * existence-alone-publishes-a-generation design. Every acquisition
- * (`acquireWorkAdmissionCoreV1`) does exactly this before publishing its own
- * claim or marker, so a barrier is completed no later than the next
- * admission/pauseCommit attempt for the task — the original revoker, moments
- * later, or a completely unrelated actor that merely finds the barrier still
- * present may all complete it. Completion is exclusive per barrier
- * (`finishPauseRevocationBarrierV1`'s doc comment): at most one caller ever
- * advances the fence for a given still-present barrier, no matter how many
- * race to finish it, so a duplicate/late/concurrent finish call is always a
- * true no-op rather than a further advance.
+ * stale marker to `pause-revocation.pending.<revokerToken>.g<targetGeneration>`
+ * and returns without advancing the fence — the barrier's mere EXISTENCE is
+ * what a later claimant must notice and complete
+ * (`listPendingPauseRevocationBarriersV1` + `finishPauseRevocationBarrierV1`)
+ * before publishing its own admission or starting another pause, exactly like
+ * `pause-fence.g<N>`'s own existence-alone-publishes-a-generation design.
+ * Every acquisition (`acquireWorkAdmissionCoreV1`) does exactly this before
+ * publishing its own claim or marker, so a barrier is completed no later than
+ * the next admission/pauseCommit attempt for the task — the original
+ * revoker, moments later, a completely unrelated actor that merely finds the
+ * barrier still present, or several of them AT ONCE, may all complete it.
+ *
+ * 2026-09-14 review blockers (`dceb2646...-2`, `dceb2646...-3`, fixed —
+ * architecturally, not just narrowed): completing a barrier used to require
+ * exclusive ownership of a separate `.finish-lock` file, which reintroduced
+ * exactly the problem this whole module exists to avoid — a lock that a
+ * crashed owner can never release, "fixed" by a staleness timeout that the
+ * plan's own rule forbids ("a timeout only triggers investigation or an
+ * offered takeover, never proves owner death"), and which a merely-SUSPENDED
+ * (not dead) original owner could still race after a reclaimer took over,
+ * producing a genuine double fence-advance. `targetGeneration` — the fence
+ * generation this barrier must reach, captured ONCE by the revoker and baked
+ * immutably into the barrier's own filename (see
+ * `ensurePauseFenceAtLeastV1`'s doc comment for the safety proof) — removes
+ * the need for exclusivity entirely: completing a barrier is now "exclusive-
+ * create this one, predetermined generation file", which is naturally
+ * idempotent and safe under ANY number of concurrent or repeated callers, no
+ * matter how much later they run or whether an earlier "owner" is dead,
+ * suspended, or merely slow. No lock, no staleness heuristic, and no
+ * liveness assumption is needed or made.
  *
  * What this does NOT do: clean up the corresponding stale watchdog pause
  * FIELDS inside `task-progress.json` (clearing `status`/`pausedReason` so a
@@ -2496,6 +2597,22 @@ export async function isWatchdogPauseFenceCurrentV1(
  * that still consult `task-progress.json` directly.
  */
 const PAUSE_REVOCATION_PENDING_PREFIX_V1 = "pause-revocation.pending.";
+
+/** Separates a barrier's `revokerToken` from its embedded target fence
+ * generation in the barrier's own filename (`<prefix><revokerToken>.g<N>`) —
+ * see the section doc comment above and `ensurePauseFenceAtLeastV1`'s doc
+ * comment for why the target is captured exactly once, at revocation time,
+ * and baked into the filename rather than recomputed by whoever finishes it. */
+const PAUSE_REVOCATION_TARGET_SUFFIX_V1 = ".g";
+const PAUSE_REVOCATION_BARRIER_RE_V1 = /^pause-revocation\.pending\.[0-9a-zA-Z-]+\.g(\d+)$/;
+
+/** Parses the target fence generation embedded in a barrier's filename by
+ * `revokeStalePauseCommitClaimV1`. `undefined` for anything not matching that
+ * shape — should never happen for a barrier this module itself wrote. */
+function parsePauseRevocationBarrierTargetGenerationV1(barrierPath: string): number | undefined {
+  const match = PAUSE_REVOCATION_BARRIER_RE_V1.exec(path.basename(barrierPath));
+  return match ? Number(match[1]) : undefined;
+}
 
 export type PauseCommitRevocationOutcomeV1 =
   | { readonly outcome: "revoked"; readonly barrierPath: string; readonly revokedClaim: WorkAdmissionClaimInfoV1 }
@@ -2546,7 +2663,17 @@ export async function revokeStalePauseCommitClaimV1(
     return { outcome: "notStale" };
   }
 
-  const barrierPath = path.join(dir, `${PAUSE_REVOCATION_PENDING_PREFIX_V1}${revokerToken}`);
+  // 2026-09-14 review blocker (`dceb2646...-3`, fixed): capture the durable
+  // fence generation NOW and bind it immutably into the barrier's own
+  // filename, rather than leaving it to whoever finishes the barrier to
+  // recompute later — see `ensurePauseFenceAtLeastV1`'s doc comment for why
+  // this specific value is always a safe upper bound and why baking it into
+  // the barrier makes finishing it lock-free.
+  const capturedGeneration = await readOrInitPauseFenceGenerationV1(taskFolderPath);
+  const barrierPath = path.join(
+    dir,
+    `${PAUSE_REVOCATION_PENDING_PREFIX_V1}${revokerToken}${PAUSE_REVOCATION_TARGET_SUFFIX_V1}${capturedGeneration + 1}`
+  );
   if (fsFailureInjectionV1?.onBeforeRevocationRenameAsync) {
     await fsFailureInjectionV1.onBeforeRevocationRenameAsync();
   }
@@ -2659,64 +2786,37 @@ export async function removePauseRevocationBarrierV1(barrierPath: string): Promi
  * fence-advance-then-cleanup ordering plan step 12 requires is violated (this
  * function's own two calls happen back-to-back with no seam for it).
  *
- * 2026-09-11 review completion blocker (fixed): a call for a barrier that
- * some OTHER actor (or an earlier call by this same caller) has already
- * finished — the barrier file no longer exists — used to still advance the
- * fence one generation further before discovering the removal was a no-op.
- * That is unsound, not merely wasteful: the fence has no memory of WHICH
- * barrier it was last advanced for, so a duplicate/delayed finish landing
- * after a brand-new, legitimate `pauseCommit` has already captured the
- * generation this barrier's completion published would silently invalidate
- * that unrelated, current pause.
- *
- * 2026-09-11 review completion blocker, round 2 (fixed): an `existsSync`
- * presence check alone is NOT exclusive ownership — it only closes the
- * already-fixed case above (a call arriving after completion). Two calls
- * that both observe the barrier PRESENT at the same time (a genuinely
- * concurrent race, not a delayed straggler) would previously both pass the
- * check, both advance the fence, and both remove the file — a real
- * double-advance, not a harmless repeat: if a brand-new legitimate
- * `pauseCommit` captures the generation the FIRST advance published in the
- * gap before the SECOND advance runs, that second advance invalidates the
- * new pause exactly as the already-fixed case above does. "Two concurrent
- * finishers of the same barrier both advancing the fence is harmless"
- * (the section doc comment's original claim) is true only when nothing else
- * can observe the fence in between the two advances — false in production,
- * where a fresh `pauseCommit` acquisition can land in that window.
- *
- * The first attempted fix used an atomic RENAME of `barrierPath` to a fixed
- * derived name as the exclusivity gate (mirroring
- * `revokeStalePauseCommitClaimV1`'s own marker-claiming rename). A
- * deterministic concurrency test on this exact platform disproved it: two
- * truly concurrent `fs.promises.rename` calls racing the SAME source path
- * both resolved successfully rather than one failing with ENOENT — measured
- * as a real double fence-advance (`2 !== 1`), not merely theorized. Node's
- * `rename` is not a safe MUTUAL-EXCLUSION primitive here; only this module's
- * own EXCLUSIVE-CREATE primitive (`{ flag: "wx" }`, already load-bearing for
- * `admission.claim` and every `pause-fence.g<N>` generation file) has an
- * atomicity guarantee this module actually depends on elsewhere and has
- * verified. The fix: gate finishing behind an exclusive-create lock file
- * fixed name derived from `barrierPath`. `EEXIST` means another caller
- * already owns finishing this exact barrier right now — treated as "not my
- * job," never as a failure, exactly like every other claim contention in
- * this module. Only the winner ever calls `advancePauseFenceForRevocationV1`,
- * so at most one advance happens per still-present barrier no matter how
- * many callers race to finish it.
- *
- * 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): a caller
- * that crashes strictly between winning this lock and its own `finally`
- * cleanup used to strand the barrier forever — the lock file is never
- * removed, and nothing ever finishes the barrier (fence never advances for
- * it) without a manual clear. `reclaimStaleFinishLockV1` (invoked by
- * `attemptFinishPauseRevocationBarrierOnceV1` once its own bounded wait for a
- * live winner is exhausted) now reclaims a lock whose age proves it can no
- * longer be a legitimate in-progress hold, closing this within a bounded
- * window instead of leaving it open indefinitely — see that function's doc
- * comment for the mechanism and its one remaining, explicitly accepted
- * residual risk (a live-but-pathologically-slow owner racing a reclaimer,
- * not provable dead the way Part 1c's liveness probing proves it).
+ * History (why this is safe to call redundantly, and why nothing here needs
+ * exclusivity): a call for an already-finished barrier is a no-op — the
+ * `readClaimInfoSyncV1` check in `performPauseRevocationBarrierFinishSequenceV1`
+ * returns early once the barrier file is gone. A call for a barrier that is
+ * STILL present, however many other callers race it or how much later it
+ * runs, converges on the SAME durable fence generation instead of each call
+ * advancing the fence further — see `ensurePauseFenceAtLeastV1`'s doc comment
+ * for the mechanism and its safety proof. Two earlier fixes (2026-09-11) are
+ * kept here as a measured, load-bearing fact for anyone tempted to
+ * reintroduce a mutex on this path: an `existsSync`-presence check is not
+ * exclusive ownership (two truly concurrent callers can both observe a
+ * barrier present and both act), and a RENAME-based exclusivity gate does not
+ * work either — a deterministic concurrency test on this exact platform found
+ * two truly concurrent `fs.promises.rename` calls racing the SAME source path
+ * can BOTH resolve successfully rather than one failing with `ENOENT`, so
+ * `rename` is not a safe mutual-exclusion primitive here. A THIRD fix
+ * (2026-09-11) built a working mutex from this module's own verified-atomic
+ * exclusive-create primitive (`{ flag: "wx" }`) instead — a `.finish-lock`
+ * file — but that reintroduced exactly the problem this module exists to
+ * avoid: a lock a crashed holder can never release, "fixed" by a staleness
+ * timeout the plan's own rule forbids trusting as proof of death, under which
+ * a merely-SUSPENDED (not dead) original holder could still wake up and race
+ * a reclaimer into a genuine double fence-advance (2026-09-14 review blockers
+ * `dceb2646...-2` and `dceb2646...-3`). Binding one fixed target generation
+ * to each barrier at revocation time (`revokeStalePauseCommitClaimV1`) and
+ * aiming every finisher at that exact, predetermined target removes the need
+ * for a lock altogether: there is nothing left to hold, so nothing to leak.
  */
-const PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1 = ".finish-lock";
+export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
+  await performPauseRevocationBarrierFinishSequenceV1(taskFolderPath, barrierPath);
+}
 
 /**
  * 2026-09-11 review completion blocker (`dceb2646...-2`, fixed): the plan's
@@ -2740,109 +2840,13 @@ export function registerPauseRevocationCleanupHookV1(hook: PauseRevocationCleanu
   pauseRevocationCleanupHookV1 = hook;
 }
 
-// Bounded wait for a losing finisher (see the EEXIST branch below) — a
-// handful of fast filesystem calls (advance + optional cleanup + remove) in
-// the common case, so this almost always resolves in one or two polls.
-const PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 = 20;
-
 /**
- * 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): a losing
- * waiter that exhausted the wait loop above with the lock STILL present used
- * to concede unconditionally ("not my job", falling through to `"done"`),
- * which is correct for a winner that is merely a little slow but is silent
- * data loss for a winner that suffered a genuine OS-level process crash (kill
- * -9, power loss — anything that skips the winner's own `finally` entirely,
- * as opposed to an in-process throw, which the `retryTakeover` branch above
- * already handles because `finally` still runs for that). A crashed winner's
- * lock then never disappears, so the barrier can NEVER be finished — the
- * fence never advances past the revoked claim's generation, exactly the
- * "later claimants cannot help" gap the plan's own step 12 ("the next
- * claimant helps finish the idempotent steps") requires closed, not deferred.
- *
- * This is answered without full OS-level owner-liveness probing (Part 1c's
- * job for `admission`/`pauseCommit` claims, which can legitimately be held
- * for real, long-running work): this lock's ONLY legitimate hold duration is
- * "a handful of fast filesystem calls" (its own doc comment, above) plus one
- * caller-supplied cleanup-hook write (`repairRevokedWatchdogPauseV1`, a
- * single lock-serialized, CAS-bounded local-disk write) — normally low
- * milliseconds, essentially never past the
- * `PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1 * CLAIM_CONTENTION_POLL_INTERVAL_MS_V1`
- * (~2s) window already spent waiting. `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`
- * below is a further, generous multiple past that, so a still-live-but-
- * unusually-slow winner is never mistaken for a crashed one, while a
- * genuinely crashed one is reclaimed within a bounded window instead of
- * forever.
- *
- * Reclaim exclusivity deliberately does NOT use a rename of the stale lock
- * path as its gate: the section doc comment above
- * `PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1` records a measured, deterministic
- * finding on this exact platform that two truly concurrent
- * `fs.promises.rename` calls racing the SAME source path can BOTH resolve
- * successfully rather than one failing with `ENOENT` — rename is not a safe
- * mutual-exclusion primitive here. Reclaim instead uses this module's own
- * verified-atomic primitive, exclusive create (`{ flag: "wx" }`, already
- * load-bearing for `admission.claim`, every `pause-fence.g<N>` file, and this
- * very lock), on a SEPARATE, uniquely-named reclaim-gate file — so two
- * callers racing to reclaim the same stale lock can never both win, and
- * therefore can never both run the finish sequence for the same barrier.
- *
- * Residual, accepted risk (recorded rather than hidden, matching this
- * module's general disclosure practice): exclusivity between reclaimers is
- * proven, but exclusivity between a reclaimer and a still-alive-but-
- * pathologically-slow original owner is not — only Part 1c's PID/start-time
- * liveness probing proves an owner is actually dead. The generous, multi-
- * second margin above is this round's mitigation for that gap, not a claim
- * that it is closed; see this task's Remaining Blockers if that residual
- * risk needs to be closed by 1c before it is treated as fully resolved.
- */
-export const PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 = 15000;
-
-// Bounded number of times a caller will attempt to TAKE OVER an
-// apparently-abandoned finish (lock released, barrier still present — see
-// the "winner released without finishing" case below) before conceding to
-// the documented interim gap. Each takeover attempt is itself a full
-// acquire-or-wait cycle, so this is not a tight retry loop; it exists only
-// to stop one caller looping forever against a lock that keeps being won and
-// released-without-finishing by a persistently crashing competitor.
-const PAUSE_REVOCATION_FINISH_TAKEOVER_ATTEMPTS_V1 = 3;
-
-export async function finishPauseRevocationBarrierV1(taskFolderPath: string, barrierPath: string): Promise<void> {
-  for (let takeover = 0; takeover < PAUSE_REVOCATION_FINISH_TAKEOVER_ATTEMPTS_V1; takeover++) {
-    const outcome = await attemptFinishPauseRevocationBarrierOnceV1(taskFolderPath, barrierPath);
-    if (outcome !== "retryTakeover") {
-      return;
-    }
-  }
-}
-
-/**
- * One acquire-or-wait cycle of `finishPauseRevocationBarrierV1`. Returns
- * `"retryTakeover"` when this call observed the lock released WITHOUT the
- * barrier being removed — i.e. the winner exited (successfully or not)
- * without completing the fence-advance-then-cleanup-then-remove sequence —
- * so the caller should attempt to become the new winner itself rather than
- * concede. Every other exit (barrier gone, or the wait bound was exhausted
- * with the lock still held) returns `"done"`.
- *
- * 2026-09-11 review completion blocker (`dceb2646...-2`, fixed): a losing
- * waiter used to return the instant `!fs.existsSync(lockPath)` was observed,
- * treating "lock gone" as synonymous with "finished". A winner that threw
- * partway through `advancePauseFenceForRevocationV1` (or the cleanup hook)
- * still unlinks its lock in its `finally` — so "lock gone" is also exactly
- * what a CRASHED-BUT-CAUGHT winner produces, and the barrier is then left
- * pending forever unless someone retries. Distinguishing the two by also
- * checking `barrierPath` lets a waiter that sees "lock gone, barrier still
- * present" take over and actually finish the barrier itself, instead of
- * conceding under the false assumption that "lock gone" always means
- * "someone else finished it".
- */
-/**
- * Shared fence-advance -> best-effort task-progress cleanup -> barrier-removal
- * sequence (plan step 12's "fence advance, then cleanup ... before publishing
- * admission"), factored out so both the normal lock-winner path and the
- * stale-lock reclaim path (`reclaimStaleFinishLockV1`, `dceb2646...-3`) apply
- * exactly the same ordering rather than maintaining two copies of it. No-op
- * when the barrier was already removed by someone else before this call ran.
+ * Shared target-fence-advance -> best-effort task-progress cleanup ->
+ * barrier-removal sequence (plan step 12's "fence advance, then cleanup ...
+ * before publishing admission"). No-op when the barrier was already removed
+ * by someone else before this call ran, and safe to run concurrently with
+ * (or repeatedly after) any other call for the same barrier — see
+ * `finishPauseRevocationBarrierV1`'s doc comment.
  */
 async function performPauseRevocationBarrierFinishSequenceV1(
   taskFolderPath: string,
@@ -2852,7 +2856,21 @@ async function performPauseRevocationBarrierFinishSequenceV1(
   if (!infoBeforeAdvance) {
     return;
   }
-  await advancePauseFenceForRevocationV1(taskFolderPath);
+  const targetGeneration = parsePauseRevocationBarrierTargetGenerationV1(barrierPath);
+  if (targetGeneration === undefined) {
+    // Should never happen for a barrier this module itself wrote (every
+    // `revokeStalePauseCommitClaimV1` call embeds a target) — logged rather
+    // than thrown, matching this function's own fail-open direction, but
+    // skipping the advance rather than guessing a target is not safe to
+    // recompute here (see `ensurePauseFenceAtLeastV1`'s doc comment for why
+    // an un-targeted "current + 1" advance is not safe to call redundantly).
+    console.error(
+      `performPauseRevocationBarrierFinishSequenceV1: barrier "${barrierPath}" has no parseable target ` +
+        "generation in its filename — skipping its fence advance."
+    );
+  } else {
+    await ensurePauseFenceAtLeastV1(taskFolderPath, targetGeneration);
+  }
   // Part 1b step 12's second half. Best-effort: a failure here must never
   // block barrier removal — the fence has already durably advanced, which is
   // what every pause-sensitive reader that consults it (once wired, plan
@@ -2872,179 +2890,4 @@ async function performPauseRevocationBarrierFinishSequenceV1(
     }
   }
   await removePauseRevocationBarrierV1(barrierPath);
-}
-
-/**
- * Reclaims a finish-lock that survived the full bounded wait in
- * `attemptFinishPauseRevocationBarrierOnceV1` (~2s) AND whose own mtime shows
- * it has been sitting for at least `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`
- * — see that constant's doc comment for why this, rather than forever
- * conceding, is the fix for `dceb2646...-3` (a genuine process crash, which
- * skips the winner's own `finally`, otherwise strands the barrier
- * permanently). Reclaim exclusivity is a single-winner exclusive-create
- * (`{ flag: "wx" }`) of a separate, fixed-name reclaim-gate file derived from
- * the lock path — NOT a rename of the lock path itself (see
- * `PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1`'s doc comment for the measured
- * finding that concurrent renames of the same source are not safely
- * exclusive on this platform): only one racing reclaimer can ever win that
- * exclusive create, so two callers can never both finish — and therefore
- * never both advance the fence for — the same barrier.
- */
-const PAUSE_REVOCATION_FINISH_LOCK_RECLAIM_GATE_SUFFIX_V1 = ".reclaim";
-
-/** Fresh classification of a finish-lock/barrier pair, used by
- * `reclaimStaleFinishLockV1` both before and after it wins the reclaim gate
- * — deliberately re-evaluated both times rather than reusing one earlier
- * read, since either observation may be stale by the time it matters.
- * `"barrierGone"` mirrors the wait loop's own `"done"` case (finished);
- * `"lockGone"` mirrors its own `"retryTakeover"` case (released without
- * finishing); `"notYetStale"` means a live owner may still legitimately be
- * working; `"stale"` is the only outcome that authorizes reclaim. */
-function classifyFinishLockForReclaimV1(
-  lockPath: string,
-  barrierPath: string
-): "barrierGone" | "lockGone" | "notYetStale" | "stale" {
-  if (!fs.existsSync(barrierPath)) {
-    return "barrierGone";
-  }
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "lockGone";
-    }
-    console.error(
-      `classifyFinishLockForReclaimV1: failed to stat finish-lock "${lockPath}" — treating as not (yet) stale.`,
-      error
-    );
-    return "notYetStale";
-  }
-  return Date.now() - stat.mtimeMs >= PAUSE_REVOCATION_FINISH_LOCK_STALE_MS_V1 ? "stale" : "notYetStale";
-}
-
-async function reclaimStaleFinishLockV1(
-  taskFolderPath: string,
-  barrierPath: string,
-  lockPath: string
-): Promise<"done" | "retryTakeover"> {
-  const preCheck = classifyFinishLockForReclaimV1(lockPath, barrierPath);
-  if (preCheck === "lockGone") {
-    return "retryTakeover";
-  }
-  if (preCheck !== "stale") {
-    // "barrierGone" (finished) or "notYetStale" (a live owner may still be
-    // legitimately working) — never reclaim in either case.
-    return "done";
-  }
-  const gatePath = `${lockPath}${PAUSE_REVOCATION_FINISH_LOCK_RECLAIM_GATE_SUFFIX_V1}`;
-  try {
-    await fs.promises.writeFile(gatePath, "", { flag: "wx" });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      // Another caller is already reclaiming this exact stale lock right now
-      // — not this call's job this pass; a later acquisition re-evaluates.
-      return "done";
-    }
-    console.error(
-      `reclaimStaleFinishLockV1: failed to acquire reclaim gate "${gatePath}" — conceding for now.`,
-      error
-    );
-    return "done";
-  }
-  try {
-    // Re-verify under exclusive ownership of the reclaim gate: the state
-    // this call observed above may already be stale itself by now.
-    const underGate = classifyFinishLockForReclaimV1(lockPath, barrierPath);
-    if (underGate === "lockGone") {
-      return "retryTakeover";
-    }
-    if (underGate !== "stale") {
-      return "done";
-    }
-    try {
-      await fs.promises.unlink(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error(`reclaimStaleFinishLockV1: failed to remove stale finish-lock "${lockPath}"`, error);
-      }
-    }
-    await performPauseRevocationBarrierFinishSequenceV1(taskFolderPath, barrierPath);
-    return "done";
-  } finally {
-    try {
-      await fs.promises.unlink(gatePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error(`reclaimStaleFinishLockV1: failed to remove reclaim gate "${gatePath}"`, error);
-      }
-    }
-  }
-}
-
-async function attemptFinishPauseRevocationBarrierOnceV1(
-  taskFolderPath: string,
-  barrierPath: string
-): Promise<"done" | "retryTakeover"> {
-  const lockPath = `${barrierPath}${PAUSE_REVOCATION_FINISH_LOCK_SUFFIX_V1}`;
-  try {
-    await fs.promises.writeFile(lockPath, "", { flag: "wx" });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      // Another caller already owns finishing this exact barrier right now
-      // (or a crashed prior attempt left its lock behind — see
-      // `reclaimStaleFinishLockV1`'s doc comment for how that case is now
-      // resolved rather than left indefinitely stranded).
-      //
-      // 2026-09-11 review completion blocker (`dceb2646...-2`, fixed):
-      // returning immediately here let THIS caller's own acquisition continue
-      // toward publishing a new marker/claim while the winner's fence-advance
-      // (and cleanup) might still be in flight — exactly the ordering plan
-      // step 12 forbids ("before publishing admission or starting another
-      // pause"). Wait, bounded, for the winner to finish (lock removed) or
-      // for the barrier itself to disappear (finished by a third party while
-      // we waited) before conceding.
-      for (let attempt = 0; attempt < PAUSE_REVOCATION_FINISH_LOCK_WAIT_ATTEMPTS_V1; attempt++) {
-        await delayV1(CLAIM_CONTENTION_POLL_INTERVAL_MS_V1);
-        if (!fs.existsSync(barrierPath)) {
-          return "done";
-        }
-        if (!fs.existsSync(lockPath)) {
-          // The lock is gone but the barrier is NOT — the winner released
-          // without finishing (threw mid-sequence, or crashed and something
-          // else already reclaimed/removed its lock). Take over rather than
-          // silently conceding as though the barrier were complete.
-          return "retryTakeover";
-        }
-      }
-      // 2026-09-11 review completion blocker (`dceb2646...-3`, fixed): this
-      // used to concede unconditionally here ("not my job"), stranding the
-      // barrier forever against a genuinely crashed winner. Attempt a bounded,
-      // single-winner reclaim instead — see `reclaimStaleFinishLockV1`'s doc
-      // comment for why this is safe even though the wait above found the
-      // lock still present.
-      return reclaimStaleFinishLockV1(taskFolderPath, barrierPath, lockPath);
-    }
-    throw error;
-  }
-  try {
-    await performPauseRevocationBarrierFinishSequenceV1(taskFolderPath, barrierPath);
-    return "done";
-  } finally {
-    // A failure to unlink our own lock (other than ENOENT, already gone)
-    // must never mask whatever the `try` block above just did or threw —
-    // throwing here would violate that (`no-unsafe-finally`) and could
-    // silently swallow a real advance/removal error. Log and move on: the
-    // fence-advance and barrier-removal above, if they ran, already
-    // succeeded or already threw their own error; a lingering lock file past
-    // this point is now bounded by `reclaimStaleFinishLockV1` above, not an
-    // unbounded interim gap.
-    try {
-      await fs.promises.unlink(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error(`finishPauseRevocationBarrierV1: failed to remove finish-lock "${lockPath}"`, error);
-      }
-    }
-  }
 }
