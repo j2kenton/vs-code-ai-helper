@@ -41,6 +41,7 @@ import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
+import { isEffectivelyPausedSyncV1 } from "../state/effectivePauseStatusV1";
 import {
   formatChecklistItemGlyphV1,
   formatChecklistPercentV1,
@@ -214,7 +215,10 @@ function buildTaskTooltip(
 ): vscode.MarkdownString {
   const lines: string[] = [`**${task.folderName}**`, ""];
 
-  const isPaused = task.progress.status === "paused";
+  // Part 1b step 13 (tree/context-key derivation): a revoked watchdog pause
+  // must not display as "Paused" — the sync resolver treats it the same as
+  // not-paused, matching every other migrated reader in this codebase.
+  const isPaused = isEffectivelyPausedSyncV1(task.folderUri.fsPath, task.progress);
   if (isPaused) {
     // A workflow-imposed pause carries its reason (e.g. an exhausted
     // provider chain, finding 4) — surfaced here so a paused-with-reason
@@ -505,7 +509,14 @@ export class TaskNode extends vscode.TreeItem {
       : taskIdentityKey(task);
 
     const currentStage = task.progress.currentStage;
-    const isPaused = task.progress.status === "paused";
+    // Part 1b step 13 (tree/context-key derivation): the raw `status` field
+    // can still say "paused" for a watchdog pause a revocation has since
+    // fenced past — see `resolveEffectivePauseStatusSyncV1`'s doc comment.
+    // Using the effective value here is what re-enables every `-paused`-gated
+    // stage-action button (package.json `when` clauses) once a pause is
+    // revoked, without waiting on the revocation's own best-effort disk
+    // repair to land first.
+    const isPaused = isEffectivelyPausedSyncV1(task.folderUri.fsPath, task.progress);
 
     // Only task-level operations (commit/push, Complete and Move On, Release)
     // spin the task row. Stage-scoped operations already spin their own stage
@@ -1036,11 +1047,14 @@ export class StageNode extends vscode.TreeItem {
     }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
-    // Use the computed stage context for stage-specific buttons
+    // Use the computed stage context for stage-specific buttons. A revoked
+    // watchdog pause must not gate stage-action buttons via the `-paused`
+    // context-value suffix — see `resolveEffectivePauseStatusSyncV1`'s doc
+    // comment and the identical fix on the task-row `isPaused` above.
     this.contextValue = getStageNodeContextValue(
       stage,
       status,
-      task.progress.status === "paused",
+      isEffectivelyPausedSyncV1(task.folderUri.fsPath, task.progress),
       task.progress.lintPayload !== undefined,
       task.progress.lintPayload?.passed,
       isScheduled,

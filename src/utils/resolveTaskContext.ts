@@ -7,6 +7,7 @@ import { taskRefFromResolved, TaskRef } from "../types/taskRef";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskRootCandidates } from "./taskRoot";
 import { migrateStatus, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * Normalize a path for comparison: on Windows, path.resolve/normalize
@@ -171,6 +172,51 @@ async function resolveAmbiguousOwnership(
     },
   }));
   return patched ? rebindRoot : undefined;
+}
+
+/**
+ * Part 1b step 13 ("audit every pause-sensitive read ... command self-checks
+ * ... to use it"): a revoked watchdog pause — one whose recorded fence
+ * generation a later revocation has already advanced past
+ * (`resolveEffectivePauseStatusV1`) — must never be treated as an effective
+ * pause by this shared resolver, the same "fix once in the shared helper"
+ * doctrine already applied to admission validation (see `workAdmissionV1.ts`'s
+ * `hasWorkspaceIndependentOwnershipV1`). Every caller of `resolveTaskContext`
+ * inherits the correction automatically, including the many callers that
+ * thread `resolved.progress.status` straight into `TaskActionRequestV1`'s
+ * `taskStatus` field, so this single fix also closes the equivalent gap in
+ * `taskActionCoordinatorV1.ts`'s eligibility check without touching it
+ * directly.
+ *
+ * Read-only: this only affects what THIS resolution reports back. Durable
+ * repair of the on-disk fields happens elsewhere — the revocation's own
+ * best-effort cleanup hook (`effectivePauseStatusV1.ts`'s registered hook,
+ * or a later admission/pause attempt helping finish an abandoned barrier) —
+ * and is never performed here, matching every other existing
+ * `isEffectivelyPausedV1` call site in this codebase.
+ *
+ * @internal exported for testing
+ */
+export async function correctResolvedForRevokedWatchdogPauseV1(
+  task: TaskWithProgress
+): Promise<TaskWithProgress> {
+  if (task.progress.status !== "paused" || task.progress.watchdogPauseClaimId === undefined) {
+    return task;
+  }
+  const effective = await resolveEffectivePauseStatusV1(task.taskFolderPath, task.progress);
+  if (effective.kind !== "revokedWatchdogPause") {
+    return task;
+  }
+  return {
+    ...task,
+    progress: {
+      ...task.progress,
+      status: "active",
+      pausedReason: undefined,
+      watchdogPauseClaimId: undefined,
+      watchdogPauseFenceGeneration: undefined,
+    },
+  };
 }
 
 /**
@@ -449,6 +495,7 @@ export async function resolveTaskContext(
     if (!resolved) {
       return undefined;
     }
+    resolved = await correctResolvedForRevokedWatchdogPauseV1(resolved);
   }
 
   // ----------------------------------------------------------------
@@ -477,6 +524,10 @@ export async function resolveTaskContext(
       if (!resolved) {
         await currentTaskStore.clear();
       }
+    }
+
+    if (resolved) {
+      resolved = await correctResolvedForRevokedWatchdogPauseV1(resolved);
     }
 
     // The persisted pointer is a convenience cache of "which task is active"

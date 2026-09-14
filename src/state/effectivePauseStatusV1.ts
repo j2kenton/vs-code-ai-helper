@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { isWatchdogPauseFenceCurrentV1, registerPauseRevocationCleanupHookV1 } from "./workAdmissionV1";
+import {
+  isWatchdogPauseFenceCurrentSyncV1,
+  isWatchdogPauseFenceCurrentV1,
+  registerPauseRevocationCleanupHookV1,
+} from "./workAdmissionV1";
 import { TaskProgress } from "../types/taskProgress";
 
 /**
@@ -25,12 +29,16 @@ import { TaskProgress } from "../types/taskProgress";
  * park, or a pause written by a pre-1b build with no claim id at all) is
  * ALWAYS authoritative and is never second-guessed here.
  *
- * NOT YET WIRED into any consumer (plan step 13's "audit every pause-sensitive
- * read: command self-checks, tree/context-key derivation, automation gates,
- * advancement gates, scheduled dispatch, notifications" remains open) —
- * this module is the primitive that audit will call into, added and tested
- * standalone first so each site can be migrated with a single, verifiable
- * call rather than reimplementing the fence check inline.
+ * Plan step 13's "audit every pause-sensitive read: command self-checks,
+ * tree/context-key derivation, automation gates, advancement gates,
+ * scheduled dispatch, notifications" audit is wired incrementally, one site
+ * at a time, against this module's async resolver (async command paths —
+ * `resolveTaskContext.ts`'s shared gate, `reviewActions.ts`,
+ * `applyCurrentStageAction.ts`, `pauseTask.ts`, `resumeTask.ts`, and more)
+ * and its synchronous twin below (render paths that cannot await mid-render
+ * — `taskTreeProvider.ts`, `taskStatusBar.ts`). Not every reader is migrated
+ * yet; each migration is a single, verifiable call rather than
+ * reimplementing the fence check inline.
  */
 export type EffectivePauseStatusV1 =
   | { readonly kind: "notPaused" }
@@ -76,6 +84,41 @@ export async function isEffectivelyPausedV1(
   progress: EffectivePauseSnapshotV1
 ): Promise<boolean> {
   const resolved = await resolveEffectivePauseStatusV1(taskFolderPath, progress);
+  return resolved.kind === "userPause" || resolved.kind === "currentWatchdogPause";
+}
+
+/**
+ * Read-only synchronous twin of `resolveEffectivePauseStatusV1`, for
+ * tree/context-key derivation and other render-path consumers that cannot
+ * await mid-render (plan step 13). Uses `isWatchdogPauseFenceCurrentSyncV1`
+ * in place of the async durable fence read; every other branch is identical
+ * to, and must be kept in sync with, the async resolver above.
+ */
+export function resolveEffectivePauseStatusSyncV1(
+  taskFolderPath: string,
+  progress: EffectivePauseSnapshotV1
+): EffectivePauseStatusV1 {
+  if (progress.status !== "paused") {
+    return { kind: "notPaused" };
+  }
+  if (progress.watchdogPauseClaimId === undefined) {
+    return { kind: "userPause" };
+  }
+  const current = isWatchdogPauseFenceCurrentSyncV1(taskFolderPath, progress.watchdogPauseFenceGeneration);
+  return current
+    ? { kind: "currentWatchdogPause" }
+    : { kind: "revokedWatchdogPause", staleClaimId: progress.watchdogPauseClaimId };
+}
+
+/**
+ * Convenience boolean twin of `isEffectivelyPausedV1` for synchronous
+ * render-path consumers — see `resolveEffectivePauseStatusSyncV1`.
+ */
+export function isEffectivelyPausedSyncV1(
+  taskFolderPath: string,
+  progress: EffectivePauseSnapshotV1
+): boolean {
+  const resolved = resolveEffectivePauseStatusSyncV1(taskFolderPath, progress);
   return resolved.kind === "userPause" || resolved.kind === "currentWatchdogPause";
 }
 

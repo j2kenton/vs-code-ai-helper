@@ -7,11 +7,17 @@ import * as vscode from "vscode";
 import { encodeTaskProgressV1 } from "../services/taskProgressWriterV1";
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import {
+  isEffectivelyPausedSyncV1,
   isEffectivelyPausedV1,
   repairRevokedWatchdogPauseV1,
+  resolveEffectivePauseStatusSyncV1,
   resolveEffectivePauseStatusV1,
 } from "../state/effectivePauseStatusV1";
-import { advancePauseFenceGenerationV1, readOrInitPauseFenceGenerationV1 } from "../state/workAdmissionV1";
+import {
+  ADMISSION_DIRNAME_V1,
+  advancePauseFenceGenerationV1,
+  readOrInitPauseFenceGenerationV1,
+} from "../state/workAdmissionV1";
 
 /**
  * v1 fixes item 1, Part 1b step 13 — the centralized effective-pause-status
@@ -213,5 +219,122 @@ void describe("effectivePauseStatusV1", () => {
     } finally {
       h.restore();
     }
+  });
+
+  /**
+   * Part 1b step 13 wiring: `resolveEffectivePauseStatusSyncV1` /
+   * `isEffectivelyPausedSyncV1` are the synchronous twins consumed by
+   * render-path readers (`taskTreeProvider.ts`, `taskStatusBar.ts`) that
+   * cannot await mid-render. Every branch below mirrors the async resolver's
+   * own test cases above one-for-one — the two must never diverge, since a
+   * paused task's tree row and its command-level gate must always agree on
+   * whether the pause is still effective.
+   */
+  void describe("synchronous twins (resolveEffectivePauseStatusSyncV1 / isEffectivelyPausedSyncV1)", () => {
+    void it("an active task resolves to notPaused", () => {
+      const resolved = resolveEffectivePauseStatusSyncV1("irrelevant-unused-path", { status: "active" });
+      assert.equal(resolved.kind, "notPaused");
+      assert.equal(isEffectivelyPausedSyncV1("irrelevant-unused-path", { status: "active" }), false);
+    });
+
+    void it("a paused task with no watchdogPauseClaimId is always userPause, with no disk access at all", () => {
+      // Deliberately uses a path with no admission directory / no fence ever
+      // initialized — a real user pause must resolve without ever touching
+      // the fence, exactly like the async resolver.
+      const resolved = resolveEffectivePauseStatusSyncV1("Z:\\definitely\\does\\not\\exist", {
+        status: "paused",
+      });
+      assert.equal(resolved.kind, "userPause");
+      assert.equal(
+        isEffectivelyPausedSyncV1("Z:\\definitely\\does\\not\\exist", { status: "paused" }),
+        true
+      );
+    });
+
+    void it("a watchdog pause whose recorded generation matches the current fence is currentWatchdogPause", async () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        const generation = await readOrInitPauseFenceGenerationV1(h.folder);
+        const resolved = resolveEffectivePauseStatusSyncV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-1",
+          watchdogPauseFenceGeneration: generation,
+        });
+        assert.equal(resolved.kind, "currentWatchdogPause");
+        assert.equal(
+          isEffectivelyPausedSyncV1(h.folder, {
+            status: "paused",
+            watchdogPauseClaimId: "claim-1",
+            watchdogPauseFenceGeneration: generation,
+          }),
+          true
+        );
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("a watchdog pause whose recorded generation is behind the current fence is revokedWatchdogPause, never a real block", async () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        const staleGeneration = await readOrInitPauseFenceGenerationV1(h.folder);
+        await advancePauseFenceGenerationV1(h.folder);
+        const resolved = resolveEffectivePauseStatusSyncV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-stale",
+          watchdogPauseFenceGeneration: staleGeneration,
+        });
+        assert.equal(resolved.kind, "revokedWatchdogPause");
+        if (resolved.kind === "revokedWatchdogPause") {
+          assert.equal(resolved.staleClaimId, "claim-stale");
+        }
+        assert.equal(
+          isEffectivelyPausedSyncV1(h.folder, {
+            status: "paused",
+            watchdogPauseClaimId: "claim-stale",
+            watchdogPauseFenceGeneration: staleGeneration,
+          }),
+          false,
+          "a revoked watchdog pause must never gate a render-path consumer either"
+        );
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("a watchdog pause with no recorded generation at all (pre-1b build) is treated as current, never revoked", async () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        await advancePauseFenceGenerationV1(h.folder);
+        const resolved = resolveEffectivePauseStatusSyncV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-pre-1b",
+          watchdogPauseFenceGeneration: undefined,
+        });
+        assert.equal(resolved.kind, "currentWatchdogPause");
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("never writes anything to disk — a purely read-only render-path check", () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        const before = fs.existsSync(path.join(h.folder, ADMISSION_DIRNAME_V1));
+        assert.equal(before, false, "no admission directory should exist before the check");
+        resolveEffectivePauseStatusSyncV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-1",
+          watchdogPauseFenceGeneration: 0,
+        });
+        assert.equal(
+          fs.existsSync(path.join(h.folder, ADMISSION_DIRNAME_V1)),
+          false,
+          "the sync check must never lazily create the admission/fence directory as a render-path side effect"
+        );
+      } finally {
+        h.restore();
+      }
+    });
   });
 });

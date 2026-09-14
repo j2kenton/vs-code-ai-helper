@@ -2713,6 +2713,46 @@ export async function isWatchdogPauseFenceCurrentV1(
 }
 
 /**
+ * Read-only synchronous twin of `isWatchdogPauseFenceCurrentV1`, for
+ * tree/context-key derivation and other render-path consumers that cannot
+ * await a durable read mid-render (plan step 13's "tree/context-key
+ * derivation" audit category). Reuses the exact same on-disk listing
+ * (`listPauseFenceGenerationsSyncV1`) the async primitive above uses —
+ * never writes, never lazily publishes generation 0 the way
+ * `readOrInitPauseFenceGenerationV1` does, so it is safe to call on every
+ * tree refresh for every paused task: an admission directory or fence that
+ * has never been initialized is treated exactly like
+ * `recordedFenceGeneration === undefined` — current, since no generation
+ * has ever existed for it to have fallen behind.
+ *
+ * A directory-read failure other than ENOENT (propagated by
+ * `listPauseFenceGenerationsSyncV1`) fails toward "still current" — i.e.
+ * still effectively paused — never silently displaying a real pause as
+ * resolved from a read this couldn't actually confirm. This only affects
+ * DISPLAY; every write path (`pauseTaskWithReasonForClaimV1`, the resolver's
+ * own repair) re-validates durably through the async primitive above.
+ */
+export function isWatchdogPauseFenceCurrentSyncV1(
+  taskFolderPath: string,
+  recordedFenceGeneration: number | undefined
+): boolean {
+  if (recordedFenceGeneration === undefined) {
+    return true;
+  }
+  const dir = admissionDirV1(taskFolderPath);
+  let generations: readonly number[];
+  try {
+    generations = listPauseFenceGenerationsSyncV1(dir);
+  } catch {
+    return true;
+  }
+  if (generations.length === 0) {
+    return true;
+  }
+  return recordedFenceGeneration === Math.max(...generations);
+}
+
+/**
  * Part 1b — stale `pauseCommit` revocation barrier (plan step 12).
  *
  * Targets the live MARKER a `pauseCommit` acquisition publishes once its
