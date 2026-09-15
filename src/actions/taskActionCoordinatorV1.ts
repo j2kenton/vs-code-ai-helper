@@ -369,11 +369,22 @@ export interface TaskActionRequestV1 {
    * — this gate's row is already known live and owned (both checks already
    * passed on every attempt), only the write recording this attempt's id
    * onto it could not be durably confirmed after retrying — which is logged
-   * as a degraded-provenance warning and lets the coordinator proceed to
-   * invoke the provider rather than losing the round. Any OTHER, unrecognized
-   * error stays fail-closed like the two ownership kinds: this hook can carry
-   * arbitrary caller logic, and an unrecognized failure gives no basis for
-   * concluding it is safe to proceed.
+   * as a degraded-provenance `console.warn` HERE, and lets the coordinator
+   * proceed to invoke the provider rather than losing the round. Any OTHER,
+   * unrecognized error stays fail-closed like the two ownership kinds: this
+   * hook can carry arbitrary caller logic, and an unrecognized failure gives
+   * no basis for concluding it is safe to proceed.
+   *
+   * This `console.warn` is a SUPPLEMENT, not the durable record: a caller
+   * that owns a round ledger (`reviewActions.ts`'s two dispatch sites) calls
+   * `attachCoordinatorIdentityToRoundTrackingDegradationV1` (`roundLedgerV1.ts`)
+   * from inside its own hook body instead of the bare attach function — that
+   * wrapper reports the SAME `writerRetriesExhausted` fact to the caller
+   * before rethrowing it unchanged, so the caller can fold it into
+   * `RoundLedgerOutcomeV1.identityAttachmentDegraded` at its own
+   * `terminalizeRoundV1` call and into that round's run log. This module's
+   * own classification (fail-open vs fail-closed) is unaffected either way —
+   * the caller's capture never changes what gets rethrown here.
    */
   readonly onAttemptAllocated?: (
     info: { readonly attemptId: string; readonly operationId: string }

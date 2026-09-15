@@ -1312,6 +1312,30 @@ export interface RoundLedgerOutcomeV1 {
     readonly taskMdBytes: number;
     readonly percentOfLimit: number;
   };
+  /**
+   * Set when this round's coordinator attach-identity hook
+   * (`attachCoordinatorIdentityToRoundV1`) failed for a confirmed transient
+   * write-plumbing reason rather than a genuine ownership violation (Part 2,
+   * "an admission gate should guard correctness, not bookkeeping" —
+   * 2026-09-15 post-freeze findings, item 2: the settlement must say "which
+   * kind it is, so 'the round did not run' is distinguishable from 'the
+   * round ran and was not recorded'"). The round proceeded and ran the
+   * provider anyway — this is the durable record that ONE of its attemptIds
+   * was never confirmed attached to this ledger row, so traceability for
+   * that attempt is degraded, not that the round itself failed. Absent for
+   * every round whose identity attached cleanly, and for one that failed
+   * closed instead (that round never reaches a terminal state with this
+   * field set — it settles `attemptIdentityAttachmentFailed` and never
+   * runs). Attached in the SAME `patchTaskProgressStrictV1` transaction
+   * `terminalizeRoundV1` uses to close this round, mirroring
+   * `taskMdSizeBand`'s own precedent for a caller-observed fact folded into
+   * a round's settlement.
+   */
+  identityAttachmentDegraded?: {
+    readonly attemptId: string;
+    readonly kind: string;
+    readonly detail: string;
+  };
 }
 
 /**

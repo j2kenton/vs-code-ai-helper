@@ -497,6 +497,9 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
     if (outcome.continuationOwed) {
       parts.push("a continuation is owed");
     }
+    if (outcome.identityAttachmentDegraded) {
+      parts.push("provenance degraded: attempt identity was not durably attached to this round");
+    }
     if (outcome.taskMdSizeBand) {
       const kb = Math.round(outcome.taskMdSizeBand.taskMdBytes / 1024);
       parts.push(
@@ -1240,6 +1243,46 @@ export async function attachCoordinatorIdentityToRoundV1(
     `failed to durably attach coordinator identity to round ${options.roundId} after ` +
       `${MAX_ATTACH_IDENTITY_WRITE_ATTEMPTS_V1} attempts`
   );
+}
+
+/**
+ * Fact captured by `attachCoordinatorIdentityToRoundTrackingDegradationV1`
+ * when a coordinator identity attach degrades rather than fails closed —
+ * shape matches `RoundLedgerOutcomeV1.identityAttachmentDegraded`, the
+ * durable field callers fold this into at their own terminalization.
+ */
+export interface IdentityAttachmentDegradedV1 {
+  readonly attemptId: string;
+  readonly kind: string;
+  readonly detail: string;
+}
+
+/**
+ * Thin wrapper around `attachCoordinatorIdentityToRoundV1` used by every
+ * `onAttemptAllocated` caller (Part 2, "an admission gate should guard
+ * correctness, not bookkeeping" — 2026-09-15 post-freeze findings, item 2:
+ * "record a warning on the round and in the run log"). A confirmed transient
+ * `writerRetriesExhausted` failure is reported to `onDegraded` before being
+ * rethrown UNCHANGED — this does not alter what the coordinator's own
+ * `classifyAttemptAllocationFailureV1` (`taskActionCoordinatorV1.ts`) decides
+ * (fail-open for this one kind, fail-closed for everything else); it only
+ * gives the caller, which owns this round's `taskFolderUri`/`roundId` and
+ * eventual `terminalizeRoundV1` call, a chance to fold the fact into this
+ * round's own durable settlement (`RoundLedgerOutcomeV1.identityAttachmentDegraded`)
+ * and run log, alongside the coordinator's separate `console.warn`.
+ */
+export async function attachCoordinatorIdentityToRoundTrackingDegradationV1(
+  options: AttachCoordinatorIdentityToRoundOptionsV1,
+  onDegraded: (info: IdentityAttachmentDegradedV1) => void
+): Promise<void> {
+  try {
+    await attachCoordinatorIdentityToRoundV1(options);
+  } catch (error) {
+    if (error instanceof AttachCoordinatorIdentityErrorV1 && error.kind === "writerRetriesExhausted") {
+      onDegraded({ attemptId: options.attemptId, kind: error.kind, detail: error.message });
+    }
+    throw error;
+  }
 }
 
 // `recordChecklistRevisionOnRoundLedgerV1` (Part 6 items 5/19) was removed

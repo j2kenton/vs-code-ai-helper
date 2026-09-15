@@ -100,7 +100,7 @@ import {
 } from "../utils/promptManifestV1";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 import {
-  attachCoordinatorIdentityToRoundV1,
+  attachCoordinatorIdentityToRoundTrackingDegradationV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   RoundLedgerTerminalStateV1,
@@ -2745,6 +2745,11 @@ export async function handleReviewRoutingOutcome(options: {
    * so the fact lands in the SAME durable transaction that closes this
    * round, whichever branch it takes. */
   taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
+  /** 2026-09-15 post-freeze findings, item 2: see
+   * `ReviewOutcomeContextV1.identityAttachmentDegraded`'s doc comment —
+   * forwarded the same way as `taskMdSizeBand`, onto both `terminalizeRoundV1`
+   * outcome branches below. */
+  identityAttachmentDegraded?: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
   const {
     folderUri,
@@ -2760,6 +2765,7 @@ export async function handleReviewRoutingOutcome(options: {
     coordinatorAttemptId,
     coordinatorExtraAttemptIds,
     taskMdSizeBand,
+    identityAttachmentDegraded,
   } = options;
   try {
     const resilience = getResilienceSettings();
@@ -2869,7 +2875,11 @@ export async function handleReviewRoutingOutcome(options: {
       await terminalizeRoundV1(
         reviewAttemptId,
         "rejected",
-        { rejectionReason, ...(taskMdSizeBand ? { taskMdSizeBand } : {}) },
+        {
+          rejectionReason,
+          ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
+          ...(identityAttachmentDegraded ? { identityAttachmentDegraded } : {}),
+        },
         {
           taskFolderUri: folderUri,
           ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
@@ -3173,6 +3183,7 @@ export async function handleReviewRoutingOutcome(options: {
         mechanicalBlockers: blockerSplit.mechanicalBlockers,
         ...(reviewerChallengedNonGoalHeadings ? { reviewerChallengedNonGoal: reviewerChallengedNonGoalHeadings } : {}),
         ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
+        ...(identityAttachmentDegraded ? { identityAttachmentDegraded } : {}),
       },
       {
         taskFolderUri: folderUri,
@@ -3444,6 +3455,16 @@ export interface ReviewOutcomeContextV1 {
    * second, separately-fragile chat append. See `RoundLedgerOutcomeV1.taskMdSizeBand`'s
    * own doc comment. */
   taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
+  /** 2026-09-15 post-freeze findings, item 2 ("an admission gate should
+   * guard correctness, not bookkeeping"): set when THIS round's coordinator
+   * attach-identity hook (`onAttemptAllocated` →
+   * `attachCoordinatorIdentityToRoundTrackingDegradationV1`) failed for a
+   * confirmed transient reason and the round proceeded anyway (fail-open) —
+   * carried through to whichever terminal path this round takes, the same
+   * way `taskMdSizeBand` is, so it lands in `outcome.identityAttachmentDegraded`
+   * in the same durable transaction that closes the round. See that field's
+   * own doc comment. */
+  identityAttachmentDegraded?: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
 }
 
 /**
@@ -3518,10 +3539,16 @@ async function terminalizeUnclosedReviewRoundV1(
 ): Promise<void> {
   try {
     const correlation = outcomeCorrelationV1(outcome);
+    const unclosedOutcomePatch = {
+      ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
+      ...(ctx.identityAttachmentDegraded
+        ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
+        : {}),
+    };
     await terminalizeRoundV1(
       ctx.reviewAttemptId,
       terminalStateForUnclosedReviewOutcomeV1(outcome),
-      ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : undefined,
+      Object.keys(unclosedOutcomePatch).length > 0 ? unclosedOutcomePatch : undefined,
       {
         taskFolderUri: ctx.folderUri,
         ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
@@ -3662,6 +3689,19 @@ export async function writeReviewRunLogV1(
         // makes this run log a usable record without it.
       }
     }
+    // 2026-09-15 post-freeze findings, item 2: "record a warning on the
+    // round and in the run log" for a confirmed transient identity-attach
+    // failure the coordinator fails OPEN for — this run log is the durable
+    // per-round record a user actually opens, so the degraded-provenance
+    // fact belongs here alongside the round-ledger field it also lands on
+    // (`RoundLedgerOutcomeV1.identityAttachmentDegraded`), not only in the
+    // coordinator's own `console.warn`.
+    const identityAttachmentSection = ctx.identityAttachmentDegraded
+      ? `\n## Provenance degraded\n\nAttempt ${ctx.identityAttachmentDegraded.attemptId}'s identity could ` +
+        `not be durably attached to this round's ledger row (${ctx.identityAttachmentDegraded.kind}: ` +
+        `${ctx.identityAttachmentDegraded.detail}). The round proceeded anyway — this affects traceability ` +
+        `only, not the round's own result.\n`
+      : "";
     const logUri = await writeRunLog(
       ctx.folderUri,
       "review-v1",
@@ -3669,7 +3709,7 @@ export async function writeReviewRunLogV1(
       `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
         outcome,
         STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
-      )}\n${blockerSection}${exhaustionSection}`
+      )}\n${blockerSection}${exhaustionSection}${identityAttachmentSection}`
     );
     taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
   } catch {
@@ -3906,6 +3946,9 @@ async function routeReviewOutcomeV1(
             ? { coordinatorExtraAttemptIds: ctx.extraCoordinatorAttemptIds }
             : {}),
           ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
+          ...(ctx.identityAttachmentDegraded
+            ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
+            : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -5487,6 +5530,13 @@ export async function runReviewForFolder(
     // item-14 same-candidate retry), not just the final one carried on
     // `outcome.correlation` — see `ReviewOutcomeContextV1.extraCoordinatorAttemptIds`.
     const observedCoordinatorAttemptIds: string[] = [];
+    // 2026-09-15 post-freeze findings, item 2: a confirmed transient
+    // `writerRetriesExhausted` attach failure lets the coordinator proceed
+    // (fail-open) rather than losing the round — captured here so it can be
+    // folded into this round's own durable settlement and run log below,
+    // alongside the coordinator's own `console.warn`. See
+    // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
+    let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
     reportStageRunningV1(options.operation, stageToken);
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
@@ -5510,12 +5560,17 @@ export async function runReviewForFolder(
       // user pause written while the provider is running.
       onAttemptAllocated: async (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        await attachCoordinatorIdentityToRoundV1({
-          roundId: reviewAttemptId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-          taskFolderUri: folderUri,
-        });
+        await attachCoordinatorIdentityToRoundTrackingDegradationV1(
+          {
+            roundId: reviewAttemptId,
+            operationId: info.operationId,
+            attemptId: info.attemptId,
+            taskFolderUri: folderUri,
+          },
+          (degraded) => {
+            identityAttachmentDegradedForOutcome = degraded;
+          }
+        );
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
@@ -5546,6 +5601,9 @@ export async function runReviewForFolder(
         ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
         : {}),
       ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
+      ...(identityAttachmentDegradedForOutcome
+        ? { identityAttachmentDegraded: identityAttachmentDegradedForOutcome }
+        : {}),
     });
   } finally {
     if (!reviewSucceeded) {
@@ -13412,6 +13470,9 @@ export async function resumeReviewInteractionV1(
     // `runReviewForFolder`'s `observedCoordinatorAttemptIds` collection here now
     // that `TaskActionResumeRequestV1.onPromptAssembled` exists.
     const observedCoordinatorAttemptIds: string[] = [];
+    // See `runReviewForFolder`'s matching declaration and
+    // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
+    let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
     const outcome = await coordinator.resumeAction({
       interaction: interactionRef,
       taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
@@ -13428,12 +13489,17 @@ export async function resumeReviewInteractionV1(
       // round ledger before the provider can run.
       onAttemptAllocated: async (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        await attachCoordinatorIdentityToRoundV1({
-          roundId: reviewAttemptId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-          taskFolderUri,
-        });
+        await attachCoordinatorIdentityToRoundTrackingDegradationV1(
+          {
+            roundId: reviewAttemptId,
+            operationId: info.operationId,
+            attemptId: info.attemptId,
+            taskFolderUri,
+          },
+          (degraded) => {
+            identityAttachmentDegradedForOutcome = degraded;
+          }
+        );
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
@@ -13453,6 +13519,9 @@ export async function resumeReviewInteractionV1(
       modelId,
       ...(observedCoordinatorAttemptIds.length
         ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
+        : {}),
+      ...(identityAttachmentDegradedForOutcome
+        ? { identityAttachmentDegraded: identityAttachmentDegradedForOutcome }
         : {}),
     });
 

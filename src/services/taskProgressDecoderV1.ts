@@ -1267,6 +1267,7 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
     "roundOutcomeAttemptId",
     "reviewerChallengedNonGoal",
     "taskMdSizeBand",
+    "identityAttachmentDegraded",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1376,6 +1377,39 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
       band["percentOfLimit"] < 0
     ) {
       return "roundLedger entry outcome taskMdSizeBand.percentOfLimit must be a non-negative integer";
+    }
+  }
+  if (value["identityAttachmentDegraded"] !== undefined) {
+    const degraded = value["identityAttachmentDegraded"];
+    if (!isPlainObject(degraded)) {
+      return "roundLedger entry outcome identityAttachmentDegraded must be an object";
+    }
+    const allowedDegradedKeys = new Set(["attemptId", "kind", "detail"]);
+    for (const key of Object.keys(degraded)) {
+      if (!allowedDegradedKeys.has(key)) {
+        return `roundLedger entry outcome identityAttachmentDegraded has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (
+      typeof degraded["attemptId"] !== "string" ||
+      degraded["attemptId"].length === 0 ||
+      degraded["attemptId"].length > MAX_ID_LENGTH
+    ) {
+      return "roundLedger entry outcome identityAttachmentDegraded.attemptId must be a bounded non-empty string";
+    }
+    if (
+      typeof degraded["kind"] !== "string" ||
+      degraded["kind"].length === 0 ||
+      degraded["kind"].length > 100
+    ) {
+      return "roundLedger entry outcome identityAttachmentDegraded.kind must be a bounded non-empty string";
+    }
+    if (
+      typeof degraded["detail"] !== "string" ||
+      degraded["detail"].length === 0 ||
+      degraded["detail"].length > MAX_ESCALATION_REASON_LENGTH
+    ) {
+      return "roundLedger entry outcome identityAttachmentDegraded.detail must be a bounded non-empty string";
     }
   }
   return undefined;
