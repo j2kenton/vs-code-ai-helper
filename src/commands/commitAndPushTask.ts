@@ -70,7 +70,7 @@ import {
   reconcileWatchdogPauseAgainstAdmissionV1,
   WorkAdmissionPauseReconciliationV1,
 } from "../state/workAdmissionReconciliationV1";
-import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
+import { isEffectivelyPausedV1, resolveEffectiveStageTaskStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 /**
@@ -3270,13 +3270,14 @@ export async function completeCommitAndPushTask(
       // has already advanced past can still read "paused" on disk (repair is
       // best-effort and may not have landed yet), which would otherwise trip
       // `actionNotEligibleForStatus` here even though this command already
-      // proved the task is not really paused. Same fix as
-      // reviewActions.ts's `advanceStageViaNextStageRowV1`.
-      const effectiveStageTaskStatus =
-        resolvedTask.progress.status === "paused" &&
-        !(await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress))
-          ? "active"
-          : resolvedTask.progress.status ?? "active";
+      // proved the task is not really paused. Shared, dedicated-tested
+      // computation (`resolveEffectiveStageTaskStatusV1`) — same fix as
+      // reviewActions.ts's `advanceStageViaNextStageRowV1`, which uses the
+      // identical function rather than reimplementing it.
+      const effectiveStageTaskStatus = await resolveEffectiveStageTaskStatusV1(
+        resolvedTask.taskFolderPath,
+        resolvedTask.progress
+      );
       const stageOutcome = await invokeLifecycleRowV1({
         actionKey: NEXT_STAGE_ACTION_KEY_V1,
         taskFolderPath: resolvedTask.taskFolderPath,

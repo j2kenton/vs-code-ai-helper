@@ -37,15 +37,20 @@ import {
 } from "../utils/taskWatchdogV1";
 import {
   acquireWorkAdmissionV1,
+  attemptAutomaticWorkAdmissionReclamationV1,
   authorizeWorkAdmissionHandoffV1,
+  describeStaleWorkAdmissionTakeoverNoticeV1,
   describeWorkAdmissionRefusalV1,
+  garbageCollectStaleWorkAdmissionTombstonesV1,
   hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
   isWatchdogPauseFenceCurrentV1,
   readOrInitPauseFenceGenerationV1,
   revokeWorkAdmissionHandoffV1,
+  takeOverStaleWorkAdmissionMarkerV1,
   withWorkAdmissionV1,
+  WorkAdmissionAutomaticReclamationOutcomeV1,
 } from "../state/workAdmissionV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
@@ -391,10 +396,186 @@ export class TaskActionScheduler implements vscode.Disposable {
     await this.reconcileRoundLedgerOrphans();
     await this.retryStuckPlanRevisionAdoptions();
     await this.armPendingImplRecoveries();
+    // v1 fixes item 1, Part 1c step 15/18: reclaim any admission marker whose
+    // owner is PROVABLY dead before the watchdog's own stand-down check
+    // (immediately below) decides whether a live marker should exempt this
+    // task. Ordered here, right before that check, for the same reason as
+    // every other self-healing pass above — so the watchdog evaluates each
+    // task against the freshest state the rest of this sweep could establish,
+    // rather than standing down for a marker that this same pass just proved
+    // stale-and-dead.
+    await this.reclaimStaleWorkAdmissionMarkersV1();
+    // v1 fixes item 1, Part 1c step 17: collect aged reclamation tombstones.
+    // Ordered after reclamation (which is what creates them) and independent
+    // of the watchdog check below — this is pure disk hygiene for an audit
+    // trail, never a decision any other pass depends on.
+    await this.garbageCollectStaleWorkAdmissionTombstonesV1();
     // Last, so it only ever fires against whatever the passes above could
     // NOT resolve — an orphaned round is already closed, a reclaimable
     // continuation is already re-armed, by the time this runs.
     await this.detectAndRepairStalledActiveTasksV1();
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 17 — best-effort, per-task tombstone GC.
+   * Delegates entirely to {@link garbageCollectStaleWorkAdmissionTombstonesV1};
+   * see that function's own doc comment for why it can never touch a live
+   * claim/marker, a pause-fence generation, or a pending revocation barrier.
+   * One task's failure is logged and never stops the pass for the rest of
+   * the inventory, matching every other self-healing pass in `armAll`.
+   */
+  private async garbageCollectStaleWorkAdmissionTombstonesV1(): Promise<void> {
+    const now = this.clock.now();
+    for (const task of this.inventory.getTasks()) {
+      try {
+        const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task.taskFolderPath, now);
+        if (outcome.outcome === "writeFailed") {
+          console.error(
+            `garbageCollectStaleWorkAdmissionTombstonesV1: failed to collect a tombstone for "${task.taskFolderPath}" ` +
+              `(collected ${outcome.partialCount} before the failure)`,
+            outcome.error
+          );
+        }
+      } catch (error) {
+        console.error(
+          `garbageCollectStaleWorkAdmissionTombstonesV1: unexpected error collecting tombstones for ` +
+            `"${task.taskFolderPath}" — leaving them for a later sweep.`,
+          error
+        );
+      }
+    }
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 16 — per-task tracking of how many
+   * CONSECUTIVE sweeps have observed the same stuck, notice-worthy admission
+   * owner (`foreignHost`/`sameHostAlive`/`corrupt` — plan step 16's own named
+   * three; `sameHostDead` is reclaimed automatically and never reaches here,
+   * `indeterminate` stays silent per `describeStaleWorkAdmissionTakeoverNoticeV1`'s
+   * doc comment). Keyed by task folder path; the tracked identity
+   * (`owner.claimId`, or a corrupt-record sentinel keyed off the marker path
+   * itself) resets the count to 1 whenever a DIFFERENT owner is observed, so
+   * a takeover notice can never fire for a marker that only just appeared —
+   * "never offered for fresh heartbeat" (plan step 16) is automatic here: a
+   * fresh marker cannot yet have crossed the staleness threshold that gates
+   * `notDead` in the first place. `notified` is one-shot per identity streak
+   * — this is a notice, not a repeating alarm; it fires once, and only fires
+   * again if the SAME task later cycles through a different stuck owner.
+   */
+  private readonly staleAdmissionNoticeStateV1 = new Map<
+    string,
+    { identityKey: string; count: number; notified: boolean }
+  >();
+
+  /** How many consecutive sweep observations of the same stuck owner before
+   * offering a takeover. Not time-based (armAll's own cadence — a 5-minute
+   * timer plus every task-progress.json write — already provides real-world
+   * spacing); this only needs to rule out a single transient blip. */
+  private static readonly STALE_ADMISSION_TAKEOVER_NOTICE_THRESHOLD_V1 = 3;
+
+  private surfaceStaleWorkAdmissionTakeoverNoticeV1(
+    task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
+    outcome: Extract<WorkAdmissionAutomaticReclamationOutcomeV1, { outcome: "notDead" }>
+  ): void {
+    const kind = outcome.liveness.kind;
+    if (kind !== "foreignHost" && kind !== "sameHostAlive" && kind !== "corrupt") {
+      // `indeterminate` (or any future kind): never notice-worthy — clear any
+      // stale tracking so a later genuinely notice-worthy streak starts fresh.
+      this.staleAdmissionNoticeStateV1.delete(task.taskFolderPath);
+      return;
+    }
+    const identityKey = outcome.owner ? outcome.owner.claimId : `corrupt:${outcome.markerPath}`;
+    const existing = this.staleAdmissionNoticeStateV1.get(task.taskFolderPath);
+    const state = existing && existing.identityKey === identityKey ? existing : { identityKey, count: 0, notified: false };
+    state.count += 1;
+    this.staleAdmissionNoticeStateV1.set(task.taskFolderPath, state);
+    if (state.notified || state.count < TaskActionScheduler.STALE_ADMISSION_TAKEOVER_NOTICE_THRESHOLD_V1) {
+      return;
+    }
+    state.notified = true;
+    const displayName = task.progress.displayName ?? task.progress.taskFolder;
+    const message = describeStaleWorkAdmissionTakeoverNoticeV1(displayName, outcome.liveness, outcome.owner, outcome.ageMs);
+    try {
+      NotificationRouter.showWarning(message, undefined, undefined, undefined, {
+        command: "vs-code-ai-helper.takeOverStaleWorkAdmission",
+        title: "Take over this task on this machine",
+        args: [{ taskFolderPath: task.taskFolderPath, expectedClaimId: outcome.owner?.claimId }],
+      });
+    } catch (error) {
+      // Best-effort, like every other notification in this sweep (e.g.
+      // `reclaimStaleWorkAdmissionMarkersV1`'s own logging-only failures) —
+      // a router that has not been initialized yet must never break the
+      // sweep pass itself.
+      console.error(
+        `surfaceStaleWorkAdmissionTakeoverNoticeV1: could not surface the takeover notice for "${task.taskFolderPath}"`,
+        error
+      );
+    }
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 15/18 — the automatic trigger that was
+   * deliberately left unwired when `attemptAutomaticWorkAdmissionReclamationV1`
+   * itself was built and fully tested: that function is the entire safety
+   * boundary (conservative same-host ESRCH liveness, purpose-specific
+   * staleness thresholds, `pauseCommit` routed through 1b's revocation
+   * barrier, admission reclaimed by a validated rename to a tombstone) — this
+   * method adds no judgment of its own, it only calls that function once per
+   * task, every sweep. A task with no marker, a fresh marker, or a marker
+   * whose owner cannot be proven dead is always a no-op here; see that
+   * function's own doc comment for the full fail-open contract this method
+   * relies on rather than re-implements.
+   *
+   * Best-effort and independent per task: one task's `writeFailed` (a real
+   * filesystem error) or unexpected throw is logged and never stops the pass
+   * for the rest of the inventory, matching this sweep's other self-healing
+   * passes above.
+   */
+  private async reclaimStaleWorkAdmissionMarkersV1(): Promise<void> {
+    const now = this.clock.now();
+    for (const task of this.inventory.getTasks()) {
+      let outcome: WorkAdmissionAutomaticReclamationOutcomeV1;
+      try {
+        outcome = await attemptAutomaticWorkAdmissionReclamationV1(task.taskFolderPath, now);
+      } catch (error) {
+        console.error(
+          `reclaimStaleWorkAdmissionMarkersV1: unexpected error probing "${task.taskFolderPath}" for a reclaimable ` +
+            "admission marker — leaving it untouched for a later sweep.",
+          error
+        );
+        continue;
+      }
+      if (outcome.outcome === "reclaimed") {
+        console.log(
+          `reclaimStaleWorkAdmissionMarkersV1: reclaimed a stale, determinately-dead ${outcome.purpose} marker for ` +
+            `"${task.taskFolderPath}" (was owned by pid ${outcome.reclaimedOwner.pid} on ` +
+            `${outcome.reclaimedOwner.hostId}, command "${outcome.reclaimedOwner.commandId}").`
+        );
+      } else if (outcome.outcome === "writeFailed") {
+        console.error(
+          `reclaimStaleWorkAdmissionMarkersV1: failed to reclaim a stale marker for "${task.taskFolderPath}"`,
+          outcome.error
+        );
+      }
+      if (outcome.outcome === "notDead") {
+        // v1 fixes item 1, Part 1c step 16: track this task's consecutive
+        // observations of a stuck, unreclaimable owner — may surface a
+        // one-click takeover notice once it has persisted. See that method's
+        // own doc comment for the full identity/threshold/reset contract.
+        this.surfaceStaleWorkAdmissionTakeoverNoticeV1(task, outcome);
+      } else {
+        // Any other outcome ("reclaimed", "nothingToReclaim", "notStale",
+        // "raced", "writeFailed") means the marker this task's tracking (if
+        // any) was watching is no longer in that same stuck state — clear it
+        // so a later, genuinely new stuck streak starts counting from zero
+        // rather than inheriting an unrelated earlier count.
+        this.staleAdmissionNoticeStateV1.delete(task.taskFolderPath);
+      }
+      // "nothingToReclaim" / "notStale" / "raced": no action and no log
+      // noise beyond the tracking-reset above — these are the overwhelmingly
+      // common, entirely unremarkable outcomes of a periodic sweep on
+      // healthy tasks.
+    }
   }
 
   /**
@@ -1163,6 +1344,71 @@ export async function scheduleQuotaResumeAtV1(
   NotificationRouter.showInformation(`Rerun scheduled for ${effectiveRunAt.toLocaleString()}, once the quota resets.`);
 }
 
+/**
+ * v1 fixes item 1, Part 1c step 16 — the handler behind the takeover
+ * notice's action button (`surfaceStaleWorkAdmissionTakeoverNoticeV1`,
+ * above). Deliberately thin: all safety-relevant logic (revalidation against
+ * the exact identity the notice named, the still-stale check, the
+ * dead-owner deferral, the identity-checked rename/barrier) lives in
+ * {@link takeOverStaleWorkAdmissionMarkerV1} itself — this only translates
+ * its outcome into what the user sees and a bounded, structured log line
+ * ("Record bounded displaced-owner diagnostics in the run log; never log
+ * unbounded or raw corrupt content", plan step 16 — every field logged below
+ * is a single already-validated primitive from `WorkAdmissionClaimInfoV1`,
+ * never raw file content).
+ *
+ * Not contributed to `package.json`: like `resumeAndApplyCurrentStageAction`,
+ * this is a wiring detail behind a notification action button, not something
+ * to offer from the Command Palette on its own — it requires the exact
+ * `taskFolderPath`/`expectedClaimId` pair the notice captured.
+ */
+export async function takeOverStaleWorkAdmissionCommandV1(
+  inventory: TaskInventory,
+  arg?: { readonly taskFolderPath?: string; readonly expectedClaimId?: string }
+): Promise<void> {
+  if (!arg?.taskFolderPath) {
+    return;
+  }
+  const taskFolderPath = arg.taskFolderPath;
+  const task = inventory.getTasks().find((t) => t.taskFolderPath === taskFolderPath);
+  const displayName = task?.progress.displayName ?? task?.progress.taskFolder ?? taskFolderPath;
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(taskFolderPath, arg.expectedClaimId);
+  switch (outcome.outcome) {
+    case "takenOver":
+    case "reclaimedAsDead": {
+      const displaced = outcome.displacedOwner;
+      console.log(
+        `takeOverStaleWorkAdmissionCommandV1: ${outcome.outcome === "reclaimedAsDead" ? "reclaimed (owner had died)" : "took over"} ` +
+          `a stale ${outcome.purpose} marker for "${taskFolderPath}"` +
+          (displaced
+            ? ` (was claim ${displaced.claimId}, owned by pid ${displaced.pid} on ${displaced.hostId}, command "${displaced.commandId}").`
+            : " (owner record was unreadable).")
+      );
+      NotificationRouter.showInformation(`Took over "${displayName}" on this machine. You can now resume or dispatch work on it.`);
+      break;
+    }
+    case "ownerChanged":
+      NotificationRouter.showInformation(
+        `"${displayName}"'s work-admission owner changed before the takeover could apply — no action was taken.`
+      );
+      break;
+    case "noLongerStale":
+      NotificationRouter.showInformation(
+        `"${displayName}"'s work-admission marker was renewed before the takeover could apply — no action was taken.`
+      );
+      break;
+    case "nothingToTakeOver":
+    case "raced":
+      // Nothing left to take over — already resolved by something else
+      // (released, reclaimed, or won by a concurrent takeover). No further
+      // notice needed; the original notice's job is done either way.
+      break;
+    case "writeFailed":
+      NotificationRouter.showWarning(`Could not take over "${displayName}": ${outcome.error.message}`);
+      break;
+  }
+}
+
 export function registerScheduleTaskResumeCommand(context: vscode.ExtensionContext, inventory: TaskInventory): TaskActionScheduler {
   const scheduler = new TaskActionScheduler(inventory);
   context.subscriptions.push(scheduler);
@@ -1176,6 +1422,10 @@ export function registerScheduleTaskResumeCommand(context: vscode.ExtensionConte
       if (Number.isNaN(resetAt.getTime())) return;
       return scheduleQuotaResumeAtV1(inventory, scheduler, arg, resetAt);
     }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.takeOverStaleWorkAdmission",
+    (arg?: { taskFolderPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg)
   ));
   return scheduler;
 }

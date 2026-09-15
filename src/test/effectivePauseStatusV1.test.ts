@@ -13,6 +13,7 @@ import {
   repairRevokedWatchdogPauseV1,
   resolveEffectivePauseStatusSyncV1,
   resolveEffectivePauseStatusV1,
+  resolveEffectiveStageTaskStatusV1,
 } from "../state/effectivePauseStatusV1";
 import {
   ADMISSION_DIRNAME_V1,
@@ -455,6 +456,85 @@ void describe("effectivePauseStatusV1", () => {
       } finally {
         h.restore();
       }
+    });
+  });
+
+  /**
+   * 2026-09-15 review completion blocker: Part 1b's status-resolution
+   * invariant requires dedicated coverage of the ADVANCEMENT GATES —
+   * `commitAndPushTask.ts`'s "Complete, Commit and Push" flow and
+   * `reviewActions.ts`'s `advanceStageViaNextStageRowV1` — not just of the
+   * general-purpose resolver above. Both call sites previously inlined an
+   * identical computation (each commented "same fix as" the other); it is now
+   * `resolveEffectiveStageTaskStatusV1` below, called verbatim by both, so
+   * these tests are dedicated coverage of exactly the logic gating
+   * `nextStage.v1`'s eligibility check at both advancement points, not merely
+   * of the shared resolver they both build on.
+   */
+  void describe("resolveEffectiveStageTaskStatusV1 (the two advancement gates: commitAndPushTask.ts and reviewActions.ts's advanceStageViaNextStageRowV1)", () => {
+    void it("an older-generation (revoked) watchdog pause resolves to active, so the advancement gate is not tripped", async () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        const staleGeneration = await readOrInitPauseFenceGenerationV1(h.folder);
+        await advancePauseFenceGenerationV1(h.folder);
+        const effective = await resolveEffectiveStageTaskStatusV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-stale-gate",
+          watchdogPauseFenceGeneration: staleGeneration,
+        });
+        assert.equal(
+          effective,
+          "active",
+          "a revoked watchdog pause must never trip nextStage.v1's eligibility.statuses:[\"active\"] gate"
+        );
+        await flushScheduledRevokedWatchdogPauseCleanupsV1();
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("a current-generation watchdog pause resolves to paused, so the advancement gate still blocks", async () => {
+      const h = installHarness({ status: "paused" });
+      try {
+        const generation = await readOrInitPauseFenceGenerationV1(h.folder);
+        const effective = await resolveEffectiveStageTaskStatusV1(h.folder, {
+          status: "paused",
+          watchdogPauseClaimId: "claim-current-gate",
+          watchdogPauseFenceGeneration: generation,
+        });
+        assert.equal(effective, "paused", "a still-current watchdog pause must continue to block advancement");
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("a genuine user pause resolves to paused and is never bypassed, regardless of fence state", async () => {
+      const h = installHarness({ status: "paused", pausedReason: "manual" });
+      try {
+        // No watchdogPauseClaimId at all — a real user pause. Even though a
+        // fence generation is supplied here (as a caller reading a stale
+        // snapshot object might), the absence of a claim id must win.
+        await advancePauseFenceGenerationV1(h.folder);
+        const effective = await resolveEffectiveStageTaskStatusV1(h.folder, { status: "paused" });
+        assert.equal(effective, "paused", "a user pause must never be second-guessed by the fence check");
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("an active task resolves to active", async () => {
+      const h = installHarness({ status: "active" });
+      try {
+        const effective = await resolveEffectiveStageTaskStatusV1(h.folder, { status: "active" });
+        assert.equal(effective, "active");
+      } finally {
+        h.restore();
+      }
+    });
+
+    void it("an undefined snapshot (a caller that could not resolve one) falls back to active, matching both call sites' pre-existing ?? \"active\" fallback", async () => {
+      const effective = await resolveEffectiveStageTaskStatusV1("irrelevant-unused-path", undefined);
+      assert.equal(effective, "active");
     });
   });
 });

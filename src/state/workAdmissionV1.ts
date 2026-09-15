@@ -224,7 +224,13 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
     : "held by an unreadable record";
   return (
     `This task already has a stage action in progress (${ownerDetail}, started ~${ageSeconds}s ago at ` +
-    `${outcome.markerPath})${outcome.likelyStale ? " — this looks stale, but it is not reclaimed automatically." : ""}.`
+    `${outcome.markerPath})${
+      outcome.likelyStale
+        ? " — this looks stale. A determinately dead owner is reclaimed automatically on the next sweep; " +
+          "a live-but-unresponsive, foreign-machine, or unreadable owner that stays stale will offer a " +
+          "one-click takeover in the Notifications panel."
+        : ""
+    }.`
   );
 }
 
@@ -3131,4 +3137,562 @@ async function performPauseRevocationBarrierFinishSequenceV1(
     }
   }
   await removePauseRevocationBarrierV1(barrierPath);
+}
+
+/**
+ * v1 fixes item 1, Part 1c step 15 — conservative owner-liveness probe.
+ *
+ * Automatic reclamation of a stale claim/marker (v1a's interim policy: NEVER
+ * automatic — see the module doc comment) is only ever safe once "the owning
+ * process died" can be told apart from "the owning process is alive but
+ * slow/suspended", with NO false positives — a wrongly-reclaimed marker for a
+ * still-live owner would let two owners believe they exclusively hold the
+ * same admission, exactly the hazard this whole module exists to prevent.
+ * This probe is therefore asymmetric by design (plan: "EPERM, unreadable
+ * start time, matching start time, foreign host, corrupt record, and lost
+ * rename races all fail open"): only a same-host, `ESRCH`-confirmed absence of
+ * the recorded pid counts as proof of death. Everything else — a foreign host
+ * (no cross-machine way to probe at all), an unreadable/missing record, a
+ * same-host pid that responds at all, or any other errno (`EPERM`, ...) —
+ * reports `foreignHost`/`corrupt`/`indeterminate` and must never be treated
+ * as death by any caller.
+ *
+ * Deliberately narrower than the plan's full description ("determinate owner
+ * death via ESRCH OR a readable process-start mismatch"): this probe
+ * implements the ESRCH half only. A same-host pid that responds is always
+ * `sameHostAlive`, even in the rare case where the ORIGINAL process died and
+ * the OS has since reused its pid for an unrelated process — the
+ * process-start-time cross-check that would additionally catch reuse needs a
+ * real cross-platform "read a DIFFERENT process's start time" primitive this
+ * codebase does not yet have (`WorkAdmissionClaimInfoV1.processStartTime`'s
+ * own doc comment: today it only ever describes a process's OWN start time,
+ * captured once at that process's module load — never a probe of a different
+ * pid from outside it). Omitting it is still SAFE, never incorrect: it can
+ * only ever cause an extra `sameHostAlive` (fail open, no reclamation) where
+ * the fuller check would have found `sameHostDead` — the conservative
+ * direction this whole probe already prefers. Real PID-reuse detection is
+ * left as explicit follow-up work, not silently dropped.
+ */
+export type WorkAdmissionOwnerLivenessV1 =
+  | { readonly kind: "sameHostDead" }
+  | { readonly kind: "sameHostAlive" }
+  | { readonly kind: "foreignHost" }
+  | { readonly kind: "corrupt" }
+  | { readonly kind: "indeterminate"; readonly reason: string };
+
+/**
+ * Test-only override of the actual `process.kill(pid, 0)` probe. Spawning and
+ * killing a real child process is this module's own preferred way to exercise
+ * the `sameHostDead`/`sameHostAlive` branches deterministically — but a
+ * genuine `EPERM` is not reliably producible cross-platform in an automated
+ * test (it depends on OS-level process-ownership/permission boundaries this
+ * test environment does not control), the same situation
+ * `WorkAdmissionFsFailureInjectionV1`/`HostIdentityFsFailureInjectionV1`
+ * already document for their own otherwise-unforceable branches. `undefined`
+ * (the default) means production behavior (`process.kill`) is unchanged.
+ */
+let pidLivenessCheckOverrideForTestV1: ((pid: number) => "alive" | "dead" | "indeterminate") | undefined;
+export function setPidLivenessCheckOverrideForTestV1(
+  override: ((pid: number) => "alive" | "dead" | "indeterminate") | undefined
+): void {
+  pidLivenessCheckOverrideForTestV1 = override;
+}
+
+function checkPidLivenessSyncV1(pid: number): "alive" | "dead" | "indeterminate" {
+  if (pidLivenessCheckOverrideForTestV1) {
+    return pidLivenessCheckOverrideForTestV1(pid);
+  }
+  try {
+    // Signal 0 sends nothing — on every platform Node supports, this only
+    // performs the existence/permission check itself.
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      return "dead";
+    }
+    // EPERM (pid exists but we cannot signal it) or any other unexpected
+    // errno — cannot conclude death either way.
+    return "indeterminate";
+  }
+}
+
+/** See the section doc comment above for the full asymmetric-safety design. */
+export async function probeWorkAdmissionOwnerLivenessV1(
+  owner: WorkAdmissionClaimInfoV1 | undefined
+): Promise<WorkAdmissionOwnerLivenessV1> {
+  if (!owner || typeof owner.pid !== "number" || typeof owner.hostId !== "string" || owner.hostId.length === 0) {
+    return { kind: "corrupt" };
+  }
+  const myHostId = await resolveHostIdentityV1();
+  if (owner.hostId !== myHostId) {
+    return { kind: "foreignHost" };
+  }
+  const liveness = checkPidLivenessSyncV1(owner.pid);
+  if (liveness === "dead") {
+    return { kind: "sameHostDead" };
+  }
+  if (liveness === "alive") {
+    return { kind: "sameHostAlive" };
+  }
+  return { kind: "indeterminate", reason: "process.kill(pid, 0) failed with an errno other than ESRCH" };
+}
+
+/**
+ * Suffix appended to a marker's exact, validated filename to durably
+ * tombstone it in place — deliberately NOT matching `MARKER_RE_V1`, so a
+ * tombstoned marker immediately stops being "live" for every reader
+ * (`listMarkersSyncV1`, `hasLiveWorkAdmissionBestEffortV1`, ...) the instant
+ * the rename lands, with no separate delete step needed for correctness. Kept
+ * on disk rather than removed (generous-age GC of tombstones is Part 1c's own
+ * later, separate item) so a human can still see what was reclaimed and when.
+ */
+const RECLAIMED_TOMBSTONE_SUFFIX_V1 = ".tombstone";
+
+export type WorkAdmissionAutomaticReclamationOutcomeV1 =
+  | { readonly outcome: "reclaimed"; readonly purpose: WorkAdmissionPurposeV1; readonly reclaimedOwner: WorkAdmissionClaimInfoV1 }
+  | { readonly outcome: "nothingToReclaim" }
+  | { readonly outcome: "notStale" }
+  /**
+   * Not reclaimed, and not eligible to be. `owner` is `undefined` only for
+   * `liveness.kind === "corrupt"` (an unreadable record — see the `!owner`
+   * branch below); every other liveness kind always carries the owner that
+   * was probed. `markerPath`/`ageMs` are attached (1c step 16) so a caller
+   * can decide whether this is "persistently" stale across repeated
+   * observations without a second disk read of its own — see
+   * `scheduleTaskResume.ts`'s takeover-notice tracking, the one consumer
+   * that needs them; the sweep's own reclamation logging does not.
+   */
+  | {
+      readonly outcome: "notDead";
+      readonly liveness: WorkAdmissionOwnerLivenessV1;
+      readonly owner: WorkAdmissionClaimInfoV1 | undefined;
+      readonly markerPath: string;
+      readonly ageMs: number;
+    }
+  | { readonly outcome: "raced" }
+  | { readonly outcome: "writeFailed"; readonly error: Error };
+
+/**
+ * v1 fixes item 1, Part 1c step 15/18 — attempt automatic reclamation of
+ * `taskFolderPath`'s current admission marker, gated on ALL of: a stale
+ * heartbeat (the same purpose-specific threshold this module's own
+ * diagnostics already use), a readable owner record, and
+ * `probeWorkAdmissionOwnerLivenessV1` reporting determinate same-host death.
+ * Any other probe result (`sameHostAlive`, `foreignHost`, `corrupt`,
+ * `indeterminate`) fails open to `notDead` — never reclaims.
+ *
+ * Scoped to MARKERS only, matching the plan's own wording ("automatic MARKER
+ * reclamation") — the shared, short-lived `admission.claim` staging file
+ * (normally sub-second) is a distinct concern 1a's own interim diagnostics
+ * already cover and is not a target here.
+ *
+ * `purpose: "pauseCommit"` never reclaims directly: it reuses 1b's
+ * already-verified revocation-barrier protocol wholesale
+ * (`revokeStalePauseCommitClaimV1` + `finishPauseRevocationBarrierV1`) — this
+ * function supplies only the one thing 1b deliberately left to a human/test
+ * trigger, proof the owner is dead rather than merely stale (plan step 15:
+ * "automatic reclamation of a pauseCommit claim still routes through 1b's
+ * barrier and fence advance"). `revokeStalePauseCommitClaimV1` re-validates
+ * staleness and identity itself, so a race that resolves the marker between
+ * this function's own staleness/liveness check and that call is still handled
+ * safely by its existing `raced`/`notStale` outcomes.
+ *
+ * `purpose: "admission"` has no barrier protocol (1b step 12's own note: "a
+ * stale `admission` claim needs no fence advance — its exact rename is
+ * sufficient fencing") — reclaimed by a directly won, identity-validated
+ * rename of the exact marker filename to a tombstone, mirroring
+ * `revokeStalePauseCommitClaimV1`'s own before/after identity check so a
+ * same-instant heartbeat renewal racing this reclamation can never be
+ * silently clobbered.
+ */
+export async function attemptAutomaticWorkAdmissionReclamationV1(
+  taskFolderPath: string,
+  now: number = Date.now()
+): Promise<WorkAdmissionAutomaticReclamationOutcomeV1> {
+  const dir = admissionDirV1(taskFolderPath);
+  let markers: readonly { readonly filePath: string; readonly basename: string }[];
+  try {
+    markers = listMarkersSyncV1(dir);
+  } catch (error) {
+    return { outcome: "writeFailed", error: error as Error };
+  }
+  if (markers.length === 0) {
+    return { outcome: "nothingToReclaim" };
+  }
+  // Ordinary operation only ever has one live marker at a time (a fresh
+  // acquisition backs off `busy` against an existing one); if more than one
+  // is somehow present, act on the oldest, exactly like this module's other
+  // diagnostics treat `markers[0]`.
+  const target = markers[0]!;
+  const owner = readClaimInfoSyncV1(target.filePath);
+  if (!owner) {
+    // Present but unreadable — this module's fail-open default (module doc
+    // comment: "an owner exists, details unknown, never no owner"). No
+    // pid/hostId to probe against; never reclaim blind. Unlike the readable
+    // branch below, this deliberately does NOT gate on staleness — an
+    // unreadable record has always been reported `notDead`/`corrupt`
+    // immediately, and that contract is unchanged here (existing callers/
+    // tests depend on it). `ageMs` is still attached, best-effort, purely as
+    // data for 1c step 16's takeover-notice consumer, which applies its own
+    // staleness gate before treating this as "persistently" stale — a fresh
+    // corrupt record must never itself trigger a takeover offer.
+    let corruptAgeMs = 0;
+    try {
+      corruptAgeMs = now - fs.statSync(target.filePath).mtimeMs;
+    } catch {
+      // Vanished already — 0 is the safe default (never looks persistently
+      // stale); a stale marker's absence is nothing left for anyone to
+      // reclaim or take over anyway.
+    }
+    return { outcome: "notDead", liveness: { kind: "corrupt" }, owner: undefined, markerPath: target.filePath, ageMs: corruptAgeMs };
+  }
+  let ageMs: number;
+  try {
+    ageMs = now - fs.statSync(target.filePath).mtimeMs;
+  } catch {
+    // Vanished between the list above and this stat.
+    return { outcome: "raced" };
+  }
+  if (ageMs <= likelyStaleThresholdForPurposeV1(owner.purpose)) {
+    return { outcome: "notStale" };
+  }
+  const liveness = await probeWorkAdmissionOwnerLivenessV1(owner);
+  if (liveness.kind !== "sameHostDead") {
+    return { outcome: "notDead", liveness, owner, markerPath: target.filePath, ageMs };
+  }
+
+  if (owner.purpose === "pauseCommit") {
+    const revoked = await revokeStalePauseCommitClaimV1(taskFolderPath, `reclaim-${crypto.randomUUID()}`, now);
+    if (revoked.outcome !== "revoked") {
+      return revoked.outcome === "writeFailed" ? revoked : { outcome: "raced" };
+    }
+    try {
+      await finishPauseRevocationBarrierV1(taskFolderPath, revoked.barrierPath);
+    } catch (error) {
+      // The revocation itself already durably landed (the marker is gone,
+      // the barrier is pending) — a failure finishing it here is not lost:
+      // `acquireWorkAdmissionCoreV1`'s own barrier-helping loop, or a later
+      // call to this function, will complete it, per the barrier's own
+      // "a later claimant helps finish an abandoned revocation" contract.
+      console.error(
+        "attemptAutomaticWorkAdmissionReclamationV1: reclaimed a pauseCommit claim but could not finish its " +
+          "revocation barrier immediately — a later acquisition or reclamation attempt will complete it.",
+        error
+      );
+    }
+    return { outcome: "reclaimed", purpose: "pauseCommit", reclaimedOwner: revoked.revokedClaim };
+  }
+
+  const tombstonePath = `${target.filePath}${RECLAIMED_TOMBSTONE_SUFFIX_V1}`;
+  try {
+    await fs.promises.rename(target.filePath, tombstonePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { outcome: "raced" };
+    }
+    return { outcome: "writeFailed", error: error as Error };
+  }
+  const movedInfo = readClaimInfoSyncV1(tombstonePath);
+  if (movedInfo === undefined || movedInfo.claimId !== owner.claimId) {
+    try {
+      await fs.promises.rename(tombstonePath, target.filePath);
+    } catch {
+      // Nothing more this module can safely do — same pattern as
+      // `revokeStalePauseCommitClaimV1`'s own identical fallback.
+    }
+    return { outcome: "raced" };
+  }
+  return { outcome: "reclaimed", purpose: "admission", reclaimedOwner: movedInfo };
+}
+
+/**
+ * v1 fixes item 1, Part 1c step 16 — the human-confirmed takeover this
+ * module's own interim policy (module doc comment) has always promised as
+ * the escape hatch for a stale owner {@link attemptAutomaticWorkAdmissionReclamationV1}
+ * itself refuses to touch: `foreignHost` (no way to probe a different
+ * machine), `sameHostAlive` (a same-host pid that still responds — never
+ * proven dead), and `corrupt` (an unreadable record). Those three,
+ * specifically, are the liveness kinds `scheduleTaskResume.ts`'s sweep
+ * offers a takeover notice for after they persist across several
+ * observations; this function is what that notice's action button invokes.
+ *
+ * `sameHostDead` is deliberately NOT a case this function handles itself —
+ * if a fresh re-probe finds the owner has since died, this defers entirely
+ * to {@link attemptAutomaticWorkAdmissionReclamationV1}, the existing,
+ * already-tested safe path, rather than duplicating its logic.
+ *
+ * Safety rests on the same two properties {@link attemptAutomaticWorkAdmissionReclamationV1}
+ * already relies on, applied identically here:
+ *   - Revalidation at invocation time against the EXACT identity the notice
+ *     was raised for (`expectedClaimId`, or `undefined` for a corrupt record
+ *     that had no readable claimId at notice time) — a changed owner, a
+ *     renewed heartbeat, or a vanished marker between the notice and the
+ *     click all refuse rather than act on stale confirmation.
+ *   - A validated, identity-checked rename (for `purpose: "admission"`, or
+ *     an unreadable record) or 1b's revocation-barrier protocol (for
+ *     `purpose: "pauseCommit"`) — the same primitives that make two
+ *     concurrent automatic reclamations produce one winner also make two
+ *     concurrent takeover clicks produce one winner.
+ *
+ * `pauseCommit` is only ever reached for a READABLE owner (an unreadable
+ * record can never be confirmed as `purpose: "pauseCommit"`, so it always
+ * falls through to the direct-rename branch below — the same reasoning
+ * {@link revokeStalePauseCommitClaimV1}'s own `notApplicable` outcome
+ * already encodes for a corrupt marker).
+ */
+export type WorkAdmissionTakeoverOutcomeV1 =
+  | { readonly outcome: "takenOver"; readonly purpose: WorkAdmissionPurposeV1; readonly displacedOwner: WorkAdmissionClaimInfoV1 | undefined }
+  | { readonly outcome: "reclaimedAsDead"; readonly purpose: WorkAdmissionPurposeV1; readonly displacedOwner: WorkAdmissionClaimInfoV1 }
+  | { readonly outcome: "nothingToTakeOver" }
+  | { readonly outcome: "noLongerStale" }
+  | { readonly outcome: "ownerChanged" }
+  | { readonly outcome: "raced" }
+  | { readonly outcome: "writeFailed"; readonly error: Error };
+
+export async function takeOverStaleWorkAdmissionMarkerV1(
+  taskFolderPath: string,
+  expectedClaimId: string | undefined,
+  now: number = Date.now()
+): Promise<WorkAdmissionTakeoverOutcomeV1> {
+  const dir = admissionDirV1(taskFolderPath);
+  let markers: readonly { readonly filePath: string; readonly basename: string }[];
+  try {
+    markers = listMarkersSyncV1(dir);
+  } catch (error) {
+    return { outcome: "writeFailed", error: error as Error };
+  }
+  if (markers.length === 0) {
+    return { outcome: "nothingToTakeOver" };
+  }
+  const target = markers[0]!;
+  const owner = readClaimInfoSyncV1(target.filePath);
+  if (expectedClaimId !== undefined) {
+    if (!owner || owner.claimId !== expectedClaimId) {
+      // A different (or now-readable) owner occupies this path than the one
+      // the human confirmed — never act on a stale confirmation.
+      return { outcome: "ownerChanged" };
+    }
+  } else if (owner !== undefined) {
+    // The notice was raised against an unreadable record (no claimId to
+    // pin); this marker is readable now, so it is a different observed
+    // state than what was confirmed.
+    return { outcome: "ownerChanged" };
+  }
+  let ageMs: number;
+  try {
+    ageMs = now - fs.statSync(target.filePath).mtimeMs;
+  } catch {
+    return { outcome: "raced" };
+  }
+  if (ageMs <= likelyStaleThresholdForPurposeV1(owner?.purpose)) {
+    return { outcome: "noLongerStale" };
+  }
+
+  if (owner) {
+    const liveness = await probeWorkAdmissionOwnerLivenessV1(owner);
+    if (liveness.kind === "sameHostDead") {
+      // The owner died between the notice and this click — the existing
+      // automatic path is strictly safer (it re-validates everything from
+      // scratch) and already routes `pauseCommit` through 1b's barrier, so
+      // defer to it wholesale rather than re-implement any of that here.
+      const auto = await attemptAutomaticWorkAdmissionReclamationV1(taskFolderPath, now);
+      if (auto.outcome === "reclaimed") {
+        return { outcome: "reclaimedAsDead", purpose: auto.purpose, displacedOwner: auto.reclaimedOwner };
+      }
+      if (auto.outcome === "writeFailed") {
+        return auto;
+      }
+      return { outcome: "raced" };
+    }
+  }
+
+  // Human-authorized override: the owner is on a different machine, alive
+  // but unresponsive/stuck on this one, or unreadable, and a human has just
+  // confirmed — against this exact, freshly re-observed record — that it
+  // should be displaced anyway.
+  if (owner?.purpose === "pauseCommit") {
+    const revoked = await revokeStalePauseCommitClaimV1(taskFolderPath, `takeover-${crypto.randomUUID()}`, now);
+    if (revoked.outcome !== "revoked") {
+      return revoked.outcome === "writeFailed" ? revoked : { outcome: "raced" };
+    }
+    try {
+      await finishPauseRevocationBarrierV1(taskFolderPath, revoked.barrierPath);
+    } catch (error) {
+      // Same not-lost reasoning as attemptAutomaticWorkAdmissionReclamationV1's
+      // identical catch: the revocation itself already durably landed.
+      console.error(
+        "takeOverStaleWorkAdmissionMarkerV1: took over a pauseCommit claim but could not finish its " +
+          "revocation barrier immediately — a later acquisition or reclamation attempt will complete it.",
+        error
+      );
+    }
+    return { outcome: "takenOver", purpose: "pauseCommit", displacedOwner: revoked.revokedClaim };
+  }
+
+  // The destination MUST be unique per attempt, not the deterministic
+  // `${target.filePath}${RECLAIMED_TOMBSTONE_SUFFIX_V1}` name alone —
+  // verified empirically (not merely theorized): on Windows, two concurrent
+  // `fs.promises.rename(sameSrc, sameDst)` calls can BOTH resolve without
+  // throwing even though only one of them physically ends up owning the
+  // destination (the loser's call reports success but its own target never
+  // actually receives the file). A shared destination therefore makes the
+  // rename call itself useless as a single-winner primitive — a caller-
+  // unique token, checked by re-observing THIS call's own exact path
+  // afterward, is what actually decides the winner. Mirrors
+  // `revokeStalePauseCommitClaimV1`'s own per-revoker-unique barrier
+  // filename, which sidesteps this exact hazard for the same reason.
+  const tombstoneToken = crypto.randomUUID();
+  const tombstonePath = `${target.filePath}.${tombstoneToken}${RECLAIMED_TOMBSTONE_SUFFIX_V1}`;
+  try {
+    await fs.promises.rename(target.filePath, tombstonePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { outcome: "raced" };
+    }
+    return { outcome: "writeFailed", error: error as Error };
+  }
+  // Re-observe THIS call's own unique destination directly — a concurrent
+  // loser's rename call above can report success with nothing actually
+  // landing at ITS path (see the comment above), so "did my rename not
+  // throw" alone is not proof of a win; "does my own exact path now exist"
+  // is.
+  let wonThisPath: boolean;
+  try {
+    wonThisPath = fs.statSync(tombstonePath).isFile();
+  } catch {
+    wonThisPath = false;
+  }
+  const movedInfo = wonThisPath ? readClaimInfoSyncV1(tombstonePath) : undefined;
+  // For a readable owner, additionally confirm the moved record is still
+  // that exact claim (a same-instant heartbeat rename racing this one must
+  // not be silently clobbered) — mirrors
+  // attemptAutomaticWorkAdmissionReclamationV1's identical check. An
+  // unreadable owner has no claimId to re-confirm; `wonThisPath` above is
+  // that branch's whole guarantee.
+  if (!wonThisPath || (owner !== undefined && (movedInfo === undefined || movedInfo.claimId !== owner.claimId))) {
+    if (wonThisPath) {
+      try {
+        await fs.promises.rename(tombstonePath, target.filePath);
+      } catch {
+        // Nothing more this module can safely do — same fallback pattern as
+        // attemptAutomaticWorkAdmissionReclamationV1.
+      }
+    }
+    return { outcome: "raced" };
+  }
+  return { outcome: "takenOver", purpose: owner?.purpose ?? "admission", displacedOwner: movedInfo ?? owner };
+}
+
+/**
+ * Format the takeover notice's message text (1c step 16: "state-specific
+ * evidence and a strong warning when the PID still responds"). Only ever
+ * called for the three notice-worthy liveness kinds
+ * (`foreignHost`/`sameHostAlive`/`corrupt`) — `scheduleTaskResume.ts`'s
+ * tracking gates on that before this is reached, so there is no branch for
+ * `sameHostDead` (never reaches the notice — reclaimed automatically) or
+ * `indeterminate` (plan step 16 names only the three kinds above; an
+ * indeterminate probe result — e.g. `EPERM` — stays silent, matching this
+ * module's asymmetric-safe default of never inviting action on ambiguous
+ * evidence).
+ */
+export function describeStaleWorkAdmissionTakeoverNoticeV1(
+  displayName: string,
+  liveness: WorkAdmissionOwnerLivenessV1,
+  owner: WorkAdmissionClaimInfoV1 | undefined,
+  ageMs: number
+): string {
+  const ageMinutes = Math.round(ageMs / 60000);
+  const ownerDetail = owner
+    ? `pid ${owner.pid} on ${owner.hostId} (command "${owner.commandId}")`
+    : "an unreadable record";
+  const base = `Task "${displayName}" has a work-admission marker owned by ${ownerDetail}, unrenewed for ~${ageMinutes} minute(s).`;
+  if (liveness.kind === "sameHostAlive") {
+    return (
+      `${base} That process still responds on THIS machine. Taking over is risky: if it is still ` +
+      "legitimately working (e.g. suspended, or just slow) rather than stuck, forcing a takeover can let " +
+      "two owners act on the same task at once. Only take over if you are sure it is stuck."
+    );
+  }
+  if (liveness.kind === "foreignHost") {
+    return `${base} That machine is not this one, so it cannot be probed from here. If it is gone for good, you can take over the task on this machine.`;
+  }
+  return `${base} Its owner cannot be determined. If you are sure nothing is using it, you can take over the task on this machine.`;
+}
+
+/**
+ * v1 fixes item 1, Part 1c step 17 — generous-age GC for the reclaimed-
+ * marker tombstones {@link attemptAutomaticWorkAdmissionReclamationV1} and
+ * {@link takeOverStaleWorkAdmissionMarkerV1} leave behind on disk (deliberately,
+ * per `RECLAIMED_TOMBSTONE_SUFFIX_V1`'s own doc comment: "so a human can
+ * still see what was reclaimed and when"). That audit trail does not need to
+ * live forever — this collects tombstones old enough that their value as a
+ * recent-history audit trail has passed. 7 days, matching this codebase's
+ * existing convention for "keep a workflow-control audit trail, then let it
+ * go" (`schedulingIntentV1.ts`'s `SCHEDULING_INTENT_RETENTION_TTL_MS_V1`).
+ *
+ * Deliberately scoped to ONLY the `.tombstone` suffix — matched literally,
+ * never the marker/claim regexes — so this can never touch a live claim, a
+ * live marker, a pause-fence generation (`pause-fence.g<N>`), or a pending
+ * revocation barrier (`pause-revocation.pending.*`). Those follow 1b's own,
+ * stricter lifecycle (a fence generation is retained for the task's
+ * lifetime; a barrier is only ever removed by
+ * {@link finishPauseRevocationBarrierV1} once its generation advance is
+ * durable) and must never be subject to age-based deletion — this function
+ * has no knowledge of either and cannot accidentally reach them.
+ *
+ * Best-effort and per-file: one tombstone's unlink failure is reported but
+ * does not stop the rest of the pass, matching this module's other
+ * self-healing loops.
+ */
+export const WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 = 7 * 24 * 60 * 60 * 1000;
+
+export type WorkAdmissionTombstoneGcOutcomeV1 =
+  | { readonly outcome: "collected"; readonly count: number }
+  | { readonly outcome: "nothingToCollect" }
+  | { readonly outcome: "writeFailed"; readonly error: Error; readonly partialCount: number };
+
+export async function garbageCollectStaleWorkAdmissionTombstonesV1(
+  taskFolderPath: string,
+  now: number = Date.now(),
+  retentionMs: number = WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1
+): Promise<WorkAdmissionTombstoneGcOutcomeV1> {
+  const dir = admissionDirV1(taskFolderPath);
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { outcome: "nothingToCollect" };
+    }
+    return { outcome: "writeFailed", error: error as Error, partialCount: 0 };
+  }
+  const tombstones = entries.filter((name) => name.endsWith(RECLAIMED_TOMBSTONE_SUFFIX_V1));
+  let collected = 0;
+  for (const name of tombstones) {
+    const filePath = path.join(dir, name);
+    let ageMs: number;
+    try {
+      ageMs = now - fs.statSync(filePath).mtimeMs;
+    } catch {
+      // Vanished already — nothing for this pass to do.
+      continue;
+    }
+    if (ageMs <= retentionMs) {
+      continue;
+    }
+    try {
+      await fs.promises.unlink(filePath);
+      collected++;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        continue;
+      }
+      // Reported with whatever was already collected this pass — a real
+      // filesystem error on one file must not silently discard the count of
+      // tombstones this call already removed.
+      return { outcome: "writeFailed", error: error as Error, partialCount: collected };
+    }
+  }
+  return collected > 0 ? { outcome: "collected", count: collected } : { outcome: "nothingToCollect" };
 }

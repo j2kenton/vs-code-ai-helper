@@ -30,6 +30,7 @@ import {
   EffectivePauseSnapshotV1,
   isEffectivelyPausedSyncV1,
   isEffectivelyPausedV1,
+  resolveEffectiveStageTaskStatusV1,
 } from "../state/effectivePauseStatusV1";
 import {
   EscalationKind,
@@ -8192,14 +8193,11 @@ async function advanceStageViaNextStageRowV1(
   // least one caller (`routeReviewOutcomeV1`'s same-stage/no-op sibling
   // branch) passes it hardcoded without resolving real pause state, so
   // reusing it here would let a genuine user pause bypass this gate instead
-  // of fixing the stale-watchdog-pause case alone.
-  const rawStatus = statusSnapshot?.status;
-  const effectiveTaskStatus =
-    rawStatus === "paused" &&
-    statusSnapshot &&
-    !(await isEffectivelyPausedV1(folderUri.fsPath, statusSnapshot))
-      ? "active"
-      : rawStatus ?? "active";
+  // of fixing the stale-watchdog-pause case alone. Shared, dedicated-tested
+  // computation (`resolveEffectiveStageTaskStatusV1`) — same fix as
+  // `commitAndPushTask.ts`'s "Complete, Commit and Push" flow, which uses the
+  // identical function rather than reimplementing it.
+  const effectiveTaskStatus = await resolveEffectiveStageTaskStatusV1(folderUri.fsPath, statusSnapshot);
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,

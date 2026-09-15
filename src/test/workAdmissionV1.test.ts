@@ -1,4 +1,5 @@
 import * as assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,12 +10,15 @@ import {
   acquireWorkAdmissionV1,
   advancePauseFenceForRevocationV1,
   advancePauseFenceGenerationV1,
+  attemptAutomaticWorkAdmissionReclamationV1,
   authorizeWorkAdmissionHandoffV1,
   beginTargetResolutionV1,
+  describeStaleWorkAdmissionTakeoverNoticeV1,
   describeWorkAdmissionBlockerV1,
   endTargetResolutionV1,
   ensurePauseFenceAtLeastV1,
   finishPauseRevocationBarrierV1,
+  garbageCollectStaleWorkAdmissionTombstonesV1,
   removePauseRevocationBarrierV1,
   hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionBestEffortV1,
@@ -24,15 +28,19 @@ import {
   isPathOutsideAllTaskRootsV1,
   isWatchdogPauseFenceCurrentV1,
   listPendingPauseRevocationBarriersV1,
+  probeWorkAdmissionOwnerLivenessV1,
   readOrInitPauseFenceGenerationV1,
   resetTargetResolutionForTestV1,
   revokeStalePauseCommitClaimV1,
   revokeWorkAdmissionHandoffV1,
+  setPidLivenessCheckOverrideForTestV1,
   setWorkAdmissionClockForTestV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
+  takeOverStaleWorkAdmissionMarkerV1,
   ADMISSION_DIRNAME_V1,
   PAUSE_COMMIT_LIKELY_STALE_MS_V1,
   WORK_ADMISSION_LIKELY_STALE_MS_V1,
+  WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1,
 } from "../state/workAdmissionV1";
 import {
   configureHostIdentityRootV1,
@@ -2728,4 +2736,499 @@ void test("purpose-aware likelyStale threshold: a pauseCommit marker is flagged 
   const admBlocker = describeWorkAdmissionBlockerV1(admissionTask);
   assert.equal(admBlocker?.likelyStale, false, "10 minutes is well under the 20-minute admission threshold");
   await admAcquired.handle.release();
+});
+
+// ── probeWorkAdmissionOwnerLivenessV1 / attemptAutomaticWorkAdmissionReclamationV1 (Part 1c step 15) ─
+
+/** Spawn a trivial child process and resolve once it has genuinely exited,
+ * returning its now-dead pid — the same real spawn/wait idiom
+ * `completionLintKillPidReuse.test.ts` uses to prove a pid is dead, rather
+ * than trusting a made-up large number that might coincidentally be live. */
+function spawnAndWaitForDeadPidV1(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(process.execPath, ["-e", ""], { windowsHide: true });
+    const pid = child.pid;
+    if (pid === undefined) {
+      reject(new Error("spawned child has no pid"));
+      return;
+    }
+    child.once("exit", () => resolve(pid));
+    child.once("error", reject);
+  });
+}
+
+function writeFakeMarkerV1(
+  task: string,
+  overrides: Partial<{
+    purpose: "admission" | "pauseCommit";
+    pid: number;
+    hostId: string;
+    ownerToken: string;
+  }>
+): string {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const ownerToken = overrides.ownerToken ?? "fakeowner1";
+  const markerPath = path.join(dir, `admission.${ownerToken}.g1.deadbeef`);
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      claimId: `${ownerToken}-claim`,
+      purpose: overrides.purpose ?? "admission",
+      ownerToken,
+      pid: overrides.pid ?? 999999,
+      processStartTime: 0,
+      hostId: overrides.hostId ?? "fake-host",
+      commandId: "fake-owner-command",
+      startedAt: new Date().toISOString(),
+    })
+  );
+  return markerPath;
+}
+
+void test("probeWorkAdmissionOwnerLivenessV1: undefined or corrupt owner records are reported corrupt, never death", async () => {
+  assert.deepEqual(await probeWorkAdmissionOwnerLivenessV1(undefined), { kind: "corrupt" });
+  assert.deepEqual(
+    await probeWorkAdmissionOwnerLivenessV1({
+      claimId: "x",
+      purpose: "admission",
+      ownerToken: "x",
+      // pid deliberately omitted/wrong-typed to simulate a corrupt record.
+      pid: undefined as unknown as number,
+      processStartTime: 0,
+      hostId: "some-host",
+      commandId: "x",
+      startedAt: new Date().toISOString(),
+    }),
+    { kind: "corrupt" }
+  );
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: a foreign hostId always fails open, regardless of whether the pid is alive or dead", async () => {
+  const result = await probeWorkAdmissionOwnerLivenessV1({
+    claimId: "x",
+    purpose: "admission",
+    ownerToken: "x",
+    pid: process.pid,
+    processStartTime: 0,
+    hostId: "definitely-a-different-host-id",
+    commandId: "x",
+    startedAt: new Date().toISOString(),
+  });
+  assert.deepEqual(result, { kind: "foreignHost" });
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: a same-host, currently-running pid is sameHostAlive (this test's own process)", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  const result = await probeWorkAdmissionOwnerLivenessV1({
+    claimId: "x",
+    purpose: "admission",
+    ownerToken: "x",
+    pid: process.pid,
+    processStartTime: 0,
+    hostId: myHostId,
+    commandId: "x",
+    startedAt: new Date().toISOString(),
+  });
+  assert.deepEqual(result, { kind: "sameHostAlive" });
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: a same-host pid that has genuinely exited (real ESRCH) is sameHostDead", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const result = await probeWorkAdmissionOwnerLivenessV1({
+    claimId: "x",
+    purpose: "admission",
+    ownerToken: "x",
+    pid: deadPid,
+    processStartTime: 0,
+    hostId: myHostId,
+    commandId: "x",
+    startedAt: new Date().toISOString(),
+  });
+  assert.deepEqual(result, { kind: "sameHostDead" });
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: any errno other than ESRCH (e.g. EPERM) fails open to indeterminate, never death", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  setPidLivenessCheckOverrideForTestV1(() => "indeterminate");
+  try {
+    const result = await probeWorkAdmissionOwnerLivenessV1({
+      claimId: "x",
+      purpose: "admission",
+      ownerToken: "x",
+      pid: 4321,
+      processStartTime: 0,
+      hostId: myHostId,
+      commandId: "x",
+      startedAt: new Date().toISOString(),
+    });
+    assert.equal(result.kind, "indeterminate");
+  } finally {
+    setPidLivenessCheckOverrideForTestV1(undefined);
+  }
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: nothingToReclaim when the task has no admission directory at all", async () => {
+  const task = freshTaskFolder("reclaim-nothing-to-reclaim");
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.deepEqual(outcome, { outcome: "nothingToReclaim" });
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a fresh (non-stale) marker is never reclaimed, even for a genuinely dead owner", async () => {
+  const task = freshTaskFolder("reclaim-not-stale");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId });
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.deepEqual(outcome, { outcome: "notStale" });
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "an unreclaimed marker must still be reported live");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker whose owner is alive (this test's own process) fails open to notDead/sameHostAlive, never reclaimed", async () => {
+  const task = freshTaskFolder("reclaim-stale-but-alive");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "alive-owner" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.equal(outcome.outcome, "notDead");
+  if (outcome.outcome === "notDead") {
+    assert.deepEqual(outcome.liveness, { kind: "sameHostAlive" });
+    assert.equal(outcome.owner?.ownerToken, acquired.handle.ownerToken, "1c step 16: the owner record must be attached, not just the liveness kind");
+    assert.ok(outcome.ageMs > WORK_ADMISSION_LIKELY_STALE_MS_V1, "1c step 16: ageMs must be attached for the takeover-notice consumer");
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a live owner's marker must never be reclaimed");
+
+  await acquired.handle.release();
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale admission marker whose owner is confirmed dead is reclaimed by a validated rename to a tombstone", async () => {
+  const task = freshTaskFolder("reclaim-admission-dead");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId, ownerToken: "deadowner1" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.equal(outcome.outcome, "reclaimed");
+  if (outcome.outcome === "reclaimed") {
+    assert.equal(outcome.purpose, "admission");
+    assert.equal(outcome.reclaimedOwner.ownerToken, "deadowner1");
+  }
+  assert.equal(fs.existsSync(markerPath), false, "the original marker filename must no longer exist");
+  assert.equal(fs.existsSync(`${markerPath}.tombstone`), true, "a tombstone must be left behind for later GC/audit");
+  assert.equal(
+    hasLiveWorkAdmissionBestEffortV1(task),
+    false,
+    "a tombstoned marker must no longer be reported as live admission"
+  );
+
+  // Reclamation must actually unblock a new acquisition — this is the whole
+  // point of automatic reclamation, not merely a diagnostic relabeling.
+  const retry = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "new-owner" });
+  assert.equal(retry.outcome, "acquired");
+  if (retry.outcome === "acquired") {
+    await retry.handle.release();
+  }
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale pauseCommit marker whose owner is confirmed dead is reclaimed through 1b's revocation barrier, not a direct tombstone", async () => {
+  const task = freshTaskFolder("reclaim-pausecommit-dead");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+  const markerPath = writeFakeMarkerV1(task, {
+    purpose: "pauseCommit",
+    pid: deadPid,
+    hostId: myHostId,
+    ownerToken: "deadsweep1",
+  });
+  backdateV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.equal(outcome.outcome, "reclaimed");
+  if (outcome.outcome === "reclaimed") {
+    assert.equal(outcome.purpose, "pauseCommit");
+  }
+  // Routed through the real 1b barrier protocol: the fence must have
+  // durably advanced, and no pending barrier (nor a direct tombstone) is
+  // left behind — `finishPauseRevocationBarrierV1` is expected to complete
+  // synchronously within this call.
+  assert.ok((await readOrInitPauseFenceGenerationV1(task)) > fenceBefore, "the pause fence must have advanced");
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0, "the barrier must be fully finished, not left pending");
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(fs.existsSync(`${markerPath}.tombstone`), false, "pauseCommit reclamation must not use the admission tombstone path");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+});
+
+/** Find any tombstone left behind in a task's admission directory.
+ * `takeOverStaleWorkAdmissionMarkerV1`'s tombstone filename embeds a random,
+ * per-attempt token (see its own doc comment — a fixed, deterministic
+ * destination is unsafe for two concurrent takeovers on Windows), so tests
+ * must not assert the exact legacy `${markerPath}.tombstone` path the way
+ * `attemptAutomaticWorkAdmissionReclamationV1`'s own tests still correctly
+ * do (that function's tombstone path IS still deterministic — unchanged). */
+function findAnyTombstoneV1(task: string): string | undefined {
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  const found = entries.find((name) => name.endsWith(".tombstone"));
+  return found ? path.join(dir, found) : undefined;
+}
+
+// ── takeOverStaleWorkAdmissionMarkerV1 (Part 1c step 16) ────────────────────
+
+void test("takeOverStaleWorkAdmissionMarkerV1: nothingToTakeOver when the task has no admission directory at all", async () => {
+  const task = freshTaskFolder("takeover-nothing");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "some-claim");
+  assert.deepEqual(outcome, { outcome: "nothingToTakeOver" });
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when the current claimId does not match what was confirmed", async () => {
+  const task = freshTaskFolder("takeover-owner-changed");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "real-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "a-different-claim-id-entirely");
+  assert.deepEqual(outcome, { outcome: "ownerChanged" });
+  assert.equal(fs.existsSync(markerPath), true, "an ownership mismatch must never mutate the marker");
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: refuses (noLongerStale) when the marker was renewed since the notice was raised", async () => {
+  const task = freshTaskFolder("takeover-renewed");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "still-working" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  // Simulate: the notice was captured against this claimId while the marker
+  // looked stale, then the owner heartbeat-renewed it (fresh mtime) before
+  // the human clicked the takeover action.
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, acquired.handle.claimId);
+  assert.deepEqual(outcome, { outcome: "noLongerStale" });
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a renewed marker must be left untouched");
+  await acquired.handle.release();
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: an admission-purpose marker owned by a foreign host is taken over by validated rename to a tombstone", async () => {
+  const task = freshTaskFolder("takeover-admission-foreign");
+  const markerPath = writeFakeMarkerV1(task, {
+    purpose: "admission",
+    pid: 123456,
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "foreign-owner",
+  });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "foreign-owner-claim");
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(outcome.purpose, "admission");
+    assert.equal(outcome.displacedOwner?.ownerToken, "foreign-owner");
+  }
+  assert.equal(fs.existsSync(markerPath), false, "the original marker filename must no longer exist");
+  assert.equal(findAnyTombstoneV1(task) !== undefined, true, "a tombstone must be left behind for later GC/audit");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false);
+
+  // A takeover must actually unblock a new acquisition.
+  const retry = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "new-owner" });
+  assert.equal(retry.outcome, "acquired");
+  if (retry.outcome === "acquired") await retry.handle.release();
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: a same-host, still-responding owner CAN be taken over — the human override is the whole point of this path", async () => {
+  const task = freshTaskFolder("takeover-admission-alive");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "stuck-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "stuck-owner-claim");
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(outcome.displacedOwner?.ownerToken, "stuck-owner");
+  }
+  assert.equal(findAnyTombstoneV1(task) !== undefined, true);
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: an unreadable (corrupt) marker can be taken over when the notice was raised with no claimId", async () => {
+  const task = freshTaskFolder("takeover-corrupt");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = path.join(dir, "admission.corruptowner.g1.deadbeef");
+  fs.writeFileSync(markerPath, "not valid json at all {{{");
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, undefined);
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(outcome.purpose, "admission");
+    assert.equal(outcome.displacedOwner, undefined, "an unreadable record has no owner to report");
+  }
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(findAnyTombstoneV1(task) !== undefined, true);
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when a corrupt-notice takeover finds the marker has since become readable", async () => {
+  const task = freshTaskFolder("takeover-corrupt-then-readable");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "now-readable" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, undefined);
+  assert.deepEqual(outcome, { outcome: "ownerChanged" });
+  assert.equal(fs.existsSync(markerPath), true, "must never act on a state different from what was confirmed");
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: a pauseCommit marker is taken over through 1b's revocation barrier, not a direct tombstone", async () => {
+  const task = freshTaskFolder("takeover-pausecommit");
+  const myHostId = await resolveHostIdentityV1();
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+  const markerPath = writeFakeMarkerV1(task, { purpose: "pauseCommit", pid: process.pid, hostId: myHostId, ownerToken: "stuck-sweep" });
+  backdateV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "stuck-sweep-claim");
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(outcome.purpose, "pauseCommit");
+  }
+  assert.ok((await readOrInitPauseFenceGenerationV1(task)) > fenceBefore, "the pause fence must have advanced");
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0, "the barrier must be fully finished, not left pending");
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(findAnyTombstoneV1(task), undefined, "pauseCommit takeover must not use the admission tombstone path");
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: an owner that has died since the notice was raised is reclaimed through the automatic (proof-of-death) path instead of the human-override path", async () => {
+  const task = freshTaskFolder("takeover-owner-died-meanwhile");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId, ownerToken: "died-meanwhile" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "died-meanwhile-claim");
+  assert.equal(outcome.outcome, "reclaimedAsDead");
+  if (outcome.outcome === "reclaimedAsDead") {
+    assert.equal(outcome.purpose, "admission");
+    assert.equal(outcome.displacedOwner.ownerToken, "died-meanwhile");
+  }
+  assert.equal(findAnyTombstoneV1(task) !== undefined, true);
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: two concurrent takeovers of the same marker produce exactly one winner", async () => {
+  const task = freshTaskFolder("takeover-concurrent-race");
+  const markerPath = writeFakeMarkerV1(task, {
+    purpose: "admission",
+    pid: 555555,
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "raced-owner",
+  });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const [a, b] = await Promise.all([
+    takeOverStaleWorkAdmissionMarkerV1(task, "raced-owner-claim"),
+    takeOverStaleWorkAdmissionMarkerV1(task, "raced-owner-claim"),
+  ]);
+  const outcomes = [a.outcome, b.outcome].sort();
+  // Exactly one call must have won ("takenOver"); the other must observe
+  // the marker already gone by the time it renames — a real filesystem
+  // race, so either "raced" (lost the rename) or "ownerChanged"/"nothingToTakeOver"
+  // (observed the post-takeover state on its own re-list) is an acceptable
+  // "I lost" outcome, but never a SECOND "takenOver".
+  assert.equal(outcomes.filter((o) => o === "takenOver").length, 1, `exactly one winner expected, got: ${JSON.stringify(outcomes)}`);
+  assert.equal(findAnyTombstoneV1(task) !== undefined, true);
+});
+
+// ── describeStaleWorkAdmissionTakeoverNoticeV1 (Part 1c step 16) ────────────
+
+void test("describeStaleWorkAdmissionTakeoverNoticeV1: sameHostAlive carries a strong warning; foreignHost/corrupt do not", () => {
+  const owner = {
+    claimId: "c1",
+    purpose: "admission" as const,
+    ownerToken: "o1",
+    pid: 42,
+    processStartTime: 0,
+    hostId: "host-a",
+    commandId: "runReviewWithAI",
+    startedAt: new Date().toISOString(),
+  };
+  const alive = describeStaleWorkAdmissionTakeoverNoticeV1("My Task", { kind: "sameHostAlive" }, owner, 25 * 60 * 1000);
+  assert.match(alive, /still responds/i);
+  assert.match(alive, /risky/i);
+
+  const foreign = describeStaleWorkAdmissionTakeoverNoticeV1("My Task", { kind: "foreignHost" }, owner, 25 * 60 * 1000);
+  assert.doesNotMatch(foreign, /risky/i);
+
+  const corrupt = describeStaleWorkAdmissionTakeoverNoticeV1("My Task", { kind: "corrupt" }, undefined, 25 * 60 * 1000);
+  assert.match(corrupt, /unreadable record|cannot be determined/i);
+});
+
+// ── garbageCollectStaleWorkAdmissionTombstonesV1 (Part 1c step 17) ──────────
+
+void test("garbageCollectStaleWorkAdmissionTombstonesV1: nothingToCollect when the task has no admission directory at all", async () => {
+  const task = freshTaskFolder("gc-no-dir");
+  const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  assert.deepEqual(outcome, { outcome: "nothingToCollect" });
+});
+
+void test("garbageCollectStaleWorkAdmissionTombstonesV1: a tombstone older than the retention window is collected", async () => {
+  const task = freshTaskFolder("gc-aged-tombstone");
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: 111, hostId: "some-host", ownerToken: "aged" });
+  const tombstonePath = `${markerPath}.tombstone`;
+  fs.renameSync(markerPath, tombstonePath);
+  backdateV1(tombstonePath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  assert.deepEqual(outcome, { outcome: "collected", count: 1 });
+  assert.equal(fs.existsSync(tombstonePath), false);
+});
+
+void test("garbageCollectStaleWorkAdmissionTombstonesV1: a fresh tombstone within the retention window is retained", async () => {
+  const task = freshTaskFolder("gc-fresh-tombstone");
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: 111, hostId: "some-host", ownerToken: "fresh" });
+  const tombstonePath = `${markerPath}.tombstone`;
+  fs.renameSync(markerPath, tombstonePath);
+
+  const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  assert.deepEqual(outcome, { outcome: "nothingToCollect" });
+  assert.equal(fs.existsSync(tombstonePath), true, "a fresh tombstone must never be collected");
+});
+
+void test("garbageCollectStaleWorkAdmissionTombstonesV1: never touches a live marker, an admission.claim, a pause-fence generation, or a pending revocation barrier, even when all are artificially aged", async () => {
+  const task = freshTaskFolder("gc-never-touches-live-state");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const liveMarkerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: 222, hostId: "some-host", ownerToken: "live" });
+  backdateV1(liveMarkerPath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const claimPath = path.join(dir, "admission.claim");
+  fs.writeFileSync(claimPath, JSON.stringify({ claimId: "c", purpose: "admission" }));
+  backdateV1(claimPath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  await readOrInitPauseFenceGenerationV1(task); // creates pause-fence.g0
+  const fencePath = path.join(dir, "pause-fence.g0");
+  backdateV1(fencePath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const barrierPath = path.join(dir, "pause-revocation.pending.revoker-x.g1");
+  fs.writeFileSync(barrierPath, "");
+  backdateV1(barrierPath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  // Also plant a genuinely aged tombstone in the same directory, to prove
+  // the pass discriminates by filename, not merely "did nothing at all".
+  const tombstonePath = path.join(dir, "admission.some-other-owner.g1.abc123.tombstone");
+  fs.writeFileSync(tombstonePath, JSON.stringify({ claimId: "x" }));
+  backdateV1(tombstonePath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  assert.deepEqual(outcome, { outcome: "collected", count: 1 });
+
+  assert.equal(fs.existsSync(liveMarkerPath), true, "a live marker must never be collected as a tombstone");
+  assert.equal(fs.existsSync(claimPath), true, "admission.claim must never be collected");
+  assert.equal(fs.existsSync(fencePath), true, "a pause-fence generation must never be age-deleted");
+  assert.equal(fs.existsSync(barrierPath), true, "a pending revocation barrier must never be age-deleted by generic GC");
+  assert.equal(fs.existsSync(tombstonePath), false, "the genuinely aged tombstone must have been collected");
 });

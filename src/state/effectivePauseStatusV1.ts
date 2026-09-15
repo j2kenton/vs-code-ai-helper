@@ -5,7 +5,7 @@ import {
   isWatchdogPauseFenceCurrentV1,
   registerPauseRevocationCleanupHookV1,
 } from "./workAdmissionV1";
-import { TaskProgress } from "../types/taskProgress";
+import { TaskProgress, TaskStatus } from "../types/taskProgress";
 
 /**
  * v1 fixes item 1, Part 1b step 13 — the centralized effective-pause-status
@@ -120,6 +120,38 @@ export async function isEffectivelyPausedV1(
 ): Promise<boolean> {
   const resolved = await resolveEffectivePauseStatusV1(taskFolderPath, progress);
   return resolved.kind === "userPause" || resolved.kind === "currentWatchdogPause";
+}
+
+/**
+ * 2026-09-15 review completion blocker: the two advancement gates that admit
+ * `nextStage.v1` (`commitAndPushTask.ts`'s "Complete, Commit and Push" flow
+ * and `reviewActions.ts`'s `advanceStageViaNextStageRowV1`) each inlined the
+ * identical "is the raw on-disk status a revoked watchdog pause I should treat
+ * as active" computation, with comments on each pointing at the other as
+ * "same fix" — duplicated logic with no shared, independently testable unit.
+ * Extracted here so both call sites are provably identical and the
+ * revoked/current/user-pause distinction at the exact point that gates
+ * `nextStage.v1`'s eligibility check has its own dedicated tests, rather than
+ * relying only on `resolveEffectivePauseStatusV1`'s own (already-covered)
+ * classification.
+ *
+ * A raw `status` of `"paused"` is downgraded to `"active"` only when the
+ * pause resolves as a revoked watchdog pause; a current watchdog pause or a
+ * user pause (or a quota park, or a pre-1b pause with no claim id) passes the
+ * raw status straight through — this function must never let a genuine pause
+ * bypass the eligibility gate it feeds. A missing snapshot (a caller that
+ * could not resolve one at all) is treated as `"active"`, matching both call
+ * sites' pre-existing `?? "active"` fallback.
+ */
+export async function resolveEffectiveStageTaskStatusV1(
+  taskFolderPath: string,
+  snapshot: EffectivePauseSnapshotV1 | undefined
+): Promise<TaskStatus> {
+  const rawStatus = snapshot?.status;
+  if (rawStatus === "paused" && snapshot && !(await isEffectivelyPausedV1(taskFolderPath, snapshot))) {
+    return "active";
+  }
+  return rawStatus ?? "active";
 }
 
 /**

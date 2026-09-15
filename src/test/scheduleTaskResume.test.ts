@@ -1,4 +1,5 @@
 import * as assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +12,7 @@ import {
   SchedulerProgressStore,
   scheduleQuotaResumeAtV1,
   setPauseCommitTestHooksForTestV1,
+  takeOverStaleWorkAdmissionCommandV1,
   TaskActionScheduler,
 } from "../commands/scheduleTaskResume";
 import { TaskProgress } from "../types/taskProgress";
@@ -23,19 +25,25 @@ import {
 } from "../utils/taskWatchdogV1";
 import {
   acquireWorkAdmissionV1,
+  ADMISSION_DIRNAME_V1,
   beginTargetResolutionV1,
   endTargetResolutionV1,
   finishPauseRevocationBarrierV1,
+  hasLiveWorkAdmissionBestEffortV1,
   listPendingPauseRevocationBarriersV1,
   PAUSE_COMMIT_LIKELY_STALE_MS_V1,
+  readOrInitPauseFenceGenerationV1,
   resetTargetResolutionForTestV1,
   revokeStalePauseCommitClaimV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   setWorkAdmissionRootOverrideForTestV1,
+  WORK_ADMISSION_LIKELY_STALE_MS_V1,
+  WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1,
   WorkAdmissionResultV1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
+import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /**
@@ -53,6 +61,66 @@ const admissionTestRootV1 = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-admi
 setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
   path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"))
 );
+
+/** Same redirection this file's admission-root override above installs,
+ * applied by hand so a test can plant a FAKE marker directly — mirrors
+ * `workAdmissionV1.test.ts`'s own `writeFakeMarkerV1`, adapted to this file's
+ * hex-encoded per-`taskFolderPath` subdirectory scheme (Part 1c step
+ * 15/18 reclaim-pass coverage). */
+function writeFakeAdmissionMarkerV1(
+  taskFolderPath: string,
+  overrides: Partial<{ purpose: "admission" | "pauseCommit"; pid: number; hostId: string; ownerToken: string }>
+): string {
+  const dir = path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"), ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const ownerToken = overrides.ownerToken ?? "fakeowner1";
+  const markerPath = path.join(dir, `admission.${ownerToken}.g1.deadbeef`);
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      claimId: `${ownerToken}-claim`,
+      purpose: overrides.purpose ?? "admission",
+      ownerToken,
+      pid: overrides.pid ?? 999999,
+      processStartTime: 0,
+      hostId: overrides.hostId ?? "fake-host",
+      commandId: "fake-owner-command",
+      startedAt: new Date().toISOString(),
+    })
+  );
+  return markerPath;
+}
+
+/**
+ * `nowMs` must be the SAME reference time the code under test will compare
+ * the file's mtime against — for the reclaim-pass tests below that is the
+ * `FakeClock`'s fixed `now()`, not the real wall clock. `armAll`'s reclaim
+ * pass calls `attemptAutomaticWorkAdmissionReclamationV1(path, this.clock.now())`,
+ * so backdating relative to real `Date.now()` while the scheduler runs on a
+ * `FakeClock` pinned to a different moment produces a wrong (often deeply
+ * negative) computed age, which silently reads as "not stale" regardless of
+ * how large `ageMs` is.
+ */
+function backdateFileV1(filePath: string, ageMs: number, nowMs: number): void {
+  const old = new Date(nowMs - ageMs);
+  fs.utimesSync(filePath, old, old);
+}
+
+/** Same real spawn/wait idiom `workAdmissionV1.test.ts` uses to prove a pid is
+ * genuinely dead, rather than trusting a made-up large number that might
+ * coincidentally be live on the test host. */
+function spawnAndWaitForDeadPidV1(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(process.execPath, ["-e", ""], { windowsHide: true });
+    const pid = child.pid;
+    if (pid === undefined) {
+      reject(new Error("spawned child has no pid"));
+      return;
+    }
+    child.once("exit", () => resolve(pid));
+    child.once("error", reject);
+  });
+}
 after(() => {
   setWorkAdmissionRootOverrideForTestV1(undefined);
   fs.rmSync(admissionTestRootV1, { recursive: true, force: true });
@@ -902,6 +970,171 @@ void test("armAll's watchdog does not pause a task with an owed implRecovery, an
   }
 });
 
+// ---------------------------------------------------------------------------
+// v1 fixes item 1, Part 1c step 15/18: `armAll`'s automatic reclaim pass for
+// admission markers whose owner is PROVABLY dead, run every sweep immediately
+// before the watchdog's own stand-down check — see
+// `TaskActionScheduler.reclaimStaleWorkAdmissionMarkersV1`'s own doc comment.
+// These tests exercise the WIRING (is it called, in what order, does a
+// reclaimed marker actually unblock the watchdog in the same sweep) — the
+// underlying safety boundary itself (conservative liveness, purpose-specific
+// barrier routing) is already exhaustively covered by
+// `workAdmissionV1.test.ts`'s own `attemptAutomaticWorkAdmissionReclamationV1`
+// suite and is deliberately not re-proven here.
+// ---------------------------------------------------------------------------
+
+void test("armAll reclaims a stale, determinately-dead admission marker and lets the watchdog pause the stalled task in the SAME sweep", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeAdmissionMarkerV1("C:\\tasks\\task", {
+    purpose: "admission",
+    pid: deadPid,
+    hostId: myHostId,
+    ownerToken: "dead-reviewer-1",
+  });
+  backdateFileV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+  // Without reclamation, this stale-but-present marker would make the
+  // watchdog stand this task's pause down entirely (v1a's interim fail-open
+  // policy: any present claim/marker counts as live) — confirms the fixture
+  // actually exercises the reclaim pass rather than a task that would have
+  // been paused anyway.
+  assert.equal(hasLiveWorkAdmissionBestEffortV1("C:\\tasks\\task"), true);
+
+  try {
+    await scheduler.armAll();
+
+    assert.equal(fs.existsSync(markerPath), false, "the dead owner's marker must be reclaimed (renamed away)");
+    assert.equal(fs.existsSync(`${markerPath}.tombstone`), true, "a tombstone must be left behind");
+    assert.equal(
+      hasLiveWorkAdmissionBestEffortV1("C:\\tasks\\task"),
+      false,
+      "a reclaimed marker must no longer be reported as live admission"
+    );
+    assert.equal(state.current().status, "paused", "the watchdog must now be free to pause the stalled task");
+    assert.equal(state.current().pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's reclaim pass never touches a stale admission marker whose owner is alive, and the watchdog stands down accordingly", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "C:\\tasks\\task", progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeAdmissionMarkerV1("C:\\tasks\\task", {
+    purpose: "admission",
+    pid: process.pid, // this test's own process: genuinely alive
+    hostId: myHostId,
+    ownerToken: "alive-reviewer-1",
+  });
+  backdateFileV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+
+    assert.equal(fs.existsSync(markerPath), true, "a live owner's marker must never be reclaimed");
+    assert.equal(fs.existsSync(`${markerPath}.tombstone`), false);
+    assert.equal(hasLiveWorkAdmissionBestEffortV1("C:\\tasks\\task"), true);
+    assert.equal(
+      state.current().status,
+      "active",
+      "the watchdog must stand down while a live (if stale-looking) admission marker is present"
+    );
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's reclaim pass reclaims a stale, determinately-dead pauseCommit marker through 1b's revocation barrier, then the watchdog pauses normally", async () => {
+  // Unlike the two admission-purpose tests above, reclaiming a pauseCommit
+  // marker also runs `finishPauseRevocationBarrierV1`'s best-effort
+  // `task-progress.json` cleanup hook (`repairRevokedWatchdogPauseV1`), which
+  // acquires a real, disk-backed `PrimarySessionLock` — a fabricated,
+  // non-existent path like "C:\\tasks\\task" makes that lock acquisition fail
+  // (ENOENT/EPERM walking up to a nonexistent parent) and would silently mask
+  // whether the cleanup actually succeeds, since that hook is best-effort by
+  // design. A real temp task folder is required here, matching the same
+  // convention `runPauseFencingBoundaryCaseV1` already uses for every other
+  // test that exercises this cleanup hook.
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = {
+    ...readPersistedProgress(folder.progressPath),
+    displayName: "stalled task",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(folder.taskFolderPath);
+  const markerPath = writeFakeAdmissionMarkerV1(folder.taskFolderPath, {
+    purpose: "pauseCommit",
+    pid: deadPid,
+    hostId: myHostId,
+    ownerToken: "dead-sweep-owner-1",
+  });
+  backdateFileV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+
+    assert.ok(
+      (await readOrInitPauseFenceGenerationV1(folder.taskFolderPath)) > fenceBefore,
+      "reclaiming a dead pauseCommit owner must advance the durable pause fence, not just remove the marker"
+    );
+    assert.equal(
+      listPendingPauseRevocationBarriersV1(folder.taskFolderPath).length,
+      0,
+      "the revocation barrier must be fully finished within this sweep, not left pending"
+    );
+    assert.equal(fs.existsSync(markerPath), false);
+    assert.equal(fs.existsSync(`${markerPath}.tombstone`), false, "pauseCommit reclamation must not use the admission tombstone path");
+    // The dead sweep's leftover claim no longer counts as live admission, so
+    // the SAME sweep pass is free to commit its own, real pauseCommit claim
+    // and pause the genuinely stalled task.
+    const afterSweep = readPersistedProgress(folder.progressPath);
+    assert.equal(afterSweep.status, "paused");
+    assert.equal(afterSweep.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+  } finally {
+    fakeContext.restore();
+    realFs.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    folder.cleanup();
+  }
+});
+
 void test("armAll's stale-dispatch reclaim is race-safe across two concurrently-sweeping windows on the same task — exactly one re-dispatch, never two (2026-09-04 review follow-up: watchdog-plus-sweep concurrency)", async () => {
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
   const folder = createRealTaskFolderV1("impl");
@@ -1709,6 +1942,257 @@ void test("reverse late-writer ordering: the old pause commits (write + post-wri
     realFs.restore();
     fakeContext.restore();
     scheduler.dispose();
+    folder.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v1 fixes item 1, Part 1c step 16/17: the takeover-notice tracking and
+// tombstone GC passes armAll() wires alongside the reclaim pass above.
+// ---------------------------------------------------------------------------
+
+void test("armAll surfaces a takeover notice only after 3 consecutive sweeps observe the SAME stuck (foreignHost) owner, never sooner", async () => {
+  // A dedicated, never-reused fixture path — several EARLIER tests in this
+  // file deliberately use (and leave a leftover marker behind for) the
+  // shared "C:\\tasks\\task" path; reusing it here would let a stale marker
+  // from an unrelated test silently win `listMarkersSyncV1`'s `markers[0]`
+  // pick and make this test observe the wrong owner entirely.
+  const taskFolderPath = "C:\\tasks\\takeover-notice-streak";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const markerPath = writeFakeAdmissionMarkerV1(taskFolderPath, {
+    purpose: "admission",
+    pid: 424242,
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "stuck-foreign-owner",
+  });
+  backdateFileV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "1 observation must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "2 observations must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
+    assert.equal(takeoverEntries[0]?.level, "warning");
+    assert.match(takeoverEntries[0]?.message ?? "", /not this one|foreign/i);
+    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
+      { taskFolderPath, expectedClaimId: "stuck-foreign-owner-claim" },
+    ]);
+
+    // A 4th consecutive observation of the SAME stuck owner must not spam a
+    // second notice — this is a one-shot notice per stuck streak, not a
+    // repeating alarm.
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      1,
+      "the notice must not repeat for the same unresolved streak"
+    );
+
+    // The marker itself must be untouched throughout — a notice is advisory
+    // only, never a mutation.
+    assert.equal(fs.existsSync(markerPath), true);
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's takeover-notice streak resets when a DIFFERENT owner is observed, so a fresh owner never inherits a stale count", async () => {
+  const taskFolderPath = "C:\\tasks\\takeover-notice-reset";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  try {
+    const markerPathA = writeFakeAdmissionMarkerV1(taskFolderPath, {
+      purpose: "admission",
+      pid: 1,
+      hostId: "foreign-host-a",
+      ownerToken: "owner-a",
+    });
+    backdateFileV1(markerPathA, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+    await scheduler.armAll();
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "owner-a has only 2 observations so far"
+    );
+
+    // A DIFFERENT owner takes the marker path (e.g. owner-a's process
+    // finally released and a genuinely new, unrelated owner acquired) —
+    // simulated here directly, since real acquisition would require a live
+    // owner-a to release first. The identity (claimId) differs, so this
+    // must count as observation 1 of a NEW streak, not observation 3.
+    fs.rmSync(markerPath2Dir(taskFolderPath), { recursive: true, force: true });
+    const markerPathB = writeFakeAdmissionMarkerV1(taskFolderPath, {
+      purpose: "admission",
+      pid: 2,
+      hostId: "foreign-host-b",
+      ownerToken: "owner-b",
+    });
+    backdateFileV1(markerPathB, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "owner-b's streak must start over at 1, not continue owner-a's count of 2"
+    );
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+/** `writeFakeAdmissionMarkerV1` always writes into the same admission
+ * directory for a given taskFolderPath — this returns that directory so a
+ * test can clear it before planting a second, unrelated marker (simulating
+ * "the old marker is gone, a new one now exists"). */
+function markerPath2Dir(taskFolderPath: string): string {
+  return path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"), ADMISSION_DIRNAME_V1);
+}
+
+void test("armAll collects an aged reclamation tombstone via the GC pass", async () => {
+  const taskFolderPath = "C:\\tasks\\takeover-gc-target";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const markerPath = writeFakeAdmissionMarkerV1(taskFolderPath, { purpose: "admission", ownerToken: "gc-target" });
+  const tombstonePath = `${markerPath}.tombstone`;
+  fs.renameSync(markerPath, tombstonePath);
+  backdateFileV1(tombstonePath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+    assert.equal(fs.existsSync(tombstonePath), false, "an aged tombstone must be collected during armAll");
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("takeOverStaleWorkAdmissionCommandV1 takes over a stale foreignHost admission marker end to end and reports success", async () => {
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), displayName: "a stuck task" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+
+  // `writeFakeAdmissionMarkerV1` (not a hand-built path under
+  // `folder.taskFolderPath` directly) — this file's `setWorkAdmissionRootOverrideForTestV1`
+  // redirects every real admission-directory lookup to a hex-encoded
+  // subdirectory of `admissionTestRootV1`; writing to the un-redirected path
+  // directly would plant a marker the code under test never actually reads.
+  const markerPath = writeFakeAdmissionMarkerV1(folder.taskFolderPath, {
+    purpose: "admission",
+    pid: 987654,
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "stuck-real-owner",
+  });
+  const old = new Date(Date.now() - (WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000));
+  fs.utimesSync(markerPath, old, old);
+
+  try {
+    await takeOverStaleWorkAdmissionCommandV1(inventory, {
+      taskFolderPath: folder.taskFolderPath,
+      expectedClaimId: "stuck-real-owner-claim",
+    });
+
+    assert.equal(fs.existsSync(markerPath), false, "the original marker must be gone after a successful takeover");
+    assert.equal(hasLiveWorkAdmissionBestEffortV1(folder.taskFolderPath), false);
+    const infoEntries = surface.entries.filter((e) => e.level === "info");
+    assert.ok(
+      infoEntries.some((e) => /took over/i.test(e.message)),
+      `expected a success notification; got: ${JSON.stringify(surface.entries)}`
+    );
+
+    // A takeover must actually unblock a new acquisition.
+    const retry = await acquireWorkAdmissionV1({ taskFolderPath: folder.taskFolderPath, purpose: "admission", commandId: "new-real-owner" });
+    assert.equal(retry.outcome, "acquired");
+    if (retry.outcome === "acquired") {
+      await retry.handle.release();
+    }
+  } finally {
+    realFs.restore();
+    deactivateNotificationRouter();
+    folder.cleanup();
+  }
+});
+
+void test("takeOverStaleWorkAdmissionCommandV1 refuses and reports (no mutation) when the observed owner no longer matches", async () => {
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), displayName: "a stuck task" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+
+  const markerPath = writeFakeAdmissionMarkerV1(folder.taskFolderPath, {
+    purpose: "admission",
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "real-current-owner",
+  });
+  const old = new Date(Date.now() - (WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000));
+  fs.utimesSync(markerPath, old, old);
+
+  try {
+    await takeOverStaleWorkAdmissionCommandV1(inventory, {
+      taskFolderPath: folder.taskFolderPath,
+      expectedClaimId: "some-stale-claim-id-that-no-longer-matches",
+    });
+
+    assert.equal(fs.existsSync(markerPath), true, "an owner mismatch must never mutate the marker");
+    assert.ok(
+      surface.entries.some((e) => /changed/i.test(e.message)),
+      `expected an explanatory notification; got: ${JSON.stringify(surface.entries)}`
+    );
+  } finally {
+    realFs.restore();
+    deactivateNotificationRouter();
     folder.cleanup();
   }
 });
