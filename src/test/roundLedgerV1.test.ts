@@ -38,6 +38,7 @@ import {
 } from "../utils/taskProgressTransforms";
 import {
   __resetPendingAutomationRoundIntentsForTestV1,
+  AttachCoordinatorIdentityErrorV1,
   attachCoordinatorIdentityToRoundV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
@@ -2458,6 +2459,210 @@ void describe(
         fsBridge.restore();
       }
     });
+
+    void it(
+      "throws a typed AttachCoordinatorIdentityErrorV1 with kind \"rowNotLive\" for a terminal row " +
+        "(2026-09-15 post-freeze findings, item 2: distinguish the failure kinds instead of a bare message)",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_typed_row_not_live");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "review-attempt-typed-1",
+            intentId: undefined,
+            attemptIds: ["review-attempt-typed-1"],
+            state: "completed",
+            endedAt: "2026-01-01T00:05:00.000Z",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_typed_row_not_live", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          let caught: unknown;
+          try {
+            await attachCoordinatorIdentityToRoundV1({
+              taskFolderUri: folderUri,
+              roundId: "review-attempt-typed-1",
+              operationId: "too-late-op",
+              attemptId: "too-late-attempt",
+            });
+          } catch (error) {
+            caught = error;
+          }
+          assert.ok(caught instanceof AttachCoordinatorIdentityErrorV1);
+          assert.equal(caught.kind, "rowNotLive");
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
+
+    void it(
+      "throws a typed AttachCoordinatorIdentityErrorV1 with kind \"wrongOwner\" for a row already " +
+        "owned by a different operation",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_typed_wrong_owner");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "review-attempt-typed-2",
+            intentId: undefined,
+            operationId: "owning-op",
+            attemptIds: ["owning-op"],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_typed_wrong_owner", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          let caught: unknown;
+          try {
+            await attachCoordinatorIdentityToRoundV1({
+              taskFolderUri: folderUri,
+              roundId: "review-attempt-typed-2",
+              operationId: "a-different-op",
+              attemptId: "a-different-attempt",
+            });
+          } catch (error) {
+            caught = error;
+          }
+          assert.ok(caught instanceof AttachCoordinatorIdentityErrorV1);
+          assert.equal(caught.kind, "wrongOwner");
+
+          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+          assert.equal(raw.roundLedger?.[0]?.operationId, "owning-op", "the existing owner must never be overwritten");
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
+
+    void it(
+      "retries after a transient read failure and durably attaches on a later attempt " +
+        "(2026-09-15 post-freeze findings, item 2: \"retry the write before giving up\")",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_retry_then_succeed");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "review-attempt-retry",
+            intentId: undefined,
+            attemptIds: [],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_retry_then_succeed", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+          const realReadFile = target.readFile as (uri: vscode.Uri) => Promise<Uint8Array>;
+          let progressReadCalls = 0;
+          target.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+            if (uri.fsPath.endsWith("task-progress.json")) {
+              progressReadCalls += 1;
+              if (progressReadCalls === 1) {
+                return Promise.reject(new Error("simulated transient read failure"));
+              }
+            }
+            return realReadFile(uri);
+          };
+
+          await attachCoordinatorIdentityToRoundV1({
+            taskFolderUri: folderUri,
+            roundId: "review-attempt-retry",
+            operationId: "coordinator-op-retry",
+            attemptId: "coordinator-attempt-retry",
+          });
+
+          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+          const updated = raw.roundLedger?.[0];
+          assert.equal(updated?.operationId, "coordinator-op-retry");
+          assert.ok(updated?.attemptIds.includes("coordinator-attempt-retry"));
+          assert.ok(
+            progressReadCalls >= 2,
+            "the first (failed) read must be retried rather than surfaced as a terminal failure"
+          );
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
+
+    void it(
+      "throws a typed writerRetriesExhausted error when the write never verifies within the retry bound",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_retries_exhausted");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "review-attempt-exhausted",
+            intentId: undefined,
+            attemptIds: [],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_retries_exhausted", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+          const realReadFile = target.readFile as (uri: vscode.Uri) => Promise<Uint8Array>;
+          target.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+            if (uri.fsPath.endsWith("task-progress.json")) {
+              return Promise.reject(new Error("simulated persistent read failure"));
+            }
+            return realReadFile(uri);
+          };
+
+          let caught: unknown;
+          try {
+            await attachCoordinatorIdentityToRoundV1({
+              taskFolderUri: folderUri,
+              roundId: "review-attempt-exhausted",
+              operationId: "coordinator-op-exhausted",
+              attemptId: "coordinator-attempt-exhausted",
+            });
+          } catch (error) {
+            caught = error;
+          }
+          assert.ok(caught instanceof AttachCoordinatorIdentityErrorV1);
+          assert.equal(caught.kind, "writerRetriesExhausted");
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
   }
 );
 

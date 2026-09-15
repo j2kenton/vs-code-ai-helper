@@ -1076,6 +1076,65 @@ export interface AttachCoordinatorIdentityToRoundOptionsV1 {
 }
 
 /**
+ * The four causes `attachCoordinatorIdentityToRoundV1` can fail for (Part 2,
+ * "an admission gate should guard correctness, not bookkeeping" — 2026-09-15
+ * post-freeze findings). Exactly two are genuine ownership violations:
+ *
+ *  - `rowNotLive` — the row does not exist, or is no longer `"scheduled"`/
+ *    `"open"` (raced `terminalizeRoundV1`, or the caller named a stale id).
+ *  - `wrongOwner` — the row already carries a DIFFERENT `operationId`.
+ *
+ * Proceeding past either could produce an untracked workspace-mutating
+ * round, so callers must keep failing closed for these two.
+ *
+ * The other two are pure write-plumbing failures with no bearing on whether
+ * the round is safe to run — the row this call is trying to enrich was
+ * already confirmed live by one of the two checks above on every attempt:
+ *
+ *  - `writeVerificationFailed` — one write attempt's post-write re-read did
+ *    not reflect the attempted attach (e.g. raced a concurrent progress
+ *    write). Retried automatically inside this function before it is ever
+ *    observed by a caller.
+ *  - `writerRetriesExhausted` — `writeVerificationFailed` recurred on every
+ *    retry this function allows. The caller-visible terminal failure kind
+ *    for the transient case.
+ */
+export type AttachCoordinatorIdentityFailureKindV1 =
+  | "rowNotLive"
+  | "wrongOwner"
+  | "writeVerificationFailed"
+  | "writerRetriesExhausted";
+
+/**
+ * Typed failure thrown by `attachCoordinatorIdentityToRoundV1` — callers
+ * (`taskActionCoordinatorV1.ts`'s `onAttemptAllocated` handling) switch on
+ * `.kind` to decide whether this is a real ownership violation (fail closed)
+ * or a transient write failure (record a warning, let the round proceed).
+ * See `AttachCoordinatorIdentityFailureKindV1`'s own doc comment for what
+ * distinguishes the two groups.
+ */
+export class AttachCoordinatorIdentityErrorV1 extends Error {
+  readonly kind: AttachCoordinatorIdentityFailureKindV1;
+  constructor(kind: AttachCoordinatorIdentityFailureKindV1, message: string) {
+    super(message);
+    this.name = "AttachCoordinatorIdentityErrorV1";
+    this.kind = kind;
+  }
+}
+
+/**
+ * Bound on how many times `attachCoordinatorIdentityToRoundV1` re-attempts
+ * its write after a `writeVerificationFailed` result — a bounded
+ * re-read-and-retry, the same shape as `MAX_OUT_OF_BAND_WRITE_RETRIES_V1`
+ * (`taskProgressWriterV1.ts`) and for the same reason: each retry costs one
+ * more read-modify-write cycle, and a caller racing this many genuinely
+ * concurrent writers has a problem this bound cannot fix by retrying
+ * further. Exhausting it surfaces as `writerRetriesExhausted`, never a
+ * silent give-up.
+ */
+const MAX_ATTACH_IDENTITY_WRITE_ATTEMPTS_V1 = 3;
+
+/**
  * Attach the coordinator's own `operationId`/`attemptId` to a round's
  * `roundLedger` row AT ALLOCATION TIME — the moment
  * `TaskActionRequestV1.onPromptAssembled` fires, well before the round ends
@@ -1133,34 +1192,54 @@ export interface AttachCoordinatorIdentityToRoundOptionsV1 {
 export async function attachCoordinatorIdentityToRoundV1(
   options: AttachCoordinatorIdentityToRoundOptionsV1
 ): Promise<void> {
-  const patched = await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
-    const row = resolveRoundV1(current, options.roundId);
-    if (!row || (row.state !== "scheduled" && row.state !== "open")) {
-      throw new Error(`round ledger row ${options.roundId} is not live`);
-    }
-    if (row.operationId !== undefined && row.operationId !== options.operationId) {
-      throw new Error(`round ledger row ${options.roundId} belongs to another operation`);
-    }
-    const attemptIds = row.attemptIds.includes(options.attemptId)
-      ? row.attemptIds
-      : [...row.attemptIds, options.attemptId];
-    if (row.operationId === options.operationId && attemptIds === row.attemptIds) {
-      return undefined;
-    }
-    return upsertRoundLedgerEntryV1(current, {
-      ...row,
-      attemptIds,
-      operationId: options.operationId,
+  // Row-liveness and ownership are semantic facts about THIS round, not
+  // write-plumbing — thrown immediately, on the first read, with no retry:
+  // retrying cannot make a terminalized row live again or a foreign
+  // operationId become this caller's own. `update` throws straight out of
+  // `patchTaskProgressStrictV1` (nothing there catches it), so the loop
+  // below never sees these two kinds as a normal iteration outcome.
+  for (let attempt = 1; attempt <= MAX_ATTACH_IDENTITY_WRITE_ATTEMPTS_V1; attempt++) {
+    const patched = await patchTaskProgressStrictV1(options.taskFolderUri, (current) => {
+      const row = resolveRoundV1(current, options.roundId);
+      if (!row || (row.state !== "scheduled" && row.state !== "open")) {
+        throw new AttachCoordinatorIdentityErrorV1(
+          "rowNotLive",
+          `round ledger row ${options.roundId} is not live`
+        );
+      }
+      if (row.operationId !== undefined && row.operationId !== options.operationId) {
+        throw new AttachCoordinatorIdentityErrorV1(
+          "wrongOwner",
+          `round ledger row ${options.roundId} belongs to another operation`
+        );
+      }
+      const attemptIds = row.attemptIds.includes(options.attemptId)
+        ? row.attemptIds
+        : [...row.attemptIds, options.attemptId];
+      if (row.operationId === options.operationId && attemptIds === row.attemptIds) {
+        return undefined;
+      }
+      return upsertRoundLedgerEntryV1(current, {
+        ...row,
+        attemptIds,
+        operationId: options.operationId,
+      });
     });
-  });
-  const row = patched && resolveRoundV1(patched, options.roundId);
-  if (
-    !row ||
-    row.operationId !== options.operationId ||
-    !row.attemptIds.includes(options.attemptId)
-  ) {
-    throw new Error(`failed to durably attach coordinator identity to round ${options.roundId}`);
+    const row = patched && resolveRoundV1(patched, options.roundId);
+    if (row && row.operationId === options.operationId && row.attemptIds.includes(options.attemptId)) {
+      return;
+    }
+    // `writeVerificationFailed` for this attempt — the write went through
+    // `patchTaskProgressStrictV1` without an ownership throw, but the
+    // post-write re-read does not (yet) show our own attach. Loop and retry
+    // rather than surfacing it to the caller on the first miss (2026-09-15
+    // post-freeze findings, item 2: "retry the write before giving up").
   }
+  throw new AttachCoordinatorIdentityErrorV1(
+    "writerRetriesExhausted",
+    `failed to durably attach coordinator identity to round ${options.roundId} after ` +
+      `${MAX_ATTACH_IDENTITY_WRITE_ATTEMPTS_V1} attempts`
+  );
 }
 
 // `recordChecklistRevisionOnRoundLedgerV1` (Part 6 items 5/19) was removed

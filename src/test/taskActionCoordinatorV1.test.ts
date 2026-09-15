@@ -96,6 +96,7 @@ import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelo
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { createObservationLedgerV1 } from "../types/preflightPlanV1";
+import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
 import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
@@ -1778,7 +1779,12 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(outcome.kind, "failed");
     if (outcome.kind === "failed") {
       assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
-      assert.equal(outcome.retryable, true);
+      // An unrecognized error (not the typed AttachCoordinatorIdentityErrorV1)
+      // stays fail-closed like a genuine ownership violation, but nothing
+      // automatically retries this settlement (2026-09-15 post-freeze
+      // findings, item 2: "retryable: true must mean something automatic").
+      assert.equal(outcome.retryable, false);
+      assert.equal(outcome.detail, "unknown: ledger write unavailable");
       assert.ok(outcome.correlation, "the failed allocation keeps its attempt identity");
       assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
     }
@@ -1808,7 +1814,7 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(outcome.kind, "failed");
     if (outcome.kind === "failed") {
       assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
-      assert.equal(outcome.retryable, true);
+      assert.equal(outcome.retryable, false);
       assert.ok(outcome.correlation, "the failed retry keeps its attempt identity");
       assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
     }
@@ -1817,6 +1823,61 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.settlementRecords.length, 1);
     assert.equal(harness.selection.reserved, 1, "the retry must not reserve or invoke a provider");
   });
+
+  void it(
+    "fails closed (does not invoke a provider) when the attach hook reports a genuine " +
+      "ownership violation (rowNotLive/wrongOwner) — 2026-09-15 post-freeze findings, item 2",
+    async () => {
+      const harness = makeHarness([]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: () =>
+          Promise.reject(new AttachCoordinatorIdentityErrorV1("rowNotLive", "round ledger row r-1 is not live")),
+      });
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
+        assert.equal(outcome.retryable, false);
+        assert.equal(outcome.detail, "rowNotLive: round ledger row r-1 is not live");
+      }
+      assert.equal(harness.selection.reserved, 0, "a genuine ownership violation must prevent provider reservation");
+    }
+  );
+
+  void it(
+    "proceeds to invoke the provider (degraded provenance, not a failed round) when the " +
+      "attach hook reports only a transient writerRetriesExhausted — 2026-09-15 post-freeze " +
+      "findings, item 2: \"an admission gate should guard correctness, not bookkeeping\"",
+    async () => {
+      const harness = makeHarness([
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# x" },
+          })
+        ),
+      ]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: () =>
+          Promise.reject(
+            new AttachCoordinatorIdentityErrorV1(
+              "writerRetriesExhausted",
+              "failed to durably attach coordinator identity to round r-1 after 3 attempts"
+            )
+          ),
+      });
+      assert.equal(
+        outcome.kind,
+        "completed",
+        "a transient, provenance-only attach failure must not stop the round from running"
+      );
+      assert.equal(harness.selection.reserved, 1, "the provider must still be invoked");
+      assert.equal(harness.promoted.length, 1);
+    }
+  );
 
   void it("passes the registry's chain-exhaustion evidence through verbatim, mutating no task state", async () => {
     // Finding 4: the coordinator is a pure pass-through for the structured
