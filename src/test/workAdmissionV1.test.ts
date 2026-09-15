@@ -52,11 +52,51 @@ import {
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
 import { fixtureOwnershipFor, writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { setProcessStartTimeIoOverrideForTestV1 } from "../state/processStartTimeProbeV1";
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-work-admission-test-"));
 after(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
+
+/**
+ * `probeWorkAdmissionOwnerLivenessV1`'s process-start-time cross-check
+ * (Part 1c step 15's "readable process-start mismatch" half) is additive
+ * proof of death on top of the pre-existing ESRCH check — every test in this
+ * file predating that check used `pid: process.pid` (a real, alive pid) with
+ * a placeholder `processStartTime` (typically `0`) to mean "alive, not
+ * provably dead", never intending to exercise real cross-process start-time
+ * comparison. Disabling the real read by default (no evidence — the same
+ * fail-open outcome production code takes for an unreadable read) keeps
+ * every one of those existing `sameHostAlive`/`takenOver` fixtures correct
+ * without editing each one, and keeps the whole suite deterministic and free
+ * of real shell-outs. Tests that specifically exercise mismatch detection
+ * install their own scoped override (see `withProcessStartTimeIoOverrideV1`)
+ * and restore this default afterward; a real, unmocked, spawned-child
+ * integration test lives in `processStartTimeProbeV1.test.ts`.
+ */
+const NO_PROCESS_START_TIME_EVIDENCE_OVERRIDE_V1 = {
+  readFileUtf8Sync: () => undefined,
+  execFileCapture: () => Promise.resolve(undefined),
+};
+setProcessStartTimeIoOverrideForTestV1(NO_PROCESS_START_TIME_EVIDENCE_OVERRIDE_V1);
+after(() => {
+  setProcessStartTimeIoOverrideForTestV1(undefined);
+});
+
+/** Scope a process-start-time IO override to one test, always restoring the
+ * suite-wide no-evidence default afterward (even on failure). */
+async function withProcessStartTimeIoOverrideV1<T>(
+  override: Parameters<typeof setProcessStartTimeIoOverrideForTestV1>[0],
+  fn: () => Promise<T>
+): Promise<T> {
+  setProcessStartTimeIoOverrideForTestV1(override);
+  try {
+    return await fn();
+  } finally {
+    setProcessStartTimeIoOverrideForTestV1(NO_PROCESS_START_TIME_EVIDENCE_OVERRIDE_V1);
+  }
+}
 
 function freshTaskFolder(name: string): string {
   const dir = path.join(TEST_ROOT, name);
@@ -2869,6 +2909,109 @@ void test("probeWorkAdmissionOwnerLivenessV1: any errno other than ESRCH (e.g. E
   }
 });
 
+void test("probeWorkAdmissionOwnerLivenessV1: a same-host pid that still responds but whose process-start-time clearly mismatches the recorded one is sameHostDead (pid reuse)", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  const recordedStartTime = 1_000_000_000_000; // 2001-09-09 — deliberately far from "now".
+  // The linux reader needs BOTH /proc files to compute a value; fabricate
+  // their contents so the computed epoch lands "now" — clearly beyond
+  // tolerance from `recordedStartTime` — keyed on the real `process.pid` so
+  // this exercises the actual dispatch path for a real, alive pid.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const result = await withProcessStartTimeIoOverrideV1(
+    {
+      platform: "linux" as NodeJS.Platform,
+      readFileUtf8Sync: (p: string) => {
+        if (p === `/proc/${process.pid}/stat`) return `${process.pid} (fakeproc) S 1 ${process.pid} ${process.pid} 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 ${nowSeconds * 100} 0`;
+        if (p === "/proc/uptime") return `${nowSeconds} 0`;
+        return undefined;
+      },
+      execFileCapture: () => Promise.resolve(undefined),
+    },
+    () =>
+      probeWorkAdmissionOwnerLivenessV1({
+        claimId: "x",
+        purpose: "admission",
+        ownerToken: "x",
+        pid: process.pid, // real, alive — ESRCH check alone would say sameHostAlive.
+        processStartTime: recordedStartTime,
+        hostId: myHostId,
+        commandId: "x",
+        startedAt: new Date().toISOString(),
+      })
+  );
+  assert.deepEqual(result, { kind: "sameHostDead" }, "a responding pid whose start time clearly does not match the recorded owner must be treated as a reused pid, not the original owner");
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: a same-host pid whose process-start-time matches the recorded one within tolerance stays sameHostAlive", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  const recordedStartTime = Date.now() - 60_000; // one minute ago.
+  const result = await withProcessStartTimeIoOverrideV1(
+    {
+      platform: "win32" as NodeJS.Platform,
+      execFileCapture: () => Promise.resolve(new Date(recordedStartTime + 500).toISOString()), // within tolerance
+      readFileUtf8Sync: undefined,
+    },
+    () =>
+      probeWorkAdmissionOwnerLivenessV1({
+        claimId: "x",
+        purpose: "admission",
+        ownerToken: "x",
+        pid: process.pid,
+        processStartTime: recordedStartTime,
+        hostId: myHostId,
+        commandId: "x",
+        startedAt: new Date().toISOString(),
+      })
+  );
+  assert.deepEqual(result, { kind: "sameHostAlive" }, "a start time within tolerance must fail open exactly like a match, never treated as death");
+});
+
+void test("probeWorkAdmissionOwnerLivenessV1: unreadable process-start-time evidence fails open to sameHostAlive, never death", async () => {
+  const myHostId = await resolveHostIdentityV1();
+  const result = await withProcessStartTimeIoOverrideV1(
+    { execFileCapture: () => Promise.resolve(undefined), readFileUtf8Sync: () => undefined },
+    () =>
+      probeWorkAdmissionOwnerLivenessV1({
+        claimId: "x",
+        purpose: "admission",
+        ownerToken: "x",
+        pid: process.pid,
+        processStartTime: 12345,
+        hostId: myHostId,
+        commandId: "x",
+        startedAt: new Date().toISOString(),
+      })
+  );
+  assert.deepEqual(result, { kind: "sameHostAlive" }, "no cross-check evidence must never be treated as proof of death");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker whose owner pid still responds but whose process-start-time mismatches is reclaimed via a won rename (pid reuse detected)", async () => {
+  const task = freshTaskFolder("reclaim-pid-reused");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "reused-pid-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const outcome = await withProcessStartTimeIoOverrideV1(
+    {
+      platform: "linux" as NodeJS.Platform,
+      readFileUtf8Sync: (p: string) => {
+        if (p === `/proc/${process.pid}/stat`) return `${process.pid} (fakeproc) S 1 ${process.pid} ${process.pid} 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 ${nowSeconds * 100} 0`;
+        if (p === "/proc/uptime") return `${nowSeconds} 0`;
+        return undefined;
+      },
+      execFileCapture: () => Promise.resolve(undefined),
+    },
+    () => attemptAutomaticWorkAdmissionReclamationV1(task)
+  );
+  assert.equal(outcome.outcome, "reclaimed", "a mismatched start time is determinate proof of death and must be reclaimed, exactly like a real ESRCH");
+  if (outcome.outcome === "reclaimed") {
+    assert.equal(outcome.purpose, "admission");
+    assert.equal(outcome.reclaimedOwner.ownerToken, "reused-pid-owner");
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false, "the reclaimed marker must no longer be reported live");
+});
+
 void test("attemptAutomaticWorkAdmissionReclamationV1: nothingToReclaim when the task has no admission directory at all", async () => {
   const task = freshTaskFolder("reclaim-nothing-to-reclaim");
   const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
@@ -2902,6 +3045,55 @@ void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker whose owne
   assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a live owner's marker must never be reclaimed");
 
   await acquired.handle.release();
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker owned by a foreign host is never automatically reclaimed (no way to probe a different machine)", async () => {
+  const task = freshTaskFolder("reclaim-foreign-host-never");
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: 123456, hostId: "definitely-a-different-host-id", ownerToken: "foreign-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.equal(outcome.outcome, "notDead");
+  if (outcome.outcome === "notDead") {
+    assert.deepEqual(outcome.liveness, { kind: "foreignHost" });
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a foreign-host marker must never be reclaimed automatically — only the human-confirmed takeover path may touch it");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale, unreadable (corrupt) marker is never automatically reclaimed — no owner to probe", async () => {
+  const task = freshTaskFolder("reclaim-corrupt-never");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = path.join(dir, "admission.corruptowner.g1.deadbeef");
+  fs.writeFileSync(markerPath, "not valid json at all {{{");
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+  assert.equal(outcome.outcome, "notDead");
+  if (outcome.outcome === "notDead") {
+    assert.deepEqual(outcome.liveness, { kind: "corrupt" });
+    assert.equal(outcome.owner, undefined);
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "an unreadable marker must never be reclaimed blind");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker whose owner liveness is indeterminate (e.g. EPERM) is never automatically reclaimed", async () => {
+  const task = freshTaskFolder("reclaim-indeterminate-never");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: 4321, hostId: myHostId, ownerToken: "indeterminate-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  setPidLivenessCheckOverrideForTestV1(() => "indeterminate");
+  try {
+    const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task);
+    assert.equal(outcome.outcome, "notDead");
+    if (outcome.outcome === "notDead") {
+      assert.equal(outcome.liveness.kind, "indeterminate");
+    }
+    assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "an indeterminate liveness probe must never be treated as death");
+  } finally {
+    setPidLivenessCheckOverrideForTestV1(undefined);
+  }
 });
 
 void test("attemptAutomaticWorkAdmissionReclamationV1: a stale admission marker whose owner is confirmed dead is reclaimed by a validated rename to a tombstone", async () => {
@@ -3344,4 +3536,47 @@ void test("garbageCollectStaleWorkAdmissionTombstonesV1: never touches a live ma
   assert.equal(fs.existsSync(fencePath), true, "a pause-fence generation must never be age-deleted");
   assert.equal(fs.existsSync(barrierPath), true, "a pending revocation barrier must never be age-deleted by generic GC");
   assert.equal(fs.existsSync(tombstonePath), false, "the genuinely aged tombstone must have been collected");
+});
+
+void test("garbageCollectStaleWorkAdmissionTombstonesV1: a real unlink failure on one aged tombstone leaves recoverable state — earlier collections in the same pass are kept, the failed one is retried on the next pass", async () => {
+  const task = freshTaskFolder("gc-unlink-failure-recoverable");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const okPath = path.join(dir, "admission.ok-owner.g1.aaa111.tombstone");
+  fs.writeFileSync(okPath, JSON.stringify({ claimId: "ok" }));
+  backdateV1(okPath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const failPath = path.join(dir, "admission.fail-owner.g1.bbb222.tombstone");
+  fs.writeFileSync(failPath, JSON.stringify({ claimId: "fail" }));
+  backdateV1(failPath, WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1 + 60_000);
+
+  const injectedError = Object.assign(new Error("simulated EACCES"), { code: "EACCES" });
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onBeforeTombstoneUnlink: (basename) => (basename === "admission.fail-owner.g1.bbb222.tombstone" ? injectedError : undefined),
+  });
+  let outcome: Awaited<ReturnType<typeof garbageCollectStaleWorkAdmissionTombstonesV1>>;
+  try {
+    outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+
+  assert.equal(outcome.outcome, "writeFailed");
+  if (outcome.outcome === "writeFailed") {
+    assert.equal(outcome.error, injectedError);
+    // Directory iteration order is not contractually fixed, so this pass may
+    // have collected the ok tombstone before or not yet reached it when the
+    // failure hit — either is a valid "recoverable" state; what must NEVER
+    // happen is losing track of which of the two actually got removed.
+    assert.equal(outcome.partialCount, fs.existsSync(okPath) ? 0 : 1, "partialCount must exactly match what was actually removed this pass");
+  }
+  assert.equal(fs.existsSync(failPath), true, "the file whose unlink failed must still be present, not silently lost");
+
+  // A later pass, with the injection removed, must still be able to finish
+  // the job — a real failure must not leave the tombstone permanently stuck.
+  const retry = await garbageCollectStaleWorkAdmissionTombstonesV1(task);
+  assert.equal(fs.existsSync(failPath), false, "a subsequent pass must retry and collect the previously-failed tombstone");
+  assert.equal(fs.existsSync(okPath), false);
+  assert.ok(retry.outcome === "collected" || retry.outcome === "nothingToCollect");
 });

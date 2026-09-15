@@ -45,6 +45,25 @@ import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmission
 import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { setProcessStartTimeIoOverrideForTestV1 } from "../state/processStartTimeProbeV1";
+
+/**
+ * `probeWorkAdmissionOwnerLivenessV1`'s process-start-time cross-check (Part
+ * 1c step 15's "readable process-start mismatch" half) is additive proof of
+ * death on top of the pre-existing ESRCH check. This file's
+ * `writeFakeAdmissionMarkerV1` (below) uses a placeholder `processStartTime: 0`
+ * purely to mean "alive, not provably dead" for tests that plant a marker for
+ * this test process's own real, alive pid — never intending to exercise real
+ * cross-process start-time comparison. Disabling the real read by default
+ * (no evidence — the same fail-open outcome production code takes for an
+ * unreadable read) keeps those fixtures correct and the suite deterministic
+ * and free of real shell-outs. See `workAdmissionV1.test.ts` for the same
+ * fix, applied there first.
+ */
+setProcessStartTimeIoOverrideForTestV1({ readFileUtf8Sync: () => undefined, execFileCapture: () => Promise.resolve(undefined) });
+after(() => {
+  setProcessStartTimeIoOverrideForTestV1(undefined);
+});
 
 /**
  * The watchdog-sweep tests below exercise `detectAndRepairStalledActiveTasksV1`,

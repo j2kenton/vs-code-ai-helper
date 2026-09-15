@@ -3,6 +3,7 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveHostIdentityV1 } from "./hostIdentityV1";
+import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./processStartTimeProbeV1";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
@@ -103,9 +104,11 @@ export interface WorkAdmissionClaimInfoV1 {
   readonly pid: number;
   /** Best-effort approximation of this process's own start time
    * (`Date.now() - process.uptime() * 1000`, captured once at module load).
-   * Real cross-process start-time comparison (for conservative liveness
-   * detection of a DIFFERENT process) is 1c's job; v1a only ever compares a
-   * marker's recorded info to itself, never probes a live PID. */
+   * Cross-process start-time comparison, for conservative liveness detection
+   * of a DIFFERENT (possibly pid-reused) process, is `processStartTimeProbeV1.ts`'s
+   * `readOtherProcessStartEpochMsV1` plus `probeWorkAdmissionOwnerLivenessV1`
+   * below — this field is only ever the self-recorded value written once at
+   * claim time; nothing writes to it from outside the owning process. */
   readonly processStartTime: number;
   readonly hostId: string;
   readonly commandId: string;
@@ -1760,6 +1763,19 @@ export interface WorkAdmissionFsFailureInjectionV1 {
    * `undefined` outside tests; never used by production code paths.
    */
   readonly onBeforeUnprotectedRootsCheckAsync?: () => Promise<void>;
+  /**
+   * Part 1c step 17/18 — forces a genuine (non-ENOENT) failure of
+   * {@link garbageCollectStaleWorkAdmissionTombstonesV1}'s own per-tombstone
+   * `unlink`, otherwise as impractical to produce reliably and
+   * cross-platform as this module's other real-filesystem-failure seams (see
+   * `onBeforeHeartbeatRename`'s doc comment for the same reasoning). Called
+   * once per tombstone immediately before its unlink, with the tombstone's
+   * basename, so a test can fail one specific tombstone in a multi-tombstone
+   * pass and confirm the earlier ones already collected are not undone and
+   * the later ones are still attempted on the NEXT pass. `undefined` outside
+   * tests; never used by production code paths.
+   */
+  readonly onBeforeTombstoneUnlink?: (basename: string) => Error | undefined;
 }
 let fsFailureInjectionV1: WorkAdmissionFsFailureInjectionV1 | undefined;
 export function setWorkAdmissionFsFailureInjectionForTestV1(injection: WorkAdmissionFsFailureInjectionV1 | undefined): void {
@@ -3188,21 +3204,19 @@ async function performPauseRevocationBarrierFinishSequenceV1(
  * reports `foreignHost`/`corrupt`/`indeterminate` and must never be treated
  * as death by any caller.
  *
- * Deliberately narrower than the plan's full description ("determinate owner
- * death via ESRCH OR a readable process-start mismatch"): this probe
- * implements the ESRCH half only. A same-host pid that responds is always
- * `sameHostAlive`, even in the rare case where the ORIGINAL process died and
- * the OS has since reused its pid for an unrelated process — the
- * process-start-time cross-check that would additionally catch reuse needs a
- * real cross-platform "read a DIFFERENT process's start time" primitive this
- * codebase does not yet have (`WorkAdmissionClaimInfoV1.processStartTime`'s
- * own doc comment: today it only ever describes a process's OWN start time,
- * captured once at that process's module load — never a probe of a different
- * pid from outside it). Omitting it is still SAFE, never incorrect: it can
- * only ever cause an extra `sameHostAlive` (fail open, no reclamation) where
- * the fuller check would have found `sameHostDead` — the conservative
- * direction this whole probe already prefers. Real PID-reuse detection is
- * left as explicit follow-up work, not silently dropped.
+ * Implements BOTH halves of the plan's description ("determinate owner death
+ * via ESRCH OR a readable process-start mismatch"). A same-host pid that
+ * responds to `process.kill(pid, 0)` is not by itself proof the ORIGINAL
+ * process is still alive — the OS can reuse a pid for an unrelated process
+ * once the original has exited — so a responding pid is cross-checked
+ * against `processStartTimeProbeV1.ts`'s `readOtherProcessStartEpochMsV1`,
+ * which reads the CURRENT occupant's own start time independently of what
+ * the claim recorded. A mismatch beyond
+ * `PROCESS_START_TIME_MISMATCH_TOLERANCE_MS_V1` is `sameHostDead` (pid
+ * reuse, proven); a match, OR an unreadable/unparseable/unsupported-platform
+ * read, is `sameHostAlive` — this cross-check can only ever ADD proof of
+ * death, never proof of life, so any uncertainty in it must default to the
+ * same safe "still alive" conclusion the ESRCH-only probe already prefers.
  */
 export type WorkAdmissionOwnerLivenessV1 =
   | { readonly kind: "sameHostDead" }
@@ -3263,10 +3277,22 @@ export async function probeWorkAdmissionOwnerLivenessV1(
   if (liveness === "dead") {
     return { kind: "sameHostDead" };
   }
-  if (liveness === "alive") {
-    return { kind: "sameHostAlive" };
+  if (liveness !== "alive") {
+    return { kind: "indeterminate", reason: "process.kill(pid, 0) failed with an errno other than ESRCH" };
   }
-  return { kind: "indeterminate", reason: "process.kill(pid, 0) failed with an errno other than ESRCH" };
+  // A responding pid alone is not proof the ORIGINAL owner is still alive —
+  // cross-check its start time to catch pid reuse. `processStartTime` is a
+  // required numeric field on a readable claim record (the `!owner` guard
+  // above only rules out a missing/malformed record entirely); a genuinely
+  // corrupt/non-finite value here still fails open exactly like an
+  // unreadable cross-check read would.
+  if (Number.isFinite(owner.processStartTime)) {
+    const currentStartTime = await readOtherProcessStartEpochMsV1(owner.pid);
+    if (isProcessStartTimeMismatchV1(owner.processStartTime, currentStartTime)) {
+      return { kind: "sameHostDead" };
+    }
+  }
+  return { kind: "sameHostAlive" };
 }
 
 /**
@@ -3736,6 +3762,10 @@ export async function garbageCollectStaleWorkAdmissionTombstonesV1(
       continue;
     }
     try {
+      const injected = fsFailureInjectionV1?.onBeforeTombstoneUnlink?.(name);
+      if (injected) {
+        throw injected;
+      }
       await fs.promises.unlink(filePath);
       collected++;
     } catch (error) {
@@ -3744,7 +3774,9 @@ export async function garbageCollectStaleWorkAdmissionTombstonesV1(
       }
       // Reported with whatever was already collected this pass — a real
       // filesystem error on one file must not silently discard the count of
-      // tombstones this call already removed.
+      // tombstones this call already removed, and must not stop a LATER
+      // pass from retrying the file that failed here (nothing about this
+      // failure marks it as anything other than "still a stale tombstone").
       return { outcome: "writeFailed", error: error as Error, partialCount: collected };
     }
   }
