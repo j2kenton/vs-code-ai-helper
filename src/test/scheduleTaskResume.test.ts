@@ -10,6 +10,7 @@ import {
   SchedulerClock,
   SchedulerProgressStore,
   scheduleQuotaResumeAtV1,
+  setPauseCommitTestHooksForTestV1,
   TaskActionScheduler,
 } from "../commands/scheduleTaskResume";
 import { TaskProgress } from "../types/taskProgress";
@@ -24,12 +25,17 @@ import {
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
   endTargetResolutionV1,
+  finishPauseRevocationBarrierV1,
+  listPendingPauseRevocationBarriersV1,
+  PAUSE_COMMIT_LIKELY_STALE_MS_V1,
   resetTargetResolutionForTestV1,
+  revokeStalePauseCommitClaimV1,
   setWorkAdmissionFsFailureInjectionForTestV1,
   setWorkAdmissionRootOverrideForTestV1,
   WorkAdmissionResultV1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /**
@@ -1368,5 +1374,341 @@ void test("ordinary pause-ordering invariant: simultaneous claim acquisition —
   } finally {
     realFs.restore();
     fakeContext.restore();
+  }
+});
+
+// ── Revoked-pause fencing invariant (v1 fixes 2, Part 1b, plan step 14):
+// "suspend a `pauseCommit` owner ... at each of the five documented
+// boundaries (before its pre-write check, after it, during the awaited
+// write, after the raw write but before post-write validation, and after
+// notification prep) ... revoke from the other window ... resume the old
+// writer and verify its late pause is rejected or immediately treated as
+// revoked and repaired ... At no point may the review abort, the tree show
+// an effective watchdog pause, or a stale pause notification survive."
+//
+// `setPauseCommitTestHooksForTestV1` (scheduleTaskResume.ts) brackets the
+// real, disk-backed pause-commit sequence in `detectAndRepairStalledActiveTasksV1`
+// at exactly these points, so "the old owner" here is the real sweep code,
+// suspended mid-sequence by an awaited test hook, not a simulation of it. A
+// real "second window" revocation (`revokeStalePauseCommitClaimV1` +
+// `finishPauseRevocationBarrierV1`, forced stale via a fabricated `now` —
+// waiting out the real 5-minute threshold would make this suite
+// impractically slow) runs inside that suspension, exactly mirroring
+// production: a `pauseCommit` claim is only ever revoked once it is
+// genuinely stale, which in reality means its owner has been suspended for
+// minutes, not milliseconds. ───────────────────────────────────────────────
+
+type PauseFencingBoundaryV1 =
+  | "beforePreWriteCheck"
+  | "afterPreWriteCheck"
+  | "duringWrite"
+  | "afterRawWriteBeforePostValidation"
+  | "afterPostValidationBeforeNotification";
+
+/** `revokeStalePauseCommitClaimV1`'s own staleness gate compares its `now`
+ * argument against the marker's REAL mtime (set moments ago, when this
+ * test's sweep acquired it) — passing a `now` already past
+ * `PAUSE_COMMIT_LIKELY_STALE_MS_V1` satisfies that gate deterministically,
+ * without an actual multi-minute sleep. */
+function forcedStaleNowV1(): number {
+  return Date.now() + PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000;
+}
+
+/** The full "another window" revocation: rename the old owner's still-live
+ * `pauseCommit` marker into a pending barrier, then finish that barrier
+ * (fence advance + best-effort `task-progress.json` cleanup of any
+ * already-landed raw pause under the revoked claim + barrier removal) — the
+ * complete sequence plan step 12 describes, run end to end by one actor
+ * rather than left pending for a later one (the reverse-ordering test below
+ * exercises the left-pending variant instead). */
+async function revokeAndFinishFromAnotherWindowV1(taskFolderPath: string): Promise<void> {
+  const revoked = await revokeStalePauseCommitClaimV1(taskFolderPath, "second-window-revoker", forcedStaleNowV1());
+  assert.equal(
+    revoked.outcome,
+    "revoked",
+    `expected the old owner's still-live pauseCommit marker to be revocable at this boundary; got ${JSON.stringify(revoked)}`
+  );
+  if (revoked.outcome === "revoked") {
+    await finishPauseRevocationBarrierV1(taskFolderPath, revoked.barrierPath);
+  }
+}
+
+async function runPauseFencingBoundaryCaseV1(boundary: PauseFencingBoundaryV1): Promise<{
+  readonly taskFolderPath: string;
+  readonly afterSweep: TaskProgress;
+  readonly notified: boolean;
+  readonly cleanup: () => void;
+}> {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, `window-boundary-${boundary}`);
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  // Real, unmediated concurrency for "duringWrite": kicked off (not awaited)
+  // from the hook immediately before the write begins, then awaited to
+  // completion from the hook immediately after the write settles — so the
+  // revocation's own disk I/O genuinely overlaps the progress write's,
+  // rather than being forced strictly before or after it.
+  let concurrentRevoke: Promise<void> | undefined;
+  setPauseCommitTestHooksForTestV1({
+    onBeforePreWriteFenceCheckAsync: async () => {
+      if (boundary === "beforePreWriteCheck") {
+        await revokeAndFinishFromAnotherWindowV1(folder.taskFolderPath);
+      }
+    },
+    onAfterPreWriteFenceCheckAsync: async () => {
+      if (boundary === "afterPreWriteCheck") {
+        await revokeAndFinishFromAnotherWindowV1(folder.taskFolderPath);
+      } else if (boundary === "duringWrite") {
+        concurrentRevoke = revokeAndFinishFromAnotherWindowV1(folder.taskFolderPath);
+      }
+    },
+    onAfterRawWriteBeforePostValidationAsync: async () => {
+      if (boundary === "duringWrite") {
+        assert.ok(concurrentRevoke, "duringWrite boundary must have kicked off its concurrent revocation earlier");
+        await concurrentRevoke;
+      } else if (boundary === "afterRawWriteBeforePostValidation") {
+        await revokeAndFinishFromAnotherWindowV1(folder.taskFolderPath);
+      }
+    },
+    onAfterPostValidationBeforeNotificationAsync: async () => {
+      if (boundary === "afterPostValidationBeforeNotification") {
+        await revokeAndFinishFromAnotherWindowV1(folder.taskFolderPath);
+      }
+    },
+  });
+
+  try {
+    await scheduler.armAll();
+  } finally {
+    // Reset the global hook immediately — regardless of what the caller does
+    // with the returned folder afterward — so a throw here can never leak
+    // into a later, unrelated test.
+    setPauseCommitTestHooksForTestV1(undefined);
+  }
+
+  const afterSweep = readPersistedProgress(folder.progressPath);
+  const notified = surface.entries.some((e) => e.level === "warning" && /was stalled/.test(e.message));
+  return {
+    taskFolderPath: folder.taskFolderPath,
+    afterSweep,
+    notified,
+    cleanup: (): void => {
+      deactivateNotificationRouter();
+      realFs.restore();
+      fakeContext.restore();
+      scheduler.dispose();
+      folder.cleanup();
+    },
+  };
+}
+
+/** Shared assertions every boundary case must satisfy, run after the old
+ * owner's sweep pass has fully settled: the pause must never remain
+ * effective, and a work-starting command's own admission — arriving some
+ * time later, exactly like a real user reopening the task — must never be
+ * blocked or aborted by whatever the old owner (or the revocation racing it)
+ * left behind. */
+async function assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1(
+  boundary: PauseFencingBoundaryV1,
+  taskFolderPath: string
+): Promise<void> {
+  const effective = await resolveEffectivePauseStatusV1(taskFolderPath, readPersistedProgress(
+    path.join(taskFolderPath, "task-progress.json")
+  ));
+  assert.notEqual(
+    effective.kind,
+    "currentWatchdogPause",
+    `boundary "${boundary}": no final state may contain an effective watchdog pause once the racing revocation has run`
+  );
+
+  const genesis = await acquireWorkAdmissionV1({
+    taskFolderPath,
+    purpose: "admission",
+    commandId: "test-work-command",
+  });
+  assert.equal(
+    genesis.outcome,
+    "acquired",
+    `boundary "${boundary}": a work-starting command's admission must never be blocked by the old pauseCommit owner's activity — got ${JSON.stringify(genesis)}`
+  );
+  if (genesis.outcome === "acquired") {
+    await genesis.handle.release();
+  }
+  assert.equal(
+    listPendingPauseRevocationBarriersV1(taskFolderPath).length,
+    0,
+    `boundary "${boundary}": no pending revocation barrier may survive once a later acquisition has run`
+  );
+}
+
+void test("revoked-pause fencing invariant: boundary 1 — revoked before the pre-write fence check — the sweep's own pre-write check catches it and never writes a pause at all", async () => {
+  const result = await runPauseFencingBoundaryCaseV1("beforePreWriteCheck");
+  try {
+    assert.equal(result.afterSweep.status, "active", `expected no pause to have been written at all; got ${JSON.stringify(result.afterSweep)}`);
+    assert.equal(result.afterSweep.pausedReason, undefined);
+    assert.equal(result.notified, false, "no escalation may be posted for a pause that was never committed");
+    await assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1("beforePreWriteCheck", result.taskFolderPath);
+  } finally {
+    result.cleanup();
+  }
+});
+
+void test("revoked-pause fencing invariant: boundary 2 — revoked after the pre-write check passes but before the write — the sweep's own post-write check catches the now-stale generation and self-reverses, no notification posted", async () => {
+  const result = await runPauseFencingBoundaryCaseV1("afterPreWriteCheck");
+  try {
+    assert.equal(result.afterSweep.status, "active", `expected the sweep's own post-write check to self-reverse; got ${JSON.stringify(result.afterSweep)}`);
+    assert.equal(result.afterSweep.pausedReason, undefined);
+    assert.equal(result.afterSweep.watchdogPauseClaimId, undefined);
+    assert.equal(result.notified, false, "a self-reversed pause must settle as revoked, never announced as a pause");
+    await assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1("afterPreWriteCheck", result.taskFolderPath);
+  } finally {
+    result.cleanup();
+  }
+});
+
+void test("revoked-pause fencing invariant: boundary 3 — revoked during the awaited progress write itself (genuine, unmediated concurrency) — the sweep's post-write check still catches it and self-reverses", async () => {
+  const result = await runPauseFencingBoundaryCaseV1("duringWrite");
+  try {
+    assert.equal(result.afterSweep.status, "active", `expected the sweep's own post-write check to self-reverse; got ${JSON.stringify(result.afterSweep)}`);
+    assert.equal(result.afterSweep.pausedReason, undefined);
+    assert.equal(result.notified, false);
+    await assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1("duringWrite", result.taskFolderPath);
+  } finally {
+    result.cleanup();
+  }
+});
+
+void test("revoked-pause fencing invariant: boundary 4 — revoked after the raw pause write lands but before post-write validation runs — the revocation's own barrier-finish cleanup repairs the raw write immediately, and the sweep's later post-write check finds it already repaired (a harmless no-op), no notification posted", async () => {
+  const result = await runPauseFencingBoundaryCaseV1("afterRawWriteBeforePostValidation");
+  try {
+    assert.equal(
+      result.afterSweep.status,
+      "active",
+      `expected the barrier-finish's own task-progress cleanup to have already repaired the raw write; got ${JSON.stringify(result.afterSweep)}`
+    );
+    assert.equal(result.afterSweep.pausedReason, undefined);
+    assert.equal(result.afterSweep.watchdogPauseClaimId, undefined);
+    assert.equal(result.notified, false, "the sweep's own post-write check must find the pause already repaired and skip notification");
+    await assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1("afterRawWriteBeforePostValidation", result.taskFolderPath);
+  } finally {
+    result.cleanup();
+  }
+});
+
+void test("revoked-pause fencing invariant: boundary 5 — revoked after post-write validation already passed (the sweep is committed to notifying) — the revocation's barrier-finish cleanup still repairs the raw write before the notification is built, so even a notification posted at this boundary refers to an already-resolved condition, never a surviving effective pause", async () => {
+  const result = await runPauseFencingBoundaryCaseV1("afterPostValidationBeforeNotification");
+  try {
+    assert.equal(
+      result.afterSweep.status,
+      "active",
+      `expected the barrier-finish's own task-progress cleanup to have repaired the raw write before notification, even though post-write validation already passed; got ${JSON.stringify(result.afterSweep)}`
+    );
+    assert.equal(result.afterSweep.pausedReason, undefined);
+    // Unlike every earlier boundary: post-write validation had ALREADY
+    // passed before revocation ran, so the sweep is unconditionally
+    // committed to notifying by this point — the notification code has no
+    // seam left to recheck status. A notification MAY therefore be posted
+    // here; the correctness property this test defends is that it can never
+    // refer to a pause that still blocks anything by the time it lands.
+    await assertBoundaryLeavesNoEffectivePauseAndAdmitsCleanlyV1("afterPostValidationBeforeNotification", result.taskFolderPath);
+  } finally {
+    result.cleanup();
+  }
+});
+
+void test("reverse late-writer ordering: the old pause commits (write + post-write validation + notification) before its claim is revoked — a revocation left pending (rename-only, not yet finished) never invalidates the already-committed pause on its own; a later acquisition's own barrier-finish is what advances the fence and repairs it, before that acquisition publishes its own marker", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), status: "active" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const scheduler = new TaskActionScheduler(inventory, clock, undefined, "window-reverse-ordering");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = installFakeExtensionContextV1();
+
+  setPauseCommitTestHooksForTestV1({
+    onAfterPostValidationBeforeNotificationAsync: async () => {
+      // Revoke ONLY — deliberately do not finish the barrier. The old
+      // owner's claim is renamed away (it can no longer heartbeat or be
+      // found live), but the fence has not yet advanced and no
+      // `task-progress.json` cleanup has run — exactly a revoker that died
+      // right after the rename, leaving a helpable pending barrier behind
+      // (Part 1b step 12: "a later claimant can help finish an abandoned
+      // revocation's idempotent steps").
+      const revoked = await revokeStalePauseCommitClaimV1(
+        folder.taskFolderPath,
+        "reverse-ordering-revoker",
+        forcedStaleNowV1()
+      );
+      assert.equal(revoked.outcome, "revoked");
+    },
+  });
+
+  try {
+    // The pause's write and post-write validation both complete normally,
+    // undisturbed — the reverse of every boundary case above, where
+    // revocation always lands no later than "just before notification".
+    await scheduler.armAll();
+
+    const committed = readPersistedProgress(folder.progressPath);
+    assert.equal(committed.status, "paused", "the pause must have committed normally — nothing raced its write or its post-write validation");
+    assert.equal(committed.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
+    assert.equal(typeof committed.watchdogPauseFenceGeneration, "number");
+
+    assert.equal(
+      listPendingPauseRevocationBarriersV1(folder.taskFolderPath).length,
+      1,
+      "the claim revocation (rename-only, not yet finished) must have left exactly one pending barrier"
+    );
+
+    // The fence has NOT advanced yet — revoking the CLAIM alone never does
+    // that; only finishing the barrier does — so the just-committed pause is
+    // still, in isolation, indistinguishable from a real one.
+    const stillCurrent = await resolveEffectivePauseStatusV1(folder.taskFolderPath, committed);
+    assert.equal(
+      stillCurrent.kind,
+      "currentWatchdogPause",
+      "revoking the CLAIM alone (without finishing the barrier) must not yet invalidate the already-committed pause"
+    );
+
+    // Admission now proceeds: a work-starting command's own acquisition is
+    // what finishes the leftover barrier BEFORE it publishes its own marker
+    // (plan step 12 / `acquireWorkAdmissionCoreV1`'s wiring) — "fence
+    // advancement must clear the matching pause before admission proceeds".
+    const genesis = await acquireWorkAdmissionV1({
+      taskFolderPath: folder.taskFolderPath,
+      purpose: "admission",
+      commandId: "test-work-command-reverse-ordering",
+    });
+    assert.equal(genesis.outcome, "acquired", "admission must never be blocked by a leftover pending barrier");
+    try {
+      const repaired = readPersistedProgress(folder.progressPath);
+      assert.equal(repaired.status, "active", "finishing the barrier during admission must have already repaired the stale pause");
+      assert.equal(repaired.watchdogPauseClaimId, undefined);
+      assert.equal(repaired.watchdogPauseFenceGeneration, undefined);
+      assert.equal(
+        listPendingPauseRevocationBarriersV1(folder.taskFolderPath).length,
+        0,
+        "the barrier must be gone once admission's own acquisition has finished it"
+      );
+    } finally {
+      await genesis.handle.release();
+    }
+  } finally {
+    setPauseCommitTestHooksForTestV1(undefined);
+    deactivateNotificationRouter();
+    realFs.restore();
+    fakeContext.restore();
+    scheduler.dispose();
+    folder.cleanup();
   }
 });

@@ -55,6 +55,41 @@ import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../t
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
 /**
+ * v1 fixes item 1, Part 1b step 14 ("revoked-pause fencing at all five
+ * boundaries") — test-only synchronous injection points bracketing
+ * `detectAndRepairStalledActiveTasksV1`'s own pauseCommit commit sequence, so
+ * a test can deterministically suspend "the old pauseCommit owner" at each of
+ * the plan's five documented boundaries and run a real revocation (from
+ * "another window") in between: before the pre-write fence-currency check,
+ * immediately after it (before the progress write begins), immediately after
+ * the progress write settles (before the post-write admission/fence
+ * currency checks), and immediately after those post-write checks pass
+ * (before the escalation notification is built and posted). The fifth
+ * boundary from the plan ("during the awaited progress write" itself) needs
+ * no dedicated hook: a test starts its revocation from inside the "after the
+ * pre-write check" hook without awaiting it, then awaits its settlement
+ * inside the "after the raw write" hook below, producing a genuine,
+ * OS-scheduled overlap between the revocation's own disk I/O and the
+ * progress write's — the same "unmediated race" pattern the ordinary
+ * pause-ordering invariant tests above already use, rather than a sixth
+ * synthetic boundary.
+ *
+ * `undefined` outside tests; every call site below is a single optional-chain
+ * no-op unless a test has installed hooks — never used by production code
+ * paths.
+ */
+export interface PauseCommitTestHooksV1 {
+  readonly onBeforePreWriteFenceCheckAsync?: () => Promise<void>;
+  readonly onAfterPreWriteFenceCheckAsync?: () => Promise<void>;
+  readonly onAfterRawWriteBeforePostValidationAsync?: () => Promise<void>;
+  readonly onAfterPostValidationBeforeNotificationAsync?: () => Promise<void>;
+}
+let pauseCommitTestHooksV1: PauseCommitTestHooksV1 | undefined;
+export function setPauseCommitTestHooksForTestV1(hooks: PauseCommitTestHooksV1 | undefined): void {
+  pauseCommitTestHooksV1 = hooks;
+}
+
+/**
  * v1 fixes item 1, Part 1a step 7: the durable `WorkflowDecisionV1` card a
  * watchdog pause posts, carrying the action that undoes it — see
  * `detectAndRepairStalledActiveTasksV1`'s call site for why this is a posted
@@ -840,18 +875,21 @@ export class TaskActionScheduler implements vscode.Disposable {
         // unambiguously "after" this attempt's own snapshot rather than
         // something this attempt could race into observing halfway.
         const fenceGeneration = await readOrInitPauseFenceGenerationV1(task.taskFolderPath);
-        // Pre-write currency check: nothing can have advanced the fence
-        // between the capture immediately above and here (no `await` runs in
-        // between), so this is a no-op today — there is no revocation
-        // protocol yet to race it. It exists so the write below never fires
-        // without this check having run at least once ahead of it, matching
-        // the plan's literal "pre-write and post-write checks" pairing; once
-        // revocation (Part 1b's remaining steps) can advance the fence
-        // asynchronously, inserting real work ahead of the write, this check
-        // starts actually doing something.
+        // Pre-write currency check, matching the plan's literal "pre-write
+        // and post-write checks" pairing: Part 1b's revocation protocol
+        // (`revokeStalePauseCommitClaimV1` + a barrier-finisher's fence
+        // advance) can now genuinely land between the capture immediately
+        // above and this read, so this is real, load-bearing currency
+        // validation, not the placeholder it was before revocation existed.
+        // `onBeforePreWriteFenceCheckAsync`/`onAfterPreWriteFenceCheckAsync`
+        // (test-only, see `PauseCommitTestHooksV1` above) bracket exactly
+        // this read so a test can deterministically revoke on either side of
+        // it.
+        await pauseCommitTestHooksV1?.onBeforePreWriteFenceCheckAsync?.();
         if (!(await isWatchdogPauseFenceCurrentV1(task.taskFolderPath, fenceGeneration))) {
           continue;
         }
+        await pauseCommitTestHooksV1?.onAfterPreWriteFenceCheckAsync?.();
         const recovery = task.progress.implRecovery;
         const stuckRecovery =
           recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
@@ -873,6 +911,11 @@ export class TaskActionScheduler implements vscode.Disposable {
           // escalation, so this one must not post a second copy of it.
           continue;
         }
+        // Test-only boundary (see `PauseCommitTestHooksV1` above): the raw
+        // pause write has now landed on disk, but the post-write
+        // admission/fence currency checks immediately below have not run
+        // yet.
+        await pauseCommitTestHooksV1?.onAfterRawWriteBeforePostValidationAsync?.();
         // Post-write checks, again excluding this claim's own marker: a
         // command's genesis that started AFTER our pre-write check but
         // BEFORE our write landed on disk must still be found here and
@@ -908,6 +951,11 @@ export class TaskActionScheduler implements vscode.Disposable {
           });
           continue;
         }
+        // Test-only boundary (see `PauseCommitTestHooksV1` above): the
+        // post-write admission/fence currency checks just passed — this
+        // sweep is committed to notifying — but the escalation has not been
+        // built or posted yet.
+        await pauseCommitTestHooksV1?.onAfterPostValidationBeforeNotificationAsync?.();
         this.stalledActiveNotified.add(task.taskFolderPath);
         // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
         // action that undoes it" — a mechanism that can pause a task must

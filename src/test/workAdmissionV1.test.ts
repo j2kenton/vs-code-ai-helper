@@ -2544,6 +2544,53 @@ void test("advancePauseFenceForRevocationV1 + removePauseRevocationBarrierV1 giv
   assert.equal(await readOrInitPauseFenceGenerationV1(task), fenceAfterAdvance);
 });
 
+void test("crash after generation creation (fence already advanced, barrier not yet removed) leaves a helpable pending barrier that a DIFFERENT later claimant completes safely, without a phantom double-advance", async () => {
+  const task = freshTaskFolder("finish-barrier-crash-after-generation-creation");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  backdateV1(markerFilePathV1(task), PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
+  const revoked = await revokeStalePauseCommitClaimV1(task, "revoker-crash-after-generation");
+  assert.equal(revoked.outcome, "revoked");
+  if (revoked.outcome !== "revoked") return;
+  const fenceBefore = await readOrInitPauseFenceGenerationV1(task);
+
+  // Simulate "crash after generation creation": the ORIGINAL finisher gets
+  // as far as durably publishing the new fence generation (step one of
+  // `finishPauseRevocationBarrierV1`'s two-step sequence — see
+  // `advancePauseFenceForRevocationV1`'s own doc comment) and then dies
+  // before removing the barrier file — the barrier is left behind exactly as
+  // the durable record that this cleanup step is still owed.
+  const fenceAfterAdvance = await advancePauseFenceForRevocationV1(task);
+  assert.equal(fenceAfterAdvance, fenceBefore + 1);
+  assert.equal(fs.existsSync(revoked.barrierPath), true, "the barrier must survive the fence advance alone");
+  assert.deepEqual(listPendingPauseRevocationBarriersV1(task), [revoked.barrierPath]);
+
+  // A completely different, later claimant (never involved in the original
+  // revocation or its fence advance) discovers the still-pending barrier via
+  // `listPendingPauseRevocationBarriersV1` and completes it.
+  const pending = listPendingPauseRevocationBarriersV1(task);
+  assert.equal(pending.length, 1);
+  for (const barrierPath of pending) {
+    await finishPauseRevocationBarrierV1(task, barrierPath);
+  }
+
+  // The barrier is now gone, and — critically — the fence must NOT have
+  // advanced a second time: the generation the crashed attempt already
+  // published is the correct, final target, and the later claimant's own
+  // finish call must recognize that target is already surpassed (mirrors
+  // "finishPauseRevocationBarrierV1 safely no-ops its fence advance when
+  // unrelated activity already carried the fence past the barrier's target"
+  // above, but here the "unrelated activity" is this SAME barrier's own
+  // first, crashed attempt, not a different revocation).
+  assert.equal(
+    await readOrInitPauseFenceGenerationV1(task),
+    fenceAfterAdvance,
+    "a later claimant finishing a barrier whose generation-creation step already ran (then crashed before removal) must never advance the fence a second time"
+  );
+  assert.equal(listPendingPauseRevocationBarriersV1(task).length, 0, "the barrier must be fully removed by the later claimant");
+});
+
 void test("removePauseRevocationBarrierV1 tolerates an already-removed barrier (ENOENT)", async () => {
   const task = freshTaskFolder("revocation-remove-idempotent");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "pauseCommit", commandId: "sweep" });
