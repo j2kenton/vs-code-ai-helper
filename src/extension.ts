@@ -236,7 +236,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   setReadToolCallObserverV1((event) => {
     console.info(
       "[ensemble:toolSession] read",
-      JSON.stringify({ tool: event.tool, relativePath: event.relativePath })
+      JSON.stringify({
+        tool: event.tool,
+        relativePath: event.relativePath,
+        ...(event.startLine !== undefined ? { startLine: event.startLine } : {}),
+        ...(event.endLine !== undefined ? { endLine: event.endLine } : {}),
+      })
     );
   });
 

@@ -242,4 +242,207 @@ void describe("editReadToolContractV1 — read session", () => {
       h.cleanup();
     }
   });
+
+  // v1 fixes 2, item 26 (2026-09-15): reviews name changed regions as line
+  // ranges, but readFile could only return a whole file and refused anything
+  // over 512 KB. A Copilot review of 9 large files spent all 64 rounds and
+  // never finished; one file (699 KB) held 10 of its 33 regions and could not
+  // be opened at all.
+  void it("readFile returns exactly the requested lines, with the whole file's observation", async () => {
+    const h = installHarness();
+    try {
+      fs.writeFileSync(path.join(h.root, "src", "lines.ts"), "one\ntwo\nthree\nfour\n");
+      const whole = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/lines.ts" });
+      const ranged = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/lines.ts",
+        startLine: 2,
+        endLine: 3,
+      });
+      assert.equal(ranged.ok, true);
+      assert.equal(whole.ok, true);
+      if (ranged.ok && whole.ok) {
+        assert.equal(ranged.contentUtf8, "two\nthree\n");
+        assert.equal(ranged.startLine, 2);
+        assert.equal(ranged.endLine, 3);
+        assert.equal(ranged.totalLines, 4);
+        assert.equal(ranged.truncated, undefined);
+        assert.equal(ranged.kind, "file");
+        assert.equal(ranged.contentSha256, whole.contentSha256, "the observation describes the whole file");
+        assert.equal(h.ledger.get(ranged.observationId)?.source, "readFile");
+        // …but the model saw only part of it, which the plan validator must know.
+        assert.equal(ranged.partialContent, true);
+        assert.equal(h.ledger.get(ranged.observationId)?.partialContent, true);
+        assert.equal(whole.partialContent, undefined);
+        assert.equal(h.ledger.get(whole.observationId)?.partialContent, undefined);
+      }
+      assert.equal(h.handler.violationCount(), 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("a ranged read keeps CRLF terminators and clamps an end past the last line", async () => {
+    const h = installHarness();
+    try {
+      fs.writeFileSync(path.join(h.root, "src", "crlf.ts"), "a\r\nb\r\nc");
+      const read = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/crlf.ts",
+        startLine: 2,
+        endLine: 99,
+      });
+      assert.equal(read.ok, true);
+      if (read.ok) {
+        assert.equal(read.contentUtf8, "b\r\nc", "exact bytes, so the slice can be copied into a patch");
+        assert.equal(read.endLine, 3);
+        assert.equal(read.totalLines, 3);
+      }
+      const nullRange = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/crlf.ts",
+        startLine: null,
+        endLine: null,
+      });
+      assert.equal(nullRange.ok && nullRange.contentUtf8, "a\r\nb\r\nc", "null range fields read the whole file");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("reads ranges of a file too large to read whole, and says how when refusing the whole read", async () => {
+    const h = installHarness();
+    try {
+      // 20,000 lines of 40 bytes: 800 KB, over the 512 KB whole-file limit.
+      const lines = Array.from({ length: 20_000 }, (_, i) => `line ${String(i + 1).padStart(34, "0")}`);
+      fs.writeFileSync(path.join(h.root, "src", "big.ts"), lines.join("\n") + "\n");
+
+      const whole = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/big.ts" });
+      assert.equal(whole.ok, false);
+      if (!whole.ok) {
+        assert.equal(whole.code, "readLimitExceeded");
+        assert.match(whole.reason, /800000 bytes, over the 512 KB whole-file limit/);
+        assert.match(whole.reason, /It has 20000 lines: read it in parts by passing startLine and endLine/);
+      }
+
+      const tail = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/big.ts",
+        startLine: 19_999,
+        endLine: 20_000,
+      });
+      assert.equal(tail.ok, true);
+      if (tail.ok) {
+        assert.equal(tail.contentUtf8, `${lines[19_998]}\n${lines[19_999]}\n`);
+        assert.equal(tail.totalLines, 20_000);
+      }
+
+      const everything = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/big.ts",
+        startLine: 1,
+        endLine: 20_000,
+      });
+      assert.equal(everything.ok, true);
+      if (everything.ok) {
+        assert.equal(everything.truncated, true, "a slice over the per-read cap stops at a whole line");
+        assert.ok(Buffer.byteLength(everything.contentUtf8 ?? "", "utf8") <= 512 * 1024);
+        assert.ok((everything.endLine ?? 0) < 20_000);
+        assert.ok((everything.contentUtf8 ?? "").endsWith("\n"));
+      }
+      assert.equal(h.handler.violationCount(), 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("a start past the end is an input error, not a protocol violation; a range on stat is a violation", async () => {
+    const h = installHarness();
+    try {
+      const past = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/app.ts",
+        startLine: 50,
+      });
+      assert.equal(past.ok, false);
+      if (!past.ok) {
+        assert.equal(past.code, "invalidInput");
+        assert.match(past.reason, /startLine 50 is past the end of the file, which has 2 lines/);
+      }
+      assert.equal(h.handler.violationCount(), 0, "the model cannot know a file's length before reading it");
+
+      const backwards = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/app.ts",
+        startLine: 2,
+        endLine: 1,
+      });
+      assert.equal(!backwards.ok && backwards.code, "invalidInput");
+
+      const stat = await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "src/app.ts", startLine: 1 });
+      assert.equal(!stat.ok && stat.code, "invalidInput");
+      assert.equal(h.handler.violationCount(), 2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("keeps empty lines as lines when slicing", async () => {
+    const h = installHarness();
+    try {
+      fs.writeFileSync(path.join(h.root, "src", "gaps.ts"), "\n\nthird\n\n");
+      const read = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/gaps.ts",
+        startLine: 2,
+        endLine: 4,
+      });
+      assert.equal(read.ok, true);
+      if (read.ok) {
+        assert.equal(read.contentUtf8, "\nthird\n\n");
+        assert.equal(read.totalLines, 4);
+        assert.equal(read.endLine, 4);
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("says a file over the ranged-read limit cannot be read at all, instead of suggesting ranges", async () => {
+    // Codex review, 2026-09-15: over 16 MB even a ranged read is refused, so
+    // advising ranges would spend another of the session's limited rounds on
+    // a retry that cannot succeed.
+    const h = installHarness();
+    try {
+      fs.writeFileSync(path.join(h.root, "src", "huge.log"), Buffer.alloc(16 * 1024 * 1024 + 1, 0x61));
+      const whole = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/huge.log" });
+      assert.equal(!whole.ok && whole.code, "readLimitExceeded");
+      assert.match(!whole.ok ? whole.reason : "", /cannot read any of it/);
+      assert.doesNotMatch(!whole.ok ? whole.reason : "", /read it in parts/);
+
+      const ranged = await h.call("ensemble_readFile", {
+        rootId: ROOT_ID,
+        relativePath: "src/huge.log",
+        startLine: 1,
+        endLine: 1,
+      });
+      assert.equal(!ranged.ok && ranged.code, "readLimitExceeded");
+      assert.match(!ranged.ok ? ranged.reason : "", /cannot read any of it/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("reports a ranged read's line range to the read-call observer", async () => {
+    const h = installHarness();
+    const events: ReadToolCallEventV1[] = [];
+    setReadToolCallObserverV1((event) => events.push(event));
+    try {
+      await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/app.ts", startLine: 1, endLine: 2 });
+      assert.deepEqual(events, [{ tool: "ensemble_readFile", relativePath: "src/app.ts", startLine: 1, endLine: 2 }]);
+    } finally {
+      setReadToolCallObserverV1(undefined);
+      h.cleanup();
+    }
+  });
 });

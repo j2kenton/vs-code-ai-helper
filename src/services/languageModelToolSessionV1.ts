@@ -163,6 +163,36 @@ export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
 const MAX_NARRATION_NUDGES_V1 = 2;
 
 /**
+ * How many rounds before the cap a text or preflight session starts being told
+ * how many remain.
+ *
+ * Without it the model has no idea the cap exists: on 2026-09-15 a Copilot
+ * High-Level Code Review (gpt-5.6-sol) spent all 64 rounds reading, every
+ * request succeeding, and ended in `toolRoundLimitExceeded` with nothing to
+ * show for it (v1 fixes 2, item 26). Six gives room to finish a last batch of
+ * reads and still answer.
+ */
+export const TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1 = 6;
+
+/** The notice appended after a round when `roundsLeft` rounds remain. */
+export function toolRoundWindDownNoticeV1(roundsLeft: number): string {
+  if (roundsLeft <= 1) {
+    return (
+      "Tool round limit: your next reply is the LAST one this session allows. If it calls a tool, " +
+      "the session ends with no result and everything you have read is lost. Reply now with your " +
+      "complete final result frame, as the result contract requires, based on what you have " +
+      "already read. Where you could not verify something, say so in the result as a confidence " +
+      "limitation."
+    );
+  }
+  return (
+    `Tool round limit: ${roundsLeft} rounds remain in this session. Read only what your answer ` +
+    "still depends on, putting the remaining reads in as few replies as you can, then reply with " +
+    "your complete final result frame. A session that runs out of rounds produces no result at all."
+  );
+}
+
+/**
  * Share of the model's advertised `maxInputTokens` this session lets its own
  * conversation occupy before it starts shedding old tool results.
  *
@@ -1002,6 +1032,22 @@ export function createCopilotLmToolSessionTransportV1(
         // Tool-call arguments are a path or two; the estimate is close enough.
         fixedTokens += (await count(roundText)) + Math.ceil(roundToolCallBytes / ESTIMATED_BYTES_PER_TOKEN_V1);
         trackedResultMessages.push({ messageIndex: messages.length - 1, results: roundResults });
+
+        // Warn before the round cap, so the session ends in an answer rather
+        // than in `toolRoundLimitExceeded` with everything it read discarded
+        // (v1 fixes 2, item 26). Never for an edit session: it is executing
+        // sealed steps, and telling it to stop would leave a plan half-applied.
+        const roundsLeft = maxRounds - (round + 1);
+        if (
+          request.mode !== "edit" &&
+          roundDeliverableContractV1(request.mode).requiresResultFrame &&
+          roundsLeft > 0 &&
+          roundsLeft <= TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1
+        ) {
+          const notice = toolRoundWindDownNoticeV1(roundsLeft);
+          messages.push(vscode.LanguageModelChatMessage.User(notice));
+          fixedTokens += await count(notice);
+        }
       }
 
       // The loop's own cancellation check is at the TOP of the next
@@ -1012,7 +1058,14 @@ export function createCopilotLmToolSessionTransportV1(
       if (request.cancellationToken.isCancellationRequested) {
         return { kind: "callerCancelled" };
       }
-      return { kind: "transportFailure", code: "toolRoundLimitExceeded" };
+      // The detail is what reaches the run log after the closed phrase. Without
+      // it this read "the transport failed before any response arrived" after
+      // every one of the rounds had in fact been answered.
+      return {
+        kind: "transportFailure",
+        code: "toolRoundLimitExceeded",
+        detail: `used all ${maxRounds} tool rounds without replying with a final answer`,
+      };
     },
   };
 }

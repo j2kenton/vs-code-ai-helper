@@ -11,6 +11,8 @@ import * as vscode from "vscode";
 import {
   createCopilotLmToolSessionTransportV1,
   setLmToolSessionRequestIssuedObserverV1,
+  TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1,
+  toolRoundWindDownNoticeV1,
 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { AgentExecutionRequestV1, BoundedResultWriterV1 } from "../types/agentExecutionV1";
@@ -194,10 +196,101 @@ void describe("languageModelToolSessionV1", () => {
         maxRounds: 2,
       });
       const exit = await transport.invoke(makeRequest(), makeWriter());
-      assert.deepEqual(exit, { kind: "transportFailure", code: "toolRoundLimitExceeded" });
+      assert.deepEqual(exit, {
+        kind: "transportFailure",
+        code: "toolRoundLimitExceeded",
+        detail: "used all 2 tool rounds without replying with a final answer",
+      });
       assert.equal(handler.calls.length, 2);
     } finally {
       model.restore();
+    }
+  });
+
+  /** The wind-down notices a request carried, in order. */
+  const windDownNotices = (request: ReadonlyArray<{ role: string; content: unknown }>): string[] =>
+    request
+      .filter((message) => message.role === "user" && typeof message.content === "string")
+      .map((message) => message.content as string)
+      .filter((text) => text.startsWith("Tool round limit"));
+
+  void it("tells a session how many rounds remain before the cap, so it answers instead of failing", async () => {
+    // v1 fixes 2, item 26 (2026-09-15): a Copilot review spent all 64 rounds
+    // reading — every request succeeded — and ended in toolRoundLimitExceeded,
+    // discarding everything it had read. Nothing had told it the cap existed.
+    const model = installBudgetedModel(128_000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3,
+      });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(writer.text(), FRAMED_FINAL_ANSWER);
+      assert.deepEqual(windDownNotices(model.sent[0]!), []);
+      assert.deepEqual(windDownNotices(model.sent[1]!), [toolRoundWindDownNoticeV1(2)]);
+      assert.deepEqual(windDownNotices(model.sent[2]!), [
+        toolRoundWindDownNoticeV1(2),
+        toolRoundWindDownNoticeV1(1),
+      ]);
+      assert.match(toolRoundWindDownNoticeV1(1), /LAST one this session allows/);
+
+      // The notice follows the tool results; it never separates a call from its result.
+      const last = model.sent[2]!;
+      for (let i = 0; i < last.length; i++) {
+        const message = last[i]!;
+        if (message.role !== "assistant" || !Array.isArray(message.content)) {
+          continue;
+        }
+        const callIds = (message.content as Array<{ callId?: string; name?: string }>)
+          .filter((part) => part.name !== undefined && part.callId !== undefined)
+          .map((part) => part.callId);
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
+          (part) => part.callId
+        );
+        assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by the next message`);
+      }
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("does not warn far from the cap, and never warns an edit session", async () => {
+    const rounds = [[toolCall("call-1")], [toolCall("call-2")], [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)]];
+    const far = installBudgetedModel(128_000, rounds);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3 + TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1,
+      });
+      assert.deepEqual(await transport.invoke(makeRequest(), makeWriter()), { kind: "completed" });
+      assert.deepEqual(far.sent.flatMap((request) => windDownNotices(request)), []);
+    } finally {
+      far.restore();
+    }
+
+    // An edit session is executing sealed steps; telling it to stop would
+    // leave a plan half-applied.
+    const edit = installBudgetedModel(128_000, rounds);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3,
+      });
+      assert.deepEqual(await transport.invoke({ ...makeRequest(), mode: "edit" as const }, makeWriter()), {
+        kind: "completed",
+      });
+      assert.deepEqual(edit.sent.flatMap((request) => windDownNotices(request)), []);
+    } finally {
+      edit.restore();
     }
   });
 

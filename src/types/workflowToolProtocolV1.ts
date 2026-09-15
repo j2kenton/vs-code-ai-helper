@@ -33,6 +33,19 @@ export type EditToolNameV1 = (typeof EDIT_TOOL_NAMES_V1)[number];
 
 /** Per-session limits (bounded results, bounded rounds — §3.2's spirit at the tool layer). */
 export const MAX_READ_FILE_BYTES_V1 = 512 * 1024;
+/**
+ * Largest file a LINE-RANGE read may open. The range's own returned content
+ * is still capped at `MAX_READ_FILE_BYTES_V1`; this only bounds what the host
+ * loads to find those lines, so a region of a file too large to return whole
+ * stays readable. Same ceiling as the edit broker's patch-target read.
+ *
+ * Why ranges exist (v1 fixes 2, item 26): reviews name changed regions as line
+ * ranges ("lines 2728-2788"), and a whole-file-only tool made each region cost
+ * the entire file — and a file over 512 KB could not be read at all. A
+ * 2026-09-15 Copilot review of 9 such files spent all 64 rounds without
+ * finishing.
+ */
+export const MAX_RANGED_READ_SOURCE_BYTES_V1 = 16 * 1024 * 1024;
 export const MAX_DIRECTORY_ENTRIES_V1 = 2_048;
 export const MAX_FIND_RESULTS_V1 = 512;
 export const MAX_TEXT_SEARCH_RESULTS_V1 = 256;
@@ -114,6 +127,55 @@ export function decodeExactPathToolInputV1(
     return { ok: false, reason: "missing or oversized relativePath" };
   }
   return { ok: true, input: { rootId: record.rootId, relativePath: record.relativePath } };
+}
+
+/** `ensemble_readFile` input: an exact path, optionally narrowed to a line range. */
+export interface ReadFileToolInputV1 extends ExactPathToolInputV1 {
+  /** 1-based first line to return, inclusive. */
+  readonly startLine?: number;
+  /** 1-based last line to return, inclusive. Past the end of the file is clamped. */
+  readonly endLine?: number;
+}
+
+/**
+ * Strict `ensemble_readFile` decode: the exact-path fields plus an optional
+ * 1-based inclusive line range. `null` is read as "not given" — models filling
+ * a schema's optional fields commonly send it — anything else must be a whole
+ * number of at least 1.
+ */
+export function decodeReadFileToolInputV1(
+  raw: unknown
+): ToolInputDecodeResultV1<ReadFileToolInputV1> {
+  const record = asRecord(raw);
+  if (!record) {
+    return { ok: false, reason: "input is not an object" };
+  }
+  const { startLine: rawStart, endLine: rawEnd, ...pathFields } = record;
+  const base = decodeExactPathToolInputV1(pathFields);
+  if (!base.ok) {
+    return base;
+  }
+  const startLine = rawStart ?? undefined;
+  const endLine = rawEnd ?? undefined;
+  for (const [name, value] of [
+    ["startLine", startLine],
+    ["endLine", endLine],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 1)) {
+      return { ok: false, reason: `invalid ${name}: expected a whole number of at least 1` };
+    }
+  }
+  if (startLine !== undefined && endLine !== undefined && (endLine as number) < (startLine as number)) {
+    return { ok: false, reason: "endLine is before startLine" };
+  }
+  return {
+    ok: true,
+    input: {
+      ...base.input,
+      ...(startLine !== undefined ? { startLine: startLine as number } : {}),
+      ...(endLine !== undefined ? { endLine: endLine as number } : {}),
+    },
+  };
 }
 
 export function decodeFindFilesToolInputV1(
@@ -202,9 +264,19 @@ export type ReadToolResultV1 =
       readonly tool: ReadToolNameV1;
       /** UTF-8 file content (readFile only), capped at MAX_READ_FILE_BYTES_V1. */
       readonly contentUtf8?: string;
+      /** Ranged readFile only: the first line returned, 1-based. */
+      readonly startLine?: number;
+      /** Ranged readFile only: the last line returned, 1-based inclusive. */
+      readonly endLine?: number;
+      /** Ranged readFile only: how many lines the whole file has. */
+      readonly totalLines?: number;
       readonly entries?: readonly DirectoryEntryV1[];
       readonly matches?: readonly DiscoveryMatchV1[];
-      /** True when a discovery walk hit its result cap — the listing is not exhaustive. */
+      /**
+       * True when a discovery walk hit its result cap (the listing is not
+       * exhaustive), or when a ranged read stopped before the requested
+       * `endLine` because the slice reached the per-read byte cap.
+       */
       readonly truncated?: boolean;
     })
   | {
@@ -276,14 +348,38 @@ const EXACT_PATH_SCHEMA_V1: Record<string, unknown> = {
   additionalProperties: false,
 };
 
+const READ_FILE_SCHEMA_V1: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    ...(EXACT_PATH_SCHEMA_V1.properties as Record<string, unknown>),
+    startLine: {
+      type: "integer",
+      minimum: 1,
+      description: "Optional. First line to return, 1-based, inclusive.",
+    },
+    endLine: {
+      type: "integer",
+      minimum: 1,
+      description: "Optional. Last line to return, 1-based, inclusive. Past the end of the file is clamped.",
+    },
+  },
+  required: ["rootId", "relativePath"],
+  additionalProperties: false,
+};
+
 /** Request-local descriptors for a PREFLIGHT session — exactly the five read tools (§7.2). */
 export function readToolDescriptorsV1(): readonly LmToolDescriptorV1[] {
   return assertHostSafeToolNamesV1([
     {
       name: "ensemble_readFile",
       description:
-        "Read one file's UTF-8 content by exact root-relative path. Returns the content plus a server-issued observation (id, revision, sha256) usable as a mutation precondition.",
-      inputSchema: EXACT_PATH_SCHEMA_V1,
+        "Read one file's UTF-8 content by exact root-relative path. Pass startLine and endLine " +
+        "(1-based, inclusive) to read only those lines: required for files over " +
+        `${MAX_READ_FILE_BYTES_V1 / 1024} KB, and far cheaper whenever you need only part of a file. ` +
+        "A ranged result reports startLine, endLine and totalLines, and is exact file text you may " +
+        "copy into a patch. Returns the content plus a server-issued observation (id, revision, " +
+        "sha256 of the whole file) usable as a mutation precondition.",
+      inputSchema: READ_FILE_SCHEMA_V1,
     },
     {
       name: "ensemble_stat",

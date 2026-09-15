@@ -34,6 +34,13 @@ export interface ObservationRefV1 {
   readonly revision: string;
   readonly contentSha256?: string;
   readonly complete: boolean;
+  /**
+   * True when a `readFile` returned only a line range. The revision and digest
+   * still describe the whole file, but the model saw only part of it — so the
+   * observation may anchor a `patchFile`, never a whole-file `replaceFile`
+   * (v1 fixes 2, item 26). Absent on every other observation.
+   */
+  readonly partialContent?: true;
 }
 
 /** Which read tool produced an observation — only exact-path reads authorize mutations (§7.2). */
@@ -92,6 +99,8 @@ export function createObservationLedgerV1(): ObservationLedgerV1 {
           complete: record.complete,
           source: record.source,
           ...(record.contentSha256 !== undefined ? { contentSha256: record.contentSha256 } : {}),
+          // Conditional, so every digest minted before ranged reads existed is unchanged.
+          ...(record.partialContent ? { partialContent: true } : {}),
         }))
       );
     },
@@ -117,6 +126,7 @@ export type PreflightPlanValidationCodeV1 =
   | "targetStateMismatch"
   | "duplicateTarget"
   | "emptinessUnproven"
+  | "replaceWithoutFullRead"
   | "parentChainMismatch";
 
 function failure(
@@ -258,6 +268,22 @@ export function validatePreflightPlanAgainstLedgerV1(
       case "deleteFile":
         if (target.kind !== "file") {
           return failure("targetStateMismatch", `${where} requires an observed file, found ${target.kind}`);
+        }
+        // A whole-file replacement must come from a whole-file read. Written
+        // from a line-range read, or from a stat that never read the content
+        // at all, it would silently delete every line the model never saw —
+        // and the revision check cannot catch that: the file has not changed,
+        // the plan is simply wrong (v1 fixes 2, item 26). A patch is safe from
+        // a slice or a stat, because its find text is re-verified against the
+        // file at execution; a delete never depended on the content.
+        if (operation.kind === "replaceFile" && (target.source !== "readFile" || target.partialContent)) {
+          return failure(
+            "replaceWithoutFullRead",
+            `${where} replaces all of ${operation.relativePath}, but its target observation ` +
+              (target.partialContent ? "is a line-range read" : `came from ${target.source}, which does not read content`) +
+              ", so the replacement would delete every line that was not read. Use patchFile to change part of " +
+              "the file, or read the whole file with ensemble_readFile (without startLine/endLine) before replacing it."
+          );
         }
         break;
       case "deleteEmptyDirectory": {

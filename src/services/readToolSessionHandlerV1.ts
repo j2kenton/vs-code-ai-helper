@@ -27,12 +27,15 @@ import {
   DiscoveryMatchV1,
   MAX_DIRECTORY_ENTRIES_V1,
   MAX_FIND_RESULTS_V1,
+  MAX_RANGED_READ_SOURCE_BYTES_V1,
   MAX_READ_FILE_BYTES_V1,
   MAX_TEXT_SEARCH_RESULTS_V1,
+  ReadFileToolInputV1,
   ReadToolNameV1,
   READ_TOOL_NAMES_V1,
   ReadToolResultV1,
   decodeExactPathToolInputV1,
+  decodeReadFileToolInputV1,
   decodeFindFilesToolInputV1,
   decodeTextSearchToolInputV1,
   readToolDescriptorsV1,
@@ -72,6 +75,91 @@ export interface ReadToolSessionHandlerOptionsV1 {
 export interface ReadToolCallEventV1 {
   readonly tool: string;
   readonly relativePath: string;
+  /** Present only on a ranged `ensemble_readFile`. */
+  readonly startLine?: number;
+  readonly endLine?: number;
+}
+
+type LineSliceV1 =
+  | {
+      readonly kind: "ok";
+      readonly content: string;
+      readonly startLine: number;
+      readonly endLine: number;
+      readonly totalLines: number;
+      /** Stopped before the requested end because the slice hit `maxBytes`. */
+      readonly truncated: boolean;
+    }
+  | { readonly kind: "pastEnd"; readonly totalLines: number }
+  | { readonly kind: "lineTooLarge"; readonly line: number; readonly totalLines: number };
+
+/**
+ * How many lines `text` has. A trailing "\n" terminates the last line; it
+ * does not start another.
+ *
+ * Scans newline positions rather than splitting: a ranged read may open a
+ * file of up to `MAX_RANGED_READ_SOURCE_BYTES_V1`, and `split("\n")` on a
+ * newline-dense one would allocate one array entry per line (millions) just
+ * to return a few of them.
+ */
+function countLinesV1(text: string): number {
+  if (text.length === 0) {
+    return 0;
+  }
+  let newlines = 0;
+  for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) {
+    newlines += 1;
+  }
+  return text.endsWith("\n") ? newlines : newlines + 1;
+}
+
+/** Refusal for a file too large even for a line-range read: nothing this tool offers can open it. */
+function rangedReadSourceLimitReasonV1(): string {
+  return (
+    `file is over the ${MAX_RANGED_READ_SOURCE_BYTES_V1 / (1024 * 1024)} MB limit even for line-range ` +
+    "reads, so this tool cannot read any of it. Do not retry. If your answer depends on this file, " +
+    "say so as a confidence limitation."
+  );
+}
+
+/**
+ * Lines `startLine..endLine` (1-based, inclusive) of `text`, byte for byte —
+ * each line keeps its own terminator (including a `\r` before `\n`), so the
+ * slice can be copied verbatim into a patch. `endLine` past the end is
+ * clamped; a slice that would exceed `maxBytes` stops at the last whole line
+ * that fits. Memory stays proportional to the returned slice (see
+ * `countLinesV1`).
+ */
+function sliceLinesV1(text: string, startLine: number, endLine: number | undefined, maxBytes: number): LineSliceV1 {
+  const totalLines = countLinesV1(text);
+  if (startLine > totalLines) {
+    return { kind: "pastEnd", totalLines };
+  }
+  const lastRequested = Math.min(endLine ?? totalLines, totalLines);
+  let offset = 0;
+  for (let line = 1; line < startLine; line++) {
+    offset = text.indexOf("\n", offset) + 1;
+  }
+  let content = "";
+  let bytes = 0;
+  let last = startLine - 1;
+  for (let line = startLine; line <= lastRequested; line++) {
+    const newline = text.indexOf("\n", offset);
+    const end = newline === -1 ? text.length : newline + 1;
+    const piece = text.slice(offset, end);
+    const pieceBytes = Buffer.byteLength(piece, "utf8");
+    if (bytes + pieceBytes > maxBytes) {
+      if (line === startLine) {
+        return { kind: "lineTooLarge", line, totalLines };
+      }
+      break;
+    }
+    content += piece;
+    bytes += pieceBytes;
+    last = line;
+    offset = end;
+  }
+  return { kind: "ok", content, startLine, endLine: last, totalLines, truncated: last < lastRequested };
 }
 
 export type ReadToolCallObserverV1 = (event: ReadToolCallEventV1) => void;
@@ -119,6 +207,7 @@ function refOf(record: ObservationRecordV1): ObservationRefV1 {
     revision: record.revision,
     complete: record.complete,
     ...(record.contentSha256 !== undefined ? { contentSha256: record.contentSha256 } : {}),
+    ...(record.partialContent ? { partialContent: true as const } : {}),
   };
 }
 
@@ -130,6 +219,29 @@ export function createReadToolSessionHandlerV1(
 
   function locator(relativePath: string): WorkflowFileLocatorV1 {
     return { rootId, relativePath };
+  }
+
+  /**
+   * Why a whole-file read was refused, and how to read the file instead. A
+   * bare "exceeds the per-read byte limit" left a model no way forward, so it
+   * names the file's size and length and the range parameters.
+   */
+  async function wholeFileLimitReasonV1(relativePath: string): Promise<string> {
+    const limitKb = MAX_READ_FILE_BYTES_V1 / 1024;
+    const probe = await view.readFileBounded(locator(relativePath), MAX_RANGED_READ_SOURCE_BYTES_V1);
+    if (probe.kind === "ok") {
+      const lines = countLinesV1(probe.value.bytes.toString("utf8"));
+      return (
+        `file is ${probe.value.bytes.length} bytes, over the ${limitKb} KB whole-file limit. ` +
+        `It has ${lines} lines: read it in parts by passing startLine and endLine.`
+      );
+    }
+    if (probe.kind === "failed" && probe.code === "readLimitExceeded") {
+      // Ranges are refused above this size too, so suggesting them would only
+      // spend another of the session's limited rounds on a certain failure.
+      return rangedReadSourceLimitReasonV1();
+    }
+    return `file is over the ${limitKb} KB whole-file limit: read it in parts by passing startLine and endLine`;
   }
 
   function wireEntries(entries: readonly WorkflowDirectoryEntryV1[]): DirectoryEntryV1[] {
@@ -144,7 +256,8 @@ export function createReadToolSessionHandlerV1(
     callId: string,
     rawInput: unknown
   ): Promise<ReadToolResultV1> {
-    const decoded = decodeExactPathToolInputV1(rawInput);
+    const decoded =
+      tool === "ensemble_readFile" ? decodeReadFileToolInputV1(rawInput) : decodeExactPathToolInputV1(rawInput);
     if (!decoded.ok) {
       violations.record();
       return errorResult(callId, tool, "invalidInput", decoded.reason);
@@ -154,17 +267,27 @@ export function createReadToolSessionHandlerV1(
       return errorResult(callId, tool, "unknownRoot", "this session exposes a single registered root");
     }
     const relativePath = decoded.input.relativePath;
+    const { startLine, endLine } = decoded.input as ReadFileToolInputV1;
+    const ranged = startLine !== undefined || endLine !== undefined;
     // Item 3b-2 (2026-08-17..19 workflow-defects batch): record which file
     // was targeted, live, before whatever happens next in the session (a
     // budget cutoff, a crash, a non-completing outcome further down the
     // loop). Fired here — the moment the call is known-valid — rather than
     // batched at session end, so a failed session still leaves a record of
-    // what it read instead of nothing at all. Tool name + path only, never
-    // content (§2.2).
-    recordReadToolCallV1({ tool, relativePath });
+    // what it read instead of nothing at all. Tool name + path (and range)
+    // only, never content (§2.2).
+    recordReadToolCallV1({
+      tool,
+      relativePath,
+      ...(startLine !== undefined ? { startLine } : {}),
+      ...(endLine !== undefined ? { endLine } : {}),
+    });
 
     if (tool === "ensemble_readFile") {
-      const read = await view.readFileBounded(locator(relativePath), MAX_READ_FILE_BYTES_V1);
+      const read = await view.readFileBounded(
+        locator(relativePath),
+        ranged ? MAX_RANGED_READ_SOURCE_BYTES_V1 : MAX_READ_FILE_BYTES_V1
+      );
       if (read.kind === "unavailable") {
         return errorResult(callId, tool, "pathUnsafe", read.code);
       }
@@ -182,10 +305,55 @@ export function createReadToolSessionHandlerV1(
           return { ok: true, tool, ...refOf(record) };
         }
         if (read.code === "readLimitExceeded") {
-          return errorResult(callId, tool, "readLimitExceeded", "file exceeds the per-read byte limit");
+          return errorResult(
+            callId,
+            tool,
+            "readLimitExceeded",
+            ranged ? rangedReadSourceLimitReasonV1() : await wholeFileLimitReasonV1(relativePath)
+          );
         }
         return errorResult(callId, tool, "readFailed", read.code);
       }
+      const text = read.value.bytes.toString("utf8");
+      let rangeFields: Pick<
+        Extract<ReadToolResultV1, { ok: true }>,
+        "startLine" | "endLine" | "totalLines" | "truncated"
+      > = {};
+      let contentUtf8 = text;
+      if (ranged) {
+        const slice = sliceLinesV1(text, startLine ?? 1, endLine, MAX_READ_FILE_BYTES_V1);
+        if (slice.kind === "pastEnd") {
+          // Not a protocol violation: the model cannot know a file's length
+          // before reading it, so this must not count toward the abort cap.
+          return errorResult(
+            callId,
+            tool,
+            "invalidInput",
+            `startLine ${startLine ?? 1} is past the end of the file, which has ${slice.totalLines} lines`
+          );
+        }
+        if (slice.kind === "lineTooLarge") {
+          return errorResult(
+            callId,
+            tool,
+            "readLimitExceeded",
+            `line ${slice.line} alone is over the ${MAX_READ_FILE_BYTES_V1 / 1024} KB per-read limit`
+          );
+        }
+        contentUtf8 = slice.content;
+        rangeFields = {
+          startLine: slice.startLine,
+          endLine: slice.endLine,
+          totalLines: slice.totalLines,
+          ...(slice.truncated ? { truncated: true } : {}),
+        };
+      }
+      // A ranged read's observation still records the WHOLE file's revision
+      // and digest: the host read all of it, so this is a complete statement
+      // of the file's state. But the model saw only a slice, so it is marked
+      // `partialContent`, which the plan validator refuses for `replaceFile`:
+      // a whole-file replacement written from a slice would silently delete
+      // every line the model never saw.
       const record = ledger.mint({
         callId,
         rootId,
@@ -195,12 +363,14 @@ export function createReadToolSessionHandlerV1(
         contentSha256: read.value.sha256,
         complete: true,
         source: "readFile",
+        ...(ranged ? { partialContent: true as const } : {}),
       });
       return {
         ok: true,
         tool,
         ...refOf(record),
-        contentUtf8: read.value.bytes.toString("utf8"),
+        contentUtf8,
+        ...rangeFields,
       };
     }
 
