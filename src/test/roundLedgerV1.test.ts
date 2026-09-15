@@ -48,6 +48,7 @@ import {
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { advancePauseFenceGenerationV1, readOrInitPauseFenceGenerationV1 } from "../state/workAdmissionV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -1464,6 +1465,75 @@ void describe("claimReviewAttempt — opens the round-ledger row at the round's 
 
       const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
       assert.equal(raw.roundLedger, undefined, "a refused claim must not open a ledger row");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  /**
+   * 2026-09-14 review completion blocker / Part 1b step 13 ("audit ... command
+   * self-checks"): this is the exact "Error: The task was paused while the
+   * review was starting." failure v1 fixes item 1 recorded in production,
+   * for the one documented call site (`resumeReviewInteractionV1`) that holds
+   * no admission and never reconciles a watchdog pause before reaching this
+   * guard — so a pause whose fence a revocation has already advanced past
+   * must not abort a review claim here either.
+   */
+  void it("claims successfully and durably clears the pause fields when the watchdog pause has been revoked by fence advance", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_revoked_pause");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_revoked_pause",
+        currentStage: "impl-high-review",
+        status: "paused",
+        pausedReason: "stalled-active-task",
+        watchdogPauseClaimId: "claim-stale-writer",
+        watchdogPauseFenceGeneration: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      // Advance the durable fence past the generation this pause was captured
+      // under — simulating a revocation this stale pause's own (suspended)
+      // writer never observed.
+      await readOrInitPauseFenceGenerationV1(folderPath);
+      await advancePauseFenceGenerationV1(folderPath);
+
+      const claimed = await claimReviewAttempt(folderUri, "claim-attempt-revoked", "impl-high-review");
+      assert.ok(claimed, "a revoked watchdog pause must never abort a review that is demonstrably starting");
+      if (!claimed) throw new Error("unreachable");
+      assert.equal(claimed.status, "active");
+      assert.equal(claimed.pausedReason, undefined);
+      assert.equal(claimed.watchdogPauseClaimId, undefined);
+      assert.equal(claimed.watchdogPauseFenceGeneration, undefined);
+
+      const row = resolveRoundV1(claimed, "claim-attempt-revoked");
+      assert.ok(row, "claimReviewAttempt must still open a round-ledger row");
+      assert.equal(row?.state, "open");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(
+        raw.status,
+        "active",
+        "the stale pause fields must be durably cleared on disk by this same claim, not left for a later reader"
+      );
     } finally {
       wsStub.restore();
       fsBridge.restore();

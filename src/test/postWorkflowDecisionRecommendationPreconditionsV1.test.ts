@@ -18,6 +18,7 @@ import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { CreateWorkflowDecisionInputV1 } from "../types/workflowDecisionV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { advancePauseFenceGenerationV1, readOrInitPauseFenceGenerationV1 } from "../state/workAdmissionV1";
 
 function makeExtensionContext(): vscode.ExtensionContext {
   const backing = new Map<string, unknown>();
@@ -65,6 +66,16 @@ function setReviewInvalidatedByRound(folder: string, stage: string): void {
   const progressPath = path.join(folder, TASK_PROGRESS_FILENAME);
   const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
   progress.reviewInvalidatedByRound = { stage, at: new Date().toISOString() };
+  fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
+}
+
+function setRevokedWatchdogPause(folder: string, staleGeneration: number): void {
+  const progressPath = path.join(folder, TASK_PROGRESS_FILENAME);
+  const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+  progress.status = "paused";
+  progress.pausedReason = "stalled-active-task";
+  progress.watchdogPauseClaimId = "claim-stale-writer";
+  progress.watchdogPauseFenceGeneration = staleGeneration;
   fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
 }
 
@@ -193,6 +204,41 @@ void describe("postWorkflowDecisionV1 — recommendationPreconditionsV1 integrat
   void it("leaves the option enabled and the recommendation intact on an active task", async () => {
     const fixture = makeOwnedTaskFolder("recPrecond-active-");
     setStatus(fixture.folder, "active");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const realFs = installRealFs();
+
+    let posted;
+    try {
+      posted = await postWorkflowDecisionV1(decisionInput(fixture.folder), {
+        taskFolderPath: fixture.folder,
+        canonicalId: fixture.folder,
+        stage: "impl",
+      });
+    } finally {
+      realFs.restore();
+    }
+
+    assert.ok(posted);
+    const goToReview = posted.options.find((o) => o.optionId === "goToReviewAndApply");
+    assert.equal(goToReview?.disabled, undefined);
+    assert.equal(posted.recommendation.kind, "option");
+    if (posted.recommendation.kind === "option") {
+      assert.equal(posted.recommendation.optionId, "goToReviewAndApply");
+    }
+  });
+
+  // 2026-09-14 review completion blocker / Part 1b step 13 ("audit ...
+  // notifications"): a watchdog pause whose fence a revocation has already
+  // advanced past must never disable a recommended action with "resume the
+  // task first" — the same state-mismatch this task exists to eliminate,
+  // here on the chat-recommendation surface instead of the tree/status bar.
+  void it("leaves the option enabled and the recommendation intact when the watchdog pause has been revoked by fence advance", async () => {
+    const fixture = makeOwnedTaskFolder("recPrecond-revoked-pause-");
+    const staleGeneration = await readOrInitPauseFenceGenerationV1(fixture.folder);
+    await advancePauseFenceGenerationV1(fixture.folder);
+    setRevokedWatchdogPause(fixture.folder, staleGeneration);
     const context = makeExtensionContext();
     __extensionContextV1TestOnly.set(context);
     contextActive = true;

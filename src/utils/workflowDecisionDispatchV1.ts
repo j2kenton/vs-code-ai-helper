@@ -11,6 +11,7 @@ import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 import { recommendationPreconditionsV1 } from "./recommendationPreconditionsV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * Apply `recommendationPreconditionsV1` to every option of a decision about
@@ -33,10 +34,24 @@ async function applyRecommendationPreconditionsV1(
   try {
     const read = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
     if (read.ok) {
-      status = read.decoded.progress.status;
-      currentStage = read.decoded.progress.currentStage;
-      reviewInvalidatedByRoundStage = read.decoded.progress.reviewInvalidatedByRound?.stage;
-      continuationOwed = read.decoded.progress.implRecovery !== undefined;
+      const progress = read.decoded.progress;
+      status = progress.status;
+      // Part 1b step 13 ("audit every pause-sensitive read ... notifications"):
+      // `recommendationPreconditionsV1` is pure/synchronous and has no fence
+      // access of its own (see its own doc comment), so it cannot tell a
+      // REVOKED watchdog pause — one whose recorded fence generation a
+      // revocation has already advanced past — from a real one. Left
+      // uncorrected, a recommended chat action would be disabled with
+      // "resume the task first" for a task the tree and status bar already
+      // show as active, the exact state-mismatch the release bar forbids.
+      // This caller already awaits a fresh disk read for this exact
+      // decision, so resolving effective status here costs nothing extra.
+      if (status === "paused" && !(await isEffectivelyPausedV1(target.taskFolderPath, progress))) {
+        status = "active";
+      }
+      currentStage = progress.currentStage;
+      reviewInvalidatedByRoundStage = progress.reviewInvalidatedByRound?.stage;
+      continuationOwed = progress.implRecovery !== undefined;
     }
   } catch {
     // Best-effort: leave options exactly as supplied.

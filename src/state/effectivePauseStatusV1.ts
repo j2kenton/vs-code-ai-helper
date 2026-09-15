@@ -39,6 +39,34 @@ import { TaskProgress } from "../types/taskProgress";
  * — `taskTreeProvider.ts`, `taskStatusBar.ts`). Not every reader is migrated
  * yet; each migration is a single, verifiable call rather than
  * reimplementing the fence check inline.
+ *
+ * 2026-09-14 review completion blocker (readiness 7/10): the async resolver
+ * below now SCHEDULES durable cleanup (`repairRevokedWatchdogPauseV1`, via
+ * `scheduleRevokedWatchdogPauseCleanupV1`) the moment it observes a revoked
+ * watchdog pause, rather than only reporting it. See that function's own doc
+ * comment for why the ONE existing repair trigger — `workAdmissionV1.ts`'s
+ * barrier-completion hook, which fires from the claim id captured BEFORE the
+ * fence advance — is not enough on its own: if the old `pauseCommit` owner's
+ * raw pause write to `task-progress.json` had not yet landed at that exact
+ * instant, the hook's own patch is a harmless no-op (nothing paused yet under
+ * that claim to clear), and nothing was ever scheduled to retry once the late
+ * write actually arrived. The stale pause was then reported correctly by
+ * every reader forever, but never actually repaired on disk.
+ *
+ * 2026-09-15 review completion blocker (readiness 7/10, narrowed): the
+ * synchronous render-path twin (`resolveEffectivePauseStatusSyncV1`) now
+ * schedules the SAME best-effort repair the async resolver does, instead of
+ * being purely read-only. A task whose tree row or status bar is the only
+ * thing ever observing it (no command dispatched, nothing else calling the
+ * async resolver) previously left a late-landing stale pause unrepaired on
+ * disk forever, even though every reader already correctly displayed it as
+ * not-paused — see `scheduleRevokedWatchdogPauseCleanupV1`'s own comment for
+ * why this is cheap rather than a "write storm": it is deduplicated per
+ * (taskFolderPath, staleClaimId), so a render tick that observes the same
+ * still-unrepaired stale claim it already scheduled a repair for is a no-op
+ * map lookup, not a new write; and the moment the repair lands, the claim id
+ * it was keyed on is gone from disk, so no further render tick can re-key
+ * against it.
  */
 export type EffectivePauseStatusV1 =
   | { readonly kind: "notPaused" }
@@ -69,9 +97,16 @@ export async function resolveEffectivePauseStatusV1(
     return { kind: "userPause" };
   }
   const current = await isWatchdogPauseFenceCurrentV1(taskFolderPath, progress.watchdogPauseFenceGeneration);
-  return current
-    ? { kind: "currentWatchdogPause" }
-    : { kind: "revokedWatchdogPause", staleClaimId: progress.watchdogPauseClaimId };
+  if (current) {
+    return { kind: "currentWatchdogPause" };
+  }
+  // "schedule cleanup, continue" (plan step 13): every observation of a
+  // revoked pause re-arms a best-effort durable repair, not just the one at
+  // revocation-barrier-completion time — see the module doc comment and
+  // `scheduleRevokedWatchdogPauseCleanupV1`'s own comment for why that single
+  // trigger can miss a late-landing raw pause write.
+  scheduleRevokedWatchdogPauseCleanupV1(taskFolderPath, progress.watchdogPauseClaimId);
+  return { kind: "revokedWatchdogPause", staleClaimId: progress.watchdogPauseClaimId };
 }
 
 /**
@@ -88,11 +123,24 @@ export async function isEffectivelyPausedV1(
 }
 
 /**
- * Read-only synchronous twin of `resolveEffectivePauseStatusV1`, for
- * tree/context-key derivation and other render-path consumers that cannot
- * await mid-render (plan step 13). Uses `isWatchdogPauseFenceCurrentSyncV1`
- * in place of the async durable fence read; every other branch is identical
- * to, and must be kept in sync with, the async resolver above.
+ * Synchronous twin of `resolveEffectivePauseStatusV1`, for tree/context-key
+ * derivation and other render-path consumers that cannot await mid-render
+ * (plan step 13). Uses `isWatchdogPauseFenceCurrentSyncV1` — a pure,
+ * never-writes, never-lazily-initializes read (see that function's own doc
+ * comment) — in place of the async durable fence read; every other branch
+ * reports the same classification as the async resolver above.
+ *
+ * Like the async resolver, a revoked pause it observes also schedules
+ * (fire-and-forget, via the same deduplicated `scheduleRevokedWatchdogPauseCleanupV1`)
+ * a best-effort durable repair — 2026-09-15 review completion blocker: a task
+ * whose only readers are render paths (tree row, status bar; no command ever
+ * dispatched against it) previously left a late-landing stale pause on disk
+ * forever, since nothing else was ever going to call the async resolver for
+ * it. The dedup keeps this from being a write storm under frequent render
+ * ticks: the underlying fence read itself never writes or creates anything
+ * (see `isWatchdogPauseFenceCurrentSyncV1`), so calling this function still
+ * never touches disk on its own — only the one deduplicated background
+ * repair it may schedule does, at most once per stale claim.
  */
 export function resolveEffectivePauseStatusSyncV1(
   taskFolderPath: string,
@@ -105,9 +153,11 @@ export function resolveEffectivePauseStatusSyncV1(
     return { kind: "userPause" };
   }
   const current = isWatchdogPauseFenceCurrentSyncV1(taskFolderPath, progress.watchdogPauseFenceGeneration);
-  return current
-    ? { kind: "currentWatchdogPause" }
-    : { kind: "revokedWatchdogPause", staleClaimId: progress.watchdogPauseClaimId };
+  if (current) {
+    return { kind: "currentWatchdogPause" };
+  }
+  scheduleRevokedWatchdogPauseCleanupV1(taskFolderPath, progress.watchdogPauseClaimId);
+  return { kind: "revokedWatchdogPause", staleClaimId: progress.watchdogPauseClaimId };
 }
 
 /**
@@ -130,11 +180,14 @@ export function isEffectivelyPausedSyncV1(
  * resume, or another actor's repair between the resolve call and this write
  * makes this a no-op — never clobbering whatever superseded it.
  *
- * This is the "schedules durable cleanup" half of plan step 13; callers
- * decide WHEN to invoke it (typically right after `resolveEffectivePauseStatusV1`
- * returns `revokedWatchdogPause`) — this function does not re-resolve on its
- * own, so it never races its own read against its own write beyond the CAS
- * re-validation already described.
+ * This is the "schedules durable cleanup" half of plan step 13. Callers decide
+ * WHEN to invoke it — this function does not re-resolve on its own, so it
+ * never races its own read against its own write beyond the CAS re-validation
+ * already described. Invoked from two places: `workAdmissionV1.ts`'s
+ * revocation-barrier-completion hook (registered below), and
+ * `scheduleRevokedWatchdogPauseCleanupV1` right below, which the async
+ * resolver above self-triggers on every observation of a revoked pause — see
+ * that function's own comment for why one trigger alone is not enough.
  */
 export async function repairRevokedWatchdogPauseV1(
   taskFolderUri: vscode.Uri,
@@ -153,6 +206,76 @@ export async function repairRevokedWatchdogPauseV1(
       updatedAt: new Date().toISOString(),
     };
   });
+}
+
+/**
+ * 2026-09-14 review completion blocker: schedule (fire-and-forget) a durable
+ * repair of a stale pause observed by `resolveEffectivePauseStatusV1`. The
+ * ONE existing repair trigger before this fix — `workAdmissionV1.ts`'s
+ * `performPauseRevocationBarrierFinishSequenceV1`, which calls
+ * `repairRevokedWatchdogPauseV1` with the claim id it captured BEFORE its own
+ * fence advance — fires exactly once, at barrier-completion time. If the old
+ * `pauseCommit` owner was merely suspended (not dead) and its raw pause write
+ * to `task-progress.json` had not yet reached disk at that instant, that
+ * one-shot call is a harmless no-op (nothing paused yet under that claim to
+ * clear) — and nothing was ever scheduled to retry once the late write
+ * actually landed. Every reader still correctly reports the pause as
+ * `revokedWatchdogPause` forever afterward (the fence generation alone
+ * guarantees that), but the raw fields could sit unrepaired on disk
+ * indefinitely, which is precisely the gap the review flagged: "the resolver
+ * ... does not schedule durable cleanup ... a late raw pause is hidden but
+ * can remain indefinitely on disk."
+ *
+ * Calling this from the resolver itself closes the gap without needing to
+ * predict timing: the very next time ANYTHING calls the async resolver
+ * (`resolveTaskContext.ts`'s shared command-resolution gate, chiefly) against
+ * a task whose stale pause has by then landed on disk, cleanup is scheduled
+ * again, this time against the real record.
+ *
+ * 2026-09-15: also called from the synchronous render-path twin
+ * (`resolveEffectivePauseStatusSyncV1`), for the same reason one level
+ * further out — a task nobody ever runs a command against, only ever
+ * rendered (tree row, status bar), would otherwise never trigger this at
+ * all. The dedup below is what makes that safe to call on every render tick.
+ *
+ * Deduplicated per (taskFolderPath, staleClaimId) so N concurrent
+ * observations of the same stale pause in the same instant schedule ONE
+ * repair, not N. The entry is removed once that repair settles — success OR
+ * failure — so a transient write failure is retried on the next observation
+ * rather than permanently abandoned, and a successful repair (which clears
+ * `watchdogPauseClaimId`) naturally stops the resolver from ever observing
+ * this exact stale claim again.
+ */
+const pendingRevokedWatchdogPauseRepairsV1 = new Map<string, Promise<void>>();
+
+function scheduleRevokedWatchdogPauseCleanupV1(taskFolderPath: string, staleClaimId: string): void {
+  const key = `${taskFolderPath} ${staleClaimId}`;
+  if (pendingRevokedWatchdogPauseRepairsV1.has(key)) {
+    return;
+  }
+  const repair = repairRevokedWatchdogPauseV1(vscode.Uri.file(taskFolderPath), staleClaimId)
+    .catch((error) => {
+      console.error(
+        `scheduleRevokedWatchdogPauseCleanupV1: best-effort repair failed for stale claim "${staleClaimId}" ` +
+          `in "${taskFolderPath}" — will retry on the next observation of the same stale pause.`,
+        error
+      );
+    })
+    .finally(() => {
+      pendingRevokedWatchdogPauseRepairsV1.delete(key);
+    });
+  pendingRevokedWatchdogPauseRepairsV1.set(key, repair);
+}
+
+/**
+ * Test-only: resolve once every repair currently scheduled by
+ * `scheduleRevokedWatchdogPauseCleanupV1` has settled, so a test can assert
+ * on the durable on-disk effect of a `resolveEffectivePauseStatusV1` call
+ * without an arbitrary sleep.
+ * @internal exported for testing
+ */
+export async function flushScheduledRevokedWatchdogPauseCleanupsV1(): Promise<void> {
+  await Promise.all(Array.from(pendingRevokedWatchdogPauseRepairsV1.values()));
 }
 
 /**

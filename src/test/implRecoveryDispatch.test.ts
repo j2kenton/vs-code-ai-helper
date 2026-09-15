@@ -37,7 +37,12 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { StatusTreeProvider } from "../views/statusView";
-import { setWorkAdmissionRootOverrideForTestV1 } from "../state/workAdmissionV1";
+import {
+  advancePauseFenceGenerationV1,
+  readOrInitPauseFenceGenerationV1,
+  setWorkAdmissionRootOverrideForTestV1,
+} from "../state/workAdmissionV1";
+import { flushScheduledRevokedWatchdogPauseCleanupsV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * `armAll()` (exercised throughout this file) may reach the watchdog sweep's
@@ -312,6 +317,61 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
 
     await harness.armAll();
     assert.equal(harness.dispatches.length, 0);
+  });
+
+  void it(
+    "re-arms a pending record even while status is still 'paused' on disk, when that pause is a REVOKED " +
+      "watchdog pause (2026-09-15 review round: Part 1b step 13's \"automation gates\" audit site — this " +
+      "sweep dispatches with no human invoking it, so unlike a manual command it cannot rely on the command's " +
+      "own admission check to reject a real pause and accept a stale one; before this fix it used a raw " +
+      "`status !== \"active\"` check that could not tell a stale pause a revocation has already fenced past " +
+      "from a real one, stranding the owed continuation until some other reader happened to trigger the " +
+      "resolver's background repair)",
+    async () => {
+      const taskFolderPath = "C:/tasks/2026-08-14_task_1";
+      const staleGeneration = await readOrInitPauseFenceGenerationV1(taskFolderPath);
+      await advancePauseFenceGenerationV1(taskFolderPath);
+      const harness = makeHarness(
+        makeProgress(pendingRecord(), {
+          status: "paused",
+          pausedReason: "stalled-active-task",
+          watchdogPauseClaimId: "claim-stale-for-recovery-sweep",
+          watchdogPauseFenceGeneration: staleGeneration,
+        })
+      );
+      active = harness;
+
+      await harness.armAll();
+      assert.equal(
+        harness.dispatches.length,
+        1,
+        "a revoked watchdog pause must not block the automated recovery re-arm"
+      );
+      // The fix routes through `isEffectivelyPausedV1`, which also schedules
+      // its own best-effort durable repair of the stale pause fields — a
+      // guaranteed no-op here (this harness's `task-progress.json` is an
+      // in-memory mock, not a real file for that repair to patch). Flush it
+      // so the (caught, logged) failure settles before this test returns
+      // rather than leaking into a later test's output.
+      await flushScheduledRevokedWatchdogPauseCleanupsV1();
+    }
+  );
+
+  void it("does not re-arm while status is 'paused' under a CURRENT (still-effective) watchdog pause", async () => {
+    const taskFolderPath = "C:/tasks/2026-08-14_task_1";
+    const currentGeneration = await readOrInitPauseFenceGenerationV1(taskFolderPath);
+    const harness = makeHarness(
+      makeProgress(pendingRecord(), {
+        status: "paused",
+        pausedReason: "stalled-active-task",
+        watchdogPauseClaimId: "claim-current-for-recovery-sweep",
+        watchdogPauseFenceGeneration: currentGeneration,
+      })
+    );
+    active = harness;
+
+    await harness.armAll();
+    assert.equal(harness.dispatches.length, 0, "a still-effective watchdog pause must still block the re-arm");
   });
 
   void describe("workflow-6 Item 1: the automation chain guard", () => {

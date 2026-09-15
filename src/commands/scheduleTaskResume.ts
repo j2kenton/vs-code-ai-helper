@@ -23,6 +23,7 @@ import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 import { pauseTaskWithReasonForClaimV1 } from "../utils/taskProgressTransforms";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
@@ -470,7 +471,19 @@ export class TaskActionScheduler implements vscode.Disposable {
     for (const task of this.inventory.getTasks()) {
       let recovery = task.progress.implRecovery;
       if (!recovery) continue;
-      if (task.progress.status !== "active") continue;
+      // Part 1b step 13 ("automation gates"): this sweep automatically
+      // re-dispatches a command with no human invoking it, so — unlike a
+      // manual command, which will itself refuse a real pause — this is the
+      // one place standing between a REVOKED-but-not-yet-repaired watchdog
+      // pause and an owed continuation silently never re-arming. A raw
+      // `status !== "active"` check here would skip re-arming for a task the
+      // tree/status bar already show as active, stranding the recovery until
+      // some other reader happens to trigger the resolver's background
+      // repair — exactly the state-mismatch the release bar forbids.
+      const effectivelyActive =
+        task.progress.status === "active" ||
+        (task.progress.status === "paused" && !(await isEffectivelyPausedV1(task.taskFolderPath, task.progress)));
+      if (!effectivelyActive) continue;
       if (recovery.dispatch === "dispatched") {
         if (!isStaleDispatchedImplRecoveryV1(recovery, this.clock.now())) {
           continue;

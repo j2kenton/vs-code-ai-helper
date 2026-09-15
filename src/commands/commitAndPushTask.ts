@@ -3261,13 +3261,29 @@ export async function completeCommitAndPushTask(
         return;
       }
       const taskBindingId = derivedBinding.binding.bindingId;
+      // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+      // advancement gates"): the lifecycle row's own eligibility check
+      // (`eligibility.statuses: ["active"]`, `taskActionCoordinatorV1.ts`'s
+      // `eligibilityFailure`) reads whatever `taskStatus` is passed here
+      // verbatim — it never re-derives it. The self-checks above already
+      // refuse a GENUINE pause, but a watchdog pause whose fence a revocation
+      // has already advanced past can still read "paused" on disk (repair is
+      // best-effort and may not have landed yet), which would otherwise trip
+      // `actionNotEligibleForStatus` here even though this command already
+      // proved the task is not really paused. Same fix as
+      // reviewActions.ts's `advanceStageViaNextStageRowV1`.
+      const effectiveStageTaskStatus =
+        resolvedTask.progress.status === "paused" &&
+        !(await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress))
+          ? "active"
+          : resolvedTask.progress.status ?? "active";
       const stageOutcome = await invokeLifecycleRowV1({
         actionKey: NEXT_STAGE_ACTION_KEY_V1,
         taskFolderPath: resolvedTask.taskFolderPath,
         taskBindingId,
         chatDocumentIdentitySeed: resolvedTask.canonicalId,
         workspaceCwd,
-        taskStatus: resolvedTask.progress.status ?? "active",
+        taskStatus: effectiveStageTaskStatus,
         taskStage: resolvedTask.progress.currentStage,
         rawInput: {
           taskFolderPath: resolvedTask.taskFolderPath,

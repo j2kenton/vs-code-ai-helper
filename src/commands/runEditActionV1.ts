@@ -1723,8 +1723,23 @@ export async function resumeEditPreflightInteractionV1(
   if (reconciled.outcome === "userPaused") {
     return { ok: false, reason: "This task is paused. Resume it before continuing this action." };
   }
+  // Part 1b step 13 ("audit every pause-sensitive read ... advancement
+  // gates"), 2026-09-14: `ownedTask.progress` was captured BEFORE this
+  // reconciliation call. On the "reversed" branch the fresh written progress
+  // is used directly. On "notPaused" ("unreadable"/"userPaused" already
+  // returned above), the reconciliation's OWN fresh read already proved the
+  // task is not paused right now — falling back to `ownedTask.progress.status`
+  // unconditionally would resurrect a stale "paused" snapshot (a watchdog
+  // pause a fence revocation elsewhere already invalidated but had not yet
+  // repaired on disk) and hand it to the coordinator's
+  // `eligibility.statuses: ["active"]` check as `taskStatus`, wrongly
+  // refusing a task this call just proved is not paused.
   const effectiveTaskStatus =
-    reconciled.outcome === "reversed" ? (reconciled.progress.status ?? "active") : (ownedTask.progress.status ?? "active");
+    reconciled.outcome === "reversed"
+      ? (reconciled.progress.status ?? "active")
+      : ownedTask.progress.status === "paused"
+        ? "active"
+        : (ownedTask.progress.status ?? "active");
 
   const orchestrator = getProductionActionConversationOrchestratorV1();
   const interactionRef: InteractionRefV1 = {

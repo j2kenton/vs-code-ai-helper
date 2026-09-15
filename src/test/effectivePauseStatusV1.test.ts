@@ -7,6 +7,7 @@ import * as vscode from "vscode";
 import { encodeTaskProgressV1 } from "../services/taskProgressWriterV1";
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import {
+  flushScheduledRevokedWatchdogPauseCleanupsV1,
   isEffectivelyPausedSyncV1,
   isEffectivelyPausedV1,
   repairRevokedWatchdogPauseV1,
@@ -144,6 +145,14 @@ void describe("effectivePauseStatusV1", () => {
         false,
         "a revoked watchdog pause must never gate a consumer"
       );
+      // Both calls above scheduled a background repair for a claim id that
+      // was never actually written to this harness's on-disk record (the
+      // harness never sets `watchdogPauseClaimId` at all here) — a harmless,
+      // guaranteed no-op once it runs. Flush it before `h.restore()` deletes
+      // the temp directory out from under it, so the failed-mkdir-on-a-
+      // deleted-directory error this would otherwise log stays out of test
+      // output.
+      await flushScheduledRevokedWatchdogPauseCleanupsV1();
     } finally {
       h.restore();
     }
@@ -159,6 +168,111 @@ void describe("effectivePauseStatusV1", () => {
         watchdogPauseFenceGeneration: undefined,
       });
       assert.equal(resolved.kind, "currentWatchdogPause");
+    } finally {
+      h.restore();
+    }
+  });
+
+  /**
+   * 2026-09-14 review completion blocker: the resolver only REPORTED a
+   * revoked pause; nothing scheduled its durable repair beyond the one-shot
+   * barrier-completion hook, which can fire before a suspended old writer's
+   * raw pause write even lands on disk. These two tests cover the fix:
+   * `resolveEffectivePauseStatusV1` (and therefore `isEffectivelyPausedV1`,
+   * which calls it) now schedules a best-effort repair on every observation
+   * of a revoked pause, while the read-only synchronous twin still never
+   * does.
+   */
+  void it("resolveEffectivePauseStatusV1 schedules a durable repair of a revoked pause it observes on disk", async () => {
+    const h = installHarness({
+      status: "paused",
+      pausedReason: "stalled-active-task",
+      watchdogPauseClaimId: "claim-late-writer",
+      watchdogPauseFenceGeneration: 0,
+    });
+    try {
+      // Simulate the exact late-writer race: the on-disk record was written
+      // under generation 0, but the durable fence has since advanced past it
+      // (a revocation this stale pause's own writer never observed).
+      await readOrInitPauseFenceGenerationV1(h.folder);
+      await advancePauseFenceGenerationV1(h.folder);
+      const resolved = await resolveEffectivePauseStatusV1(h.folder, {
+        status: "paused",
+        watchdogPauseClaimId: "claim-late-writer",
+        watchdogPauseFenceGeneration: 0,
+      });
+      assert.equal(resolved.kind, "revokedWatchdogPause");
+      await flushScheduledRevokedWatchdogPauseCleanupsV1();
+      const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as {
+        status: string;
+        pausedReason?: string;
+        watchdogPauseClaimId?: string;
+        watchdogPauseFenceGeneration?: number;
+      };
+      assert.equal(
+        onDisk.status,
+        "active",
+        "observing a revoked pause must schedule its own durable repair, not just report it as ineffective"
+      );
+      assert.equal(onDisk.pausedReason, undefined);
+      assert.equal(onDisk.watchdogPauseClaimId, undefined);
+      assert.equal(onDisk.watchdogPauseFenceGeneration, undefined);
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("isEffectivelyPausedV1 also schedules the same durable repair, since it resolves through the same function", async () => {
+    const h = installHarness({
+      status: "paused",
+      pausedReason: "unrecoverable-recovery",
+      watchdogPauseClaimId: "claim-late-writer-2",
+      watchdogPauseFenceGeneration: 0,
+    });
+    try {
+      await readOrInitPauseFenceGenerationV1(h.folder);
+      await advancePauseFenceGenerationV1(h.folder);
+      const paused = await isEffectivelyPausedV1(h.folder, {
+        status: "paused",
+        watchdogPauseClaimId: "claim-late-writer-2",
+        watchdogPauseFenceGeneration: 0,
+      });
+      assert.equal(paused, false);
+      await flushScheduledRevokedWatchdogPauseCleanupsV1();
+      const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as { status: string };
+      assert.equal(onDisk.status, "active");
+    } finally {
+      h.restore();
+    }
+  });
+
+  void it("resolveEffectivePauseStatusSyncV1 (render path) schedules the same durable repair as the async resolver — a task only ever rendered must not strand a stale pause forever", async () => {
+    const h = installHarness({
+      status: "paused",
+      pausedReason: "stalled-active-task",
+      watchdogPauseClaimId: "claim-render-path-only",
+      watchdogPauseFenceGeneration: 0,
+    });
+    try {
+      await readOrInitPauseFenceGenerationV1(h.folder);
+      await advancePauseFenceGenerationV1(h.folder);
+      const resolved = resolveEffectivePauseStatusSyncV1(h.folder, {
+        status: "paused",
+        watchdogPauseClaimId: "claim-render-path-only",
+        watchdogPauseFenceGeneration: 0,
+      });
+      assert.equal(resolved.kind, "revokedWatchdogPause");
+      await flushScheduledRevokedWatchdogPauseCleanupsV1();
+      const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as {
+        status: string;
+        watchdogPauseClaimId?: string;
+      };
+      assert.equal(
+        onDisk.status,
+        "active",
+        "a render-path observation of a revoked pause must schedule its own durable repair, exactly like the async resolver"
+      );
+      assert.equal(onDisk.watchdogPauseClaimId, undefined);
     } finally {
       h.restore();
     }
@@ -297,6 +411,12 @@ void describe("effectivePauseStatusV1", () => {
           false,
           "a revoked watchdog pause must never gate a render-path consumer either"
         );
+        // Both calls above scheduled a background repair for a claim id that
+        // was never actually written to this harness's on-disk record — a
+        // harmless, guaranteed no-op once it runs. Flush it before
+        // `h.restore()` deletes the temp directory out from under it, same as
+        // the async resolver's equivalent test above.
+        await flushScheduledRevokedWatchdogPauseCleanupsV1();
       } finally {
         h.restore();
       }

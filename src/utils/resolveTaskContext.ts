@@ -188,12 +188,16 @@ async function resolveAmbiguousOwnership(
  * `taskActionCoordinatorV1.ts`'s eligibility check without touching it
  * directly.
  *
- * Read-only: this only affects what THIS resolution reports back. Durable
- * repair of the on-disk fields happens elsewhere — the revocation's own
- * best-effort cleanup hook (`effectivePauseStatusV1.ts`'s registered hook,
- * or a later admission/pause attempt helping finish an abandoned barrier) —
- * and is never performed here, matching every other existing
- * `isEffectivelyPausedV1` call site in this codebase.
+ * Read-only AT THIS CALL SITE: the object this function returns is never
+ * written back to disk here. `resolveEffectivePauseStatusV1` itself, however,
+ * schedules a best-effort durable repair the moment it observes a revoked
+ * pause (2026-09-14 review completion blocker fix — see that function's own
+ * comment) — so calling it from this widely-used shared gate is also what
+ * gives the repair its main real-world trigger, on top of
+ * `effectivePauseStatusV1.ts`'s registered revocation-barrier-completion
+ * hook. Neither this function nor its caller needs to await or otherwise
+ * react to that scheduled repair; it proceeds independently in the
+ * background.
  *
  * @internal exported for testing
  */

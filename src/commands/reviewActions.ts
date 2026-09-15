@@ -26,7 +26,11 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
-import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
+import {
+  EffectivePauseSnapshotV1,
+  isEffectivelyPausedSyncV1,
+  isEffectivelyPausedV1,
+} from "../state/effectivePauseStatusV1";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
@@ -518,6 +522,25 @@ export function scheduleAutomaticImplementationAfterReview(
  * always wins regardless of which fires first (see that function's doc
  * comment). A manually-invoked review has nothing pending to consume and
  * keeps opening its own row exactly as before.
+ *
+ * Part 1b step 13 ("audit every pause-sensitive read ... command
+ * self-checks"), 2026-09-14: the paused guard used to trust the raw `status`
+ * field unconditionally — the exact "Error: The task was paused while the
+ * review was starting." failure v1 fixes item 1 recorded in production, where
+ * the sweep paused a task mid-setup and this check then aborted work that was
+ * demonstrably running. Part 1a closes the sweep-timing half of that race for
+ * `runReviewForFolder`'s two callers (`runReviewWithAI`/
+ * `fastForwardReviewWithAI` both reconcile any watchdog-provenance pause
+ * against their own held admission before reaching this point), but
+ * `resumeReviewInteractionV1` — the other documented call site above — holds
+ * no admission and never reconciles, so a watchdog pause whose fence a
+ * revocation has already advanced past (this task's fence-generation
+ * mechanism, orthogonal to admission) could still reach this guard raw. Using
+ * the effective-pause resolver here fixes it once for every caller instead of
+ * chasing each one — the "fix once in the shared helper" doctrine this Part's
+ * own directive requires. The synchronous twin is used because this callback
+ * runs inside `patchTaskProgressStrictV1`'s synchronous `update` function and
+ * cannot await the durable fence read.
  */
 export async function claimReviewAttempt(
   folderUri: vscode.Uri,
@@ -526,10 +549,24 @@ export async function claimReviewAttempt(
 ): Promise<TaskProgress | undefined> {
   const pendingIntentId = consumePendingAutomationRoundIntentV1(folderUri.fsPath);
   return patchTaskProgressStrictV1(folderUri, (current) => {
+    let effectiveCurrent = current;
     if (current.status === "paused") {
-      throw new Error("The task was paused while the review was starting.");
+      if (isEffectivelyPausedSyncV1(folderUri.fsPath, current)) {
+        throw new Error("The task was paused while the review was starting.");
+      }
+      // Effectively revoked: clear the stale pause fields as part of this
+      // same compare-and-swap write instead of leaving `status: "paused"` on
+      // disk for a later async observation to repair — this claim IS the
+      // proof the pause no longer applies.
+      effectiveCurrent = {
+        ...current,
+        status: "active",
+        pausedReason: undefined,
+        watchdogPauseClaimId: undefined,
+        watchdogPauseFenceGeneration: undefined,
+      };
     }
-    const resolvedPending = pendingIntentId ? resolveRoundV1(current, pendingIntentId) : undefined;
+    const resolvedPending = pendingIntentId ? resolveRoundV1(effectiveCurrent, pendingIntentId) : undefined;
     // Stale-intent guard (2026-08-27 review follow-up, blocker "the
     // replacement task-key/TTL correlation can attach a later review to a
     // stale, already-terminal round"): `pendingIntentId` is a best-effort
@@ -573,7 +610,7 @@ export async function claimReviewAttempt(
           // different, already-ended round and must not be attached here.
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
-    return upsertRoundLedgerEntryV1({ ...current, reviewAttemptId }, openRow);
+    return upsertRoundLedgerEntryV1({ ...effectiveCurrent, reviewAttemptId }, openRow);
   });
 }
 
@@ -3792,7 +3829,7 @@ async function routeReviewOutcomeV1(
             ownership: freshProgressForTransition?.ownership,
             taskFolder: freshProgressForTransition?.taskFolder ?? path.basename(folderUri.fsPath),
           },
-          freshProgressForTransition?.status,
+          freshProgressForTransition,
           currentStage,
           targetStage,
           false,
@@ -4061,7 +4098,7 @@ async function routeReviewOutcomeV1(
                 ownership: freshProgressForAdvance?.ownership,
                 taskFolder: freshProgressForAdvance?.taskFolder ?? path.basename(folderUri.fsPath),
               },
-              freshProgressForAdvance?.status,
+              freshProgressForAdvance,
               targetStage,
               next,
               isPausedForAdvance,
@@ -6264,8 +6301,8 @@ export async function applyReviewWithAI(
 
   // Admission is now guaranteed live for this exact target (or the caller's
   // own admission covers it, under `options.parentOperation`) — reconcile a
-  // watchdog-provenance pause (never a user pause) before the paused check
-  // below, exactly like `runReviewWithAI`/`runImplementationWithAI`.
+  // watchdog-provenance pause (never a user pause) before proceeding, exactly
+  // like `runReviewWithAI`/`fastForwardReviewWithAI`.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
@@ -6278,10 +6315,20 @@ export async function applyReviewWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: `reconciled.outcome` is exhaustive here —
+  // "unreadable" and "userPaused" already returned above, so only "reversed"
+  // (status just written back to active) or "notPaused" (the reconciliation's
+  // own FRESH read already found the task not paused) remain. Either way the
+  // task is not paused right now. A trailing `resolved.progress.status ===
+  // "paused"` check here would read `resolved.progress`'s STALE
+  // pre-reconciliation snapshot on the "notPaused" branch (never updated,
+  // unlike "reversed") and could wrongly refuse a task that this very
+  // reconciliation call just proved is not paused — the same
+  // command-self-check defect class this Part exists to close, just in the
+  // opposite direction (false refusal from stale data instead of a raw
+  // status read skipping the resolver entirely). Removed rather than kept as
+  // dead weight; `runReviewWithAI`/`fastForwardReviewWithAI` never had it.
 
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
@@ -8089,11 +8136,12 @@ export async function viewReview(
  * `nextStageRowV1.ts`'s header for why a same-stage re-review confirmation is
  * handled by the caller instead of going through this helper.
  *
- * @param status  The task's persisted status, read fresh by the caller
- *   immediately before calling (mirrors `advanceStage`'s own no-staleness
- *   contract) — used only for the coordinator's eligibility pre-check;
- *   the row's own field policy independently re-validates `active` inside
- *   the lock.
+ * @param statusSnapshot  The task's persisted status (plus the pause-fence
+ *   fields needed to resolve it), read fresh by the caller immediately
+ *   before calling (mirrors `advanceStage`'s own no-staleness contract) —
+ *   used only for the coordinator's eligibility pre-check; the row's own
+ *   field policy independently re-validates `active` inside the lock, from
+ *   the same resolved value (see below).
  * @param currentStage  The stage the caller observed as current immediately
  *   before this call — the row's `expectedSourceStage` CAS.
  * @param expectedReviewAttemptId  Optional CAS against the freshly re-read
@@ -8107,7 +8155,7 @@ export async function viewReview(
 async function advanceStageViaNextStageRowV1(
   folderUri: vscode.Uri,
   binding: Pick<TaskProgress, "ownership" | "taskFolder">,
-  status: TaskProgress["status"] | undefined,
+  statusSnapshot: EffectivePauseSnapshotV1 | undefined,
   currentStage: TaskStage,
   next: TaskStage,
   isPaused: boolean,
@@ -8129,13 +8177,36 @@ async function advanceStageViaNextStageRowV1(
     throw new Error("taskBindingUnavailable");
   }
   const taskBindingId = derivedBinding.binding.bindingId;
+  // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+  // advancement gates"): `nextStage.v1`'s own eligibility row
+  // (`eligibility.statuses: ["active"]`, checked from `request.taskStatus`
+  // both at admission and again inside the write lock — see
+  // `taskActionCoordinatorV1.ts`'s `admitAction`/`eligibilityFailure`) must
+  // never refuse the transition solely because the raw on-disk `status`
+  // still reads "paused" while the watchdog pause it names has already been
+  // revoked by fence advance and not yet durably repaired — an advancement
+  // gate trapping the exact task it should release, the defect class this
+  // Part exists to close. Resolved independently of the `isPaused` argument
+  // above: that argument answers a different, caller-specific question
+  // (whether THIS transition should auto-continue into a review) and at
+  // least one caller (`routeReviewOutcomeV1`'s same-stage/no-op sibling
+  // branch) passes it hardcoded without resolving real pause state, so
+  // reusing it here would let a genuine user pause bypass this gate instead
+  // of fixing the stale-watchdog-pause case alone.
+  const rawStatus = statusSnapshot?.status;
+  const effectiveTaskStatus =
+    rawStatus === "paused" &&
+    statusSnapshot &&
+    !(await isEffectivelyPausedV1(folderUri.fsPath, statusSnapshot))
+      ? "active"
+      : rawStatus ?? "active";
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,
     taskBindingId,
     chatDocumentIdentitySeed: folderUri.fsPath,
     workspaceCwd: path.dirname(folderUri.fsPath),
-    taskStatus: status ?? "active",
+    taskStatus: effectiveTaskStatus,
     taskStage: currentStage,
     rawInput: {
       taskFolderPath: folderUri.fsPath,
@@ -8347,7 +8418,7 @@ export async function nextStage(
     transitionResult = await advanceStageViaNextStageRowV1(
       resolved.folderUri,
       resolved.progress,
-      resolved.progress.status,
+      resolved.progress,
       resolved.progress.currentStage,
       next,
       isPausedForTransition,
@@ -11357,7 +11428,7 @@ async function executeImplementationRun(
           const transition = await advanceStageViaNextStageRowV1(
             folderUri,
             freshProgress,
-            freshProgress.status,
+            freshProgress,
             "impl",
             "impl-high-review",
             false,
@@ -11619,8 +11690,8 @@ export async function runImplementationWithAI(
   // `fastForwardReviewWithAI`. `resolved.progress` was captured by
   // `resolveTask` BEFORE this reconciliation call, so a real user pause that
   // lands in the window between that read and this re-read would leave
-  // `resolved.progress.status` stale at "active" and slip past the
-  // fallback `resolved.progress.status === "paused"` check below.
+  // `resolved.progress.status` stale at "active" and slip past a raw
+  // `resolved.progress.status === "paused"` fallback check.
   if (reconciled.outcome === "userPaused") {
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
     return false;
@@ -11628,10 +11699,17 @@ export async function runImplementationWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: no trailing raw `resolved.progress.status ===
+  // "paused"` check here — by this point `reconciled.outcome` (a fresh,
+  // authoritative disk read) is exhaustively "reversed" or "notPaused"
+  // ("unreadable"/"userPaused" already returned above), both of which mean
+  // the task is not paused right now. Such a check would fire only on the
+  // "notPaused" branch, using `resolved.progress`'s STALE
+  // pre-reconciliation snapshot (never updated on that branch, unlike
+  // "reversed") — wrongly refusing a task this very call just proved is not
+  // paused. `runReviewWithAI`/`fastForwardReviewWithAI` never had this
+  // fallback; it was dead weight here that could only ever misfire.
 
   // Chained fast-forward request from "Complete & Move On triggers AI:
   // auto-fast-forward" — the post-run follow-up review must run as the Fast
@@ -12428,8 +12506,7 @@ export async function applyReviewEditWithAI(
 
   // Admission is now guaranteed live for this exact target (or the caller's
   // own admission covers it, under `options.parentOperation`) — reconcile a
-  // watchdog-provenance pause (never a user pause) before the paused check
-  // below.
+  // watchdog-provenance pause (never a user pause) before proceeding.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
@@ -12442,10 +12519,14 @@ export async function applyReviewEditWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: no trailing raw `resolved.progress.status ===
+  // "paused"` check here — see the identical note at this function's sibling
+  // call sites (`applyReviewWithAI`, `runImplementationWithAI`) above.
+  // `reconciled.outcome` is exhaustively "reversed" or "notPaused" by this
+  // point, both meaning not-paused-right-now from a FRESH read; a raw check
+  // against `resolved.progress`'s stale pre-reconciliation snapshot could
+  // only ever misfire on the "notPaused" branch.
 
   const consented = await ensureAiConsent(context);
   if (!consented) {
