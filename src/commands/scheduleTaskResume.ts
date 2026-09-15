@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  RUNS_DIRNAME,
   TaskProgress,
 } from "../types/taskProgress";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
@@ -499,7 +500,7 @@ export class TaskActionScheduler implements vscode.Disposable {
       NotificationRouter.showWarning(message, undefined, undefined, undefined, {
         command: "vs-code-ai-helper.takeOverStaleWorkAdmission",
         title: "Take over this task on this machine",
-        args: [{ taskFolderPath: task.taskFolderPath, expectedClaimId: outcome.owner?.claimId }],
+        args: [{ taskFolderPath: task.taskFolderPath, expectedMarkerPath: outcome.markerPath, expectedClaimId: outcome.owner?.claimId }],
       });
     } catch (error) {
       // Best-effort, like every other notification in this sweep (e.g.
@@ -1345,34 +1346,76 @@ export async function scheduleQuotaResumeAtV1(
 }
 
 /**
+ * Bounded, durable record of a takeover event, written beside the task's
+ * other run logs (2026-09-15 review, completion blocker: the previous
+ * version only logged to the extension console, which is invisible to a
+ * user inspecting the task folder and is not retained across host restarts —
+ * plan step 16's "records bounded displaced-owner diagnostics in the run
+ * log" needs the diagnostic to actually live on disk). Named by timestamp,
+ * one file per takeover, the same convention `writeOversizedInputAbortRecordV1`
+ * / `writeTaskMdSizeBandAnnouncementRecordV1` (`promptManifestV1.ts`) already
+ * use for a non-round diagnostic record under `runs/` — NOT routed through
+ * `writeRunLog`, whose `AgentWorkflowStage` parameter models an AI round's
+ * own stage and has no value that fits a takeover event. Every field written
+ * here is a single already-validated primitive from `WorkAdmissionClaimInfoV1`
+ * ("never log unbounded or raw corrupt content", plan step 16) — best-effort,
+ * like every other diagnostic writer in this module: the takeover itself has
+ * already durably landed by the time this is called, so a failure here must
+ * never be treated as though the takeover itself failed.
+ */
+async function writeStaleWorkAdmissionTakeoverRunLogRecordV1(
+  taskFolderPath: string,
+  record: {
+    readonly at: string;
+    readonly outcome: "takenOver" | "reclaimedAsDead";
+    readonly purpose: string;
+    readonly displacedOwner?: { readonly claimId: string; readonly pid: number; readonly hostId: string; readonly commandId: string };
+  }
+): Promise<void> {
+  try {
+    const runsUri = vscode.Uri.joinPath(vscode.Uri.file(taskFolderPath), RUNS_DIRNAME);
+    await vscode.workspace.fs.createDirectory(runsUri);
+    const safeAt = record.at.replace(/[:.]/g, "-");
+    const uri = vscode.Uri.joinPath(runsUri, `${safeAt}.stale-work-admission-takeover.json`);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(record, null, 2)));
+  } catch (error) {
+    console.error(
+      `writeStaleWorkAdmissionTakeoverRunLogRecordV1: could not write the run-log record for "${taskFolderPath}" — ` +
+        "the takeover itself already landed; only this diagnostic record failed.",
+      error
+    );
+  }
+}
+
+/**
  * v1 fixes item 1, Part 1c step 16 — the handler behind the takeover
  * notice's action button (`surfaceStaleWorkAdmissionTakeoverNoticeV1`,
  * above). Deliberately thin: all safety-relevant logic (revalidation against
  * the exact identity the notice named, the still-stale check, the
  * dead-owner deferral, the identity-checked rename/barrier) lives in
  * {@link takeOverStaleWorkAdmissionMarkerV1} itself — this only translates
- * its outcome into what the user sees and a bounded, structured log line
- * ("Record bounded displaced-owner diagnostics in the run log; never log
- * unbounded or raw corrupt content", plan step 16 — every field logged below
- * is a single already-validated primitive from `WorkAdmissionClaimInfoV1`,
- * never raw file content).
+ * its outcome into what the user sees, a bounded console log line, and (on a
+ * successful takeover) the durable run-log record
+ * ({@link writeStaleWorkAdmissionTakeoverRunLogRecordV1}) plan step 16
+ * requires.
  *
  * Not contributed to `package.json`: like `resumeAndApplyCurrentStageAction`,
  * this is a wiring detail behind a notification action button, not something
  * to offer from the Command Palette on its own — it requires the exact
- * `taskFolderPath`/`expectedClaimId` pair the notice captured.
+ * `taskFolderPath`/`expectedMarkerPath`/`expectedClaimId` triple the notice
+ * captured.
  */
 export async function takeOverStaleWorkAdmissionCommandV1(
   inventory: TaskInventory,
-  arg?: { readonly taskFolderPath?: string; readonly expectedClaimId?: string }
+  arg?: { readonly taskFolderPath?: string; readonly expectedMarkerPath?: string; readonly expectedClaimId?: string }
 ): Promise<void> {
-  if (!arg?.taskFolderPath) {
+  if (!arg?.taskFolderPath || !arg?.expectedMarkerPath) {
     return;
   }
   const taskFolderPath = arg.taskFolderPath;
   const task = inventory.getTasks().find((t) => t.taskFolderPath === taskFolderPath);
   const displayName = task?.progress.displayName ?? task?.progress.taskFolder ?? taskFolderPath;
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(taskFolderPath, arg.expectedClaimId);
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(taskFolderPath, arg.expectedMarkerPath, arg.expectedClaimId);
   switch (outcome.outcome) {
     case "takenOver":
     case "reclaimedAsDead": {
@@ -1384,6 +1427,14 @@ export async function takeOverStaleWorkAdmissionCommandV1(
             ? ` (was claim ${displaced.claimId}, owned by pid ${displaced.pid} on ${displaced.hostId}, command "${displaced.commandId}").`
             : " (owner record was unreadable).")
       );
+      await writeStaleWorkAdmissionTakeoverRunLogRecordV1(taskFolderPath, {
+        at: new Date().toISOString(),
+        outcome: outcome.outcome,
+        purpose: outcome.purpose,
+        displacedOwner: displaced
+          ? { claimId: displaced.claimId, pid: displaced.pid, hostId: displaced.hostId, commandId: displaced.commandId }
+          : undefined,
+      });
       NotificationRouter.showInformation(`Took over "${displayName}" on this machine. You can now resume or dispatch work on it.`);
       break;
     }
@@ -1425,7 +1476,7 @@ export function registerScheduleTaskResumeCommand(context: vscode.ExtensionConte
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.takeOverStaleWorkAdmission",
-    (arg?: { taskFolderPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg)
+    (arg?: { taskFolderPath?: string; expectedMarkerPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg)
   ));
   return scheduler;
 }

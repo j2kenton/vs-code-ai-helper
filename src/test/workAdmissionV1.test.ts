@@ -2986,7 +2986,7 @@ function findAnyTombstoneV1(task: string): string | undefined {
 
 void test("takeOverStaleWorkAdmissionMarkerV1: nothingToTakeOver when the task has no admission directory at all", async () => {
   const task = freshTaskFolder("takeover-nothing");
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "some-claim");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, path.join(task, ADMISSION_DIRNAME_V1, "admission.x.g1.0"), "some-claim");
   assert.deepEqual(outcome, { outcome: "nothingToTakeOver" });
 });
 
@@ -2996,7 +2996,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when the c
   const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "real-owner" });
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "a-different-claim-id-entirely");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "a-different-claim-id-entirely");
   assert.deepEqual(outcome, { outcome: "ownerChanged" });
   assert.equal(fs.existsSync(markerPath), true, "an ownership mismatch must never mutate the marker");
 });
@@ -3008,8 +3008,14 @@ void test("takeOverStaleWorkAdmissionMarkerV1: refuses (noLongerStale) when the 
   if (acquired.outcome !== "acquired") return;
   // Simulate: the notice was captured against this claimId while the marker
   // looked stale, then the owner heartbeat-renewed it (fresh mtime) before
-  // the human clicked the takeover action.
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, acquired.handle.claimId);
+  // the human clicked the takeover action. The readable-owner path is keyed
+  // on `claimId`, not path (a heartbeat rename changes the path but not the
+  // claimId), so the exact marker path is irrelevant here — any current
+  // marker in the directory works.
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const currentMarkerName = fs.readdirSync(dir).find((n) => n.startsWith("admission."));
+  assert.ok(currentMarkerName, "expected a live marker after acquisition");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, path.join(dir, currentMarkerName), acquired.handle.claimId);
   assert.deepEqual(outcome, { outcome: "noLongerStale" });
   assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a renewed marker must be left untouched");
   await acquired.handle.release();
@@ -3025,7 +3031,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: an admission-purpose marker owned
   });
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "foreign-owner-claim");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "foreign-owner-claim");
   assert.equal(outcome.outcome, "takenOver");
   if (outcome.outcome === "takenOver") {
     assert.equal(outcome.purpose, "admission");
@@ -3047,7 +3053,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: a same-host, still-responding own
   const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "stuck-owner" });
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "stuck-owner-claim");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "stuck-owner-claim");
   assert.equal(outcome.outcome, "takenOver");
   if (outcome.outcome === "takenOver") {
     assert.equal(outcome.displacedOwner?.ownerToken, "stuck-owner");
@@ -3063,7 +3069,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: an unreadable (corrupt) marker ca
   fs.writeFileSync(markerPath, "not valid json at all {{{");
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, undefined);
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, undefined);
   assert.equal(outcome.outcome, "takenOver");
   if (outcome.outcome === "takenOver") {
     assert.equal(outcome.purpose, "admission");
@@ -3079,7 +3085,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when a cor
   const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "now-readable" });
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, undefined);
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, undefined);
   assert.deepEqual(outcome, { outcome: "ownerChanged" });
   assert.equal(fs.existsSync(markerPath), true, "must never act on a state different from what was confirmed");
 });
@@ -3091,7 +3097,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: a pauseCommit marker is taken ove
   const markerPath = writeFakeMarkerV1(task, { purpose: "pauseCommit", pid: process.pid, hostId: myHostId, ownerToken: "stuck-sweep" });
   backdateV1(markerPath, PAUSE_COMMIT_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "stuck-sweep-claim");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "stuck-sweep-claim");
   assert.equal(outcome.outcome, "takenOver");
   if (outcome.outcome === "takenOver") {
     assert.equal(outcome.purpose, "pauseCommit");
@@ -3109,7 +3115,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: an owner that has died since the 
   const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId, ownerToken: "died-meanwhile" });
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, "died-meanwhile-claim");
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "died-meanwhile-claim");
   assert.equal(outcome.outcome, "reclaimedAsDead");
   if (outcome.outcome === "reclaimedAsDead") {
     assert.equal(outcome.purpose, "admission");
@@ -3129,8 +3135,8 @@ void test("takeOverStaleWorkAdmissionMarkerV1: two concurrent takeovers of the s
   backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
 
   const [a, b] = await Promise.all([
-    takeOverStaleWorkAdmissionMarkerV1(task, "raced-owner-claim"),
-    takeOverStaleWorkAdmissionMarkerV1(task, "raced-owner-claim"),
+    takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "raced-owner-claim"),
+    takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "raced-owner-claim"),
   ]);
   const outcomes = [a.outcome, b.outcome].sort();
   // Exactly one call must have won ("takenOver"); the other must observe
@@ -3140,6 +3146,113 @@ void test("takeOverStaleWorkAdmissionMarkerV1: two concurrent takeovers of the s
   // "I lost" outcome, but never a SECOND "takenOver".
   assert.equal(outcomes.filter((o) => o === "takenOver").length, 1, `exactly one winner expected, got: ${JSON.stringify(outcomes)}`);
   assert.equal(findAnyTombstoneV1(task) !== undefined, true);
+});
+
+// 2026-09-15 review, completion blocker: corrupt-marker takeover was not
+// bound to the exact observed marker (`expectedClaimId` alone is `undefined`
+// for every corrupt record, so it cannot distinguish "the same corrupt file
+// the notice named" from "a different corrupt file"). The two tests below
+// exercise exactly the "multiple corrupt markers" and "changed" cases the
+// review named.
+
+void test("takeOverStaleWorkAdmissionMarkerV1: two distinct corrupt markers coexisting — takeover only touches the exact one the notice named, never the other", async () => {
+  const task = freshTaskFolder("takeover-corrupt-multiple");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPathA = path.join(dir, "admission.corruptownera.g1.aaaaaaaa");
+  const markerPathB = path.join(dir, "admission.corruptownerb.g1.bbbbbbbb");
+  fs.writeFileSync(markerPathA, "not valid json at all {{{ A");
+  fs.writeFileSync(markerPathB, "not valid json at all {{{ B");
+  backdateV1(markerPathA, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+  backdateV1(markerPathB, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  // Deliberately target whichever of the two is NOT first in directory-list
+  // order, so this test proves the fix regardless of the underlying
+  // filesystem's readdir ordering: a regression back to blindly using
+  // `markers[0]` would visibly take over the WRONG file here.
+  const listedFirst = fs.readdirSync(dir).find((n) => n.startsWith("admission."));
+  const target = listedFirst === path.basename(markerPathA) ? markerPathB : markerPathA;
+  const other = target === markerPathA ? markerPathB : markerPathA;
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, target, undefined);
+  assert.equal(outcome.outcome, "takenOver");
+  assert.equal(fs.existsSync(target), false, "the exact corrupt marker named by the notice must be taken over");
+  assert.equal(fs.existsSync(other), true, "a different, unrelated corrupt marker must never be touched by the takeover");
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when the exact corrupt marker path named by the notice no longer exists, even though a different corrupt marker now occupies the directory", async () => {
+  const task = freshTaskFolder("takeover-corrupt-path-changed");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const originalMarkerPath = path.join(dir, "admission.originalcorrupt.g1.11111111");
+  fs.writeFileSync(originalMarkerPath, "not valid json at all {{{");
+  backdateV1(originalMarkerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  // Simulate the observed marker vanishing and a DIFFERENT corrupt marker
+  // appearing in its place before the human clicks the takeover action —
+  // the notice's confirmation must not carry over to it.
+  fs.rmSync(originalMarkerPath);
+  const replacementMarkerPath = path.join(dir, "admission.replacementcorrupt.g1.22222222");
+  fs.writeFileSync(replacementMarkerPath, "also not valid json {{{");
+  backdateV1(replacementMarkerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, originalMarkerPath, undefined);
+  assert.deepEqual(outcome, { outcome: "ownerChanged" });
+  assert.equal(fs.existsSync(replacementMarkerPath), true, "a different corrupt marker occupying the directory must never be silently taken over");
+});
+
+// 2026-09-15 review, completion blocker (narrowed remainder): `readClaimInfoSyncV1`
+// validated that `ownerToken`/`claimId` were strings but placed no upper bound
+// on ANY field's length, so a record with a wildly oversized `hostId` (or
+// `commandId`/`claimId`/`startedAt`) parsed as "readable" and flowed verbatim
+// into the takeover notice, the console log, and the durable run-log record
+// (`writeStaleWorkAdmissionTakeoverRunLogRecordV1`) — exactly the "unbounded …
+// content" plan step 16 forbids. The fix treats an oversized field the same
+// as any other corrupt/unreadable record: "an owner exists, details unknown".
+void test("takeOverStaleWorkAdmissionMarkerV1: a record with a wildly oversized field is treated as unreadable/corrupt, never surfaced with unbounded content", async () => {
+  const task = freshTaskFolder("takeover-oversized-field");
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = path.join(dir, "admission.oversizedowner.g1.deadbeef");
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      claimId: "oversized-claim",
+      purpose: "admission",
+      ownerToken: "oversizedowner",
+      pid: 999999,
+      processStartTime: 0,
+      // Otherwise entirely valid JSON — only this one field is unreasonable.
+      hostId: "x".repeat(100_000),
+      commandId: "fake-owner-command",
+      startedAt: new Date().toISOString(),
+    })
+  );
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, undefined);
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(
+      outcome.displacedOwner,
+      undefined,
+      "an oversized field must make the whole record unreadable, never surfaced verbatim to a notice/log consumer"
+    );
+  }
+  assert.equal(fs.existsSync(markerPath), false);
+});
+
+void test("takeOverStaleWorkAdmissionMarkerV1: an otherwise-normal record is still read normally at (and just under) the length bound", async () => {
+  const task = freshTaskFolder("takeover-boundary-field-length");
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeMarkerV1(task, { purpose: "admission", pid: process.pid, hostId: myHostId, ownerToken: "boundary-owner" });
+  backdateV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);
+
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(task, markerPath, "boundary-owner-claim");
+  assert.equal(outcome.outcome, "takenOver");
+  if (outcome.outcome === "takenOver") {
+    assert.equal(outcome.displacedOwner?.ownerToken, "boundary-owner", "a normal, reasonably-sized record must still read through unaffected by the bound");
+  }
 });
 
 // ── describeStaleWorkAdmissionTakeoverNoticeV1 (Part 1c step 16) ────────────

@@ -758,11 +758,42 @@ function listMarkersSyncV1(dir: string): readonly { readonly filePath: string; r
     .map((name) => ({ filePath: path.join(dir, name), basename: name }));
 }
 
+/**
+ * Generous upper bound for every string field on a claim/marker record. This
+ * module's own writer ({@link acquireWorkAdmissionCoreV1}) only ever produces
+ * short, fixed-shape values — a UUID `claimId`/`ownerToken` suffix, a
+ * `hostId` that is at most a UUID or a ~70-character derived/ephemeral id
+ * (`hostIdentityV1.ts`), a `commandId` that is a `package.json` command
+ * string, and an ISO-8601 `startedAt` — nothing legitimate ever comes close
+ * to this bound. A field beyond it can only be a corrupted or hand-edited
+ * record and must be treated exactly like any other corrupt/unreadable one:
+ * "an owner exists, details unknown" (2026-09-15 review, completion blocker:
+ * these fields previously reached the takeover notice, console log, and the
+ * durable run-log record (`writeStaleWorkAdmissionTakeoverRunLogRecordV1`)
+ * verbatim and unbounded).
+ */
+const WORK_ADMISSION_CLAIM_INFO_MAX_STRING_LENGTH_V1 = 512;
+
+function isBoundedClaimInfoStringV1(value: unknown): value is string {
+  return typeof value === "string" && value.length <= WORK_ADMISSION_CLAIM_INFO_MAX_STRING_LENGTH_V1;
+}
+
+function isValidWorkAdmissionPurposeV1(value: unknown): value is WorkAdmissionPurposeV1 {
+  return value === "admission" || value === "pauseCommit";
+}
+
 function readClaimInfoSyncV1(filePath: string): WorkAdmissionClaimInfoV1 | undefined {
   try {
     const raw = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<WorkAdmissionClaimInfoV1>;
-    if (typeof parsed.ownerToken !== "string" || typeof parsed.claimId !== "string") {
+    if (
+      !isBoundedClaimInfoStringV1(parsed.ownerToken) ||
+      !isBoundedClaimInfoStringV1(parsed.claimId) ||
+      !isBoundedClaimInfoStringV1(parsed.hostId) ||
+      !isBoundedClaimInfoStringV1(parsed.commandId) ||
+      !isBoundedClaimInfoStringV1(parsed.startedAt) ||
+      !isValidWorkAdmissionPurposeV1(parsed.purpose)
+    ) {
       return undefined;
     }
     return parsed as WorkAdmissionClaimInfoV1;
@@ -3428,7 +3459,16 @@ export async function attemptAutomaticWorkAdmissionReclamationV1(
  *     was raised for (`expectedClaimId`, or `undefined` for a corrupt record
  *     that had no readable claimId at notice time) — a changed owner, a
  *     renewed heartbeat, or a vanished marker between the notice and the
- *     click all refuse rather than act on stale confirmation.
+ *     click all refuse rather than act on stale confirmation. A readable
+ *     owner's `claimId` alone is sufficient identity — it survives a
+ *     legitimate heartbeat rename (new generation/epoch) untouched, so that
+ *     path intentionally still targets whichever marker is current
+ *     (`markers[0]`). A corrupt record has no `claimId` to pin to, so
+ *     `claimId` alone cannot tell "the same corrupt file the notice named"
+ *     apart from "a different corrupt file that happens to occupy
+ *     `markers[0]` right now" (2026-09-15 review: takeover was not bound to
+ *     the exact observed marker) — `expectedMarkerPath`, the one immutable
+ *     per-file identity a corrupt record still has, closes that gap.
  *   - A validated, identity-checked rename (for `purpose: "admission"`, or
  *     an unreadable record) or 1b's revocation-barrier protocol (for
  *     `purpose: "pauseCommit"`) — the same primitives that make two
@@ -3452,6 +3492,7 @@ export type WorkAdmissionTakeoverOutcomeV1 =
 
 export async function takeOverStaleWorkAdmissionMarkerV1(
   taskFolderPath: string,
+  expectedMarkerPath: string,
   expectedClaimId: string | undefined,
   now: number = Date.now()
 ): Promise<WorkAdmissionTakeoverOutcomeV1> {
@@ -3465,7 +3506,20 @@ export async function takeOverStaleWorkAdmissionMarkerV1(
   if (markers.length === 0) {
     return { outcome: "nothingToTakeOver" };
   }
-  const target = markers[0]!;
+  // A readable owner is pinned by `claimId` below, which is tolerant of a
+  // legitimate heartbeat rename — so that branch still targets whichever
+  // marker is current (`markers[0]`). An unreadable (corrupt) record has no
+  // `claimId`, so it is the one case where more than one notice-worthy
+  // marker could coexist and `markers[0]` alone cannot prove this is the
+  // SAME corrupt file the notice named — bind to the exact path observed at
+  // notice time instead.
+  const target = expectedClaimId === undefined ? markers.find((m) => m.filePath === expectedMarkerPath) : markers[0]!;
+  if (!target) {
+    // The exact corrupt marker the notice named is no longer present at
+    // that path (replaced, cleaned up, or racing another actor) — never act
+    // on a state different from what was confirmed.
+    return { outcome: "ownerChanged" };
+  }
   const owner = readClaimInfoSyncV1(target.filePath);
   if (expectedClaimId !== undefined) {
     if (!owner || owner.claimId !== expectedClaimId) {

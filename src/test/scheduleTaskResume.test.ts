@@ -405,16 +405,25 @@ function installRealWorkspaceFsV1(): { restore: () => void } {
     fs: {
       readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
       writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      createDirectory: (uri: vscode.Uri) => Promise<void>;
     };
   };
   const originalReadFile = workspace.fs.readFile;
   const originalWriteFile = workspace.fs.writeFile;
+  const originalCreateDirectory = workspace.fs.createDirectory;
   workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath);
   workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+  // Needed for `writeStaleWorkAdmissionTakeoverRunLogRecordV1` (Part 1c
+  // step 16), which creates `runs/` before writing into it — matches
+  // `promptManifestV1.test.ts`'s identical `createDirectory` bridge for the
+  // same reason.
+  workspace.fs.createDirectory = (uri: vscode.Uri): Promise<void> =>
+    fs.promises.mkdir(uri.fsPath, { recursive: true }).then(() => undefined);
   return {
     restore: (): void => {
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
+      workspace.fs.createDirectory = originalCreateDirectory;
     },
   };
 }
@@ -1998,7 +2007,7 @@ void test("armAll surfaces a takeover notice only after 3 consecutive sweeps obs
     assert.equal(takeoverEntries[0]?.level, "warning");
     assert.match(takeoverEntries[0]?.message ?? "", /not this one|foreign/i);
     assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
-      { taskFolderPath, expectedClaimId: "stuck-foreign-owner-claim" },
+      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-foreign-owner-claim" },
     ]);
 
     // A 4th consecutive observation of the SAME stuck owner must not spam a
@@ -2138,6 +2147,7 @@ void test("takeOverStaleWorkAdmissionCommandV1 takes over a stale foreignHost ad
   try {
     await takeOverStaleWorkAdmissionCommandV1(inventory, {
       taskFolderPath: folder.taskFolderPath,
+      expectedMarkerPath: markerPath,
       expectedClaimId: "stuck-real-owner-claim",
     });
 
@@ -2148,6 +2158,22 @@ void test("takeOverStaleWorkAdmissionCommandV1 takes over a stale foreignHost ad
       infoEntries.some((e) => /took over/i.test(e.message)),
       `expected a success notification; got: ${JSON.stringify(surface.entries)}`
     );
+
+    // The bounded displaced-owner diagnostic must be recorded durably in the
+    // task's own run log, not only the extension console (2026-09-15 review,
+    // completion blocker).
+    const runsDir = path.join(folder.taskFolderPath, "runs");
+    const runLogFiles = fs.existsSync(runsDir) ? fs.readdirSync(runsDir) : [];
+    const takeoverRecordName = runLogFiles.find((n) => n.endsWith(".stale-work-admission-takeover.json"));
+    assert.ok(takeoverRecordName, `expected a durable takeover run-log record; got: ${JSON.stringify(runLogFiles)}`);
+    const takeoverRecord = JSON.parse(fs.readFileSync(path.join(runsDir, takeoverRecordName), "utf8")) as {
+      outcome: string;
+      purpose: string;
+      displacedOwner?: { commandId: string };
+    };
+    assert.equal(takeoverRecord.outcome, "takenOver");
+    assert.equal(takeoverRecord.purpose, "admission");
+    assert.equal(takeoverRecord.displacedOwner?.commandId, "fake-owner-command");
 
     // A takeover must actually unblock a new acquisition.
     const retry = await acquireWorkAdmissionV1({ taskFolderPath: folder.taskFolderPath, purpose: "admission", commandId: "new-real-owner" });
@@ -2182,6 +2208,7 @@ void test("takeOverStaleWorkAdmissionCommandV1 refuses and reports (no mutation)
   try {
     await takeOverStaleWorkAdmissionCommandV1(inventory, {
       taskFolderPath: folder.taskFolderPath,
+      expectedMarkerPath: markerPath,
       expectedClaimId: "some-stale-claim-id-that-no-longer-matches",
     });
 
@@ -2190,6 +2217,39 @@ void test("takeOverStaleWorkAdmissionCommandV1 refuses and reports (no mutation)
       surface.entries.some((e) => /changed/i.test(e.message)),
       `expected an explanatory notification; got: ${JSON.stringify(surface.entries)}`
     );
+  } finally {
+    realFs.restore();
+    deactivateNotificationRouter();
+    folder.cleanup();
+  }
+});
+
+void test("takeOverStaleWorkAdmissionCommandV1 does nothing when no expectedMarkerPath was supplied (2026-09-15 review: never act without the exact observed identity)", async () => {
+  const folder = createRealTaskFolderV1("impl");
+  const progress: TaskProgress = { ...readPersistedProgress(folder.progressPath), displayName: "a stuck task" };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", progress);
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+
+  const markerPath = writeFakeAdmissionMarkerV1(folder.taskFolderPath, {
+    purpose: "admission",
+    hostId: "definitely-a-different-host-id",
+    ownerToken: "untouched-owner",
+  });
+  const old = new Date(Date.now() - (WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000));
+  fs.utimesSync(markerPath, old, old);
+
+  try {
+    await takeOverStaleWorkAdmissionCommandV1(inventory, {
+      taskFolderPath: folder.taskFolderPath,
+      expectedClaimId: "untouched-owner-claim",
+      // expectedMarkerPath deliberately omitted.
+    });
+
+    assert.equal(fs.existsSync(markerPath), true, "no expectedMarkerPath means no action, ever");
+    assert.equal(surface.entries.length, 0, "no notification should be shown for a malformed invocation");
   } finally {
     realFs.restore();
     deactivateNotificationRouter();
