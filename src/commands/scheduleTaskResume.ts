@@ -13,7 +13,11 @@ import {
   isAutomationChainActive,
   scheduleAutomationChain,
 } from "../utils/automationChain";
-import { IMPL_CONTINUATION_CHAIN_ID_V1, owedContinuationSourceV1 } from "./implementationRecoveryV1";
+import {
+  IMPL_CONTINUATION_CHAIN_ID_V1,
+  owedContinuationSourceV1,
+  retireSatisfiedSummaryRejectedRecoveryV1,
+} from "./implementationRecoveryV1";
 import {
   hasLiveSchedulingIntentBestEffortV1,
   liveSchedulingIntentIdsBestEffortV1,
@@ -688,6 +692,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     for (const task of this.inventory.getTasks()) {
       let recovery = task.progress.implRecovery;
       if (!recovery) continue;
+      // 2026-09-15 post-freeze findings, item 5 (Part 5 step 33): a
+      // `summaryRejected` recovery whose blocking condition has already been
+      // satisfied (a usable impl-summary.md exists again) has nothing left to
+      // wait for — retire it here, BEFORE the dispatch-state handling below,
+      // so this sweep never re-arms or leaves dangling a continuation that
+      // would just re-review an already-usable summary. Independent of
+      // `effectivelyActive` below: a satisfied recovery should retire
+      // whether or not the task currently reads as active.
+      if (await retireSatisfiedSummaryRejectedRecoveryV1(vscode.Uri.file(task.taskFolderPath))) {
+        continue;
+      }
       // Part 1b step 13 ("automation gates"): this sweep automatically
       // re-dispatches a command with no human invoking it, so — unlike a
       // manual command, which will itself refuse a real pause — this is the

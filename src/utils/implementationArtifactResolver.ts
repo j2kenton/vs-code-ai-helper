@@ -752,6 +752,28 @@ export function buildSyntheticImplementationSummaryV1(
 }
 
 /**
+ * Appends a deterministic "files changed" fact to a MODEL-AUTHORED summary
+ * banked for a round whose real change set was empty.
+ *
+ * 2026-09-15 post-freeze findings, item 3: a round that correctly changed no
+ * files (every remaining plan item was a human gate) must have that recorded
+ * as a fact in impl-summary.md — not left to depend on whatever the model
+ * happened to write in its own optional `## Files Changed` section, which is
+ * free text and not guaranteed to say so accurately or at all. The synthetic
+ * (runner-authored) path already states this deterministically via
+ * `buildSyntheticImplementationSummaryV1`; this is the model-authored
+ * equivalent.
+ *
+ * Appended as a blockquote, not a `##` heading, so it cannot be picked up by
+ * `findLastHeadingV1("Files Changed")` and shift what downstream consumers
+ * (attribution parsing, section-presence checks) treat as the round's own
+ * Files Changed section — this note is a supplement, never a replacement.
+ */
+export function withDeterministicZeroFilesChangedNoteV1(summaryText: string): string {
+  return `${summaryText}\n\n> **Files changed: none.** This round's real change set was empty; recorded here as a fact rather than left to depend on this summary's own account of it.`;
+}
+
+/**
  * The stamp written in place of a round's unusable summary.
  *
  * `roundChangedFiles` defaults to `true` (the common case: the round DID

@@ -76,6 +76,7 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import type { TaskInventory } from "../state/taskInventory";
 import type {
   ChatViewProvider,
@@ -729,7 +730,12 @@ export async function continueSealedEditExecutionV1(
         paths.push(filePath);
       }
     }
-    return paths;
+    // 2026-09-15 post-freeze findings, item 5: never bank Ensemble's own
+    // bookkeeping as an applied edit step's target, even in the unlikely
+    // case a sealed plan step's relativePath resolves to one — the same
+    // sanitizeChangeSetV1 rule the git-diff-based capture in
+    // cliAgentRunner.ts and the Copilot tool-call tracker apply.
+    return sanitizeChangeSetV1(paths);
   };
   // Decodes the actual text a step introduced — see
   // `SealedAppliedOperationV1.contentExcerpt`'s doc comment. `contentBase64`

@@ -120,8 +120,13 @@ import {
   buildImplementationContinuationPromptV1,
   claimImplRecoveryDispatchV1,
   ClaimedImplRecoveryV1,
+  describeOwedImplRecoveryRefusalV1,
+  discardOwedImplRecoveryV1,
   escalateClaimedSummaryOnlyIfUnavailableV1,
+  ImplRecoveryOwedRefusalError,
+  isImplRecoveryDiscardOfferableV1,
   owedContinuationSourceV1,
+  retireSatisfiedSummaryRejectedRecoveryV1,
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
@@ -193,6 +198,7 @@ import {
   attributeImplementationRoundFilesV1,
   buildSyntheticImplementationSummaryV1,
   buildUnusableImplementationSummaryV1,
+  withDeterministicZeroFilesChangedNoteV1,
   describeImplementationSummaryShapeIssue,
   parseReportedFilesChangedV1,
   describeIncompleteImplementationRoundV1,
@@ -5823,7 +5829,31 @@ export async function markReviewArtifactStale(
   // recognizes it) — repeated staling events never clobber the last REAL
   // review's `_prev` backup, matching this guard's original purpose.
   await backupReviewUnlessStale(reviewUri);
-  const banded = upsertArtifactChangeStaleBannerV1(existing, changedArtifact, new Date().toISOString());
+  // 2026-09-15 post-freeze findings, item 3: `existing` can itself already be
+  // the LEGACY bare "# Review Stale" placeholder — left on disk by a pre-A3
+  // build, or by a run of THIS function before this fix landed. Banner-
+  // wrapping it as-is (the fallback below) would keep the artifact at the
+  // placeholder's ~138 bytes forever: none of the verdict, score, blockers or
+  // progress this banner exists to keep reachable. `backupReviewUnlessStale`'s
+  // own stale-skip guard, just above, never overwrites `_prev` with a
+  // placeholder, so `_prev` may still hold the last real review from before
+  // the FIRST staling event. Recover it and banner THAT instead, so the
+  // artifact ends up exactly where it would be had the placeholder never
+  // overwritten it — a real review body, marked stale through the same
+  // non-destructive path every other review takes. Falls back to the bare
+  // placeholder only when `_prev` is itself unusable (missing, or itself a
+  // placeholder — no genuine review ever landed between two staling events).
+  const base = existing.trimStart().startsWith("# Review Stale")
+    ? await (async (): Promise<string> => {
+        const previousReview = await readTextIfExists(previousVersionUri(reviewUri));
+        return previousReview !== undefined &&
+          !isStaleReviewArtifact(previousReview) &&
+          !isInProgressReviewArtifact(previousReview)
+          ? previousReview
+          : existing;
+      })()
+    : existing;
+  const banded = upsertArtifactChangeStaleBannerV1(base, changedArtifact, new Date().toISOString());
   await writeTextFile(reviewUri, banded, { skipBackup: true });
 }
 
@@ -8332,6 +8362,13 @@ async function advanceStageViaNextStageRowV1(
   // `commitAndPushTask.ts`'s "Complete, Commit and Push" flow, which uses the
   // identical function rather than reimplementing it.
   const effectiveTaskStatus = await resolveEffectiveStageTaskStatusV1(folderUri.fsPath, statusSnapshot);
+  // 2026-09-15 post-freeze findings, item 5 (Part 5 step 33): checked here —
+  // the shared advancement gate every nextStage.v1 caller routes through —
+  // as well as by the periodic sweep (`scheduleTaskResume.ts`'s
+  // `armPendingImplRecoveries`), so neither depends on the other having
+  // already run. A `summaryRejected` recovery whose blocking condition is
+  // already satisfied must not go on refusing this transition.
+  await retireSatisfiedSummaryRejectedRecoveryV1(folderUri);
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,
@@ -8353,6 +8390,25 @@ async function advanceStageViaNextStageRowV1(
     beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
   if (outcome.kind !== "completed") {
+    // 2026-09-15 post-freeze findings, item 5's general requirement: "every
+    // refusal must name a remedy the system can reach, or an action the user
+    // can actually take" — `nextStage.implRecoveryOwed` alone named neither.
+    // Re-read fresh progress for the record's own fields (trigger, dispatch
+    // state, lease) rather than trying to thread them back out of the
+    // policy's bare failure code. `ImplRecoveryOwedRefusalError` carries the
+    // record too, so a caller that wants to ALSO offer the "Discard this
+    // owed continuation" action (rather than just showing the message every
+    // existing catch site already does via `error.message`) can.
+    if (outcome.kind === "failed" && outcome.code === "implRecoveryOwed") {
+      const freshForRefusal = await readTaskProgressAdvisoryV1(folderUri);
+      const owedRecovery = freshForRefusal?.implRecovery;
+      if (owedRecovery && freshForRefusal) {
+        throw new ImplRecoveryOwedRefusalError(
+          describeOwedImplRecoveryRefusalV1(owedRecovery, freshForRefusal),
+          owedRecovery
+        );
+      }
+    }
     throw new Error(outcome.kind === "failed" ? outcome.code : outcome.kind);
   }
   const shouldAutoReview =
@@ -8570,8 +8626,26 @@ export async function nextStage(
     // was in flight. Report it like any other failed transition instead of
     // an unhandled rejection.
     const message = error instanceof Error ? error.message : String(error);
+    // 2026-09-15 post-freeze findings, item 5 (Part 5 step 34): this is the
+    // command the finding's own report named ("Complete & Move On then
+    // refused with nextStage.implRecoveryOwed") — the primary manual surface
+    // where a stuck owed recovery is discovered. Offer the escape here, only
+    // when the record itself has no automated way back.
+    const owedRecovery = error instanceof ImplRecoveryOwedRefusalError ? error.recovery : undefined;
+    const canDiscardOwedRecovery =
+      owedRecovery !== undefined && isImplRecoveryDiscardOfferableV1(owedRecovery, resolved.progress);
     NotificationRouter.showWarning(
-      `Could not advance ${resolved.progress.taskFolder}: ${message}`
+      `Could not advance ${resolved.progress.taskFolder}: ${message}`,
+      undefined,
+      undefined,
+      undefined,
+      canDiscardOwedRecovery
+        ? {
+            command: "vs-code-ai-helper.discardOwedImplRecoveryV1",
+            title: "Discard This Owed Continuation",
+            args: [resolved.folderUri.fsPath],
+          }
+        : undefined
     );
     return;
   }
@@ -10129,7 +10203,9 @@ async function executeImplementationRun(
       // regardless of which path wrote it.
       const summaryText = completedResult.summaryIsSynthetic
         ? buildSyntheticImplementationSummaryV1(summary, completedResult.filesChanged)
-        : summary;
+        : !completedResult.filesChangedUnknown && completedResult.filesChanged.length === 0
+          ? withDeterministicZeroFilesChangedNoteV1(summary)
+          : summary;
       const signedSummary = completedResult.providerLabel
         ? withAttribution(
             summaryText,
@@ -12922,6 +12998,48 @@ export function registerReviewActionCommands(
           return undefined;
         }
         return restoreRejectedImplementationRoundV1(task.folderUri.fsPath, task.progress.currentStage);
+      }
+    ),
+    // 2026-09-15 post-freeze findings, item 5 (Part 5 step 34): the
+    // user-reachable escape for a `dispatched` recovery with no automated way
+    // back — waiting out its lease plus the 90-minute stale-dispatch grace to
+    // reach a round that will fail the same way is not an exit. Reachable
+    // from the "Complete Stage & Move On" refusal button
+    // (`advanceStageViaNextStageRowV1`'s catch site) and from any other
+    // refusal surface that chooses to offer it, never automatically.
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.discardOwedImplRecoveryV1",
+      async (taskFolderPath: string) => {
+        const confirmation = await vscode.window.showWarningMessage(
+          "Discard this owed implementation continuation?\n\n" +
+            "This clears the recovery record without ever running the round it was waiting for. " +
+            "Only do this once you've confirmed the pending work is no longer needed — it cannot be undone.",
+          { modal: true },
+          "Discard Continuation"
+        );
+        if (confirmation !== "Discard Continuation") {
+          return;
+        }
+        const discarded = await discardOwedImplRecoveryV1(vscode.Uri.file(taskFolderPath));
+        if (discarded) {
+          NotificationRouter.showInformation(
+            "Discarded the owed implementation continuation. Re-evaluating Complete Stage & Move On now."
+          );
+          // Part 5 step 34's own wording: "record the action, and re-evaluate
+          // advancement immediately" — a discard that only cleared state and
+          // left the user to click "Complete Stage & Move On" a second time
+          // would still be friction the finding names as a dead end. `{
+          // taskFolderPath }` matches the `TaskNodeArg` shape every other
+          // notification-button command in this file passes to `resolveTask`
+          // (see this command's own registration site's neighboring comment).
+          // `nextStage` reports its own success/failure notification, so
+          // nothing further is shown here regardless of outcome.
+          await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", { taskFolderPath });
+        } else {
+          NotificationRouter.showInformation(
+            "Nothing to discard — the owed continuation already cleared on its own."
+          );
+        }
       }
     ),
     vscode.commands.registerCommand(

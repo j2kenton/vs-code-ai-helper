@@ -9,6 +9,7 @@ import {
 } from "./copilotModelResolution";
 import { sanitizeRelativePath } from "../utils/pathSafety";
 import { classifyFailure } from "../utils/quota";
+import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
 import {
   LmChatRequestOptionsV1,
   LmChatResponseV1,
@@ -279,7 +280,15 @@ async function executeToolCall(
           await vscode.workspace.fs.createDirectory(parentUri);
         }
         await writeTextFile(fileUri, content);
-        filesChanged.add(normalizedPath || relPath);
+        // 2026-09-15 post-freeze findings, item 5: never record Ensemble's
+        // own bookkeeping (a session lock, a progress journal, an admission
+        // marker) as provider work, even in the unlikely case a tool call
+        // targets one directly — the same sanitizeChangeSetV1 rule the
+        // git-diff-based capture in cliAgentRunner.ts applies.
+        const writtenPath = normalizedPath || relPath;
+        if (classifyWorkflowPathV1(writtenPath) !== "workflowControl") {
+          filesChanged.add(writtenPath);
+        }
         return `OK: wrote "${relPath}" (${content.length} chars)`;
       } catch (e) {
         return `Error writing "${relPath}": ${
@@ -321,7 +330,10 @@ async function executeToolCall(
       }
       try {
         await deletePath(targetUri);
-        filesChanged.add(normalizedPath);
+        // Same workflow-control exclusion as write_file above.
+        if (classifyWorkflowPathV1(normalizedPath) !== "workflowControl") {
+          filesChanged.add(normalizedPath);
+        }
         return `OK: deleted "${relPath}"`;
       } catch (e) {
         return `Error deleting "${relPath}": ${

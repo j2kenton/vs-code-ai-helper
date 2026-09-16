@@ -271,22 +271,116 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     const { writer } = collectingWriter();
     const exit = await transport.invoke(makeRequest(correlation), writer);
 
-    // The code is the stable contract; the detail is diagnostic text that may
-    // be reworded, so it is matched by shape rather than compared exactly.
-    // What matters is that a non-zero exit now reports whether the process
-    // said anything at all — "exited 3, stderr 0 bytes" and "exited 3, stderr
-    // 4KB" are different failures and were previously indistinguishable.
+    // The code is the stable contract; the detail's exact wording may be
+    // reworded, so it is matched by shape rather than compared exactly.
+    // 2026-09-15 post-freeze findings, item 4: a non-zero exit now diagnoses
+    // the process's own buffered stdout (via the same toFriendlyError() the
+    // legacy execCliAgent path uses) BEFORE discarding it, so the real
+    // structured error event's message reaches `detail` — not just a byte
+    // count that could never say WHY the run failed.
     assert.equal(exit.kind, "transportFailure");
     assert.equal(exit.kind === "transportFailure" && exit.code, "cliExit.3");
     assert.match(
       (exit.kind === "transportFailure" && exit.detail) || "",
-      /exited 3; stderr \d+ byte\(s\)/
+      /backend unavailable/
     );
     assert.equal(
       writer.bytesWritten,
       0,
       "a failed structured run must not write wrapper bytes to the result writer"
     );
+  });
+
+  /**
+   * 2026-09-15 post-freeze findings, item 4 (the reported real-world case): a
+   * Codex-shaped quota-exhaustion event pair (`turn.failed` carrying the
+   * provider's own "usage limit" message, with a reset time) must reach
+   * `detail` verbatim rather than being discarded in favor of a bare
+   * "stderr 0 byte(s)" byte count — the exact defect measured live (codex
+   * 0.147.0: exit 1, 527 bytes of stdout, 39 bytes of benign stderr banner
+   * noise that `stripKnownBenignCliNoiseV1` correctly reduces to nothing).
+   */
+  void it("diagnoses a Codex-shaped quota exhaustion from stdout instead of reporting only a stderr byte count", async () => {
+    const correlation = makeCorrelation();
+    const stdout =
+      [
+        JSON.stringify({
+          type: "error",
+          message:
+            "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage " +
+            "to purchase more credits or try again at 4:12 PM.",
+        }),
+        JSON.stringify({
+          type: "turn.failed",
+          error: { message: "You've hit your usage limit. Try again at 4:12 PM." },
+        }),
+      ].join("\n") + "\n";
+    const def: CliProviderDefinition = {
+      ...scriptedDef({ id: "claude-cli", stdout, exitCode: 1 }),
+      id: "codex-cli",
+      structuredEventStream: "codex",
+    };
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliExit.1");
+    const detail = (exit.kind === "transportFailure" && exit.detail) || "";
+    assert.match(detail, /usage limit/i);
+    assert.match(detail, /4:12 PM/);
+    assert.ok(
+      !/stderr \d+ byte\(s\)$/.test(detail),
+      "a diagnosed structured failure must not fall back to a bare byte count"
+    );
+  });
+
+  /**
+   * 2026-09-15 post-freeze findings, item 4 (acceptance criterion): the
+   * failure-diagnosis tail is bounded (`MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1`,
+   * overridden here via `diagnosisTailMaxBytes` so the test does not need to
+   * emit real 64 KB) — this proves the terminal `turn.failed` event still
+   * reaches `detail` even when a large volume of earlier, unrelated stdout
+   * would have overflowed that bound many times over. The bound evicts whole
+   * earlier LINES only (see `createBoundedStdoutTailForDiagnosisV1`), so the
+   * terminal event — written last — is never split or lost regardless of how
+   * much filler preceded it.
+   */
+  void it("still diagnoses the terminal quota event when a large volume of earlier stdout exceeds the diagnosis tail bound", async () => {
+    const correlation = makeCorrelation();
+    const terminalEvent = JSON.stringify({
+      type: "turn.failed",
+      error: { message: "You've hit your usage limit. Try again at 4:12 PM." },
+    });
+    // ~10 KB of unrelated, harmless structured-event noise ahead of the
+    // terminal event — many multiples of the 300-byte bound this test uses.
+    const noiseScript =
+      'const line = JSON.stringify({type:"noise",data:"a".repeat(180)});' +
+      'for (let i = 0; i < 50; i++) process.stdout.write(line + "\\n");' +
+      `process.stdout.write(${JSON.stringify(terminalEvent)} + "\\n");` +
+      "process.exit(1);";
+    const def: CliProviderDefinition = {
+      ...scriptedDef({ id: "claude-cli", stdout: "", exitCode: 1 }),
+      id: "codex-cli",
+      structuredEventStream: "codex",
+      buildArgs(): string[] {
+        return ["-e", noiseScript];
+      },
+    };
+    const transport = createCliTextTransportV1({
+      def,
+      model: undefined,
+      cwd: process.cwd(),
+      diagnosisTailMaxBytes: 300,
+    });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliExit.1");
+    const detail = (exit.kind === "transportFailure" && exit.detail) || "";
+    assert.match(detail, /usage limit/i);
+    assert.match(detail, /4:12 PM/);
   });
 
   /**

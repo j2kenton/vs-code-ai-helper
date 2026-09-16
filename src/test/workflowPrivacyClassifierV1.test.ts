@@ -15,6 +15,7 @@ import { describe, it } from "node:test";
 import {
   classifyWorkflowPathV1,
   isWorkflowPrivatePathV1,
+  sanitizeChangeSetV1,
   CREATION_SENTINEL_FILENAME_V1,
   ADMISSION_DIRNAME_V1,
 } from "../services/workflowPrivacyClassifierV1";
@@ -196,5 +197,63 @@ void describe("workflowPrivacyClassifierV1", () => {
     ]) {
       assert.equal(isWorkflowPrivatePathV1(privatePath), true, privatePath);
     }
+  });
+});
+
+/**
+ * Coverage for sanitizeChangeSetV1 (2026-09-15 post-freeze findings, item 5):
+ * `.ensemble-session.lock` was observed recorded as a file the provider
+ * changed, manufacturing an owed continuation that blocked an already-
+ * finished task. This is the one function every capture site (the
+ * git-diff-based CLI runner, the Copilot tool-call tracker, the sealed edit
+ * runner, and the implementation-recovery quarantine boundary) routes
+ * through so a workflow-control-only change set reads as empty everywhere.
+ */
+void describe("sanitizeChangeSetV1", () => {
+  void it("drops workflow-control paths, keeping artifact-safe ones", () => {
+    assert.deepEqual(
+      sanitizeChangeSetV1(["src/a.ts", ".ensemble-session.lock", "src/b.ts"]),
+      ["src/a.ts", "src/b.ts"]
+    );
+  });
+
+  void it("returns an empty array for a workflow-control-only set", () => {
+    assert.deepEqual(
+      sanitizeChangeSetV1([".ensemble-session.lock", `${ADMISSION_DIRNAME_V1}/admission.claim`]),
+      []
+    );
+  });
+
+  void it("is a no-op for an already-clean set", () => {
+    const clean = ["src/a.ts", "src/b.ts"];
+    assert.deepEqual(sanitizeChangeSetV1(clean), clean);
+  });
+
+  void it("is idempotent — sanitizing an already-sanitized list changes nothing", () => {
+    const once = sanitizeChangeSetV1(["src/a.ts", ".ensemble-session.lock"]);
+    const twice = sanitizeChangeSetV1(once);
+    assert.deepEqual(twice, once);
+  });
+
+  void it("preserves order and does not deduplicate", () => {
+    assert.deepEqual(
+      sanitizeChangeSetV1(["src/a.ts", ".ensemble-session.lock", "src/a.ts"]),
+      ["src/a.ts", "src/a.ts"]
+    );
+  });
+
+  void it("returns an empty array for an empty input", () => {
+    assert.deepEqual(sanitizeChangeSetV1([]), []);
+  });
+
+  void it("never drops chatPrivate or transientProviderData paths — only workflowControl", () => {
+    // A different privacy concern (content that must never enter a prompt at
+    // all); conflating it here would silently hide a real change instead of
+    // excluding only the product's own bookkeeping.
+    const withOtherClasses = [
+      "workflow-runtime-v1/provider-results/a/b/c",
+      "workflow-runtime-v1/chat-transactions/x.json",
+    ];
+    assert.deepEqual(sanitizeChangeSetV1(withOtherClasses), withOtherClasses);
   });
 });

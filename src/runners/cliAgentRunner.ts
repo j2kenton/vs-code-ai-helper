@@ -25,6 +25,7 @@ import {
   shouldNudgeForMissingResultFrameV1,
 } from "../types/aiResultEnvelope";
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
+import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
@@ -1862,6 +1863,75 @@ export function cliProviderSupportsV1StdoutCapture(def: CliProviderDefinition): 
 export const MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1 = 64 * 1024 * 1024;
 
 /**
+ * 2026-09-15 post-freeze findings, item 4: how much of a failing run's raw
+ * stdout is retained specifically for FAILURE diagnosis — independent of
+ * (and far smaller than) `MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1`, which
+ * bounds the full-run buffer used to extract a SUCCESSFUL reply. A structured
+ * provider's terminal `error`/`turn.failed` event is always near the very end
+ * of the stream, so 64 KB is generous headroom over any observed case
+ * (Codex's quota-exhaustion pair: 527 bytes total) while keeping
+ * `toFriendlyError`'s regex/lowercase work cheap regardless of how much
+ * stdout a failing run produced before exiting.
+ */
+export const MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1 = 64 * 1024;
+
+/**
+ * A byte-bounded, line-safe tail of a CLI's raw stdout, built incrementally
+ * as chunks arrive. Bounding by COMPLETE LINES rather than raw bytes means a
+ * terminal structured-event line (Codex's `error`/`turn.failed` pair, or any
+ * other provider's JSONL event) can never be split in half at the tail
+ * boundary — a boundary only ever falls between two whole lines, never
+ * inside one, so a terminal event straddling where the tail WOULD be cut by
+ * a naive byte-offset slice is still captured whole. `push` must see every
+ * chunk in arrival order (a stateful `TextDecoder` handles a multi-byte UTF-8
+ * character split across chunk boundaries); `snapshot` is cheap and callable
+ * at any time, including after the process has exited.
+ *
+ * The trailing not-yet-newline-terminated partial line is always included in
+ * `snapshot()` — the CLI's last write before exit may have no trailing
+ * newline at all, and dropping it would lose exactly the terminal event this
+ * exists to keep. That partial line is itself defensively capped at
+ * `maxBytes` (approximated in UTF-16 code units) so a pathological single
+ * huge line with no newlines at all cannot defeat the bound.
+ * @internal exported for testing
+ */
+export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
+  push(chunk: Buffer): void;
+  snapshot(): string;
+} {
+  const decoder = new TextDecoder("utf-8");
+  const lines: string[] = [];
+  let bytes = 0;
+  let remainder = "";
+  return {
+    push(chunk: Buffer): void {
+      const text = remainder + decoder.decode(chunk, { stream: true });
+      const parts = text.split("\n");
+      remainder = parts.pop() ?? "";
+      if (remainder.length > maxBytes) {
+        remainder = remainder.slice(remainder.length - maxBytes);
+      }
+      for (const line of parts) {
+        lines.push(line);
+        bytes += Buffer.byteLength(line, "utf8") + 1;
+      }
+      // `lines.length > 1`, never `> 0`: a single line that is itself larger
+      // than `maxBytes` (a terminal event bigger than the whole bound) must
+      // still be kept whole rather than evicted down to nothing — an
+      // oversized-but-present terminal event is strictly more useful than an
+      // empty tail.
+      while (bytes > maxBytes && lines.length > 1) {
+        const removed = lines.shift()!;
+        bytes -= Buffer.byteLength(removed, "utf8") + 1;
+      }
+    },
+    snapshot(): string {
+      return [...lines, remainder].join("\n");
+    },
+  };
+}
+
+/**
  * V1 transport (plan §3.2/§3.4) for a vendor CLI's read-only text mode:
  * spawns the CLI exactly like the legacy path (same argument builder,
  * sanitized environment, shell quoting, kill-tree cancellation, and run
@@ -1929,10 +1999,18 @@ export function createCliTextTransportV1(options: {
    * callers (the registry) never set it.
    */
   maxEventStreamBytes?: number;
+  /**
+   * Test seam: overrides `MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1` so the
+   * failure-diagnosis tail bound is exercisable without emitting 64 KB of
+   * filler. Production callers (the registry) never set it.
+   */
+  diagnosisTailMaxBytes?: number;
 }): AgentTransportV1 {
   const { def, model, cwd } = options;
   const maxEventStreamBytes =
     options.maxEventStreamBytes ?? MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1;
+  const diagnosisTailMaxBytes =
+    options.diagnosisTailMaxBytes ?? MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1;
   return {
     runnerId: def.id,
     invoke(
@@ -2081,6 +2159,12 @@ export function createCliTextTransportV1(options: {
             let cancelled = false;
             const rawEventChunks: Buffer[] = [];
             let rawEventBytes = 0;
+            // 2026-09-15 post-freeze findings, item 4: maintained alongside
+            // `rawEventChunks` (never as a substitute for it — the success
+            // path still needs the full buffer to extract the actual reply),
+            // purely so a non-zero exit can diagnose from a small, line-safe
+            // tail instead of the full (up to 64 MB) buffer.
+            const diagnosisTail = createBoundedStdoutTailForDiagnosisV1(diagnosisTailMaxBytes);
             // Part 7: last time ANY raw byte arrived on stdout or stderr. Keyed
             // off raw chunk arrival rather than onProgress/capture callbacks,
             // since structured providers buffer everything until close and
@@ -2207,6 +2291,12 @@ export function createCliTextTransportV1(options: {
               if (settled) {
                 return;
               }
+              // Fed unconditionally (independent of the size guard below) so
+              // a failure diagnosis always has the most recent bounded tail,
+              // even for a run that is ABOUT to be killed for exceeding
+              // maxEventStreamBytes — see MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1's
+              // doc comment for why this stays bounded far below that cap.
+              diagnosisTail.push(chunk);
               // Buffered for BOTH opaque-text and structured-event CLIs (see
               // CliTextAttemptResultV1's doc comment): the raw stream is
               // unboundedly large in either case, so it is discarded and the
@@ -2297,21 +2387,55 @@ export function createCliTextTransportV1(options: {
                 }
                 return;
               }
-              // A CLI whose run failed wrote nothing to the result writer
+              // A CLI whose run failed wrote nothing to the RESULT WRITER
               // (its buffered raw stdout is only ever extracted/written on
               // exit 0, for both opaque and structured CLIs — see above), so
               // the broker correctly reports this as a pre-response failure.
+              // 2026-09-15 post-freeze findings, item 4: `diagnosisTail`, at
+              // this exact point, still holds a bounded, line-safe tail of
+              // everything the process recently wrote to stdout before
+              // exiting — exactly where a structured provider's terminal
+              // failure lives (Codex's quota-exhaustion `error`/`turn.failed`
+              // event pair, measured live: 527 bytes of stdout, previously
+              // discarded here, one line before a failure detail built from
+              // stderr's byte count alone — "stderr 0 byte(s)" — when the
+              // real explanation was right there). Diagnose through the SAME
+              // toFriendlyError() the legacy execCliAgent path already uses
+              // for this: same structured extractors (keyed off
+              // def.structuredEventStream), same auth/quota classification,
+              // same noise-stripping and truncation. stderr content is never
+              // retained by this transport (§2.2 — see
+              // cliStdoutResultCaptureV1), so toFriendlyError's stderr
+              // argument is always "" here; that already matches every
+              // reported failure of this shape, which arrives entirely on
+              // stdout. `rawEventChunks` itself is no longer needed once the
+              // process has failed (only a successful exit ever unwraps it
+              // into a reply), so it is freed here rather than read.
+              const rawStdoutForDiagnosis = diagnosisTail.snapshot();
               rawEventChunks.length = 0;
               // Sanitized stderr accounting only (never its text): "exited 1,
               // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
               // different failures and were previously indistinguishable.
               const stderr = capture.stderrSummary();
+              const friendly = toFriendlyError(def, model, code, "", rawStdoutForDiagnosis);
+              // boundedTransportDetailV1 applies this type's own §2.2
+              // redaction (bearer tokens, API keys, credential URIs, private
+              // paths) on top of toFriendlyError's noise-stripping/truncation
+              // — belt-and-braces before this text reaches a run log or
+              // user-facing notification. Falls back to the byte-count-only
+              // detail only if that redaction leaves nothing (e.g. the
+              // diagnostic text was itself pure whitespace/control chars,
+              // which toFriendlyError never actually produces — its own
+              // fallback is always a non-empty "exit code N" sentence — so
+              // this is a defensive last resort, not the expected path).
+              const detail =
+                boundedTransportDetailV1(friendly.diagnosticText, 1000) ??
+                `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
+                  `${stderr.truncated ? " (truncated)" : ""}`;
               finishTerminal({
                 kind: "transportFailure",
                 code: `cliExit.${String(code)}`,
-                detail:
-                  `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
-                  `${stderr.truncated ? " (truncated)" : ""}`,
+                detail,
               });
             });
 
@@ -3837,9 +3961,19 @@ export async function runImplementationWithCli(options: {
   // implementations, rather than trusting an empty filesChanged.
   const after = before ? await gitStatusSnapshot(cwd) : undefined;
   const filesChangedUnknown = before === undefined || after === undefined;
+  // 2026-09-15 post-freeze findings, item 5: a blind git-status diff around
+  // this round's wall-clock window cannot tell "the model wrote this" from
+  // "Ensemble's own runtime touched this while the round happened to be
+  // running" — `.ensemble-session.lock` was observed banked into
+  // roundLedger.filesChanged this way, manufacturing an owed continuation
+  // that blocked an already-finished, already-reviewed task. Sanitized
+  // immediately after the raw diff, before any other filter runs, so every
+  // downstream consumer of `filesChanged` (review scope, the run log,
+  // pendingImplReviewFiles quarantine) sees a change set that never
+  // contained Ensemble's own bookkeeping in the first place.
   const rawFilesChanged = filesChangedUnknown
     ? []
-    : changedPathsSince(before, after);
+    : sanitizeChangeSetV1(changedPathsSince(before, after));
 
   const strayReservedNames = rawFilesChanged.filter((path) => {
     if (!RESERVED_ROOT_ARTIFACT_NAMES.has(path)) {

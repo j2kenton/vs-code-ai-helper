@@ -31,7 +31,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { __testOnly } from "../runners/cliAgentRunner";
+import { __testOnly, createBoundedStdoutTailForDiagnosisV1 } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { classifyCliFailure, isAuthenticationFailure, isModelEntitlementFailure, isTransportError } from "../utils/quota";
 
@@ -1403,5 +1403,111 @@ void describe("stream-transport failures are cascade-eligible", () => {
     );
 
     assert.equal(promoted.failureKind, "generic");
+  });
+});
+
+/**
+ * 2026-09-15 post-freeze findings, item 4: `createBoundedStdoutTailForDiagnosisV1`
+ * is the mechanism that lets the sealed CLI transport keep a small, cheap
+ * failure-diagnosis tail (rather than the full, up-to-64-MB raw buffer)
+ * without ever losing a terminal `error`/`turn.failed` event to a naive
+ * byte-offset truncation — a boundary only ever falls between two whole
+ * lines, never inside one.
+ */
+void describe("createBoundedStdoutTailForDiagnosisV1", () => {
+  void it("keeps the full text when it fits within the bound", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(1024);
+    tail.push(Buffer.from("line one\nline two\n"));
+    assert.equal(tail.snapshot(), "line one\nline two\n");
+  });
+
+  void it("evicts only whole earlier lines once the bound is exceeded, never splitting a line", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(30);
+    // Each line's body is 9 bytes ("023456789") + 1 for its newline = 10
+    // accounted bytes; a 30-byte bound keeps at most 3 whole lines.
+    for (let i = 0; i < 6; i++) {
+      tail.push(Buffer.from(`${String(i)}23456789\n`));
+    }
+    const snapshot = tail.snapshot();
+    // Every surviving line is a COMPLETE, unmodified original line — never a
+    // fragment of one.
+    for (const line of snapshot.split("\n").filter((l) => l.length > 0)) {
+      assert.equal(line.length, 9, `line "${line}" must be a whole 9-byte line, not a fragment`);
+    }
+    assert.ok(snapshot.endsWith("523456789\n"), "the most recent line must survive");
+    assert.ok(!snapshot.includes("023456789"), "the oldest line must have been evicted");
+  });
+
+  /**
+   * The exact scenario item 4 requires: a terminal event that a naive
+   * `text.slice(-maxBytes)` truncation WOULD cut in half (its own JSON
+   * straddles where the byte offset falls), but that the line-safe tail
+   * still preserves whole, because eviction only ever removes complete
+   * earlier lines.
+   */
+  void it("preserves a terminal event whose own bytes straddle where a naive byte-offset tail would cut", () => {
+    const filler = "x".repeat(80) + "\n"; // 81 bytes/line
+    const terminalEvent =
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "You've hit your usage limit. Try again at 4:12 PM." },
+      }) + "\n";
+    // The terminal event line (~90 bytes) is itself larger than a 60-byte
+    // bound — a naive `fullText.slice(-60)` would land INSIDE this line,
+    // corrupting its JSON. The line-safe tail must still keep it whole.
+    assert.ok(terminalEvent.length > 60, "test fixture must exceed the bound to be meaningful");
+    const tail = createBoundedStdoutTailForDiagnosisV1(60);
+    for (let i = 0; i < 5; i++) {
+      tail.push(Buffer.from(filler));
+    }
+    tail.push(Buffer.from(terminalEvent));
+
+    // Sanity check on the fixture itself (not on the implementation under
+    // test): since the terminal event is the LAST thing written and is
+    // itself longer than the 60-byte bound, a naive `text.slice(-60)` tail
+    // would necessarily start partway INSIDE the terminal event's own JSON,
+    // never at its opening brace — proving this fixture really would defeat
+    // a byte-offset-only tail if one were used.
+    const fullText = filler.repeat(5) + terminalEvent;
+    const naiveTail = fullText.slice(fullText.length - 60);
+    assert.ok(
+      !naiveTail.trimStart().startsWith("{"),
+      "sanity check: the fixture must be constructed so a naive byte-offset tail lands mid-object"
+    );
+
+    const snapshot = tail.snapshot();
+    assert.ok(snapshot.includes(terminalEvent.trim()), "the whole terminal event line must survive intact");
+    const parsedLine = snapshot
+      .split("\n")
+      .find((line) => line.includes("turn.failed"));
+    assert.ok(parsedLine, "the terminal event line must be present");
+    const parsed = JSON.parse(parsedLine) as { error: { message: string } };
+    assert.match(parsed.error.message, /usage limit/i);
+  });
+
+  void it("caps a single huge unterminated line (no newline at all) rather than growing unboundedly", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(100);
+    tail.push(Buffer.from("y".repeat(10_000)));
+    const snapshot = tail.snapshot();
+    assert.ok(snapshot.length <= 100, `snapshot length ${String(snapshot.length)} must be capped near the bound`);
+  });
+
+  void it("never drops the last line even when it alone exceeds the bound", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(10);
+    tail.push(Buffer.from("a".repeat(5) + "\n"));
+    tail.push(Buffer.from("b".repeat(50) + "\n"));
+    const snapshot = tail.snapshot();
+    assert.ok(snapshot.includes("b".repeat(50)), "an oversized final line must be kept whole, not evicted to nothing");
+  });
+
+  void it("correctly reassembles a multi-byte UTF-8 character split across chunk boundaries", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(1024);
+    const text = "usage limit — try again later\n"; // em dash is a 3-byte UTF-8 sequence
+    const bytes = Buffer.from(text, "utf8");
+    // Split exactly inside the em dash's 3-byte sequence.
+    const splitPoint = text.indexOf("—") > 0 ? Buffer.from(text.slice(0, text.indexOf("—"))).length + 1 : 10;
+    tail.push(bytes.subarray(0, splitPoint));
+    tail.push(bytes.subarray(splitPoint));
+    assert.equal(tail.snapshot(), text);
   });
 });
