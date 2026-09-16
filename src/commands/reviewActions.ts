@@ -4957,10 +4957,35 @@ export async function runReviewForFolder(
     // run itself declined to dispatch — because the alternative is reviewing
     // an earlier round's notes against a tree they no longer describe.
     if (isUnusableImplementationSummaryV1(implementationContent)) {
+      // 2026-09-15 post-freeze findings, item 3: a refusal must name a
+      // remedy the system can actually reach, not just tell the user to
+      // rerun a round that may have nothing left to change (e.g. every
+      // remaining plan item is a human gate — the exact deadlock this item
+      // describes). `impl-summary_prev.md` is written precisely so nothing
+      // is lost when a round is stamped unusable; offer to restore it here
+      // when it is itself usable, via the same restore path "Discard Last
+      // Round" already exercises (`restoreRejectedImplementationRoundV1`).
+      const previousImplSummary = await readTextIfExists(
+        previousVersionUri(getImplementationSummaryUri(folderUri))
+      );
+      const canRestorePreviousImplSummary =
+        previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       NotificationRouter.showWarning(
         "The last implementation round did not produce usable implementation notes, so there is " +
           `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
-          "Run the implementation step again to produce them."
+          (canRestorePreviousImplSummary
+            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
+            : "Run the implementation step again to produce them."),
+        undefined,
+        undefined,
+        undefined,
+        canRestorePreviousImplSummary
+          ? {
+              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+              title: "Restore Last Usable Summary",
+              args: [folderUri.fsPath, targetStage],
+            }
+          : undefined
       );
       return;
     }
@@ -5833,11 +5858,27 @@ export async function beginInProgressReviewMarkingV1(
   // artifact-change banner has real body left to swap a banner line on
   // below, not a placeholder to replace wholesale.
   if (current.trimStart().startsWith("# Review Stale")) {
+    // 2026-09-15 post-freeze findings, item 3: this placeholder itself has
+    // nothing to preserve, but the review it replaced does — sitting in
+    // `_prev`, exactly where `backupReviewUnlessStale` put it, and otherwise
+    // unreachable from this artifact. Inline it (labelled, so it reads as
+    // history rather than the current verdict) instead of leaving a bare
+    // banner with no prior score, blockers, or progress. Guarded against a
+    // `_prev` that is itself a placeholder (no genuine review ever landed
+    // between two staling events) — there is nothing useful to inline then.
+    const previousReviewForInProgress = await readTextIfExists(previousVersionUri(reviewUri));
+    const hasUsablePreviousReview =
+      previousReviewForInProgress !== undefined &&
+      !isStaleReviewArtifact(previousReviewForInProgress) &&
+      !isInProgressReviewArtifact(previousReviewForInProgress);
     const inProgressNotice = [
       IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
       "",
       "This review is being re-evaluated against the current artifact.",
       "",
+      ...(hasUsablePreviousReview
+        ? ["## Previous result", "", previousReviewForInProgress.trim(), ""]
+        : []),
     ].join("\n");
     await writeTextFile(reviewUri, inProgressNotice, { skipBackup: true });
     return { rewrote: true, priorContent: current };
@@ -10002,6 +10043,116 @@ async function executeImplementationRun(
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
+    // `result` is declared `let ... | undefined` at this function's top —
+    // narrowed to the "completed" variant only for DIRECT reads in this
+    // block, not inside a nested closure (TS does not retain narrowing of a
+    // mutable outer binding across a function boundary). `bankValidImplementationSummaryV1`
+    // below is such a closure, so it captures this narrowed copy instead of
+    // reading `result` directly.
+    const completedResult = result;
+    // Filled in below, only for a runner-synthesized round with a plan
+    // checklist — read by the run log write and by the reconcile-decision
+    // post to surface it for explicit human selection (workflow 8, item 2 /
+    // plan Part 4). Never used to exempt the round from
+    // checklistProgressUnreliable — see `computeSyntheticRoundChecklistLatchV1`'s
+    // doc comment. Hoisted here (rather than declared just above its original
+    // single use site) so `bankValidImplementationSummaryV1` below — called
+    // both from the zero-file gate and from this round's ordinary write path
+    // — can set it from either call site.
+    let automaticChecklistReconciliation: AutomaticChecklistReconciliationOutcomeV1 | undefined;
+
+    /**
+     * Banks THIS round's own valid report into impl-summary.md — including
+     * the checklist merge — even when the round is about to be refused
+     * advancement (e.g. by the zero-file gate below, when unticked items
+     * remain that no review has cleared yet). Extracted so a caller that
+     * must return early without advancing can still call this first
+     * (2026-09-15 post-freeze findings, item 3: "a round with nothing to do
+     * must still produce a usable summary — and today its summary is
+     * discarded even when it writes one"). Every call site only invokes this
+     * once `!summaryIssue` is already established — a rejected summary keeps
+     * using the unusable-stamp path below unchanged.
+     */
+    const bankValidImplementationSummaryV1 = async (): Promise<void> => {
+      const planOfRecordUri = getCanonicalImplementationUri(folderUri);
+      // Same attribution formula as the outer `attributedFilesChanged` below
+      // (kept as a second, self-contained computation rather than shared,
+      // since this function is also called from a call site that runs
+      // BEFORE that outer computation exists) — pure and deterministic over
+      // `result`/`summary`/`planChecklist`, none of which change between the
+      // two call sites.
+      const { attributed: bankedAttributedFilesChanged, unattributed: _bankedUnattributedFilesChanged } =
+        completedResult.summaryIsSynthetic || completedResult.filesChangedUnknown
+          ? { attributed: [...completedResult.filesChanged], unattributed: [] as string[] }
+          : attributeImplementationRoundFilesV1(
+              completedResult.filesChanged,
+              parseReportedFilesChangedV1(summary, { planChecklist })
+            );
+      // Signed with the reservation actually invoked (never the requested
+      // primary) — same helper and header format review artifacts use
+      // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
+      // regardless of which path wrote it.
+      const summaryText = completedResult.summaryIsSynthetic
+        ? buildSyntheticImplementationSummaryV1(summary, completedResult.filesChanged)
+        : summary;
+      const signedSummary = completedResult.providerLabel
+        ? withAttribution(
+            summaryText,
+            completedResult.providerLabel,
+            completedResult.storedModelId ? attributionModelLabel(completedResult.storedModelId) : undefined
+          )
+        : summaryText;
+      options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
+      await writeTextFile(summaryUri, `${signedSummary}\n`);
+
+      if (planChecklist !== undefined) {
+        const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
+        if (mergeResult.kind === "merged") {
+          const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planChecklist, mergeResult.content);
+          if (!written) {
+            NotificationRouter.showWarning(
+              "⚠️ plan-final.md changed while this round's checklist progress was being merged, so nothing was " +
+                "written — its ticks were not lost, but this round's progress could not be recorded. Re-run " +
+                "reconciliation once the concurrent change settles."
+            );
+          } else {
+            effectivePlanChecklist = mergeResult.content;
+            await withdrawWorkflowDecisionsByKeyV1(
+              { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+              "applyReviewerVerifiedTicks",
+              "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
+            );
+            if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
+              const existingLog = await readTextIfExists(logUri);
+              if (existingLog !== undefined) {
+                const retroSection =
+                  "\n\n## Retroactive plan ticks\n\n" +
+                  "Items ticked this round via a retroactive claim (verified complete from an " +
+                  "earlier round, not built this round):\n\n" +
+                  mergeResult.retroactiveTicks
+                    .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
+                    .join("\n");
+                await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
+              }
+            }
+          }
+        } else if (mergeResult.kind === "no-match") {
+          NotificationRouter.showWarning(
+            "⚠️ The implementation round reported checklist progress that did not match any " +
+              "item in the plan of record, so no boxes were ticked. Unmatched: " +
+              mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")
+          );
+        }
+      }
+
+      if (planChecklist !== undefined && completedResult.summaryIsSynthetic) {
+        automaticChecklistReconciliation = await runAutomaticChecklistReconciliationV1(
+          folderUri,
+          bankedAttributedFilesChanged,
+          completedResult.appliedOperations
+        );
+      }
+    };
 
     if (incompleteRound && recovery) {
       // A detected deferred/cut-short round is recorded INCOMPLETE and
@@ -10201,6 +10352,16 @@ async function executeImplementationRun(
         );
         const persistedGateRounds = gateTerminalization.ok ? gateTerminalization.progress : undefined;
         await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
+        // 2026-09-15 post-freeze findings, item 3: this branch refuses to
+        // ADVANCE the round (warns, or escalates, below) but that is a
+        // decision about ROUTING, not about whether the round's own report
+        // was usable — `uncheckedItemsWithoutClearingReview` above already
+        // required `!summaryIssue` to reach here at all. Banking it is what
+        // stops a genuinely valid "nothing to fix" report from leaving
+        // impl-summary.md on whatever it held before this round ran (a stale
+        // `implementation-summary-unusable` stamp, in the reported case), the
+        // exact three-round deadlock this item describes.
+        await bankValidImplementationSummaryV1();
         // wf10 item 3 / item 6b / Part 5 step 13: a fallback provider that has
         // now produced `fallbackProviderBreakerRounds` consecutive zero-file
         // rounds is a known-broken path — stop and name it instead of letting
@@ -10247,8 +10408,19 @@ async function executeImplementationRun(
                   "with zero blockers), the checklist under-recording latch engages automatically on the " +
                   "following round and **Ensemble: Mark Plan Checklist Reconciled** becomes available; if it " +
                   "does not clear, its blockers name the work that is actually still outstanding."
-              : "Implementation finished, but no workspace files changed. " +
-                  "Review the implementation run log; the provider may have been blocked from writing files.",
+              : // 2026-09-15 post-freeze findings, item 3: this used to say "the
+                // provider may have been blocked from writing files" — false in
+                // the common case, where the model correctly found nothing left
+                // to do (e.g. every remaining plan item is a human deployment
+                // gate) and sent that reasoning back accurately. Blaming the
+                // provider sent operators looking for a permissions problem
+                // that did not exist. impl-summary.md now records this round's
+                // own report (see the bankValidImplementationSummaryV1 call
+                // just above), so the run log is not the only place to check.
+                "Implementation finished with no workspace file changes. This can be correct — for example, " +
+                  "when every remaining plan item is a human action (a deployment step, an external " +
+                  "confirmation) rather than something the model can do. This round's own report is now saved " +
+                  "in impl-summary.md; review it, or the implementation run log, to confirm.",
             undefined,
             undefined,
             undefined,
@@ -10801,14 +10973,9 @@ async function executeImplementationRun(
     // carrying a checklist must get its checklist back with updated boxes:
     // that echo is the only thing that advances plan progress, so the merge
     // below reuses the same read the gate validated against.
-    const planOfRecordUri = getCanonicalImplementationUri(folderUri);
-    // Filled in below, only for a runner-synthesized round with a plan
-    // checklist — read by the run log write to record the evidence found,
-    // and by the reconcile-decision post to surface it for explicit human
-    // selection (workflow 8, item 2 / plan Part 4). Never used to exempt the
-    // round from checklistProgressUnreliable — see
-    // `computeSyntheticRoundChecklistLatchV1`'s doc comment.
-    let automaticChecklistReconciliation: AutomaticChecklistReconciliationOutcomeV1 | undefined;
+    // (`planOfRecordUri` and `automaticChecklistReconciliation` moved into/up
+    // beside `bankValidImplementationSummaryV1`, above, so the zero-file gate
+    // can call it too — see that function's own doc comment.)
 
     // Attribution (finding 2): the git snapshot diff spans the round's
     // wall-clock window, not its authorship — edits made BY HAND in the same
@@ -10838,147 +11005,7 @@ async function executeImplementationRun(
           );
 
     if (!summaryIssue) {
-      // Signed with the reservation actually invoked (never the requested
-      // primary) — same helper and header format review artifacts use
-      // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
-      // regardless of which path wrote it.
-      // A runner-authored summary is recorded AS runner-authored, so later
-      // stages can tell that this round could not report checklist progress
-      // instead of reading the plan's frozen counts as current.
-      const summaryText = result.summaryIsSynthetic
-        ? buildSyntheticImplementationSummaryV1(summary, result.filesChanged)
-        : summary;
-      const signedSummary = result.providerLabel
-        ? withAttribution(
-            summaryText,
-            result.providerLabel,
-            result.storedModelId ? attributionModelLabel(result.storedModelId) : undefined
-          )
-        : summaryText;
-      // Coarse label at an explicit boundary: the round's provider call has
-      // already returned by this point, so "running" no longer describes
-      // what's happening — this write (plus the checklist-merge and
-      // artifact bookkeeping below) is the last visible activity before the
-      // stage ends and the terminal notification takes over.
-      options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
-      await writeTextFile(summaryUri, `${signedSummary}\n`);
-
-      // Carry this round's checkbox progress back into the plan of record.
-      // The reproduced checklist in the summary is the only persistent record
-      // of how much of the plan remains (run-implementation.md), and the next
-      // round reads plan-final.md — not the summary — as its Final Plan. It
-      // used to arrive there because the summary REPLACED plan-final.md, which
-      // is the same coupling that destroyed the checklist when a provider
-      // returned a status message. Merging ticks instead keeps the progress
-      // record without ever letting a run overwrite the plan.
-      if (planChecklist !== undefined) {
-        // Reuses the SAME result the zero-change routing decision above
-        // already computed (checklistAdvanced/checklistClaimedButUnmerged) —
-        // never recomputed, so the two can never disagree about what this
-        // round reported.
-        const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
-        if (mergeResult.kind === "merged") {
-          // Revision-conditional (review-flagged 2026-08-25, task-fixable
-          // blocker `739cfbbb-…-1`, narrowed a seventh time): this was the
-          // third remaining in-process writer of `plan-final.md` that
-          // bypassed `writeTextFileIfUnchangedV1`. Unlike the two decision-
-          // confirmation writers (`applyReviewerVerifiedTicksConfirmedV1`,
-          // `applyReconciliationReviewVerifiedTicksV1`), `checklistMergeResult`
-          // is reused by several routing decisions made earlier in this same
-          // function (see the comment above), so this cannot simply re-read
-          // and recompute the merge immediately before writing without
-          // risking those earlier decisions disagreeing with what actually
-          // gets written. `planChecklist` — the exact text the merge was
-          // computed against — is passed as the expected content instead: a
-          // concurrent writer or editor save that lands between that read and
-          // this write is still detected and refused rather than silently
-          // overwritten; only the earlier-computed routing messages remain
-          // based on the read at the time they were built, same as before.
-          const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planChecklist, mergeResult.content);
-          if (!written) {
-            NotificationRouter.showWarning(
-              "⚠️ plan-final.md changed while this round's checklist progress was being merged, so nothing was " +
-                "written — its ticks were not lost, but this round's progress could not be recorded. Re-run " +
-                "reconciliation once the concurrent change settles."
-            );
-          } else {
-            effectivePlanChecklist = mergeResult.content;
-            // Part 11 item 13c (event-driven half): an `applyReviewerVerifiedTicks`
-            // card is only defensible while `deriveApplicableVerifiedTicksV1`
-            // still finds unapplied reviewer-verified ticks against the
-            // CURRENT plan-final.md (chatView.ts's render-time safety net
-            // predicate). This round's own merge just changed plan-final.md's
-            // tick state, so any such card for this task may already be
-            // stale — withdraw here rather than waiting for the next render.
-            await withdrawWorkflowDecisionsByKeyV1(
-              { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
-              "applyReviewerVerifiedTicks",
-              "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
-            );
-            // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
-            // round verified as already complete rather than built itself —
-            // recorded in the run log, next to the rest of the round's
-            // evidence, so the claim is auditable rather than indistinguishable
-            // from an ordinary this-round tick.
-            if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
-              const existingLog = await readTextIfExists(logUri);
-              if (existingLog !== undefined) {
-                const retroSection =
-                  "\n\n## Retroactive plan ticks\n\n" +
-                  "Items ticked this round via a retroactive claim (verified complete from an " +
-                  "earlier round, not built this round):\n\n" +
-                  mergeResult.retroactiveTicks
-                    .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
-                    .join("\n");
-                await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
-              }
-            }
-          }
-        } else if (mergeResult.kind === "no-match") {
-          // The round reported ticked items, but none matched any item in the
-          // plan of record — a silent no-op here would be indistinguishable
-          // from a round that genuinely made no progress. Surfaced rather than
-          // swallowed so a corrupted or reworded echo is visible instead of
-          // quietly stalling the plan.
-          NotificationRouter.showWarning(
-            "⚠️ The implementation round reported checklist progress that did not match any " +
-              "item in the plan of record, so no boxes were ticked. Unmatched: " +
-              mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")
-          );
-        }
-        // "unchanged" / "no-report" behave as the old undefined case did: no
-        // write, no warning.
-      }
-
-      // Bounded automatic checklist reconciliation evidence-gathering
-      // (workflow 8, item 2 / plan Part 4): a runner-synthesized round has no
-      // echo to merge above — the sealed edit pipeline returns tool-call
-      // receipts, not prose — so its checklist state is otherwise ALWAYS
-      // "unrecorded" and latches checklistProgressUnreliable below, even when
-      // an implementation review already on file verified the exact plan
-      // items this round's edits complete. Gather that evidence once, from
-      // hard evidence only (never from this round's own diff or intent — see
-      // `runAutomaticChecklistReconciliationV1`'s doc comment) — but 2026-08-21
-      // NINTH review round: NEVER write it. plan-final.md is untouched here;
-      // the evidence is surfaced to the operator via
-      // `postReconcilePlanChecklistDecisionV1` below, and only an explicit
-      // selection there (`applyReconciliationReviewVerifiedTicksV1`) can turn
-      // it into a tick. Never run for a model-authored round: those either
-      // echo the checklist themselves (merged/no-match/unchanged above) or
-      // are a rejected summary, a different failure class this part does not
-      // touch.
-      if (planChecklist !== undefined && result.summaryIsSynthetic) {
-        automaticChecklistReconciliation = await runAutomaticChecklistReconciliationV1(
-          folderUri,
-          attributedFilesChanged,
-          // Only the sealed pipeline ever sets this (see
-          // ImplementationRunResult.appliedOperations's own doc comment); a
-          // model-authored round never reaches this branch at all
-          // (`result.summaryIsSynthetic` gates it), so this is never a stale
-          // carry-over from a different round's shape.
-          result.appliedOperations
-        );
-      }
+      await bankValidImplementationSummaryV1();
     } else {
       // Stamped HERE, next to the write it replaces, rather than beside the
       // warning further down: a round can fail its type-check AND return a
@@ -13282,7 +13309,18 @@ async function buildReviewResumeVariablesV1(
   workspaceUri: vscode.Uri,
   targetStage: TaskStage,
   operationToken: vscode.CancellationToken | undefined
-): Promise<{ ok: true; variables: Record<string, string> } | { ok: false; warning: string }> {
+): Promise<
+  | { ok: true; variables: Record<string, string> }
+  | {
+      ok: false;
+      warning: string;
+      /** See `runReviewForFolder`'s matching unusable-summary branch — the
+       * "Restore Last Usable Summary" action, offered here too when
+       * `impl-summary_prev.md` is itself usable (2026-09-15 post-freeze
+       * findings, item 3). */
+      actionCommand?: { command: string; title: string; args?: unknown[] };
+    }
+> {
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
 
@@ -13327,11 +13365,29 @@ async function buildReviewResumeVariablesV1(
       };
     }
     if (isUnusableImplementationSummaryV1(implementationContent)) {
+      // See `runReviewForFolder`'s matching branch's doc comment.
+      const previousImplSummary = await readTextIfExists(
+        previousVersionUri(getImplementationSummaryUri(folderUri))
+      );
+      const canRestorePreviousImplSummary =
+        previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       return {
         ok: false,
         warning:
           "The last implementation round did not produce usable implementation notes, so there is " +
-          "nothing to review it against. Run the implementation step again to produce them.",
+          "nothing to review it against. " +
+          (canRestorePreviousImplSummary
+            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
+            : "Run the implementation step again to produce them."),
+        ...(canRestorePreviousImplSummary
+          ? {
+              actionCommand: {
+                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                title: "Restore Last Usable Summary",
+                args: [folderUri.fsPath, targetStage],
+              },
+            }
+          : {}),
       };
     }
     variables.implementation = implementationContent;
@@ -13454,7 +13510,13 @@ export async function resumeReviewInteractionV1(
       cancellationToken
     );
     if (!variablesResult.ok) {
-      NotificationRouter.showWarning(variablesResult.warning);
+      NotificationRouter.showWarning(
+        variablesResult.warning,
+        undefined,
+        undefined,
+        undefined,
+        variablesResult.actionCommand
+      );
       // 2026-08-27 review, same blocker as the "no configured model" early
       // return in `runReviewForFolder`: this happens before `coordinator.resumeAction`
       // is ever called, so `handleReviewOutcomeV1`'s safety net never runs and
