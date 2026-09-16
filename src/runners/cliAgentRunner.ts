@@ -1876,6 +1876,19 @@ export const MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1 = 64 * 1024 * 1024;
 export const MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1 = 64 * 1024;
 
 /**
+ * Cheap, provider-agnostic textual signature of a structured terminal
+ * diagnostic line — Codex's `{"type":"error",...}` / `{"type":"turn.failed",
+ * ...}` events (the two the plan names explicitly), and the same shape any
+ * other structured-stream provider uses for its own terminal failure event.
+ * Deliberately a plain substring/regex test, not a JSON parse: this runs on
+ * every completed line as it arrives (see
+ * `createBoundedStdoutTailForDiagnosisV1`'s `push`), so it must stay cheap
+ * regardless of throughput, and a false-positive match only ever causes an
+ * extra (harmless) line to be latched, never a lost one.
+ */
+const TERMINAL_DIAGNOSTIC_LINE_SIGNATURE_V1 = /"type"\s*:\s*"(error|turn\.failed)"/;
+
+/**
  * A byte-bounded, line-safe tail of a CLI's raw stdout, built incrementally
  * as chunks arrive. Bounding by COMPLETE LINES rather than raw bytes means a
  * terminal structured-event line (Codex's `error`/`turn.failed` pair, or any
@@ -1893,6 +1906,25 @@ export const MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1 = 64 * 1024;
  * exists to keep. That partial line is itself defensively capped at
  * `maxBytes` (approximated in UTF-16 code units) so a pathological single
  * huge line with no newlines at all cannot defeat the bound.
+ *
+ * 2026-09-15 post-freeze findings, item 4: the sliding window above only
+ * protects a terminal event from being split in half at the boundary — it
+ * does NOT protect one from being evicted entirely once enough LATER output
+ * arrives (a slow shutdown, trailing tool-cleanup chatter, etc. pushing the
+ * running total back over `maxBytes` after the failure line already
+ * scrolled out of the window). That is the literal "parse structured
+ * terminal diagnostics incrementally as chunks arrive" requirement: as each
+ * complete line arrives it is tested against
+ * `TERMINAL_DIAGNOSTIC_LINE_SIGNATURE_V1`, and a match is latched into a
+ * small, separate buffer that ordinary window eviction never touches, so the
+ * failure line survives regardless of how much unrelated output follows it.
+ * `snapshot()` prepends any latched line the current window no longer
+ * contains, so `toFriendlyError`'s own (post-hoc) structured-event parsing
+ * still finds it. The latch itself is capped far below `maxBytes` (terminal
+ * event lines are small — Codex's observed pair was 527 bytes total) so a
+ * pathological stream of matching-looking lines still cannot grow it
+ * unboundedly; the oldest latched line is evicted first, same discipline as
+ * the main window.
  * @internal exported for testing
  */
 export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
@@ -1903,6 +1935,9 @@ export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
   const lines: string[] = [];
   let bytes = 0;
   let remainder = "";
+  const latchedTerminalLines: string[] = [];
+  let latchedBytes = 0;
+  const maxLatchedBytes = Math.min(maxBytes, 16 * 1024);
   return {
     push(chunk: Buffer): void {
       const text = remainder + decoder.decode(chunk, { stream: true });
@@ -1914,6 +1949,14 @@ export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
       for (const line of parts) {
         lines.push(line);
         bytes += Buffer.byteLength(line, "utf8") + 1;
+        if (TERMINAL_DIAGNOSTIC_LINE_SIGNATURE_V1.test(line)) {
+          latchedTerminalLines.push(line);
+          latchedBytes += Buffer.byteLength(line, "utf8") + 1;
+          while (latchedBytes > maxLatchedBytes && latchedTerminalLines.length > 1) {
+            const removed = latchedTerminalLines.shift()!;
+            latchedBytes -= Buffer.byteLength(removed, "utf8") + 1;
+          }
+        }
       }
       // `lines.length > 1`, never `> 0`: a single line that is itself larger
       // than `maxBytes` (a terminal event bigger than the whole bound) must
@@ -1926,7 +1969,11 @@ export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
       }
     },
     snapshot(): string {
-      return [...lines, remainder].join("\n");
+      const windowed = [...lines, remainder].join("\n");
+      const survivingLatched = latchedTerminalLines.filter((line) => !lines.includes(line));
+      return survivingLatched.length > 0
+        ? [...survivingLatched, windowed].join("\n")
+        : windowed;
     },
   };
 }
@@ -2410,14 +2457,29 @@ export function createCliTextTransportV1(options: {
               // reported failure of this shape, which arrives entirely on
               // stdout. `rawEventChunks` itself is no longer needed once the
               // process has failed (only a successful exit ever unwraps it
-              // into a reply), so it is freed here rather than read.
+              // into a reply), so it is freed here rather than read — the
+              // bounded `diagnosisTail` snapshot below, not `rawEventChunks`,
+              // is what diagnosis actually parses, so nothing this failure
+              // path needs is lost by freeing it first.
               const rawStdoutForDiagnosis = diagnosisTail.snapshot();
+              // Parsed explicitly (rather than left to toFriendlyError's own
+              // default parameter) so this call site mirrors the legacy
+              // execCliAgent call's shape exactly: same five positional
+              // arguments, `parsedEvents` included, not implied.
+              const parsedEventsForDiagnosis = parseJsonLineEvents(rawStdoutForDiagnosis);
               rawEventChunks.length = 0;
               // Sanitized stderr accounting only (never its text): "exited 1,
               // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
               // different failures and were previously indistinguishable.
               const stderr = capture.stderrSummary();
-              const friendly = toFriendlyError(def, model, code, "", rawStdoutForDiagnosis);
+              const friendly = toFriendlyError(
+                def,
+                model,
+                code,
+                "",
+                rawStdoutForDiagnosis,
+                parsedEventsForDiagnosis
+              );
               // boundedTransportDetailV1 applies this type's own §2.2
               // redaction (bearer tokens, API keys, credential URIs, private
               // paths) on top of toFriendlyError's noise-stripping/truncation

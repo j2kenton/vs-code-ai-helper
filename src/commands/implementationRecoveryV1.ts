@@ -1314,12 +1314,7 @@ export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Prom
       return undefined;
     }
     discarded = true;
-    const {
-      implRecovery: _recovery,
-      pendingImplReviewFiles: _pending,
-      incompleteRoundContinuations: _continuations,
-      ...rest
-    } = current;
+    const { implRecovery: _recovery, pendingImplReviewFiles: _pending, ...rest } = current;
     return { ...rest, updatedAt: new Date().toISOString() };
   });
   return discarded;

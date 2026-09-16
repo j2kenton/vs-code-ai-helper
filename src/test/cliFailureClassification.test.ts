@@ -33,7 +33,7 @@ import { describe, it } from "node:test";
 
 import { __testOnly, createBoundedStdoutTailForDiagnosisV1 } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
-import { classifyCliFailure, isAuthenticationFailure, isModelEntitlementFailure, isTransportError } from "../utils/quota";
+import { classifyCliFailure, classifyFailure, isAuthenticationFailure, isModelEntitlementFailure, isQuotaError, isTransportError, parseQuotaResetV1 } from "../utils/quota";
 
 const {
   toFriendlyError,
@@ -44,6 +44,7 @@ const {
   unwrapJsonString,
   applyTransportTransience,
   truncateCliDetail,
+  parseJsonLineEvents,
 } = __testOnly;
 
 /** classifyCliFailure over a failed run, with the empty output such a run has. */
@@ -1509,5 +1510,139 @@ void describe("createBoundedStdoutTailForDiagnosisV1", () => {
     tail.push(bytes.subarray(0, splitPoint));
     tail.push(bytes.subarray(splitPoint));
     assert.equal(tail.snapshot(), text);
+  });
+
+  /**
+   * 2026-09-15 post-freeze findings, item 4 (incremental-parsing requirement):
+   * the sliding window alone only protects a terminal event from being split
+   * in half — it does NOT protect one from being evicted entirely once
+   * enough LATER output pushes the running total back over the bound. This
+   * is the scenario "parse ... incrementally as chunks arrive" exists to
+   * close: the terminal line must be latched the moment it is seen, not
+   * recovered after the fact from a window it has already scrolled out of.
+   */
+  void it("keeps a terminal event alive even after enough trailing output would evict it from the sliding window", () => {
+    const terminalEvent = JSON.stringify({
+      type: "turn.failed",
+      error: { message: "You've hit your usage limit. Try again at 4:12 PM." },
+    });
+    const tail = createBoundedStdoutTailForDiagnosisV1(60);
+    tail.push(Buffer.from(`${terminalEvent}\n`));
+    // Flood the window with enough later, unrelated output that the terminal
+    // line would normally scroll entirely out of a 60-byte window.
+    const filler = "x".repeat(80) + "\n";
+    for (let i = 0; i < 10; i++) {
+      tail.push(Buffer.from(filler));
+    }
+
+    const snapshot = tail.snapshot();
+    // Sanity check on the fixture itself: ten 81-byte filler lines (810
+    // bytes) alone are far more than the 60-byte bound, so the plain sliding
+    // window holds only the last one or two filler lines by the time
+    // snapshot() runs — the terminal event is nowhere near the tail end of
+    // the windowed portion, proving it really did scroll out and is only
+    // present because of the latch.
+    const windowedPortion = snapshot.slice(snapshot.indexOf(filler.trimEnd()));
+    assert.ok(
+      !windowedPortion.includes(terminalEvent),
+      "fixture sanity: the terminal event must have scrolled out of the plain window"
+    );
+    assert.ok(
+      snapshot.includes(terminalEvent),
+      "the terminal event must survive (via the latch) even though it scrolled out of the plain sliding window"
+    );
+    const parsedLine = snapshot.split("\n").find((line) => line.includes("turn.failed"));
+    assert.ok(parsedLine);
+    const parsed = JSON.parse(parsedLine) as { error: { message: string } };
+    assert.match(parsed.error.message, /usage limit/i);
+  });
+
+  void it("never lets a flood of matching-looking lines grow the terminal-event latch unboundedly", () => {
+    const tail = createBoundedStdoutTailForDiagnosisV1(1024);
+    for (let i = 0; i < 500; i++) {
+      tail.push(
+        Buffer.from(`${JSON.stringify({ type: "error", message: `noise ${String(i)}` })}\n`)
+      );
+    }
+    const snapshot = tail.snapshot();
+    // The latch is capped well below an unbounded 500-line accumulation;
+    // this is a coarse sanity bound, not an exact byte assertion.
+    assert.ok(snapshot.length < 20_000, `snapshot length ${String(snapshot.length)} must stay bounded`);
+    assert.ok(snapshot.includes("noise 499"), "the most recent matching line must still be present");
+  });
+});
+
+/**
+ * 2026-09-15 post-freeze findings, item 4, end-to-end: the sealed transport's
+ * whole failure-diagnosis pipeline — bounded tail -> parsed events ->
+ * toFriendlyError -> quota classification — for the exact Codex
+ * quota-exhaustion shape the finding reproduced live (a `turn.failed` event
+ * whose message reads "You've hit your usage limit ... or try again at
+ * 4:12 PM."). Proves the core complaint ("stderr 0 byte(s)" was the whole
+ * story) is actually fixed: the real provider message now survives all the
+ * way to a quota-classified diagnostic, not just that the bounded tail keeps
+ * the raw bytes (already covered above).
+ */
+void describe("sealed-transport quota diagnosis (2026-09-15 post-freeze findings, item 4)", () => {
+  const CODEX_LIKE = getCliProvider("codex-cli");
+
+  void it("carries a Codex turn.failed quota message through to a quota-classified friendly diagnostic", () => {
+    assert.ok(CODEX_LIKE, "expected codex-cli provider definition");
+    const quotaMessage =
+      "You've hit your usage limit. Upgrade to Pro, visit " +
+      "https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:12 PM.";
+    const stdout =
+      `${JSON.stringify({ type: "error", message: quotaMessage })}\n` +
+      `${JSON.stringify({ type: "turn.failed", error: { message: quotaMessage } })}\n`;
+
+    // Exactly the sealed transport's own non-zero-exit path: bound the tail,
+    // parse events from that (possibly truncated) snapshot, then diagnose —
+    // never the unbounded raw buffer.
+    const tail = createBoundedStdoutTailForDiagnosisV1(64 * 1024);
+    tail.push(Buffer.from(stdout));
+    const snapshot = tail.snapshot();
+    const parsedEvents = parseJsonLineEvents(snapshot);
+    const friendly = toFriendlyError(CODEX_LIKE, "gpt-5.6-sol", 1, "", snapshot, parsedEvents);
+
+    assert.match(
+      friendly.diagnosticText,
+      /usage limit/i,
+      "the real provider explanation must reach the friendly diagnostic text, not a bare byte count"
+    );
+    assert.ok(
+      !/stderr 0 byte/i.test(friendly.diagnosticText),
+      "must never fall back to a byte-count-only explanation when the real reason was captured"
+    );
+
+    const classified = classifyFailure({ errorMessage: friendly.diagnosticText });
+    assert.equal(
+      classified.failureKind,
+      "quota",
+      "the surviving message must classify as quota so the chain defers/parks instead of exhausting silently"
+    );
+    assert.ok(isQuotaError(friendly.diagnosticText), "isQuotaError must match on the surviving message text");
+  });
+
+  /**
+   * Documents a real gap rather than papering over it: `parseQuotaResetV1`
+   * only recognizes "resets HH:MM (TIMEZONE)" and "in N <unit>" phrasing (see
+   * quota.ts's parseClockTimeReset/parseRelativeDurationReset). The literal
+   * message this finding reproduced ("...or try again at 4:12 PM.", no
+   * "resets" keyword, no parenthesized timezone) matches NEITHER shape today.
+   * Quota classification and chain deferral still work (previous test) —
+   * only the reset-time extraction for THIS exact phrasing does not, and
+   * guessing at an unstated timezone to make it match would trade a silent
+   * failure for a silently wrong one. Left failing-fast/documented rather
+   * than "fixed" by a guess.
+   */
+  void it("does not (yet) extract a reset time from Codex's observed free-form 'try again at HH:MM' phrasing", () => {
+    const quotaMessage =
+      "You've hit your usage limit. Upgrade to Pro, visit " +
+      "https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:12 PM.";
+    assert.equal(
+      parseQuotaResetV1(quotaMessage, new Date("2026-09-07T12:00:00.000Z")),
+      undefined,
+      "this phrasing matches neither parseQuotaResetV1 shape today — a known, documented gap, not a regression"
+    );
   });
 });

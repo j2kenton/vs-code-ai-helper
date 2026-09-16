@@ -471,8 +471,15 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
     };
   }
 
+  // Lock-scope isolation: `withTaskLock` derives the shared session lock TWO
+  // levels above the task folder (see `taskFolderFixture.ts`'s
+  // `makeOwnedTaskFolder`). Nesting under `ROOT/tasks/<name>` instead of
+  // `ROOT/<name>` keeps that session lock inside this file's own private
+  // `ROOT` mkdtemp container instead of colliding with `os.tmpdir()` itself,
+  // where every other concurrently running test file's session lock would
+  // otherwise also land.
   function makeTaskFolder(name: string): { folderUri: vscode.Uri; folderPath: string } {
-    const folderPath = path.join(ROOT, name);
+    const folderPath = path.join(ROOT, "tasks", name);
     fs.mkdirSync(folderPath, { recursive: true });
     return { folderUri: vscode.Uri.file(folderPath), folderPath };
   }
@@ -586,7 +593,11 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
         const after = readProgress(folderPath);
         assert.equal(after.implRecovery, undefined);
         assert.equal(after.pendingImplReviewFiles, undefined);
-        assert.equal(after.incompleteRoundContinuations, undefined);
+        assert.equal(
+          after.incompleteRoundContinuations,
+          2,
+          "discard removes only the recovery record and quarantined pending-review paths — the continuation budget counter is unrelated state and must survive so a future recovery cannot restart its budget from zero"
+        );
         assert.ok(
           !(after.implReviewFiles ?? []).includes("src/should-not-be-reviewed.ts"),
           "a discarded continuation's files must never enter review scope — that is the difference from retiring"
