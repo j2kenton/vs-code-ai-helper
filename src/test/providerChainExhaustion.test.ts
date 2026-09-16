@@ -214,6 +214,36 @@ const QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
   ],
 };
 
+/**
+ * 2026-09-15 post-freeze findings, item 4, requirement 4: a chain where TWO
+ * ranked candidates were both quota-blocked, with different reset times, and
+ * the first-ranked one (Claude Code) is NOT the one that reopens soonest —
+ * proves the park record names the earliest reset across the whole chain,
+ * not merely the first quota-shaped candidate encountered in ranked order.
+ * Relative-duration phrasing ("resets in Nh") is used rather than clock-time
+ * phrasing so the ordering between the two candidates' resolved reset
+ * instants (`now + duration`) is invariant to the real wall-clock time the
+ * test happens to run at — the ordering between two `now`-relative durations
+ * never flips depending on `now`, unlike two fixed clock times.
+ */
+const MULTI_QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
+  stage: "impl-high-review",
+  candidates: [
+    {
+      storedModelId: "claude-cli:sonnet",
+      providerLabel: "Claude Code",
+      runnerId: "claude-cli",
+      reason: "You've hit your session limit, resets in 5h",
+    },
+    {
+      storedModelId: "codex-cli:gpt-5.6-sol",
+      providerLabel: "OpenAI Codex",
+      runnerId: "codex-cli",
+      reason: "You've hit your usage limit, resets in 1h",
+    },
+  ],
+};
+
 void describe("provider chain exhaustion (stage owner)", () => {
   void it("pauses the task with a reason naming the stage and exhausted chain, bumping updatedAt", async () => {
     const { folderPath, folderUri } = makeTaskFolder("exhausted_pause");
@@ -251,6 +281,23 @@ void describe("provider chain exhaustion (stage owner)", () => {
       persisted.quotaParkRecord?.resetAt,
       "the 12:10am reset phrase should have parsed to a resetAt"
     );
+  });
+
+  void it("picks the EARLIEST reset across multiple quota-blocked candidates, not merely the first ranked one", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_multi_quota_earliest");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", MULTI_QUOTA_EXHAUSTION);
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.ok(persisted.quotaParkRecord, "expected a quotaParkRecord to be persisted");
+    assert.equal(
+      persisted.quotaParkRecord?.providerId,
+      "codex-cli",
+      "the SECOND-ranked candidate reopens sooner (1h vs 5h) and must be the one parked on"
+    );
+    assert.equal(persisted.quotaParkRecord?.modelId, "codex-cli:gpt-5.6-sol");
   });
 
   void it("leaves quotaParkRecord unset when no candidate's reason was quota/entitlement-shaped", async () => {

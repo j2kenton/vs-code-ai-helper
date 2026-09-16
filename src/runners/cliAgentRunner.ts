@@ -399,6 +399,14 @@ interface CliFriendlyError {
    * don't all need updating — toFriendlyError itself always sets it.
    */
   quotaSignal?: boolean;
+  /**
+   * True when no real diagnostic content was found anywhere (parsed events,
+   * stderr, stdout) — `diagnosticText` is the bare "gave no reason" fallback.
+   * Lets a caller append supplemental evidence (e.g. captured byte counts)
+   * to an honestly-empty diagnosis without ever displacing real content that
+   * WAS found (2026-09-15 post-freeze findings, item 4, requirement 5).
+   */
+  hadNoDiagnosticContent?: boolean;
 }
 
 /** Bounded retry policy for transient CLI failures (timeouts). */
@@ -2490,10 +2498,20 @@ export function createCliTextTransportV1(options: {
               // which toFriendlyError never actually produces — its own
               // fallback is always a non-empty "exit code N" sentence — so
               // this is a defensive last resort, not the expected path).
+              // Requirement 5 (2026-09-15 post-freeze findings, item 4): when
+              // there is genuinely no reason to report, say so plainly and
+              // keep byte counts SUPPLEMENTAL rather than the whole story —
+              // this is the honest-empty case; a real diagnosis (the common
+              // path) never has bytes appended to it.
+              const boundedDiagnosis = boundedTransportDetailV1(friendly.diagnosticText, 1000);
               const detail =
-                boundedTransportDetailV1(friendly.diagnosticText, 1000) ??
-                `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
-                  `${stderr.truncated ? " (truncated)" : ""}`;
+                boundedDiagnosis === undefined
+                  ? `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
+                    `${stderr.truncated ? " (truncated)" : ""}`
+                  : friendly.hadNoDiagnosticContent
+                    ? `${boundedDiagnosis} (stdout ${String(rawStdoutForDiagnosis.length)} byte(s), ` +
+                      `stderr ${String(stderr.totalByteLength)} byte(s)${stderr.truncated ? ", truncated" : ""})`
+                    : boundedDiagnosis;
               finishTerminal({
                 kind: "transportFailure",
                 code: `cliExit.${String(code)}`,
@@ -2846,13 +2864,22 @@ function toFriendlyError(
     : truncateCliDetail(filteredStderr.filtered) || truncateCliDetail(filteredStdout.filtered);
   const benignNoiseHint =
     filteredStructuredDetail?.hint ?? filteredStderr.hint ?? filteredStdout.hint;
+  // 2026-09-15 post-freeze findings, item 4, requirement 5: "provider exited
+  // with code N and gave no reason" must be the stated explanation when
+  // neither stream nor parsed events contain one — not a bare "exit code N"
+  // fragment that reads as a truncated message rather than an honest "we
+  // don't know" — with byte counts kept supplemental (added by callers, e.g.
+  // the sealed transport's own stderr-byte-count detail) rather than
+  // standing in as the sole explanation.
+  const hadNoDiagnosticContent =
+    diagnosticTextOverride === undefined && !realDiagnosticContent && !benignNoiseHint;
   const diagnosticText =
     diagnosticTextOverride ??
     `${cliDisplayLabel(def)} CLI failed: ${
       realDiagnosticContent ||
       (benignNoiseHint
         ? `exit code ${exitCode ?? "unknown"} / no diagnostic output (${benignNoiseHint})`
-        : `exit code ${exitCode ?? "unknown"}`)
+        : `exit code ${exitCode ?? "unknown"} — the provider gave no reason`)
     }`;
   // No re-login hint for an entitlement block — the credential already
   // works. Advise switching the stage's model instead; the provider's own
@@ -2869,6 +2896,7 @@ function toFriendlyError(
     diagnosticText,
     retryableHint: structured?.retryable === true,
     quotaSignal: structured?.quotaSignal === true,
+    hadNoDiagnosticContent,
   };
 }
 

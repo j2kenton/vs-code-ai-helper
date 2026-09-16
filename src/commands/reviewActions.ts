@@ -4545,19 +4545,48 @@ export async function pauseTaskForExhaustedChainV1(
   // folding into the same generic "tried and failed" sentence every other
   // candidatesExhausted cause used (item 3b/companion finding, 2026-08-17/18:
   // several rounds of real spend were spent before the cause was legible).
-  const quotaCandidate = exhaustion.candidates
-    .map((candidate) => ({ candidate, classified: classifyFailure({ errorMessage: candidate.reason }) }))
-    .find(
+  // 2026-09-15 post-freeze findings, item 4, requirement 4 ("park with its
+  // reset time, not exhaust the chain" / "the earliest reset time when no
+  // candidate is currently runnable"): when more than one candidate in the
+  // chain was blocked by quota/entitlement, park on whichever one reopens
+  // SOONEST, not merely the first one encountered in ranked order — the
+  // first-ranked candidate could easily be the one with the longest wait,
+  // which would misreport how soon the task can actually resume. A
+  // candidate with a parseable resetAt always outranks one without: an
+  // unknown reset is worse information than a known one, however early it
+  // sorts numerically.
+  const quotaCandidates = exhaustion.candidates
+    .map((candidate) => ({
+      candidate,
+      classified: classifyFailure({ errorMessage: candidate.reason }),
+      resetAt: parseQuotaResetV1(candidate.reason, new Date()),
+    }))
+    .filter(
       ({ classified }) =>
         classified.failureKind === "quota" || classified.failureKind === "model-entitlement"
     );
+  const quotaCandidate = quotaCandidates.reduce<(typeof quotaCandidates)[number] | undefined>(
+    (earliest, current) => {
+      if (earliest === undefined) {
+        return current;
+      }
+      if (earliest.resetAt === undefined) {
+        return current.resetAt !== undefined ? current : earliest;
+      }
+      if (current.resetAt === undefined) {
+        return earliest;
+      }
+      return current.resetAt < earliest.resetAt ? current : earliest;
+    },
+    undefined
+  );
   const quotaParkRecord: QuotaParkRecordV1 | undefined = quotaCandidate
     ? {
         modelId: quotaCandidate.candidate.storedModelId,
         providerId: quotaCandidate.candidate.runnerId,
         accountKey: resolveQuotaAccountKeyV1(quotaCandidate.candidate.storedModelId),
         failureKind: quotaCandidate.classified.failureKind as "quota" | "model-entitlement",
-        resetAt: parseQuotaResetV1(quotaCandidate.candidate.reason, new Date()),
+        resetAt: quotaCandidate.resetAt,
         observedAt: new Date().toISOString(),
       }
     : undefined;

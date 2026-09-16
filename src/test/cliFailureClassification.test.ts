@@ -1624,25 +1624,34 @@ void describe("sealed-transport quota diagnosis (2026-09-15 post-freeze findings
   });
 
   /**
-   * Documents a real gap rather than papering over it: `parseQuotaResetV1`
-   * only recognizes "resets HH:MM (TIMEZONE)" and "in N <unit>" phrasing (see
-   * quota.ts's parseClockTimeReset/parseRelativeDurationReset). The literal
-   * message this finding reproduced ("...or try again at 4:12 PM.", no
-   * "resets" keyword, no parenthesized timezone) matches NEITHER shape today.
-   * Quota classification and chain deferral still work (previous test) —
-   * only the reset-time extraction for THIS exact phrasing does not, and
-   * guessing at an unstated timezone to make it match would trade a silent
-   * failure for a silently wrong one. Left failing-fast/documented rather
-   * than "fixed" by a guess.
+   * `parseQuotaResetV1` now also recognizes the free-form "try again at
+   * HH:MM" shape (parseTryAgainAtReset in quota.ts), interpreting the
+   * unqualified time as this process's local timezone — the same
+   * convention `toLocaleString()` already applies wherever a resolved reset
+   * time is displayed to the user. No timezone is invented; an unqualified
+   * time is read the same way it always is in this codebase.
    */
-  void it("does not (yet) extract a reset time from Codex's observed free-form 'try again at HH:MM' phrasing", () => {
+  void it("extracts a reset time from Codex's observed free-form 'try again at HH:MM' phrasing", () => {
     const quotaMessage =
       "You've hit your usage limit. Upgrade to Pro, visit " +
       "https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:12 PM.";
-    assert.equal(
-      parseQuotaResetV1(quotaMessage, new Date("2026-09-07T12:00:00.000Z")),
-      undefined,
-      "this phrasing matches neither parseQuotaResetV1 shape today — a known, documented gap, not a regression"
-    );
+    const now = new Date("2026-09-07T12:00:00.000Z");
+    const resetAt = parseQuotaResetV1(quotaMessage, now);
+    assert.ok(resetAt, "the free-form 'try again at HH:MM' phrasing must now resolve to a reset time");
+    const resetDate = new Date(resetAt);
+    assert.equal(resetDate.getHours(), 16, "4:12 PM must resolve to local hour 16");
+    assert.equal(resetDate.getMinutes(), 12);
+    assert.ok(resetDate.getTime() > now.getTime(), "the resolved reset time must be in the future relative to `now`");
+  });
+
+  void it("rolls 'try again at HH:MM' to tomorrow when today's occurrence has already passed", () => {
+    const quotaMessage = "You've hit your usage limit. Try again at 4:12 PM.";
+    const now = new Date();
+    now.setHours(23, 0, 0, 0);
+    const resetAt = parseQuotaResetV1(quotaMessage, now);
+    assert.ok(resetAt, "expected a resolved reset time");
+    const resetDate = new Date(resetAt);
+    assert.ok(resetDate.getTime() > now.getTime(), "a 4:12 PM occurrence earlier than 11pm today must roll to tomorrow");
+    assert.equal(resetDate.getHours(), 16);
   });
 });
