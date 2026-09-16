@@ -23,6 +23,7 @@
  * These are opaque host-issued identifiers, not paths or anything derivable.
  * Stating them verbatim is the whole contract.
  */
+import { MAX_READ_FILE_BYTES_V1 } from "../types/workflowToolProtocolV1";
 
 /** Everything the model must know before it can plan a single edit. */
 export interface PreflightToolSessionPreambleInputV1 {
@@ -168,6 +169,14 @@ export function buildPreflightToolSessionPreambleV1(
     "`..`. Use `ensemble_readDirectory` with an empty `relativePath` to list the",
     "root.",
     "",
+    "`ensemble_readFile` takes an optional `startLine`/`endLine` to read only part",
+    "of a file. Prefer that for large files: this session has a limited number of",
+    "tool rounds, and a file over " + `${MAX_READ_FILE_BYTES_V1 / 1024} KB` + " can only be read in ranges. A",
+    "ranged result is exact file text, so it is a valid source for `findText`, and",
+    "its observation authorizes a `patchFile` or `deleteFile` on that file. It does",
+    "NOT authorize `replaceFile`: a plan that replaces a file from a line-range",
+    "observation is rejected, because it would delete every line you did not read.",
+    "",
     "`ensemble_findFiles` and `ensemble_textSearch` are discovery only. Their",
     "observations can NEVER authorize an operation — only `ensemble_readFile`,",
     "`ensemble_stat` and `ensemble_readDirectory` can. Locate a candidate with",
@@ -181,7 +190,9 @@ export function buildPreflightToolSessionPreambleV1(
     "match the state the operation assumes, or the plan is rejected:",
     "",
     "  - `createFile` / `createDirectory` require an observation of kind `missing`",
-    "  - `patchFile` / `replaceFile` / `deleteFile` require an observation of kind `file`",
+    "  - `patchFile` / `replaceFile` / `deleteFile` require an observation of kind `file`;",
+    "    `replaceFile` additionally requires a WHOLE-file `ensemble_readFile` of that path",
+    "    (not a stat, not a line range), since it overwrites everything",
     "  - `deleteEmptyDirectory` requires an observed, provably empty directory",
     "",
     "So stat a path you intend to create even when you expect it to be absent — the",
@@ -271,11 +282,22 @@ export function buildWorkspaceReadSessionPreambleV1(input: { readonly rootId: st
     "",
     "Tools available to you (read-only — nothing here can modify anything):",
     "",
-    "  - `ensemble_readFile` — read one file by exact root-relative path",
+    "  - `ensemble_readFile` — read one file by exact root-relative path, or only",
+    "    part of it with `startLine` and `endLine`",
     "  - `ensemble_stat` — check whether a path exists and what kind it is",
     "  - `ensemble_readDirectory` — list one directory's entries",
     "  - `ensemble_findFiles` — find files whose path contains a substring",
     "  - `ensemble_textSearch` — search file contents for a literal string",
+    "",
+    "### Read line ranges, not whole files",
+    "",
+    "This session has a limited number of tool rounds, and every file you read is",
+    "carried in the conversation from then on. So when the prompt names changed",
+    "regions as line ranges (\"lines 2728-2788\"), read exactly those ranges with",
+    "`startLine`/`endLine` — widen by a few lines if you need context — instead",
+    "of the whole file. A file over " + `${MAX_READ_FILE_BYTES_V1 / 1024} KB` + " can only be read in ranges.",
+    "Request several ranges in the same step where you can: several tool calls in",
+    "one reply cost one round.",
     "",
     "Every call takes `rootId`. Exactly one root is registered:",
     "",

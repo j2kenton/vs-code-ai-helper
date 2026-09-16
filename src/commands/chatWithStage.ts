@@ -57,6 +57,21 @@ import { resolveMarkdownUpdateTarget as resolveMarkdownUpdateTargetV1 } from "..
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendBlockerSupersession } from "../utils/taskProgressTransforms";
+import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
+  acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
+  beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
+  describeTargetResolutionWriteFailureV1,
+  describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
+  revokeWorkAdmissionHandoffV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -368,23 +383,287 @@ export async function chatWithStage(
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
-  const validated = await validateChatSendV1(inventory, resolverArg, stage);
-  if (!validated.ok) {
-    NotificationRouter.showWarning(validated.reason);
-    return;
-  }
-  const { task, targetStage } = validated;
-  if (!message?.trim()) {
-    await chatViewProvider.open({
-      canonicalId: task.canonicalId,
-      taskFolderPath: task.taskFolderPath,
-      stage: targetStage,
-      taskName: task.progress.displayName,
-    });
-    return;
-  }
-  if (!(await ensureAiConsent(context))) return;
 
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE task resolution and the consent gate
+  // whenever a message is actually being sent (an empty message only opens
+  // the chat view — no provider dispatch, nothing to protect) and the target
+  // folder is known synchronously from `explicitArg` — mirrors
+  // runReviewWithAI/runLintingFixes. This route matters more than most: it is
+  // the one stage-action button left reachable on a PAUSED task (see
+  // `registerChatWithStageCommand`'s own comment below on
+  // `respondToStageDecision`), so it must not itself be vulnerable to the
+  // exact setup-phase watchdog race this module exists to close. Chat Resume
+  // of a `chatSend.v1` question is already covered by chatView.ts's own
+  // shared admission acquisition ahead of every resume handler, so only this
+  // direct-invocation path needs its own.
+  const wantsSend = !!message?.trim();
+  // 2026-09-10 review blockers (new), mirroring runPublishChecks/
+  // commitAndPushTask's already-fixed shape:
+  //  - a `wantsSend` invocation whose folder is not known synchronously
+  //    (canonicalId-only, or a resolver-aware caller with no explicit path)
+  //    previously ran `validateChatSendV1`'s `resolveTaskContext` call with
+  //    NO protection at all. `beginTargetResolutionV1` now stands the whole
+  //    sweep pass down across that resolution, whether or not an early guess
+  //    exists.
+  //  - `resolverArg?.taskFolderPath` is an UNVALIDATED raw path; if it
+  //    targets a different folder than `validateChatSendV1` authoritatively
+  //    resolves to, the early admission is released and reacquired for the
+  //    REAL target instead of protecting the wrong one.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = wantsSend
+    ? await beginTargetResolutionV1(taskRootCandidatePathsV1)
+    : undefined;
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle && targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): no durable
+  // protection at all (not even a foreign window's) could be confirmed for
+  // this resolution window after exhausting retries — see
+  // `TargetResolutionHandleV1.unprotectedRootPaths`'s doc comment for why
+  // this is a same-tick verification, not a new wait, and safe to fail
+  // dispatch on immediately rather than proceed into setup unprotected.
+  if (targetResolutionHandle && targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-10 round: `resolverArg?.taskFolderPath` is a raw, unvalidated
+  // caller-supplied path — `validateChatSendV1`'s `resolveTaskContext` call
+  // performs the real ownership/containment/workspace-binding validation,
+  // but this early guess runs BEFORE any of that. A synchronous containment
+  // check against `resolveTaskRootCandidates()` was tried here and reverted
+  // the same round: it depends on `vscode.workspace.workspaceFolders` being
+  // configured exactly in step with wherever the caller's raw path actually
+  // points, which real callers (and this route's own unit tests, using a
+  // bare temp directory with no configured workspace folder) are not
+  // guaranteed to be — it silently skipped early admission for legitimate
+  // candidates, reopening exactly the unprotected setup-phase window this
+  // helper exists to close, which is worse than the narrower gap it aimed to
+  // close. `acquireEarlyWorkAdmissionForCandidatePathV1` still does not
+  // replace the real ownership/containment/workspace-binding validation
+  // `validateChatSendV1` performs below, so the underlying architectural
+  // blocker only shrinks in blast radius.
+  //
+  // 2026-09-11 round (review architectural blocker `d620c877...-1`,
+  // narrowed further): passing `taskRootCandidatePathsV1` as
+  // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
+  // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
+  // repeating the reverted gate. 2026-09-14 (`d620c877...-1`, closed): when
+  // `taskRootCandidatePathsV1` is explicitly empty (no workspace open),
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` now verifies the
+  // candidate's own persisted ownership record before acquiring — see that
+  // function's own doc comment. A path this window's `workspaceFolders`
+  // snapshot has not caught up to is unaffected as long as its ownership
+  // verifies; the previously unconditional "always acquired" no longer
+  // applies to a candidate whose ownership does not.
+  const earlyFolderPath = wantsSend ? resolverArg?.taskFolderPath : undefined;
+  // 2026-09-10 round (re-fixed per review directive "fix these in the shared
+  // admission helper, not per route"): the validation-before-bookkeeping
+  // check now lives once in `acquireEarlyWorkAdmissionForCandidatePathV1`
+  // instead of being duplicated per route — see draftTaskWithAI.ts's
+  // identical call site. It does not replace the real ownership/containment/
+  // workspace-binding validation `validateChatSendV1` performs below, so the
+  // underlying architectural blocker only shrinks in blast radius.
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "chatWithStage",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
+  if (early && early.outcome !== "acquired") {
+    if (targetResolutionHandle) {
+      await endTargetResolutionV1(targetResolutionHandle);
+    }
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
+
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    if (handle) {
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
+    }
+  };
+
+  // 2026-09-10 review completion blocker fix (`d620c877...-2`): resolution
+  // protection used to end as soon as `validateChatSendV1` settled — BEFORE
+  // the (unbounded) consent modal and the late per-task admission
+  // acquisition that both follow it — so a canonical-ID/no-path invocation
+  // (no early guess) had NO protection at all for the whole consent window.
+  // Protection now stays live, guarded so it ends exactly once, until either
+  // this command decides it will not enter the send path (validation failed,
+  // no message to send, consent declined) or per-task admission has taken
+  // over for the authoritative target.
+  let targetResolutionEnded = !targetResolutionHandle;
+  const endTargetResolutionOnceV1 = async (): Promise<void> => {
+    if (targetResolutionEnded) {
+      return;
+    }
+    targetResolutionEnded = true;
+    await endTargetResolutionV1(targetResolutionHandle);
+  };
+
+  let dispatch: ChatSendDispatchV1 | undefined;
+  try {
+    const validated: ChatSendValidationResultV1 = await validateChatSendV1(inventory, resolverArg, stage);
+    if (!validated.ok) {
+      await endTargetResolutionOnceV1();
+      NotificationRouter.showWarning(validated.reason);
+      return;
+    }
+    const { task, targetStage } = validated;
+    if (!message?.trim()) {
+      await endTargetResolutionOnceV1();
+      await chatViewProvider.open({
+        canonicalId: task.canonicalId,
+        taskFolderPath: task.taskFolderPath,
+        stage: targetStage,
+        taskName: task.progress.displayName,
+      });
+      return;
+    }
+    if (!(await ensureAiConsent(context))) {
+      await endTargetResolutionOnceV1();
+      return;
+    }
+
+    // The early guess above can target the wrong task — release it and fall
+    // through to the ordinary late-acquisition path below, which acquires
+    // for the AUTHORITATIVE, now-validated folder.
+    if (handle && handle.taskFolderPath !== task.taskFolderPath) {
+      await releaseCurrentAdmissionV1();
+    }
+
+    if (!handle) {
+      const late = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "admission",
+        commandId: "chatWithStage",
+      });
+      if (late.outcome !== "acquired") {
+        await endTargetResolutionOnceV1();
+        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        return;
+      }
+      handle = late.handle;
+      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    }
+
+    // Per-task admission is now live for the authoritative target — the
+    // best-effort cross-window resolution guard has served its purpose and
+    // can end; per-task admission takes over protection from here.
+    await endTargetResolutionOnceV1();
+
+    // Admission is now guaranteed live for this exact target — reverse a
+    // watchdog-provenance pause (never a user pause) before any further
+    // setup, exactly like runReviewWithAI/runLintingFixes.
+    //
+    // 2026-09-10 review completion blocker (new): the reconciliation result
+    // was previously discarded — a genuine `userPaused`/`unreadable` outcome
+    // must stop this command, exactly as runPublishChecks/
+    // completeCommitAndPushTask already do.
+    const chatReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
+    if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Chat send is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
+
+    dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message);
+
+    // 2026-09-10 review completion blocker fix (`d620c877...-2`): `triggerStageAI`
+    // is the one pinned stage action that starts real work — it goes through
+    // an (unbounded) confirmation modal and a downstream
+    // `applyCurrentStageAction` dispatch before the actual admission-wired
+    // stage command ever gets a chance to acquire its own, so that whole
+    // window used to run with NO admission for this task at all. Kept alive
+    // through this dispatch ONLY for that action id, and handed off via a
+    // single-use token (`dispatchProposedStageActionV1`'s own
+    // `authorizeWorkAdmissionHandoffV1` call) instead of racing a fresh
+    // genesis against it. The other three pinned actions
+    // (`completeStage`/`setTaskStage`/`completeTask`) are deterministic
+    // status writes with no admission-wired route of their own
+    // (`workAdmissionRouteInventoryV1.ts`) — except `completeStage`, which
+    // can reach `scheduleAutomationChain` and, through it, an
+    // admission-wired review/implementation dispatch with no handoff token
+    // threaded that deep. Admission is released before those, exactly as
+    // before this fix, so an already-admission-wired downstream command
+    // never sees this call's marker as a live foreign `busy` owner.
+    const proposedActionNeedsAdmissionHandoffV1 = dispatch?.proposedAction?.id === "triggerStageAI";
+    if (!proposedActionNeedsAdmissionHandoffV1) {
+      await releaseCurrentAdmissionV1();
+    }
+    if (dispatch?.proposedAction) {
+      await dispatchProposedStageActionV1(
+        context,
+        inventory,
+        currentTaskStore,
+        chatViewProvider,
+        dispatch.task.taskFolderPath,
+        dispatch.task.canonicalId,
+        dispatch.targetStage,
+        dispatch.proposedAction
+      );
+    }
+    if (dispatch?.proposedBlockerSupersessionEdit) {
+      await dispatchProposedBlockerSupersessionEditV1(
+        chatViewProvider,
+        dispatch.task.taskFolderPath,
+        dispatch.task.canonicalId,
+        dispatch.targetStage,
+        dispatch.proposedBlockerSupersessionEdit,
+        dispatch.proposedBlockerSupersessionEditAt
+      );
+    }
+  } finally {
+    // Safety net: any exception path above that did not reach one of the
+    // explicit `endTargetResolutionOnceV1()` calls (e.g. a thrown error from
+    // `validateChatSendV1` or the consent gate) must still release the
+    // resolution guard here, exactly like draftTaskWithAI.ts's identical
+    // outer-finally safety net. Admission itself is released only now, after
+    // both dispatch calls above have settled.
+    await endTargetResolutionOnceV1();
+    await releaseCurrentAdmissionV1();
+  }
+}
+
+interface ChatSendDispatchV1 {
+  readonly task: ResolvedTaskContext;
+  readonly targetStage: TaskStage;
+  readonly proposedAction: StageChatActionProposal | undefined;
+  readonly proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
+  readonly proposedBlockerSupersessionEditAt: string | undefined;
+}
+
+/**
+ * The actual send: everything that used to run directly inside
+ * `chatWithStage` after the consent gate, unchanged, extracted only so
+ * admission's `finally` (above it, in `chatWithStage`) can wrap it without
+ * also wrapping the proposed-action dispatches that intentionally run AFTER
+ * admission is released (see `chatWithStage`'s own call site). Returns what
+ * to dispatch instead of dispatching it directly, for the same reason.
+ */
+async function chatWithStageSendV1(
+  chatViewProvider: ChatViewProvider,
+  task: ResolvedTaskContext,
+  targetStage: TaskStage,
+  message: string
+): Promise<ChatSendDispatchV1 | undefined> {
   const lockKey = task.taskFolderPath;
   let proposedAction: StageChatActionProposal | undefined;
   let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
@@ -573,28 +852,7 @@ export async function chatWithStage(
     return;
   }
 
-  if (proposedAction) {
-    await dispatchProposedStageActionV1(
-      context,
-      inventory,
-      currentTaskStore,
-      chatViewProvider,
-      task.taskFolderPath,
-      task.canonicalId,
-      targetStage,
-      proposedAction
-    );
-  }
-  if (proposedBlockerSupersessionEdit) {
-    await dispatchProposedBlockerSupersessionEditV1(
-      chatViewProvider,
-      task.taskFolderPath,
-      task.canonicalId,
-      targetStage,
-      proposedBlockerSupersessionEdit,
-      proposedBlockerSupersessionEditAt
-    );
-  }
+  return { task, targetStage, proposedAction, proposedBlockerSupersessionEdit, proposedBlockerSupersessionEditAt };
 }
 
 /**
@@ -647,18 +905,33 @@ export async function dispatchProposedStageActionV1(
     );
     return;
   }
-  const outcome = await executeProposedAction(
-    {
-      inventory,
-      currentTaskStore,
-      assistantFolderUri: vscode.Uri.file(taskFolderPath),
-      pendingOperations: new PendingOperationsStore(context.workspaceState),
-    },
-    {
-      operationId: action.id,
-      payload: buildStageActionPayload(action, taskFolderPath, proposedAction.payload),
-    }
-  );
+  // 2026-09-10 review completion blocker fix (`d620c877...-2`): this call's
+  // caller (`chatWithStage`) keeps its own live admission for `taskFolderPath`
+  // open through this whole dispatch instead of releasing it beforehand, and
+  // hands that admission off here rather than leaving `triggerStageAI`'s
+  // confirmation modal and downstream `applyCurrentStageAction` dispatch
+  // unprotected. Mint immediately before the call that can adopt it and
+  // revoke once it settles, mirroring `resumeThenDispatchV1`'s identical
+  // mint/dispatch/revoke shape.
+  const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
+  let outcome: string;
+  try {
+    outcome = await executeProposedAction(
+      {
+        inventory,
+        currentTaskStore,
+        assistantFolderUri: vscode.Uri.file(taskFolderPath),
+        pendingOperations: new PendingOperationsStore(context.workspaceState),
+        admissionHandoffTokenV1: handoffToken,
+      },
+      {
+        operationId: action.id,
+        payload: buildStageActionPayload(action, taskFolderPath, proposedAction.payload),
+      }
+    );
+  } finally {
+    revokeWorkAdmissionHandoffV1(taskFolderPath);
+  }
   await chatViewProvider.append("assistant", outcome, targetStage, chatTarget);
 }
 

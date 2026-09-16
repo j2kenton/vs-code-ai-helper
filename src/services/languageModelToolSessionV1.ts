@@ -66,6 +66,8 @@ export interface CopilotLmToolSessionOptionsV1 {
   readonly roundTimeoutMs?: number;
   /** Model-enumeration deadline override for tests. */
   readonly modelSelectionTimeoutMs?: number;
+  /** Per-call `countTokens` deadline override for tests. */
+  readonly countTokensTimeoutMs?: number;
 }
 
 /**
@@ -160,6 +162,256 @@ export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
  */
 const MAX_NARRATION_NUDGES_V1 = 2;
 
+/**
+ * How many rounds before the cap a text or preflight session starts being told
+ * how many remain.
+ *
+ * Without it the model has no idea the cap exists: on 2026-09-15 a Copilot
+ * High-Level Code Review (gpt-5.6-sol) spent all 64 rounds reading, every
+ * request succeeding, and ended in `toolRoundLimitExceeded` with nothing to
+ * show for it (v1 fixes 2, item 26). Six gives room to finish a last batch of
+ * reads and still answer.
+ */
+export const TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1 = 6;
+
+/** The notice appended after a round when `roundsLeft` rounds remain. */
+export function toolRoundWindDownNoticeV1(roundsLeft: number): string {
+  if (roundsLeft <= 1) {
+    return (
+      "Tool round limit: your next reply is the LAST one this session allows. If it calls a tool, " +
+      "the session ends with no result and everything you have read is lost. Reply now with your " +
+      "complete final result frame, as the result contract requires, based on what you have " +
+      "already read. Where you could not verify something, say so in the result as a confidence " +
+      "limitation."
+    );
+  }
+  return (
+    `Tool round limit: ${roundsLeft} rounds remain in this session. Read only what your answer ` +
+    "still depends on, putting the remaining reads in as few replies as you can, then reply with " +
+    "your complete final result frame. A session that runs out of rounds produces no result at all."
+  );
+}
+
+/**
+ * Share of the model's advertised `maxInputTokens` this session lets its own
+ * conversation occupy before it starts shedding old tool results.
+ *
+ * Why the session must police this itself (v1 fixes 2, item 17): Copilot's LM
+ * provider renders every request through prompt-tsx under the model's prompt
+ * budget, and when the conversation is over budget it does NOT fail — it
+ * prunes, oldest message first. The first casualty is the original prompt;
+ * the next is the first assistant turn, whose tool calls vanish while their
+ * tool results survive. The Responses API then rejects the orphaned result:
+ * `400 No tool call found for function call output with call_id …`.
+ * Observed 2026-09-11 on two consecutive High-Level Code Reviews
+ * (gpt-5.6-sol@high) of a change spanning ~1.3 MB of source; the same model
+ * had succeeded 45 minutes earlier on a review that read less. It looked
+ * like quota and was not.
+ *
+ * The remainder of the limit is headroom for what the provider adds on top
+ * of these messages. In Copilot's provider that is its own system prompt,
+ * the tool schemas and a 3-token constant (`modelMaxPromptTokens − base −
+ * 3 − tool tokens`, Copilot Chat 0.65.0) — a few thousand tokens at most.
+ *
+ * Was 0.7 against a pessimistic byte estimate, which together cut at roughly
+ * 55% of the real window: on 2026-09-11 16:50 a review whose third round read
+ * several large files was refused at ~108k *estimated* tokens — about 80k
+ * real, comfortably inside the window. Sizes now come from the provider's own
+ * tokenizer (`countTokensV1`), so the margin can be the provider's overhead
+ * rather than the estimate's error.
+ */
+export const TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1 = 0.85;
+
+/**
+ * Ceiling on the input size the budget above is taken from, whatever the
+ * model advertises.
+ *
+ * `maxInputTokens` is NOT the limit Copilot enforces. For a model with
+ * long-context pricing, Copilot's model configuration offers a "Context
+ * Size" whose default is the smaller standard window; VS Code core
+ * (`sendChatRequest` → `getModelConfiguration`) fills schema defaults into
+ * every request, extension requests included, and Copilot's provider clones
+ * the endpoint down to that size before rendering. `maxInputTokens`, though,
+ * reports the full long-context maximum. Budgeting 70% of the advertised
+ * figure therefore still overran the real window, and the 2026-09-11 15:42
+ * review failed exactly as before, after 15 rounds, on a build that shed
+ * against the advertised number.
+ *
+ * The extension API exposes no way to read the effective window, so this
+ * is a fixed ceiling every Copilot chat model's default window clears.
+ *
+ * It applies to `@…+long` selections too, deliberately. That suffix becomes
+ * `modelOptions.model_context_window` (`buildCopilotRequestOptions`), but
+ * Copilot's LM provider never reads it: the window comes only from the
+ * request's `modelConfiguration.contextSize`, and the provider passes on just
+ * `stop`/`temperature`/`max_tokens`/penalty keys from `modelOptions`
+ * (checked in Copilot Chat 0.65.0). A `+long` session therefore runs in the
+ * default window like any other, and must be budgeted like one.
+ */
+export const MAX_TOOL_SESSION_CONTEXT_TOKENS_V1 = 128_000;
+
+/**
+ * How many times one round may be re-sent after the provider rejects it for
+ * an orphaned tool result. That rejection means the conversation was over
+ * the provider's real window despite the budget, so each retry first sheds
+ * down to half the conversation's current size.
+ */
+const MAX_ORPHANED_RESULT_RETRIES_V1 = 2;
+
+/**
+ * The provider's rejection when its own over-budget pruning removed a tool
+ * call but kept that call's result — see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1.
+ */
+export function isOrphanedToolResultRejectionV1(detail: string | undefined): boolean {
+  return detail !== undefined && /No tool call found for function call output/i.test(detail);
+}
+
+/**
+ * Deliberately pessimistic bytes-per-token, used only when the model cannot
+ * count for itself (see `countTokensV1`). Source code and JSON-escaped file
+ * content tokenize at roughly 3.5–4 bytes per token; assuming 3 overestimates.
+ */
+const ESTIMATED_BYTES_PER_TOKEN_V1 = 3;
+
+export function estimateLmTokensV1(text: string): number {
+  return Math.ceil(Buffer.byteLength(text, "utf8") / ESTIMATED_BYTES_PER_TOKEN_V1);
+}
+
+/**
+ * Size `text` with the model's own tokenizer, falling back to the
+ * pessimistic estimate when the model offers no `countTokens` or it fails.
+ *
+ * Strings only, on purpose: Copilot's `provideTokenCount` for a whole
+ * message counts text, image and PDF parts and silently skips tool-call and
+ * tool-result parts, so a message holding a 150 KB file read counts as
+ * almost nothing. Counting the result text directly is the accurate route.
+ */
+async function countTokensV1(
+  model: { countTokens?: unknown },
+  text: string,
+  abortTokens: readonly vscode.CancellationToken[],
+  deadlineMs: number
+): Promise<{ readonly tokens: number; readonly timedOut: boolean }> {
+  // Neither caller cancellation nor a round deadline is a tokenizer failure:
+  // the caller re-checks both right after every count and exits on its own
+  // terms. This only has to stop waiting promptly when either fires.
+  const alreadyAborted = abortTokens.some((token) => token.isCancellationRequested);
+  if (typeof model.countTokens === "function" && !alreadyAborted) {
+    // `countTokens` is a cancellable Thenable with no completion guarantee,
+    // and the caller's own deadlines cancel tokens this call would otherwise
+    // never observe (the prompt is sized before round 1 exists; the round
+    // timer cancels the round's token, not the caller's). Bound it here, stop
+    // waiting the moment any of them fires — a tokenizer that ignores its
+    // token must not delay that — and cancel what it abandons.
+    const countCts = new vscode.CancellationTokenSource();
+    const subscriptions: vscode.Disposable[] = [];
+    const aborted = new Promise<"aborted">((resolve) => {
+      for (const token of abortTokens) {
+        subscriptions.push(
+          token.onCancellationRequested(() => {
+            countCts.cancel();
+            resolve("aborted");
+          })
+        );
+      }
+    });
+    try {
+      const counted = await raceDeadlineV1(
+        Promise.race([
+          Promise.resolve(
+            (model.countTokens as (text: string, token: vscode.CancellationToken) => Thenable<number>).call(
+              model,
+              text,
+              countCts.token
+            )
+          ),
+          aborted,
+        ]),
+        deadlineMs
+      );
+      if (!counted.ok) {
+        countCts.cancel();
+        return { tokens: estimateLmTokensV1(text), timedOut: true };
+      }
+      if (typeof counted.value === "number" && Number.isFinite(counted.value) && counted.value >= 0) {
+        return { tokens: counted.value, timedOut: false };
+      }
+    } catch {
+      // Fall through to the estimate: sizing must never fail the session.
+    } finally {
+      for (const subscription of subscriptions) {
+        subscription.dispose();
+      }
+      countCts.dispose();
+    }
+  }
+  return { tokens: estimateLmTokensV1(text), timedOut: false };
+}
+
+/**
+ * Deadline for one `countTokens` call. Tokenizing is local and takes
+ * milliseconds even for a 500 KB file; anything near this is a hang.
+ */
+export const MAX_COUNT_TOKENS_WALL_CLOCK_MS_V1 = 10_000;
+
+/**
+ * Resolved in place of a round's work when the round is abandoned — its
+ * deadline fired, or the caller cancelled. A symbol so it can never collide
+ * with a tool handler's own string result.
+ */
+const ROUND_ABANDONED_V1 = Symbol("roundAbandoned");
+
+/**
+ * Replacement for a tool result shed to keep the conversation under budget.
+ * It keeps the result's `callId`, so the call/result pairing the provider
+ * validates stays intact — only the payload is gone, and the model is told
+ * how to get it back.
+ */
+export function elidedToolResultTextV1(originalBytes: number): string {
+  return (
+    `[Ensemble removed this tool result (${originalBytes} bytes) from the conversation ` +
+    "to stay within the model's input limit. Call the tool again if you still need it.]"
+  );
+}
+
+/**
+ * Replacement for a result the model has NOT yet seen, withheld because the
+ * round it belongs to read more than fits at once.
+ */
+export function deferredToolResultTextV1(originalBytes: number): string {
+  return (
+    `[Ensemble did not include this tool result (${originalBytes} bytes): together with the other ` +
+    "files you read in the same step it would exceed the model's input limit. Read it again on its " +
+    "own, after you have finished with the others.]"
+  );
+}
+
+/** One tool result as sent, tracked so it can be shed later. */
+interface TrackedToolResultV1 {
+  readonly callId: string;
+  readonly text: string;
+  /** Size of `text` as the model counts it. */
+  readonly tokens: number;
+  elided: boolean;
+  /** Withheld before the model ever saw it (newest round), not shed after. */
+  deferred?: boolean;
+}
+
+/** What the conversation actually carries for this result right now. */
+function sentResultTextV1(result: TrackedToolResultV1): string {
+  if (!result.elided) {
+    return result.text;
+  }
+  const bytes = Buffer.byteLength(result.text, "utf8");
+  return result.deferred ? deferredToolResultTextV1(bytes) : elidedToolResultTextV1(bytes);
+}
+
+/** The user message carrying one round's tool results, by index into `messages`. */
+interface TrackedToolResultMessageV1 {
+  readonly messageIndex: number;
+  readonly results: TrackedToolResultV1[];
+}
+
 
 /** One round's activity, reported for observability. Never affects behaviour. */
 export interface LmToolSessionRoundV1 {
@@ -243,6 +495,7 @@ export function createCopilotLmToolSessionTransportV1(
   const roundTimeoutMs = options.roundTimeoutMs ?? MAX_TOOL_ROUND_WALL_CLOCK_MS_V1;
   const modelSelectionTimeoutMs =
     options.modelSelectionTimeoutMs ?? MAX_MODEL_SELECTION_WALL_CLOCK_MS_V1;
+  const countTokensTimeoutMs = options.countTokensTimeoutMs ?? MAX_COUNT_TOKENS_WALL_CLOCK_MS_V1;
 
   return {
     runnerId: COPILOT_LM_RUNNER_ID,
@@ -313,14 +566,134 @@ export function createCopilotLmToolSessionTransportV1(
       let totalResultBytes = 0;
       let narrationNudges = 0;
 
+      // Conversation-size budget (see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1
+      // and MAX_TOOL_SESSION_CONTEXT_TOKENS_V1). The advertised limit only
+      // ever lowers the ceiling, never raises it.
+      const advertisedRaw = (resolved.model as { maxInputTokens?: unknown }).maxInputTokens;
+      const advertisedInputTokens =
+        typeof advertisedRaw === "number" && advertisedRaw > 0 ? advertisedRaw : undefined;
+      const budgetBasisTokens = Math.min(
+        advertisedInputTokens ?? MAX_TOOL_SESSION_CONTEXT_TOKENS_V1,
+        MAX_TOOL_SESSION_CONTEXT_TOKENS_V1
+      );
+      let contextBudgetTokens = Math.floor(budgetBasisTokens * TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1);
+      let orphanedResultRetries = 0;
+      // After one timeout the tokenizer is treated as unavailable for the rest
+      // of the session: otherwise every later result would wait out the same
+      // deadline before falling back.
+      let tokenizerUnavailable = false;
+      // `roundAbortToken` is the active round's own token, so a count made
+      // inside a round stops when that round's deadline fires instead of
+      // running on under the tokenizer's separate, longer deadline.
+      const count = async (text: string, roundAbortToken?: vscode.CancellationToken): Promise<number> => {
+        if (tokenizerUnavailable) {
+          return estimateLmTokensV1(text);
+        }
+        const abortTokens =
+          roundAbortToken === undefined
+            ? [request.cancellationToken]
+            : [request.cancellationToken, roundAbortToken];
+        const counted = await countTokensV1(resolved.model, text, abortTokens, countTokensTimeoutMs);
+        if (counted.timedOut) {
+          tokenizerUnavailable = true;
+        }
+        return counted.tokens;
+      };
+      // Everything except tool results, which are the only thing ever shed.
+      let fixedTokens = await count(request.prompt);
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "callerCancelled" };
+      }
+      const trackedResultMessages: TrackedToolResultMessageV1[] = [];
+
+      const conversationTokens = (): number =>
+        trackedResultMessages.reduce(
+          (sum, message) =>
+            sum +
+            message.results.reduce(
+              (inner, result) =>
+                inner + (result.elided ? estimateLmTokensV1(sentResultTextV1(result)) : result.tokens),
+              0
+            ),
+          fixedTokens
+        );
+
+      const contextBudgetExceededExit = (estimate: number, rounds: number): AgentTransportExitV1 => ({
+        kind: "transportFailure",
+        code: "toolSessionContextBudgetExceeded",
+        detail:
+          `the conversation is ~${estimate} tokens after ${rounds} round(s) even with every earlier ` +
+          `tool result removed — over this session's ~${contextBudgetTokens}-token budget ` +
+          `(from a ${budgetBasisTokens}-token input limit). Sending it anyway would let ` +
+          "the provider silently drop the start of the conversation. Narrow the prompt or pick a " +
+          "model with a larger context.",
+      });
+
+      const rebuildResultMessage = (tracked: TrackedToolResultMessageV1): void => {
+        messages[tracked.messageIndex] = createLmUserMessageWithPartsV1(
+          vscodeModule,
+          tracked.results.map((result) =>
+            createLmToolResultPartV1(vscodeModule, result.callId, sentResultTextV1(result))
+          )
+        );
+      };
+
+      /**
+       * Shed tool results until the conversation fits the budget: whole older
+       * rounds first, oldest first. If the newest round alone is still too
+       * big — the model asked for several large files at once — its largest
+       * results are deferred with a note to re-read them separately, keeping
+       * at least one. Returns false when even that is not enough.
+       */
+      const fitConversationToBudget = (): boolean => {
+        for (let i = 0; i < trackedResultMessages.length - 1; i++) {
+          if (conversationTokens() <= contextBudgetTokens) {
+            return true;
+          }
+          const tracked = trackedResultMessages[i]!;
+          if (tracked.results.every((result) => result.elided)) {
+            continue;
+          }
+          for (const result of tracked.results) {
+            result.elided = true;
+          }
+          rebuildResultMessage(tracked);
+        }
+        const newest = trackedResultMessages[trackedResultMessages.length - 1];
+        if (newest && conversationTokens() > contextBudgetTokens) {
+          const byLargest = newest.results
+            .filter((result) => !result.elided)
+            .sort((a, b) => b.tokens - a.tokens);
+          for (const result of byLargest.slice(0, -1)) {
+            if (conversationTokens() <= contextBudgetTokens) {
+              break;
+            }
+            result.elided = true;
+            result.deferred = true;
+          }
+          rebuildResultMessage(newest);
+        }
+        return conversationTokens() <= contextBudgetTokens;
+      };
+
+      if (!fitConversationToBudget()) {
+        return contextBudgetExceededExit(conversationTokens(), 0);
+      }
+
       for (let round = 0; round < maxRounds; round++) {
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
+        }
+        if (!fitConversationToBudget()) {
+          return contextBudgetExceededExit(conversationTokens(), round);
         }
 
         let roundText = "";
         const assistantRawParts: unknown[] = [];
         const toolResultParts: unknown[] = [];
+        const roundResults: TrackedToolResultV1[] = [];
+        let roundToolCallBytes = 0;
+        let orphanedRejectionDetail: string | undefined;
         const roundToolNames: string[] = [];
         let roundResultBytes = 0;
         let sawToolCall = false;
@@ -345,6 +718,18 @@ export function createCopilotLmToolSessionTransportV1(
         const callerCancelSub = request.cancellationToken.onCancellationRequested(() =>
           roundCts.cancel()
         );
+        // `RequestLocalToolHandlerV1.handleToolCall` takes no cancellation
+        // token, so the round deadline — which works by cancelling `roundCts`
+        // — cannot reach inside it: a wedged workspace read or edit would park
+        // the round indefinitely, the exact unbounded silent wait this
+        // deadline exists to convert into a reported failure. Racing the
+        // handler against this settles that. The abandoned handler keeps
+        // running (see `raceDeadlineV1`'s note on the same trade-off), which
+        // is acceptable only because every path that observes it exits the
+        // whole transport rather than continuing the round.
+        const roundAbandoned = new Promise<typeof ROUND_ABANDONED_V1>((resolve) => {
+          roundCts.token.onCancellationRequested(() => resolve(ROUND_ABANDONED_V1));
+        });
         let roundTimedOut = false;
         const roundTimer = setTimeout(() => {
           roundTimedOut = true;
@@ -390,12 +775,95 @@ export function createCopilotLmToolSessionTransportV1(
               continue;
             }
             sawToolCall = true;
-            const resultText = await options.toolHandler.handleToolCall(part);
+            // A response can carry several tool calls, already buffered, and
+            // the edit broker's tools mutate the workspace. Nothing may be
+            // dispatched once the caller has cancelled or the round's deadline
+            // has passed — including after an await earlier in this loop
+            // (the previous call's handler, or sizing its result).
+            if (roundTimedOut) {
+              return timedOutExit();
+            }
+            if (request.cancellationToken.isCancellationRequested) {
+              return { kind: "callerCancelled" };
+            }
+            // Racing the handler bounds a wedged READ, but a MUTATION must
+            // never be abandoned. Losing the race does not stop the handler:
+            // it runs on, and its write can land after this transport has
+            // reported a timeout and `taskActionCoordinatorV1` has already
+            // moved to the next ranked candidate. The store's revision-exact
+            // primitives (`replaceFileExact`/`deleteFileExact` against the
+            // preflight revision, `createFileExclusive`) do stop that stale
+            // write clobbering the newer attempt's work — it loses
+            // atomically and settles the execution `stalePreflight`. What
+            // they cannot prevent is the case where the newer attempt has not
+            // touched that path yet: one late write lands, with a receipt, on
+            // an execution the coordinator has abandoned. Files changing
+            // after Ensemble said "timed out" is its own trust problem.
+            //
+            // RESIDUAL, recorded in `v1 fixes 2` item 17: an edit handler
+            // that genuinely wedges holds its round past the deadline.
+            //
+            // The obvious fix — a cancellation token on
+            // `RequestLocalToolHandlerV1.handleToolCall`, checked at each
+            // commit point — does NOT close this, and has been proposed and
+            // rejected here twice. `workflowFileStoreV1` is raw `fs.promises`
+            // (`open`/`lstat`/`readdir` and the write helpers) with no
+            // cancellation at any level, so a token could only stop the
+            // handler STARTING the next operation; it can never unwedge one
+            // already in flight. Bounding an in-flight syscall requires
+            // abandoning it — which is exactly the late-write hazard the
+            // branch above exists to prevent. The two options at this layer
+            // are therefore "bounded, with possible late writes" and "safe,
+            // with a possible unbounded wait"; edits take the second.
+            //
+            // A real fix lives below this file: cancellation plumbed through
+            // the file store (which Node cannot do for an in-flight write
+            // without a worker/process boundary). Until then this is a latent
+            // gap, not a live defect: no handler hang has ever been observed,
+            // the documented hangs were LM requests (already covered by the
+            // round deadline), and CLI providers never reach this branch —
+            // `cliAgentRunner` runs its own `mode: "edit"` path.
+            const handled =
+              request.mode === "edit"
+                ? await options.toolHandler.handleToolCall(part)
+                : await Promise.race([
+                    Promise.resolve(options.toolHandler.handleToolCall(part)),
+                    roundAbandoned,
+                  ]);
+            if (handled === ROUND_ABANDONED_V1) {
+              return roundTimedOut ? timedOutExit() : { kind: "callerCancelled" };
+            }
+            const resultText = handled;
             roundToolNames.push(part.name);
             const resultBytes = Buffer.byteLength(resultText, "utf8");
             roundResultBytes += resultBytes;
             totalResultBytes += resultBytes;
             toolResultParts.push(createLmToolResultPartV1(vscodeModule, part.callId, resultText));
+            // Sized against the round's own token. Both terminal signals are
+            // then re-checked, in the same precedence the catch block uses:
+            // this single point covers BOTH preceding awaits (the handler and
+            // the sizing call), either of which can span a deadline or a
+            // cancel. Without it, a round that expired or was cancelled while
+            // a result was in flight would fall through to the protocol and
+            // result-budget exits below and be reported as one of those —
+            // and `callerCancelled` is not a provider fault downstream
+            // (`taskActionCoordinatorV1` treats it differently from a
+            // transport failure), so mislabelling it burns a candidate for
+            // something the user chose to stop.
+            const resultTokens = await count(resultText, roundCts.token);
+            if (roundTimedOut) {
+              return timedOutExit();
+            }
+            if (request.cancellationToken.isCancellationRequested) {
+              return { kind: "callerCancelled" };
+            }
+            roundResults.push({
+              callId: part.callId,
+              text: resultText,
+              tokens: resultTokens,
+              elided: false,
+            });
+            roundToolCallBytes += Buffer.byteLength(part.name + JSON.stringify(part.input), "utf8");
             if (options.toolHandler.violationCount() > MAX_TOOL_PROTOCOL_VIOLATIONS_V1) {
               // Report BEFORE returning: a terminal round is the most
               // diagnostically valuable one, and returning straight out left
@@ -453,15 +921,46 @@ export function createCopilotLmToolSessionTransportV1(
           // a firewall/HTTP2 message) — the default 200-char bound cut those
           // mid-sentence, so this site gets a wider allowance.
           const detail = boundedTransportDetailV1(error, 800);
-          return {
-            kind: "transportFailure",
-            code: "copilotRequestFailed",
-            ...(detail !== undefined ? { detail } : {}),
-          };
+          // The provider pruned this conversation itself and orphaned a tool
+          // result (see MAX_TOOL_SESSION_CONTEXT_TOKENS_V1): the request, not
+          // the account, was the problem. Retryable only while nothing from
+          // this round has been acted on yet.
+          if (
+            isOrphanedToolResultRejectionV1(detail) &&
+            assistantRawParts.length === 0 &&
+            orphanedResultRetries < MAX_ORPHANED_RESULT_RETRIES_V1
+          ) {
+            orphanedRejectionDetail = detail;
+          } else {
+            return {
+              kind: "transportFailure",
+              code: "copilotRequestFailed",
+              ...(detail !== undefined ? { detail } : {}),
+            };
+          }
         } finally {
           clearTimeout(roundTimer);
           callerCancelSub.dispose();
           roundCts.dispose();
+        }
+        if (orphanedRejectionDetail !== undefined) {
+          // Halve the budget and shed to it, then resend the same round. If
+          // nothing could be shed the retry would send the identical request,
+          // so report the rejection instead.
+          orphanedResultRetries += 1;
+          const before = conversationTokens();
+          contextBudgetTokens = Math.floor(before / 2);
+          fitConversationToBudget();
+          const after = conversationTokens();
+          if (after >= before) {
+            return { kind: "transportFailure", code: "copilotRequestFailed", detail: orphanedRejectionDetail };
+          }
+          // Keep the tighter budget for the rest of the session, but no lower
+          // than what could actually be reached — otherwise the check at the
+          // top of the loop would reject the conversation just shed.
+          contextBudgetTokens = Math.max(contextBudgetTokens, after);
+          round -= 1;
+          continue;
         }
         // A stream that ENDS on cancellation rather than throwing would fall
         // through the try with a truncated round and no error, so the
@@ -514,6 +1013,7 @@ export function createCopilotLmToolSessionTransportV1(
             messages.push(
               vscode.LanguageModelChatMessage.User(RESULT_FRAME_NUDGE_MESSAGE_V1)
             );
+            fixedTokens += (await count(roundText)) + (await count(RESULT_FRAME_NUDGE_MESSAGE_V1));
             continue;
           }
           // Final round: only THIS round's text is the provider result —
@@ -529,9 +1029,43 @@ export function createCopilotLmToolSessionTransportV1(
 
         messages.push(createLmAssistantMessageWithPartsV1(vscodeModule, assistantRawParts));
         messages.push(createLmUserMessageWithPartsV1(vscodeModule, toolResultParts));
+        // Tool-call arguments are a path or two; the estimate is close enough.
+        fixedTokens += (await count(roundText)) + Math.ceil(roundToolCallBytes / ESTIMATED_BYTES_PER_TOKEN_V1);
+        trackedResultMessages.push({ messageIndex: messages.length - 1, results: roundResults });
+
+        // Warn before the round cap, so the session ends in an answer rather
+        // than in `toolRoundLimitExceeded` with everything it read discarded
+        // (v1 fixes 2, item 26). Never for an edit session: it is executing
+        // sealed steps, and telling it to stop would leave a plan half-applied.
+        const roundsLeft = maxRounds - (round + 1);
+        if (
+          request.mode !== "edit" &&
+          roundDeliverableContractV1(request.mode).requiresResultFrame &&
+          roundsLeft > 0 &&
+          roundsLeft <= TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1
+        ) {
+          const notice = toolRoundWindDownNoticeV1(roundsLeft);
+          messages.push(vscode.LanguageModelChatMessage.User(notice));
+          fixedTokens += await count(notice);
+        }
       }
 
-      return { kind: "transportFailure", code: "toolRoundLimitExceeded" };
+      // The loop's own cancellation check is at the TOP of the next
+      // iteration, which the final allowed round never reaches — so a cancel
+      // landing during that round's post-round accounting would be reported
+      // as "too many tool rounds", a provider fault, rather than as the
+      // cancellation it was.
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "callerCancelled" };
+      }
+      // The detail is what reaches the run log after the closed phrase. Without
+      // it this read "the transport failed before any response arrived" after
+      // every one of the rounds had in fact been answered.
+      return {
+        kind: "transportFailure",
+        code: "toolRoundLimitExceeded",
+        detail: `used all ${maxRounds} tool rounds without replying with a final answer`,
+      };
     },
   };
 }

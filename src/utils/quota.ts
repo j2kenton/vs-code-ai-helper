@@ -314,16 +314,67 @@ function parseRelativeDurationReset(message: string, now: Date): string | undefi
 }
 
 /**
+ * "...or try again at 4:12 PM." — a free-form clock-time mention with no
+ * "resets" keyword and no parenthesized timezone, the exact shape Codex's
+ * observed quota message uses (2026-09-15 post-freeze findings, item 4).
+ * Unlike {@link parseClockTimeReset}, no IANA zone is named in the message,
+ * so there is nothing to resolve the wall-clock time against except the
+ * zone this process itself runs in — the same assumption
+ * `Date.prototype.toLocaleString()` already makes everywhere this reset time
+ * is displayed to the user (buildQuotaRemedyTextV1 above). That is a
+ * consistent, load-bearing interpretation of an unqualified time, not a
+ * guess at a fact the message never stated (contrast: guessing an unstated
+ * IANA zone name would be inventing information; reading an unqualified time
+ * as local time is the ordinary convention this codebase already applies).
+ * Rolls to tomorrow when today's occurrence has already passed, exactly like
+ * parseClockTimeReset's own next-day handling.
+ */
+function parseTryAgainAtReset(message: string, now: Date): string | undefined {
+  const match = /\btry\s+again\s+at\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?/i.exec(message);
+  if (!match) {
+    return undefined;
+  }
+  const hourRaw = Number(match[1]);
+  const minute = Number(match[2]);
+  const ampm = match[3];
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minute) || minute > 59) {
+    return undefined;
+  }
+  let hour24 = hourRaw;
+  if (ampm) {
+    if (hourRaw < 1 || hourRaw > 12) {
+      return undefined;
+    }
+    const isPm = /p/i.test(ampm);
+    hour24 = (hourRaw % 12) + (isPm ? 12 : 0);
+  } else if (hourRaw > 23) {
+    return undefined;
+  }
+  const candidate = new Date(now.getTime());
+  candidate.setHours(hour24, minute, 0, 0);
+  if (candidate.getTime() <= now.getTime()) {
+    candidate.setDate(candidate.getDate() + 1);
+  }
+  return candidate.toISOString();
+}
+
+/**
  * Parses a provider-reported quota/rate-limit reset time out of a failure
  * message. Returns an ISO timestamp for when the limit is expected to lift,
  * or `undefined` on any ambiguity — see parseClockTimeReset/
- * parseRelativeDurationReset for the two recognized shapes. Clock-time
- * phrasing is tried first since a message could in principle contain an
- * unrelated "in N ..." phrase elsewhere.
+ * parseRelativeDurationReset/parseTryAgainAtReset for the three recognized
+ * shapes. Clock-time-with-zone phrasing is tried first (most specific),
+ * then relative duration, then the free-form "try again at HH:MM" shape
+ * (least specific, so it never shadows a more precise match elsewhere in
+ * the same message).
  */
 export function parseQuotaResetV1(message: string | undefined, now: Date): string | undefined {
   const value = message ?? "";
-  return parseClockTimeReset(value, now) ?? parseRelativeDurationReset(value, now);
+  return (
+    parseClockTimeReset(value, now) ??
+    parseRelativeDurationReset(value, now) ??
+    parseTryAgainAtReset(value, now)
+  );
 }
 
 /** Byte-for-byte the tail every quota-parked remedy message used before a

@@ -68,11 +68,18 @@ import {
   isReviewStage,
 } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { readTextIfExists } from "../utils/fileUtils";
 import { parseReadiness, isStaleReviewArtifactV1 } from "../utils/reviewReadiness";
+import {
+  getImplementationSummaryUri,
+  isUnusableImplementationSummaryV1,
+} from "../utils/implementationArtifactResolver";
+import { isUnrecoverableImplRecoveryV1 } from "../utils/taskWatchdogV1";
 import { isSummaryOnlyDispatchAvailableV1 } from "./implContinuationTextDispatchV1";
 import {
   quarantinePendingImplReviewFiles,
+  promotePendingImplReviewFiles,
   recordReviewInvalidatedByRound,
   resolveRoundV1,
   setIncompleteRoundContinuations,
@@ -424,7 +431,17 @@ export async function beginImplementationRecoveryV1(
   input: ImplementationRecoveryInputV1
 ): Promise<BegunImplementationRecoveryV1> {
   const sourceAttemptId = freshToken("impl-recovery");
-  const quarantinedPaths = input.filesChangedUnknown ? [] : [...input.filesChanged];
+  // 2026-09-15 post-freeze findings, item 5: `pendingImplReviewFiles` (this
+  // transition's own quarantine) is one of the two named sites the finding
+  // observed Ensemble's own bookkeeping (`.ensemble-session.lock`)
+  // manufacturing an owed continuation through — every capture site upstream
+  // already sanitizes its own raw change set (cliAgentRunner.ts,
+  // copilotImplementationRunner.ts, runEditActionV1.ts), but this filters
+  // again at the quarantine boundary itself so no future or indirect caller
+  // of this function can reintroduce a workflow-control path here.
+  const quarantinedPaths = input.filesChangedUnknown
+    ? []
+    : sanitizeChangeSetV1(input.filesChanged);
   let continuations = 0;
   // The two async evidence reads happen BEFORE the patch (the callback must
   // stay synchronous): the artifact's usability is durable review-tracking
@@ -1126,4 +1143,179 @@ export function buildImplementationContinuationPromptV1(
       ...pendingFiles.map((file) => `- ${file}`),
     ].join("\n")
   );
+}
+
+/**
+ * Thrown by `advanceStageViaNextStageRowV1` (reviewActions.ts) in place of a
+ * bare `Error("implRecoveryOwed")` (2026-09-15 post-freeze findings, item 5:
+ * "a refusal must name what it is waiting for" — `nextStage.implRecoveryOwed`
+ * is a symbol, not an explanation). `.message` is the full human-readable
+ * explanation from `describeOwedImplRecoveryRefusalV1`, so every EXISTING
+ * catch site that already does `NotificationRouter.showWarning(error.message)`
+ * gets the richer text for free; `.recovery` lets a caller that wants to also
+ * offer the "Discard this owed continuation" action decide whether to.
+ */
+export class ImplRecoveryOwedRefusalError extends Error {
+  constructor(
+    message: string,
+    readonly recovery: ImplRecoveryV1
+  ) {
+    super(message);
+    this.name = "ImplRecoveryOwedRefusalError";
+  }
+}
+
+/** Human-readable description of why a round left `implRecovery` owed, for `describeOwedImplRecoveryRefusalV1`. */
+function describeImplRecoveryTriggerV1(trigger: ImplRecoveryTriggerV1): string {
+  switch (trigger) {
+    case "roundDeferred":
+      return "the last implementation round deferred its work to a follow-up turn that never ran";
+    case "roundIncomplete":
+      return "the last implementation round ended without a complete report";
+    case "summaryRejected":
+      return "the last implementation round's summary was rejected as unusable";
+    case "externallyTerminated":
+      return "the last implementation round was stopped from outside (timeout or inactivity) before it could report";
+    case "providerFailedMidRound":
+      return "the last implementation round's provider failed mid-round after making unverified edits";
+  }
+}
+
+/**
+ * The full explanation for an `implRecoveryOwed` refusal (2026-09-15
+ * post-freeze findings, item 5's general requirement: "every refusal must
+ * name a remedy the system can reach, or an action the user can actually
+ * take"). Names the trigger, the source round, the dispatch/lease state, and
+ * what will clear it — the four facts `nextStage.implRecoveryOwed` alone
+ * gave none of.
+ */
+export function describeOwedImplRecoveryRefusalV1(
+  recovery: ImplRecoveryV1,
+  progress: TaskProgress,
+  now: number = Date.now()
+): string {
+  const lines = [
+    "An implementation recovery continuation is still owed for the current stage, so it may not advance yet.",
+    `- Waiting on: ${describeImplRecoveryTriggerV1(recovery.trigger)} (recorded ${recovery.at}).`,
+    `- Source round: ${recovery.sourceRoundId ?? recovery.sourceAttemptId} (quoted in its run log).`,
+  ];
+  if (recovery.dispatch === "pending") {
+    lines.push("- Status: pending — the next sweep or a manual retry will dispatch its continuation round.");
+  } else {
+    const leaseDescription =
+      recovery.leaseUntil !== undefined && Date.parse(recovery.leaseUntil) > now
+        ? `a continuation round is running or holds an unexpired lease until ${recovery.leaseUntil}`
+        : "its lease has expired; the sweep will reclaim it automatically if it still can";
+    lines.push(`- Status: dispatched — ${leaseDescription}.`);
+  }
+  lines.push(
+    recovery.trigger === "summaryRejected"
+      ? "- Clears automatically once a usable Implementation Summary exists for this stage."
+      : "- Clears automatically once its continuation round completes with a usable report."
+  );
+  if (isImplRecoveryDiscardOfferableV1(recovery, progress, now)) {
+    lines.push(
+      "- This continuation has no automated way back (its round is stale and there is no reconstructable " +
+        'change set to re-arm from). Use "Discard this owed continuation" to clear it by hand.'
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * True when `recovery` is stuck with no automated path back — the same test
+ * the sweep's own reclaim uses (`isUnrecoverableImplRecoveryV1`). Used both
+ * by `describeOwedImplRecoveryRefusalV1` above (to decide whether to mention
+ * the discard action in its explanation) and by a refusal surface that wants
+ * to decide separately whether to attach the "Discard this owed
+ * continuation" button — never offered for a record that can still resolve
+ * itself.
+ */
+export function isImplRecoveryDiscardOfferableV1(
+  recovery: ImplRecoveryV1,
+  progress: TaskProgress,
+  now: number = Date.now()
+): boolean {
+  return isUnrecoverableImplRecoveryV1(recovery, progress, now);
+}
+
+/**
+ * Part 5 step 33: a `summaryRejected` recovery exists only to block
+ * advancement until a usable `impl-summary.md` exists again — once one does,
+ * the continuation it was guarding has nothing left to do, and leaving the
+ * record in place blocks a task that is otherwise finished (2026-09-15
+ * post-freeze findings, item 5's dominant real-world case: a recovery whose
+ * `pendingImplReviewFiles` had already been satisfied by a 9/10, zero-blocker
+ * review, still refusing every advancement attempt for over two hours until a
+ * lease-plus-grace window finally let the sweep reclaim it).
+ *
+ * Reuses `promotePendingImplReviewFiles` — the SAME transform a normal
+ * successor round's completion already runs — so retiring reactively (from
+ * here) and retiring inline (from a completing round) both union any
+ * genuinely-pending files into review scope identically; nothing is silently
+ * dropped. Checked from two call sites, per the plan: the periodic sweep
+ * (`scheduleTaskResume.ts`'s `armPendingImplRecoveries`) and the advancement
+ * gate itself (`advanceStageViaNextStageRowV1`), so neither depends on the
+ * other having already run. Returns whether anything was actually retired.
+ */
+export async function retireSatisfiedSummaryRejectedRecoveryV1(
+  taskFolderUri: vscode.Uri
+): Promise<boolean> {
+  // Cheap pre-check outside the lock: skip reading impl-summary.md at all for
+  // the overwhelmingly common case (no recovery, or a trigger this
+  // self-heal does not apply to). Re-checked again, from the FRESH read,
+  // inside the CAS callback below — this is only an optimization, never
+  // relied on for correctness.
+  const summaryContent = await readTextIfExists(getImplementationSummaryUri(taskFolderUri));
+  const summaryIsUsable = summaryContent !== undefined && !isUnusableImplementationSummaryV1(summaryContent);
+  if (!summaryIsUsable) {
+    return false;
+  }
+  // `retired` is set only from INSIDE the callback that actually decided to
+  // write a change — never derived from `patchTaskProgressStrictV1`'s return
+  // value, which is the pre-existing `current` (still carrying whatever
+  // `implRecovery` it had, possibly `undefined` for an unrelated reason) on
+  // every no-op path (`update` returning falsy, or a read/decode failure).
+  // Deriving "did this retire something" from `patched?.implRecovery ===
+  // undefined` would misreport both a genuine no-op (no recovery at all) and
+  // a failed read as "retired".
+  let retired = false;
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
+    if (current.implRecovery?.trigger !== "summaryRejected") {
+      return undefined;
+    }
+    retired = true;
+    return promotePendingImplReviewFiles(current);
+  });
+  return retired;
+}
+
+/**
+ * Part 5 step 34: the user-reachable escape for a `dispatched` recovery that
+ * has no automated way back (per `isImplRecoveryDiscardOfferableV1` /
+ * `isUnrecoverableImplRecoveryV1`) — waiting out its lease plus the 90-minute
+ * stale-dispatch grace only to reach a round that will fail the same way is
+ * not an exit. Unlike `retireSatisfiedSummaryRejectedRecoveryV1` (which
+ * treats the pending files as real, reviewable work and unions them into
+ * review scope), this is an explicit abandonment: it removes the recovery
+ * record and its quarantined pending-review paths WITHOUT promoting them,
+ * since a discarded continuation's edits are — by definition of reaching
+ * this action — no longer trusted to be worth reviewing. Callers are
+ * responsible for confirming with the user before calling this; it performs
+ * no confirmation of its own. Returns whether anything was actually cleared.
+ */
+export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Promise<boolean> {
+  // Same reasoning as `retireSatisfiedSummaryRejectedRecoveryV1` above: the
+  // "did this do anything" flag is set only inside the branch that actually
+  // wrote a change, never derived from the patch's return value.
+  let discarded = false;
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
+    if (current.implRecovery === undefined) {
+      return undefined;
+    }
+    discarded = true;
+    const { implRecovery: _recovery, pendingImplReviewFiles: _pending, ...rest } = current;
+    return { ...rest, updatedAt: new Date().toISOString() };
+  });
+  return discarded;
 }

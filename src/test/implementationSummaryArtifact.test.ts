@@ -39,6 +39,7 @@ import {
   isUnusableImplementationSummaryV1,
   parseReportedFilesChangedV1,
   readImplementationReviewContent,
+  withDeterministicZeroFilesChangedNoteV1,
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
 import {
@@ -1678,6 +1679,53 @@ void describe("a runner-synthesized summary is not held to the prompt contract",
     assert.equal(overview, "Implemented the summary shape gate and split the artifacts.");
     assert.ok(own.includes("- ran the suite"), "verification still comes from the run's region");
     assert.ok(!own.includes("Implemented the summary shape gate"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withDeterministicZeroFilesChangedNoteV1 — 2026-09-15 post-freeze findings,
+// item 3: a model-authored zero-file round must have "Files changed: none"
+// recorded as a fact in impl-summary.md, not left to depend on the model's
+// own optional `## Files Changed` section. The synthetic (runner-authored)
+// path already states this deterministically via
+// buildSyntheticImplementationSummaryV1; this is the model-authored
+// equivalent, applied only when the round's real change set was empty.
+// ---------------------------------------------------------------------------
+void describe("withDeterministicZeroFilesChangedNoteV1", () => {
+  void it("appends a deterministic fact regardless of what the model itself wrote", () => {
+    const modelSummary = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [ ] Confirm the CDK stack deploys with the schedule DISABLED",
+      "",
+      "Every remaining plan item is a human deployment gate; no files changed.",
+      "",
+      "## Files Changed",
+      "",
+      "_none_",
+    ].join("\n");
+    const withFact = withDeterministicZeroFilesChangedNoteV1(modelSummary);
+    assert.ok(withFact.startsWith(modelSummary), "the model's own report is preserved verbatim");
+    assert.ok(/Files changed: none/i.test(withFact));
+  });
+
+  void it("does not introduce a second '## Files Changed' heading", () => {
+    // A `##` heading would be picked up by findLastHeadingV1 and shift what
+    // downstream consumers treat as the round's own Files Changed section —
+    // the note must be a supplement (blockquote), never a competing section.
+    const modelSummary = "The round found nothing to fix.\n\n## Files Changed\n\n_none_";
+    const withFact = withDeterministicZeroFilesChangedNoteV1(modelSummary);
+    const headingCount = (withFact.match(/^##\s+Files Changed/gim) ?? []).length;
+    assert.equal(headingCount, 1, "the appended fact must not add a competing heading");
+  });
+
+  void it("is distinguishable from a model claiming files WERE changed", () => {
+    const modelSummary = "## Files Changed\n\n- `src/a.ts` — fixed a bug";
+    const withFact = withDeterministicZeroFilesChangedNoteV1(modelSummary);
+    assert.ok(withFact.includes("Files changed: none"));
+    // The model's own (now-contradicted) claim is still preserved verbatim —
+    // this function only records a fact about the REAL change set; it never
+    // rewrites or removes what the model said.
+    assert.ok(withFact.includes("- `src/a.ts` — fixed a bug"));
   });
 });
 

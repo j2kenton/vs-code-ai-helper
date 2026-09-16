@@ -83,6 +83,17 @@ function installFakeInventory(taskFolderPath: string, canonicalId: string): Task
     workspaceFolder: undefined,
     progress: fixtureTaskProgress(taskFolderPath),
   };
+  // 2026-09-10 review completion blocker (new): commitAndPushTask now
+  // actually consults reconcileWatchdogPauseAgainstAdmissionV1's result —
+  // that reconciliation does a real disk read of task-progress.json,
+  // independent of this in-memory fake inventory. Write the same fixture
+  // progress to disk so the task reads as the realistic, readable,
+  // non-paused task it always is in production.
+  fs.writeFileSync(
+    path.join(taskFolderPath, "task-progress.json"),
+    JSON.stringify(task.progress, null, 2),
+    "utf8"
+  );
   return {
     getTaskById: (id: string) => (id === canonicalId ? task : undefined),
     getVisibleTaskForSuppressedId: () => undefined,
@@ -114,9 +125,14 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
     const originalRunCompletionLint = completionLintModule.runCompletionLint;
     const originalShowWarningMessage = vscode.window.showWarningMessage;
     const originalShowErrorMessage = vscode.window.showErrorMessage;
+    const originalReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile;
     (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
       { uri: vscode.Uri.file(repoRoot), name: "root", index: 0 },
     ];
+    // See installFakeInventory's own comment: bridge vscode.workspace.fs.readFile
+    // to the real task-progress.json written to disk above.
+    (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
 
     let lintCallCount = 0;
     const lintGate = deferred<void>();
@@ -161,6 +177,7 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       vscode.window.showWarningMessage = originalShowWarningMessage;
       vscode.window.showErrorMessage = originalShowErrorMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = originalReadFile;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
     }
@@ -178,9 +195,14 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
     const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
     const originalRunCompletionLint = completionLintModule.runCompletionLint;
     const originalShowWarningMessage = vscode.window.showWarningMessage;
+    const originalReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile;
     (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
       { uri: vscode.Uri.file(repoRoot), name: "root", index: 0 },
     ];
+    // See installFakeInventory's own comment: bridge vscode.workspace.fs.readFile
+    // to the real task-progress.json written to disk above.
+    (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
 
     completionLintModule.runCompletionLint = () => Promise.resolve({
       passed: true, summary: "", runAt: new Date().toISOString(), issueCount: 0, failedChecks: [],
@@ -220,6 +242,7 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       completionLintModule.runCompletionLint = originalRunCompletionLint;
       vscode.window.showWarningMessage = originalShowWarningMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
+      (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = originalReadFile;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
     }

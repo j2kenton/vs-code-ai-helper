@@ -81,7 +81,11 @@ export function describeTaskActionOutcomeForLogV1(
     case "malformedResult":
       return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":
-      return `Status: unavailable (${outcome.code})`;
+      return outcome.code === "candidatesDeferred"
+        ? `Status: unavailable (${outcome.code}) — every remaining candidate is currently ` +
+          "quota/entitlement-limited, not tried-and-failed; the task is being parked with the " +
+          "earliest known reset time rather than treated as exhausted."
+        : `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":
       return `Status: recovery required (${outcome.code})`;
     case "duplicateRejected":

@@ -17,6 +17,7 @@ import { renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
 import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { isEffectivelyPausedSyncV1, isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -215,7 +216,10 @@ export class TaskStatusBar implements vscode.Disposable {
     reviewScoreLabel?: string
   ): void {
     const stage = taskToShow.progress.currentStage;
-    const isPaused = taskToShow.progress.status === "paused";
+    // Part 1b step 13 (tree/context-key derivation): a revoked watchdog
+    // pause must not display or gate as "Paused" — see
+    // `resolveEffectivePauseStatusSyncV1`'s doc comment.
+    const isPaused = isEffectivelyPausedSyncV1(taskToShow.folderUri.fsPath, taskToShow.progress);
     const statusLabel = isPaused ? "paused" : "active";
 
     // Passive-case standing indicator (wf10 item 11's passive complement):
@@ -366,7 +370,10 @@ export class TaskStatusBar implements vscode.Disposable {
     const items: ActionQuickPickItem[] = [];
 
     if (taskToShow) {
-      if (taskToShow.progress.status === "paused") {
+      // Async resolver here (this menu is built once per click, not a hot
+      // render path) — a revoked watchdog pause must not offer "Resume shown
+      // task" as if it were still genuinely paused.
+      if (await isEffectivelyPausedV1(taskToShow.folderUri.fsPath, taskToShow.progress)) {
         items.push({
           label: `$(debug-continue) Resume shown task`,
           description: taskToShow.folderName,

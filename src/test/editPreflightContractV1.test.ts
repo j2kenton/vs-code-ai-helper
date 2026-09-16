@@ -559,6 +559,104 @@ void describe("editPreflightContractV1 — plan-vs-ledger validation", () => {
     assert.equal(!patchThenDelete.ok && patchThenDelete.code, "duplicateTarget");
   });
 
+  void it("refuses a whole-file replacement authorized by a line-range read, but allows a patch or delete", () => {
+    // v1 fixes 2, item 26 (Codex adversarial review, 2026-09-15): a ranged
+    // readFile records the whole file's revision, so a replaceFile written
+    // from the slice would pass the revision check at execution and silently
+    // delete every line the model never saw.
+    const ledger = createObservationLedgerV1();
+    const partial = ledger.mint({
+      callId: "call-ranged",
+      rootId: ROOT,
+      relativePath: "big.ts",
+      kind: "file",
+      revision: "v1:10:1:2",
+      contentSha256: "ab".repeat(32),
+      complete: true,
+      source: "readFile",
+      partialContent: true,
+    }).observationId;
+
+    const replace = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "replaceFile",
+          relativePath: "big.ts",
+          targetObservationId: partial,
+          contentBase64: "aGk=",
+          decodedByteLength: 2,
+          contentSha256: "12".repeat(32),
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(!replace.ok && replace.code, "replaceWithoutFullRead");
+    assert.match(!replace.ok ? replace.reason : "", /is a line-range read/);
+    assert.match(!replace.ok ? replace.reason : "", /Use patchFile to change part of the file/);
+
+    // The same rule for a stat, which never read the content at all.
+    const statted = ledger.mint({
+      callId: "call-stat",
+      rootId: ROOT,
+      relativePath: "big.ts",
+      kind: "file",
+      revision: "v1:10:1:2",
+      complete: true,
+      source: "stat",
+    }).observationId;
+    const replaceFromStat = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "replaceFile",
+          relativePath: "big.ts",
+          targetObservationId: statted,
+          contentBase64: "aGk=",
+          decodedByteLength: 2,
+          contentSha256: "12".repeat(32),
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(!replaceFromStat.ok && replaceFromStat.code, "replaceWithoutFullRead");
+    assert.match(!replaceFromStat.ok ? replaceFromStat.reason : "", /came from stat, which does not read content/);
+    assert.deepEqual(
+      validatePreflightPlanAgainstLedgerV1(
+        plan([op({ stepId: "s1", kind: "deleteFile", relativePath: "big.ts", targetObservationId: statted })]),
+        ledger,
+        ROOT
+      ),
+      { ok: true },
+      "deleting a file needs no knowledge of its content"
+    );
+
+    const patch = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "big.ts",
+          targetObservationId: partial,
+          findBase64: "aGk=",
+          replacementBase64: "Ynll",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.deepEqual(patch, { ok: true });
+
+    const remove = validatePreflightPlanAgainstLedgerV1(
+      plan([op({ stepId: "s1", kind: "deleteFile", relativePath: "big.ts", targetObservationId: partial })]),
+      ledger,
+      ROOT
+    );
+    assert.deepEqual(remove, { ok: true });
+  });
+
   void it("still rejects two whole-file writes on one target — the second would silently discard the first", () => {
     // The safety half of workflow-6 manual-confirm line 98. Item 17 relaxed
     // `duplicateTarget` so several `patchFile` operations may chain on one

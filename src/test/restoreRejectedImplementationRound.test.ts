@@ -24,6 +24,7 @@ import * as vscode from "vscode";
 
 import {
   describeUnusableReviewBlockV1,
+  registerReviewActionCommands,
   restoreRejectedImplementationRoundV1,
 } from "../commands/reviewActions";
 import {
@@ -185,8 +186,9 @@ void describe("restoreRejectedImplementationRoundV1", () => {
     activeStore = mem;
     activeNotifications = captureNotifications();
 
-    await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl-low-review");
+    const restored = await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl-low-review");
 
+    assert.equal(restored, true, "a successful restore must report true so a caller can safely rerun");
     assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
     assert.equal(mem.store.get(REVIEW_URI.toString()), REAL_REVIEW);
   });
@@ -204,9 +206,10 @@ void describe("restoreRejectedImplementationRoundV1", () => {
     const notifications = captureNotifications();
     activeNotifications = notifications;
 
-    await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl-low-review");
+    const restored = await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl-low-review");
 
     // Untouched — restoring here would have clobbered a newer, usable summary.
+    assert.equal(restored, false, "a no-op restore must report false so a caller never reruns off of it");
     assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
     assert.equal(mem.store.get(REVIEW_URI.toString()), REAL_REVIEW);
     assert.ok(
@@ -228,7 +231,134 @@ void describe("restoreRejectedImplementationRoundV1", () => {
     activeStore = mem;
     activeNotifications = captureNotifications();
 
-    await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl");
+    const restored = await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl");
+
+    assert.equal(restored, true);
+    assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
+  });
+
+  void it("reports false (no rerun) when neither the summary nor a review backup can be restored", async () => {
+    const summaryUri = getImplementationSummaryUri(FOLDER);
+    const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+    const mem = installMemStore(
+      seed({
+        [summaryUri.toString()]: stamped,
+        // No _prev backup for the summary, and no review artifact at all.
+      })
+    );
+    activeStore = mem;
+    activeNotifications = captureNotifications();
+
+    const restored = await restoreRejectedImplementationRoundV1(FOLDER.fsPath, "impl");
+
+    assert.equal(restored, false);
+    assert.equal(mem.store.get(summaryUri.toString()), stamped, "the stamp must survive an impossible restore");
+  });
+});
+
+/**
+ * 2026-09-15 post-freeze findings, item 3 / plan step 24: restoring the last
+ * usable summary from the Review/Fast Forward refusal must "rerun admission"
+ * — re-enter the refused stage automatically — rather than leaving the user
+ * to click Review or Fast Forward again by hand. Driven through the REAL
+ * registered "vs-code-ai-helper.restoreRejectedImplementationRound" command
+ * (the exact invocation the refusal's notification button makes), with only
+ * the rerun target itself faked, so this exercises the actual dispatch glue
+ * in registerReviewActionCommands rather than restoreRejectedImplementationRoundV1
+ * in isolation.
+ */
+void describe("restoreRejectedImplementationRound command — rerun-on-success wiring", () => {
+  void it("re-invokes the supplied rerun command with {taskFolderPath} after a successful restore", async () => {
+    const summaryUri = getImplementationSummaryUri(FOLDER);
+    const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+    const mem = installMemStore(
+      seed({
+        [summaryUri.toString()]: stamped,
+        [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+      })
+    );
+    activeStore = mem;
+    activeNotifications = captureNotifications();
+
+    const fakeContext = {
+      subscriptions: [],
+      extensionUri: vscode.Uri.file("/fake-extension"),
+    } as unknown as vscode.ExtensionContext;
+    registerReviewActionCommands(fakeContext);
+
+    const rerunCalls: unknown[] = [];
+    vscode.commands.registerCommand("test.spyRerun", (arg: unknown) => {
+      rerunCalls.push(arg);
+    });
+
+    await vscode.commands.executeCommand(
+      "vs-code-ai-helper.restoreRejectedImplementationRound",
+      FOLDER.fsPath,
+      "impl",
+      "test.spyRerun"
+    );
+
+    assert.deepEqual(rerunCalls, [{ taskFolderPath: FOLDER.fsPath }]);
+  });
+
+  void it("does NOT re-invoke the rerun command when the restore was a no-op", async () => {
+    const summaryUri = getImplementationSummaryUri(FOLDER);
+    const mem = installMemStore(
+      seed({
+        // Already a real summary — nothing to restore.
+        [summaryUri.toString()]: REAL_SUMMARY,
+      })
+    );
+    activeStore = mem;
+    activeNotifications = captureNotifications();
+
+    const fakeContext = {
+      subscriptions: [],
+      extensionUri: vscode.Uri.file("/fake-extension"),
+    } as unknown as vscode.ExtensionContext;
+    registerReviewActionCommands(fakeContext);
+
+    const rerunCalls: unknown[] = [];
+    vscode.commands.registerCommand("test.spyRerunNoop", () => {
+      rerunCalls.push(true);
+    });
+
+    await vscode.commands.executeCommand(
+      "vs-code-ai-helper.restoreRejectedImplementationRound",
+      FOLDER.fsPath,
+      "impl",
+      "test.spyRerunNoop"
+    );
+
+    assert.deepEqual(rerunCalls, []);
+  });
+
+  void it("does NOT re-invoke anything when no rerun command id is supplied (the plain 'Discard Last Round' shape)", async () => {
+    const summaryUri = getImplementationSummaryUri(FOLDER);
+    const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+    const mem = installMemStore(
+      seed({
+        [summaryUri.toString()]: stamped,
+        [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+      })
+    );
+    activeStore = mem;
+    activeNotifications = captureNotifications();
+
+    const fakeContext = {
+      subscriptions: [],
+      extensionUri: vscode.Uri.file("/fake-extension"),
+    } as unknown as vscode.ExtensionContext;
+    registerReviewActionCommands(fakeContext);
+
+    // No third argument — mirrors the "Discard Last Round" decision-card and
+    // task-row context-menu invocations, which must keep behaving exactly as
+    // before (restore only, never an automatic rerun).
+    await vscode.commands.executeCommand(
+      "vs-code-ai-helper.restoreRejectedImplementationRound",
+      FOLDER.fsPath,
+      "impl"
+    );
 
     assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
   });

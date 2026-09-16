@@ -582,6 +582,27 @@ export interface TaskProgress {
   watchdogPauseClaimId?: string;
 
   /**
+   * The durable pause-fence generation (`workAdmissionV1.ts`'s
+   * `readOrInitPauseFenceGenerationV1`/`advancePauseFenceGenerationV1`) that
+   * was current at the moment this watchdog pause's committing claim was
+   * acquired (v1 fixes item 1, Part 1b step 1). Captured exactly once, before
+   * the progress mutation that writes this pause begins, and carried
+   * unchanged through pre-write and post-write currency checks
+   * (`isWatchdogPauseFenceCurrentV1`) — a pause is only EFFECTIVE while this
+   * value still equals the task's current durable generation; once a
+   * revocation advances the fence past it, every reader must treat this pause
+   * as stale (ignored and repaired), never as a real block, regardless of
+   * what `status`/`pausedReason` still say on disk. Absent for a pause
+   * committed before this field existed (shipped Part 1a builds) or one not
+   * committed through the claim protocol at all (a user pause, a quota park)
+   * — an absent value is always treated as current (there is no fence to have
+   * fallen behind). Cleared by the same rule as `watchdogPauseClaimId`: any
+   * status change away from paused, or a later unrelated pause overwriting
+   * it.
+   */
+  watchdogPauseFenceGeneration?: number;
+
+  /**
    * Durable record that an implementation round finished without a usable
    * report and a recovery continuation is owed — the ONE transition every
    * unreported round lands on (deferred, cut short, or a stamped-unusable
@@ -1290,6 +1311,30 @@ export interface RoundLedgerOutcomeV1 {
     readonly band: number;
     readonly taskMdBytes: number;
     readonly percentOfLimit: number;
+  };
+  /**
+   * Set when this round's coordinator attach-identity hook
+   * (`attachCoordinatorIdentityToRoundV1`) failed for a confirmed transient
+   * write-plumbing reason rather than a genuine ownership violation (Part 2,
+   * "an admission gate should guard correctness, not bookkeeping" —
+   * 2026-09-15 post-freeze findings, item 2: the settlement must say "which
+   * kind it is, so 'the round did not run' is distinguishable from 'the
+   * round ran and was not recorded'"). The round proceeded and ran the
+   * provider anyway — this is the durable record that ONE of its attemptIds
+   * was never confirmed attached to this ledger row, so traceability for
+   * that attempt is degraded, not that the round itself failed. Absent for
+   * every round whose identity attached cleanly, and for one that failed
+   * closed instead (that round never reaches a terminal state with this
+   * field set — it settles `attemptIdentityAttachmentFailed` and never
+   * runs). Attached in the SAME `patchTaskProgressStrictV1` transaction
+   * `terminalizeRoundV1` uses to close this round, mirroring
+   * `taskMdSizeBand`'s own precedent for a caller-observed fact folded into
+   * a round's settlement.
+   */
+  identityAttachmentDegraded?: {
+    readonly attemptId: string;
+    readonly kind: string;
+    readonly detail: string;
   };
 }
 

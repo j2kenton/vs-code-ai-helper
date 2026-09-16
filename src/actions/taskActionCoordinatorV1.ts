@@ -144,6 +144,7 @@ import {
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { classifyFailure, parseQuotaResetV1 } from "../utils/quota";
 import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import {
   AiResultEnvelopeV1,
@@ -152,7 +153,11 @@ import {
   MalformedAiResultV1,
   parseAiResultEnvelopeV1,
 } from "../types/aiResultEnvelope";
-import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import {
+  ProviderChainCandidateStatusV1,
+  ProviderChainExhaustionV1,
+  TaskActionOutcomeV1,
+} from "../types/taskActionOutcomeV1";
 import { unavailableV1 } from "../types/workflowAvailabilityV1";
 import {
   AgentExecutionBrokerOptionsV1,
@@ -193,6 +198,7 @@ import { EDIT_EXECUTION_ACTION_KEY_V1 } from "./rows/editExecutionRowV1";
 import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { isInputSnapshotSizeRejectionReasonV1 } from "../types/chatInteractionTransactionV1";
+import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
 
 export class TaskActionCoordinatorErrorV1 extends Error {
   constructor(message: string) {
@@ -354,9 +360,36 @@ export interface TaskActionRequestV1 {
    * `attachCoordinatorIdentityToRoundV1` can be called from it
    * instead of (or in addition to) `onPromptAssembled`. Unlike the prompt
    * observer, this hook may be awaited: callers that own a round ledger use
-   * it as an admission gate. A rejected hook never escapes the coordinator;
-   * it produces a settled `attemptIdentityAttachmentFailed` outcome before a
-   * provider can run.
+   * it as an admission gate.
+   *
+   * NOT purely fail-closed (2026-09-15 post-freeze findings, item 2: "an
+   * admission gate should guard correctness, not bookkeeping"). A rejected
+   * hook never escapes the coordinator either way, but what happens next
+   * depends on WHY it rejected — see `classifyAttemptAllocationFailureV1`
+   * (this module): a confirmed `AttachCoordinatorIdentityErrorV1` whose
+   * `kind` is `rowNotLive` or `wrongOwner` is a genuine ownership violation
+   * — the round settles `attemptIdentityAttachmentFailed` before a provider
+   * can run, retryable only by a fresh human/task-level attempt, never
+   * automatically. The ONE exception is a confirmed `writerRetriesExhausted`
+   * — this gate's row is already known live and owned (both checks already
+   * passed on every attempt), only the write recording this attempt's id
+   * onto it could not be durably confirmed after retrying — which is logged
+   * as a degraded-provenance `console.warn` HERE, and lets the coordinator
+   * proceed to invoke the provider rather than losing the round. Any OTHER,
+   * unrecognized error stays fail-closed like the two ownership kinds: this
+   * hook can carry arbitrary caller logic, and an unrecognized failure gives
+   * no basis for concluding it is safe to proceed.
+   *
+   * This `console.warn` is a SUPPLEMENT, not the durable record: a caller
+   * that owns a round ledger (`reviewActions.ts`'s two dispatch sites) calls
+   * `attachCoordinatorIdentityToRoundTrackingDegradationV1` (`roundLedgerV1.ts`)
+   * from inside its own hook body instead of the bare attach function — that
+   * wrapper reports the SAME `writerRetriesExhausted` fact to the caller
+   * before rethrowing it unchanged, so the caller can fold it into
+   * `RoundLedgerOutcomeV1.identityAttachmentDegraded` at its own
+   * `terminalizeRoundV1` call and into that round's run log. This module's
+   * own classification (fail-open vs fail-closed) is unaffected either way —
+   * the caller's capture never changes what gets rethrown here.
    */
   readonly onAttemptAllocated?: (
     info: { readonly attemptId: string; readonly operationId: string }
@@ -1183,14 +1216,55 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
       cursor++;
     }
     if (lastMatch.outcome !== undefined) {
+      // Classified from the SAME `detail` text the reason phrase above is
+      // built from — 2026-09-15 post-freeze findings, item 4: a quota/
+      // model-entitlement candidate is recorded as `deferred`, typed at the
+      // point its detail is known, rather than left for a later consumer to
+      // re-derive by re-parsing the rendered `reason` string.
+      const classified =
+        lastMatch.detail !== undefined
+          ? classifyFailure({ errorMessage: lastMatch.detail })
+          : undefined;
+      const deferredFailureKind =
+        classified?.failureKind === "quota" || classified?.failureKind === "model-entitlement"
+          ? classified.failureKind
+          : undefined;
+      const deferredResetAt =
+        deferredFailureKind !== undefined ? parseQuotaResetV1(lastMatch.detail, new Date()) : undefined;
       return {
         ...candidate,
         reason: attemptOutcomeReasonTextV1(lastMatch.outcome, lastMatch.detail),
+        ...(deferredFailureKind !== undefined ? { deferredFailureKind } : {}),
+        ...(deferredResetAt !== undefined ? { deferredResetAt } : {}),
       };
     }
     return candidate;
   });
   return { ...exhaustion, candidates };
+}
+
+/**
+ * True when every candidate that was actually reserved and invoked in an
+ * exhausted chain failed with a quota/model-entitlement block — i.e. this
+ * was not "every candidate tried and failed", it was "every candidate is
+ * currently unavailable and told us when it might reopen". 2026-09-15
+ * post-freeze findings, item 4, requirement: "a candidate that told us when
+ * it will be available again has not been exhausted, it has been deferred" —
+ * distinguishing this from ordinary exhaustion at the OUTCOME CODE level (not
+ * only inside `chainExhaustion`'s per-candidate detail) is what keeps the run
+ * log's leading `Status:` line from reading as an unexplained failure.
+ *
+ * A candidate the registry skipped at selection time (never reserved, so it
+ * never got the chance to be a quota block) does not disqualify this: only
+ * candidates that were actually invoked and failed are considered. Requires
+ * at least one such candidate, and none of them failed for a non-quota
+ * reason, or this reports `false` (the ordinary "exhausted" wording stands).
+ */
+function allInvokedCandidatesDeferredByQuotaV1(candidates: readonly ProviderChainCandidateStatusV1[]): boolean {
+  const invoked = candidates.filter(
+    (candidate) => !candidate.reason.startsWith('cannot satisfy the requested "')
+  );
+  return invoked.length > 0 && invoked.every((candidate) => candidate.deferredFailureKind !== undefined);
 }
 
 /**
@@ -1257,6 +1331,40 @@ const RESUME_FALLBACK_LOGGING_POLICY_V1: TaskActionLoggingPolicyV1 = {
   includeResultMetrics: false,
 };
 const RESUME_UNRESOLVED_ACTION_KEY_V1 = "resume.unresolved";
+
+/**
+ * How `onAttemptAllocated` handling classifies a rejected attach (Part 2,
+ * "an admission gate should guard correctness, not bookkeeping" — 2026-09-15
+ * post-freeze findings, item 2). `failClosed: false` means this is a
+ * provenance-only failure: the round-ledger row is confirmed live and owned
+ * by this operation, only the write recording THIS attempt's id onto it
+ * could not be durably confirmed — traceability degrades, the round still
+ * runs. `failClosed: true` covers both real ownership violations
+ * (`AttachCoordinatorIdentityErrorV1` with kind `rowNotLive`/`wrongOwner`)
+ * and any error this coordinator does not recognize, which is deliberately
+ * treated the same as an ownership violation: an `onAttemptAllocated` hook
+ * can carry arbitrary caller logic (`reviewActions.ts`, `runEditActionV1.ts`),
+ * and an unrecognized failure gives no basis for concluding it is safe to
+ * proceed — see `attachCoordinatorIdentityToRoundV1`'s own
+ * `AttachCoordinatorIdentityFailureKindV1` doc comment for why only those two
+ * kinds are singled out as fail-open.
+ */
+function classifyAttemptAllocationFailureV1(
+  error: unknown
+): { readonly failClosed: boolean; readonly kind: string; readonly detail: string } {
+  if (error instanceof AttachCoordinatorIdentityErrorV1) {
+    return {
+      failClosed: error.kind === "rowNotLive" || error.kind === "wrongOwner",
+      kind: error.kind,
+      detail: error.message,
+    };
+  }
+  return {
+    failClosed: true,
+    kind: "unknown",
+    detail: error instanceof Error ? error.message : String(error),
+  };
+}
 
 export function createTaskActionCoordinatorV1(
   deps: TaskActionCoordinatorDepsV1
@@ -1467,7 +1575,11 @@ export function createTaskActionCoordinatorV1(
     onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"],
     taskBinding?: TaskBindingRefV1
   ): Promise<TaskActionOutcomeV1> {
-    const attachmentFailureOutcomeV1 = (attemptId: string): TaskActionOutcomeV1 => ({
+    const attachmentFailureOutcomeV1 = (
+      attemptId: string,
+      failureKind: string,
+      detail: string
+    ): TaskActionOutcomeV1 => ({
       kind: "failed",
       ...(operationId !== undefined && taskBinding !== undefined
         ? {
@@ -1481,22 +1593,46 @@ export function createTaskActionCoordinatorV1(
           }
         : {}),
       code: "attemptIdentityAttachmentFailed",
-      retryable: true,
+      // Nothing automatically retries this settlement (2026-09-15 post-freeze
+      // findings, item 2: "retryable: true must mean something automatic") —
+      // only a genuine ownership violation (rowNotLive/wrongOwner, or an
+      // unrecognized error) reaches this path now; a confirmed transient
+      // write failure proceeds with a degraded-provenance warning instead
+      // (see `reportAttemptAllocatedV1` below), so clearing this requires a
+      // human/task-level retry, not an automatic one.
+      retryable: false,
+      detail: `${failureKind}: ${detail}`,
     });
-    const reportAttemptAllocatedV1 = async (allocatedAttemptId: string): Promise<boolean> => {
+    /** See `classifyAttemptAllocationFailureV1`'s own doc comment for the
+     * fail-open/fail-closed split this applies. */
+    type AttemptAllocationReportV1 =
+      | { readonly ok: true }
+      | { readonly ok: false; readonly failureKind: string; readonly detail: string };
+    const reportAttemptAllocatedV1 = async (
+      allocatedAttemptId: string
+    ): Promise<AttemptAllocationReportV1> => {
       if (operationId === undefined) {
-        return true;
+        return { ok: true };
       }
       try {
         await onAttemptAllocated?.({ attemptId: allocatedAttemptId, operationId });
-        return true;
+        return { ok: true };
       } catch (error) {
+        const classified = classifyAttemptAllocationFailureV1(error);
+        if (!classified.failClosed) {
+          // This gate protects a RECORD of the round, not the workspace —
+          // proceed with degraded traceability rather than losing real work.
+          console.warn(
+            `onAttemptAllocated degraded (proceeding): ${classified.kind}: ${classified.detail}`
+          );
+          return { ok: true };
+        }
         // The attachment is required for ledger-owning callers, but a failed
         // attachment must still take the coordinator's normal settlement
         // path. Letting it reject here previously leaked progress and skipped
         // the stage owner's terminalization path entirely.
         console.error("onAttemptAllocated failed:", error);
-        return false;
+        return { ok: false, failureKind: classified.kind, detail: classified.detail };
       }
     };
     // No task-operation lease is held anywhere in this function except the
@@ -1625,9 +1761,10 @@ export function createTaskActionCoordinatorV1(
       } else {
         isFreshCandidateReservationThisIterationV1 = true;
         attemptId = session.allocateAttempt();
-        if (!(await reportAttemptAllocatedV1(attemptId))) {
+        const allocationReport = await reportAttemptAllocatedV1(attemptId);
+        if (!allocationReport.ok) {
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return attachmentFailureOutcomeV1(attemptId);
+          return attachmentFailureOutcomeV1(attemptId, allocationReport.failureKind, allocationReport.detail);
         }
 
         const next = selection.reserveNext(attemptId);
@@ -1654,21 +1791,32 @@ export function createTaskActionCoordinatorV1(
           // (enriched run record, paused task) still belongs to the stage
           // owner that dispatched the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return (
-            lastMalformedOutcomeV1 ?? {
-              kind: "unavailable",
-              code: next.code,
-              ...(next.chainExhaustion !== undefined
-                ? {
-                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
-                      next.chainExhaustion,
-                      session,
-                      networkFaultRetryAttemptIdsV1
-                    ),
-                  }
-                : {}),
-            }
-          );
+          if (lastMalformedOutcomeV1 !== undefined) {
+            return lastMalformedOutcomeV1;
+          }
+          const enrichedChain =
+            next.chainExhaustion !== undefined
+              ? enrichChainExhaustionWithAttemptOutcomesV1(
+                  next.chainExhaustion,
+                  session,
+                  networkFaultRetryAttemptIdsV1
+                )
+              : undefined;
+          // 2026-09-15 post-freeze findings, item 4: when every invoked
+          // candidate was quota/entitlement-deferred (not "tried and
+          // failed" in the ordinary sense), the outcome code itself says so
+          // — see `allInvokedCandidatesDeferredByQuotaV1`.
+          const code =
+            next.code === "candidatesExhausted" &&
+            enrichedChain !== undefined &&
+            allInvokedCandidatesDeferredByQuotaV1(enrichedChain.candidates)
+              ? ("candidatesDeferred" as const)
+              : next.code;
+          return {
+            kind: "unavailable",
+            code,
+            ...(enrichedChain !== undefined ? { chainExhaustion: enrichedChain } : {}),
+          };
         }
         if (next.kind === "candidateUnavailable") {
           // The registry settled this attempt (providerUnavailablePreInvocation)
@@ -1909,9 +2057,14 @@ export function createTaskActionCoordinatorV1(
           ) {
             networkFaultRetriesUsedV1++;
             const retryAttemptId = session.allocateAttempt();
-            if (!(await reportAttemptAllocatedV1(retryAttemptId))) {
+            const retryAllocationReport = await reportAttemptAllocatedV1(retryAttemptId);
+            if (!retryAllocationReport.ok) {
               session.reportAttemptOutcome(retryAttemptId, "providerUnavailablePreInvocation");
-              return attachmentFailureOutcomeV1(retryAttemptId);
+              return attachmentFailureOutcomeV1(
+                retryAttemptId,
+                retryAllocationReport.failureKind,
+                retryAllocationReport.detail
+              );
             }
             networkFaultRetryAttemptIdsV1.add(retryAttemptId);
             const retryHandle = session.reserve({
@@ -2483,14 +2636,28 @@ export function createTaskActionCoordinatorV1(
     for (;;) {
       const attemptId = session.allocateAttempt();
       let identityAttached = true;
+      let identityFailureKind = "";
+      let identityFailureDetail = "";
       try {
         await request.onAttemptAllocated?.({ attemptId, operationId });
       } catch (error) {
-        // `admitAction` owns an open progress handle at this point. Convert
-        // an attachment failure into a normal, settled result so it cannot
-        // escape `executeAction` before `progress.end()` and audit logging.
-        console.error("onAttemptAllocated failed:", error);
-        identityAttached = false;
+        const classified = classifyAttemptAllocationFailureV1(error);
+        if (!classified.failClosed) {
+          // This gate protects a RECORD of the round, not the workspace —
+          // proceed with degraded traceability rather than losing real work
+          // (see `classifyAttemptAllocationFailureV1`'s doc comment).
+          console.warn(
+            `onAttemptAllocated degraded (proceeding): ${classified.kind}: ${classified.detail}`
+          );
+        } else {
+          // `admitAction` owns an open progress handle at this point. Convert
+          // an attachment failure into a normal, settled result so it cannot
+          // escape `executeAction` before `progress.end()` and audit logging.
+          console.error("onAttemptAllocated failed:", error);
+          identityAttached = false;
+          identityFailureKind = classified.kind;
+          identityFailureDetail = classified.detail;
+        }
       }
       if (!identityAttached) {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
@@ -2511,7 +2678,12 @@ export function createTaskActionCoordinatorV1(
                 chatDocumentId: request.taskBinding.chatDocumentId,
               },
               code: "attemptIdentityAttachmentFailed",
-              retryable: true,
+              // See the matching comment on `runProviderRow`'s
+              // `attachmentFailureOutcomeV1`: nothing automatically retries
+              // this settlement, and only a genuine ownership violation (or
+              // an unrecognized error) reaches this path now.
+              retryable: false,
+              detail: `${identityFailureKind}: ${identityFailureDetail}`,
             },
             metrics
           ),
@@ -2528,27 +2700,32 @@ export function createTaskActionCoordinatorV1(
         // been invoked yet, so this is providerModeUnavailable in practice;
         // the registry's code is still carried verbatim rather than
         // re-asserted here.
-        return {
-          kind: "settled",
-          outcome: finalizeOutcome(
-            row,
-            request,
-            operationId,
-            {
-              kind: "unavailable",
-              code: next.code,
-              ...(next.chainExhaustion !== undefined
-                ? {
-                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
-                      next.chainExhaustion,
-                      session
-                    ),
-                  }
-                : {}),
-            },
-            metrics
-          ),
-        };
+        {
+          const enrichedChain =
+            next.chainExhaustion !== undefined
+              ? enrichChainExhaustionWithAttemptOutcomesV1(next.chainExhaustion, session)
+              : undefined;
+          const code =
+            next.code === "candidatesExhausted" &&
+            enrichedChain !== undefined &&
+            allInvokedCandidatesDeferredByQuotaV1(enrichedChain.candidates)
+              ? ("candidatesDeferred" as const)
+              : next.code;
+          return {
+            kind: "settled",
+            outcome: finalizeOutcome(
+              row,
+              request,
+              operationId,
+              {
+                kind: "unavailable",
+                code,
+                ...(enrichedChain !== undefined ? { chainExhaustion: enrichedChain } : {}),
+              },
+              metrics
+            ),
+          };
+        }
       }
       if (next.kind === "candidateUnavailable") {
         reportCandidateSkipped(deps, next, request.taskStage);

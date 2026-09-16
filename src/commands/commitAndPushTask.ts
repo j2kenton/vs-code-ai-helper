@@ -56,8 +56,11 @@ import { COMMIT_PUSH_ACTION_KEY_V1, CommitPushServicesV1 } from "../actions/rows
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
   acquireWorkAdmissionV1,
   beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
+  describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
@@ -67,6 +70,8 @@ import {
   reconcileWatchdogPauseAgainstAdmissionV1,
   WorkAdmissionPauseReconciliationV1,
 } from "../state/workAdmissionReconciliationV1";
+import { isEffectivelyPausedV1, resolveEffectiveStageTaskStatusV1 } from "../state/effectivePauseStatusV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
@@ -2785,17 +2790,57 @@ export async function commitAndPushTask(
   // resolution, leaving the setup-phase watchdog race open). The peek is a
   // best-effort guess, corrected below once `resolveCommitPushTargetTaskV1`
   // returns the authoritative target.
+  //
+  // 2026-09-10 review completion blocker (narrowed further): the
+  // resolution-in-flight stand-down (`beginTargetResolutionV1`) used to start
+  // only around `resolveCommitPushTargetTaskV1` further below — AFTER this
+  // early guessed-target admission had already been awaited. The guess can be
+  // wrong or absent (true no-arg invocation, cold current-task-store cache),
+  // and while this await was outstanding the watchdog was still free to
+  // pause whatever the eventual real target turns out to be, since the
+  // same-process stand-down had not begun yet. Starting it here closes that
+  // gap; `endTargetResolutionV1()` (in the inner `finally` below, once
+  // resolution completes) balances this call on every path, including the
+  // early-refusal return immediately below.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`): `earlyFolderPath`
+  // is a raw, unvalidated caller-supplied path (or a best-effort in-memory
+  // peek) — this now goes through the same shared
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` helper every other early-
+  // admission route uses, instead of acquiring bookkeeping directly against
+  // an unvalidated path (validation-before-bookkeeping, plus containment
+  // observability against `taskRootCandidatePathsV1`). `resolveCommitPushTargetTaskV1`
+  // below remains the sole authoritative ownership/workspace-binding check.
   const earlyFolderPath =
     extractSynchronousCommitPushFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
-  const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "commitAndPushTask",
-      })
-    : undefined;
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "commitAndPushTask",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
   if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     releaseCommitPushToken();
     return;
@@ -2821,11 +2866,12 @@ export async function commitAndPushTask(
     // 2026-09-10 review completion blocker (narrowed further): per-task
     // admission cannot protect a target that is not yet known — the peek
     // above can miss a refresh-discovered actual target entirely (its guess
-    // predates the refresh that first reveals such a target). Stand the
-    // watchdog's whole pause pass down for the length of this barrier plus
-    // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
-    // (see that pair's doc comment in `workAdmissionV1.ts`).
-    beginTargetResolutionV1();
+    // predates the refresh that first reveals such a target). The watchdog's
+    // whole pause pass stays stood down (via `beginTargetResolutionV1`, now
+    // called BEFORE the early guessed-target admission acquisition above —
+    // see that call site's own comment) through this barrier plus resolution
+    // below. `endTargetResolutionV1()` in the `finally` immediately below
+    // balances that single `beginTargetResolutionV1()` call.
     let resolvedTask: Awaited<ReturnType<typeof resolveCommitPushTargetTaskV1>>;
     try {
       await TaskCreationStartupReconcilerV1.waitUntilReady();
@@ -2856,7 +2902,7 @@ export async function commitAndPushTask(
       };
       resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore, admitCandidateV1);
     } finally {
-      endTargetResolutionV1();
+      await endTargetResolutionV1(targetResolutionHandle);
     }
     if (!resolvedTask) {
       return;
@@ -2881,7 +2927,25 @@ export async function commitAndPushTask(
       handle = late.handle;
       heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
-    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+    // 2026-09-10 review completion blocker (new): check the reconciliation
+    // result rather than discarding it — a genuine `userPaused` or
+    // `unreadable` outcome must stop this command here, the same way
+    // `completeCommitAndPushTask`'s first reconciliation already does. The
+    // pre-reconciliation `resolvedTask.progress.status` snapshot alone can't
+    // tell a real user pause apart from a watchdog pause this call just
+    // reversed.
+    const commitPushReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
+      vscode.Uri.file(resolvedTask.taskFolderPath)
+    );
+    if (
+      commitPushReconcileOutcome.outcome === "userPaused" ||
+      commitPushReconcileOutcome.outcome === "unreadable"
+    ) {
+      NotificationRouter.showWarning(
+        "Commit and Push is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
     await invokeCommitPushRowV1(resolvedTask, {
       inventory,
       explicitArg,
@@ -2936,17 +3000,54 @@ export async function completeCommitAndPushTask(
   // case `resolveTaskContext` can unambiguously resolve; a genuine cold-cache
   // miss with no unique active-task fallback still falls through to late
   // acquisition below, same as before.
+  //
+  // 2026-09-10 review completion blocker (narrowed further): the
+  // resolution-in-flight stand-down (`beginTargetResolutionV1`) used to start
+  // only around `resolveTaskContext` further below — AFTER this early
+  // guessed-target admission had already been awaited. The guess can be
+  // wrong or absent (true no-arg invocation, cold current-task-store cache),
+  // and while this await was outstanding the watchdog was still free to
+  // pause whatever the eventual real target turns out to be, since the
+  // same-process stand-down had not begun yet. Starting it here closes that
+  // gap; `endTargetResolutionV1()` (in the inner `finally` below, once
+  // resolution completes) balances this call on every path, including the
+  // early-refusal return immediately below.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    releaseCommitPushToken();
+    return;
+  }
+  // 2026-09-11 review architectural blocker (`d620c877...-1`): route through
+  // the shared early-admission helper (validation-before-bookkeeping plus
+  // containment observability) instead of acquiring directly against an
+  // unvalidated raw/peeked path — see the sibling call site above for the
+  // full rationale.
   const earlyFolderPath =
     extractSynchronousCommitPushFolderPathV1(explicitArg) ??
     peekTaskFolderPathSynchronouslyV1(inventory, normalizeArg(explicitArg), currentTaskStore);
-  const early = earlyFolderPath
-    ? await acquireWorkAdmissionV1({
-        taskFolderPath: earlyFolderPath,
-        purpose: "admission",
-        commandId: "completeCommitAndPushTask",
-      })
-    : undefined;
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "completeCommitAndPushTask",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
   if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     releaseCommitPushToken();
     return;
@@ -2972,11 +3073,12 @@ export async function completeCommitAndPushTask(
     // 2026-09-10 review completion blocker (narrowed further): per-task
     // admission cannot protect a target that is not yet known — the peek
     // above can miss a refresh-discovered actual target entirely (its guess
-    // predates the refresh that first reveals such a target). Stand the
-    // watchdog's whole pause pass down for the length of this barrier plus
-    // resolution below, via `beginTargetResolutionV1`/`endTargetResolutionV1`
-    // (see that pair's doc comment in `workAdmissionV1.ts`).
-    beginTargetResolutionV1();
+    // predates the refresh that first reveals such a target). The watchdog's
+    // whole pause pass stays stood down (via `beginTargetResolutionV1`, now
+    // called BEFORE the early guessed-target admission acquisition above —
+    // see that call site's own comment) through this barrier plus resolution
+    // below. `endTargetResolutionV1()` in the `finally` immediately below
+    // balances that single `beginTargetResolutionV1()` call.
     const resolverArg = normalizeArg(explicitArg);
     // 2026-09-10 review completion blocker ("publish/complete actions"
     // route, narrowed further): this call used to pass `allowPaused: false`,
@@ -3023,7 +3125,7 @@ export async function completeCommitAndPushTask(
         onResolvedCandidate: admitCandidateV1,
       }, currentTaskStore);
     } finally {
-      endTargetResolutionV1();
+      await endTargetResolutionV1(targetResolutionHandle);
     }
 
     // 2026-09-10 review completion blocker (new): `resolvedTask.progress.status`
@@ -3039,11 +3141,19 @@ export async function completeCommitAndPushTask(
     // ran at all (`reconcileOutcome === undefined` — admission itself could
     // not be acquired for this candidate) does the snapshot remain the only
     // available signal.
+    // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+    // command self-checks"): the fallback branch (reconciliation never ran —
+    // admission itself could not be acquired) used to trust the raw `status`
+    // field directly, which wrongly reports "still paused" for a watchdog
+    // pause a revocation has already advanced the fence past but whose
+    // on-disk `status` some later admission acquisition has not yet repaired.
+    // The resolver's fence check is independent of admission acquisition, so
+    // it applies here exactly as well as it would have with a live marker.
     const stillGenuinelyPaused =
       !!resolvedTask &&
       (reconcileOutcome
         ? reconcileOutcome.outcome === "userPaused" || reconcileOutcome.outcome === "unreadable"
-        : resolvedTask.progress.status === "paused");
+        : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress));
 
     if (!resolvedTask || stillGenuinelyPaused) {
       if (resolverArg) {
@@ -3079,7 +3189,25 @@ export async function completeCommitAndPushTask(
       handle = late.handle;
       heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
-    await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+    // 2026-09-10 review completion blocker (narrowed further): this second
+    // reconciliation — run after the late re-acquisition above corrects a
+    // wrong early guess — discarded its result too, so a genuine user pause
+    // (or unreadable progress) landing between the first check above and this
+    // point could still let the command continue. Same fix as the first
+    // check: a fresh `userPaused`/`unreadable` outcome here must win over
+    // continuing, not just over the stale pre-reconciliation snapshot.
+    const secondReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
+      vscode.Uri.file(resolvedTask.taskFolderPath)
+    );
+    if (
+      secondReconcileOutcome.outcome === "userPaused" ||
+      secondReconcileOutcome.outcome === "unreadable"
+    ) {
+      NotificationRouter.showInformation(
+        "No active task found to complete, commit, and push."
+      );
+      return;
+    }
 
     // Check stage eligibility: must be at final review stage (impl-low-review) or completed
     if (resolvedTask.progress.currentStage !== "impl-low-review") {
@@ -3133,13 +3261,30 @@ export async function completeCommitAndPushTask(
         return;
       }
       const taskBindingId = derivedBinding.binding.bindingId;
+      // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+      // advancement gates"): the lifecycle row's own eligibility check
+      // (`eligibility.statuses: ["active"]`, `taskActionCoordinatorV1.ts`'s
+      // `eligibilityFailure`) reads whatever `taskStatus` is passed here
+      // verbatim — it never re-derives it. The self-checks above already
+      // refuse a GENUINE pause, but a watchdog pause whose fence a revocation
+      // has already advanced past can still read "paused" on disk (repair is
+      // best-effort and may not have landed yet), which would otherwise trip
+      // `actionNotEligibleForStatus` here even though this command already
+      // proved the task is not really paused. Shared, dedicated-tested
+      // computation (`resolveEffectiveStageTaskStatusV1`) — same fix as
+      // reviewActions.ts's `advanceStageViaNextStageRowV1`, which uses the
+      // identical function rather than reimplementing it.
+      const effectiveStageTaskStatus = await resolveEffectiveStageTaskStatusV1(
+        resolvedTask.taskFolderPath,
+        resolvedTask.progress
+      );
       const stageOutcome = await invokeLifecycleRowV1({
         actionKey: NEXT_STAGE_ACTION_KEY_V1,
         taskFolderPath: resolvedTask.taskFolderPath,
         taskBindingId,
         chatDocumentIdentitySeed: resolvedTask.canonicalId,
         workspaceCwd,
-        taskStatus: resolvedTask.progress.status ?? "active",
+        taskStatus: effectiveStageTaskStatus,
         taskStage: resolvedTask.progress.currentStage,
         rawInput: {
           taskFolderPath: resolvedTask.taskFolderPath,

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext, ResolveTaskOptions } from "../utils/resolveTaskContext";
 import {
   runTrackedOperation,
   taskOperations,
@@ -28,10 +28,61 @@ import {
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
+import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
+  acquireWorkAdmissionV1,
+  beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
+  describeTargetResolutionWriteFailureV1,
+  describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
 
-async function resolve(inventory: TaskInventory, arg?: TaskArg) {
+/**
+ * Work admission (v1 fixes item 1, Part 1a) needs a task folder path BEFORE
+ * any awaited setup — mirrors `runLintingFixes.ts`'s
+ * `extractSynchronousLintingFolderPathV1`. Only returns a path when one is
+ * known synchronously from the argument (a tree-row invocation or a
+ * resolver-aware caller); a bare canonicalId or no-arg invocation has
+ * nothing to protect until `resolve()` picks a target, so admission is
+ * acquired right after resolution instead, in `renameTaskWithAI` itself.
+ */
+function extractSynchronousRenameFolderPathV1(arg?: TaskArg): string | undefined {
+  if (!arg) {
+    return undefined;
+  }
+  if (arg instanceof TaskNode) {
+    return arg.task.folderUri.fsPath;
+  }
+  return arg.taskFolderPath;
+}
+
+async function resolve(
+  inventory: TaskInventory,
+  arg?: TaskArg,
+  /**
+   * 2026-09-10 review architectural blocker fix (`d620c877...-1`): threaded
+   * through so `renameTaskWithAI` can acquire late admission and reconcile a
+   * watchdog-provenance pause from INSIDE `resolveTaskContext`'s own
+   * `onResolvedCandidate` hook — fired after ownership/containment/
+   * workspace-binding validation has already passed, mirroring
+   * `draftTaskWithAI.ts`'s identical fix. Previously `renameTaskWithAI` ended
+   * root-level target-resolution protection in a `finally` wrapped around
+   * this call's own await, then acquired late per-task admission afterward —
+   * a real gap between "resolution protection ends" and "per-task admission
+   * begins" that no amount of narrowing the early-admission check (the
+   * validation-before-bookkeeping fix) could close, because it was a
+   * sequencing defect, not a validation one. `renameTask` (the plain,
+   * non-AI rename) has no provider dispatch and passes nothing here.
+   */
+  onResolvedCandidate?: ResolveTaskOptions["onResolvedCandidate"]
+) {
   if (arg instanceof TaskNode) {
     return resolveTaskContext(
       inventory,
@@ -39,10 +90,10 @@ async function resolve(inventory: TaskInventory, arg?: TaskArg) {
         canonicalId: arg.task.canonicalId,
         taskFolderPath: arg.task.folderUri.fsPath,
       },
-      { allowPaused: true }
+      { allowPaused: true, onResolvedCandidate }
     );
   }
-  return resolveTaskContext(inventory, arg, { allowPaused: true });
+  return resolveTaskContext(inventory, arg, { allowPaused: true, onResolvedCandidate });
 }
 
 /**
@@ -344,12 +395,179 @@ export async function renameTaskWithAI(
   inventory: TaskInventory,
   arg?: TaskArg
 ): Promise<void> {
-  // Same activation-barrier contract as renameTask above (plan §1.4).
-  await TaskCreationStartupReconcilerV1.waitUntilReady();
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the startup gate, task resolution, and
+  // consent gate whenever the target folder is known synchronously from
+  // `arg` — mirrors runLintingFixes.ts/draftTaskWithAI.ts. Without this, the
+  // real provider dispatch below (`requestAiNameV1`'s `coordinator.executeAction`)
+  // ran with no durable evidence this task was doing anything, so a watchdog
+  // sweep could pause it mid-run.
+  //
+  // 2026-09-10 review blockers (new), mirroring runPublishChecks/
+  // commitAndPushTask's already-fixed shape:
+  //  - a canonicalId-only or true no-arg invocation left NO protection at
+  //    all across `resolve()` below. `beginTargetResolutionV1` now stands
+  //    the whole sweep pass down across that resolution regardless of
+  //    whether an early guess exists.
+  //  - `earlyFolderPath` is an UNVALIDATED raw path; if it targets a
+  //    different folder than `resolve()` authoritatively resolves to, the
+  //    early admission is released and reacquired for the REAL target.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-10 review architectural blocker fix (`d620c877...-1`):
+  // `earlyFolderPath` is a raw, unvalidated caller-supplied path —
+  // `resolve()`'s `resolveTaskContext` call below performs the real
+  // ownership/workspace-binding validation, but this early guess runs BEFORE
+  // any of that. This route used to gate on a bare
+  // `fs.existsSync(earlyFolderPath)`, duplicating (and falling short of) the
+  // validation-before-bookkeeping check every other early-admission route
+  // already gets from the shared helper — a directory that merely exists but
+  // is not a task folder (no `task.md`) would still have had admission
+  // bookkeeping created beneath it. Routed through
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` like every other route so
+  // the same rule (and any future fix to it) applies here too. A synchronous
+  // containment check against `resolveTaskRootCandidates()` was tried here
+  // and reverted the same round — see `chatWithStage.ts`'s identical call
+  // site for why: it depends on `vscode.workspace.workspaceFolders` being
+  // configured exactly in step with the caller's raw path, which is not
+  // guaranteed, and it silently skipped early admission for legitimate
+  // candidates instead of narrowing the gap. This still does not replace the
+  // real ownership/workspace-binding validation `resolve()` performs below.
+  //
+  // 2026-09-11 round (review architectural blocker `d620c877...-1`,
+  // narrowed further): passing `taskRootCandidatePathsV1` as
+  // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
+  // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
+  // repeating the reverted gate. 2026-09-14 (`d620c877...-1`, closed): when
+  // `taskRootCandidatePathsV1` is explicitly empty (no workspace open),
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` now verifies the
+  // candidate's own persisted ownership record before acquiring — see that
+  // function's own doc comment; the previously unconditional "always
+  // acquired" no longer applies to a candidate whose ownership does not
+  // verify.
+  const earlyFolderPath = extractSynchronousRenameFolderPathV1(arg);
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "renameTaskWithAI",
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
+  });
+  if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    return;
+  }
 
-  const task = await resolve(inventory, arg);
-  if (!task) return;
-  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    if (handle) {
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
+    }
+  };
+
+  // 2026-09-10 review architectural blocker fix (`d620c877...-1`): target-
+  // resolution protection must stay live across the ENTIRE resolve() call,
+  // not just until it returns — late admission and pause reconciliation now
+  // run from `resolveTaskContext`'s `onResolvedCandidate` hook, which fires
+  // DURING resolution (after ownership/containment/workspace-binding checks,
+  // before the `allowPaused` gate), so there is no longer any window where
+  // resolution protection has ended but per-task admission has not yet begun.
+  let targetResolutionEnded = false;
+  const endTargetResolutionOnceV1 = async (): Promise<void> => {
+    if (targetResolutionEnded) {
+      return;
+    }
+    targetResolutionEnded = true;
+    await endTargetResolutionV1(targetResolutionHandle);
+  };
+  let reconcileOutcomeCapturedV1: Awaited<ReturnType<typeof reconcileWatchdogPauseAgainstAdmissionV1>> | undefined;
+  let lateAdmissionRefusalV1: Parameters<typeof describeWorkAdmissionRefusalV1>[0] | undefined;
+
+  try {
+    // Same activation-barrier contract as renameTask above (plan §1.4).
+    await TaskCreationStartupReconcilerV1.waitUntilReady();
+
+    let task: Awaited<ReturnType<typeof resolve>>;
+    try {
+      task = await resolve(inventory, arg, async (candidate) => {
+        // The early guess above can target the wrong task — release it and
+        // fall through to the ordinary late-acquisition path below, which
+        // acquires for the AUTHORITATIVE, now-validated folder.
+        if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+          await releaseCurrentAdmissionV1();
+        }
+        if (!handle) {
+          const late = await acquireWorkAdmissionV1({
+            taskFolderPath: candidate.taskFolderPath,
+            purpose: "admission",
+            commandId: "renameTaskWithAI",
+          });
+          if (late.outcome === "acquired") {
+            handle = late.handle;
+            heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+          } else {
+            lateAdmissionRefusalV1 = late;
+          }
+        }
+        // Admission is now guaranteed live for this exact target — reverse a
+        // watchdog-provenance pause (never a user pause) before any further
+        // setup, exactly like runReviewWithAI/runLintingFixes. Only reconcile
+        // once admission is confirmed live for this exact target — otherwise
+        // a reversed pause would leave the task with nothing actually
+        // protecting it.
+        if (handle) {
+          reconcileOutcomeCapturedV1 = await reconcileWatchdogPauseAgainstAdmissionV1(
+            vscode.Uri.file(candidate.taskFolderPath)
+          );
+        }
+      });
+    } finally {
+      await endTargetResolutionOnceV1();
+    }
+    if (!task) return;
+    if (!handle) {
+      NotificationRouter.showWarning(
+        lateAdmissionRefusalV1
+          ? describeWorkAdmissionRefusalV1(lateAdmissionRefusalV1)
+          : "Could not acquire work admission for this task."
+      );
+      return;
+    }
+    if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+
+    // 2026-09-10 review completion blocker (new): the reconciliation result
+    // was previously discarded — a genuine `userPaused`/`unreadable` outcome
+    // must stop this command, exactly as runPublishChecks/
+    // completeCommitAndPushTask already do.
+    if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Rename Task with AI is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
 
   const readText = async (fileName: string): Promise<string> => {
     try {
@@ -465,6 +683,9 @@ export async function renameTaskWithAI(
       }
     }
   );
+  } finally {
+    await releaseCurrentAdmissionV1();
+  }
 }
 
 export function registerRenameTaskCommands(

@@ -428,6 +428,56 @@ void describe("beginInProgressReviewMarkingV1 / revertInProgressReviewMarkingV1 
     }
   });
 
+  void it("inlines the previous review from _prev, labelled, when replacing a # Review Stale placeholder (2026-09-15 post-freeze findings, item 3)", async () => {
+    const { folderPath } = makeTaskFolder("task_a_prev");
+    const reviewFile = path.join(folderPath, "impl-high-review.md");
+    const staleText =
+      "# Review Stale\n\nThis review was generated before plan-final.md was updated.\n";
+    const previousReviewText =
+      "Readiness: 7/10\n\n## Summary\nThe last real verdict, with its score and blockers.\n";
+    fs.writeFileSync(reviewFile, staleText, "utf8");
+    fs.writeFileSync(path.join(folderPath, "impl-high-review_prev.md"), previousReviewText, "utf8");
+    seedProgress(folderPath, { reviewAttemptId: "attempt-1" });
+
+    const restore = installFsStub();
+    try {
+      const marking = await beginInProgressReviewMarkingV1(vscode.Uri.file(reviewFile));
+      assert.ok(marking.rewrote);
+      const rewritten = fs.readFileSync(reviewFile, "utf8");
+      assert.ok(rewritten.startsWith("# Review in progress"));
+      assert.ok(rewritten.includes("## Previous result"));
+      assert.ok(rewritten.includes("Readiness: 7/10"));
+      assert.ok(rewritten.includes("The last real verdict, with its score and blockers."));
+    } finally {
+      restore();
+    }
+  });
+
+  void it("does NOT inline a _prev that is itself a placeholder — nothing usable to preserve", async () => {
+    const { folderPath } = makeTaskFolder("task_a_prev_placeholder");
+    const reviewFile = path.join(folderPath, "impl-high-review.md");
+    const staleText =
+      "# Review Stale\n\nThis review was generated before plan-final.md was updated.\n";
+    fs.writeFileSync(reviewFile, staleText, "utf8");
+    fs.writeFileSync(
+      path.join(folderPath, "impl-high-review_prev.md"),
+      "# Review Stale\n\nAn older staling event with nothing real behind it either.\n",
+      "utf8"
+    );
+    seedProgress(folderPath, { reviewAttemptId: "attempt-1" });
+
+    const restore = installFsStub();
+    try {
+      const marking = await beginInProgressReviewMarkingV1(vscode.Uri.file(reviewFile));
+      assert.ok(marking.rewrote);
+      const rewritten = fs.readFileSync(reviewFile, "utf8");
+      assert.ok(rewritten.startsWith("# Review in progress"));
+      assert.ok(!rewritten.includes("## Previous result"));
+    } finally {
+      restore();
+    }
+  });
+
   void it("does NOT revert when a newer attempt has since claimed the review (run-token guard)", async () => {
     const { folderUri, folderPath } = makeTaskFolder("task_b");
     const reviewFile = path.join(folderPath, "impl-high-review.md");

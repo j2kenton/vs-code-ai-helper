@@ -42,6 +42,19 @@ import {
 } from "../actions/rows/draftRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
+import {
+  acquireEarlyWorkAdmissionForCandidatePathV1,
+  acquireOrAdoptWorkAdmissionV1,
+  beginTargetResolutionV1,
+  describeTargetResolutionUnprotectedRootsV1,
+  describeTargetResolutionWriteFailureV1,
+  describeWorkAdmissionRefusalV1,
+  endTargetResolutionV1,
+  WorkAdmissionHandleV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "../state/workAdmissionV1";
+import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 import {
   buildTaskDocument,
@@ -76,8 +89,40 @@ export {
  * and from the keyboard shortcut router (`{ canonicalId }`).
  */
 type DraftTaskArg =
-  | { canonicalId?: string; taskFolderPath?: string }
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      /**
+       * Single-use same-process admission handoff token (2026-09-10 review
+       * completion blocker `d620c877...-2`), mirroring
+       * `generatePlanWithAI.ts`'s `GeneratePlanArg.admissionHandoffTokenV1`.
+       * Only `applyCurrentStageAction` — dispatching on behalf of a caller
+       * that already holds live durable admission for this exact task (the
+       * resume-and-rerun path, `scheduleTaskResume.ts`'s scheduled firing,
+       * or now `chatWithStage.ts`'s `triggerStageAI` proposal) — ever sets
+       * this, so it lets this route's own admission acquisition adopt that
+       * already-live marker instead of racing a fresh genesis against it and
+       * observing `busy`.
+       */
+      admissionHandoffTokenV1?: string;
+    }
   | { task?: IncompleteTask };
+
+/**
+ * Extract `admissionHandoffTokenV1` from `arg`, when present — mirrors
+ * `generatePlanWithAI.ts`'s identically-named helper. Only the
+ * `{ canonicalId?, taskFolderPath? }` shape ever carries it, so a UI-
+ * originated invocation (tree row, keyboard shortcut) can never accidentally
+ * supply one and trigger adoption.
+ *
+ * @internal exported for testing
+ */
+export function extractAdmissionHandoffTokenV1(arg: DraftTaskArg | undefined): string | undefined {
+  if (!arg || !("admissionHandoffTokenV1" in arg)) {
+    return undefined;
+  }
+  return typeof arg.admissionHandoffTokenV1 === "string" ? arg.admissionHandoffTokenV1 : undefined;
+}
 
 /**
  * Normalize a DraftTaskArg into the `{ canonicalId?, taskFolderPath? }` shape
@@ -524,35 +569,253 @@ export async function draftTaskWithAI(
   explicitArg?: DraftTaskArg
 ): Promise<boolean | undefined> {
   assertLegacyAiRouteAllowedV0("draft.v1");
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
+
+  // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
+  // Acquire durable admission BEFORE the consent gate and task resolution
+  // whenever the target folder is known synchronously from `explicitArg` —
+  // mirrors runReviewWithAI/runLintingFixes. Without this, the whole consent
+  // wait (unbounded — a human decision) and the coordinator dispatch below
+  // ran with no durable evidence this task was doing anything, so a watchdog
+  // sweep could pause it mid-run exactly like the resume-trap defect this
+  // module closes elsewhere. No handoff-token adoption is wired here: no
+  // resume-then-dispatch flow currently targets this command directly (Chat
+  // Resume of a `draft.v1` question goes through chatView.ts's own shared
+  // admission acquisition instead, see resumeDraftInteractionV1's caller).
+  //
+  // 2026-09-10 review blockers (new): two gaps mirroring what
+  // runPublishChecks/commitAndPushTask already closed for their own routes.
+  //  - A true no-arg (or canonicalId-only) invocation left NO protection at
+  //    all across the consent wait and `resolveTaskContext` below — the
+  //    checked "route every command..." checklist item overstated this
+  //    route's coverage. `beginTargetResolutionV1` now stands the whole
+  //    sweep pass down for that window regardless of whether an early guess
+  //    exists, exactly like runPublishChecks.
+  //  - `earlyFolderPath` is an UNVALIDATED raw path from the caller-supplied
+  //    argument — `resolveTaskContext` below performs the real
+  //    ownership/containment/workspace-binding validation. If the early
+  //    guess turns out to target a different folder than the authoritative
+  //    resolution (stale arg, wrong id, or a path resolveTaskContext would
+  //    reject outright), the early admission is now released and
+  //    reacquired for the REAL target, instead of being held on the wrong
+  //    (possibly bogus) path while the real target goes unprotected.
+  const taskRootCandidatePathsV1 = resolveTaskRootCandidates().map((candidate) => candidate.absolutePath);
+  const targetResolutionHandle = await beginTargetResolutionV1(taskRootCandidatePathsV1);
+  // 2026-09-11 review completion blocker (`b5a1f851...-0`): a real filesystem
+  // write error protecting this resolution window must fail dispatch before
+  // setup, same as a per-task admission write error already does — never
+  // silently fall through to same-process-only protection.
+  if (targetResolutionHandle.writeFailedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionWriteFailureV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
     return;
   }
-
-  const resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
-    allowPaused: false,
+  // 2026-09-14 review architectural blocker (`b5a1f851...-0`): see
+  // `chatWithStage.ts`'s identical call site.
+  if (targetResolutionHandle.unprotectedRootPaths.length > 0) {
+    NotificationRouter.showError(describeTargetResolutionUnprotectedRootsV1(targetResolutionHandle));
+    await endTargetResolutionV1(targetResolutionHandle);
+    return;
+  }
+  // 2026-09-10 round: `earlyFolderPath` is a raw, unvalidated caller-supplied
+  // path — `resolveTaskContext`'s `onResolvedCandidate` hook below performs
+  // the real ownership/containment/workspace-binding validation, but this
+  // early guess runs BEFORE any of that. A synchronous containment check
+  // against `resolveTaskRootCandidates()` was tried here and reverted the
+  // same round — see `chatWithStage.ts`'s identical call site for why: it
+  // depends on `vscode.workspace.workspaceFolders` being configured exactly
+  // in step with the caller's raw path, which is not guaranteed, and it
+  // silently skipped early admission for legitimate candidates instead of
+  // narrowing the gap. `acquireEarlyWorkAdmissionForCandidatePathV1` still
+  // does not perform ownership/workspace-binding validation (only
+  // `resolveTaskContext` below does that), so the underlying architectural
+  // blocker only shrinks in blast radius, but the duplicated-per-route
+  // instance of it is now removed.
+  //
+  // 2026-09-11 round (review architectural blocker `d620c877...-1`,
+  // narrowed further): passing `taskRootCandidatePathsV1` as
+  // `taskRootCandidatePaths` below makes an out-of-root candidate OBSERVABLE
+  // (a logged diagnostic, see `isPathOutsideAllTaskRootsV1`) without
+  // repeating the reverted gate. 2026-09-14 (`d620c877...-1`, closed): when
+  // `taskRootCandidatePathsV1` is explicitly empty (no workspace open),
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` now verifies the
+  // candidate's own persisted ownership record before acquiring — see that
+  // function's own doc comment. A real path this window's `workspaceFolders`
+  // snapshot has not caught up to is unaffected as long as its ownership
+  // verifies; the previously unconditional "always acquired" no longer
+  // applies to a candidate whose ownership does not.
+  const earlyFolderPath = normalizeDraftTaskArg(explicitArg)?.taskFolderPath;
+  // 2026-09-10 round (re-fixed per review directive "fix these in the shared
+  // admission helper, not per route"): the validation-before-bookkeeping
+  // check (candidate path exists AND contains task.md) now lives once in
+  // `acquireEarlyWorkAdmissionForCandidatePathV1` instead of being
+  // duplicated here — this still does not perform ownership/workspace-binding
+  // validation (only `resolveTaskContext` below does that), so the underlying
+  // architectural blocker only shrinks in blast radius, but the
+  // duplicated-per-route instance of it is now removed.
+  const early = await acquireEarlyWorkAdmissionForCandidatePathV1({
+    candidatePath: earlyFolderPath,
+    purpose: "admission",
+    commandId: "draftTaskWithAI",
+    handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
+    taskRootCandidatePaths: taskRootCandidatePathsV1,
   });
-
-  if (!resolvedTask) {
-    NotificationRouter.showInformation(
-      "No active task found at the Task Description stage."
-    );
+  if (early && early.outcome !== "acquired") {
+    await endTargetResolutionV1(targetResolutionHandle);
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
 
-  const lockKey = resolvedTask.taskFolderPath;
-  const result = await runTrackedOperation(
-    lockKey,
-    // TASK_NAME_WRITE_CONFLICT_KEY: description generation never writes the
-    // task's name (handleDraftOutcomeV1 leaves naming to the rename actions),
-    // but it runs under the name captured here, so it must never overlap a
-    // (non-exclusive) rename — the shared key makes begin() refuse whichever
-    // side arrives second, atomically.
-    { label: "Draft Task with AI", stage: "desc", taskName: resolveWorkflowRootTaskName(resolvedTask.progress.displayName ?? resolvedTask.folderName, resolvedTask.taskFolderPath), kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
-    (op) => draftTaskWithAIForResolvedTask(context, chatViewProvider, resolvedTask, op)
-  );
-  return result?.succeeded || undefined;
+  let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
+  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  const releaseCurrentAdmissionV1 = async (): Promise<void> => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    if (handle) {
+      const toRelease = handle;
+      handle = undefined;
+      await toRelease.release();
+    }
+  };
+
+  // 2026-09-10 review completion blocker fix: `endTargetResolutionV1` was
+  // only ever reached via the `finally` wrapped around `resolveTaskContext`
+  // below — a declined/failed consent gate returned BEFORE that `finally`
+  // ever ran, leaking this call's target-resolution counter, durable root
+  // marker, and background retry timer for the rest of the process's life
+  // and permanently standing every subsequent watchdog sweep down for every
+  // task root candidate it touched. `endTargetResolutionOnceV1` is called
+  // from both the inner `finally` (the normal path) AND the outer `finally`
+  // below (covering consent decline and any other early return before that
+  // point), guarded so it never ends the same handle twice.
+  let targetResolutionEnded = false;
+  const endTargetResolutionOnceV1 = async (): Promise<void> => {
+    if (targetResolutionEnded) {
+      return;
+    }
+    targetResolutionEnded = true;
+    await endTargetResolutionV1(targetResolutionHandle);
+  };
+
+  try {
+    // ── Consent gate ─────────────────────────────────────────────────────────
+    const consented = await ensureAiConsent(context);
+    if (!consented) {
+      return;
+    }
+
+    // 2026-09-10 review completion blocker fix (`d620c877...-2`): this used
+    // to call resolveTaskContext with `allowPaused: false`, which rejects a
+    // watchdog-paused target BEFORE any reconciliation can run — the pause
+    // gate fired first, so a watchdog-provenance pause could never be
+    // reversed and the command simply reported "no active task". Fixed by
+    // passing `allowPaused: true` and doing admission acquisition PLUS
+    // watchdog-pause reconciliation from `onResolvedCandidate`, which
+    // `resolveTaskContext` fires after its own ownership/containment/
+    // workspace-binding checks but BEFORE its `allowPaused` gate. A genuine
+    // user pause is still rejected below, using the reconciliation outcome
+    // captured here rather than the in-memory (pre-reconciliation) status.
+    let reconcileOutcomeCapturedV1: Awaited<ReturnType<typeof reconcileWatchdogPauseAgainstAdmissionV1>> | undefined;
+    // 2026-09-10 review completion blocker fix (new): the late-acquisition
+    // branch used to discard a `busy`/`writeFailed` refusal from
+    // `acquireWorkAdmissionV1` and simply leave `handle` undefined, so the
+    // caller only ever saw the generic "Could not acquire work admission for
+    // this task." message below regardless of whether the real cause was a
+    // live owner (busy, with owner/age/path detail) or a genuine filesystem
+    // write failure — collapsing the required busy/write-failed distinction
+    // this module's own `describeWorkAdmissionRefusalV1` exists to preserve.
+    // Captured here and surfaced verbatim below instead.
+    let lateAdmissionRefusalV1: Parameters<typeof describeWorkAdmissionRefusalV1>[0] | undefined;
+    let resolvedTask: Awaited<ReturnType<typeof resolveTaskContext>>;
+    try {
+      resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
+        allowPaused: true,
+        onResolvedCandidate: async (candidate) => {
+          // The early guess above can target the wrong task (a
+          // stale/incorrect raw path) — release it and fall through to the
+          // ordinary late-acquisition path below, which acquires for the
+          // AUTHORITATIVE, now-validated folder.
+          if (handle && handle.taskFolderPath !== candidate.taskFolderPath) {
+            await releaseCurrentAdmissionV1();
+          }
+          if (!handle) {
+            const late = await acquireOrAdoptWorkAdmissionV1({
+              taskFolderPath: candidate.taskFolderPath,
+              purpose: "admission",
+              commandId: "draftTaskWithAI",
+              handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
+            });
+            if (late.outcome === "acquired") {
+              handle = late.handle;
+              heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+            } else {
+              lateAdmissionRefusalV1 = late;
+            }
+          }
+          // 2026-09-10 review completion blocker fix (`d620c877...-2`):
+          // reconciliation used to run unconditionally here, even when the
+          // late acquisition above returned busy/write-failed — reversing a
+          // watchdog-provenance pause while this window held NO admission at
+          // all for the target, leaving the reversed pause with nothing
+          // actually protecting the task. Only reconcile once admission is
+          // confirmed live for this exact target.
+          if (handle) {
+            reconcileOutcomeCapturedV1 = await reconcileWatchdogPauseAgainstAdmissionV1(
+              vscode.Uri.file(candidate.taskFolderPath)
+            );
+          }
+        },
+      });
+    } finally {
+      await endTargetResolutionOnceV1();
+    }
+
+    if (!resolvedTask) {
+      NotificationRouter.showInformation(
+        "No active task found at the Task Description stage."
+      );
+      return;
+    }
+
+    // A genuine user pause (or an unreadable progress file) must still stop
+    // this command — only a watchdog-provenance pause is reversible, and
+    // that reversal already happened above, before the allowPaused gate.
+    if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
+      NotificationRouter.showWarning(
+        "Draft Task with AI is only available for tasks that are not paused. Resume the task first."
+      );
+      return;
+    }
+
+    if (!handle) {
+      NotificationRouter.showWarning(
+        lateAdmissionRefusalV1
+          ? describeWorkAdmissionRefusalV1(lateAdmissionRefusalV1)
+          : "Could not acquire work admission for this task."
+      );
+      return;
+    }
+
+    const lockKey = resolvedTask.taskFolderPath;
+    const result = await runTrackedOperation(
+      lockKey,
+      // TASK_NAME_WRITE_CONFLICT_KEY: description generation never writes the
+      // task's name (handleDraftOutcomeV1 leaves naming to the rename actions),
+      // but it runs under the name captured here, so it must never overlap a
+      // (non-exclusive) rename — the shared key makes begin() refuse whichever
+      // side arrives second, atomically.
+      { label: "Draft Task with AI", stage: "desc", taskName: resolveWorkflowRootTaskName(resolvedTask.progress.displayName ?? resolvedTask.folderName, resolvedTask.taskFolderPath), kind: "draft-task", cancellable: true, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
+      (op) => draftTaskWithAIForResolvedTask(context, chatViewProvider, resolvedTask, op)
+    );
+    return result?.succeeded || undefined;
+  } finally {
+    // Safety net for the consent-decline / early-return leak fixed above:
+    // guaranteed to be a no-op on the normal path, where the inner `finally`
+    // already ended target resolution.
+    await endTargetResolutionOnceV1();
+    await releaseCurrentAdmissionV1();
+  }
 }
 
 /**

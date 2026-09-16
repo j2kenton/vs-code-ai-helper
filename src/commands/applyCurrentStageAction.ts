@@ -14,6 +14,7 @@ import {
 import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 type ApplyArg = {
   canonicalId?: string;
@@ -88,11 +89,17 @@ export async function applyCurrentStageAction(
     // before falling back to the plain refusal below, so a resumed-then-
     // immediately-re-paused race can't defeat a caller that already proved
     // it is doing the work.
+    // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+    // command self-checks" / "scheduled dispatch"): the plain (no handoff
+    // token) path used to trust the raw `status` field unconditionally, which
+    // wrongly refuses a task whose watchdog pause a revocation has already
+    // advanced the fence past but whose on-disk `status` has not yet been
+    // repaired by some later admission acquisition's barrier cleanup.
     const stillPaused = explicitArg?.admissionHandoffTokenV1
       ? (await reconcileWatchdogPauseAgainstAdmissionV1(
           vscode.Uri.file(resolvedTask.taskFolderPath)
         )).outcome !== "reversed"
-      : true;
+      : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress);
     if (stillPaused) {
       NotificationRouter.showWarning(
         "Task is paused. Resume it before using this shortcut."

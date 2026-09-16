@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -1048,4 +1048,33 @@ void test("setIncompleteRoundContinuations sets and clears the persisted counter
   assert.equal(set.incompleteRoundContinuations, 2);
   const cleared = setIncompleteRoundContinuations(set, undefined);
   assert.equal(cleared.incompleteRoundContinuations, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// pauseTaskWithReasonForClaimV1 / updateTaskStatus: pause-fence generation
+// stamping and clearing (v1 fixes item 1, Part 1b step 1)
+// ---------------------------------------------------------------------------
+
+void test("pauseTaskWithReasonForClaimV1 stamps both the claimId and the captured fence generation", () => {
+  const progress = makeProgress();
+  const paused = pauseTaskWithReasonForClaimV1(progress, "stalled", "claim-1", 5);
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.pausedReason, "stalled");
+  assert.equal(paused.watchdogPauseClaimId, "claim-1");
+  assert.equal(paused.watchdogPauseFenceGeneration, 5);
+});
+
+void test("updateTaskStatus clears watchdogPauseFenceGeneration alongside watchdogPauseClaimId on any transition away from paused", () => {
+  const paused = pauseTaskWithReasonForClaimV1(makeProgress(), "stalled", "claim-1", 5);
+  const resumed = updateTaskStatus(paused, "active");
+  assert.equal(resumed.watchdogPauseClaimId, undefined);
+  assert.equal(resumed.watchdogPauseFenceGeneration, undefined);
+  assert.equal(resumed.pausedReason, undefined);
+});
+
+void test("a later claim-bound pause overwrites, rather than accumulates on top of, a prior pause's fence generation", () => {
+  const first = pauseTaskWithReasonForClaimV1(makeProgress(), "stalled", "claim-1", 2);
+  const second = pauseTaskWithReasonForClaimV1(first, "stalled again", "claim-2", 7);
+  assert.equal(second.watchdogPauseClaimId, "claim-2");
+  assert.equal(second.watchdogPauseFenceGeneration, 7);
 });

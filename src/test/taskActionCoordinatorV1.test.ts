@@ -96,6 +96,7 @@ import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelo
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { createObservationLedgerV1 } from "../types/preflightPlanV1";
+import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
 import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
@@ -1778,7 +1779,12 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(outcome.kind, "failed");
     if (outcome.kind === "failed") {
       assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
-      assert.equal(outcome.retryable, true);
+      // An unrecognized error (not the typed AttachCoordinatorIdentityErrorV1)
+      // stays fail-closed like a genuine ownership violation, but nothing
+      // automatically retries this settlement (2026-09-15 post-freeze
+      // findings, item 2: "retryable: true must mean something automatic").
+      assert.equal(outcome.retryable, false);
+      assert.equal(outcome.detail, "unknown: ledger write unavailable");
       assert.ok(outcome.correlation, "the failed allocation keeps its attempt identity");
       assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
     }
@@ -1808,7 +1814,7 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(outcome.kind, "failed");
     if (outcome.kind === "failed") {
       assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
-      assert.equal(outcome.retryable, true);
+      assert.equal(outcome.retryable, false);
       assert.ok(outcome.correlation, "the failed retry keeps its attempt identity");
       assert.match(outcome.correlation.attemptId, /^[0-9a-f]{32}$/);
     }
@@ -1817,6 +1823,61 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.settlementRecords.length, 1);
     assert.equal(harness.selection.reserved, 1, "the retry must not reserve or invoke a provider");
   });
+
+  void it(
+    "fails closed (does not invoke a provider) when the attach hook reports a genuine " +
+      "ownership violation (rowNotLive/wrongOwner) — 2026-09-15 post-freeze findings, item 2",
+    async () => {
+      const harness = makeHarness([]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: () =>
+          Promise.reject(new AttachCoordinatorIdentityErrorV1("rowNotLive", "round ledger row r-1 is not live")),
+      });
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
+        assert.equal(outcome.retryable, false);
+        assert.equal(outcome.detail, "rowNotLive: round ledger row r-1 is not live");
+      }
+      assert.equal(harness.selection.reserved, 0, "a genuine ownership violation must prevent provider reservation");
+    }
+  );
+
+  void it(
+    "proceeds to invoke the provider (degraded provenance, not a failed round) when the " +
+      "attach hook reports only a transient writerRetriesExhausted — 2026-09-15 post-freeze " +
+      "findings, item 2: \"an admission gate should guard correctness, not bookkeeping\"",
+    async () => {
+      const harness = makeHarness([
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# x" },
+          })
+        ),
+      ]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: () =>
+          Promise.reject(
+            new AttachCoordinatorIdentityErrorV1(
+              "writerRetriesExhausted",
+              "failed to durably attach coordinator identity to round r-1 after 3 attempts"
+            )
+          ),
+      });
+      assert.equal(
+        outcome.kind,
+        "completed",
+        "a transient, provenance-only attach failure must not stop the round from running"
+      );
+      assert.equal(harness.selection.reserved, 1, "the provider must still be invoked");
+      assert.equal(harness.promoted.length, 1);
+    }
+  );
 
   void it("passes the registry's chain-exhaustion evidence through verbatim, mutating no task state", async () => {
     // Finding 4: the coordinator is a pure pass-through for the structured
@@ -1917,6 +1978,104 @@ void describe("taskActionCoordinatorV1", () => {
         assert.match(candidate.reason, /^invoked, but the transport failed before any response arrived/);
         assert.match(candidate.reason, /connectFailed/);
       }
+    }
+  );
+
+  void it(
+    "reports candidatesDeferred (not candidatesExhausted) when every invoked candidate was quota-blocked",
+    async () => {
+      // 2026-09-15 post-freeze findings, item 4, requirement: "a candidate
+      // that told us when it will be available again has not been
+      // exhausted, it has been deferred". Every candidate here fails with a
+      // quota-marker detail string, so the coordinator must emit the
+      // distinguishing code at the OUTCOME level, not only inside
+      // `chainExhaustion`'s per-candidate detail.
+      const quotaBlocked: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () =>
+          Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "cliExit.1",
+            detail: "You've hit your usage limit. Try again at 4:12 PM.",
+          }),
+      };
+      const exhaustion = {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+        ],
+      };
+      const harness = makeHarness([quotaBlocked, quotaBlocked], {}, [], undefined, exhaustion);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind !== "unavailable") {
+        assert.fail("expected unavailable");
+      }
+      assert.equal(
+        outcome.code,
+        "candidatesDeferred",
+        "every invoked candidate was quota-blocked, so this is deferred, not exhausted"
+      );
+      for (const candidate of outcome.chainExhaustion?.candidates ?? []) {
+        assert.equal(candidate.deferredFailureKind, "quota");
+      }
+    }
+  );
+
+  void it(
+    "keeps candidatesExhausted when only SOME invoked candidates were quota-blocked",
+    async () => {
+      // A mix of a quota-blocked candidate and a genuinely-failed candidate
+      // is real exhaustion, not a pure deferral — the chain did not fail
+      // solely because of quota, so the ordinary wording must stand.
+      const quotaBlocked: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () =>
+          Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "cliExit.1",
+            detail: "You've hit your usage limit. Try again at 4:12 PM.",
+          }),
+      };
+      const genuinelyFailed: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "connectFailed" }),
+      };
+      const exhaustion = {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+        ],
+      };
+      const harness = makeHarness([quotaBlocked, genuinelyFailed], {}, [], undefined, exhaustion);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind !== "unavailable") {
+        assert.fail("expected unavailable");
+      }
+      assert.equal(outcome.code, "candidatesExhausted");
     }
   );
 

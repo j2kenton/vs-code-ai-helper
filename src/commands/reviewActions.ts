@@ -27,6 +27,12 @@ import {
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import {
+  EffectivePauseSnapshotV1,
+  isEffectivelyPausedSyncV1,
+  isEffectivelyPausedV1,
+  resolveEffectiveStageTaskStatusV1,
+} from "../state/effectivePauseStatusV1";
+import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
   IMPLEMENTATION_SUMMARY_FILENAME,
@@ -94,7 +100,7 @@ import {
 } from "../utils/promptManifestV1";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 import {
-  attachCoordinatorIdentityToRoundV1,
+  attachCoordinatorIdentityToRoundTrackingDegradationV1,
   claimImplementationRoundLedgerV1,
   consumePendingAutomationRoundIntentV1,
   RoundLedgerTerminalStateV1,
@@ -114,8 +120,13 @@ import {
   buildImplementationContinuationPromptV1,
   claimImplRecoveryDispatchV1,
   ClaimedImplRecoveryV1,
+  describeOwedImplRecoveryRefusalV1,
+  discardOwedImplRecoveryV1,
   escalateClaimedSummaryOnlyIfUnavailableV1,
+  ImplRecoveryOwedRefusalError,
+  isImplRecoveryDiscardOfferableV1,
   owedContinuationSourceV1,
+  retireSatisfiedSummaryRejectedRecoveryV1,
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
@@ -187,6 +198,7 @@ import {
   attributeImplementationRoundFilesV1,
   buildSyntheticImplementationSummaryV1,
   buildUnusableImplementationSummaryV1,
+  withDeterministicZeroFilesChangedNoteV1,
   describeImplementationSummaryShapeIssue,
   parseReportedFilesChangedV1,
   describeIncompleteImplementationRoundV1,
@@ -517,6 +529,25 @@ export function scheduleAutomaticImplementationAfterReview(
  * always wins regardless of which fires first (see that function's doc
  * comment). A manually-invoked review has nothing pending to consume and
  * keeps opening its own row exactly as before.
+ *
+ * Part 1b step 13 ("audit every pause-sensitive read ... command
+ * self-checks"), 2026-09-14: the paused guard used to trust the raw `status`
+ * field unconditionally — the exact "Error: The task was paused while the
+ * review was starting." failure v1 fixes item 1 recorded in production, where
+ * the sweep paused a task mid-setup and this check then aborted work that was
+ * demonstrably running. Part 1a closes the sweep-timing half of that race for
+ * `runReviewForFolder`'s two callers (`runReviewWithAI`/
+ * `fastForwardReviewWithAI` both reconcile any watchdog-provenance pause
+ * against their own held admission before reaching this point), but
+ * `resumeReviewInteractionV1` — the other documented call site above — holds
+ * no admission and never reconciles, so a watchdog pause whose fence a
+ * revocation has already advanced past (this task's fence-generation
+ * mechanism, orthogonal to admission) could still reach this guard raw. Using
+ * the effective-pause resolver here fixes it once for every caller instead of
+ * chasing each one — the "fix once in the shared helper" doctrine this Part's
+ * own directive requires. The synchronous twin is used because this callback
+ * runs inside `patchTaskProgressStrictV1`'s synchronous `update` function and
+ * cannot await the durable fence read.
  */
 export async function claimReviewAttempt(
   folderUri: vscode.Uri,
@@ -525,10 +556,24 @@ export async function claimReviewAttempt(
 ): Promise<TaskProgress | undefined> {
   const pendingIntentId = consumePendingAutomationRoundIntentV1(folderUri.fsPath);
   return patchTaskProgressStrictV1(folderUri, (current) => {
+    let effectiveCurrent = current;
     if (current.status === "paused") {
-      throw new Error("The task was paused while the review was starting.");
+      if (isEffectivelyPausedSyncV1(folderUri.fsPath, current)) {
+        throw new Error("The task was paused while the review was starting.");
+      }
+      // Effectively revoked: clear the stale pause fields as part of this
+      // same compare-and-swap write instead of leaving `status: "paused"` on
+      // disk for a later async observation to repair — this claim IS the
+      // proof the pause no longer applies.
+      effectiveCurrent = {
+        ...current,
+        status: "active",
+        pausedReason: undefined,
+        watchdogPauseClaimId: undefined,
+        watchdogPauseFenceGeneration: undefined,
+      };
     }
-    const resolvedPending = pendingIntentId ? resolveRoundV1(current, pendingIntentId) : undefined;
+    const resolvedPending = pendingIntentId ? resolveRoundV1(effectiveCurrent, pendingIntentId) : undefined;
     // Stale-intent guard (2026-08-27 review follow-up, blocker "the
     // replacement task-key/TTL correlation can attach a later review to a
     // stale, already-terminal round"): `pendingIntentId` is a best-effort
@@ -572,7 +617,7 @@ export async function claimReviewAttempt(
           // different, already-ended round and must not be attached here.
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
-    return upsertRoundLedgerEntryV1({ ...current, reviewAttemptId }, openRow);
+    return upsertRoundLedgerEntryV1({ ...effectiveCurrent, reviewAttemptId }, openRow);
   });
 }
 
@@ -2706,6 +2751,11 @@ export async function handleReviewRoutingOutcome(options: {
    * so the fact lands in the SAME durable transaction that closes this
    * round, whichever branch it takes. */
   taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
+  /** 2026-09-15 post-freeze findings, item 2: see
+   * `ReviewOutcomeContextV1.identityAttachmentDegraded`'s doc comment —
+   * forwarded the same way as `taskMdSizeBand`, onto both `terminalizeRoundV1`
+   * outcome branches below. */
+  identityAttachmentDegraded?: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
   const {
     folderUri,
@@ -2721,6 +2771,7 @@ export async function handleReviewRoutingOutcome(options: {
     coordinatorAttemptId,
     coordinatorExtraAttemptIds,
     taskMdSizeBand,
+    identityAttachmentDegraded,
   } = options;
   try {
     const resilience = getResilienceSettings();
@@ -2830,7 +2881,11 @@ export async function handleReviewRoutingOutcome(options: {
       await terminalizeRoundV1(
         reviewAttemptId,
         "rejected",
-        { rejectionReason, ...(taskMdSizeBand ? { taskMdSizeBand } : {}) },
+        {
+          rejectionReason,
+          ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
+          ...(identityAttachmentDegraded ? { identityAttachmentDegraded } : {}),
+        },
         {
           taskFolderUri: folderUri,
           ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
@@ -3134,6 +3189,7 @@ export async function handleReviewRoutingOutcome(options: {
         mechanicalBlockers: blockerSplit.mechanicalBlockers,
         ...(reviewerChallengedNonGoalHeadings ? { reviewerChallengedNonGoal: reviewerChallengedNonGoalHeadings } : {}),
         ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
+        ...(identityAttachmentDegraded ? { identityAttachmentDegraded } : {}),
       },
       {
         taskFolderUri: folderUri,
@@ -3405,6 +3461,16 @@ export interface ReviewOutcomeContextV1 {
    * second, separately-fragile chat append. See `RoundLedgerOutcomeV1.taskMdSizeBand`'s
    * own doc comment. */
   taskMdSizeBand?: RoundLedgerOutcomeV1["taskMdSizeBand"];
+  /** 2026-09-15 post-freeze findings, item 2 ("an admission gate should
+   * guard correctness, not bookkeeping"): set when THIS round's coordinator
+   * attach-identity hook (`onAttemptAllocated` →
+   * `attachCoordinatorIdentityToRoundTrackingDegradationV1`) failed for a
+   * confirmed transient reason and the round proceeded anyway (fail-open) —
+   * carried through to whichever terminal path this round takes, the same
+   * way `taskMdSizeBand` is, so it lands in `outcome.identityAttachmentDegraded`
+   * in the same durable transaction that closes the round. See that field's
+   * own doc comment. */
+  identityAttachmentDegraded?: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
 }
 
 /**
@@ -3479,10 +3545,16 @@ async function terminalizeUnclosedReviewRoundV1(
 ): Promise<void> {
   try {
     const correlation = outcomeCorrelationV1(outcome);
+    const unclosedOutcomePatch = {
+      ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
+      ...(ctx.identityAttachmentDegraded
+        ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
+        : {}),
+    };
     await terminalizeRoundV1(
       ctx.reviewAttemptId,
       terminalStateForUnclosedReviewOutcomeV1(outcome),
-      ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : undefined,
+      Object.keys(unclosedOutcomePatch).length > 0 ? unclosedOutcomePatch : undefined,
       {
         taskFolderUri: ctx.folderUri,
         ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
@@ -3559,9 +3631,61 @@ export async function writeReviewRunLogV1(
     // from `providerModeUnavailable` (nothing was ever reserved) — "no
     // provider could be acquired" is only true of the second.
     const exhaustionHeadline =
-      outcome.kind === "unavailable" && outcome.code === "candidatesExhausted"
-        ? `Every configured model was tried and failed for ${exhaustion?.stage ?? ctx.targetStage}.`
-        : `No provider could be acquired for ${exhaustion?.stage ?? ctx.targetStage}.`;
+      outcome.kind === "unavailable" && outcome.code === "candidatesDeferred"
+        ? `Every configured model for ${exhaustion?.stage ?? ctx.targetStage} is currently ` +
+          "quota/entitlement-limited — deferred, not tried-and-failed."
+        : outcome.kind === "unavailable" && outcome.code === "candidatesExhausted"
+          ? `Every configured model was tried and failed for ${exhaustion?.stage ?? ctx.targetStage}.`
+          : `No provider could be acquired for ${exhaustion?.stage ?? ctx.targetStage}.`;
+    // 2026-09-15 post-freeze findings, item 4, requirement 3 ("a quota
+    // refusal must park with its reset time... its message reach the run log
+    // and user-facing failure detail"): when the exhaustion was actually
+    // caused by a quota/entitlement block (the same typed detection
+    // `pauseTaskForExhaustedChainV1` below uses to compute `quotaParkRecord`),
+    // say so plainly in the run log too — "Status: unavailable
+    // (candidatesExhausted)" alone reads like an unexplained provider
+    // failure, exactly the "stderr 0 byte(s)" style dead end this finding
+    // was filed against. Uses the same earliest-reset selection so the run
+    // log and the paused task's own reason never disagree about which
+    // candidate's reset governs.
+    const quotaCandidatesForLog =
+      outcome.kind === "unavailable" &&
+      (outcome.code === "candidatesExhausted" || outcome.code === "candidatesDeferred")
+        ? (exhaustion?.candidates ?? [])
+            .map((candidate) => ({
+              candidate,
+              failureKind:
+                candidate.deferredFailureKind ??
+                classifyFailure({ errorMessage: candidate.reason }).failureKind,
+              resetAt:
+                candidate.deferredFailureKind !== undefined
+                  ? candidate.deferredResetAt
+                  : parseQuotaResetV1(candidate.reason, new Date()),
+            }))
+            .filter(({ failureKind }) => failureKind === "quota" || failureKind === "model-entitlement")
+        : [];
+    const quotaCandidateForLog = quotaCandidatesForLog.reduce<
+      (typeof quotaCandidatesForLog)[number] | undefined
+    >((earliest, current) => {
+      if (earliest === undefined) {
+        return current;
+      }
+      if (earliest.resetAt === undefined) {
+        return current.resetAt !== undefined ? current : earliest;
+      }
+      if (current.resetAt === undefined) {
+        return earliest;
+      }
+      return current.resetAt < earliest.resetAt ? current : earliest;
+    }, undefined);
+    const quotaLogNote = quotaCandidateForLog
+      ? `\n**Quota/credit-limit block detected** on ${quotaCandidateForLog.candidate.providerLabel} — ` +
+        `this chain was blocked by a provider account limit, not a transport or code fault. ` +
+        (quotaCandidateForLog.resetAt !== undefined
+          ? `Reported reset: ${quotaCandidateForLog.resetAt}. `
+          : "No reset time was reported. ") +
+        "The task has been parked with this reset time rather than left as a bare failure.\n"
+      : "";
     const exhaustionSection = exhaustion
       ? `\n## Provider chain exhausted\n\n` +
         `${exhaustionHeadline} ` +
@@ -3576,7 +3700,8 @@ export async function writeReviewRunLogV1(
               )
               .join("\n")
           : "_no candidates are configured for this stage_") +
-        "\n\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
+        `\n${quotaLogNote}` +
+        "\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
       : "";
     // wf10 continuation item 12, Part 1 step 4: the durable per-review record
     // (this run log) must show the same reviewer/mechanical split every other
@@ -3623,6 +3748,19 @@ export async function writeReviewRunLogV1(
         // makes this run log a usable record without it.
       }
     }
+    // 2026-09-15 post-freeze findings, item 2: "record a warning on the
+    // round and in the run log" for a confirmed transient identity-attach
+    // failure the coordinator fails OPEN for — this run log is the durable
+    // per-round record a user actually opens, so the degraded-provenance
+    // fact belongs here alongside the round-ledger field it also lands on
+    // (`RoundLedgerOutcomeV1.identityAttachmentDegraded`), not only in the
+    // coordinator's own `console.warn`.
+    const identityAttachmentSection = ctx.identityAttachmentDegraded
+      ? `\n## Provenance degraded\n\nAttempt ${ctx.identityAttachmentDegraded.attemptId}'s identity could ` +
+        `not be durably attached to this round's ledger row (${ctx.identityAttachmentDegraded.kind}: ` +
+        `${ctx.identityAttachmentDegraded.detail}). The round proceeded anyway — this affects traceability ` +
+        `only, not the round's own result.\n`
+      : "";
     const logUri = await writeRunLog(
       ctx.folderUri,
       "review-v1",
@@ -3630,7 +3768,7 @@ export async function writeReviewRunLogV1(
       `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
         outcome,
         STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
-      )}\n${blockerSection}${exhaustionSection}`
+      )}\n${blockerSection}${exhaustionSection}${identityAttachmentSection}`
     );
     taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
   } catch {
@@ -3791,7 +3929,7 @@ async function routeReviewOutcomeV1(
             ownership: freshProgressForTransition?.ownership,
             taskFolder: freshProgressForTransition?.taskFolder ?? path.basename(folderUri.fsPath),
           },
-          freshProgressForTransition?.status,
+          freshProgressForTransition,
           currentStage,
           targetStage,
           false,
@@ -3867,6 +4005,9 @@ async function routeReviewOutcomeV1(
             ? { coordinatorExtraAttemptIds: ctx.extraCoordinatorAttemptIds }
             : {}),
           ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
+          ...(ctx.identityAttachmentDegraded
+            ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
+            : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -4044,14 +4185,23 @@ async function routeReviewOutcomeV1(
             // stale/hardcoded "not paused" here would let shouldAutoReview
             // fire anyway even though the task is now paused.
             const freshProgressForAdvance = await readTaskProgressAdvisoryV1(folderUri);
-            const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
+            // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive
+            // read ... automation gates"): a watchdog pause whose fence
+            // generation a revocation has already advanced past must not
+            // halt auto-advance — the raw `status` field on disk can lag the
+            // durable revocation until some later admission acquisition
+            // repairs it. A genuine user pause (the scenario this check
+            // exists for) is unaffected: the resolver always treats it as real.
+            const isPausedForAdvance = freshProgressForAdvance
+              ? await isEffectivelyPausedV1(folderUri.fsPath, freshProgressForAdvance)
+              : false;
             const transition = await advanceStageViaNextStageRowV1(
               folderUri,
               {
                 ownership: freshProgressForAdvance?.ownership,
                 taskFolder: freshProgressForAdvance?.taskFolder ?? path.basename(folderUri.fsPath),
               },
-              freshProgressForAdvance?.status,
+              freshProgressForAdvance,
               targetStage,
               next,
               isPausedForAdvance,
@@ -4448,35 +4598,79 @@ export async function pauseTaskForExhaustedChainV1(
   // folding into the same generic "tried and failed" sentence every other
   // candidatesExhausted cause used (item 3b/companion finding, 2026-08-17/18:
   // several rounds of real spend were spent before the cause was legible).
-  const quotaCandidate = exhaustion.candidates
-    .map((candidate) => ({ candidate, classified: classifyFailure({ errorMessage: candidate.reason }) }))
-    .find(
-      ({ classified }) =>
-        classified.failureKind === "quota" || classified.failureKind === "model-entitlement"
+  // 2026-09-15 post-freeze findings, item 4, requirement 4 ("park with its
+  // reset time, not exhaust the chain" / "the earliest reset time when no
+  // candidate is currently runnable"): when more than one candidate in the
+  // chain was blocked by quota/entitlement, park on whichever one reopens
+  // SOONEST, not merely the first one encountered in ranked order — the
+  // first-ranked candidate could easily be the one with the longest wait,
+  // which would misreport how soon the task can actually resume. A
+  // candidate with a parseable resetAt always outranks one without: an
+  // unknown reset is worse information than a known one, however early it
+  // sorts numerically.
+  // Prefer the typed `deferredFailureKind`/`deferredResetAt` fields
+  // `enrichChainExhaustionWithAttemptOutcomesV1` stamps at the point a
+  // candidate's failure detail is known (2026-09-15 post-freeze findings,
+  // item 4) — falling back to re-classifying the rendered `reason` text only
+  // for candidates that were never enriched that way (e.g. selection-time
+  // skips, or a chain-exhaustion record built by another producer).
+  const quotaCandidates = exhaustion.candidates
+    .map((candidate) => ({
+      candidate,
+      failureKind:
+        candidate.deferredFailureKind ?? classifyFailure({ errorMessage: candidate.reason }).failureKind,
+      resetAt:
+        candidate.deferredFailureKind !== undefined
+          ? candidate.deferredResetAt
+          : parseQuotaResetV1(candidate.reason, new Date()),
+    }))
+    .filter(
+      ({ failureKind }) => failureKind === "quota" || failureKind === "model-entitlement"
     );
+  const quotaCandidate = quotaCandidates.reduce<(typeof quotaCandidates)[number] | undefined>(
+    (earliest, current) => {
+      if (earliest === undefined) {
+        return current;
+      }
+      if (earliest.resetAt === undefined) {
+        return current.resetAt !== undefined ? current : earliest;
+      }
+      if (current.resetAt === undefined) {
+        return earliest;
+      }
+      return current.resetAt < earliest.resetAt ? current : earliest;
+    },
+    undefined
+  );
   const quotaParkRecord: QuotaParkRecordV1 | undefined = quotaCandidate
     ? {
         modelId: quotaCandidate.candidate.storedModelId,
         providerId: quotaCandidate.candidate.runnerId,
         accountKey: resolveQuotaAccountKeyV1(quotaCandidate.candidate.storedModelId),
-        failureKind: quotaCandidate.classified.failureKind as "quota" | "model-entitlement",
-        resetAt: parseQuotaResetV1(quotaCandidate.candidate.reason, new Date()),
+        failureKind: quotaCandidate.failureKind as "quota" | "model-entitlement",
+        resetAt: quotaCandidate.resetAt,
         observedAt: new Date().toISOString(),
       }
     : undefined;
   const reason =
-    code === "candidatesExhausted" && quotaCandidate !== undefined
-      ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
-        `${quotaCandidate.classified.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+    code === "candidatesDeferred" && quotaCandidate !== undefined
+      ? `Every configured model for ${stageName} is currently blocked by a ` +
+        `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
         `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
-        `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
-      : code === "candidatesExhausted"
-        ? `Every configured model for ${stageName} was tried and failed — ` +
-          `the resolved chain was exhausted (${chain}). ` +
-          "See the run log for per-candidate reasons."
-        : `No configured provider for ${stageName} is available — ` +
-          `the resolved chain was exhausted (${chain}). ` +
-          "See the run log for per-candidate reasons.";
+        `fault (${quotaCandidate.candidate.reason}). Deferred, not exhausted: the task is parked until the known ` +
+        "reset. See the run log for the remaining per-candidate reasons."
+      : code === "candidatesExhausted" && quotaCandidate !== undefined
+        ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
+          `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+          `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
+          `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
+        : code === "candidatesExhausted"
+          ? `Every configured model for ${stageName} was tried and failed — ` +
+            `the resolved chain was exhausted (${chain}). ` +
+            "See the run log for per-candidate reasons."
+          : `No configured provider for ${stageName} is available — ` +
+            `the resolved chain was exhausted (${chain}). ` +
+            "See the run log for per-candidate reasons.";
   await patchTaskProgressStrictV1(folderUri, (current) =>
     pauseTaskWithReason(current, reason, quotaParkRecord)
   );
@@ -4645,6 +4839,21 @@ export async function runReviewForFolder(
      * and a different model is being tried against it.
      */
     skipUnchangedTreeGuard?: boolean;
+    /**
+     * The command id to re-invoke, with a `{ taskFolderPath }` arg, when this
+     * call's "Restore Last Usable Summary" refusal (below) is accepted and
+     * the restore succeeds — 2026-09-15 post-freeze findings, item 3 / plan
+     * step 24: restoring must "rerun admission", not just unstamp the file
+     * and leave the user to click Review or Fast Forward again by hand.
+     * Defaults to plain Review, which is always a valid way to re-enter the
+     * refused path — every caller of this function either IS a Review
+     * dispatch or is itself one step of a longer chain (Fast Forward's
+     * "no initial review yet" branch literally calls this function directly)
+     * that the user can restart. Set explicitly to Fast Forward's own
+     * command id at that one call site so restoring from a Fast-Forward
+     * initiated refusal re-enters Fast Forward specifically.
+     */
+    rerunCommandId?: string;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -4866,10 +5075,39 @@ export async function runReviewForFolder(
     // run itself declined to dispatch — because the alternative is reviewing
     // an earlier round's notes against a tree they no longer describe.
     if (isUnusableImplementationSummaryV1(implementationContent)) {
+      // 2026-09-15 post-freeze findings, item 3: a refusal must name a
+      // remedy the system can actually reach, not just tell the user to
+      // rerun a round that may have nothing left to change (e.g. every
+      // remaining plan item is a human gate — the exact deadlock this item
+      // describes). `impl-summary_prev.md` is written precisely so nothing
+      // is lost when a round is stamped unusable; offer to restore it here
+      // when it is itself usable, via the same restore path "Discard Last
+      // Round" already exercises (`restoreRejectedImplementationRoundV1`).
+      const previousImplSummary = await readTextIfExists(
+        previousVersionUri(getImplementationSummaryUri(folderUri))
+      );
+      const canRestorePreviousImplSummary =
+        previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       NotificationRouter.showWarning(
         "The last implementation round did not produce usable implementation notes, so there is " +
           `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
-          "Run the implementation step again to produce them."
+          (canRestorePreviousImplSummary
+            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
+            : "Run the implementation step again to produce them."),
+        undefined,
+        undefined,
+        undefined,
+        canRestorePreviousImplSummary
+          ? {
+              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+              title: "Restore Last Usable Summary",
+              args: [
+                folderUri.fsPath,
+                targetStage,
+                options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
+              ],
+            }
+          : undefined
       );
       return;
     }
@@ -5439,6 +5677,13 @@ export async function runReviewForFolder(
     // item-14 same-candidate retry), not just the final one carried on
     // `outcome.correlation` — see `ReviewOutcomeContextV1.extraCoordinatorAttemptIds`.
     const observedCoordinatorAttemptIds: string[] = [];
+    // 2026-09-15 post-freeze findings, item 2: a confirmed transient
+    // `writerRetriesExhausted` attach failure lets the coordinator proceed
+    // (fail-open) rather than losing the round — captured here so it can be
+    // folded into this round's own durable settlement and run log below,
+    // alongside the coordinator's own `console.warn`. See
+    // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
+    let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
     reportStageRunningV1(options.operation, stageToken);
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
@@ -5462,12 +5707,17 @@ export async function runReviewForFolder(
       // user pause written while the provider is running.
       onAttemptAllocated: async (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        await attachCoordinatorIdentityToRoundV1({
-          roundId: reviewAttemptId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-          taskFolderUri: folderUri,
-        });
+        await attachCoordinatorIdentityToRoundTrackingDegradationV1(
+          {
+            roundId: reviewAttemptId,
+            operationId: info.operationId,
+            attemptId: info.attemptId,
+            taskFolderUri: folderUri,
+          },
+          (degraded) => {
+            identityAttachmentDegradedForOutcome = degraded;
+          }
+        );
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
@@ -5498,6 +5748,9 @@ export async function runReviewForFolder(
         ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
         : {}),
       ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
+      ...(identityAttachmentDegradedForOutcome
+        ? { identityAttachmentDegraded: identityAttachmentDegradedForOutcome }
+        : {}),
     });
   } finally {
     if (!reviewSucceeded) {
@@ -5673,7 +5926,31 @@ export async function markReviewArtifactStale(
   // recognizes it) — repeated staling events never clobber the last REAL
   // review's `_prev` backup, matching this guard's original purpose.
   await backupReviewUnlessStale(reviewUri);
-  const banded = upsertArtifactChangeStaleBannerV1(existing, changedArtifact, new Date().toISOString());
+  // 2026-09-15 post-freeze findings, item 3: `existing` can itself already be
+  // the LEGACY bare "# Review Stale" placeholder — left on disk by a pre-A3
+  // build, or by a run of THIS function before this fix landed. Banner-
+  // wrapping it as-is (the fallback below) would keep the artifact at the
+  // placeholder's ~138 bytes forever: none of the verdict, score, blockers or
+  // progress this banner exists to keep reachable. `backupReviewUnlessStale`'s
+  // own stale-skip guard, just above, never overwrites `_prev` with a
+  // placeholder, so `_prev` may still hold the last real review from before
+  // the FIRST staling event. Recover it and banner THAT instead, so the
+  // artifact ends up exactly where it would be had the placeholder never
+  // overwritten it — a real review body, marked stale through the same
+  // non-destructive path every other review takes. Falls back to the bare
+  // placeholder only when `_prev` is itself unusable (missing, or itself a
+  // placeholder — no genuine review ever landed between two staling events).
+  const base = existing.trimStart().startsWith("# Review Stale")
+    ? await (async (): Promise<string> => {
+        const previousReview = await readTextIfExists(previousVersionUri(reviewUri));
+        return previousReview !== undefined &&
+          !isStaleReviewArtifact(previousReview) &&
+          !isInProgressReviewArtifact(previousReview)
+          ? previousReview
+          : existing;
+      })()
+    : existing;
+  const banded = upsertArtifactChangeStaleBannerV1(base, changedArtifact, new Date().toISOString());
   await writeTextFile(reviewUri, banded, { skipBackup: true });
 }
 
@@ -5727,11 +6004,27 @@ export async function beginInProgressReviewMarkingV1(
   // artifact-change banner has real body left to swap a banner line on
   // below, not a placeholder to replace wholesale.
   if (current.trimStart().startsWith("# Review Stale")) {
+    // 2026-09-15 post-freeze findings, item 3: this placeholder itself has
+    // nothing to preserve, but the review it replaced does — sitting in
+    // `_prev`, exactly where `backupReviewUnlessStale` put it, and otherwise
+    // unreachable from this artifact. Inline it (labelled, so it reads as
+    // history rather than the current verdict) instead of leaving a bare
+    // banner with no prior score, blockers, or progress. Guarded against a
+    // `_prev` that is itself a placeholder (no genuine review ever landed
+    // between two staling events) — there is nothing useful to inline then.
+    const previousReviewForInProgress = await readTextIfExists(previousVersionUri(reviewUri));
+    const hasUsablePreviousReview =
+      previousReviewForInProgress !== undefined &&
+      !isStaleReviewArtifact(previousReviewForInProgress) &&
+      !isInProgressReviewArtifact(previousReviewForInProgress);
     const inProgressNotice = [
       IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
       "",
       "This review is being re-evaluated against the current artifact.",
       "",
+      ...(hasUsablePreviousReview
+        ? ["## Previous result", "", previousReviewForInProgress.trim(), ""]
+        : []),
     ].join("\n");
     await writeTextFile(reviewUri, inProgressNotice, { skipBackup: true });
     return { rewrote: true, priorContent: current };
@@ -5801,11 +6094,17 @@ export async function revertInProgressReviewMarkingV1(
  * (executeImplementationRun's `postRunReviewStage`), used to locate that
  * stage's review artifact; a plan-only task (no review stage yet) restores
  * just the summary.
+ *
+ * Returns whether anything was actually restored, so a caller reached from
+ * the "Restore Last Usable Summary" refusal action (2026-09-15 post-freeze
+ * findings, item 3 / plan step 24) knows whether it is safe to re-dispatch
+ * the stage action that was refused — never announce or re-enter that path
+ * off of a no-op restore.
  */
 export async function restoreRejectedImplementationRoundV1(
   taskFolderPath: string,
   stage: TaskStage
-): Promise<void> {
+): Promise<boolean> {
   const folderUri = vscode.Uri.file(taskFolderPath);
   const summaryUri = getImplementationSummaryUri(folderUri);
 
@@ -5815,7 +6114,7 @@ export async function restoreRejectedImplementationRoundV1(
       "Nothing to restore — the current implementation summary is not a rejected-round stamp " +
         "(it may already have been restored, or a later round already replaced it)."
     );
-    return;
+    return false;
   }
 
   const restoreTargets: Array<{ current: vscode.Uri; label: string }> = [
@@ -5843,13 +6142,14 @@ export async function restoreRejectedImplementationRoundV1(
       "Could not restore the prior round: no backup (_prev) file was found for the implementation " +
         "summary" + (reviewUri ? " or review" : "") + "."
     );
-    return;
+    return false;
   }
 
   NotificationRouter.showInformation(
     `Restored the prior ${restored.join(" and ")} — the task is back to its pre-rejection state.` +
       (missing.length > 0 ? ` (No backup was found for the ${missing.join(" and ")}.)` : "")
   );
+  return true;
 }
 
 /**
@@ -6254,8 +6554,8 @@ export async function applyReviewWithAI(
 
   // Admission is now guaranteed live for this exact target (or the caller's
   // own admission covers it, under `options.parentOperation`) — reconcile a
-  // watchdog-provenance pause (never a user pause) before the paused check
-  // below, exactly like `runReviewWithAI`/`runImplementationWithAI`.
+  // watchdog-provenance pause (never a user pause) before proceeding, exactly
+  // like `runReviewWithAI`/`fastForwardReviewWithAI`.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
@@ -6268,10 +6568,20 @@ export async function applyReviewWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: `reconciled.outcome` is exhaustive here —
+  // "unreadable" and "userPaused" already returned above, so only "reversed"
+  // (status just written back to active) or "notPaused" (the reconciliation's
+  // own FRESH read already found the task not paused) remain. Either way the
+  // task is not paused right now. A trailing `resolved.progress.status ===
+  // "paused"` check here would read `resolved.progress`'s STALE
+  // pre-reconciliation snapshot on the "notPaused" branch (never updated,
+  // unlike "reversed") and could wrongly refuse a task that this very
+  // reconciliation call just proved is not paused — the same
+  // command-self-check defect class this Part exists to close, just in the
+  // opposite direction (false refusal from stale data instead of a raw
+  // status read skipping the resolver entirely). Removed rather than kept as
+  // dead weight; `runReviewWithAI`/`fastForwardReviewWithAI` never had it.
 
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
@@ -6921,7 +7231,16 @@ export async function fastForwardReviewWithAI(
         title: `Running initial ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
-      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op, chatViewProvider })
+      () =>
+        runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, {
+          operation: op,
+          chatViewProvider,
+          // If this initial review itself refuses on an unusable implementation
+          // summary, restoring should re-enter Fast Forward (this function),
+          // not plain Review — the user asked to fast-forward, and Fast
+          // Forward's own "no initial review yet" branch is exactly this call.
+          rerunCommandId: "vs-code-ai-helper.fastForwardReviewWithAI",
+        })
     );
     initialContent = await readNonEmptyText(reviewUri);
     // Same unusable check as the pre-dispatch read above (line ~3209) — the
@@ -8079,11 +8398,12 @@ export async function viewReview(
  * `nextStageRowV1.ts`'s header for why a same-stage re-review confirmation is
  * handled by the caller instead of going through this helper.
  *
- * @param status  The task's persisted status, read fresh by the caller
- *   immediately before calling (mirrors `advanceStage`'s own no-staleness
- *   contract) — used only for the coordinator's eligibility pre-check;
- *   the row's own field policy independently re-validates `active` inside
- *   the lock.
+ * @param statusSnapshot  The task's persisted status (plus the pause-fence
+ *   fields needed to resolve it), read fresh by the caller immediately
+ *   before calling (mirrors `advanceStage`'s own no-staleness contract) —
+ *   used only for the coordinator's eligibility pre-check; the row's own
+ *   field policy independently re-validates `active` inside the lock, from
+ *   the same resolved value (see below).
  * @param currentStage  The stage the caller observed as current immediately
  *   before this call — the row's `expectedSourceStage` CAS.
  * @param expectedReviewAttemptId  Optional CAS against the freshly re-read
@@ -8097,7 +8417,7 @@ export async function viewReview(
 async function advanceStageViaNextStageRowV1(
   folderUri: vscode.Uri,
   binding: Pick<TaskProgress, "ownership" | "taskFolder">,
-  status: TaskProgress["status"] | undefined,
+  statusSnapshot: EffectivePauseSnapshotV1 | undefined,
   currentStage: TaskStage,
   next: TaskStage,
   isPaused: boolean,
@@ -8119,13 +8439,40 @@ async function advanceStageViaNextStageRowV1(
     throw new Error("taskBindingUnavailable");
   }
   const taskBindingId = derivedBinding.binding.bindingId;
+  // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+  // advancement gates"): `nextStage.v1`'s own eligibility row
+  // (`eligibility.statuses: ["active"]`, checked from `request.taskStatus`
+  // both at admission and again inside the write lock — see
+  // `taskActionCoordinatorV1.ts`'s `admitAction`/`eligibilityFailure`) must
+  // never refuse the transition solely because the raw on-disk `status`
+  // still reads "paused" while the watchdog pause it names has already been
+  // revoked by fence advance and not yet durably repaired — an advancement
+  // gate trapping the exact task it should release, the defect class this
+  // Part exists to close. Resolved independently of the `isPaused` argument
+  // above: that argument answers a different, caller-specific question
+  // (whether THIS transition should auto-continue into a review) and at
+  // least one caller (`routeReviewOutcomeV1`'s same-stage/no-op sibling
+  // branch) passes it hardcoded without resolving real pause state, so
+  // reusing it here would let a genuine user pause bypass this gate instead
+  // of fixing the stale-watchdog-pause case alone. Shared, dedicated-tested
+  // computation (`resolveEffectiveStageTaskStatusV1`) — same fix as
+  // `commitAndPushTask.ts`'s "Complete, Commit and Push" flow, which uses the
+  // identical function rather than reimplementing it.
+  const effectiveTaskStatus = await resolveEffectiveStageTaskStatusV1(folderUri.fsPath, statusSnapshot);
+  // 2026-09-15 post-freeze findings, item 5 (Part 5 step 33): checked here —
+  // the shared advancement gate every nextStage.v1 caller routes through —
+  // as well as by the periodic sweep (`scheduleTaskResume.ts`'s
+  // `armPendingImplRecoveries`), so neither depends on the other having
+  // already run. A `summaryRejected` recovery whose blocking condition is
+  // already satisfied must not go on refusing this transition.
+  await retireSatisfiedSummaryRejectedRecoveryV1(folderUri);
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,
     taskBindingId,
     chatDocumentIdentitySeed: folderUri.fsPath,
     workspaceCwd: path.dirname(folderUri.fsPath),
-    taskStatus: status ?? "active",
+    taskStatus: effectiveTaskStatus,
     taskStage: currentStage,
     rawInput: {
       taskFolderPath: folderUri.fsPath,
@@ -8140,6 +8487,25 @@ async function advanceStageViaNextStageRowV1(
     beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
   if (outcome.kind !== "completed") {
+    // 2026-09-15 post-freeze findings, item 5's general requirement: "every
+    // refusal must name a remedy the system can reach, or an action the user
+    // can actually take" — `nextStage.implRecoveryOwed` alone named neither.
+    // Re-read fresh progress for the record's own fields (trigger, dispatch
+    // state, lease) rather than trying to thread them back out of the
+    // policy's bare failure code. `ImplRecoveryOwedRefusalError` carries the
+    // record too, so a caller that wants to ALSO offer the "Discard this
+    // owed continuation" action (rather than just showing the message every
+    // existing catch site already does via `error.message`) can.
+    if (outcome.kind === "failed" && outcome.code === "implRecoveryOwed") {
+      const freshForRefusal = await readTaskProgressAdvisoryV1(folderUri);
+      const owedRecovery = freshForRefusal?.implRecovery;
+      if (owedRecovery && freshForRefusal) {
+        throw new ImplRecoveryOwedRefusalError(
+          describeOwedImplRecoveryRefusalV1(owedRecovery, freshForRefusal),
+          owedRecovery
+        );
+      }
+    }
     throw new Error(outcome.kind === "failed" ? outcome.code : outcome.kind);
   }
   const shouldAutoReview =
@@ -8328,13 +8694,19 @@ export async function nextStage(
   // recovery).
   let transitionResult: StageTransitionResult | undefined;
   try {
+    // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
+    // automation gates"): `isPaused` here suppresses `shouldAutoReview` — a
+    // watchdog pause whose fence generation a revocation has already advanced
+    // past must not silently block auto-continuing into the next review, the
+    // same defect class as fastForwardCurrentTaskReview.ts's identical check.
+    const isPausedForTransition = await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress);
     transitionResult = await advanceStageViaNextStageRowV1(
       resolved.folderUri,
       resolved.progress,
-      resolved.progress.status,
+      resolved.progress,
       resolved.progress.currentStage,
       next,
-      resolved.progress.status === "paused",
+      isPausedForTransition,
       // Completing a stage may start work in its destination only when
       // the workspace explicitly enables that behavior. Manual stage
       // selection deliberately does not use this path.
@@ -8351,8 +8723,26 @@ export async function nextStage(
     // was in flight. Report it like any other failed transition instead of
     // an unhandled rejection.
     const message = error instanceof Error ? error.message : String(error);
+    // 2026-09-15 post-freeze findings, item 5 (Part 5 step 34): this is the
+    // command the finding's own report named ("Complete & Move On then
+    // refused with nextStage.implRecoveryOwed") — the primary manual surface
+    // where a stuck owed recovery is discovered. Offer the escape here, only
+    // when the record itself has no automated way back.
+    const owedRecovery = error instanceof ImplRecoveryOwedRefusalError ? error.recovery : undefined;
+    const canDiscardOwedRecovery =
+      owedRecovery !== undefined && isImplRecoveryDiscardOfferableV1(owedRecovery, resolved.progress);
     NotificationRouter.showWarning(
-      `Could not advance ${resolved.progress.taskFolder}: ${message}`
+      `Could not advance ${resolved.progress.taskFolder}: ${message}`,
+      undefined,
+      undefined,
+      undefined,
+      canDiscardOwedRecovery
+        ? {
+            command: "vs-code-ai-helper.discardOwedImplRecoveryV1",
+            title: "Discard This Owed Continuation",
+            args: [resolved.folderUri.fsPath],
+          }
+        : undefined
     );
     return;
   }
@@ -8813,7 +9203,10 @@ export async function generateImplementationWithAI(
   if (!resolved) {
     return;
   }
-  if (resolved.progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+  // identical check for why this must use the resolver rather than the raw
+  // `status` field.
+  if (await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress)) {
     NotificationRouter.showInformation("This task is paused. Resume it before generating implementation notes.");
     return;
   }
@@ -9856,6 +10249,118 @@ async function executeImplementationRun(
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
+    // `result` is declared `let ... | undefined` at this function's top —
+    // narrowed to the "completed" variant only for DIRECT reads in this
+    // block, not inside a nested closure (TS does not retain narrowing of a
+    // mutable outer binding across a function boundary). `bankValidImplementationSummaryV1`
+    // below is such a closure, so it captures this narrowed copy instead of
+    // reading `result` directly.
+    const completedResult = result;
+    // Filled in below, only for a runner-synthesized round with a plan
+    // checklist — read by the run log write and by the reconcile-decision
+    // post to surface it for explicit human selection (workflow 8, item 2 /
+    // plan Part 4). Never used to exempt the round from
+    // checklistProgressUnreliable — see `computeSyntheticRoundChecklistLatchV1`'s
+    // doc comment. Hoisted here (rather than declared just above its original
+    // single use site) so `bankValidImplementationSummaryV1` below — called
+    // both from the zero-file gate and from this round's ordinary write path
+    // — can set it from either call site.
+    let automaticChecklistReconciliation: AutomaticChecklistReconciliationOutcomeV1 | undefined;
+
+    /**
+     * Banks THIS round's own valid report into impl-summary.md — including
+     * the checklist merge — even when the round is about to be refused
+     * advancement (e.g. by the zero-file gate below, when unticked items
+     * remain that no review has cleared yet). Extracted so a caller that
+     * must return early without advancing can still call this first
+     * (2026-09-15 post-freeze findings, item 3: "a round with nothing to do
+     * must still produce a usable summary — and today its summary is
+     * discarded even when it writes one"). Every call site only invokes this
+     * once `!summaryIssue` is already established — a rejected summary keeps
+     * using the unusable-stamp path below unchanged.
+     */
+    const bankValidImplementationSummaryV1 = async (): Promise<void> => {
+      const planOfRecordUri = getCanonicalImplementationUri(folderUri);
+      // Same attribution formula as the outer `attributedFilesChanged` below
+      // (kept as a second, self-contained computation rather than shared,
+      // since this function is also called from a call site that runs
+      // BEFORE that outer computation exists) — pure and deterministic over
+      // `result`/`summary`/`planChecklist`, none of which change between the
+      // two call sites.
+      const { attributed: bankedAttributedFilesChanged, unattributed: _bankedUnattributedFilesChanged } =
+        completedResult.summaryIsSynthetic || completedResult.filesChangedUnknown
+          ? { attributed: [...completedResult.filesChanged], unattributed: [] as string[] }
+          : attributeImplementationRoundFilesV1(
+              completedResult.filesChanged,
+              parseReportedFilesChangedV1(summary, { planChecklist })
+            );
+      // Signed with the reservation actually invoked (never the requested
+      // primary) — same helper and header format review artifacts use
+      // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
+      // regardless of which path wrote it.
+      const summaryText = completedResult.summaryIsSynthetic
+        ? buildSyntheticImplementationSummaryV1(summary, completedResult.filesChanged)
+        : !completedResult.filesChangedUnknown && completedResult.filesChanged.length === 0
+          ? withDeterministicZeroFilesChangedNoteV1(summary)
+          : summary;
+      const signedSummary = completedResult.providerLabel
+        ? withAttribution(
+            summaryText,
+            completedResult.providerLabel,
+            completedResult.storedModelId ? attributionModelLabel(completedResult.storedModelId) : undefined
+          )
+        : summaryText;
+      options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
+      await writeTextFile(summaryUri, `${signedSummary}\n`);
+
+      if (planChecklist !== undefined) {
+        const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
+        if (mergeResult.kind === "merged") {
+          const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planChecklist, mergeResult.content);
+          if (!written) {
+            NotificationRouter.showWarning(
+              "⚠️ plan-final.md changed while this round's checklist progress was being merged, so nothing was " +
+                "written — its ticks were not lost, but this round's progress could not be recorded. Re-run " +
+                "reconciliation once the concurrent change settles."
+            );
+          } else {
+            effectivePlanChecklist = mergeResult.content;
+            await withdrawWorkflowDecisionsByKeyV1(
+              { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+              "applyReviewerVerifiedTicks",
+              "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
+            );
+            if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
+              const existingLog = await readTextIfExists(logUri);
+              if (existingLog !== undefined) {
+                const retroSection =
+                  "\n\n## Retroactive plan ticks\n\n" +
+                  "Items ticked this round via a retroactive claim (verified complete from an " +
+                  "earlier round, not built this round):\n\n" +
+                  mergeResult.retroactiveTicks
+                    .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
+                    .join("\n");
+                await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
+              }
+            }
+          }
+        } else if (mergeResult.kind === "no-match") {
+          NotificationRouter.showWarning(
+            "⚠️ The implementation round reported checklist progress that did not match any " +
+              "item in the plan of record, so no boxes were ticked. Unmatched: " +
+              mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")
+          );
+        }
+      }
+
+      if (planChecklist !== undefined && completedResult.summaryIsSynthetic) {
+        automaticChecklistReconciliation = await runAutomaticChecklistReconciliationV1(
+          folderUri,
+          bankedAttributedFilesChanged,
+          completedResult.appliedOperations
+        );
+      }
+    };
 
     if (incompleteRound && recovery) {
       // A detected deferred/cut-short round is recorded INCOMPLETE and
@@ -10055,6 +10560,16 @@ async function executeImplementationRun(
         );
         const persistedGateRounds = gateTerminalization.ok ? gateTerminalization.progress : undefined;
         await appendRoundOutcomeLogNoteV1(logUri, gateClassification);
+        // 2026-09-15 post-freeze findings, item 3: this branch refuses to
+        // ADVANCE the round (warns, or escalates, below) but that is a
+        // decision about ROUTING, not about whether the round's own report
+        // was usable — `uncheckedItemsWithoutClearingReview` above already
+        // required `!summaryIssue` to reach here at all. Banking it is what
+        // stops a genuinely valid "nothing to fix" report from leaving
+        // impl-summary.md on whatever it held before this round ran (a stale
+        // `implementation-summary-unusable` stamp, in the reported case), the
+        // exact three-round deadlock this item describes.
+        await bankValidImplementationSummaryV1();
         // wf10 item 3 / item 6b / Part 5 step 13: a fallback provider that has
         // now produced `fallbackProviderBreakerRounds` consecutive zero-file
         // rounds is a known-broken path — stop and name it instead of letting
@@ -10101,8 +10616,19 @@ async function executeImplementationRun(
                   "with zero blockers), the checklist under-recording latch engages automatically on the " +
                   "following round and **Ensemble: Mark Plan Checklist Reconciled** becomes available; if it " +
                   "does not clear, its blockers name the work that is actually still outstanding."
-              : "Implementation finished, but no workspace files changed. " +
-                  "Review the implementation run log; the provider may have been blocked from writing files.",
+              : // 2026-09-15 post-freeze findings, item 3: this used to say "the
+                // provider may have been blocked from writing files" — false in
+                // the common case, where the model correctly found nothing left
+                // to do (e.g. every remaining plan item is a human deployment
+                // gate) and sent that reasoning back accurately. Blaming the
+                // provider sent operators looking for a permissions problem
+                // that did not exist. impl-summary.md now records this round's
+                // own report (see the bankValidImplementationSummaryV1 call
+                // just above), so the run log is not the only place to check.
+                "Implementation finished with no workspace file changes. This can be correct — for example, " +
+                  "when every remaining plan item is a human action (a deployment step, an external " +
+                  "confirmation) rather than something the model can do. This round's own report is now saved " +
+                  "in impl-summary.md; review it, or the implementation run log, to confirm.",
             undefined,
             undefined,
             undefined,
@@ -10655,14 +11181,9 @@ async function executeImplementationRun(
     // carrying a checklist must get its checklist back with updated boxes:
     // that echo is the only thing that advances plan progress, so the merge
     // below reuses the same read the gate validated against.
-    const planOfRecordUri = getCanonicalImplementationUri(folderUri);
-    // Filled in below, only for a runner-synthesized round with a plan
-    // checklist — read by the run log write to record the evidence found,
-    // and by the reconcile-decision post to surface it for explicit human
-    // selection (workflow 8, item 2 / plan Part 4). Never used to exempt the
-    // round from checklistProgressUnreliable — see
-    // `computeSyntheticRoundChecklistLatchV1`'s doc comment.
-    let automaticChecklistReconciliation: AutomaticChecklistReconciliationOutcomeV1 | undefined;
+    // (`planOfRecordUri` and `automaticChecklistReconciliation` moved into/up
+    // beside `bankValidImplementationSummaryV1`, above, so the zero-file gate
+    // can call it too — see that function's own doc comment.)
 
     // Attribution (finding 2): the git snapshot diff spans the round's
     // wall-clock window, not its authorship — edits made BY HAND in the same
@@ -10692,147 +11213,7 @@ async function executeImplementationRun(
           );
 
     if (!summaryIssue) {
-      // Signed with the reservation actually invoked (never the requested
-      // primary) — same helper and header format review artifacts use
-      // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
-      // regardless of which path wrote it.
-      // A runner-authored summary is recorded AS runner-authored, so later
-      // stages can tell that this round could not report checklist progress
-      // instead of reading the plan's frozen counts as current.
-      const summaryText = result.summaryIsSynthetic
-        ? buildSyntheticImplementationSummaryV1(summary, result.filesChanged)
-        : summary;
-      const signedSummary = result.providerLabel
-        ? withAttribution(
-            summaryText,
-            result.providerLabel,
-            result.storedModelId ? attributionModelLabel(result.storedModelId) : undefined
-          )
-        : summaryText;
-      // Coarse label at an explicit boundary: the round's provider call has
-      // already returned by this point, so "running" no longer describes
-      // what's happening — this write (plus the checklist-merge and
-      // artifact bookkeeping below) is the last visible activity before the
-      // stage ends and the terminal notification takes over.
-      options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
-      await writeTextFile(summaryUri, `${signedSummary}\n`);
-
-      // Carry this round's checkbox progress back into the plan of record.
-      // The reproduced checklist in the summary is the only persistent record
-      // of how much of the plan remains (run-implementation.md), and the next
-      // round reads plan-final.md — not the summary — as its Final Plan. It
-      // used to arrive there because the summary REPLACED plan-final.md, which
-      // is the same coupling that destroyed the checklist when a provider
-      // returned a status message. Merging ticks instead keeps the progress
-      // record without ever letting a run overwrite the plan.
-      if (planChecklist !== undefined) {
-        // Reuses the SAME result the zero-change routing decision above
-        // already computed (checklistAdvanced/checklistClaimedButUnmerged) —
-        // never recomputed, so the two can never disagree about what this
-        // round reported.
-        const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
-        if (mergeResult.kind === "merged") {
-          // Revision-conditional (review-flagged 2026-08-25, task-fixable
-          // blocker `739cfbbb-…-1`, narrowed a seventh time): this was the
-          // third remaining in-process writer of `plan-final.md` that
-          // bypassed `writeTextFileIfUnchangedV1`. Unlike the two decision-
-          // confirmation writers (`applyReviewerVerifiedTicksConfirmedV1`,
-          // `applyReconciliationReviewVerifiedTicksV1`), `checklistMergeResult`
-          // is reused by several routing decisions made earlier in this same
-          // function (see the comment above), so this cannot simply re-read
-          // and recompute the merge immediately before writing without
-          // risking those earlier decisions disagreeing with what actually
-          // gets written. `planChecklist` — the exact text the merge was
-          // computed against — is passed as the expected content instead: a
-          // concurrent writer or editor save that lands between that read and
-          // this write is still detected and refused rather than silently
-          // overwritten; only the earlier-computed routing messages remain
-          // based on the read at the time they were built, same as before.
-          const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planChecklist, mergeResult.content);
-          if (!written) {
-            NotificationRouter.showWarning(
-              "⚠️ plan-final.md changed while this round's checklist progress was being merged, so nothing was " +
-                "written — its ticks were not lost, but this round's progress could not be recorded. Re-run " +
-                "reconciliation once the concurrent change settles."
-            );
-          } else {
-            effectivePlanChecklist = mergeResult.content;
-            // Part 11 item 13c (event-driven half): an `applyReviewerVerifiedTicks`
-            // card is only defensible while `deriveApplicableVerifiedTicksV1`
-            // still finds unapplied reviewer-verified ticks against the
-            // CURRENT plan-final.md (chatView.ts's render-time safety net
-            // predicate). This round's own merge just changed plan-final.md's
-            // tick state, so any such card for this task may already be
-            // stale — withdraw here rather than waiting for the next render.
-            await withdrawWorkflowDecisionsByKeyV1(
-              { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
-              "applyReviewerVerifiedTicks",
-              "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
-            );
-            // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
-            // round verified as already complete rather than built itself —
-            // recorded in the run log, next to the rest of the round's
-            // evidence, so the claim is auditable rather than indistinguishable
-            // from an ordinary this-round tick.
-            if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
-              const existingLog = await readTextIfExists(logUri);
-              if (existingLog !== undefined) {
-                const retroSection =
-                  "\n\n## Retroactive plan ticks\n\n" +
-                  "Items ticked this round via a retroactive claim (verified complete from an " +
-                  "earlier round, not built this round):\n\n" +
-                  mergeResult.retroactiveTicks
-                    .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
-                    .join("\n");
-                await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
-              }
-            }
-          }
-        } else if (mergeResult.kind === "no-match") {
-          // The round reported ticked items, but none matched any item in the
-          // plan of record — a silent no-op here would be indistinguishable
-          // from a round that genuinely made no progress. Surfaced rather than
-          // swallowed so a corrupted or reworded echo is visible instead of
-          // quietly stalling the plan.
-          NotificationRouter.showWarning(
-            "⚠️ The implementation round reported checklist progress that did not match any " +
-              "item in the plan of record, so no boxes were ticked. Unmatched: " +
-              mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")
-          );
-        }
-        // "unchanged" / "no-report" behave as the old undefined case did: no
-        // write, no warning.
-      }
-
-      // Bounded automatic checklist reconciliation evidence-gathering
-      // (workflow 8, item 2 / plan Part 4): a runner-synthesized round has no
-      // echo to merge above — the sealed edit pipeline returns tool-call
-      // receipts, not prose — so its checklist state is otherwise ALWAYS
-      // "unrecorded" and latches checklistProgressUnreliable below, even when
-      // an implementation review already on file verified the exact plan
-      // items this round's edits complete. Gather that evidence once, from
-      // hard evidence only (never from this round's own diff or intent — see
-      // `runAutomaticChecklistReconciliationV1`'s doc comment) — but 2026-08-21
-      // NINTH review round: NEVER write it. plan-final.md is untouched here;
-      // the evidence is surfaced to the operator via
-      // `postReconcilePlanChecklistDecisionV1` below, and only an explicit
-      // selection there (`applyReconciliationReviewVerifiedTicksV1`) can turn
-      // it into a tick. Never run for a model-authored round: those either
-      // echo the checklist themselves (merged/no-match/unchanged above) or
-      // are a rejected summary, a different failure class this part does not
-      // touch.
-      if (planChecklist !== undefined && result.summaryIsSynthetic) {
-        automaticChecklistReconciliation = await runAutomaticChecklistReconciliationV1(
-          folderUri,
-          attributedFilesChanged,
-          // Only the sealed pipeline ever sets this (see
-          // ImplementationRunResult.appliedOperations's own doc comment); a
-          // model-authored round never reaches this branch at all
-          // (`result.summaryIsSynthetic` gates it), so this is never a stale
-          // carry-over from a different round's shape.
-          result.appliedOperations
-        );
-      }
+      await bankValidImplementationSummaryV1();
     } else {
       // Stamped HERE, next to the write it replaces, rather than beside the
       // warning further down: a round can fail its type-check AND return a
@@ -11327,11 +11708,18 @@ async function executeImplementationRun(
     if (isAutoAdvanceEnabled()) {
       try {
         const freshProgress = await readTaskProgressAdvisoryV1(folderUri);
-        if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
+        // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive
+        // read ... automation gates"): see fastForwardCurrentTaskReview.ts's
+        // identical check for why this must use the resolver rather than the
+        // raw `status` field.
+        if (
+          freshProgress?.currentStage === "impl" &&
+          !(await isEffectivelyPausedV1(folderUri.fsPath, freshProgress))
+        ) {
           const transition = await advanceStageViaNextStageRowV1(
             folderUri,
             freshProgress,
-            freshProgress.status,
+            freshProgress,
             "impl",
             "impl-high-review",
             false,
@@ -11593,8 +11981,8 @@ export async function runImplementationWithAI(
   // `fastForwardReviewWithAI`. `resolved.progress` was captured by
   // `resolveTask` BEFORE this reconciliation call, so a real user pause that
   // lands in the window between that read and this re-read would leave
-  // `resolved.progress.status` stale at "active" and slip past the
-  // fallback `resolved.progress.status === "paused"` check below.
+  // `resolved.progress.status` stale at "active" and slip past a raw
+  // `resolved.progress.status === "paused"` fallback check.
   if (reconciled.outcome === "userPaused") {
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
     return false;
@@ -11602,10 +11990,17 @@ export async function runImplementationWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: no trailing raw `resolved.progress.status ===
+  // "paused"` check here — by this point `reconciled.outcome` (a fresh,
+  // authoritative disk read) is exhaustively "reversed" or "notPaused"
+  // ("unreadable"/"userPaused" already returned above), both of which mean
+  // the task is not paused right now. Such a check would fire only on the
+  // "notPaused" branch, using `resolved.progress`'s STALE
+  // pre-reconciliation snapshot (never updated on that branch, unlike
+  // "reversed") — wrongly refusing a task this very call just proved is not
+  // paused. `runReviewWithAI`/`fastForwardReviewWithAI` never had this
+  // fallback; it was dead weight here that could only ever misfire.
 
   // Chained fast-forward request from "Complete & Move On triggers AI:
   // auto-fast-forward" — the post-run follow-up review must run as the Fast
@@ -12402,8 +12797,7 @@ export async function applyReviewEditWithAI(
 
   // Admission is now guaranteed live for this exact target (or the caller's
   // own admission covers it, under `options.parentOperation`) — reconcile a
-  // watchdog-provenance pause (never a user pause) before the paused check
-  // below.
+  // watchdog-provenance pause (never a user pause) before proceeding.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
     NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
@@ -12416,10 +12810,14 @@ export async function applyReviewEditWithAI(
   if (reconciled.outcome === "reversed") {
     resolved.progress = reconciled.progress;
   }
-  if (resolved.progress.status === "paused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
-    return false;
-  }
+  // Part 1b step 13 ("audit every pause-sensitive read ... command
+  // self-checks"), 2026-09-14: no trailing raw `resolved.progress.status ===
+  // "paused"` check here — see the identical note at this function's sibling
+  // call sites (`applyReviewWithAI`, `runImplementationWithAI`) above.
+  // `reconciled.outcome` is exhaustively "reversed" or "notPaused" by this
+  // point, both meaning not-paused-right-now from a FRESH read; a raw check
+  // against `resolved.progress`'s stale pre-reconciliation snapshot could
+  // only ever misfire on the "notPaused" branch.
 
   const consented = await ensureAiConsent(context);
   if (!consented) {
@@ -12670,13 +13068,26 @@ export function registerReviewActionCommands(
     // `{ task: IncompleteTask }`-shaped node instead.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.restoreRejectedImplementationRound",
-      (arg: string | TaskNodeArg | undefined, stage?: TaskStage) => {
+      async (arg: string | TaskNodeArg | undefined, stage?: TaskStage, rerunCommandId?: string) => {
         if (typeof arg === "string") {
           if (!stage) {
             NotificationRouter.showWarning("Could not discard the last round: no stage was supplied.");
             return undefined;
           }
-          return restoreRejectedImplementationRoundV1(arg, stage);
+          const restored = await restoreRejectedImplementationRoundV1(arg, stage);
+          // Only the "Restore Last Usable Summary" refusal action supplies
+          // `rerunCommandId` (2026-09-15 post-freeze findings, item 3 / plan
+          // step 24) — the plain "Discard Last Round" entry points (decision
+          // card, task-row context menu) never pass a third argument, so this
+          // stays a no-op restore for them, unchanged from before. Re-entering
+          // the refused stage only when the restore actually replaced
+          // something avoids re-dispatching against an untouched, still-bad
+          // summary (e.g. the button was stale — a later round already fixed
+          // it, or there was no usable `_prev` to restore from).
+          if (restored && rerunCommandId) {
+            await vscode.commands.executeCommand(rerunCommandId, { taskFolderPath: arg });
+          }
+          return undefined;
         }
         const task = arg?.task;
         if (!task) {
@@ -12684,6 +13095,48 @@ export function registerReviewActionCommands(
           return undefined;
         }
         return restoreRejectedImplementationRoundV1(task.folderUri.fsPath, task.progress.currentStage);
+      }
+    ),
+    // 2026-09-15 post-freeze findings, item 5 (Part 5 step 34): the
+    // user-reachable escape for a `dispatched` recovery with no automated way
+    // back — waiting out its lease plus the 90-minute stale-dispatch grace to
+    // reach a round that will fail the same way is not an exit. Reachable
+    // from the "Complete Stage & Move On" refusal button
+    // (`advanceStageViaNextStageRowV1`'s catch site) and from any other
+    // refusal surface that chooses to offer it, never automatically.
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.discardOwedImplRecoveryV1",
+      async (taskFolderPath: string) => {
+        const confirmation = await vscode.window.showWarningMessage(
+          "Discard this owed implementation continuation?\n\n" +
+            "This clears the recovery record without ever running the round it was waiting for. " +
+            "Only do this once you've confirmed the pending work is no longer needed — it cannot be undone.",
+          { modal: true },
+          "Discard Continuation"
+        );
+        if (confirmation !== "Discard Continuation") {
+          return;
+        }
+        const discarded = await discardOwedImplRecoveryV1(vscode.Uri.file(taskFolderPath));
+        if (discarded) {
+          NotificationRouter.showInformation(
+            "Discarded the owed implementation continuation. Re-evaluating Complete Stage & Move On now."
+          );
+          // Part 5 step 34's own wording: "record the action, and re-evaluate
+          // advancement immediately" — a discard that only cleared state and
+          // left the user to click "Complete Stage & Move On" a second time
+          // would still be friction the finding names as a dead end. `{
+          // taskFolderPath }` matches the `TaskNodeArg` shape every other
+          // notification-button command in this file passes to `resolveTask`
+          // (see this command's own registration site's neighboring comment).
+          // `nextStage` reports its own success/failure notification, so
+          // nothing further is shown here regardless of outcome.
+          await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", { taskFolderPath });
+        } else {
+          NotificationRouter.showInformation(
+            "Nothing to discard — the owed continuation already cleared on its own."
+          );
+        }
       }
     ),
     vscode.commands.registerCommand(
@@ -12972,7 +13425,10 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     return;
   }
   let progress: TaskProgress = strictRelease.decoded.progress;
-  if (progress.currentStage !== "publish" || progress.status === "paused") {
+  // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
+  // identical check for why this must use the resolver rather than the raw
+  // `status` field.
+  if (progress.currentStage !== "publish" || (await isEffectivelyPausedV1(candidateUri.fsPath, progress))) {
     NotificationRouter.showWarning("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
     return;
   }
@@ -13116,7 +13572,18 @@ async function buildReviewResumeVariablesV1(
   workspaceUri: vscode.Uri,
   targetStage: TaskStage,
   operationToken: vscode.CancellationToken | undefined
-): Promise<{ ok: true; variables: Record<string, string> } | { ok: false; warning: string }> {
+): Promise<
+  | { ok: true; variables: Record<string, string> }
+  | {
+      ok: false;
+      warning: string;
+      /** See `runReviewForFolder`'s matching unusable-summary branch — the
+       * "Restore Last Usable Summary" action, offered here too when
+       * `impl-summary_prev.md` is itself usable (2026-09-15 post-freeze
+       * findings, item 3). */
+      actionCommand?: { command: string; title: string; args?: unknown[] };
+    }
+> {
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
 
@@ -13161,11 +13628,34 @@ async function buildReviewResumeVariablesV1(
       };
     }
     if (isUnusableImplementationSummaryV1(implementationContent)) {
+      // See `runReviewForFolder`'s matching branch's doc comment.
+      const previousImplSummary = await readTextIfExists(
+        previousVersionUri(getImplementationSummaryUri(folderUri))
+      );
+      const canRestorePreviousImplSummary =
+        previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       return {
         ok: false,
         warning:
           "The last implementation round did not produce usable implementation notes, so there is " +
-          "nothing to review it against. Run the implementation step again to produce them.",
+          "nothing to review it against. " +
+          (canRestorePreviousImplSummary
+            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
+            : "Run the implementation step again to produce them."),
+        ...(canRestorePreviousImplSummary
+          ? {
+              actionCommand: {
+                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                title: "Restore Last Usable Summary",
+                // No record here of which top-level command originally started
+                // the interaction being resumed (Review or Fast Forward both
+                // create the same kind of interaction) — default to plain
+                // Review, same rationale as `runReviewForFolder`'s
+                // `rerunCommandId` default.
+                args: [folderUri.fsPath, targetStage, "vs-code-ai-helper.runReviewWithAI"],
+              },
+            }
+          : {}),
       };
     }
     variables.implementation = implementationContent;
@@ -13288,7 +13778,13 @@ export async function resumeReviewInteractionV1(
       cancellationToken
     );
     if (!variablesResult.ok) {
-      NotificationRouter.showWarning(variablesResult.warning);
+      NotificationRouter.showWarning(
+        variablesResult.warning,
+        undefined,
+        undefined,
+        undefined,
+        variablesResult.actionCommand
+      );
       // 2026-08-27 review, same blocker as the "no configured model" early
       // return in `runReviewForFolder`: this happens before `coordinator.resumeAction`
       // is ever called, so `handleReviewOutcomeV1`'s safety net never runs and
@@ -13304,6 +13800,9 @@ export async function resumeReviewInteractionV1(
     // `runReviewForFolder`'s `observedCoordinatorAttemptIds` collection here now
     // that `TaskActionResumeRequestV1.onPromptAssembled` exists.
     const observedCoordinatorAttemptIds: string[] = [];
+    // See `runReviewForFolder`'s matching declaration and
+    // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
+    let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
     const outcome = await coordinator.resumeAction({
       interaction: interactionRef,
       taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
@@ -13320,12 +13819,17 @@ export async function resumeReviewInteractionV1(
       // round ledger before the provider can run.
       onAttemptAllocated: async (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
-        await attachCoordinatorIdentityToRoundV1({
-          roundId: reviewAttemptId,
-          operationId: info.operationId,
-          attemptId: info.attemptId,
-          taskFolderUri,
-        });
+        await attachCoordinatorIdentityToRoundTrackingDegradationV1(
+          {
+            roundId: reviewAttemptId,
+            operationId: info.operationId,
+            attemptId: info.attemptId,
+            taskFolderUri,
+          },
+          (degraded) => {
+            identityAttachmentDegradedForOutcome = degraded;
+          }
+        );
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
@@ -13345,6 +13849,9 @@ export async function resumeReviewInteractionV1(
       modelId,
       ...(observedCoordinatorAttemptIds.length
         ? { extraCoordinatorAttemptIds: observedCoordinatorAttemptIds }
+        : {}),
+      ...(identityAttachmentDegradedForOutcome
+        ? { identityAttachmentDegraded: identityAttachmentDegradedForOutcome }
         : {}),
     });
 

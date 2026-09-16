@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  RUNS_DIRNAME,
   TaskProgress,
 } from "../types/taskProgress";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
@@ -12,7 +13,11 @@ import {
   isAutomationChainActive,
   scheduleAutomationChain,
 } from "../utils/automationChain";
-import { IMPL_CONTINUATION_CHAIN_ID_V1, owedContinuationSourceV1 } from "./implementationRecoveryV1";
+import {
+  IMPL_CONTINUATION_CHAIN_ID_V1,
+  owedContinuationSourceV1,
+  retireSatisfiedSummaryRejectedRecoveryV1,
+} from "./implementationRecoveryV1";
 import {
   hasLiveSchedulingIntentBestEffortV1,
   liveSchedulingIntentIdsBestEffortV1,
@@ -23,6 +28,7 @@ import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 import { pauseTaskWithReasonForClaimV1 } from "../utils/taskProgressTransforms";
+import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
@@ -36,18 +42,62 @@ import {
 } from "../utils/taskWatchdogV1";
 import {
   acquireWorkAdmissionV1,
+  attemptAutomaticWorkAdmissionReclamationV1,
   authorizeWorkAdmissionHandoffV1,
+  describeStaleWorkAdmissionTakeoverNoticeV1,
   describeWorkAdmissionRefusalV1,
+  garbageCollectStaleWorkAdmissionTombstonesV1,
+  hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
   hasResolutionInFlightBestEffortV1,
+  isWatchdogPauseFenceCurrentV1,
+  readOrInitPauseFenceGenerationV1,
   revokeWorkAdmissionHandoffV1,
+  takeOverStaleWorkAdmissionMarkerV1,
   withWorkAdmissionV1,
+  WorkAdmissionAutomaticReclamationOutcomeV1,
 } from "../state/workAdmissionV1";
+import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
+
+/**
+ * v1 fixes item 1, Part 1b step 14 ("revoked-pause fencing at all five
+ * boundaries") — test-only synchronous injection points bracketing
+ * `detectAndRepairStalledActiveTasksV1`'s own pauseCommit commit sequence, so
+ * a test can deterministically suspend "the old pauseCommit owner" at each of
+ * the plan's five documented boundaries and run a real revocation (from
+ * "another window") in between: before the pre-write fence-currency check,
+ * immediately after it (before the progress write begins), immediately after
+ * the progress write settles (before the post-write admission/fence
+ * currency checks), and immediately after those post-write checks pass
+ * (before the escalation notification is built and posted). The fifth
+ * boundary from the plan ("during the awaited progress write" itself) needs
+ * no dedicated hook: a test starts its revocation from inside the "after the
+ * pre-write check" hook without awaiting it, then awaits its settlement
+ * inside the "after the raw write" hook below, producing a genuine,
+ * OS-scheduled overlap between the revocation's own disk I/O and the
+ * progress write's — the same "unmediated race" pattern the ordinary
+ * pause-ordering invariant tests above already use, rather than a sixth
+ * synthetic boundary.
+ *
+ * `undefined` outside tests; every call site below is a single optional-chain
+ * no-op unless a test has installed hooks — never used by production code
+ * paths.
+ */
+export interface PauseCommitTestHooksV1 {
+  readonly onBeforePreWriteFenceCheckAsync?: () => Promise<void>;
+  readonly onAfterPreWriteFenceCheckAsync?: () => Promise<void>;
+  readonly onAfterRawWriteBeforePostValidationAsync?: () => Promise<void>;
+  readonly onAfterPostValidationBeforeNotificationAsync?: () => Promise<void>;
+}
+let pauseCommitTestHooksV1: PauseCommitTestHooksV1 | undefined;
+export function setPauseCommitTestHooksForTestV1(hooks: PauseCommitTestHooksV1 | undefined): void {
+  pauseCommitTestHooksV1 = hooks;
+}
 
 /**
  * v1 fixes item 1, Part 1a step 7: the durable `WorkflowDecisionV1` card a
@@ -351,10 +401,186 @@ export class TaskActionScheduler implements vscode.Disposable {
     await this.reconcileRoundLedgerOrphans();
     await this.retryStuckPlanRevisionAdoptions();
     await this.armPendingImplRecoveries();
+    // v1 fixes item 1, Part 1c step 15/18: reclaim any admission marker whose
+    // owner is PROVABLY dead before the watchdog's own stand-down check
+    // (immediately below) decides whether a live marker should exempt this
+    // task. Ordered here, right before that check, for the same reason as
+    // every other self-healing pass above — so the watchdog evaluates each
+    // task against the freshest state the rest of this sweep could establish,
+    // rather than standing down for a marker that this same pass just proved
+    // stale-and-dead.
+    await this.reclaimStaleWorkAdmissionMarkersV1();
+    // v1 fixes item 1, Part 1c step 17: collect aged reclamation tombstones.
+    // Ordered after reclamation (which is what creates them) and independent
+    // of the watchdog check below — this is pure disk hygiene for an audit
+    // trail, never a decision any other pass depends on.
+    await this.garbageCollectStaleWorkAdmissionTombstonesV1();
     // Last, so it only ever fires against whatever the passes above could
     // NOT resolve — an orphaned round is already closed, a reclaimable
     // continuation is already re-armed, by the time this runs.
     await this.detectAndRepairStalledActiveTasksV1();
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 17 — best-effort, per-task tombstone GC.
+   * Delegates entirely to {@link garbageCollectStaleWorkAdmissionTombstonesV1};
+   * see that function's own doc comment for why it can never touch a live
+   * claim/marker, a pause-fence generation, or a pending revocation barrier.
+   * One task's failure is logged and never stops the pass for the rest of
+   * the inventory, matching every other self-healing pass in `armAll`.
+   */
+  private async garbageCollectStaleWorkAdmissionTombstonesV1(): Promise<void> {
+    const now = this.clock.now();
+    for (const task of this.inventory.getTasks()) {
+      try {
+        const outcome = await garbageCollectStaleWorkAdmissionTombstonesV1(task.taskFolderPath, now);
+        if (outcome.outcome === "writeFailed") {
+          console.error(
+            `garbageCollectStaleWorkAdmissionTombstonesV1: failed to collect a tombstone for "${task.taskFolderPath}" ` +
+              `(collected ${outcome.partialCount} before the failure)`,
+            outcome.error
+          );
+        }
+      } catch (error) {
+        console.error(
+          `garbageCollectStaleWorkAdmissionTombstonesV1: unexpected error collecting tombstones for ` +
+            `"${task.taskFolderPath}" — leaving them for a later sweep.`,
+          error
+        );
+      }
+    }
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 16 — per-task tracking of how many
+   * CONSECUTIVE sweeps have observed the same stuck, notice-worthy admission
+   * owner (`foreignHost`/`sameHostAlive`/`corrupt` — plan step 16's own named
+   * three; `sameHostDead` is reclaimed automatically and never reaches here,
+   * `indeterminate` stays silent per `describeStaleWorkAdmissionTakeoverNoticeV1`'s
+   * doc comment). Keyed by task folder path; the tracked identity
+   * (`owner.claimId`, or a corrupt-record sentinel keyed off the marker path
+   * itself) resets the count to 1 whenever a DIFFERENT owner is observed, so
+   * a takeover notice can never fire for a marker that only just appeared —
+   * "never offered for fresh heartbeat" (plan step 16) is automatic here: a
+   * fresh marker cannot yet have crossed the staleness threshold that gates
+   * `notDead` in the first place. `notified` is one-shot per identity streak
+   * — this is a notice, not a repeating alarm; it fires once, and only fires
+   * again if the SAME task later cycles through a different stuck owner.
+   */
+  private readonly staleAdmissionNoticeStateV1 = new Map<
+    string,
+    { identityKey: string; count: number; notified: boolean }
+  >();
+
+  /** How many consecutive sweep observations of the same stuck owner before
+   * offering a takeover. Not time-based (armAll's own cadence — a 5-minute
+   * timer plus every task-progress.json write — already provides real-world
+   * spacing); this only needs to rule out a single transient blip. */
+  private static readonly STALE_ADMISSION_TAKEOVER_NOTICE_THRESHOLD_V1 = 3;
+
+  private surfaceStaleWorkAdmissionTakeoverNoticeV1(
+    task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
+    outcome: Extract<WorkAdmissionAutomaticReclamationOutcomeV1, { outcome: "notDead" }>
+  ): void {
+    const kind = outcome.liveness.kind;
+    if (kind !== "foreignHost" && kind !== "sameHostAlive" && kind !== "corrupt") {
+      // `indeterminate` (or any future kind): never notice-worthy — clear any
+      // stale tracking so a later genuinely notice-worthy streak starts fresh.
+      this.staleAdmissionNoticeStateV1.delete(task.taskFolderPath);
+      return;
+    }
+    const identityKey = outcome.owner ? outcome.owner.claimId : `corrupt:${outcome.markerPath}`;
+    const existing = this.staleAdmissionNoticeStateV1.get(task.taskFolderPath);
+    const state = existing && existing.identityKey === identityKey ? existing : { identityKey, count: 0, notified: false };
+    state.count += 1;
+    this.staleAdmissionNoticeStateV1.set(task.taskFolderPath, state);
+    if (state.notified || state.count < TaskActionScheduler.STALE_ADMISSION_TAKEOVER_NOTICE_THRESHOLD_V1) {
+      return;
+    }
+    state.notified = true;
+    const displayName = task.progress.displayName ?? task.progress.taskFolder;
+    const message = describeStaleWorkAdmissionTakeoverNoticeV1(displayName, outcome.liveness, outcome.owner, outcome.ageMs);
+    try {
+      NotificationRouter.showWarning(message, undefined, undefined, undefined, {
+        command: "vs-code-ai-helper.takeOverStaleWorkAdmission",
+        title: "Take over this task on this machine",
+        args: [{ taskFolderPath: task.taskFolderPath, expectedMarkerPath: outcome.markerPath, expectedClaimId: outcome.owner?.claimId }],
+      });
+    } catch (error) {
+      // Best-effort, like every other notification in this sweep (e.g.
+      // `reclaimStaleWorkAdmissionMarkersV1`'s own logging-only failures) —
+      // a router that has not been initialized yet must never break the
+      // sweep pass itself.
+      console.error(
+        `surfaceStaleWorkAdmissionTakeoverNoticeV1: could not surface the takeover notice for "${task.taskFolderPath}"`,
+        error
+      );
+    }
+  }
+
+  /**
+   * v1 fixes item 1, Part 1c step 15/18 — the automatic trigger that was
+   * deliberately left unwired when `attemptAutomaticWorkAdmissionReclamationV1`
+   * itself was built and fully tested: that function is the entire safety
+   * boundary (conservative same-host ESRCH liveness, purpose-specific
+   * staleness thresholds, `pauseCommit` routed through 1b's revocation
+   * barrier, admission reclaimed by a validated rename to a tombstone) — this
+   * method adds no judgment of its own, it only calls that function once per
+   * task, every sweep. A task with no marker, a fresh marker, or a marker
+   * whose owner cannot be proven dead is always a no-op here; see that
+   * function's own doc comment for the full fail-open contract this method
+   * relies on rather than re-implements.
+   *
+   * Best-effort and independent per task: one task's `writeFailed` (a real
+   * filesystem error) or unexpected throw is logged and never stops the pass
+   * for the rest of the inventory, matching this sweep's other self-healing
+   * passes above.
+   */
+  private async reclaimStaleWorkAdmissionMarkersV1(): Promise<void> {
+    const now = this.clock.now();
+    for (const task of this.inventory.getTasks()) {
+      let outcome: WorkAdmissionAutomaticReclamationOutcomeV1;
+      try {
+        outcome = await attemptAutomaticWorkAdmissionReclamationV1(task.taskFolderPath, now);
+      } catch (error) {
+        console.error(
+          `reclaimStaleWorkAdmissionMarkersV1: unexpected error probing "${task.taskFolderPath}" for a reclaimable ` +
+            "admission marker — leaving it untouched for a later sweep.",
+          error
+        );
+        continue;
+      }
+      if (outcome.outcome === "reclaimed") {
+        console.log(
+          `reclaimStaleWorkAdmissionMarkersV1: reclaimed a stale, determinately-dead ${outcome.purpose} marker for ` +
+            `"${task.taskFolderPath}" (was owned by pid ${outcome.reclaimedOwner.pid} on ` +
+            `${outcome.reclaimedOwner.hostId}, command "${outcome.reclaimedOwner.commandId}").`
+        );
+      } else if (outcome.outcome === "writeFailed") {
+        console.error(
+          `reclaimStaleWorkAdmissionMarkersV1: failed to reclaim a stale marker for "${task.taskFolderPath}"`,
+          outcome.error
+        );
+      }
+      if (outcome.outcome === "notDead") {
+        // v1 fixes item 1, Part 1c step 16: track this task's consecutive
+        // observations of a stuck, unreclaimable owner — may surface a
+        // one-click takeover notice once it has persisted. See that method's
+        // own doc comment for the full identity/threshold/reset contract.
+        this.surfaceStaleWorkAdmissionTakeoverNoticeV1(task, outcome);
+      } else {
+        // Any other outcome ("reclaimed", "nothingToReclaim", "notStale",
+        // "raced", "writeFailed") means the marker this task's tracking (if
+        // any) was watching is no longer in that same stuck state — clear it
+        // so a later, genuinely new stuck streak starts counting from zero
+        // rather than inheriting an unrelated earlier count.
+        this.staleAdmissionNoticeStateV1.delete(task.taskFolderPath);
+      }
+      // "nothingToReclaim" / "notStale" / "raced": no action and no log
+      // noise beyond the tracking-reset above — these are the overwhelmingly
+      // common, entirely unremarkable outcomes of a periodic sweep on
+      // healthy tasks.
+    }
   }
 
   /**
@@ -466,7 +692,30 @@ export class TaskActionScheduler implements vscode.Disposable {
     for (const task of this.inventory.getTasks()) {
       let recovery = task.progress.implRecovery;
       if (!recovery) continue;
-      if (task.progress.status !== "active") continue;
+      // 2026-09-15 post-freeze findings, item 5 (Part 5 step 33): a
+      // `summaryRejected` recovery whose blocking condition has already been
+      // satisfied (a usable impl-summary.md exists again) has nothing left to
+      // wait for — retire it here, BEFORE the dispatch-state handling below,
+      // so this sweep never re-arms or leaves dangling a continuation that
+      // would just re-review an already-usable summary. Independent of
+      // `effectivelyActive` below: a satisfied recovery should retire
+      // whether or not the task currently reads as active.
+      if (await retireSatisfiedSummaryRejectedRecoveryV1(vscode.Uri.file(task.taskFolderPath))) {
+        continue;
+      }
+      // Part 1b step 13 ("automation gates"): this sweep automatically
+      // re-dispatches a command with no human invoking it, so — unlike a
+      // manual command, which will itself refuse a real pause — this is the
+      // one place standing between a REVOKED-but-not-yet-repaired watchdog
+      // pause and an owed continuation silently never re-arming. A raw
+      // `status !== "active"` check here would skip re-arming for a task the
+      // tree/status bar already show as active, stranding the recovery until
+      // some other reader happens to trigger the resolver's background
+      // repair — exactly the state-mismatch the release bar forbids.
+      const effectivelyActive =
+        task.progress.status === "active" ||
+        (task.progress.status === "paused" && !(await isEffectivelyPausedV1(task.taskFolderPath, task.progress)));
+      if (!effectivelyActive) continue;
       if (recovery.dispatch === "dispatched") {
         if (!isStaleDispatchedImplRecoveryV1(recovery, this.clock.now())) {
           continue;
@@ -660,7 +909,8 @@ export class TaskActionScheduler implements vscode.Disposable {
     attemptId: string | undefined,
     reason: string,
     claimId: string,
-    claimOwnerToken: string
+    claimOwnerToken: string,
+    fenceGeneration: number
   ): Promise<{ readonly progress: TaskProgress | undefined; readonly transitioned: boolean }> {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
     // `excludeWorkAdmissionOwnerToken` is this call's OWN `pauseCommit` claim
@@ -705,13 +955,14 @@ export class TaskActionScheduler implements vscode.Disposable {
           }
           liveRowTransitioned = true;
           const cleared = clearImplRecovery ? { ...current, implRecovery: undefined } : current;
-          return pauseTaskWithReasonForClaimV1(cleared, reason, claimId);
+          return pauseTaskWithReasonForClaimV1(cleared, reason, claimId, fenceGeneration);
         },
         whenNoLiveRow: {
           reason,
           clearImplRecovery,
           isStillImpossible,
           claimId,
+          fenceGeneration,
           patch: (folder, transform) => this.store.patch(folder, transform),
         },
       }
@@ -773,7 +1024,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     // resolution is in flight in this window, rather than risk pausing the
     // very task that resolution is about to settle on and start work for.
     // See `hasResolutionInFlightBestEffortV1`'s doc comment.
+    //
+    // 2026-09-10 review completion blocker (new): that same-process check
+    // alone is invisible to a DIFFERENT window's sweep — this pass also
+    // consults the durable, cross-window counterpart
+    // (`hasDurableResolutionInFlightV1`) across every task root candidate
+    // this window can see, so a resolution running in ANOTHER window on the
+    // same workspace stands this sweep down too.
     if (hasResolutionInFlightBestEffortV1()) {
+      return;
+    }
+    if (hasDurableResolutionInFlightV1(resolveTaskRootCandidates().map((candidate) => candidate.absolutePath))) {
       return;
     }
     for (const task of this.inventory.getTasks()) {
@@ -803,6 +1064,29 @@ export class TaskActionScheduler implements vscode.Disposable {
         if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
           continue;
         }
+        // v1 fixes item 1, Part 1b step 1: capture the durable pause-fence
+        // generation exactly once here, before this attempt's progress
+        // mutation begins — every subsequent step (the write below, and both
+        // currency checks) carries this SAME captured value, never a
+        // re-read, so a concurrent revocation's later fence advance is
+        // unambiguously "after" this attempt's own snapshot rather than
+        // something this attempt could race into observing halfway.
+        const fenceGeneration = await readOrInitPauseFenceGenerationV1(task.taskFolderPath);
+        // Pre-write currency check, matching the plan's literal "pre-write
+        // and post-write checks" pairing: Part 1b's revocation protocol
+        // (`revokeStalePauseCommitClaimV1` + a barrier-finisher's fence
+        // advance) can now genuinely land between the capture immediately
+        // above and this read, so this is real, load-bearing currency
+        // validation, not the placeholder it was before revocation existed.
+        // `onBeforePreWriteFenceCheckAsync`/`onAfterPreWriteFenceCheckAsync`
+        // (test-only, see `PauseCommitTestHooksV1` above) bracket exactly
+        // this read so a test can deterministically revoke on either side of
+        // it.
+        await pauseCommitTestHooksV1?.onBeforePreWriteFenceCheckAsync?.();
+        if (!(await isWatchdogPauseFenceCurrentV1(task.taskFolderPath, fenceGeneration))) {
+          continue;
+        }
+        await pauseCommitTestHooksV1?.onAfterPreWriteFenceCheckAsync?.();
         const recovery = task.progress.implRecovery;
         const stuckRecovery =
           recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
@@ -814,7 +1098,8 @@ export class TaskActionScheduler implements vscode.Disposable {
           stuckRecovery ? recovery?.attemptId : undefined,
           expectedReason,
           claimId,
-          ownerToken
+          ownerToken,
+          fenceGeneration
         );
         if (!transitioned || patched?.status !== "paused" || patched.pausedReason !== expectedReason) {
           // Either nothing changed, or the task was already paused by a
@@ -823,15 +1108,26 @@ export class TaskActionScheduler implements vscode.Disposable {
           // escalation, so this one must not post a second copy of it.
           continue;
         }
-        // Post-write check, again excluding this claim's own marker: a
+        // Test-only boundary (see `PauseCommitTestHooksV1` above): the raw
+        // pause write has now landed on disk, but the post-write
+        // admission/fence currency checks immediately below have not run
+        // yet.
+        await pauseCommitTestHooksV1?.onAfterRawWriteBeforePostValidationAsync?.();
+        // Post-write checks, again excluding this claim's own marker: a
         // command's genesis that started AFTER our pre-write check but
         // BEFORE our write landed on disk must still be found here and
         // reversed, never announced as a pause — the mirror case of
         // `reconcileWatchdogPauseAgainstAdmissionV1`, which covers the same
         // race from the ADMITTING side. `watchdogPauseClaimId` is checked
         // alongside status/reason so this reversal can only ever clear the
-        // EXACT pause attempt this call itself just committed.
-        if (hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken)) {
+        // EXACT pause attempt this call itself just committed. The fence
+        // currency check (Part 1b step 1) is the same idea for revocation,
+        // once it exists: a revoke-and-advance that lands during the awaited
+        // write above must be found here too, not just a live admission
+        // marker.
+        const admissionArrivedDuringWrite = hasLiveWorkAdmissionExcludingOwnerV1(task.taskFolderPath, ownerToken);
+        const fenceAdvancedDuringWrite = !(await isWatchdogPauseFenceCurrentV1(task.taskFolderPath, fenceGeneration));
+        if (admissionArrivedDuringWrite || fenceAdvancedDuringWrite) {
           await this.store.patch(vscode.Uri.file(task.taskFolderPath), (current) => {
             if (
               current.status !== "paused" ||
@@ -846,11 +1142,17 @@ export class TaskActionScheduler implements vscode.Disposable {
               status: "active",
               pausedReason: undefined,
               watchdogPauseClaimId: undefined,
+              watchdogPauseFenceGeneration: undefined,
               updatedAt: new Date(this.clock.now()).toISOString(),
             };
           });
           continue;
         }
+        // Test-only boundary (see `PauseCommitTestHooksV1` above): the
+        // post-write admission/fence currency checks just passed — this
+        // sweep is committed to notifying — but the escalation has not been
+        // built or posted yet.
+        await pauseCommitTestHooksV1?.onAfterPostValidationBeforeNotificationAsync?.();
         this.stalledActiveNotified.add(task.taskFolderPath);
         // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
         // action that undoes it" — a mechanism that can pause a task must
@@ -1058,6 +1360,121 @@ export async function scheduleQuotaResumeAtV1(
   NotificationRouter.showInformation(`Rerun scheduled for ${effectiveRunAt.toLocaleString()}, once the quota resets.`);
 }
 
+/**
+ * Bounded, durable record of a takeover event, written beside the task's
+ * other run logs (2026-09-15 review, completion blocker: the previous
+ * version only logged to the extension console, which is invisible to a
+ * user inspecting the task folder and is not retained across host restarts —
+ * plan step 16's "records bounded displaced-owner diagnostics in the run
+ * log" needs the diagnostic to actually live on disk). Named by timestamp,
+ * one file per takeover, the same convention `writeOversizedInputAbortRecordV1`
+ * / `writeTaskMdSizeBandAnnouncementRecordV1` (`promptManifestV1.ts`) already
+ * use for a non-round diagnostic record under `runs/` — NOT routed through
+ * `writeRunLog`, whose `AgentWorkflowStage` parameter models an AI round's
+ * own stage and has no value that fits a takeover event. Every field written
+ * here is a single already-validated primitive from `WorkAdmissionClaimInfoV1`
+ * ("never log unbounded or raw corrupt content", plan step 16) — best-effort,
+ * like every other diagnostic writer in this module: the takeover itself has
+ * already durably landed by the time this is called, so a failure here must
+ * never be treated as though the takeover itself failed.
+ */
+async function writeStaleWorkAdmissionTakeoverRunLogRecordV1(
+  taskFolderPath: string,
+  record: {
+    readonly at: string;
+    readonly outcome: "takenOver" | "reclaimedAsDead";
+    readonly purpose: string;
+    readonly displacedOwner?: { readonly claimId: string; readonly pid: number; readonly hostId: string; readonly commandId: string };
+  }
+): Promise<void> {
+  try {
+    const runsUri = vscode.Uri.joinPath(vscode.Uri.file(taskFolderPath), RUNS_DIRNAME);
+    await vscode.workspace.fs.createDirectory(runsUri);
+    const safeAt = record.at.replace(/[:.]/g, "-");
+    const uri = vscode.Uri.joinPath(runsUri, `${safeAt}.stale-work-admission-takeover.json`);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(record, null, 2)));
+  } catch (error) {
+    console.error(
+      `writeStaleWorkAdmissionTakeoverRunLogRecordV1: could not write the run-log record for "${taskFolderPath}" — ` +
+        "the takeover itself already landed; only this diagnostic record failed.",
+      error
+    );
+  }
+}
+
+/**
+ * v1 fixes item 1, Part 1c step 16 — the handler behind the takeover
+ * notice's action button (`surfaceStaleWorkAdmissionTakeoverNoticeV1`,
+ * above). Deliberately thin: all safety-relevant logic (revalidation against
+ * the exact identity the notice named, the still-stale check, the
+ * dead-owner deferral, the identity-checked rename/barrier) lives in
+ * {@link takeOverStaleWorkAdmissionMarkerV1} itself — this only translates
+ * its outcome into what the user sees, a bounded console log line, and (on a
+ * successful takeover) the durable run-log record
+ * ({@link writeStaleWorkAdmissionTakeoverRunLogRecordV1}) plan step 16
+ * requires.
+ *
+ * Not contributed to `package.json`: like `resumeAndApplyCurrentStageAction`,
+ * this is a wiring detail behind a notification action button, not something
+ * to offer from the Command Palette on its own — it requires the exact
+ * `taskFolderPath`/`expectedMarkerPath`/`expectedClaimId` triple the notice
+ * captured.
+ */
+export async function takeOverStaleWorkAdmissionCommandV1(
+  inventory: TaskInventory,
+  arg?: { readonly taskFolderPath?: string; readonly expectedMarkerPath?: string; readonly expectedClaimId?: string }
+): Promise<void> {
+  if (!arg?.taskFolderPath || !arg?.expectedMarkerPath) {
+    return;
+  }
+  const taskFolderPath = arg.taskFolderPath;
+  const task = inventory.getTasks().find((t) => t.taskFolderPath === taskFolderPath);
+  const displayName = task?.progress.displayName ?? task?.progress.taskFolder ?? taskFolderPath;
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(taskFolderPath, arg.expectedMarkerPath, arg.expectedClaimId);
+  switch (outcome.outcome) {
+    case "takenOver":
+    case "reclaimedAsDead": {
+      const displaced = outcome.displacedOwner;
+      console.log(
+        `takeOverStaleWorkAdmissionCommandV1: ${outcome.outcome === "reclaimedAsDead" ? "reclaimed (owner had died)" : "took over"} ` +
+          `a stale ${outcome.purpose} marker for "${taskFolderPath}"` +
+          (displaced
+            ? ` (was claim ${displaced.claimId}, owned by pid ${displaced.pid} on ${displaced.hostId}, command "${displaced.commandId}").`
+            : " (owner record was unreadable).")
+      );
+      await writeStaleWorkAdmissionTakeoverRunLogRecordV1(taskFolderPath, {
+        at: new Date().toISOString(),
+        outcome: outcome.outcome,
+        purpose: outcome.purpose,
+        displacedOwner: displaced
+          ? { claimId: displaced.claimId, pid: displaced.pid, hostId: displaced.hostId, commandId: displaced.commandId }
+          : undefined,
+      });
+      NotificationRouter.showInformation(`Took over "${displayName}" on this machine. You can now resume or dispatch work on it.`);
+      break;
+    }
+    case "ownerChanged":
+      NotificationRouter.showInformation(
+        `"${displayName}"'s work-admission owner changed before the takeover could apply — no action was taken.`
+      );
+      break;
+    case "noLongerStale":
+      NotificationRouter.showInformation(
+        `"${displayName}"'s work-admission marker was renewed before the takeover could apply — no action was taken.`
+      );
+      break;
+    case "nothingToTakeOver":
+    case "raced":
+      // Nothing left to take over — already resolved by something else
+      // (released, reclaimed, or won by a concurrent takeover). No further
+      // notice needed; the original notice's job is done either way.
+      break;
+    case "writeFailed":
+      NotificationRouter.showWarning(`Could not take over "${displayName}": ${outcome.error.message}`);
+      break;
+  }
+}
+
 export function registerScheduleTaskResumeCommand(context: vscode.ExtensionContext, inventory: TaskInventory): TaskActionScheduler {
   const scheduler = new TaskActionScheduler(inventory);
   context.subscriptions.push(scheduler);
@@ -1071,6 +1488,10 @@ export function registerScheduleTaskResumeCommand(context: vscode.ExtensionConte
       if (Number.isNaN(resetAt.getTime())) return;
       return scheduleQuotaResumeAtV1(inventory, scheduler, arg, resetAt);
     }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.takeOverStaleWorkAdmission",
+    (arg?: { taskFolderPath?: string; expectedMarkerPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg)
   ));
   return scheduler;
 }

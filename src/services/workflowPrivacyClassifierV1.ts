@@ -235,3 +235,38 @@ export function classifyWorkflowPathV1(pathLike: string): WorkflowPathClassV1 {
 export function isWorkflowPrivatePathV1(pathLike: string): boolean {
   return classifyWorkflowPathV1(pathLike) !== "artifactSafe";
 }
+
+/**
+ * Drop every path classified `workflowControl` from a round's reported
+ * change set (2026-09-15 post-freeze findings, item 5).
+ *
+ * Ensemble's own bookkeeping — `.ensemble-session.lock`, a progress journal,
+ * an admission claim/marker, a fence generation — is never provider work,
+ * but a blind git-status diff around a round's wall-clock window cannot tell
+ * "the model wrote this" from "the extension's own runtime touched this
+ * while the round happened to be running". Observed live: a lock-file write
+ * banked into `roundLedger.filesChanged` and `pendingImplReviewFiles`
+ * manufactured an owed continuation that then blocked a task whose real work
+ * was already finished and reviewed at 9/10 with zero blockers.
+ *
+ * Apply this at every site that captures a round's raw change set —
+ * `roundLedger.filesChanged`, `pendingImplReviewFiles`, a banked summary's
+ * own "Files Changed" report, the no-workspace-change determination, and
+ * `isReconstructableImplRecoveryV1`'s reconstruction inputs — so a
+ * workflow-control-only set reads as empty everywhere a real (or absent)
+ * change set is read, not just at the one site that happened to be audited.
+ *
+ * Only `workflowControl` is dropped — `chatPrivate`/`transientProviderData`/
+ * `legacyChatPrivateArtifact` paths are a different privacy concern
+ * (content that must never enter an artifact or prompt at all) and are not
+ * expected to appear in a workspace git diff in the first place; conflating
+ * them here would silently hide a real, if unusual, change instead of
+ * excluding only the product's own bookkeeping.
+ *
+ * Idempotent: sanitizing an already-sanitized list returns it unchanged
+ * (order and duplicates, if any, are otherwise preserved — this function
+ * only filters, it never reorders or deduplicates).
+ */
+export function sanitizeChangeSetV1(paths: readonly string[]): string[] {
+  return paths.filter((path) => classifyWorkflowPathV1(path) !== "workflowControl");
+}

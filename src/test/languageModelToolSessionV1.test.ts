@@ -11,6 +11,8 @@ import * as vscode from "vscode";
 import {
   createCopilotLmToolSessionTransportV1,
   setLmToolSessionRequestIssuedObserverV1,
+  TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1,
+  toolRoundWindDownNoticeV1,
 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { AgentExecutionRequestV1, BoundedResultWriterV1 } from "../types/agentExecutionV1";
@@ -194,10 +196,101 @@ void describe("languageModelToolSessionV1", () => {
         maxRounds: 2,
       });
       const exit = await transport.invoke(makeRequest(), makeWriter());
-      assert.deepEqual(exit, { kind: "transportFailure", code: "toolRoundLimitExceeded" });
+      assert.deepEqual(exit, {
+        kind: "transportFailure",
+        code: "toolRoundLimitExceeded",
+        detail: "used all 2 tool rounds without replying with a final answer",
+      });
       assert.equal(handler.calls.length, 2);
     } finally {
       model.restore();
+    }
+  });
+
+  /** The wind-down notices a request carried, in order. */
+  const windDownNotices = (request: ReadonlyArray<{ role: string; content: unknown }>): string[] =>
+    request
+      .filter((message) => message.role === "user" && typeof message.content === "string")
+      .map((message) => message.content as string)
+      .filter((text) => text.startsWith("Tool round limit"));
+
+  void it("tells a session how many rounds remain before the cap, so it answers instead of failing", async () => {
+    // v1 fixes 2, item 26 (2026-09-15): a Copilot review spent all 64 rounds
+    // reading — every request succeeded — and ended in toolRoundLimitExceeded,
+    // discarding everything it had read. Nothing had told it the cap existed.
+    const model = installBudgetedModel(128_000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3,
+      });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(writer.text(), FRAMED_FINAL_ANSWER);
+      assert.deepEqual(windDownNotices(model.sent[0]!), []);
+      assert.deepEqual(windDownNotices(model.sent[1]!), [toolRoundWindDownNoticeV1(2)]);
+      assert.deepEqual(windDownNotices(model.sent[2]!), [
+        toolRoundWindDownNoticeV1(2),
+        toolRoundWindDownNoticeV1(1),
+      ]);
+      assert.match(toolRoundWindDownNoticeV1(1), /LAST one this session allows/);
+
+      // The notice follows the tool results; it never separates a call from its result.
+      const last = model.sent[2]!;
+      for (let i = 0; i < last.length; i++) {
+        const message = last[i]!;
+        if (message.role !== "assistant" || !Array.isArray(message.content)) {
+          continue;
+        }
+        const callIds = (message.content as Array<{ callId?: string; name?: string }>)
+          .filter((part) => part.name !== undefined && part.callId !== undefined)
+          .map((part) => part.callId);
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
+          (part) => part.callId
+        );
+        assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by the next message`);
+      }
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("does not warn far from the cap, and never warns an edit session", async () => {
+    const rounds = [[toolCall("call-1")], [toolCall("call-2")], [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)]];
+    const far = installBudgetedModel(128_000, rounds);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3 + TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1,
+      });
+      assert.deepEqual(await transport.invoke(makeRequest(), makeWriter()), { kind: "completed" });
+      assert.deepEqual(far.sent.flatMap((request) => windDownNotices(request)), []);
+    } finally {
+      far.restore();
+    }
+
+    // An edit session is executing sealed steps; telling it to stop would
+    // leave a plan half-applied.
+    const edit = installBudgetedModel(128_000, rounds);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 3,
+      });
+      assert.deepEqual(await transport.invoke({ ...makeRequest(), mode: "edit" as const }, makeWriter()), {
+        kind: "completed",
+      });
+      assert.deepEqual(edit.sent.flatMap((request) => windDownNotices(request)), []);
+    } finally {
+      edit.restore();
     }
   });
 
@@ -233,6 +326,623 @@ void describe("languageModelToolSessionV1", () => {
       );
       // Stopped promptly rather than running out the 50-round cap.
       assert.ok(handler.calls.length <= 3, `expected an early stop, got ${handler.calls.length} calls`);
+    } finally {
+      model.restore();
+    }
+  });
+
+  /**
+   * A fake Copilot model that advertises `maxInputTokens` and keeps a copy of
+   * every request's message list (the session edits earlier entries in place
+   * when it sheds a result, so a live reference would show only the end state).
+   */
+  function installBudgetedModel(
+    maxInputTokens: number,
+    rounds: ReadonlyArray<readonly object[]>
+  ): { restore: () => void; sent: Array<Array<{ role: string; content: unknown }>> } {
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const sent: Array<Array<{ role: string; content: unknown }>> = [];
+    let round = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens,
+          sendRequest: (messages: ReadonlyArray<{ role: string; content: unknown }>) => {
+            sent.push([...messages]);
+            const parts = rounds[Math.min(round, rounds.length - 1)]!;
+            round += 1;
+            return Promise.resolve({
+              stream: (function* (): Generator<object> {
+                yield* parts;
+              })(),
+            });
+          },
+        },
+      ]);
+    return {
+      restore: (): void => {
+        lm.selectChatModels = original;
+      },
+      sent,
+    };
+  }
+
+  const toolCall = (callId: string): object =>
+    new stubClasses.LanguageModelToolCallPart(callId, "ensemble_readFile", { rootId: "r", relativePath: callId });
+
+  void it("sheds the oldest tool results rather than letting the provider prune the conversation", async () => {
+    // v1 fixes 2, item 17 (2026-09-11): over its prompt budget, Copilot's LM
+    // provider prunes the conversation oldest-first — the prompt, then the
+    // first assistant turn — so a tool result survives its own tool call and
+    // the API rejects it: "400 No tool call found for function call output".
+    // The session must stay under budget itself, and when it sheds, it must
+    // keep every call/result pair intact.
+    const model = installBudgetedModel(1000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [toolCall("call-3")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    // ~500 estimated tokens each against a ~700-token session budget: any two
+    // unshed results together are over it.
+    const handler = recordingHandler(() => "x".repeat(1500));
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(model.sent.length, 4);
+
+      const last = model.sent[3]!;
+      assert.equal(last[0]!.content, "preflight the change", "the original prompt must survive");
+
+      const resultText = (callId: string): string => {
+        for (const message of last) {
+          if (!Array.isArray(message.content)) {
+            continue;
+          }
+          for (const part of message.content as Array<{ callId?: string; content?: Array<{ value: string }> }>) {
+            if (part.callId === callId && Array.isArray(part.content)) {
+              return part.content.map((chunk) => chunk.value).join("");
+            }
+          }
+        }
+        throw new Error(`no tool result for ${callId}`);
+      };
+      assert.match(resultText("call-1"), /Ensemble removed this tool result \(1500 bytes\)/);
+      assert.match(resultText("call-2"), /Ensemble removed this tool result \(1500 bytes\)/);
+      assert.equal(resultText("call-3"), "x".repeat(1500), "the newest result must reach the model intact");
+
+      // Every tool call is immediately followed by a message answering it.
+      for (let i = 0; i < last.length; i++) {
+        const message = last[i]!;
+        if (message.role !== "assistant" || !Array.isArray(message.content)) {
+          continue;
+        }
+        const callIds = (message.content as Array<{ callId?: string; name?: string }>)
+          .filter((part) => part.name !== undefined && part.callId !== undefined)
+          .map((part) => part.callId);
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
+          (part) => part.callId
+        );
+        assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by message ${i + 1}`);
+      }
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("does not trust a large advertised maxInputTokens — budgets against a fixed ceiling", async () => {
+    // 2026-09-11 15:42: the first fix budgeted 70% of `maxInputTokens` and the
+    // review still failed identically. Copilot advertises a model's full
+    // long-context maximum there, but VS Code fills the model's default
+    // "Context Size" (the smaller standard window) into every request, and
+    // that is the window Copilot prunes against.
+    const model = installBudgetedModel(1_000_000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [toolCall("call-3")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    // ~50k estimated tokens each: two together overrun the ceiling's budget,
+    // but not 70% of the advertised million.
+    const handler = recordingHandler(() => "y".repeat(150_000));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      const serialized = JSON.stringify(model.sent[3]);
+      assert.match(serialized, /Ensemble removed this tool result \(150000 bytes\)/);
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("sizes the conversation with the model's own tokenizer, not the pessimistic estimate", async () => {
+    // 2026-09-11 16:50: a review whose third round read several large files
+    // was refused at ~108k *estimated* tokens (3 bytes/token) — about 80k real,
+    // well inside the window. The model can count; use its count.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const rounds: object[][] = [[toolCall("call-1")], [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)]];
+    let served = 0;
+    const counted: unknown[] = [];
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 128_000,
+          // A real tokenizer's ~4 bytes/token on this content.
+          countTokens: (input: unknown) => {
+            counted.push(input);
+            return Promise.resolve(typeof input === "string" ? Math.ceil(input.length / 4) : 0);
+          },
+          sendRequest: () => {
+            const parts = rounds[Math.min(served, rounds.length - 1)]!;
+            served += 1;
+            return Promise.resolve({ stream: (function* (): Generator<object> { yield* parts; })() });
+          },
+        },
+      ]);
+    // 330 KB: ~110k by the estimate (over the ~108.8k budget), ~82.5k counted.
+    const handler = recordingHandler(() => "w".repeat(330_000));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(served, 2);
+      // Strings only: Copilot's per-message count skips tool-result parts.
+      assert.ok(counted.every((input) => typeof input === "string"), "count text, never whole messages");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("falls back to the estimate when countTokens never answers, instead of hanging", async () => {
+    // `countTokens` is a Thenable with no completion guarantee, and the prompt
+    // is sized before any round deadline exists. A tokenizer that never
+    // settles must cost one bounded wait, then the estimate for the rest.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const rounds: object[][] = [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ];
+    let served = 0;
+    let countCalls = 0;
+    const cancelledCounts: boolean[] = [];
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 128_000,
+          countTokens: (_text: string, token: vscode.CancellationToken) => {
+            countCalls += 1;
+            token.onCancellationRequested(() => cancelledCounts.push(true));
+            return new Promise<number>(() => undefined);
+          },
+          sendRequest: () => {
+            const parts = rounds[Math.min(served, rounds.length - 1)]!;
+            served += 1;
+            return Promise.resolve({ stream: (function* (): Generator<object> { yield* parts; })() });
+          },
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        countTokensTimeoutMs: 20,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(served, 3);
+      assert.equal(countCalls, 1, "after one timeout the tokenizer is not waited on again");
+      assert.deepEqual(cancelledCounts, [true], "the abandoned count is cancelled");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("dispatches no further buffered tool call once the caller cancels mid-sizing", async () => {
+    // The edit broker's tools mutate the workspace. A cancel that lands while
+    // one result is being sized must stop the session before the next
+    // already-buffered call runs — and promptly, even if the tokenizer ignores
+    // its cancellation token.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const tokenSource = new vscode.CancellationTokenSource();
+    let countCalls = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 128_000,
+          countTokens: (text: string) => {
+            countCalls += 1;
+            if (countCalls === 1) {
+              return Promise.resolve(Math.ceil(text.length / 4));
+            }
+            // Sizing the first tool result: the user cancels, and this
+            // tokenizer never answers and never honours its token.
+            tokenSource.cancel();
+            return new Promise<number>(() => undefined);
+          },
+          sendRequest: () =>
+            Promise.resolve({
+              stream: (function* (): Generator<object> {
+                yield toolCall("call-a");
+                yield toolCall("call-b");
+              })(),
+            }),
+        },
+      ]);
+    const handler = recordingHandler(() => "{}");
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: handler,
+        countTokensTimeoutMs: 5000,
+      });
+      const started = Date.now();
+      const exit = await transport.invoke({ ...makeRequest(), cancellationToken: tokenSource.token }, makeWriter());
+      assert.deepEqual(exit, { kind: "callerCancelled" });
+      assert.deepEqual(
+        handler.calls.map((call) => call.callId),
+        ["call-a"],
+        "call-b was buffered but must not run after the cancel"
+      );
+      assert.ok(Date.now() - started < 1000, "cancellation must not wait out the tokenizer deadline");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("reports a round deadline that expires while a tool result is being sized", async () => {
+    // The round deadline cancels the round's own token; token counting used to
+    // watch only the caller's. A count in flight when the round expired could
+    // run on under the tokenizer's separate 10s deadline and then report some
+    // later outcome instead of the timeout that actually happened.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    let countCalls = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 128_000,
+          countTokens: (text: string) => {
+            countCalls += 1;
+            // The prompt sizes normally; sizing the tool result never answers.
+            return countCalls === 1
+              ? Promise.resolve(Math.ceil(text.length / 4))
+              : new Promise<number>(() => undefined);
+          },
+          sendRequest: () =>
+            Promise.resolve({
+              stream: (function* (): Generator<object> {
+                yield toolCall("call-1");
+              })(),
+            }),
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        roundTimeoutMs: 200,
+        countTokensTimeoutMs: 5000,
+      });
+      const started = Date.now();
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind, "transportFailure");
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestTimedOut");
+      assert.equal(countCalls, 2, "the round must have reached the result-sizing count");
+      assert.ok(
+        Date.now() - started < 1000,
+        "the round deadline must end the count, not the tokenizer's own 5s deadline"
+      );
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("reports a cancel that lands during a tool call as cancelled, not as a protocol violation", async () => {
+    // The protocol and result-budget exits run after the handler's await. A
+    // cancel arriving while the handler was working used to fall through to
+    // whichever of those tripped first, so a run the user stopped was
+    // reported as a provider fault — which the coordinator treats quite
+    // differently from a cancellation.
+    const model = installModel([[toolCall("call-1")]]);
+    const tokenSource = new vscode.CancellationTokenSource();
+    // Already over the violation cap: without the cancellation check this
+    // round exits as `toolProtocolViolation`.
+    const handler = recordingHandler(() => {
+      tokenSource.cancel();
+      return "{}";
+    }, 99);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke({ ...makeRequest(), cancellationToken: tokenSource.token }, makeWriter());
+      assert.deepEqual(exit, { kind: "callerCancelled" });
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("ends the round when a tool handler hangs past the round deadline", async () => {
+    // `handleToolCall` takes no cancellation token, so the round deadline —
+    // which works by cancelling the round's token — cannot reach inside it. A
+    // wedged workspace read or edit used to park the round indefinitely: the
+    // exact unbounded silent wait the deadline exists to convert into a
+    // reported failure. Without the race this test hangs until the runner
+    // kills it.
+    const model = installModel([[toolCall("call-1")]]);
+    const hangingHandler: RequestLocalToolHandlerV1 = {
+      descriptors: [{ name: "ensemble_readFile", description: "read" }],
+      handleToolCall: () => new Promise<string>(() => undefined),
+      violationCount: () => 0,
+    };
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: hangingHandler,
+        roundTimeoutMs: 200,
+      });
+      const started = Date.now();
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind, "transportFailure");
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestTimedOut");
+      assert.ok(Date.now() - started < 3000, "the round deadline must end a hung handler");
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("never abandons a mutation handler mid-flight, even past the round deadline", async () => {
+    // Abandoning a read is harmless; abandoning a MUTATION is not. The
+    // handler keeps running after a lost race, so its write could land after
+    // this transport reported a timeout and the coordinator moved to the next
+    // candidate. An edit session therefore waits for its handler, and reports
+    // the timeout only once the mutation has settled.
+    const model = installModel([[toolCall("call-1")]]);
+    let handlerSettled = false;
+    const slowEditHandler: RequestLocalToolHandlerV1 = {
+      descriptors: [{ name: "ensemble_replaceFile", description: "replace" }],
+      handleToolCall: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        handlerSettled = true;
+        return "{}";
+      },
+      violationCount: () => 0,
+    };
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: slowEditHandler,
+        roundTimeoutMs: 100,
+      });
+      const exit = await transport.invoke(
+        { ...makeRequest(), mode: "edit" as const },
+        makeWriter()
+      );
+      assert.ok(handlerSettled, "the mutation must not be abandoned when the round deadline fires");
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestTimedOut");
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("reports a cancel during the final round's accounting as cancelled, not as a round-limit failure", async () => {
+    // The loop's cancellation check sits at the top of the next iteration,
+    // which the last allowed round never reaches — so a cancel landing in
+    // that round's post-round accounting fell through to
+    // `toolRoundLimitExceeded`, a provider fault.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const tokenSource = new vscode.CancellationTokenSource();
+    let countCalls = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 128_000,
+          countTokens: (text: string) => {
+            countCalls += 1;
+            // 1 = the prompt, 2 = the tool result, 3 = this round's own text,
+            // which is the post-round accounting the cancel lands in.
+            if (countCalls === 3) {
+              tokenSource.cancel();
+            }
+            return Promise.resolve(Math.ceil(text.length / 4));
+          },
+          sendRequest: () =>
+            Promise.resolve({
+              stream: (function* (): Generator<object> {
+                yield toolCall("call-1");
+              })(),
+            }),
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        maxRounds: 1,
+      });
+      const exit = await transport.invoke({ ...makeRequest(), cancellationToken: tokenSource.token }, makeWriter());
+      assert.deepEqual(exit, { kind: "callerCancelled" });
+      assert.equal(countCalls, 3, "the cancel must land in the post-round accounting");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("defers the largest reads of one oversized step instead of failing the session", async () => {
+    // A single step that reads several large files at once can overrun the
+    // budget with nothing older left to shed. Withhold the largest, keep at
+    // least one, and tell the model to re-read the rest separately.
+    const model = installBudgetedModel(1000, [
+      [toolCall("call-a"), toolCall("call-b")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    const handler = recordingHandler((call) => (call.callId === "call-a" ? "a".repeat(1500) : "b".repeat(1200)));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      const second = JSON.stringify(model.sent[1]);
+      assert.match(second, /Ensemble did not include this tool result \(1500 bytes\)/);
+      assert.ok(second.includes("b".repeat(1200)), "the smaller read reaches the model intact");
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("sheds and resends the round when the provider still orphans a tool result", async () => {
+    // Even under budget, the provider's real window is unknowable from the
+    // extension API. If it prunes anyway, the 400 names an orphaned tool
+    // result; that is a request-size fault, so shed harder and resend the same
+    // round instead of failing the review.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    const rounds: object[][] = [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ];
+    const sent: string[] = [];
+    let served = 0;
+    let rejected = false;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 1000,
+          sendRequest: (messages: readonly unknown[]) => {
+            sent.push(JSON.stringify(messages));
+            // The third request (carrying call-1's and call-2's results) is
+            // rejected once, exactly as Copilot rejected it on 2026-09-11.
+            if (served === 2 && !rejected) {
+              rejected = true;
+              return Promise.reject(
+                new Error(
+                  'Request Failed: 400 {"error":{"message":"No tool call found for function call output ' +
+                    'with call_id call-1.","code":"invalid_request_body"}}'
+                )
+              );
+            }
+            const parts = rounds[Math.min(served, rounds.length - 1)]!;
+            served += 1;
+            return Promise.resolve({ stream: (function* (): Generator<object> { yield* parts; })() });
+          },
+        },
+      ]);
+    // ~200 estimated tokens each: comfortably inside the ~700-token budget
+    // together, so only the rejection makes the session shed.
+    const handler = recordingHandler(() => "z".repeat(600));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(sent.length, 4, "the rejected round is sent again, once");
+      assert.doesNotMatch(sent[2]!, /Ensemble removed this tool result/, "nothing was shed before the rejection");
+      assert.match(sent[3]!, /Ensemble removed this tool result \(600 bytes\)/, "the resend sheds call-1");
+      assert.equal(handler.calls.length, 2, "no tool call is executed twice");
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("reports the orphaned-result rejection when shedding cannot shrink the request", async () => {
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    let served = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          maxInputTokens: 1000,
+          sendRequest: () => {
+            served += 1;
+            if (served === 1) {
+              return Promise.resolve({ stream: (function* (): Generator<object> { yield toolCall("call-1"); })() });
+            }
+            return Promise.reject(new Error("Request Failed: 400 No tool call found for function call output"));
+          },
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      // Only the newest round's result exists, and it is never shed — so a
+      // resend would be identical. Fail with the provider's own words.
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestFailed");
+      assert.match((exit.kind === "transportFailure" && exit.detail) || "", /No tool call found/);
+      assert.equal(served, 2);
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("stops with a readable reason when even the newest result cannot fit, instead of sending", async () => {
+    const model = installBudgetedModel(100, [[toolCall("call-1")]]);
+    const handler = recordingHandler(() => "x".repeat(3000));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "toolSessionContextBudgetExceeded");
+      assert.match(
+        (exit.kind === "transportFailure" && exit.detail) || "",
+        /100-token input limit.*silently drop the start of the conversation/
+      );
+      // The over-budget second request was never sent.
+      assert.equal(model.sent.length, 1);
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("refuses to send a prompt that alone exceeds the budget", async () => {
+    const model = installBudgetedModel(5, [[new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)]]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "toolSessionContextBudgetExceeded");
+      assert.equal(model.sent.length, 0);
     } finally {
       model.restore();
     }

@@ -108,6 +108,28 @@ void describe("workAdmissionReconciliationV1", () => {
     }
   });
 
+  void it("clears watchdogPauseFenceGeneration alongside watchdogPauseClaimId on reversal (v1 fixes item 1, Part 1b step 1)", async () => {
+    const h = installHarness({
+      status: "paused",
+      pausedReason: STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+      watchdogPauseClaimId: "claim-abc-123",
+      watchdogPauseFenceGeneration: 3,
+    });
+    try {
+      const result = await reconcileWatchdogPauseAgainstAdmissionV1(h.folderUri);
+      assert.equal(result.outcome, "reversed");
+      if (result.outcome === "reversed") {
+        assert.equal(result.progress.watchdogPauseFenceGeneration, undefined);
+      }
+      const onDisk = JSON.parse(fs.readFileSync(h.progressPath, "utf8")) as {
+        watchdogPauseFenceGeneration?: number;
+      };
+      assert.equal(onDisk.watchdogPauseFenceGeneration, undefined);
+    } finally {
+      h.restore();
+    }
+  });
+
   void it("reverses a pause with the unrecoverable-recovery watchdog reason as well", async () => {
     const h = installHarness({ status: "paused", pausedReason: UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 });
     try {
