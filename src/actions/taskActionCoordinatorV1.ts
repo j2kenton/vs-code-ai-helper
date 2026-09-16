@@ -144,6 +144,7 @@ import {
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { classifyFailure, parseQuotaResetV1 } from "../utils/quota";
 import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import {
   AiResultEnvelopeV1,
@@ -152,7 +153,11 @@ import {
   MalformedAiResultV1,
   parseAiResultEnvelopeV1,
 } from "../types/aiResultEnvelope";
-import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import {
+  ProviderChainCandidateStatusV1,
+  ProviderChainExhaustionV1,
+  TaskActionOutcomeV1,
+} from "../types/taskActionOutcomeV1";
 import { unavailableV1 } from "../types/workflowAvailabilityV1";
 import {
   AgentExecutionBrokerOptionsV1,
@@ -1211,14 +1216,55 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
       cursor++;
     }
     if (lastMatch.outcome !== undefined) {
+      // Classified from the SAME `detail` text the reason phrase above is
+      // built from — 2026-09-15 post-freeze findings, item 4: a quota/
+      // model-entitlement candidate is recorded as `deferred`, typed at the
+      // point its detail is known, rather than left for a later consumer to
+      // re-derive by re-parsing the rendered `reason` string.
+      const classified =
+        lastMatch.detail !== undefined
+          ? classifyFailure({ errorMessage: lastMatch.detail })
+          : undefined;
+      const deferredFailureKind =
+        classified?.failureKind === "quota" || classified?.failureKind === "model-entitlement"
+          ? classified.failureKind
+          : undefined;
+      const deferredResetAt =
+        deferredFailureKind !== undefined ? parseQuotaResetV1(lastMatch.detail, new Date()) : undefined;
       return {
         ...candidate,
         reason: attemptOutcomeReasonTextV1(lastMatch.outcome, lastMatch.detail),
+        ...(deferredFailureKind !== undefined ? { deferredFailureKind } : {}),
+        ...(deferredResetAt !== undefined ? { deferredResetAt } : {}),
       };
     }
     return candidate;
   });
   return { ...exhaustion, candidates };
+}
+
+/**
+ * True when every candidate that was actually reserved and invoked in an
+ * exhausted chain failed with a quota/model-entitlement block — i.e. this
+ * was not "every candidate tried and failed", it was "every candidate is
+ * currently unavailable and told us when it might reopen". 2026-09-15
+ * post-freeze findings, item 4, requirement: "a candidate that told us when
+ * it will be available again has not been exhausted, it has been deferred" —
+ * distinguishing this from ordinary exhaustion at the OUTCOME CODE level (not
+ * only inside `chainExhaustion`'s per-candidate detail) is what keeps the run
+ * log's leading `Status:` line from reading as an unexplained failure.
+ *
+ * A candidate the registry skipped at selection time (never reserved, so it
+ * never got the chance to be a quota block) does not disqualify this: only
+ * candidates that were actually invoked and failed are considered. Requires
+ * at least one such candidate, and none of them failed for a non-quota
+ * reason, or this reports `false` (the ordinary "exhausted" wording stands).
+ */
+function allInvokedCandidatesDeferredByQuotaV1(candidates: readonly ProviderChainCandidateStatusV1[]): boolean {
+  const invoked = candidates.filter(
+    (candidate) => !candidate.reason.startsWith('cannot satisfy the requested "')
+  );
+  return invoked.length > 0 && invoked.every((candidate) => candidate.deferredFailureKind !== undefined);
 }
 
 /**
@@ -1745,21 +1791,32 @@ export function createTaskActionCoordinatorV1(
           // (enriched run record, paused task) still belongs to the stage
           // owner that dispatched the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return (
-            lastMalformedOutcomeV1 ?? {
-              kind: "unavailable",
-              code: next.code,
-              ...(next.chainExhaustion !== undefined
-                ? {
-                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
-                      next.chainExhaustion,
-                      session,
-                      networkFaultRetryAttemptIdsV1
-                    ),
-                  }
-                : {}),
-            }
-          );
+          if (lastMalformedOutcomeV1 !== undefined) {
+            return lastMalformedOutcomeV1;
+          }
+          const enrichedChain =
+            next.chainExhaustion !== undefined
+              ? enrichChainExhaustionWithAttemptOutcomesV1(
+                  next.chainExhaustion,
+                  session,
+                  networkFaultRetryAttemptIdsV1
+                )
+              : undefined;
+          // 2026-09-15 post-freeze findings, item 4: when every invoked
+          // candidate was quota/entitlement-deferred (not "tried and
+          // failed" in the ordinary sense), the outcome code itself says so
+          // — see `allInvokedCandidatesDeferredByQuotaV1`.
+          const code =
+            next.code === "candidatesExhausted" &&
+            enrichedChain !== undefined &&
+            allInvokedCandidatesDeferredByQuotaV1(enrichedChain.candidates)
+              ? ("candidatesDeferred" as const)
+              : next.code;
+          return {
+            kind: "unavailable",
+            code,
+            ...(enrichedChain !== undefined ? { chainExhaustion: enrichedChain } : {}),
+          };
         }
         if (next.kind === "candidateUnavailable") {
           // The registry settled this attempt (providerUnavailablePreInvocation)
@@ -2643,27 +2700,32 @@ export function createTaskActionCoordinatorV1(
         // been invoked yet, so this is providerModeUnavailable in practice;
         // the registry's code is still carried verbatim rather than
         // re-asserted here.
-        return {
-          kind: "settled",
-          outcome: finalizeOutcome(
-            row,
-            request,
-            operationId,
-            {
-              kind: "unavailable",
-              code: next.code,
-              ...(next.chainExhaustion !== undefined
-                ? {
-                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
-                      next.chainExhaustion,
-                      session
-                    ),
-                  }
-                : {}),
-            },
-            metrics
-          ),
-        };
+        {
+          const enrichedChain =
+            next.chainExhaustion !== undefined
+              ? enrichChainExhaustionWithAttemptOutcomesV1(next.chainExhaustion, session)
+              : undefined;
+          const code =
+            next.code === "candidatesExhausted" &&
+            enrichedChain !== undefined &&
+            allInvokedCandidatesDeferredByQuotaV1(enrichedChain.candidates)
+              ? ("candidatesDeferred" as const)
+              : next.code;
+          return {
+            kind: "settled",
+            outcome: finalizeOutcome(
+              row,
+              request,
+              operationId,
+              {
+                kind: "unavailable",
+                code,
+                ...(enrichedChain !== undefined ? { chainExhaustion: enrichedChain } : {}),
+              },
+              metrics
+            ),
+          };
+        }
       }
       if (next.kind === "candidateUnavailable") {
         reportCandidateSkipped(deps, next, request.taskStage);

@@ -1250,9 +1250,11 @@ export function describeEditActionOutcomeFailureV1(
     // (nothing was ever reserved) are opposite conditions with opposite
     // remedies — "was unavailable" is only true of the second.
     parts.push(
-      code === "candidatesExhausted"
-        ? `Every configured model was tried and failed: ${candidateList}`
-        : `No configured model was available: ${candidateList}`
+      code === "candidatesDeferred"
+        ? `Every configured model is currently quota/entitlement-limited (deferred, not exhausted): ${candidateList}`
+        : code === "candidatesExhausted"
+          ? `Every configured model was tried and failed: ${candidateList}`
+          : `No configured model was available: ${candidateList}`
     );
   }
   // The outcome VARIANT, not just its code. `unavailable` carries

@@ -1992,8 +1992,11 @@ export function createBoundedStdoutTailForDiagnosisV1(maxBytes: number): {
  * sanitized environment, shell quoting, kill-tree cancellation, and run
  * timeout), captures the framed result from bounded stdout only, and reports
  * how the process exited. It receives no artifact or result path
- * (AC-RUNNER-01), and stderr participates solely in the capture layer's
- * sanitized size/digest summary.
+ * (AC-RUNNER-01). stderr participates in the capture layer's sanitized
+ * size/digest summary (the only stderr surface ever logged or persisted),
+ * plus — on a failed exit only — a bounded in-memory tail read once to
+ * feed the same `toFriendlyError` diagnosis the legacy path uses; see
+ * `cliStdoutResultCaptureV1.ts` for that surface's contract.
  *
  * Two stdout shapes are supported (AC-RUNNER-02 — the result is captured
  * only from bounded stdout in both):
@@ -2458,12 +2461,13 @@ export function createCliTextTransportV1(options: {
               // toFriendlyError() the legacy execCliAgent path already uses
               // for this: same structured extractors (keyed off
               // def.structuredEventStream), same auth/quota classification,
-              // same noise-stripping and truncation. stderr content is never
-              // retained by this transport (§2.2 — see
-              // cliStdoutResultCaptureV1), so toFriendlyError's stderr
-              // argument is always "" here; that already matches every
-              // reported failure of this shape, which arrives entirely on
-              // stdout. `rawEventChunks` itself is no longer needed once the
+              // same noise-stripping and truncation. `stderrDiagnosisTail()`
+              // (2026-09-15 post-freeze findings, item 4) supplies the same
+              // bounded stderr text the legacy path passes here — read only
+              // for this one synchronous call and never logged or persisted
+              // raw; only the redacted, noise-stripped `friendly.diagnosticText`
+              // this call returns is allowed to reach `detail` below.
+              // `rawEventChunks` itself is no longer needed once the
               // process has failed (only a successful exit ever unwraps it
               // into a reply), so it is freed here rather than read — the
               // bounded `diagnosisTail` snapshot below, not `rawEventChunks`,
@@ -2476,15 +2480,20 @@ export function createCliTextTransportV1(options: {
               // arguments, `parsedEvents` included, not implied.
               const parsedEventsForDiagnosis = parseJsonLineEvents(rawStdoutForDiagnosis);
               rawEventChunks.length = 0;
-              // Sanitized stderr accounting only (never its text): "exited 1,
-              // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
-              // different failures and were previously indistinguishable.
+              // `stderr` (the sanitized summary) is what may be logged:
+              // "exited 1, stderr 0 bytes" and "exited 1, stderr 4KB" are
+              // completely different failures and were previously
+              // indistinguishable. `stderrDiagnosisTail()` is the separate,
+              // narrower surface read below solely to feed `toFriendlyError`
+              // — its raw text never reaches `detail` directly; only
+              // `friendly.diagnosticText`, already redacted and
+              // noise-stripped, does.
               const stderr = capture.stderrSummary();
               const friendly = toFriendlyError(
                 def,
                 model,
                 code,
-                "",
+                capture.stderrDiagnosisTail(),
                 rawStdoutForDiagnosis,
                 parsedEventsForDiagnosis
               );

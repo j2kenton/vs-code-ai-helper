@@ -2112,6 +2112,199 @@ function markerPath2Dir(taskFolderPath: string): string {
   return path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"), ADMISSION_DIRNAME_V1);
 }
 
+// 2026-09-16 review, completion blocker: the consecutive-observation notice
+// streak above was previously exercised only for `foreignHost`. The other two
+// notice-worthy liveness kinds (`sameHostAlive`, `corrupt`) already had
+// dedicated coverage for `describeStaleWorkAdmissionTakeoverNoticeV1`'s
+// wording and `takeOverStaleWorkAdmissionMarkerV1`'s takeover mechanics
+// (`workAdmissionV1.test.ts`), but never for the `armAll`-driven 3-consecutive
+// -sweep threshold itself — leaving open the possibility that the threshold
+// logic in `surfaceStaleWorkAdmissionTakeoverNoticeV1` was accidentally
+// specific to the `foreignHost` branch. These two tests close that gap.
+
+void test("armAll surfaces a takeover notice only after 3 consecutive sweeps observe the SAME stuck (sameHostAlive) owner, never sooner", async () => {
+  const taskFolderPath = "C:\\tasks\\takeover-notice-streak-alive";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const myHostId = await resolveHostIdentityV1();
+  const markerPath = writeFakeAdmissionMarkerV1(taskFolderPath, {
+    purpose: "admission",
+    pid: process.pid, // this test's own process: genuinely alive, same host
+    hostId: myHostId,
+    ownerToken: "stuck-alive-owner",
+  });
+  backdateFileV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "1 observation must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "2 observations must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
+    assert.equal(takeoverEntries[0]?.level, "warning");
+    // sameHostAlive is the one liveness kind carrying a strong warning — see
+    // `describeStaleWorkAdmissionTakeoverNoticeV1`'s own dedicated wording test.
+    assert.match(takeoverEntries[0]?.message ?? "", /still respond|alive|running/i);
+    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
+      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-alive-owner-claim" },
+    ]);
+
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      1,
+      "the notice must not repeat for the same unresolved streak"
+    );
+
+    // A live owner's marker must never be mutated by the mere act of
+    // observing and noticing it — the notice is advisory only.
+    assert.equal(fs.existsSync(markerPath), true);
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll surfaces a takeover notice only after 3 consecutive sweeps observe the SAME stuck (corrupt) marker, never sooner", async () => {
+  const taskFolderPath = "C:\\tasks\\takeover-notice-streak-corrupt";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  // A corrupt marker: unparseable JSON at a well-formed marker filename, so
+  // `probeWorkAdmissionOwnerLivenessV1` has an owner-record to attempt to
+  // read and fails, exactly as `workAdmissionV1.test.ts`'s own corrupt-marker
+  // fixtures do (see "an unreadable (corrupt) marker can be taken over...").
+  const dir = markerPath2Dir(taskFolderPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = path.join(dir, "admission.corruptowner.g1.deadbeef");
+  fs.writeFileSync(markerPath, "{ not valid json");
+  backdateFileV1(markerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
+
+  try {
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "1 observation must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "2 observations must not yet surface a notice"
+    );
+
+    await scheduler.armAll();
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
+    assert.equal(takeoverEntries[0]?.level, "warning");
+    assert.match(takeoverEntries[0]?.message ?? "", /unreadable record|cannot be determined/i);
+    // A corrupt record carries no readable `claimId`, so the notice-state
+    // identity key falls back to the marker path itself — the takeover
+    // command args must still name the exact observed marker.
+    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
+      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: undefined },
+    ]);
+
+    await scheduler.armAll();
+    assert.equal(
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      1,
+      "the notice must not repeat for the same unresolved streak"
+    );
+
+    assert.equal(fs.existsSync(markerPath), true, "a corrupt marker must never be mutated by observation alone");
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+// 2026-09-16 review, narrowed completion blocker: every takeover-notice test
+// above exercises a marker already PAST the stale threshold. None asserted
+// the converse — that a marker still within its fresh heartbeat window never
+// offers takeover, no matter how many consecutive sweeps observe it. Without
+// this, a bug that dropped the staleness gate entirely (surfacing a notice
+// for ANY marker) would pass every other test in this file.
+void test("armAll never surfaces a takeover notice for a fresh (non-stale) admission marker, however many consecutive sweeps observe it", async () => {
+  const taskFolderPath = "C:\\tasks\\takeover-notice-fresh-marker";
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath, canonicalId: taskFolderPath, progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+
+  const myHostId = await resolveHostIdentityV1();
+  // Deliberately alive (this test's own PID) and same-host, i.e. exactly the
+  // ownership shape that DOES eventually warrant a notice once stale — but
+  // this marker's mtime is left fresh (no backdate at all), so it must never
+  // cross the staleness gate regardless of owner shape.
+  const markerPath = writeFakeAdmissionMarkerV1(taskFolderPath, {
+    purpose: "admission",
+    pid: process.pid,
+    hostId: myHostId,
+    ownerToken: "fresh-owner",
+  });
+  // Explicitly pinned well under WORK_ADMISSION_LIKELY_STALE_MS_V1 (20m),
+  // relative to the SAME clock the sweep reads, rather than left at the
+  // real filesystem mtime — deterministic regardless of wall-clock skew
+  // between the FakeClock's fixed epoch and the sandbox's real system time.
+  backdateFileV1(markerPath, 60_000, clock.now());
+
+  try {
+    for (let i = 0; i < 5; i++) {
+      await scheduler.armAll();
+    }
+    assert.equal(
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      false,
+      "a fresh marker must never surface a takeover notice, however many consecutive sweeps observe it"
+    );
+    assert.equal(fs.existsSync(markerPath), true, "a fresh marker must never be mutated by observation alone");
+  } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
 void test("armAll collects an aged reclamation tombstone via the GC pass", async () => {
   const taskFolderPath = "C:\\tasks\\takeover-gc-target";
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));

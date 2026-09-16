@@ -69,3 +69,78 @@ void describe("decodeTaskActionOutcomeV1 — malformedResult.malformedInvocation
     assert.equal(decoded.ok, false);
   });
 });
+
+void describe("decodeTaskActionOutcomeV1 — chainExhaustion.candidates[].deferredFailureKind/deferredResetAt", () => {
+  // 2026-09-16 review (new completion blocker): the strict decoder rejected
+  // these two fields as unknown, so a persisted `unavailable` outcome
+  // carrying the 2026-09-15 post-freeze quota-deferral metadata
+  // (`enrichChainExhaustionWithAttemptOutcomesV1`, taskActionCoordinatorV1.ts)
+  // failed to round-trip through disk.
+  void it("round-trips a chainExhaustion candidate carrying deferredFailureKind and deferredResetAt", () => {
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "unavailable",
+      code: "candidatesExhausted",
+      chainExhaustion: {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "codex/gpt-5.6-sol",
+            providerLabel: "OpenAI Codex",
+            runnerId: "codex",
+            reason: "invoked, but the transport failed before any response arrived",
+            deferredFailureKind: "quota",
+            deferredResetAt: "2026-09-16T16:12:00.000Z",
+          },
+        ],
+      },
+    };
+    const decoded = decodeTaskActionOutcomeV1(JSON.parse(JSON.stringify(outcome)));
+    assert.equal(decoded.ok, true);
+    if (decoded.ok) {
+      assert.deepEqual(decoded.outcome, outcome);
+    }
+  });
+
+  void it("decodes a pre-existing chainExhaustion candidate with neither field present", () => {
+    const raw = {
+      kind: "unavailable",
+      code: "candidatesExhausted",
+      chainExhaustion: {
+        candidates: [
+          {
+            storedModelId: "m",
+            providerLabel: "p",
+            runnerId: "r",
+            reason: "failed",
+          },
+        ],
+      },
+    };
+    const decoded = decodeTaskActionOutcomeV1(raw);
+    assert.equal(decoded.ok, true);
+    if (decoded.ok && decoded.outcome.kind === "unavailable") {
+      assert.equal(decoded.outcome.chainExhaustion?.candidates[0]?.deferredFailureKind, undefined);
+      assert.equal(decoded.outcome.chainExhaustion?.candidates[0]?.deferredResetAt, undefined);
+    }
+  });
+
+  void it("rejects an invalid deferredFailureKind value", () => {
+    const raw = {
+      kind: "unavailable",
+      code: "candidatesExhausted",
+      chainExhaustion: {
+        candidates: [
+          {
+            storedModelId: "m",
+            providerLabel: "p",
+            runnerId: "r",
+            reason: "failed",
+            deferredFailureKind: "not-a-real-kind",
+          },
+        ],
+      },
+    };
+    const decoded = decodeTaskActionOutcomeV1(raw);
+    assert.equal(decoded.ok, false);
+  });
+});

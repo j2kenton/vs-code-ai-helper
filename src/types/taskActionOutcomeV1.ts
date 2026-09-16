@@ -55,6 +55,20 @@ export interface ProviderChainCandidateStatusV1 {
   readonly providerLabel: string;
   readonly runnerId: string;
   readonly reason: string;
+  /**
+   * Set when this candidate's failure was classified quota/model-entitlement
+   * (2026-09-15 post-freeze findings, item 4, requirement: "a candidate that
+   * told us when it will be available again has not been exhausted, it has
+   * been deferred"). Set alongside `reason` by
+   * `enrichChainExhaustionWithAttemptOutcomesV1` from the SAME per-attempt
+   * detail text `reason` is built from — never re-derived later by re-parsing
+   * `reason`, so a candidate is deferred or not, and of which kind, by
+   * construction rather than by a downstream consumer's own text
+   * classification.
+   */
+  readonly deferredFailureKind?: "quota" | "model-entitlement";
+  /** ISO reset time parsed from this candidate's failure detail, when `deferredFailureKind` is set and one was found. */
+  readonly deferredResetAt?: string;
 }
 
 /**
@@ -299,6 +313,7 @@ const WORKFLOW_UNAVAILABLE_CODES_V1: ReadonlySet<string> = new Set<WorkflowUnava
   "hostToolApiUnavailable",
   "providerModeUnavailable",
   "candidatesExhausted",
+  "candidatesDeferred",
   "workspaceRootUnsupported",
   "workspacePathUnsafe",
   "workflowStorageUnavailable",
@@ -392,7 +407,14 @@ function decodeOptionalChainExhaustionV1(
     }
     const unknownEntry = unknownOutcomeField(
       entry,
-      new Set(["storedModelId", "providerLabel", "runnerId", "reason"]),
+      new Set([
+        "storedModelId",
+        "providerLabel",
+        "runnerId",
+        "reason",
+        "deferredFailureKind",
+        "deferredResetAt",
+      ]),
       "chainExhaustion candidate"
     );
     if (unknownEntry) {
@@ -411,11 +433,25 @@ function decodeOptionalChainExhaustionV1(
     ) {
       return "\"chainExhaustion.candidates\" entries must carry bounded non-empty identity and reason strings";
     }
+    if (
+      entry.deferredFailureKind !== undefined &&
+      entry.deferredFailureKind !== "quota" &&
+      entry.deferredFailureKind !== "model-entitlement"
+    ) {
+      return "\"chainExhaustion.candidates\" entry \"deferredFailureKind\" must be \"quota\" or \"model-entitlement\" when present";
+    }
+    if (entry.deferredResetAt !== undefined && typeof entry.deferredResetAt !== "string") {
+      return "\"chainExhaustion.candidates\" entry \"deferredResetAt\" must be a string when present";
+    }
     candidates.push({
       storedModelId: entry.storedModelId,
       providerLabel: entry.providerLabel,
       runnerId: entry.runnerId,
       reason: entry.reason,
+      ...(entry.deferredFailureKind !== undefined
+        ? { deferredFailureKind: entry.deferredFailureKind }
+        : {}),
+      ...(entry.deferredResetAt !== undefined ? { deferredResetAt: entry.deferredResetAt } : {}),
     });
   }
   return {

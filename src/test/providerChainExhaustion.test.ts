@@ -214,6 +214,27 @@ const QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
   ],
 };
 
+/** A chain where EVERY candidate was quota-blocked — a pure deferral, not exhaustion. */
+const ALL_QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
+  stage: "impl-high-review",
+  candidates: [
+    {
+      storedModelId: "claude-cli:sonnet",
+      providerLabel: "Claude Code",
+      runnerId: "claude-cli",
+      reason: "You've hit your session limit · resets 12:10am (Asia/Jerusalem)",
+      deferredFailureKind: "quota",
+    },
+    {
+      storedModelId: "kimi-cli:k3",
+      providerLabel: "Kimi CLI",
+      runnerId: "kimi-cli",
+      reason: "You've hit your usage limit. Try again at 4:12 PM.",
+      deferredFailureKind: "quota",
+    },
+  ],
+};
+
 /**
  * 2026-09-15 post-freeze findings, item 4, requirement 4: a chain where TWO
  * ranked candidates were both quota-blocked, with different reset times, and
@@ -309,6 +330,39 @@ void describe("provider chain exhaustion (stage owner)", () => {
     const persisted = readProgress(folderPath);
     assert.equal(persisted.status, "paused");
     assert.equal(persisted.quotaParkRecord, undefined);
+  });
+
+  void it("prefers a candidate's typed deferredFailureKind/deferredResetAt over re-classifying its reason text", async () => {
+    // 2026-09-15 post-freeze findings, item 4: `enrichChainExhaustionWithAttemptOutcomesV1`
+    // stamps `deferredFailureKind`/`deferredResetAt` at the point a candidate's
+    // failure detail is known. This fixture's `reason` text alone (plain
+    // "temporarily unavailable" wording) would NOT classify as quota under
+    // `classifyFailure`, proving the typed field — not a re-parse of `reason`
+    // — is what drives the park decision.
+    const TYPED_DEFERRED_EXHAUSTION: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [
+        {
+          storedModelId: "claude-cli:sonnet",
+          providerLabel: "Claude Code",
+          runnerId: "claude-cli",
+          reason: "invoked, but the transport failed before any response arrived - some other text",
+          deferredFailureKind: "quota",
+          deferredResetAt: "2099-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_typed_deferred");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", TYPED_DEFERRED_EXHAUSTION);
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.ok(persisted.quotaParkRecord, "the typed deferredFailureKind must drive the park decision");
+    assert.equal(persisted.quotaParkRecord?.failureKind, "quota");
+    assert.equal(persisted.quotaParkRecord?.resetAt, "2099-01-01T00:00:00.000Z");
+    assert.equal(persisted.quotaParkRecord?.modelId, "claude-cli:sonnet");
   });
 
   void it("posts a WorkflowDecisionV1 enumerating retry/adjust/stay with a 'no basis' recommendation when nothing is quota-shaped", async () => {
@@ -576,6 +630,61 @@ void describe("provider chain exhaustion (stage owner)", () => {
     );
   });
 
+  // 2026-09-15 post-freeze findings, item 4, requirement: a chain where
+  // EVERY candidate is quota-blocked is deferred, not exhausted — the pause
+  // reason must say so, never "was tried and failed".
+  void it("pauses with 'deferred, not exhausted' wording for a candidatesDeferred code", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("deferred_pause_quota");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", ALL_QUOTA_EXHAUSTION, "candidatesDeferred");
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.match(persisted.pausedReason ?? "", /is currently blocked by a/);
+    assert.match(persisted.pausedReason ?? "", /Deferred, not exhausted/);
+    assert.doesNotMatch(persisted.pausedReason ?? "", /was tried, but the chain was blocked/);
+    assert.doesNotMatch(persisted.pausedReason ?? "", /Every configured model for impl-high-review was tried and failed/);
+    assert.ok(persisted.quotaParkRecord, "a candidatesDeferred pause must still park with a quotaParkRecord");
+  });
+
+  void it("writes an enriched run record with 'deferred' wording for candidatesDeferred", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("deferred_runlog_quota");
+    await withHarness(async () => {
+      await writeReviewRunLogV1(
+        {
+          kind: "unavailable",
+          code: "candidatesDeferred",
+          chainExhaustion: ALL_QUOTA_EXHAUSTION,
+        },
+        {
+          extensionUri: vscode.Uri.file(REAL_ROOT),
+          folderUri,
+          workspaceUri: vscode.Uri.file(REAL_ROOT),
+          currentStage: "impl",
+          targetStage: "impl-high-review",
+          reviewUri: vscode.Uri.file(path.join(folderPath, "impl-high-review.md")),
+          variables: {},
+          reviewAttemptId: "attempt-1",
+        }
+      );
+    });
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs
+      .readdirSync(runsDir)
+      .sort()
+      .map((name) => fs.readFileSync(path.join(runsDir, name), "utf8"));
+    assert.equal(logs.length, 1);
+    assert.match(logs[0]!, /Status: unavailable \(candidatesDeferred\)/);
+    assert.match(logs[0]!, /currently quota\/entitlement-limited — deferred, not tried-and-failed/);
+    assert.doesNotMatch(logs[0]!, /was tried and failed for impl-high-review/);
+    assert.match(
+      logs[0]!,
+      /\*\*Quota\/credit-limit block detected\*\*/
+    );
+  });
+
   void it("pauses with the legacy 'no provider available' wording when no code is passed (back-compat)", async () => {
     const { folderPath, folderUri } = makeTaskFolder("exhausted_pause_default");
     await withHarness(async () => {
@@ -622,6 +731,47 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.match(logs[0]!, /## Provider chain exhausted/);
     assert.match(logs[0]!, /Every configured model was tried and failed for impl-high-review/);
     assert.doesNotMatch(logs[0]!, /No provider could be acquired/);
+  });
+
+  // 2026-09-15 post-freeze findings, item 4, requirement 3: the run log must
+  // name a quota/entitlement block plainly rather than leaving the reader
+  // with only the bare "Status: unavailable (candidatesExhausted)" line —
+  // the same "stderr 0 byte(s)"-style dead end this finding was filed
+  // against, one layer up.
+  void it("names the quota/credit-limit block in the run log, not just the paused reason", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_runlog_quota_named");
+    await withHarness(async () => {
+      await writeReviewRunLogV1(
+        {
+          kind: "unavailable",
+          code: "candidatesExhausted",
+          chainExhaustion: QUOTA_EXHAUSTION,
+        },
+        {
+          extensionUri: vscode.Uri.file(REAL_ROOT),
+          folderUri,
+          workspaceUri: vscode.Uri.file(REAL_ROOT),
+          currentStage: "impl",
+          targetStage: "impl-high-review",
+          reviewUri: vscode.Uri.file(path.join(folderPath, "impl-high-review.md")),
+          variables: {},
+          reviewAttemptId: "attempt-1",
+        }
+      );
+    });
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs
+      .readdirSync(runsDir)
+      .sort()
+      .map((name) => fs.readFileSync(path.join(runsDir, name), "utf8"));
+    assert.equal(logs.length, 1);
+    assert.match(logs[0]!, /Status: unavailable \(candidatesExhausted\)/);
+    assert.match(
+      logs[0]!,
+      /\*\*Quota\/credit-limit block detected\*\* on Claude Code — this chain was blocked by a provider account limit, not a transport or code fault\./
+    );
+    assert.match(logs[0]!, /parked with this reset time rather than left as a bare failure/);
   });
 });
 

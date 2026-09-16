@@ -25,6 +25,20 @@ export type WorkflowUnavailableCodeV1 =
    * result — but the code now states which of the two conditions held.
    */
   | "candidatesExhausted"
+  /**
+   * Every candidate that was actually reserved and invoked failed with a
+   * quota/model-entitlement block — none was "tried and failed" in the
+   * ordinary sense; each told us when it might become available again.
+   * 2026-09-15 post-freeze findings, item 4, requirement: "a candidate that
+   * told us when it will be available again has not been exhausted, it has
+   * been deferred" — this is the code that keeps that distinction visible on
+   * the outcome itself (and therefore in the run log's leading `Status:`
+   * line), rather than only inside the chain-exhaustion detail a reader has
+   * to scroll to. Still carries `chainExhaustion`, and the coordinator only
+   * ever produces this in place of `candidatesExhausted` (never in place of
+   * `providerModeUnavailable`, which means nothing was ever reserved at all).
+   */
+  | "candidatesDeferred"
   | "workspaceRootUnsupported"
   | "workspacePathUnsafe"
   | "workflowStorageUnavailable";

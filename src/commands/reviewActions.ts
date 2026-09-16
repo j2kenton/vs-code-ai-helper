@@ -3631,9 +3631,61 @@ export async function writeReviewRunLogV1(
     // from `providerModeUnavailable` (nothing was ever reserved) — "no
     // provider could be acquired" is only true of the second.
     const exhaustionHeadline =
-      outcome.kind === "unavailable" && outcome.code === "candidatesExhausted"
-        ? `Every configured model was tried and failed for ${exhaustion?.stage ?? ctx.targetStage}.`
-        : `No provider could be acquired for ${exhaustion?.stage ?? ctx.targetStage}.`;
+      outcome.kind === "unavailable" && outcome.code === "candidatesDeferred"
+        ? `Every configured model for ${exhaustion?.stage ?? ctx.targetStage} is currently ` +
+          "quota/entitlement-limited — deferred, not tried-and-failed."
+        : outcome.kind === "unavailable" && outcome.code === "candidatesExhausted"
+          ? `Every configured model was tried and failed for ${exhaustion?.stage ?? ctx.targetStage}.`
+          : `No provider could be acquired for ${exhaustion?.stage ?? ctx.targetStage}.`;
+    // 2026-09-15 post-freeze findings, item 4, requirement 3 ("a quota
+    // refusal must park with its reset time... its message reach the run log
+    // and user-facing failure detail"): when the exhaustion was actually
+    // caused by a quota/entitlement block (the same typed detection
+    // `pauseTaskForExhaustedChainV1` below uses to compute `quotaParkRecord`),
+    // say so plainly in the run log too — "Status: unavailable
+    // (candidatesExhausted)" alone reads like an unexplained provider
+    // failure, exactly the "stderr 0 byte(s)" style dead end this finding
+    // was filed against. Uses the same earliest-reset selection so the run
+    // log and the paused task's own reason never disagree about which
+    // candidate's reset governs.
+    const quotaCandidatesForLog =
+      outcome.kind === "unavailable" &&
+      (outcome.code === "candidatesExhausted" || outcome.code === "candidatesDeferred")
+        ? (exhaustion?.candidates ?? [])
+            .map((candidate) => ({
+              candidate,
+              failureKind:
+                candidate.deferredFailureKind ??
+                classifyFailure({ errorMessage: candidate.reason }).failureKind,
+              resetAt:
+                candidate.deferredFailureKind !== undefined
+                  ? candidate.deferredResetAt
+                  : parseQuotaResetV1(candidate.reason, new Date()),
+            }))
+            .filter(({ failureKind }) => failureKind === "quota" || failureKind === "model-entitlement")
+        : [];
+    const quotaCandidateForLog = quotaCandidatesForLog.reduce<
+      (typeof quotaCandidatesForLog)[number] | undefined
+    >((earliest, current) => {
+      if (earliest === undefined) {
+        return current;
+      }
+      if (earliest.resetAt === undefined) {
+        return current.resetAt !== undefined ? current : earliest;
+      }
+      if (current.resetAt === undefined) {
+        return earliest;
+      }
+      return current.resetAt < earliest.resetAt ? current : earliest;
+    }, undefined);
+    const quotaLogNote = quotaCandidateForLog
+      ? `\n**Quota/credit-limit block detected** on ${quotaCandidateForLog.candidate.providerLabel} — ` +
+        `this chain was blocked by a provider account limit, not a transport or code fault. ` +
+        (quotaCandidateForLog.resetAt !== undefined
+          ? `Reported reset: ${quotaCandidateForLog.resetAt}. `
+          : "No reset time was reported. ") +
+        "The task has been parked with this reset time rather than left as a bare failure.\n"
+      : "";
     const exhaustionSection = exhaustion
       ? `\n## Provider chain exhausted\n\n` +
         `${exhaustionHeadline} ` +
@@ -3648,7 +3700,8 @@ export async function writeReviewRunLogV1(
               )
               .join("\n")
           : "_no candidates are configured for this stage_") +
-        "\n\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
+        `\n${quotaLogNote}` +
+        "\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
       : "";
     // wf10 continuation item 12, Part 1 step 4: the durable per-review record
     // (this run log) must show the same reviewer/mechanical split every other
@@ -4555,15 +4608,24 @@ export async function pauseTaskForExhaustedChainV1(
   // candidate with a parseable resetAt always outranks one without: an
   // unknown reset is worse information than a known one, however early it
   // sorts numerically.
+  // Prefer the typed `deferredFailureKind`/`deferredResetAt` fields
+  // `enrichChainExhaustionWithAttemptOutcomesV1` stamps at the point a
+  // candidate's failure detail is known (2026-09-15 post-freeze findings,
+  // item 4) — falling back to re-classifying the rendered `reason` text only
+  // for candidates that were never enriched that way (e.g. selection-time
+  // skips, or a chain-exhaustion record built by another producer).
   const quotaCandidates = exhaustion.candidates
     .map((candidate) => ({
       candidate,
-      classified: classifyFailure({ errorMessage: candidate.reason }),
-      resetAt: parseQuotaResetV1(candidate.reason, new Date()),
+      failureKind:
+        candidate.deferredFailureKind ?? classifyFailure({ errorMessage: candidate.reason }).failureKind,
+      resetAt:
+        candidate.deferredFailureKind !== undefined
+          ? candidate.deferredResetAt
+          : parseQuotaResetV1(candidate.reason, new Date()),
     }))
     .filter(
-      ({ classified }) =>
-        classified.failureKind === "quota" || classified.failureKind === "model-entitlement"
+      ({ failureKind }) => failureKind === "quota" || failureKind === "model-entitlement"
     );
   const quotaCandidate = quotaCandidates.reduce<(typeof quotaCandidates)[number] | undefined>(
     (earliest, current) => {
@@ -4585,24 +4647,30 @@ export async function pauseTaskForExhaustedChainV1(
         modelId: quotaCandidate.candidate.storedModelId,
         providerId: quotaCandidate.candidate.runnerId,
         accountKey: resolveQuotaAccountKeyV1(quotaCandidate.candidate.storedModelId),
-        failureKind: quotaCandidate.classified.failureKind as "quota" | "model-entitlement",
+        failureKind: quotaCandidate.failureKind as "quota" | "model-entitlement",
         resetAt: quotaCandidate.resetAt,
         observedAt: new Date().toISOString(),
       }
     : undefined;
   const reason =
-    code === "candidatesExhausted" && quotaCandidate !== undefined
-      ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
-        `${quotaCandidate.classified.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+    code === "candidatesDeferred" && quotaCandidate !== undefined
+      ? `Every configured model for ${stageName} is currently blocked by a ` +
+        `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
         `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
-        `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
-      : code === "candidatesExhausted"
-        ? `Every configured model for ${stageName} was tried and failed — ` +
-          `the resolved chain was exhausted (${chain}). ` +
-          "See the run log for per-candidate reasons."
-        : `No configured provider for ${stageName} is available — ` +
-          `the resolved chain was exhausted (${chain}). ` +
-          "See the run log for per-candidate reasons.";
+        `fault (${quotaCandidate.candidate.reason}). Deferred, not exhausted: the task is parked until the known ` +
+        "reset. See the run log for the remaining per-candidate reasons."
+      : code === "candidatesExhausted" && quotaCandidate !== undefined
+        ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
+          `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+          `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
+          `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
+        : code === "candidatesExhausted"
+          ? `Every configured model for ${stageName} was tried and failed — ` +
+            `the resolved chain was exhausted (${chain}). ` +
+            "See the run log for per-candidate reasons."
+          : `No configured provider for ${stageName} is available — ` +
+            `the resolved chain was exhausted (${chain}). ` +
+            "See the run log for per-candidate reasons.";
   await patchTaskProgressStrictV1(folderUri, (current) =>
     pauseTaskWithReason(current, reason, quotaParkRecord)
   );

@@ -1981,6 +1981,104 @@ void describe("taskActionCoordinatorV1", () => {
     }
   );
 
+  void it(
+    "reports candidatesDeferred (not candidatesExhausted) when every invoked candidate was quota-blocked",
+    async () => {
+      // 2026-09-15 post-freeze findings, item 4, requirement: "a candidate
+      // that told us when it will be available again has not been
+      // exhausted, it has been deferred". Every candidate here fails with a
+      // quota-marker detail string, so the coordinator must emit the
+      // distinguishing code at the OUTCOME level, not only inside
+      // `chainExhaustion`'s per-candidate detail.
+      const quotaBlocked: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () =>
+          Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "cliExit.1",
+            detail: "You've hit your usage limit. Try again at 4:12 PM.",
+          }),
+      };
+      const exhaustion = {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+        ],
+      };
+      const harness = makeHarness([quotaBlocked, quotaBlocked], {}, [], undefined, exhaustion);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind !== "unavailable") {
+        assert.fail("expected unavailable");
+      }
+      assert.equal(
+        outcome.code,
+        "candidatesDeferred",
+        "every invoked candidate was quota-blocked, so this is deferred, not exhausted"
+      );
+      for (const candidate of outcome.chainExhaustion?.candidates ?? []) {
+        assert.equal(candidate.deferredFailureKind, "quota");
+      }
+    }
+  );
+
+  void it(
+    "keeps candidatesExhausted when only SOME invoked candidates were quota-blocked",
+    async () => {
+      // A mix of a quota-blocked candidate and a genuinely-failed candidate
+      // is real exhaustion, not a pure deferral — the chain did not fail
+      // solely because of quota, so the ordinary wording must stand.
+      const quotaBlocked: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () =>
+          Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "cliExit.1",
+            detail: "You've hit your usage limit. Try again at 4:12 PM.",
+          }),
+      };
+      const genuinelyFailed: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "connectFailed" }),
+      };
+      const exhaustion = {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+        ],
+      };
+      const harness = makeHarness([quotaBlocked, genuinelyFailed], {}, [], undefined, exhaustion);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind !== "unavailable") {
+        assert.fail("expected unavailable");
+      }
+      assert.equal(outcome.code, "candidatesExhausted");
+    }
+  );
+
   void it("maps provider-declared failure and cancellation envelopes onto stable outcomes", async () => {
     const failed = makeHarness([
       envelopeTransport((correlation) =>
