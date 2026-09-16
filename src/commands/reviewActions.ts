@@ -4736,6 +4736,21 @@ export async function runReviewForFolder(
      * and a different model is being tried against it.
      */
     skipUnchangedTreeGuard?: boolean;
+    /**
+     * The command id to re-invoke, with a `{ taskFolderPath }` arg, when this
+     * call's "Restore Last Usable Summary" refusal (below) is accepted and
+     * the restore succeeds — 2026-09-15 post-freeze findings, item 3 / plan
+     * step 24: restoring must "rerun admission", not just unstamp the file
+     * and leave the user to click Review or Fast Forward again by hand.
+     * Defaults to plain Review, which is always a valid way to re-enter the
+     * refused path — every caller of this function either IS a Review
+     * dispatch or is itself one step of a longer chain (Fast Forward's
+     * "no initial review yet" branch literally calls this function directly)
+     * that the user can restart. Set explicitly to Fast Forward's own
+     * command id at that one call site so restoring from a Fast-Forward
+     * initiated refusal re-enters Fast Forward specifically.
+     */
+    rerunCommandId?: string;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -4983,7 +4998,11 @@ export async function runReviewForFolder(
           ? {
               command: "vs-code-ai-helper.restoreRejectedImplementationRound",
               title: "Restore Last Usable Summary",
-              args: [folderUri.fsPath, targetStage],
+              args: [
+                folderUri.fsPath,
+                targetStage,
+                options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
+              ],
             }
           : undefined
       );
@@ -5948,11 +5967,17 @@ export async function revertInProgressReviewMarkingV1(
  * (executeImplementationRun's `postRunReviewStage`), used to locate that
  * stage's review artifact; a plan-only task (no review stage yet) restores
  * just the summary.
+ *
+ * Returns whether anything was actually restored, so a caller reached from
+ * the "Restore Last Usable Summary" refusal action (2026-09-15 post-freeze
+ * findings, item 3 / plan step 24) knows whether it is safe to re-dispatch
+ * the stage action that was refused — never announce or re-enter that path
+ * off of a no-op restore.
  */
 export async function restoreRejectedImplementationRoundV1(
   taskFolderPath: string,
   stage: TaskStage
-): Promise<void> {
+): Promise<boolean> {
   const folderUri = vscode.Uri.file(taskFolderPath);
   const summaryUri = getImplementationSummaryUri(folderUri);
 
@@ -5962,7 +5987,7 @@ export async function restoreRejectedImplementationRoundV1(
       "Nothing to restore — the current implementation summary is not a rejected-round stamp " +
         "(it may already have been restored, or a later round already replaced it)."
     );
-    return;
+    return false;
   }
 
   const restoreTargets: Array<{ current: vscode.Uri; label: string }> = [
@@ -5990,13 +6015,14 @@ export async function restoreRejectedImplementationRoundV1(
       "Could not restore the prior round: no backup (_prev) file was found for the implementation " +
         "summary" + (reviewUri ? " or review" : "") + "."
     );
-    return;
+    return false;
   }
 
   NotificationRouter.showInformation(
     `Restored the prior ${restored.join(" and ")} — the task is back to its pre-rejection state.` +
       (missing.length > 0 ? ` (No backup was found for the ${missing.join(" and ")}.)` : "")
   );
+  return true;
 }
 
 /**
@@ -7078,7 +7104,16 @@ export async function fastForwardReviewWithAI(
         title: `Running initial ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
-      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op, chatViewProvider })
+      () =>
+        runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, {
+          operation: op,
+          chatViewProvider,
+          // If this initial review itself refuses on an unusable implementation
+          // summary, restoring should re-enter Fast Forward (this function),
+          // not plain Review — the user asked to fast-forward, and Fast
+          // Forward's own "no initial review yet" branch is exactly this call.
+          rerunCommandId: "vs-code-ai-helper.fastForwardReviewWithAI",
+        })
     );
     initialContent = await readNonEmptyText(reviewUri);
     // Same unusable check as the pre-dispatch read above (line ~3209) — the
@@ -12860,13 +12895,26 @@ export function registerReviewActionCommands(
     // `{ task: IncompleteTask }`-shaped node instead.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.restoreRejectedImplementationRound",
-      (arg: string | TaskNodeArg | undefined, stage?: TaskStage) => {
+      async (arg: string | TaskNodeArg | undefined, stage?: TaskStage, rerunCommandId?: string) => {
         if (typeof arg === "string") {
           if (!stage) {
             NotificationRouter.showWarning("Could not discard the last round: no stage was supplied.");
             return undefined;
           }
-          return restoreRejectedImplementationRoundV1(arg, stage);
+          const restored = await restoreRejectedImplementationRoundV1(arg, stage);
+          // Only the "Restore Last Usable Summary" refusal action supplies
+          // `rerunCommandId` (2026-09-15 post-freeze findings, item 3 / plan
+          // step 24) — the plain "Discard Last Round" entry points (decision
+          // card, task-row context menu) never pass a third argument, so this
+          // stays a no-op restore for them, unchanged from before. Re-entering
+          // the refused stage only when the restore actually replaced
+          // something avoids re-dispatching against an untouched, still-bad
+          // summary (e.g. the button was stale — a later round already fixed
+          // it, or there was no usable `_prev` to restore from).
+          if (restored && rerunCommandId) {
+            await vscode.commands.executeCommand(rerunCommandId, { taskFolderPath: arg });
+          }
+          return undefined;
         }
         const task = arg?.task;
         if (!task) {
@@ -13384,7 +13432,12 @@ async function buildReviewResumeVariablesV1(
               actionCommand: {
                 command: "vs-code-ai-helper.restoreRejectedImplementationRound",
                 title: "Restore Last Usable Summary",
-                args: [folderUri.fsPath, targetStage],
+                // No record here of which top-level command originally started
+                // the interaction being resumed (Review or Fast Forward both
+                // create the same kind of interaction) — default to plain
+                // Review, same rationale as `runReviewForFolder`'s
+                // `rerunCommandId` default.
+                args: [folderUri.fsPath, targetStage, "vs-code-ai-helper.runReviewWithAI"],
               },
             }
           : {}),
