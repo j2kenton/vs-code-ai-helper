@@ -12,6 +12,11 @@ export ENSEMBLE_HOST_ROLE=runner
 WORKSPACE="${ENSEMBLE_RUNNER_WORKSPACE:-/workspace/vs-code-ai-helper}"
 mkdir -p "$HOME/.devbox-logs"
 
+# `docker restart` keeps the container's /tmp: the previous boot's X lock
+# survives, Xvfb refuses to start ("Server is already active for display
+# 99"), and with no display VS Code exits at once and loops (seen live).
+# Nothing else can own display :99 in this container, so the lock is stale.
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 Xvfb :99 -screen 0 1600x1000x24 -nolisten tcp >>"$HOME/.devbox-logs/xvfb.log" 2>&1 &
 sleep 2
 # VNC bound to loopback only, no password: reachable solely via SSH port-forward.
