@@ -45,6 +45,12 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai \
 RUN corepack enable --install-directory /usr/local/bin
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
+# The user's local time, not UTC: the workflow writes times into its messages
+# ("paused until 1:02 PM") in the runner's own clock, which read as three
+# hours off (2026-09-17). Build with --build-arg TZ=<zone> for another user.
+ARG TZ=Asia/Jerusalem
+RUN ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime && echo "${TZ}" > /etc/timezone
+
 # One non-root user who owns the workspace and the logins. uid 1000 is
 # `node` in this base image: reuse the uid under a clearer name.
 RUN usermod -l dev -d /home/dev -m node \
