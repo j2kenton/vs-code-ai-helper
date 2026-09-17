@@ -2436,7 +2436,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: 0 0 var(--ensemble-space-2);
         }
         .msg-row {
-          margin: 0 0 var(--ensemble-space-2);
+          margin: 0 0 var(--ensemble-space-4);
         }
         .msg-meta {
           display: flex;
