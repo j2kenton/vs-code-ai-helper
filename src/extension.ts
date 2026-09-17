@@ -3,6 +3,11 @@ import * as path from "path";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
 import { configureViewerCommandForwarderV1, RELAYABLE_COMMAND_IDS_V1 } from "./services/viewerForwardingV1";
+import {
+  appendMirroredNotificationV1,
+  createNotificationMirrorTailV1,
+  HOST_NOTIFICATION_MIRROR_FILENAME_V1,
+} from "./services/hostNotificationMirrorV1";
 import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./utils/chatHistoryStore";
 import {
   acquireWorkAdmissionV1,
@@ -772,7 +777,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.statusViewInitialized", false);
   const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
   context.subscriptions.push(statusTreeProvider);
-  initNotificationRouter(statusTreeProvider);
+  // Cloud runner/viewer split (hostNotificationMirrorV1.ts): the runner also
+  // appends every notification to the shared mirror file, and a viewer shows
+  // those entries in its own Notifications view — otherwise a forwarded
+  // action the runner refused looked like it silently did nothing.
+  const relayDir = relayRoot !== undefined ? path.join(relayRoot, HOST_RELAY_DIRNAME_V1) : undefined;
+  if (hostRole === "runner" && relayDir !== undefined) {
+    initNotificationRouter({
+      addEntry: (message, level, filePath, resultTargetUri, sourceOperationId, actionCommand) => {
+        statusTreeProvider.addEntry(message, level, filePath, resultTargetUri, sourceOperationId, actionCommand);
+        void appendMirroredNotificationV1(relayDir, {
+          at: new Date().toISOString(),
+          level,
+          message,
+          ...(filePath !== undefined ? { filePath } : {}),
+          ...(resultTargetUri !== undefined ? { resultTargetUri } : {}),
+          ...(actionCommand !== undefined ? { actionCommand } : {}),
+        });
+      },
+    });
+  } else {
+    initNotificationRouter(statusTreeProvider);
+  }
+  if (viewerHost && relayDir !== undefined) {
+    void createNotificationMirrorTailV1(relayDir, (entries) => {
+      for (const entry of entries) {
+        statusTreeProvider.addEntry(
+          `Runner: ${entry.message}`,
+          entry.level,
+          entry.filePath,
+          entry.resultTargetUri,
+          undefined,
+          entry.actionCommand !== undefined
+            ? { ...entry.actionCommand, args: entry.actionCommand.args !== undefined ? [...entry.actionCommand.args] : undefined }
+            : undefined
+        );
+      }
+      // A warning or error from the runner is what the user is waiting to
+      // hear about: bring the Notifications view forward for it.
+      if (entries.some((entry) => entry.level !== "info")) {
+        void vscode.commands.executeCommand(`${STATUS_VIEW_ID}.focus`);
+      }
+    }).then((tail) => {
+      const mirrorWatcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(relayDir, HOST_NOTIFICATION_MIRROR_FILENAME_V1)
+      );
+      mirrorWatcher.onDidCreate(() => void tail.poll());
+      mirrorWatcher.onDidChange(() => void tail.poll());
+      const mirrorTimer = setInterval(() => void tail.poll(), 5 * 1000);
+      context.subscriptions.push(mirrorWatcher, { dispose: () => clearInterval(mirrorTimer) });
+    });
+  }
   const statusTreeView = vscode.window.createTreeView(STATUS_VIEW_ID, {
     treeDataProvider: statusTreeProvider,
     showCollapseAll: false,
