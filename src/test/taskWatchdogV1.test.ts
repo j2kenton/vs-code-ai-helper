@@ -12,6 +12,7 @@ import * as assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import {
   STALE_DISPATCH_GRACE_MS,
+  effectiveNextActorV1,
   hasOpenRoundLedgerRowV1,
   isImpossibleActiveStateV1,
   isReconstructableImplRecoveryV1,
@@ -400,5 +401,19 @@ void describe("stale-dispatch + reconstructability evidence — the single defin
     assert.equal(isUnrecoverableImplRecoveryV1(reconstructable, progressWithFiles, pastGrace), false);
     // stale, not reconstructable -> unrecoverable, the only true cell
     assert.equal(isUnrecoverableImplRecoveryV1(bare, baseProgress(), pastGrace), true);
+  });
+});
+
+void describe("effectiveNextActorV1 (v1 fixes 2, item 8, Wave I)", () => {
+  void it("reads an absent nextActor as automation, not as unknown-therefore-human", () => {
+    assert.equal(effectiveNextActorV1(baseProgress()), "automation");
+  });
+
+  void it("reads an explicit \"automation\" as automation", () => {
+    assert.equal(effectiveNextActorV1(baseProgress({ nextActor: "automation" })), "automation");
+  });
+
+  void it("reads an explicit \"human\" as human", () => {
+    assert.equal(effectiveNextActorV1(baseProgress({ nextActor: "human" })), "human");
   });
 });

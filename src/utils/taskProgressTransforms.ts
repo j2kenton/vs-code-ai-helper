@@ -1122,3 +1122,53 @@ export function clearImplementationTypeCheckFailure(progress: TaskProgress): Tas
     updatedAt: new Date().toISOString(),
   };
 }
+
+/**
+ * Record who is expected to act next (v1 fixes 2, item 8/31/Wave I — see
+ * `TaskProgress.nextActor`'s own doc comment). Callers pass `undefined` to
+ * fall back to unknown rather than asserting a stale actor; every consumer
+ * must already treat unknown the same as `"automation"`, so clearing is
+ * always safe.
+ */
+export function setNextActorV1(
+  progress: TaskProgress,
+  nextActor: "human" | "automation" | undefined
+): TaskProgress {
+  if (progress.nextActor === nextActor) {
+    return progress;
+  }
+  if (nextActor === undefined) {
+    const { nextActor: _unused, ...rest } = progress;
+    return {
+      ...rest,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    ...progress,
+    nextActor,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Reserve the next review-pass number for `stage` (v1 fixes 2, item 32/Wave
+ * I — see `TaskProgress.stageReviewPasses`'s own doc comment). Must be called
+ * at review DISPATCH time, before the round runs, and the reservation must
+ * never be rolled back on failure or cancellation — a failed round still
+ * consumes its number so a later, different attempt can never collide with
+ * it. Returns the new progress; the reserved number is
+ * `result.stageReviewPasses[stage]` after the caller persists it (e.g. via
+ * `patchTaskProgressStrictV1`).
+ */
+export function reserveStageReviewPassV1(progress: TaskProgress, stage: TaskStage): TaskProgress {
+  const current = progress.stageReviewPasses?.[stage] ?? 0;
+  return {
+    ...progress,
+    stageReviewPasses: {
+      ...progress.stageReviewPasses,
+      [stage]: current + 1,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}

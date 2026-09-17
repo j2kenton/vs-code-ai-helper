@@ -17,7 +17,7 @@
  * regardless of readiness, so a low score can never render as a down arrow).
  */
 
-import { BlockerLineageDeclaration, TaskStage } from "../types/taskProgress";
+import { BlockerLineageDeclaration, TaskProgress, TaskStage } from "../types/taskProgress";
 
 /**
  * Stages from which a review can be run, mapped to the review stage it
@@ -550,6 +550,55 @@ const REVIEWED_COMMIT_RE = /<!--\s*reviewed-commit:\s*([0-9a-f]{7,40})\s*-->/gi;
 export function parseReviewedCommitSha(content: string): string | undefined {
   const match = [...content.matchAll(REVIEWED_COMMIT_RE)].at(-1);
   return match?.[1];
+}
+
+/**
+ * Global (not first-match), matching {@link REVIEWED_COMMIT_RE}'s own reason:
+ * the instruction shows a worked example, and the LAST occurrence in the
+ * reply is the authoritative one.
+ */
+const REVIEW_PASS_RE = /<!--\s*review-pass:\s*(\d+)\s*-->/gi;
+
+/**
+ * Parse the machine-readable `<!-- review-pass: N -->` marker a review is
+ * asked to echo back (v1 fixes 2, item 32/Wave I): the stage's review-pass
+ * number reserved for THIS round at dispatch time
+ * (`reserveStageReviewPassV1`, `TaskProgress.stageReviewPasses`). Returns
+ * undefined when absent (older prompt, a plan-review artifact that never
+ * carries this marker, or a provider that dropped it) — see
+ * {@link isReviewPassCurrentV1}, which treats an absent marker as always
+ * stale rather than "cannot determine", unlike {@link parseReviewedCommitSha}.
+ */
+export function parseReviewPass(content: string): number | undefined {
+  const match = [...content.matchAll(REVIEW_PASS_RE)].at(-1);
+  if (match === undefined) {
+    return undefined;
+  }
+  const parsed = Number(match[1]);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+/**
+ * Whether a review artifact's stamped pass number matches the stage's
+ * CURRENT reservation (v1 fixes 2, item 32/6, Wave I). Deliberately
+ * fail-closed, unlike the reviewed-commit family: a review with no pass
+ * marker at all, or a task with no reservation recorded for this stage yet
+ * (a pre-Wave-I artifact, or a stage never dispatched through
+ * `claimReviewAttempt`), reads as NOT current — a review must prove it
+ * belongs to this visit to the stage, rather than being trusted by default.
+ * This is what closes item 32 ("A review stage can 'pass' on a review left
+ * over from an earlier visit"): a stale artifact from a prior visit can
+ * never be mistaken for the current pass, because it carries an older
+ * number (or none), never a matching one.
+ */
+export function isReviewPassCurrentV1(
+  content: string,
+  stageReviewPasses: TaskProgress["stageReviewPasses"],
+  stage: TaskStage
+): boolean {
+  const stamped = parseReviewPass(content);
+  const current = stageReviewPasses?.[stage];
+  return stamped !== undefined && current !== undefined && stamped === current;
 }
 
 /**

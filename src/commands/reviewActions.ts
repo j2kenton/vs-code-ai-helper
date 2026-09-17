@@ -74,6 +74,7 @@ import {
   promotePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
   resolveRoundV1,
+  reserveStageReviewPassV1,
   setZeroChangeImplRounds,
   latestReviewBlockerNamedPathsV1,
   pauseTaskWithReason,
@@ -617,7 +618,16 @@ export async function claimReviewAttempt(
           // different, already-ended round and must not be attached here.
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
-    return upsertRoundLedgerEntryV1({ ...effectiveCurrent, reviewAttemptId }, openRow);
+    // v1 fixes 2, item 32/Wave I: reserve this stage's next review-pass
+    // number in the SAME transaction that opens the round-ledger row, so the
+    // reservation and the claim can never observably disagree (a claim that
+    // landed with no reservation, or vice versa). See
+    // `TaskProgress.stageReviewPasses`'s own doc comment — reserved here,
+    // before the round runs, and never rolled back on failure.
+    return upsertRoundLedgerEntryV1(
+      reserveStageReviewPassV1({ ...effectiveCurrent, reviewAttemptId }, targetStage),
+      openRow
+    );
   });
 }
 
@@ -3074,6 +3084,13 @@ export async function handleReviewRoutingOutcome(options: {
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
       blockers: resolveBlockerLineageV1(blockers, priorEntryForStage?.blockers, reviewAttemptId),
+      // v1 fixes 2, item 32/4/Wave I: the pass number `claimReviewAttempt`
+      // reserved for THIS round, read from durable progress rather than the
+      // artifact's own (possibly dropped) marker — this is the ground truth
+      // `isReviewPassCurrentV1` compares an artifact's stamped marker against.
+      ...(progressBefore.stageReviewPasses?.[targetStage] !== undefined
+        ? { reviewPass: progressBefore.stageReviewPasses[targetStage] }
+        : {}),
       ...(reviewer ? { reviewer } : {}),
       ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
       ...(challengedMatches.length > 0
@@ -5382,6 +5399,16 @@ export async function runReviewForFolder(
   // in the `finally` below regardless of outcome.
   const claimed = await claimReviewAttemptWithLiveLeaseV1(folderUri, reviewAttemptId, targetStage);
   if (!claimed) return;
+  // v1 fixes 2, item 32/Wave I: `claimReviewAttempt` reserved this stage's
+  // next review-pass number in the same transaction that opened this round's
+  // ledger row (see that function). Echo it into the prompt so the reviewer
+  // stamps it back onto the artifact as `<!-- review-pass: N -->` — read back
+  // by `isReviewPassCurrentV1` to tell this visit's review from a leftover
+  // one belonging to an earlier visit to the stage.
+  const reservedReviewPass = claimed.stageReviewPasses?.[targetStage];
+  if (reservedReviewPass !== undefined) {
+    variables.reviewPass = String(reservedReviewPass);
+  }
 
   // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
   // itself is eating a large share of the review-input limit — "the same

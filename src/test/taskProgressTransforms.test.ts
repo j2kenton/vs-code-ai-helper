@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -1077,4 +1077,73 @@ void test("a later claim-bound pause overwrites, rather than accumulates on top 
   const second = pauseTaskWithReasonForClaimV1(first, "stalled again", "claim-2", 7);
   assert.equal(second.watchdogPauseClaimId, "claim-2");
   assert.equal(second.watchdogPauseFenceGeneration, 7);
+});
+
+// ---------------------------------------------------------------------------
+// setNextActorV1 (v1 fixes 2, item 8, Wave I)
+// ---------------------------------------------------------------------------
+
+void test("setNextActorV1 sets the field and bumps updatedAt", () => {
+  const progress = makeProgress();
+  const updated = setNextActorV1(progress, "human");
+  assert.equal(updated.nextActor, "human");
+  assert.notEqual(updated.updatedAt, progress.updatedAt);
+});
+
+void test("setNextActorV1(undefined) clears a previously set value", () => {
+  const progress = setNextActorV1(makeProgress(), "automation");
+  const cleared = setNextActorV1(progress, undefined);
+  assert.equal(cleared.nextActor, undefined);
+  assert.ok(!("nextActor" in cleared));
+});
+
+void test("setNextActorV1 is a no-op (same reference) when the value is already current", () => {
+  const progress = setNextActorV1(makeProgress(), "human");
+  const again = setNextActorV1(progress, "human");
+  assert.equal(again, progress);
+});
+
+// ---------------------------------------------------------------------------
+// reserveStageReviewPassV1 (v1 fixes 2, item 32/Wave I)
+// ---------------------------------------------------------------------------
+
+void test("reserveStageReviewPassV1 starts a fresh stage's counter at 1", () => {
+  const progress = makeProgress();
+  const reserved = reserveStageReviewPassV1(progress, "impl-high-review");
+  assert.equal(reserved.stageReviewPasses?.["impl-high-review"], 1);
+});
+
+void test("reserveStageReviewPassV1 increments monotonically across repeated calls for the same stage", () => {
+  let progress = makeProgress();
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  assert.equal(progress.stageReviewPasses?.["impl-high-review"], 3);
+});
+
+void test("reserveStageReviewPassV1 tracks each stage's counter independently", () => {
+  let progress = makeProgress();
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  progress = reserveStageReviewPassV1(progress, "publish");
+  assert.equal(progress.stageReviewPasses?.["impl-high-review"], 2);
+  assert.equal(progress.stageReviewPasses?.["publish"], 1);
+});
+
+void test("reserveStageReviewPassV1 never rolls back — a failed/cancelled round's reservation stays consumed", () => {
+  // Nothing in this module (or anywhere else, as of this field's introduction)
+  // decrements or clears stageReviewPasses — the reservation transform is the
+  // only writer, and it only ever increments. This test pins that: two
+  // reservations followed by re-reading the same progress object never see
+  // the counter drop back down, which is the property item 5 depends on (a
+  // review round that fails after reservation must not free its number for
+  // reuse by a later, different attempt).
+  let progress = makeProgress();
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  const afterFirst = progress.stageReviewPasses?.["impl-high-review"];
+  // Simulate a second, later dispatch for the same stage after the first
+  // round failed/was cancelled with no rollback call ever made.
+  progress = reserveStageReviewPassV1(progress, "impl-high-review");
+  assert.equal(afterFirst, 1);
+  assert.equal(progress.stageReviewPasses?.["impl-high-review"], 2);
 });

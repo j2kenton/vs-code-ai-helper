@@ -32,6 +32,22 @@ export function hasOpenRoundLedgerRowV1(progress: TaskProgress): boolean {
 }
 
 /**
+ * The conservative read of `TaskProgress.nextActor` every consumer must use
+ * instead of comparing the raw field directly (v1 fixes 2, item 8, Wave I).
+ * Absence means unknown, and unknown is treated exactly like `"automation"`
+ * — the field can only ever make the watchdog MORE precise about a task that
+ * is genuinely waiting on a human, never less protective of a task that
+ * might still be stuck. Every task written before this field existed, and
+ * every chokepoint that has not yet been updated to set it, reads as
+ * `"automation"` here, so this helper is a safe no-op until the writer-side
+ * chokepoints (resume/dispatch/schedule/recovery/stage-transition) actually
+ * start setting the field.
+ */
+export function effectiveNextActorV1(progress: TaskProgress): "human" | "automation" {
+  return progress.nextActor === "human" ? "human" : "automation";
+}
+
+/**
  * A `dispatched` recovery record's lease dates from the transition, and the
  * round it covers can legitimately run for the full CLI timeout (60
  * minutes) — only well past that is silence evidence of a dead round. The
