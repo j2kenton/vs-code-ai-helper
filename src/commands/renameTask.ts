@@ -41,6 +41,7 @@ import {
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
 
@@ -700,7 +701,12 @@ export function registerRenameTaskCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.renameTaskWithAI",
-      (arg?: TaskArg) => renameTaskWithAI(context, inventory, arg)
+      // In a viewer the naming run belongs to the runner: run here, the AI
+      // call was refused and the row still ended "completed" with the name
+      // unchanged (seen 2026-09-17).
+      forwardInViewerV1("vs-code-ai-helper.renameTaskWithAI", (arg?: TaskArg) =>
+        renameTaskWithAI(context, inventory, arg)
+      )
     )
   );
 }
