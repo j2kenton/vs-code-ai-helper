@@ -60,7 +60,8 @@ RUN printf '%s\n' \
 # Host keys live on the volume so the box's identity survives rebuilds.
 COPY entrypoint.sh /usr/local/bin/devbox-entrypoint
 COPY runner.sh /usr/local/bin/devbox-runner
-RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner
+COPY install-extension.sh /usr/local/bin/devbox-install-extension
+RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner /usr/local/bin/devbox-install-extension
 
 EXPOSE 2222
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/devbox-entrypoint"]

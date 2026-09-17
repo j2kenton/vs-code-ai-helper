@@ -25,14 +25,13 @@ x11vnc -display :99 -localhost -forever -shared -nopw -quiet >>"$HOME/.devbox-lo
 # then open http://localhost:6080/vnc.html . Loopback only.
 websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 >>"$HOME/.devbox-logs/novnc.log" 2>&1 &
 
-# The runner's own profile needs the extension too (desktop profile, not the
-# Remote-SSH server's). A newer package dropped at ~/ensemble.vsix is picked up
-# on the next restart.
-if [ -f "$HOME/ensemble.vsix" ]; then
-  code --no-sandbox --install-extension "$HOME/ensemble.vsix" --force >>"$HOME/.devbox-logs/runner.log" 2>&1
-fi
-
 while true; do
+  # Before every start, not only at boot: stopping the runner VS Code is then
+  # enough to pick up a newer ~/ensemble.vsix (installed into both profiles
+  # and pinned — see install-extension.sh).
+  if [ -f "$HOME/ensemble.vsix" ]; then
+    sh /usr/local/bin/devbox-install-extension "$HOME/ensemble.vsix" >>"$HOME/.devbox-logs/runner.log" 2>&1 || true
+  fi
   echo "$(date -u +%FT%TZ) starting runner VS Code on $WORKSPACE" >>"$HOME/.devbox-logs/runner.log"
   # --wait keeps this process in the foreground until the window closes.
   dbus-run-session -- code --wait --no-sandbox --disable-gpu --password-store=basic \
