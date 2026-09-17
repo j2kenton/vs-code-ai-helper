@@ -56,6 +56,23 @@ export type HostRelayRequestV1 =
       readonly idempotencyId: string;
       readonly timeoutMs?: number;
       readonly createdAt: string;
+    }
+  | {
+      readonly id: string;
+      readonly kind: "resolveDecision";
+      /** A pending workflow decision the runner raised (hostDecisionMirrorV1.ts). */
+      readonly decisionId: string;
+      readonly optionId: string;
+      readonly timeoutMs?: number;
+      readonly createdAt: string;
+    }
+  | {
+      readonly id: string;
+      readonly kind: "cancelOperation";
+      /** The runner's own id for a running operation it mirrored (hostOperationsMirrorV1.ts). */
+      readonly operationId: string;
+      readonly timeoutMs?: number;
+      readonly createdAt: string;
     };
 
 export interface HostRelayResponseV1 {
@@ -78,7 +95,9 @@ export interface HostRelayV1 {
   /** Viewer side: enqueue and wait. Rejects on timeout (the request file is removed then). */
   send(
     request: Omit<Extract<HostRelayRequestV1, { kind: "command" }>, "id" | "createdAt"> |
-      Omit<Extract<HostRelayRequestV1, { kind: "interaction" }>, "id" | "createdAt">,
+      Omit<Extract<HostRelayRequestV1, { kind: "interaction" }>, "id" | "createdAt"> |
+      Omit<Extract<HostRelayRequestV1, { kind: "resolveDecision" }>, "id" | "createdAt"> |
+      Omit<Extract<HostRelayRequestV1, { kind: "cancelOperation" }>, "id" | "createdAt">,
     options?: { readonly timeoutMs?: number; readonly pollMs?: number }
   ): Promise<HostRelayResponseV1>;
   /** Runner side: claim and answer every pending request, oldest first. Returns how many were handled. */

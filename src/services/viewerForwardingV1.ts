@@ -36,15 +36,38 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.nextStage",
   "vs-code-ai-helper.runPublishChecks",
   "vs-code-ai-helper.runLintingFixes",
+  // A chat send (its stage and message travel as the command argument);
+  // chatWithStage forwards only a send, opening the panel stays local.
+  "vs-code-ai-helper.chatWithStage",
 ]);
 
-export type ViewerCommandForwarderV1 = (commandId: string, taskFolderPath: string | undefined) => Promise<void>;
+export type ViewerCommandForwarderV1 = (
+  commandId: string,
+  taskFolderPath: string | undefined,
+  /** Extra fields for the runner's command argument, beside the task. */
+  commandArg?: Readonly<Record<string, unknown>>
+) => Promise<void>;
 
 let forwarder: ViewerCommandForwarderV1 | undefined;
 
 /** extension.ts installs the relay-backed forwarder during activation. */
 export function configureViewerCommandForwarderV1(next: ViewerCommandForwarderV1 | undefined): void {
   forwarder = next;
+}
+
+/** Forward one invocation to the runner directly (a command that forwards only some invocations). */
+export function forwardToRunnerV1(
+  commandId: string,
+  taskFolderPath: string | undefined,
+  commandArg?: Readonly<Record<string, unknown>>
+): Promise<void> {
+  if (!RELAYABLE_COMMAND_IDS_V1.has(commandId)) {
+    return Promise.reject(new Error(`${commandId} is not in RELAYABLE_COMMAND_IDS_V1 — the runner would refuse to run it`));
+  }
+  if (forwarder === undefined) {
+    return Promise.reject(new Error("This viewer window has no connection to the runner yet."));
+  }
+  return forwarder(commandId, taskFolderPath, commandArg);
 }
 
 /**

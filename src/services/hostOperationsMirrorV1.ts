@@ -31,6 +31,35 @@ export interface MirroredOperationV1 {
   readonly parentId?: string;
   readonly activity?: string;
   readonly waitingForUser: boolean;
+  /**
+   * The rest of the operation, so a viewer can put it in its own registry
+   * and every surface (stage spinners, Notifications rows) renders it as a
+   * local run. Optional only for snapshots written by an older runner.
+   */
+  readonly key?: string;
+  readonly stage?: string;
+  readonly kind?: string;
+  readonly detail?: string;
+  readonly modelId?: string;
+  readonly activityStartedAt?: number;
+  readonly exclusive?: boolean;
+  readonly cancellable?: boolean;
+  readonly resultTargetUri?: string;
+}
+
+/**
+ * Viewer side: the operations to show as running here — none once the
+ * runner has gone silent (a stopped runner's work must not keep spinning),
+ * and none written by a runner too old to say which task they belong to.
+ */
+export function liveMirroredOperationsV1(
+  snapshot: RunnerOperationsSnapshotV1 | undefined,
+  now: number
+): readonly (MirroredOperationV1 & { readonly key: string })[] {
+  if (snapshot === undefined || now - snapshot.writtenAt > RUNNER_OPERATIONS_STALE_MS_V1) {
+    return [];
+  }
+  return snapshot.operations.filter((op): op is MirroredOperationV1 & { readonly key: string } => typeof op.key === "string");
 }
 
 export interface RunnerOperationsSnapshotV1 {

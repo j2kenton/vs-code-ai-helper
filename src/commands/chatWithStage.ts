@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
+import { isViewerHostV1 } from "../state/hostRoleV1";
+import { forwardToRunnerV1 } from "../services/viewerForwardingV1";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
   IMPLEMENTATION_SUMMARY_FILENAME,
@@ -381,6 +383,9 @@ export async function chatWithStage(
   explicitArg?: ChatWithStageArg,
   currentTaskStore?: CurrentTaskStore
 ): Promise<void> {
+  if (isViewerHostV1()) {
+    return chatWithStageInViewerV1(inventory, chatViewProvider, explicitArg);
+  }
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
 
@@ -1152,6 +1157,37 @@ export async function resumeChatSendInteractionV1(
 }
 
 
+
+/**
+ * A viewer (hostRoleV1.ts) opens the conversation itself — no AI runs for
+ * that — and hands a send to the runner, which saves the message and runs
+ * the reply; the reply reaches this panel through chat-v1.json.
+ */
+async function chatWithStageInViewerV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  arg: ChatWithStageArg | undefined
+): Promise<void> {
+  const normalized = normalizeArg(arg);
+  const validated = await validateChatSendV1(inventory, normalized.resolverArg, normalized.stage);
+  if (!validated.ok) {
+    NotificationRouter.showWarning(validated.reason);
+    return;
+  }
+  await chatViewProvider.open({
+    canonicalId: validated.task.canonicalId,
+    taskFolderPath: validated.task.taskFolderPath,
+    stage: validated.targetStage,
+    taskName: validated.task.progress.displayName,
+  });
+  if (normalized.message?.trim()) {
+    await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", validated.task.taskFolderPath, {
+      stage: validated.targetStage,
+      taskName: validated.task.progress.displayName,
+      message: normalized.message,
+    });
+  }
+}
 
 export function registerChatWithStageCommand(context: vscode.ExtensionContext, inventory: TaskInventory, chatViewProvider: ChatViewProvider, currentTaskStore?: CurrentTaskStore): void {
   context.subscriptions.push(vscode.commands.registerCommand(

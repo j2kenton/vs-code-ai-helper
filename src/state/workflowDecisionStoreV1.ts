@@ -8,6 +8,8 @@ import {
 } from "../types/workflowDecisionV1";
 
 const STORAGE_KEY = "workflowDecisions";
+/** The Memento key holding every decision (hostDecisionMirrorV1.ts mirrors it into viewers). */
+export const WORKFLOW_DECISIONS_STORAGE_KEY_V1 = STORAGE_KEY;
 
 /**
  * `WorkflowDecisionStoreV1` is deliberately re-constructed independently at
@@ -29,6 +31,14 @@ function changeEmitterFor(state: vscode.Memento): vscode.EventEmitter<void> {
     changeEmitters.set(state, emitter);
   }
   return emitter;
+}
+
+/**
+ * Fire every store's change signal for `state` after its decisions changed
+ * outside this process (a viewer's mirror of the runner's decisions).
+ */
+export function notifyWorkflowDecisionsChangedV1(state: vscode.Memento): void {
+  changeEmitterFor(state).fire();
 }
 
 /**

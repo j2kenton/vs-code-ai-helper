@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   describeRunnerActivityV1,
+  liveMirroredOperationsV1,
   readRunnerOperationsSnapshotV1,
   RUNNER_OPERATIONS_STALE_MS_V1,
   writeRunnerOperationsSnapshotV1,
@@ -64,5 +65,13 @@ void describe("hostOperationsMirrorV1", () => {
     );
     assert.equal(stale.kind, "stale");
     assert.deepEqual(describeRunnerActivityV1({ writtenAt: old, operations: [] }, NOW), { kind: "idle" });
+  });
+
+  void it("a viewer shows only operations of a runner still writing, and only ones that name their task", () => {
+    const op = { id: "r", key: "/w/.ensemble/t", label: "Review", taskName: "t", startedAt: NOW, waitingForUser: false };
+    const legacy = { id: "old", label: "Review", taskName: "t", startedAt: NOW, waitingForUser: false };
+    assert.deepEqual(liveMirroredOperationsV1({ writtenAt: NOW, operations: [op, legacy] }, NOW), [op]);
+    assert.deepEqual(liveMirroredOperationsV1({ writtenAt: NOW - RUNNER_OPERATIONS_STALE_MS_V1 - 1, operations: [op] }, NOW), []);
+    assert.deepEqual(liveMirroredOperationsV1(undefined, NOW), []);
   });
 });

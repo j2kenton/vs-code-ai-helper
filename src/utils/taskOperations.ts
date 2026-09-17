@@ -374,6 +374,18 @@ export class TaskOperationRegistry implements vscode.Disposable {
   // to views cannot reach a token source (cancel goes through cancelOperation).
   private readonly tokenSources = new Map<string, vscode.CancellationTokenSource>();
   private operationSeq = 0;
+  /**
+   * Operations another window is running (hostOperationsMirrorV1.ts): a
+   * viewer shows the runner's work through every DISPLAY query below — tree
+   * spinners, the Notifications rows and progress bar, badges — exactly as a
+   * local run shows it. They never take part in admission (`begin`), never
+   * hand out a token or root id to code running here, never end() (so no
+   * terminal notification is invented here), and are never persisted as
+   * "interrupted". Cancel is forwarded to the window that owns the work.
+   */
+  private mirrored = new Map<string, Map<string, MutableOperation>>();
+  private mirroredSignature = "";
+  private mirroredCancel: ((operationId: string) => void) | undefined;
   private pendingChange = false;
   // Coalesced with OR across every change batched into the same microtask,
   // so a persistence-relevant change is never masked by a later
@@ -390,6 +402,51 @@ export class TaskOperationRegistry implements vscode.Disposable {
       this.pendingPersistenceRelevant = false;
       this._onDidChange.fire({ persistenceRelevant: relevant });
     });
+  }
+
+  /** Every operation map, local first, then mirrored — for display queries only. */
+  private allKeyMaps(): Map<string, MutableOperation>[] {
+    return [...this.operations.values(), ...this.mirrored.values()];
+  }
+
+  /**
+   * Replace the mirrored operations with `snapshots` (ids as the owning
+   * window knows them; they are namespaced here so they never collide with
+   * this window's own `op-N` ids). An unchanged set fires nothing.
+   */
+  setMirroredOperations(snapshots: readonly TaskOperationSnapshot[]): void {
+    const signature = JSON.stringify(snapshots);
+    if (signature === this.mirroredSignature) {return;}
+    this.mirroredSignature = signature;
+    const next = new Map<string, Map<string, MutableOperation>>();
+    for (const snap of snapshots) {
+      const key = taskKey(snap.key);
+      let keyMap = next.get(key);
+      if (!keyMap) {
+        keyMap = new Map();
+        next.set(key, keyMap);
+      }
+      const id = MIRRORED_OPERATION_ID_PREFIX + snap.id;
+      keyMap.set(id, {
+        ...snap,
+        id,
+        key,
+        ...(snap.parentId !== undefined ? { parentId: MIRRORED_OPERATION_ID_PREFIX + snap.parentId } : {}),
+        state: "running",
+        stageGeneration: 0,
+      });
+    }
+    this.mirrored = next;
+    this.triggerChange(false);
+  }
+
+  isMirroredOperation(id: string): boolean {
+    return id.startsWith(MIRRORED_OPERATION_ID_PREFIX);
+  }
+
+  /** Where a cancel of a mirrored operation goes (receives the owning window's id). */
+  configureMirroredOperationCancel(handler: ((operationId: string) => void) | undefined): void {
+    this.mirroredCancel = handler;
   }
 
   begin(taskPath: string, spec: TaskOperationSpec): TaskOperationHandle | null {
@@ -700,6 +757,18 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * removal.
    */
   cancelOperation(id: string): boolean {
+    if (this.isMirroredOperation(id)) {
+      for (const keyMap of this.mirrored.values()) {
+        const op = keyMap.get(id);
+        if (op && op.cancellable && this.mirroredCancel) {
+          op.detail = "cancelling…";
+          this.mirroredCancel(id.slice(MIRRORED_OPERATION_ID_PREFIX.length));
+          this.triggerChange(false);
+          return true;
+        }
+      }
+      return false;
+    }
     for (const keyMap of this.operations.values()) {
       const op = keyMap.get(id);
       if (op) {
@@ -754,14 +823,13 @@ export class TaskOperationRegistry implements vscode.Disposable {
 
   getTaskOperations(taskPath: string): readonly TaskOperationSnapshot[] {
     const key = taskKey(taskPath);
-    const keyMap = this.operations.get(key);
-    if (!keyMap) {return [];}
-    return Array.from(keyMap.values()).sort((a, b) => a.startedAt - b.startedAt);
+    return [...(this.operations.get(key)?.values() ?? []), ...(this.mirrored.get(key)?.values() ?? [])]
+      .sort((a, b) => a.startedAt - b.startedAt);
   }
 
   getAll(): readonly TaskOperationSnapshot[] {
     const all: TaskOperationSnapshot[] = [];
-    for (const keyMap of this.operations.values()) {
+    for (const keyMap of this.allKeyMaps()) {
       all.push(...keyMap.values());
     }
     return all.sort((a, b) => a.startedAt - b.startedAt);
@@ -776,7 +844,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
    */
   getRootOperations(): readonly TaskOperationSnapshot[] {
     const roots: TaskOperationSnapshot[] = [];
-    for (const keyMap of this.operations.values()) {
+    for (const keyMap of this.allKeyMaps()) {
       const ops = Array.from(keyMap.values());
       for (const op of ops) {
         if (op.parentId !== undefined) {continue;}
@@ -819,7 +887,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * call it separately from getRootOperations().
    */
   getDisplayStage(rootId: string): TaskStage | undefined {
-    for (const keyMap of this.operations.values()) {
+    for (const keyMap of this.allKeyMaps()) {
       const root = keyMap.get(rootId);
       if (!root) {continue;}
       const ops = Array.from(keyMap.values());
@@ -846,13 +914,23 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * does this leaf's spinner belong to" logic lives in exactly one place.
    */
   private leafStages(taskPath: string, predicate: (op: MutableOperation) => boolean): TaskStage[] {
-    const keyMap = this.operations.get(taskKey(taskPath));
-    if (!keyMap) {return [];}
+    const key = taskKey(taskPath);
+    const stages = new Set<TaskStage>();
+    for (const keyMap of [this.operations.get(key), this.mirrored.get(key)]) {
+      if (keyMap) {this.collectLeafStages(keyMap, predicate, stages);}
+    }
+    return [...stages];
+  }
+
+  private collectLeafStages(
+    keyMap: Map<string, MutableOperation>,
+    predicate: (op: MutableOperation) => boolean,
+    stages: Set<TaskStage>
+  ): void {
     const ops = Array.from(keyMap.values());
     const parentIds = new Set(
       ops.map(op => op.parentId).filter((id): id is string => id !== undefined)
     );
-    const stages = new Set<TaskStage>();
     for (const op of ops) {
       if (parentIds.has(op.id)) {continue;} // has running children — not a leaf
       if (!predicate(op)) {continue;}
@@ -862,7 +940,6 @@ export class TaskOperationRegistry implements vscode.Disposable {
       }
       if (node?.stage !== undefined) {stages.add(node.stage);}
     }
-    return [...stages];
   }
 
   /**
@@ -890,7 +967,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   hasAny(): boolean {
-    return this.operations.size > 0;
+    return this.operations.size > 0 || this.mirrored.size > 0;
   }
 
   /**
@@ -902,7 +979,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * the user and therefore not "in progress" from the user's perspective).
    */
   hasAnyRunning(): boolean {
-    for (const keyMap of this.operations.values()) {
+    for (const keyMap of this.allKeyMaps()) {
       for (const op of keyMap.values()) {
         if (op.parentId === undefined && !op.waitingForUser) {return true;}
       }
@@ -928,6 +1005,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
     this._onDidEnd.dispose();
   }
 }
+
+/** Namespace for operations mirrored from another window (see `setMirroredOperations`). */
+export const MIRRORED_OPERATION_ID_PREFIX = "runner:";
 
 export const taskOperations = new TaskOperationRegistry();
 

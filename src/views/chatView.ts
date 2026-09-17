@@ -147,6 +147,12 @@ export interface ChatInteractionServicesV1 {
    */
   validateSend?(target: ChatTarget, text: string): Promise<ChatInteractionServiceResultV1>;
   /**
+   * A viewer window (hostRoleV1.ts) answers a workflow decision by handing it
+   * to the runner that raised it. Unset everywhere else: the decision is
+   * resolved and its effect run in this window.
+   */
+  resolveWorkflowDecision?(decisionId: string, optionId: string): Promise<void>;
+  /**
    * Resolve a task's current lifecycle status from the shared inventory.
    * Used by render() to hide (never delete) the stored conversation of a
    * completed/archived task; resume/reopen flips the status back to active
@@ -725,7 +731,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // route rejects without mutating the transcript (the downstream
         // chatWithStage handler would only throw after this write).
         try {
-          assertLegacyAiRouteAllowedV0("chatSend.v1");
+          // A viewer's send runs on the runner (chatWithStage forwards it),
+          // where this same gate is consulted.
+          if (!isViewerHostV1()) {
+            assertLegacyAiRouteAllowedV0("chatSend.v1");
+          }
         } catch (error) {
           NotificationRouter.showError(
             error instanceof Error ? error.message : String(error)
@@ -1792,6 +1802,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     target: ChatTarget,
     decisions: readonly WorkflowDecisionV1[]
   ): Promise<readonly WorkflowDecisionV1[]> {
+    if (isViewerHostV1()) {
+      // The runner's decisions (hostDecisionMirrorV1.ts): withdrawing them is
+      // the runner's call, and the "Withdrawn" line it writes is shared.
+      return decisions;
+    }
     const fresh: WorkflowDecisionV1[] = [];
     const stale: { decision: WorkflowDecisionV1; reason: string }[] = [];
     for (const decision of decisions) {
@@ -1852,7 +1867,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * target switch mid-race still acknowledges the task the click actually
    * came from, not whatever is open when the store call returns.
    */
-  private async resolveWorkflowDecision(decisionId: string, optionId: string): Promise<void> {
+  async resolveWorkflowDecision(decisionId: string, optionId: string): Promise<void> {
+    if (this.interactionServices?.resolveWorkflowDecision) {
+      await this.interactionServices.resolveWorkflowDecision(decisionId, optionId);
+      return;
+    }
     const clickIdentity =
       this.target && this.target.kind !== "global" ? this.target : undefined;
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);

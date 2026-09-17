@@ -336,7 +336,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   private persistRunningOperations(): void {
     if (!this.state) return;
-    const snapshots = taskOperations.getRootOperations().map(serializeOperation);
+    // Another window's work (mirrored) is not interrupted by THIS window's reload.
+    const snapshots = taskOperations
+      .getRootOperations()
+      .filter((op) => !taskOperations.isMirroredOperation(op.id))
+      .map(serializeOperation);
     this.writes = this.writes.then(() => this.state!.update(RUNNING_OPERATIONS_STATE_KEY, snapshots));
     void this.writes.catch(() => undefined);
   }

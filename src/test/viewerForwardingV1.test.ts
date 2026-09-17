@@ -8,6 +8,7 @@ import { configureEnsembleHostRoleForTestV1 } from "../state/hostRoleV1";
 import {
   configureViewerCommandForwarderV1,
   forwardInViewerV1,
+  forwardToRunnerV1,
   RELAYABLE_COMMAND_IDS_V1,
   taskFolderPathFromCommandArgV1,
 } from "../services/viewerForwardingV1";
@@ -60,6 +61,18 @@ void describe("viewerForwardingV1", () => {
     for (const junk of [undefined, null, "x", 7, {}, { task: {} }, { taskFolderPath: "" }]) {
       assert.equal(taskFolderPathFromCommandArgV1(junk), undefined);
     }
+  });
+
+  void it("forwards one invocation directly, with the extra command argument (a chat send)", async () => {
+    await assert.rejects(forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t"), /no connection/);
+    const forwarded: unknown[] = [];
+    configureViewerCommandForwarderV1((commandId, taskFolderPath, commandArg) => {
+      forwarded.push([commandId, taskFolderPath, commandArg]);
+      return Promise.resolve();
+    });
+    await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" });
+    assert.deepEqual(forwarded, [["vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }]]);
+    await assert.rejects(forwardToRunnerV1("vs-code-ai-helper.commitAndPushTask", "/t"), /RELAYABLE_COMMAND_IDS_V1/);
   });
 
   void it("refuses to wrap a command the runner would not run", () => {

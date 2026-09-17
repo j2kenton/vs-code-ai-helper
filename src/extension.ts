@@ -4,8 +4,20 @@ import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./sta
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
 import { configureViewerCommandForwarderV1, RELAYABLE_COMMAND_IDS_V1 } from "./services/viewerForwardingV1";
 import {
+  createMirroredDecisionsMementoV1,
+  HOST_DECISIONS_MIRROR_FILENAME_V1,
+  readRunnerDecisionsSnapshotV1,
+  writeRunnerDecisionsSnapshotV1,
+} from "./services/hostDecisionMirrorV1";
+import {
+  notifyWorkflowDecisionsChangedV1,
+  WORKFLOW_DECISIONS_STORAGE_KEY_V1,
+  WorkflowDecisionStoreV1,
+} from "./state/workflowDecisionStoreV1";
+import {
   describeRunnerActivityV1,
   HOST_OPERATIONS_MIRROR_FILENAME_V1,
+  liveMirroredOperationsV1,
   readRunnerOperationsSnapshotV1,
   RUNNER_OPERATIONS_HEARTBEAT_MS_V1,
   writeRunnerOperationsSnapshotV1,
@@ -138,6 +150,8 @@ import { installOperationNotificationBridge } from "./utils/operationNotificatio
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
+import type { OperationKind } from "./utils/operationTaxonomy";
+import type { TaskStage } from "./types/taskProgress";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
 import { normalizePath, resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
@@ -309,7 +323,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const inventory = new TaskInventory();
 
   const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
-  const chatViewProvider = new ChatViewProvider(context.workspaceState);
+  // A viewer's chat and tree read the RUNNER's pending decisions
+  // (hostDecisionMirrorV1.ts); every other workspaceState key stays its own.
+  const viewerDecisions = viewerHost
+    ? createMirroredDecisionsMementoV1(context.workspaceState, WORKFLOW_DECISIONS_STORAGE_KEY_V1)
+    : undefined;
+  const decisionsState = viewerDecisions?.memento ?? context.workspaceState;
+  const chatViewProvider = new ChatViewProvider(decisionsState);
   context.subscriptions.push(chatViewProvider);
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
@@ -564,6 +584,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     getTaskStatus: (canonicalId) => inventory.getTaskById(canonicalId)?.progress.status,
     validateSend: (target, text) =>
       runnerInteractionServices.validateSend?.(target, text) ?? Promise.resolve({ ok: true }),
+    // The decision is the runner's: it resolves it and runs the chosen
+    // option's effect there, exactly as a click on the runner would.
+    resolveWorkflowDecision: async (decisionId, optionId) => {
+      if (hostRelay === undefined) {
+        NotificationRouter.showWarning(relayUnavailable.reason);
+        return;
+      }
+      try {
+        const response = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: "Sending your decision to the runner…" },
+          () =>
+            hostRelay.send(
+              { kind: "resolveDecision", decisionId, optionId },
+              { timeoutMs: RELAYED_ACTION_TIMEOUT_MS_V1 }
+            )
+        );
+        if (!response.ok) {
+          NotificationRouter.showWarning(`The runner could not apply your decision: ${response.reason ?? "unknown reason"}`);
+        }
+      } catch (error) {
+        NotificationRouter.showWarning(
+          `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    },
   };
   chatViewProvider.setInteractionServices(viewerHost ? viewerInteractionServices : runnerInteractionServices);
 
@@ -615,6 +660,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           return relayedResume(request);
         }
+        if (request.kind === "resolveDecision") {
+          await chatViewProvider.resolveWorkflowDecision(request.decisionId, request.optionId);
+          return undefined;
+        }
+        if (request.kind === "cancelOperation") {
+          // A viewer's Stop button on a row it mirrors from this runner.
+          if (!taskOperations.cancelOperation(request.operationId)) {
+            throw new Error("the operation can no longer be cancelled (it may have just finished)");
+          }
+          return undefined;
+        }
         // Only the actions a viewer offers may be relayed: anything that can
         // write the relay directory (a CLI coding agent running in this
         // workspace, say) must not get arbitrary command execution here.
@@ -628,7 +684,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (taskFolderPath !== undefined) {
           await currentTaskStore.set(taskFolderPath);
         }
-        const taskArg = taskFolderPath !== undefined ? { taskFolderPath, canonicalId: taskFolderPath } : undefined;
+        // A command that needs more than the task (a chat send's stage and
+        // message) sends it as its first argument; the task stays the one
+        // named by the request.
+        const extraArg = request.args?.[0];
+        const extra = typeof extraArg === "object" && extraArg !== null ? (extraArg as Record<string, unknown>) : {};
+        const taskArg =
+          taskFolderPath !== undefined ? { ...extra, taskFolderPath, canonicalId: taskFolderPath } : undefined;
         const result: unknown = await vscode.commands.executeCommand(request.command, taskArg);
         if (result === false) {
           throw new Error("the runner declined the action (see its Notifications view)");
@@ -707,9 +769,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * runner. Never rejects — a rejection from a command handler is what
    * produced VS Code's raw "Error running command" toast.
    */
-  async function forwardCommandToRunner(commandId: string, taskFolderPath: string | undefined): Promise<void> {
+  async function forwardCommandToRunner(
+    commandId: string,
+    taskFolderPath: string | undefined,
+    commandArg?: Readonly<Record<string, unknown>>
+  ): Promise<void> {
     const task = taskFolderPath ?? currentTaskStore.get();
-    const label = RUN_ON_RUNNER_ACTIONS_V1.find((action) => action.command === commandId)?.label ?? commandId;
+    const label =
+      commandId === "vs-code-ai-helper.chatWithStage"
+        ? "Chat reply"
+        : RUN_ON_RUNNER_ACTIONS_V1.find((action) => action.command === commandId)?.label ?? commandId;
     if (hostRelay === undefined) {
       NotificationRouter.showWarning("No workspace folder is open — there is no runner to send this to.");
       return;
@@ -723,7 +792,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         { location: vscode.ProgressLocation.Notification, title: `Running on the runner: ${label}` },
         () =>
           hostRelay.send(
-            { kind: "command", command: commandId, taskFolderPath: task },
+            {
+              kind: "command",
+              command: commandId,
+              taskFolderPath: task,
+              ...(commandArg !== undefined ? { args: [commandArg] } : {}),
+            },
             { timeoutMs: RELAYED_ACTION_TIMEOUT_MS_V1 }
           )
       );
@@ -767,7 +841,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
   // Tasks tree view: persistent visibility of workflow progress.
-  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, context.workspaceState);
+  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, decisionsState);
   context.subscriptions.push(taskTreeProvider);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
@@ -1180,14 +1254,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const operations = taskOperations
         .getAll()
         .filter((op) => op.state === "running")
+        .filter((op) => !taskOperations.isMirroredOperation(op.id))
         .map((op) => ({
           id: op.id,
+          key: op.key,
           label: op.label,
           taskName: op.taskName,
           startedAt: op.startedAt,
           waitingForUser: op.waitingForUser,
+          exclusive: op.exclusive,
+          cancellable: op.cancellable,
           ...(op.parentId !== undefined ? { parentId: op.parentId } : {}),
+          ...(op.stage !== undefined ? { stage: op.stage } : {}),
+          ...(op.kind !== undefined ? { kind: op.kind } : {}),
+          ...(op.detail !== undefined ? { detail: op.detail } : {}),
+          ...(op.modelId !== undefined ? { modelId: op.modelId } : {}),
           ...(op.activity !== undefined ? { activity: op.activity } : {}),
+          ...(op.activityStartedAt !== undefined ? { activityStartedAt: op.activityStartedAt } : {}),
+          ...(op.resultTargetUri !== undefined ? { resultTargetUri: op.resultTargetUri } : {}),
         }));
       void writeRunnerOperationsSnapshotV1(relayDir, { writtenAt: Date.now(), operations });
     };
@@ -1197,6 +1281,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         writeTimer = setTimeout(writeSnapshot, 500);
       }
     };
+    // Pending decisions, for viewers (hostDecisionMirrorV1.ts). Re-written on
+    // the heartbeat too: an in-process orphan mark changes what is pending
+    // without a store write.
+    const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+    let lastDecisionsSignature: string | undefined;
+    const writeDecisions = (): void => {
+      const pending = decisionStore.listPending();
+      const signature = JSON.stringify(pending);
+      if (signature !== lastDecisionsSignature) {
+        lastDecisionsSignature = signature;
+        void writeRunnerDecisionsSnapshotV1(relayDir, pending);
+      }
+    };
+    const decisionsListener = decisionStore.onDidChange(writeDecisions);
+    const decisionsHeartbeat = setInterval(writeDecisions, RUNNER_OPERATIONS_HEARTBEAT_MS_V1);
+    writeDecisions();
+    context.subscriptions.push(decisionsListener, { dispose: () => clearInterval(decisionsHeartbeat) });
     const operationsListener = taskOperations.onDidChange(scheduleSnapshot);
     // The heartbeat is what lets a viewer tell "still running" from "the
     // runner stopped writing".
@@ -1212,39 +1313,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
   }
   if (viewerHost && relayDir !== undefined) {
+    // The runner's operations go into this window's own registry, so the
+    // stage-row spinners, the Notifications rows, the progress bar and the
+    // badges all render them exactly as they render a local run.
+    taskOperations.configureMirroredOperationCancel((operationId) => {
+      void hostRelay
+        ?.send({ kind: "cancelOperation", operationId }, { timeoutMs: 60 * 1000 })
+        .then((response) => {
+          if (!response.ok) {
+            NotificationRouter.showWarning(`The runner could not cancel the operation: ${response.reason ?? "unknown reason"}`);
+          }
+        })
+        .catch((error: unknown) => {
+          NotificationRouter.showWarning(
+            `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+    });
     const runnerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     runnerStatus.command = `${STATUS_VIEW_ID}.focus`;
-    let resolveRunnerProgress: (() => void) | undefined;
     const refreshRunnerStatus = async (): Promise<void> => {
-      const view = describeRunnerActivityV1(await readRunnerOperationsSnapshotV1(relayDir), Date.now());
-      if (view.kind === "running") {
-        runnerStatus.text = `${view.waitingForUser ? "$(bell)" : "$(sync~spin)"} ${view.text}`;
-        runnerStatus.tooltip = [
-          view.waitingForUser ? "The runner is waiting for you (see Chat With AI)." : "Running on the runner:",
-          ...view.details,
-        ].join("\n");
+      const snapshot = await readRunnerOperationsSnapshotV1(relayDir);
+      const now = Date.now();
+      taskOperations.setMirroredOperations(
+        liveMirroredOperationsV1(snapshot, now).map((op) => ({
+          ...op,
+          stage: op.stage as TaskStage | undefined,
+          kind: op.kind as OperationKind | undefined,
+          exclusive: op.exclusive ?? op.parentId === undefined,
+          cancellable: op.cancellable ?? false,
+          state: "running" as const,
+        }))
+      );
+      // Only what the registry cannot say: the runner went silent.
+      const view = describeRunnerActivityV1(snapshot, now);
+      if (view.kind === "stale") {
+        runnerStatus.text = "$(warning) Runner not responding";
+        runnerStatus.tooltip = `The runner stopped reporting ${Math.round(view.sinceMs / 60000)} min ago while work was listed as running. Is the runner VS Code on the box up?`;
         runnerStatus.show();
-        // The same progress bar a local run shows on the Notifications view.
-        if (resolveRunnerProgress === undefined && !view.waitingForUser) {
-          void vscode.window.withProgress(
-            { location: { viewId: STATUS_VIEW_ID } },
-            () => new Promise<void>((resolve) => {
-              resolveRunnerProgress = resolve;
-            })
-          );
-        }
       } else {
-        if (view.kind === "stale") {
-          runnerStatus.text = "$(warning) Runner not responding";
-          runnerStatus.tooltip = `The runner stopped reporting ${Math.round(view.sinceMs / 60000)} min ago while work was listed as running. Is the runner VS Code on the box up?`;
-          runnerStatus.show();
-        } else {
-          runnerStatus.hide();
-        }
-      }
-      if ((view.kind !== "running" || view.waitingForUser) && resolveRunnerProgress !== undefined) {
-        resolveRunnerProgress();
-        resolveRunnerProgress = undefined;
+        runnerStatus.hide();
       }
     };
     const operationsWatcher = vscode.workspace.createFileSystemWatcher(
@@ -1252,12 +1360,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     operationsWatcher.onDidCreate(() => void refreshRunnerStatus());
     operationsWatcher.onDidChange(() => void refreshRunnerStatus());
-    const operationsTimer = setInterval(() => void refreshRunnerStatus(), 10 * 1000);
+    const refreshRunnerDecisions = async (): Promise<void> => {
+      if (viewerDecisions?.setDecisions(await readRunnerDecisionsSnapshotV1(relayDir))) {
+        notifyWorkflowDecisionsChangedV1(decisionsState);
+      }
+    };
+    const decisionsWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(relayDir, HOST_DECISIONS_MIRROR_FILENAME_V1)
+    );
+    decisionsWatcher.onDidCreate(() => void refreshRunnerDecisions());
+    decisionsWatcher.onDidChange(() => void refreshRunnerDecisions());
+    context.subscriptions.push(decisionsWatcher);
+    const operationsTimer = setInterval(() => {
+      void refreshRunnerStatus();
+      void refreshRunnerDecisions();
+    }, 10 * 1000);
     void refreshRunnerStatus();
+    void refreshRunnerDecisions();
     context.subscriptions.push(runnerStatus, operationsWatcher, {
       dispose: () => {
         clearInterval(operationsTimer);
-        resolveRunnerProgress?.();
+        taskOperations.setMirroredOperations([]);
+        taskOperations.configureMirroredOperationCancel(undefined);
       },
     });
   }
