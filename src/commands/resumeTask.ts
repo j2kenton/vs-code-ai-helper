@@ -165,15 +165,17 @@ export type ResumePausedTaskOutcomeV1 =
  * Uses patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
  * scheduled metadata, lint results) when writing the updated status.
  *
- * `options.arrangeStageDispatch` (default `true`) controls whether this
+ * `options.arrangeStageDispatch` (default `false`) controls whether this
  * function itself durably arranges the current stage's action to run once
- * the task is active (v1 fixes item 1, Part 1a step 5 — "resume must arrange
- * work, not just change a status"). The five `resumeAndXxxV1` helpers below
- * pass `false`: each of them already dispatches its OWN specific follow-up
- * command moments after this resolves, so leaving arrangement on here would
- * durably schedule a SECOND, possibly different, stage action alongside their
- * explicit one. Only the bare `resumeTask` command (and any other caller with
- * no follow-up dispatch of its own) needs this function to arrange one.
+ * the task is active. It defaulted to `true` from v1 fixes item 1 ("resume
+ * must arrange work, not just change a status") until 2026-09-17, when the
+ * bare Resume button on a task still at `desc` re-ran Draft with AI on every
+ * press — 28 provider runs nobody asked for. The product rule that decided
+ * it: Resume means resume. It flips the status and nothing else; anything
+ * that starts work is a separate, explicitly labelled action the user chose
+ * (the `resumeAndXxxV1` helpers below, whose labels say what they dispatch).
+ * Nothing infers what the user "must have wanted". The option stays only so
+ * a caller can opt in deliberately; the bare `resumeTask` command never does.
  *
  * `options.holdAdmissionForCaller` (default `false`, review completion
  * blocker 2026-09-08): when `true`, this function does NOT release its own
@@ -211,7 +213,7 @@ export async function resumePausedTask(
   explicitArg?: ResumeTaskArg,
   options?: { readonly arrangeStageDispatch?: boolean; readonly holdAdmissionForCaller?: boolean }
 ): Promise<ResumePausedTaskOutcomeV1> {
-  const arrangeStageDispatch = options?.arrangeStageDispatch ?? true;
+  const arrangeStageDispatch = options?.arrangeStageDispatch ?? false;
   const holdAdmissionForCaller = options?.holdAdmissionForCaller ?? false;
   // Block on the startup gate's classification pass before this lifecycle
   // command's first task-state read, so it cannot race the read-only

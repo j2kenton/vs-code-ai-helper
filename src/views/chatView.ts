@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
+import { isViewerHostV1 } from "../state/hostRoleV1";
 import * as path from "path";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
@@ -1499,12 +1500,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // await, closes that gap uniformly at this one shared boundary instead of
     // requiring every current and future resume handler to duplicate its own
     // admission check.
-    const admission = await acquireWorkAdmissionV1({
-      taskFolderPath: unavailableIdentity.taskFolderPath,
-      purpose: "admission",
-      commandId: "chatResumeInteractionV1",
-    });
-    if (admission.outcome !== "acquired") {
+    // A VIEWER window (hostRoleV1.ts) forwards Resume to the runner, which
+    // acquires admission for the task itself; holding it here for the whole
+    // relayed round trip would make the runner's own acquisition refuse as
+    // "busy, held by another host".
+    const admission = isViewerHostV1()
+      ? undefined
+      : await acquireWorkAdmissionV1({
+          taskFolderPath: unavailableIdentity.taskFolderPath,
+          purpose: "admission",
+          commandId: "chatResumeInteractionV1",
+        });
+    if (admission !== undefined && admission.outcome !== "acquired") {
       const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(admission)}`;
       NotificationRouter.showWarning(declineMessage);
       await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
@@ -1513,7 +1520,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       return;
     }
-    const admissionHandle: WorkAdmissionHandleV1 = admission.handle;
+    const admissionHandle: WorkAdmissionHandleV1 | undefined =
+      admission?.outcome === "acquired" ? admission.handle : undefined;
     const admissionHeartbeat = admissionHandle
       ? setInterval(() => void admissionHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
       : undefined;
@@ -1571,12 +1579,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               NotificationRouter.showWarning(declineMessage);
               return;
             }
-            await settleChatInteraction(
-              identity.taskFolderPath,
-              identity.canonicalId,
-              clientRef.interactionId,
-              result.settlement
-            );
+            // A viewer's Resume ran on the runner, which settles the shared
+            // mirror itself (extension.ts's relay executor) — so the record
+            // is settled even if this window's wait for the answer times out.
+            if (!isViewerHostV1()) {
+              await settleChatInteraction(
+                identity.taskFolderPath,
+                identity.canonicalId,
+                clientRef.interactionId,
+                result.settlement
+              );
+            }
             resumed = true;
           } finally {
             if (admissionHandoffTokenV1) {

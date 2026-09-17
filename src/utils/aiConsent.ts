@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { isRunnerHostV1 } from "../state/hostRoleV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 
 /**
@@ -37,6 +38,12 @@ export async function ensureAiConsent(
 ): Promise<boolean> {
   const existing = context.workspaceState.get<ConsentRecord>(CONSENT_KEY);
   if (existing && existing.version === DISCLAIMER_VERSION) {
+    return true;
+  }
+  // The cloud RUNNER is unattended: a modal here would hang every relayed
+  // action forever. Its operator accepted the disclaimer by setting the
+  // runner up to run their workflow (hostRoleV1.ts).
+  if (isRunnerHostV1()) {
     return true;
   }
 

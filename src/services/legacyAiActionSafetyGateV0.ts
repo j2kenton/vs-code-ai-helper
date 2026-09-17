@@ -110,6 +110,8 @@
  * statically asserts this file's production initializers.
  */
 
+import { assertAiExecutionAllowedInThisHostV1 } from "../state/hostRoleV1";
+
 /** Stable identity for every baseline question-capable or edit-capable AI route (plan §1.2's route table). */
 export type LegacyAiRouteIdV0 =
   | "draft.v1"
@@ -186,6 +188,9 @@ export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>(
  * adding its id to `LEGACY_AI_ROUTE_DISABLED_V0`.
  */
 export function assertLegacyAiRouteAllowedV0(routeId: string): void {
+  // A viewer window (cloud runner/viewer split, hostRoleV1.ts) never runs an
+  // AI route: this is the user-facing refusal, before any read or consent.
+  assertAiExecutionAllowedInThisHostV1();
   if (!REGISTERED_LEGACY_AI_ROUTE_IDS_V0.has(routeId)) {
     throw new LegacyAiActionSafetyGateErrorV0(
       `Unregistered AI action route id: ${JSON.stringify(routeId)}. Every baseline ` +

@@ -5,6 +5,10 @@
 set -u
 export DISPLAY=:99
 export HOME=/home/dev
+# This VS Code is THE runner (src/state/hostRoleV1.ts): it executes every
+# task; Remote-SSH windows on this box are viewers (see run.sh, which writes
+# that role into the VS Code server's machine settings).
+export ENSEMBLE_HOST_ROLE=runner
 WORKSPACE="${ENSEMBLE_RUNNER_WORKSPACE:-/workspace/vs-code-ai-helper}"
 mkdir -p "$HOME/.devbox-logs"
 

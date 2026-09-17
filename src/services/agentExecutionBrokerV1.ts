@@ -39,6 +39,7 @@ import {
 } from "../types/agentExecutionV1";
 import { createHash } from "crypto";
 import { MIGRATED_ACTION_KEYS_V0 } from "./legacyAiActionSafetyGateV0";
+import { assertAiExecutionAllowedInThisHostV1 } from "../state/hostRoleV1";
 import { BoundedResultStoreV1 } from "./boundedResultStoreV1";
 import { ClaimedReservationV1 } from "./providerSelectionPolicyV1";
 
@@ -282,6 +283,9 @@ export function prepareAgentInvocationV1(
   claimedReservation: ClaimedReservationV1,
   transport: AgentTransportV1
 ): PreparedAgentInvocationV1 {
+  // Provider-boundary backstop for the cloud viewer/runner split: a viewer
+  // host never reaches a provider, whatever path led here (hostRoleV1.ts).
+  assertAiExecutionAllowedInThisHostV1();
   validateRequest(request, claimedReservation, transport);
   // Consume the reservation's single invocation before any provider work; a
   // second execution with the same claimed reservation throws here.

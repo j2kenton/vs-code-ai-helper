@@ -113,6 +113,12 @@
         "icon": "$(target)"
       },
       {
+        "command": "vs-code-ai-helper.runOnRunner",
+        "title": "Run on Runner…",
+        "category": "Ensemble",
+        "icon": "$(cloud-upload)"
+      },
+      {
         "command": "vs-code-ai-helper.refreshTasksView",
         "title": "Refresh Tasks",
         "category": "Ensemble",
@@ -561,11 +567,22 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "vs-code-ai-helper.runOnRunner",
+          "when": "vs-code-ai-helper.hostRole == viewer"
+        }
+      ],
       "view/title": [
         {
           "command": "vs-code-ai-helper.startNewTask",
           "when": "view == vs-code-ai-helper.tasksView",
           "group": "navigation@1"
+        },
+        {
+          "command": "vs-code-ai-helper.runOnRunner",
+          "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.hostRole == viewer",
+          "group": "navigation@0"
         },
         {
           "command": "vs-code-ai-helper.refreshTasksView",
@@ -929,6 +946,22 @@
           "scope": "window",
           "description": "Maximum rounds for one Fast Forward run (1–99, default 5). Applies only after a fast-forward is explicitly started — this cap never starts one by itself."
         },
+        "ensemble.hostRole": {
+          "type": "string",
+          "enum": [
+            "standalone",
+            "runner",
+            "viewer"
+          ],
+          "enumDescriptions": [
+            "This window runs the workflow itself (the default).",
+            "The always-on VS Code on a cloud box that runs every task; never prompts for the auto-implement confirmation.",
+            "A window that only shows tasks and chat, and forwards actions and answers to the runner on the same box. Never runs AI itself."
+          ],
+          "default": "standalone",
+          "scope": "machine-overridable",
+          "markdownDescription": "Cloud runner/viewer split. The `ENSEMBLE_HOST_ROLE` environment variable, when set, overrides this setting. Fixed for the life of the window: change it, then reload."
+        },
         "ensemble.autoAdvanceEnabled": {
           "type": [
             "string",
@@ -1189,6 +1222,18 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "vs-code-ai-helper.hostRole": {
+          "deprecationMessage": "Use `ensemble.hostRole` instead.",
+          "type": "string",
+          "enum": [
+            "standalone",
+            "runner",
+            "viewer"
+          ],
+          "default": "standalone",
+          "scope": "machine-overridable",
+          "description": "Cloud runner/viewer split: standalone (default), runner, or viewer."
         },
         "vs-code-ai-helper.modelSettings": {
           "deprecationMessage": "Use `ensemble.modelSettings` instead.",

@@ -78,6 +78,7 @@ import {
   ProviderChainExhaustionV1,
 } from "../types/taskActionOutcomeV1";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
+import { assertAiExecutionAllowedInThisHostV1 } from "../state/hostRoleV1";
 
 type EffectiveProvider =
   | { kind: "copilot"; model: string | undefined }
@@ -969,6 +970,9 @@ export async function runImplementationForModel(options: {
     actualStoredModelId: string | undefined;
   }
 > {
+  // The CLI edit path bypasses the broker: it needs the viewer/runner
+  // backstop of its own (hostRoleV1.ts).
+  assertAiExecutionAllowedInThisHostV1();
   assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
   const primaryProviderLabel = toResolvedRunner(effective).providerLabel;

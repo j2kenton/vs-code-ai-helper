@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { isViewerHostV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "../state/hostRoleV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
@@ -213,6 +214,11 @@ export class TaskActionScheduler implements vscode.Disposable {
   }
 
   async arm(taskFolderPath: string, canonicalId?: string): Promise<void> {
+    // A viewer host never claims a schedule lease: the schedule belongs to
+    // the runner, and a viewer's timer could only fire into the route gate.
+    if (isViewerHostV1()) {
+      return;
+    }
     const folder = vscode.Uri.file(taskFolderPath);
     const claimed = await this.store.patch(folder, progress => {
       const run = progress.scheduledRun;
@@ -1478,20 +1484,30 @@ export async function takeOverStaleWorkAdmissionCommandV1(
 export function registerScheduleTaskResumeCommand(context: vscode.ExtensionContext, inventory: TaskInventory): TaskActionScheduler {
   const scheduler = new TaskActionScheduler(inventory);
   context.subscriptions.push(scheduler);
-  context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.scheduleTaskResume", (arg?: ScheduleArg) => scheduleTaskResume(inventory, scheduler, arg)));
-  context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.cancelScheduledTaskAction", (arg?: ScheduleArg) => cancelScheduledTaskAction(inventory, scheduler, arg)));
+  // Schedules, lease takeovers and cancellations mutate the shared
+  // task-progress.json / admission markers the RUNNER owns: a viewer host
+  // refuses them (hostRoleV1.ts) instead of fighting the runner for them.
+  const unlessViewer = <A extends unknown[]>(run: (...args: A) => unknown) => (...args: A): unknown => {
+    if (isViewerHostV1()) {
+      NotificationRouter.showWarning(VIEWER_HOST_REFUSAL_MESSAGE_V1);
+      return undefined;
+    }
+    return run(...args);
+  };
+  context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.scheduleTaskResume", unlessViewer((arg?: ScheduleArg) => scheduleTaskResume(inventory, scheduler, arg))));
+  context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.cancelScheduledTaskAction", unlessViewer((arg?: ScheduleArg) => cancelScheduledTaskAction(inventory, scheduler, arg))));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.scheduleQuotaResumeV1",
-    (arg?: ScheduleArg & { resetAtIso?: string }) => {
+    unlessViewer((arg?: ScheduleArg & { resetAtIso?: string }) => {
       if (!arg?.resetAtIso) return;
       const resetAt = new Date(arg.resetAtIso);
       if (Number.isNaN(resetAt.getTime())) return;
       return scheduleQuotaResumeAtV1(inventory, scheduler, arg, resetAt);
-    }
+    })
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.takeOverStaleWorkAdmission",
-    (arg?: { taskFolderPath?: string; expectedMarkerPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg)
+    unlessViewer((arg?: { taskFolderPath?: string; expectedMarkerPath?: string; expectedClaimId?: string }) => takeOverStaleWorkAdmissionCommandV1(inventory, arg))
   ));
   return scheduler;
 }

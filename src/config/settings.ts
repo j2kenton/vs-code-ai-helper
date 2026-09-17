@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { isRunnerHostV1 } from "../state/hostRoleV1";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings, StageModelSetting, normalizeBackupChain } from "../utils/modelFallback";
 import {
@@ -907,6 +908,11 @@ export class AutoImplementConfirmationController implements vscode.Disposable {
     this.snapshot = current;
 
     if (autoImplementConfirmed) return;
+    // The cloud RUNNER is headless: nobody can click this modal there, and it
+    // blocked the window (confirmed live). Its operator opted in by
+    // configuring the runner with these settings; the consent is taken as
+    // given rather than asked for.
+    if (isRunnerHostV1()) return;
     const enabledScopes = initial || !previous
       ? current.autoScopes()
       : current.transitionsToAuto(previous);

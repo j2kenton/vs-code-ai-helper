@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { isViewerHostV1 } from "../state/hostRoleV1";
 import { createHash, randomBytes } from "crypto";
 import { STAGE_ORDER, TaskStage } from "../types/taskProgress";
 import {
@@ -193,6 +194,16 @@ export const onDidChangeChatHistoryV1: vscode.Event<{
   readonly taskFolderPath: string;
   readonly canonicalId: string;
 }> = chatHistoryChangeEmitterV1.event;
+
+/**
+ * A chat document changed on disk by ANOTHER extension host — the cloud
+ * runner writing questions and replies that a viewer window shows
+ * (hostRoleV1.ts). The in-process emitter above only sees this host's own
+ * writes; extension.ts's `chat-v1.json` file watcher fires this instead.
+ */
+export function notifyChatHistoryChangedExternallyV1(taskFolderPath: string, canonicalId: string): void {
+  chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+}
 
 /**
  * The fail-closed recovery condition (plan §5.1/§3.7's `chatRecoveryRequired`):
@@ -1854,6 +1865,18 @@ async function readChatInteractionsLockedV1(
   const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
   if (!document) {
     return [];
+  }
+  // A VIEWER host (hostRoleV1.ts) has its own, EMPTY transaction store: the
+  // durable transactions live in the runner's private storage. Reconciling
+  // here rewrote every one of the runner's live questions in the SHARED
+  // mirror as `missingTransaction` the instant the viewer rendered them —
+  // hiding the card in the viewer and breaking the runner's own view of the
+  // same record (review of the runner/viewer split). For a viewer the mirror
+  // is authoritative: never reconcile, never persist from a read.
+  if (isViewerHostV1()) {
+    return stage === undefined
+      ? [...document.interactions]
+      : document.interactions.filter((i) => i.stage === stage);
   }
   const store = getChatInteractionTransactionStoreV1();
   let changed = false;

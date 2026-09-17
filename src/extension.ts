@@ -1,4 +1,16 @@
 import * as vscode from "vscode";
+import * as path from "path";
+import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
+import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
+import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./utils/chatHistoryStore";
+import {
+  acquireWorkAdmissionV1,
+  authorizeWorkAdmissionHandoffV1,
+  describeWorkAdmissionRefusalV1,
+  revokeWorkAdmissionHandoffV1,
+  WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+} from "./state/workAdmissionV1";
+import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
 // Side-effect only: registers `effectivePauseStatusV1.ts`'s pause-revocation
 // cleanup hook with `workAdmissionV1.ts` (2026-09-11 review completion
 // blocker `dceb2646...-2`). No other production module reaches this file yet
@@ -84,7 +96,13 @@ import { registerConfigureStepModelsCommand } from "./commands/configureStepMode
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
-import { ChatViewProvider, ChatInteractionServiceResultV1, ChatTarget } from "./views/chatView";
+import {
+  ChatViewProvider,
+  ChatInteractionResumeResultV1,
+  ChatInteractionServiceResultV1,
+  ChatInteractionServicesV1,
+  ChatTarget,
+} from "./views/chatView";
 import {
   createChatInteractionTransactionStoreV1,
 } from "./services/chatInteractionTransactionStoreV1";
@@ -108,7 +126,7 @@ import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./uti
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
-import { resolveTaskRootCandidates } from "./utils/taskRoot";
+import { normalizePath, resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
@@ -179,6 +197,15 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log("Ensemble is now active!");
   setExtensionContextV1(context);
+  // Cloud runner/viewer split (hostRoleV1.ts): resolved once, here, and
+  // fixed for this host's lifetime. A VIEWER activates every view and
+  // command but runs no AI and no automation: the sections below that
+  // schedule, recover or execute work are skipped for it, and the provider
+  // boundaries refuse it as a backstop.
+  const hostRole = resolveEnsembleHostRoleV1();
+  const viewerHost = hostRole === "viewer";
+  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.hostRole", hostRole);
+  console.log(`Ensemble host role: ${hostRole}`);
 
   // The envelope parser recovers a complete payload followed by surplus
   // closing braces (three of four observed providers miscount them at the end
@@ -323,7 +350,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const chatConversationOrchestrator = createActionConversationOrchestratorV1({
     transactionStore: chatInteractionTransactionStore,
   });
-  chatViewProvider.setInteractionServices({
+  const runnerInteractionServices: ChatInteractionServicesV1 = {
     submitAnswers: async (ref, rawAnswers, answerIdempotencyId) => {
       const submitted = await chatConversationOrchestrator.submitAnswers(ref, rawAnswers, answerIdempotencyId);
       return submitted.ok ? { ok: true } : { ok: false, reason: submitted.reason };
@@ -460,7 +487,238 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         cancellation.dispose();
       }
     },
-  });
+  };
+
+  // ── Cloud runner/viewer relay (hostRelayV1.ts) ─────────────────────────
+  // Both hosts share the workspace's task root, so `.ensemble/relay-v1/` is
+  // the queue: a viewer's Answer/Cancel/Resume and "Run on Runner…" become
+  // request files the runner claims and executes.
+  // Viewer: the actions a user starts from a tree button or keybinding are
+  // refused by the route gate; this is how they start them on the runner.
+  // Every entry takes a `{ taskFolderPath, canonicalId }` argument and shows
+  // no modal a runner could not answer (Commit and Push confirms with one, so
+  // it is not here).
+  const RUN_ON_RUNNER_ACTIONS_V1: ReadonlyArray<{ readonly label: string; readonly command: string }> = [
+    { label: "Draft with AI", command: "vs-code-ai-helper.draftTaskWithAI" },
+    { label: "Generate Plan with AI", command: "vs-code-ai-helper.generatePlanWithAI" },
+    { label: "Apply Current Stage Action", command: "vs-code-ai-helper.applyCurrentStageAction" },
+    { label: "Review Current Task", command: "vs-code-ai-helper.reviewCurrentTask" },
+    { label: "Fast-Forward Review", command: "vs-code-ai-helper.fastForwardCurrentTaskReview" },
+    { label: "Run Implementation with AI", command: "vs-code-ai-helper.runImplementationWithAI" },
+    { label: "Next Stage", command: "vs-code-ai-helper.nextStage" },
+    { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks" },
+  ];
+  const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set(RUN_ON_RUNNER_ACTIONS_V1.map((a) => a.command));
+  const RELAYED_ACTION_TIMEOUT_MS_V1 = 30 * 60 * 1000;
+  const relayRoot = resolveTaskRootCandidates()[0]?.absolutePath;
+  const hostRelay =
+    relayRoot !== undefined ? createHostRelayV1({ dir: path.join(relayRoot, HOST_RELAY_DIRNAME_V1) }) : undefined;
+  const relayUnavailable = { ok: false as const, reason: "no workspace folder — nothing to relay to the runner" };
+  async function relayInteraction<T extends { readonly ok: boolean }>(
+    request: Omit<Extract<HostRelayRequestV1, { kind: "interaction" }>, "id" | "createdAt" | "kind" | "timeoutMs">,
+    timeoutMs: number
+  ): Promise<T | typeof relayUnavailable | { readonly ok: false; readonly reason: string }> {
+    if (hostRelay === undefined) {
+      return relayUnavailable;
+    }
+    try {
+      const response = await hostRelay.send({ kind: "interaction", ...request }, { timeoutMs });
+      if (!response.ok) {
+        return { ok: false, reason: response.reason ?? "the runner refused the request" };
+      }
+      return response.result as T;
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const viewerInteractionServices: ChatInteractionServicesV1 = {
+    submitAnswers: (ref, rawAnswers, answerIdempotencyId) =>
+      relayInteraction<ChatInteractionServiceResultV1>(
+        { op: "submitAnswers", ref, rawAnswers, idempotencyId: answerIdempotencyId },
+        5 * 60 * 1000
+      ),
+    cancel: (ref) =>
+      relayInteraction<ChatInteractionServiceResultV1>(
+        { op: "cancel", ref, idempotencyId: allocateHostRelayIdV1() },
+        5 * 60 * 1000
+      ),
+    // A Resume runs the whole continuation (an edit-preflight resume runs the
+    // edit session): the wait is as long as a relayed action's.
+    resume: (ref, resumeIdempotencyId) =>
+      relayInteraction<ChatInteractionResumeResultV1>(
+        { op: "resume", ref, idempotencyId: resumeIdempotencyId },
+        RELAYED_ACTION_TIMEOUT_MS_V1
+      ),
+    getTaskStatus: (canonicalId) => inventory.getTaskById(canonicalId)?.progress.status,
+    validateSend: (target, text) =>
+      runnerInteractionServices.validateSend?.(target, text) ?? Promise.resolve({ ok: true }),
+  };
+  chatViewProvider.setInteractionServices(viewerHost ? viewerInteractionServices : runnerInteractionServices);
+
+  if (hostRole === "runner" && hostRelay !== undefined && relayRoot !== undefined) {
+    const relayedResume = async (
+      request: Extract<HostRelayRequestV1, { kind: "interaction" }>
+    ): Promise<ChatInteractionResumeResultV1> => {
+      // What chatView.resumeInteraction does around a standalone Resume, done
+      // HERE because the viewer skipped it: admission for the task before any
+      // provider work (the watchdog and scheduled fires must see it), a
+      // single-use handoff token for the handler, and the mirror settled by
+      // the host that ran the continuation — so it is settled even when the
+      // viewer's wait for the answer times out.
+      const task = inventory.getTaskByBindingId(request.ref.taskBindingId);
+      if (task === undefined) {
+        return { ok: false, reason: "the runner does not know this task" };
+      }
+      const admission = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "admission",
+        commandId: "relayResumeInteractionV1",
+      });
+      if (admission.outcome !== "acquired") {
+        return { ok: false, reason: describeWorkAdmissionRefusalV1(admission) };
+      }
+      const heartbeat = setInterval(() => void admission.handle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      const handoffToken = authorizeWorkAdmissionHandoffV1(task.taskFolderPath);
+      try {
+        const result = await runnerInteractionServices.resume!(request.ref, request.idempotencyId, handoffToken);
+        if (result.ok) {
+          await settleChatInteraction(task.taskFolderPath, task.canonicalId, request.ref.interactionId, result.settlement);
+        }
+        return result;
+      } finally {
+        revokeWorkAdmissionHandoffV1(task.taskFolderPath);
+        clearInterval(heartbeat);
+        await admission.handle.release();
+      }
+    };
+    const runRelayed = async (request: HostRelayRequestV1): Promise<unknown> => {
+      const deadlineMs = request.timeoutMs ?? RELAYED_ACTION_TIMEOUT_MS_V1;
+      const work = (async (): Promise<unknown> => {
+        if (request.kind === "interaction") {
+          if (request.op === "submitAnswers") {
+            return runnerInteractionServices.submitAnswers(request.ref, request.rawAnswers, request.idempotencyId);
+          }
+          if (request.op === "cancel") {
+            return runnerInteractionServices.cancel(request.ref);
+          }
+          return relayedResume(request);
+        }
+        // Only the actions a viewer offers may be relayed: anything that can
+        // write the relay directory (a CLI coding agent running in this
+        // workspace, say) must not get arbitrary command execution here.
+        if (!RELAYABLE_COMMAND_IDS_V1.has(request.command)) {
+          throw new Error(`"${request.command}" cannot be run through the relay`);
+        }
+        // The task comes with the request, both as this host's current task
+        // and as the command's own argument — a bare invocation of most of
+        // these commands opens a task picker nobody here can answer.
+        const taskFolderPath = request.taskFolderPath !== undefined ? normalizePath(request.taskFolderPath) : undefined;
+        if (taskFolderPath !== undefined) {
+          await currentTaskStore.set(taskFolderPath);
+        }
+        const taskArg = taskFolderPath !== undefined ? { taskFolderPath, canonicalId: taskFolderPath } : undefined;
+        const result: unknown = await vscode.commands.executeCommand(request.command, taskArg);
+        if (result === false) {
+          throw new Error("the runner declined the action (see its Notifications view)");
+        }
+        return result;
+      })();
+      // A command that stalls on a prompt nobody can answer must not hold the
+      // viewer, or this relay lane, forever.
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("the runner did not finish within the wait; it may still be running")), deadlineMs);
+      });
+      try {
+        return await Promise.race([work, timeout]);
+      } finally {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+      }
+    };
+    let draining = false;
+    let drainAgain = false;
+    const drainRelay = (): void => {
+      if (draining) {
+        drainAgain = true;
+        return;
+      }
+      draining = true;
+      void hostRelay
+        .drain(runRelayed)
+        .catch((error: unknown) => console.error("Ensemble runner relay failed", error))
+        .finally(() => {
+          draining = false;
+          if (drainAgain) {
+            drainAgain = false;
+            drainRelay();
+          }
+        });
+    };
+    const relayWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(relayRoot, `${HOST_RELAY_DIRNAME_V1}/req-*.json`)
+    );
+    relayWatcher.onDidCreate(drainRelay);
+    // The watcher can miss a create (or the request can predate this
+    // activation): a periodic sweep is the safety net.
+    const relayTimer = setInterval(drainRelay, 10 * 1000);
+    context.subscriptions.push(relayWatcher, { dispose: () => clearInterval(relayTimer) });
+    drainRelay();
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vs-code-ai-helper.runOnRunner", async () => {
+      if (!viewerHost) {
+        NotificationRouter.showInformation("This window runs the workflow itself — actions run here directly.");
+        return;
+      }
+      const currentTaskCanonicalId = currentTaskStore.get();
+      if (currentTaskCanonicalId === undefined) {
+        NotificationRouter.showWarning("Select a task first — the action runs on the runner for the current task.");
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({ label: action.label, command: action.command })),
+        { placeHolder: "Run on the runner for the current task" }
+      );
+      if (picked === undefined || hostRelay === undefined) {
+        return;
+      }
+      try {
+        const response = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: `Runner: ${picked.label}` },
+          () =>
+            hostRelay.send(
+              { kind: "command", command: picked.command, taskFolderPath: currentTaskCanonicalId },
+              { timeoutMs: RELAYED_ACTION_TIMEOUT_MS_V1 }
+            )
+        );
+        if (response.ok) {
+          NotificationRouter.showInformation(`Runner finished: ${picked.label}.`);
+        } else {
+          NotificationRouter.showWarning(`Runner could not run ${picked.label}: ${response.reason ?? "unknown reason"}`);
+        }
+      } catch (error) {
+        NotificationRouter.showWarning(
+          `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    })
+  );
+
+  // Chat documents are written by the OTHER host too (the runner posting a
+  // question a viewer must show, a viewer's answer the runner must see): the
+  // in-process change emitter does not cover that, a file watcher does.
+  const chatWatcher = vscode.workspace.createFileSystemWatcher(`**/${CHAT_HISTORY_FILENAME}`);
+  const onChatFileChange = (uri: vscode.Uri): void => {
+    const taskFolderPath = normalizePath(path.dirname(uri.fsPath));
+    notifyChatHistoryChangedExternallyV1(taskFolderPath, taskFolderPath);
+  };
+  chatWatcher.onDidCreate(onChatFileChange);
+  chatWatcher.onDidChange(onChatFileChange);
+  context.subscriptions.push(chatWatcher);
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       SettingsViewProvider.viewType,
@@ -543,7 +801,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     .then(() => migrateEnabledProvidersForExistingModels())
     .catch(error => console.error("Provider settings migration failed", error))
     .then(() => refreshModelsConfiguredContext());
-  context.subscriptions.push(installAutoImplementConfirmation(context));
+  if (!viewerHost) {
+    context.subscriptions.push(installAutoImplementConfirmation(context));
+  }
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.
   const pendingOperations = new PendingOperationsStore(context.workspaceState);
@@ -580,14 +840,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     const candidates = resolveTaskRootCandidates();
     const rootPaths = candidates.map((c) => c.absolutePath);
-    void cleanupOrphanedTempFiles(rootPaths);
+    // A viewer repairs nothing: the sweeps below mutate task state the
+    // runner owns. It still runs the read-only classification (last line).
+    if (!viewerHost) {
+      void cleanupOrphanedTempFiles(rootPaths);
+    }
     // Plan §4.1 startup step 1 ("Resume verified Safe Delete
     // journals/tombstones"), ahead of step 4's classification below: a
     // deletion journal stuck at `folderRemoved` (crash between physically
     // removing the folder and recording `externalStateResolved`) is
     // invisible to `TaskCreationStartupReconcilerV1`'s own scan, which only
     // walks folders that still exist.
-    const strandedDeletionSweeps = rootPaths.map((root) =>
+    const mutatingRoots = viewerHost ? [] : rootPaths;
+    const strandedDeletionSweeps = mutatingRoots.map((root) =>
       resumeStrandedTaskDeletionsV1(root, currentTaskStore, inventory).catch((err) =>
         console.error("Stranded task-deletion sweep failed", err)
       )
@@ -600,7 +865,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // fire-and-forget reconciliation remains anywhere in activation) folds
     // them into `startupGateReady` alongside the stranded-deletion sweeps,
     // ahead of `beginClassification` — never run detached.
-    const finalizationRecoveries = rootPaths.map((root) =>
+    const finalizationRecoveries = mutatingRoots.map((root) =>
       recoverFinalizationTree(root).then(async journals => {
         for (const journal of journals) {
           // The journaled write itself is atomic (writeAtomic rename), so a
@@ -621,7 +886,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }).catch(err => console.error("Finalization recovery failed", err))
     );
-    const checkpointRecoveries = rootPaths.map((root) =>
+    const checkpointRecoveries = mutatingRoots.map((root) =>
       recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
         if (summary) NotificationRouter.showWarning(summary);
       }).catch(err => console.error("Activation checkpoint recovery failed", err))
@@ -944,9 +1209,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const progressWatcher = vscode.workspace.createFileSystemWatcher(
     `**/${TASK_PROGRESS_FILENAME}`
   );
+  // A viewer only re-reads: arming schedules here would let it claim
+  // scheduled-run leases and dispatch owed continuations the runner owns.
+  const armSchedulesUnlessViewer = async (): Promise<void> => {
+    if (!viewerHost) {
+      await taskActionScheduler.armAll();
+    }
+  };
   const onProgressChange = (): void => {
     void startupGateReady.then(() => inventory.refresh()).then(async () => {
-      await taskActionScheduler.armAll();
+      await armSchedulesUnlessViewer();
       taskTreeProvider.refresh();
     });
   };
@@ -957,16 +1229,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // A crashed window can leave a lease behind. Periodically retrying the
   // persisted schedules lets this window claim an expired lease even when no
   // task-progress file change happens after the crash.
-  const schedulerRecoveryTimer = setInterval(() => {
-    void taskActionScheduler.armAll();
-  }, 5 * 60 * 1000);
+  const schedulerRecoveryTimer = viewerHost
+    ? undefined
+    : setInterval(() => {
+        void taskActionScheduler.armAll();
+      }, 5 * 60 * 1000);
 
   // Refresh when the meta resources folder setting changes. Also gated on
   // startupGateReady — see onProgressChange above for why.
   const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("vs-code-ai-helper.metaResourcesPath")) {
       void startupGateReady.then(() => inventory.refresh()).then(async () => {
-        await taskActionScheduler.armAll();
+        await armSchedulesUnlessViewer();
         taskTreeProvider.refresh();
       });
     }
@@ -1013,7 +1287,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     collapseAllCommand,
     statusBarMenuCommand,
     progressWatcher,
-    { dispose: () => clearInterval(schedulerRecoveryTimer) },
+    { dispose: () => { if (schedulerRecoveryTimer !== undefined) clearInterval(schedulerRecoveryTimer); } },
     configListener,
     currentTaskListener,
     onExpandListener,
@@ -1031,8 +1305,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Awaiting startupGateReady first means the first inventory publication can
   // never race the legacy-creating classification pass above.
   void startupGateReady.then(() => inventory.refresh()).then(async () => {
-    await taskActionScheduler.armAll();
+    await armSchedulesUnlessViewer();
     taskTreeProvider.refresh();
+    if (viewerHost) {
+      return;
+    }
     // Git-ignore handling for Ensemble resources is automatic (no settings
     // UI); a legacy/custom resource folder additionally gets a one-time
     // offer to move to the fixed `.ensemble` location.
@@ -1043,6 +1320,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void maybeOfferMetaResourcesMigration(context, inventory, currentTaskStore)
       .catch(err => console.error("Meta resources migration offer failed", err));
   });
+  if (viewerHost) {
+    // Nothing below runs AI, but the revert-journal prompt repairs artifacts
+    // the runner owns and the model-cache warm-up probes every CLI: neither
+    // belongs in a window that only watches.
+    console.log(`Ensemble viewer: ${VIEWER_HOST_REFUSAL_MESSAGE_V1}`);
+    return;
+  }
   void warmCliModelCache();
 
   // Activation-time recovery for the one durable mid-flight artifact: an

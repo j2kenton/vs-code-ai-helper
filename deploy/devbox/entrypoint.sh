@@ -12,6 +12,18 @@ for type in ed25519 rsa; do
   cp "$key.pub" "/etc/ssh/ssh_host_${type}_key.pub"
   chmod 0600 "/etc/ssh/ssh_host_${type}_key"
 done
+# Every Remote-SSH window on this box is a VIEWER (src/state/hostRoleV1.ts):
+# the VS Code server reads its machine settings from here. Merged, so other
+# machine settings survive.
+mkdir -p /home/dev/.vscode-server/data/Machine
+node -e '
+const fs = require("fs");
+const p = "/home/dev/.vscode-server/data/Machine/settings.json";
+let s = {};
+try { s = JSON.parse(fs.readFileSync(p, "utf8")); } catch {}
+s["ensemble.hostRole"] = "viewer";
+fs.writeFileSync(p, JSON.stringify(s, null, 2) + "\n");
+'
 chown -R dev:dev /home/dev /workspace
 # sshd's StrictModes refuses a key file owned by the host's uid (the mount):
 # copy it root-owned.

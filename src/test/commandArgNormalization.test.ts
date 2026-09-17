@@ -985,13 +985,12 @@ void describe("resumePausedTask integration (full command path)", () => {
     }
   });
 
-  // v1 fixes item 1 (Part 1a step 5): the bare "Resume Task" command must
-  // durably arrange the current stage's action in the SAME mutation that
-  // bumps updatedAt, so the task is never observably active with admission
-  // as the only protection. This is the fix for the measured 4-second
-  // resume-trap: a resumed task used to go active with nothing scheduled and
-  // no admission, and the sweep re-paused it before the user could act.
-  void it("arranges a durable scheduledRun for the current stage alongside the active status write", async () => {
+  // 2026-09-17 product rule: Resume means resume. The bare "Resume Task"
+  // command flips the status and nothing else — it used to also arrange the
+  // current stage's action (v1 fixes item 1), which re-ran Draft with AI on
+  // every press for a task still at `desc`. Work only starts from an action
+  // the user explicitly chose, whose label says what it dispatches.
+  void it("does NOT arrange a scheduledRun: resuming flips the status and starts nothing", async () => {
     const store = new Map<string, string>();
     const fs = installMemStore(store);
     const msgs = installMessageCapture();
@@ -1016,15 +1015,10 @@ void describe("resumePausedTask integration (full command path)", () => {
 
       const stored = await readStoredProgress(store, folderUri);
       assert.strictEqual(stored!.status, "active", "task must be resumed to active");
-      assert.ok(
-        stored!.scheduledRun !== undefined,
-        "resumePausedTask must arrange a durable scheduledRun so the task is never active with " +
-          "nothing admitted or scheduled — the whole point of this fix"
-      );
       assert.strictEqual(
-        stored!.scheduledRun.stage,
-        "impl-high-review",
-        "the arranged scheduledRun must target the task's actual current stage"
+        stored!.scheduledRun,
+        undefined,
+        "resumePausedTask must not schedule the stage's action — Resume only flips the status"
       );
     } finally {
       msgs.restore();
