@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
+import { configureViewerCommandForwarderV1, RELAYABLE_COMMAND_IDS_V1 } from "./services/viewerForwardingV1";
 import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./utils/chatHistoryStore";
 import {
   acquireWorkAdmissionV1,
@@ -508,7 +509,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     { label: "Next Stage", command: "vs-code-ai-helper.nextStage" },
     { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks" },
   ];
-  const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set(RUN_ON_RUNNER_ACTIONS_V1.map((a) => a.command));
   const RELAYED_ACTION_TIMEOUT_MS_V1 = 30 * 60 * 1000;
   const relayRoot = resolveTaskRootCandidates()[0]?.absolutePath;
   const hostRelay =
@@ -682,30 +682,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({ label: action.label, command: action.command })),
         { placeHolder: "Run on the runner for the current task" }
       );
-      if (picked === undefined || hostRelay === undefined) {
+      if (picked === undefined) {
         return;
       }
-      try {
-        const response = await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: `Runner: ${picked.label}` },
-          () =>
-            hostRelay.send(
-              { kind: "command", command: picked.command, taskFolderPath: currentTaskCanonicalId },
-              { timeoutMs: RELAYED_ACTION_TIMEOUT_MS_V1 }
-            )
-        );
-        if (response.ok) {
-          NotificationRouter.showInformation(`Runner finished: ${picked.label}.`);
-        } else {
-          NotificationRouter.showWarning(`Runner could not run ${picked.label}: ${response.reason ?? "unknown reason"}`);
-        }
-      } catch (error) {
-        NotificationRouter.showWarning(
-          `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      await forwardCommandToRunner(picked.command, currentTaskCanonicalId);
     })
   );
+
+  /**
+   * A viewer's action buttons, tree rows and shortcuts land here
+   * (viewerForwardingV1.ts): the same action, for the same task, on the
+   * runner. Never rejects — a rejection from a command handler is what
+   * produced VS Code's raw "Error running command" toast.
+   */
+  async function forwardCommandToRunner(commandId: string, taskFolderPath: string | undefined): Promise<void> {
+    const task = taskFolderPath ?? currentTaskStore.get();
+    const label = RUN_ON_RUNNER_ACTIONS_V1.find((action) => action.command === commandId)?.label ?? commandId;
+    if (hostRelay === undefined) {
+      NotificationRouter.showWarning("No workspace folder is open — there is no runner to send this to.");
+      return;
+    }
+    if (task === undefined) {
+      NotificationRouter.showWarning("Select a task first — the action runs on the runner for that task.");
+      return;
+    }
+    try {
+      const response = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Running on the runner: ${label}` },
+        () =>
+          hostRelay.send(
+            { kind: "command", command: commandId, taskFolderPath: task },
+            { timeoutMs: RELAYED_ACTION_TIMEOUT_MS_V1 }
+          )
+      );
+      if (!response.ok) {
+        NotificationRouter.showWarning(`The runner could not run ${label}: ${response.reason ?? "unknown reason"}`);
+      }
+    } catch (error) {
+      NotificationRouter.showWarning(
+        `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  configureViewerCommandForwarderV1(viewerHost ? forwardCommandToRunner : undefined);
 
   // Chat documents are written by the OTHER host too (the runner posting a
   // question a viewer must show, a viewer's answer the runner must see): the

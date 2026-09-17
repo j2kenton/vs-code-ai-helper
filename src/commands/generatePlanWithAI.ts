@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
@@ -1084,8 +1085,9 @@ export function registerGeneratePlanWithAICommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.generatePlanWithAI",
-    (arg?: GeneratePlanArg) =>
+    forwardInViewerV1("vs-code-ai-helper.generatePlanWithAI", (arg?: GeneratePlanArg) =>
       generatePlanWithAI(context, inventory, chatViewProvider, arg)
+    )
   );
   context.subscriptions.push(disposable);
 }

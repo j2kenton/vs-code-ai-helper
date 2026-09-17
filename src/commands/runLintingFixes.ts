@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
@@ -707,8 +708,9 @@ export function registerRunLintingFixesCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runLintingFixes",
-    (arg?: RunLintingFixesArg) =>
+    forwardInViewerV1("vs-code-ai-helper.runLintingFixes", (arg?: RunLintingFixesArg) =>
       runLintingFixes(inventory, context.extensionUri, arg, context, undefined, chatViewProvider)
+    )
   );
   context.subscriptions.push(disposable);
 }

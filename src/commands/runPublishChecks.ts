@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as crypto from "node:crypto";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
@@ -567,7 +568,9 @@ export function registerRunPublishChecksCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runPublishChecks",
-    (arg?: RunPublishChecksArg) => runPublishChecks(inventory, arg, undefined, currentTaskStore)
+    forwardInViewerV1("vs-code-ai-helper.runPublishChecks", (arg?: RunPublishChecksArg) =>
+      runPublishChecks(inventory, arg, undefined, currentTaskStore)
+    )
   );
   context.subscriptions.push(disposable);
 }

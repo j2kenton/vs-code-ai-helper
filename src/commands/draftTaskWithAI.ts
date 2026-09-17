@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
@@ -933,8 +934,9 @@ export function registerDraftTaskWithAICommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.draftTaskWithAI",
-    (explicitArg?: Parameters<typeof draftTaskWithAI>[3]) =>
+    forwardInViewerV1("vs-code-ai-helper.draftTaskWithAI", (explicitArg?: Parameters<typeof draftTaskWithAI>[3]) =>
       draftTaskWithAI(inventory, context, chatViewProvider, explicitArg)
+    )
   );
   context.subscriptions.push(disposable);
 }

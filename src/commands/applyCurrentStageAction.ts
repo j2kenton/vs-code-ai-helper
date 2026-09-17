@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -303,7 +304,9 @@ export function registerApplyCurrentStageActionCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.applyCurrentStageAction",
-    (arg?: ApplyArg) => applyCurrentStageAction(inventory, currentTaskStore, arg)
+    forwardInViewerV1("vs-code-ai-helper.applyCurrentStageAction", (arg?: ApplyArg) =>
+      applyCurrentStageAction(inventory, currentTaskStore, arg)
+    )
   );
   context.subscriptions.push(disposable);
 }

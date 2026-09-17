@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
@@ -141,8 +142,11 @@ export function registerApplyLowLevelReviewChangesCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.applyLowLevelReviewChanges",
-    (arg?: { canonicalId?: string; taskFolderPath?: string; admissionHandoffTokenV1?: string }) =>
-      applyLowLevelReviewChanges(inventory, arg)
+    forwardInViewerV1(
+      "vs-code-ai-helper.applyLowLevelReviewChanges",
+      (arg?: { canonicalId?: string; taskFolderPath?: string; admissionHandoffTokenV1?: string }) =>
+        applyLowLevelReviewChanges(inventory, arg)
+    )
   );
   context.subscriptions.push(disposable);
 }

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import * as crypto from "crypto";
 
@@ -13030,27 +13031,33 @@ export function registerReviewActionCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.generateImplementationWithAI",
-      (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.generateImplementationWithAI", (arg?: ReviewCommandArg) =>
         generateImplementationWithAI(context.extensionUri, context, chatViewProvider, arg)
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
-      (arg?: ReviewCommandArg) => runReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
+      forwardInViewerV1("vs-code-ai-helper.runReviewWithAI", (arg?: ReviewCommandArg) =>
+        runReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
-      (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.applyReviewWithAI", (arg?: ReviewCommandArg) =>
         applyReviewWithAI(context.extensionUri, context, arg, { chatViewProvider })
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewEditWithAI",
-      (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.applyReviewEditWithAI", (arg?: ReviewCommandArg) =>
         applyReviewEditWithAI(context.extensionUri, context, arg, { chatViewProvider })
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.fastForwardReviewWithAI",
-      (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.fastForwardReviewWithAI", (arg?: ReviewCommandArg) =>
         fastForwardReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
@@ -13141,8 +13148,9 @@ export function registerReviewActionCommands(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",
-      (node?: TaskNodeArg) =>
+      forwardInViewerV1("vs-code-ai-helper.nextStage", (node?: TaskNodeArg) =>
         nextStage(context.extensionUri, context, node)
+      )
     ),
     // wf10 item 19 / Step 28: the "Complete Anyway" override on the
     // blocker-gate warning in `nextStage`. `{ taskFolderPath }` is
@@ -13166,8 +13174,9 @@ export function registerReviewActionCommands(
     // checklist automatically when it is absent, then implements.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runImplementationWithAI",
-      (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.runImplementationWithAI", (arg?: ReviewCommandArg) =>
         runImplementationWithAI(context.extensionUri, context, arg, chatViewProvider)
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.release",

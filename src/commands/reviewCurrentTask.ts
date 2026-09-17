@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -57,7 +58,7 @@ export function registerReviewCurrentTaskCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.reviewCurrentTask",
-    () => reviewCurrentTask(inventory, currentTaskStore)
+    forwardInViewerV1("vs-code-ai-helper.reviewCurrentTask", () => reviewCurrentTask(inventory, currentTaskStore))
   );
   context.subscriptions.push(disposable);
 }
