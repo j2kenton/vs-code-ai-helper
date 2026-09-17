@@ -4,6 +4,13 @@ import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./sta
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
 import { configureViewerCommandForwarderV1, RELAYABLE_COMMAND_IDS_V1 } from "./services/viewerForwardingV1";
 import {
+  describeRunnerActivityV1,
+  HOST_OPERATIONS_MIRROR_FILENAME_V1,
+  readRunnerOperationsSnapshotV1,
+  RUNNER_OPERATIONS_HEARTBEAT_MS_V1,
+  writeRunnerOperationsSnapshotV1,
+} from "./services/hostOperationsMirrorV1";
+import {
   appendMirroredNotificationV1,
   createNotificationMirrorTailV1,
   HOST_NOTIFICATION_MIRROR_FILENAME_V1,
@@ -1164,6 +1171,96 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const progressBinder = new ViewProgressBinder(taskOperations);
   context.subscriptions.push(progressBinder);
+
+  // ── Runner activity, visible in viewers (hostOperationsMirrorV1.ts) ─────
+  if (hostRole === "runner" && relayDir !== undefined) {
+    let writeTimer: NodeJS.Timeout | undefined;
+    const writeSnapshot = (): void => {
+      writeTimer = undefined;
+      const operations = taskOperations
+        .getAll()
+        .filter((op) => op.state === "running")
+        .map((op) => ({
+          id: op.id,
+          label: op.label,
+          taskName: op.taskName,
+          startedAt: op.startedAt,
+          waitingForUser: op.waitingForUser,
+          ...(op.parentId !== undefined ? { parentId: op.parentId } : {}),
+          ...(op.activity !== undefined ? { activity: op.activity } : {}),
+        }));
+      void writeRunnerOperationsSnapshotV1(relayDir, { writtenAt: Date.now(), operations });
+    };
+    // Debounced: activity reports can arrive many times a second.
+    const scheduleSnapshot = (): void => {
+      if (writeTimer === undefined) {
+        writeTimer = setTimeout(writeSnapshot, 500);
+      }
+    };
+    const operationsListener = taskOperations.onDidChange(scheduleSnapshot);
+    // The heartbeat is what lets a viewer tell "still running" from "the
+    // runner stopped writing".
+    const heartbeat = setInterval(writeSnapshot, RUNNER_OPERATIONS_HEARTBEAT_MS_V1);
+    writeSnapshot();
+    context.subscriptions.push(operationsListener, {
+      dispose: () => {
+        clearInterval(heartbeat);
+        if (writeTimer !== undefined) {
+          clearTimeout(writeTimer);
+        }
+      },
+    });
+  }
+  if (viewerHost && relayDir !== undefined) {
+    const runnerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+    runnerStatus.command = `${STATUS_VIEW_ID}.focus`;
+    let resolveRunnerProgress: (() => void) | undefined;
+    const refreshRunnerStatus = async (): Promise<void> => {
+      const view = describeRunnerActivityV1(await readRunnerOperationsSnapshotV1(relayDir), Date.now());
+      if (view.kind === "running") {
+        runnerStatus.text = `${view.waitingForUser ? "$(bell)" : "$(sync~spin)"} ${view.text}`;
+        runnerStatus.tooltip = [
+          view.waitingForUser ? "The runner is waiting for you (see Chat With AI)." : "Running on the runner:",
+          ...view.details,
+        ].join("\n");
+        runnerStatus.show();
+        // The same progress bar a local run shows on the Notifications view.
+        if (resolveRunnerProgress === undefined && !view.waitingForUser) {
+          void vscode.window.withProgress(
+            { location: { viewId: STATUS_VIEW_ID } },
+            () => new Promise<void>((resolve) => {
+              resolveRunnerProgress = resolve;
+            })
+          );
+        }
+      } else {
+        if (view.kind === "stale") {
+          runnerStatus.text = "$(warning) Runner not responding";
+          runnerStatus.tooltip = `The runner stopped reporting ${Math.round(view.sinceMs / 60000)} min ago while work was listed as running. Is the runner VS Code on the box up?`;
+          runnerStatus.show();
+        } else {
+          runnerStatus.hide();
+        }
+      }
+      if ((view.kind !== "running" || view.waitingForUser) && resolveRunnerProgress !== undefined) {
+        resolveRunnerProgress();
+        resolveRunnerProgress = undefined;
+      }
+    };
+    const operationsWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(relayDir, HOST_OPERATIONS_MIRROR_FILENAME_V1)
+    );
+    operationsWatcher.onDidCreate(() => void refreshRunnerStatus());
+    operationsWatcher.onDidChange(() => void refreshRunnerStatus());
+    const operationsTimer = setInterval(() => void refreshRunnerStatus(), 10 * 1000);
+    void refreshRunnerStatus();
+    context.subscriptions.push(runnerStatus, operationsWatcher, {
+      dispose: () => {
+        clearInterval(operationsTimer);
+        resolveRunnerProgress?.();
+      },
+    });
+  }
 
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
   // Mirrors Source Control's changed-file-count overlay on its activity-bar
