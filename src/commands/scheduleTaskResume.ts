@@ -180,6 +180,14 @@ export const systemSchedulerClock: SchedulerClock = { now: () => Date.now(), set
 const progressStore: SchedulerProgressStore = { patch: patchTaskProgressStrictV1 };
 const MAX_TIMER_DELAY = 0x7fffffff;
 const LEASE_DURATION_MS = 60 * 60 * 1000;
+/**
+ * How long a schedule waits after its firing was refused because another
+ * stage action holds the task. Without it, every `task-progress.json` write
+ * by that running action (the progress watcher calls `armAll`) re-armed the
+ * overdue schedule for an immediate re-fire — and each re-fire posted the
+ * same "could not start yet" warning again (seen live, 2026-09-17).
+ */
+export const REFUSED_SCHEDULE_RETRY_DELAY_MS_V1 = 60 * 1000;
 
 /**
  * Persisted one-shot scheduler. A lease means only one VS Code window arms a
@@ -191,6 +199,12 @@ export class TaskActionScheduler implements vscode.Disposable {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Signature of the persisted run represented by each armed timer. */
   private readonly armedRuns = new Map<string, string>();
+  /**
+   * Schedules whose firing was refused (another stage action held the task):
+   * the refused run's signature, and the earliest moment it may be retried.
+   * The user is warned once per signature, not once per retry.
+   */
+  private readonly refusedRuns = new Map<string, { readonly signature: string; readonly retryAt: number }>();
   private readonly owner: string;
   /**
    * `fire()` is deliberately fire-and-forget from its `setTimeout` callback
@@ -244,6 +258,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     // window still had a timer armed.
     const delay = Math.max(0, Math.min(remaining, MAX_TIMER_DELAY, LEASE_DURATION_MS / 2));
     const signature = `${run.runAt}\u0000${run.stage}`;
+    // A refused run waits out its retry delay however often it is re-armed;
+    // a different (replaced) schedule starts fresh.
+    let timerDelay = delay;
+    const refused = this.refusedRuns.get(taskFolderPath);
+    if (refused !== undefined) {
+      if (refused.signature === signature) {
+        timerDelay = Math.max(delay, refused.retryAt - this.clock.now());
+      } else {
+        this.refusedRuns.delete(taskFolderPath);
+      }
+    }
     const old = this.timers.get(taskFolderPath);
     if (old) this.clock.clearTimeout(old);
     this.armedRuns.set(taskFolderPath, signature);
@@ -255,7 +280,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         this.inFlightFiresForTestV1.add(firing);
         void firing.finally(() => this.inFlightFiresForTestV1.delete(firing));
       }
-    }, delay));
+    }, timerDelay));
   }
 
   /** Test-only: resolve once every `fire()` currently in flight has settled
@@ -288,10 +313,21 @@ export class TaskActionScheduler implements vscode.Disposable {
         purpose: "admission",
         commandId: "vs-code-ai-helper.scheduleTaskResume.fire",
         onRefused: (outcome) => {
-          NotificationRouter.showWarning(
-            `A scheduled stage action could not start yet (${describeWorkAdmissionRefusalV1(outcome)}); ` +
-              "it remains scheduled and will be retried automatically."
-          );
+          const signature = `${expectedRunAt}\u0000${expectedStage}`;
+          const alreadyWarned = this.refusedRuns.get(taskFolderPath)?.signature === signature;
+          this.refusedRuns.set(taskFolderPath, {
+            signature,
+            retryAt: this.clock.now() + REFUSED_SCHEDULE_RETRY_DELAY_MS_V1,
+          });
+          if (!alreadyWarned) {
+            NotificationRouter.showWarning(
+              `A scheduled stage action could not start yet (${describeWorkAdmissionRefusalV1(outcome)}); ` +
+                "it remains scheduled and will be retried automatically."
+            );
+          }
+          // Retry on this window's own timer once the delay has passed, instead
+          // of waiting for (or being re-fired by) the next sweep.
+          void this.arm(taskFolderPath, canonicalId);
         },
       },
       async () => {
@@ -304,6 +340,7 @@ export class TaskActionScheduler implements vscode.Disposable {
           // selected when the schedule was created.
           if (run?.leaseOwner !== this.owner || run.runAt !== expectedRunAt || run.stage !== expectedStage) return current;
           clearedByThisOwner = true;
+          this.refusedRuns.delete(taskFolderPath);
           stageStillCurrent = current.currentStage === run.stage;
           return {
             ...current,

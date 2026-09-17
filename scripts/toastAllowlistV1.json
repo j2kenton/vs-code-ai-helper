@@ -198,7 +198,7 @@
     },
     {
       "file": "src/commands/scheduleTaskResume.ts",
-      "line": 510,
+      "line": 547,
       "reason": "v1 fixes item 1, Part 1c step 16 — the periodic sweep's takeover notice for a work-admission marker whose owner has stayed persistently unreachable/unresponsive/unreadable. This is workflow-control bookkeeping about Ensemble's own admission-directory lock file (already classified `workflowControl` by classifyWorkflowPathV1, same as `.ensemble-session.lock`), not a task review/round content decision — nothing here asks what the AI should do next, only who owns a stale lock. 'Non-pausing notice' by the plan's own wording, which also rules out the pausing escalation-card system as the right surface. (Line moved 499 -> 500 -> 504: the first shift on 2026-09-15 by an added `RUNS_DIRNAME` import earlier in the file, the second the same day by the post-freeze findings item 5 `retireSatisfiedSummaryRejectedRecoveryV1` import addition to the same import block.)"
     }
   ]

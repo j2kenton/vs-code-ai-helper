@@ -297,6 +297,85 @@ void test("scheduled firing restores the schedule when applyCurrentStageAction r
   }
 });
 
+void test("a firing refused because another stage action holds the task warns ONCE and backs off instead of re-firing on every re-arm (seen live 2026-09-17)", async () => {
+  // Before: every task-progress.json write by the running action re-armed the
+  // overdue schedule for an immediate re-fire, and every re-fire posted the
+  // same "could not start yet" warning again.
+  class RecordingClock extends FakeClock {
+    readonly delays: number[] = [];
+    override setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout> {
+      this.delays.push(delay);
+      return super.setTimeout(callback, delay);
+    }
+  }
+  const clock = new RecordingClock(Date.parse("2026-01-01T00:05:00.000Z")); // the run is overdue
+  const taskFolderPath = "C:\\tasks\\refused-backoff";
+  const state = memoryStore(scheduledProgress("plan"));
+  const inventory = { getTasks: () => [] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const warnings: string[] = [];
+  const surface: StatusSurface = {
+    addEntry(message: string): void {
+      if (message.includes("could not start yet")) {
+        warnings.push(message);
+      }
+    },
+  };
+  initNotificationRouter(surface);
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const original = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(true);
+  }) as typeof commands.executeCommand;
+  // Another stage action holds this task's admission right now.
+  const holder = await acquireWorkAdmissionV1({ taskFolderPath, purpose: "admission", commandId: "runReviewWithAI" });
+  assert.equal(holder.outcome, "acquired");
+
+  try {
+    await scheduler.arm(taskFolderPath, "task-id");
+    assert.equal(clock.delays.at(-1), 0, "an overdue schedule fires at once the first time");
+    clock.fireNext();
+    await scheduler.waitForPendingFiresForTestV1();
+    // The refusal re-armed on its own, at the retry delay.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(warnings.length, 1);
+    assert.ok(state.current().scheduledRun !== undefined, "the schedule is kept");
+
+    // Progress writes by the running action re-arm the scheduler repeatedly:
+    // none of them may bring the retry forward, fire, or warn again.
+    for (let i = 0; i < 5; i += 1) {
+      await scheduler.arm(taskFolderPath, "task-id");
+      assert.ok(clock.delays.at(-1)! >= 59_000, `re-arm ${i} waits out the retry delay (got ${clock.delays.at(-1)})`);
+    }
+    assert.equal(warnings.length, 1, "one warning per refused schedule, not one per retry");
+    assert.equal(dispatched, 0);
+
+    // A retry while the holder is still busy stays quiet too.
+    clock.fireNext();
+    await scheduler.waitForPendingFiresForTestV1();
+    assert.equal(warnings.length, 1);
+
+    // Once the holder releases, the retry dispatches and clears the schedule.
+    if (holder.outcome === "acquired") {
+      await holder.handle.release();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    clock.fireNext();
+    await scheduler.waitForPendingFiresForTestV1();
+    assert.equal(dispatched, 1);
+    assert.equal(state.current().scheduledRun, undefined);
+  } finally {
+    if (holder.outcome === "acquired") {
+      await holder.handle.release().catch(() => undefined);
+    }
+    commands.executeCommand = original;
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
 void test("a live lease held by another window prevents this scheduler from arming", async () => {
   const clock = new FakeClock(Date.parse("2026-01-01T00:00:00.000Z"));
   const progress = scheduledProgress("plan");
