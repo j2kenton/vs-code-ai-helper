@@ -207,9 +207,21 @@ export function createHostRelayV1(options: {
         if (Date.now() >= deadline) {
           // Withdraw an unclaimed request so a late runner never runs it;
           // a claimed one is already the runner's, and its answer is dropped.
+          let claimed = true;
+          try {
+            await fs.access(`${requestPath}${CLAIMED_SUFFIX}`);
+          } catch {
+            claimed = false;
+          }
           await fs.rm(requestPath, { force: true });
+          // Never blame the runner for being down when it plainly is not: an
+          // unclaimed request means it never picked this up (busy with a long
+          // round, or not running), a claimed one means it took it and has not
+          // finished (verification review, 2026-09-17).
           throw new Error(
-            "the runner did not answer in time — is the runner VS Code on the box running?"
+            claimed
+              ? "the runner took this but has not finished within the wait; it may still be running"
+              : "the runner did not pick this up in time — it may be busy with a long round, or not running"
           );
         }
         await new Promise((resolve) => setTimeout(resolve, pollMs));

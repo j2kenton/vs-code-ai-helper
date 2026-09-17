@@ -33,7 +33,7 @@ void describe("renameTaskWithAI in a viewer", () => {
     const forwarded: Array<[string, string | undefined]> = [];
     configureViewerCommandForwarderV1((commandId, taskFolderPath) => {
       forwarded.push([commandId, taskFolderPath]);
-      return Promise.resolve(true);
+      return Promise.resolve({ ok: true });
     });
     const context = { subscriptions: [] as { dispose(): void }[] } as unknown as vscode.ExtensionContext;
     registerRenameTaskCommands(context, new TaskInventory());

@@ -199,9 +199,12 @@ void describe("hostRelayV1", () => {
     const dir = await tempDir();
     try {
       const relay = createHostRelayV1({ dir });
+      // Nobody claimed it, so the give-up must say exactly that — blaming the
+      // runner for being down is a diagnosis the viewer's own liveness check
+      // may have just contradicted (verification review, 2026-09-17).
       await assert.rejects(
         relay.send({ kind: "command", command: "x" }, { timeoutMs: 30, pollMs: 5 }),
-        /did not answer in time/
+        /did not pick this up in time/
       );
       let executed = false;
       const handled = await relay.drain(() => {
@@ -210,6 +213,21 @@ void describe("hostRelayV1", () => {
       });
       assert.equal(handled, 0);
       assert.equal(executed, false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("a request the runner CLAIMED and did not finish is reported as still running, not as a dead runner", async () => {
+    const dir = await tempDir();
+    try {
+      const relay = createHostRelayV1({ dir });
+      const pending = relay.send({ kind: "command", command: "x" }, { timeoutMs: 400, pollMs: 5 });
+      // Claim it exactly as the runner does, and never answer.
+      await waitForRequestFile(dir);
+      const [request] = (await fs.readdir(dir)).filter((name) => name.startsWith("req-") && name.endsWith(".json"));
+      await fs.writeFile(path.join(dir, `${request!}.claimed`), "", { flag: "wx" });
+      await assert.rejects(pending, /has not finished/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

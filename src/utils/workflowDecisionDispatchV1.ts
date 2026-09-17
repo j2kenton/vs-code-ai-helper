@@ -1,5 +1,24 @@
 import * as vscode from "vscode";
 import { getExtensionContextV1 } from "./extensionContextV1";
+
+/**
+ * The Memento the DECISION VIEWS are built over. In a viewer that is not
+ * `context.workspaceState` itself but a wrapper carrying the runner's mirrored
+ * decisions too (hostDecisionMirrorV1.ts) — and the store's change signal is
+ * keyed by Memento identity, so posting through the raw state left the chat
+ * panel and the tree unaware of a decision this window had just raised
+ * (verification review, 2026-09-17). extension.ts installs it during
+ * activation; unset, the raw workspaceState is used exactly as before.
+ */
+let decisionStateV1: vscode.Memento | undefined;
+
+export function configureWorkflowDecisionStateV1(state: vscode.Memento | undefined): void {
+  decisionStateV1 = state;
+}
+
+function decisionStoreStateV1(context: vscode.ExtensionContext): vscode.Memento {
+  return decisionStateV1 ?? context.workspaceState;
+}
 import {
   WorkflowDecisionStoreV1,
   clearWorkflowDecisionOrphanedV1,
@@ -212,7 +231,7 @@ export async function postWorkflowDecisionV1(
     return undefined;
   }
   const preconditioned = await applyRecommendationPreconditionsV1(input, target);
-  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
   const result = await store.post({
     ...preconditioned,
     decisionId: preconditioned.decisionId ?? crypto.randomUUID(),
@@ -308,7 +327,7 @@ export async function awaitWorkflowDecisionAnswerV1(
   if (!context) {
     return undefined;
   }
-  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
   const posted = await store.post({
     ...input,
     decisionId: input.decisionId ?? crypto.randomUUID(),
@@ -423,7 +442,7 @@ export async function withdrawWorkflowDecisionsByKeyV1(
   if (!context) {
     return;
   }
-  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
   const matches = store.listPending(target.canonicalId).filter((d) => d.decisionKey === decisionKey);
   for (const decision of matches) {
     try {
@@ -469,7 +488,7 @@ export async function retirePendingWorkflowDecisionsForTaskV1(
   if (!context) {
     return;
   }
-  const store = new WorkflowDecisionStoreV1(context.workspaceState);
+  const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
   const matches = store.listPending(target.canonicalId);
   for (const decision of matches) {
     try {

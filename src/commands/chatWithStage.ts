@@ -74,7 +74,7 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
-import { resolveTaskRootCandidates } from "../utils/taskRoot";
+import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -96,6 +96,47 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
     stage: value.stage,
     message: value.message,
   };
+}
+
+/**
+ * The last sends whose user message actually reached `chat-v1.json`.
+ *
+ * A relayed send (from a viewer) has to be able to tell "the runner took it"
+ * from "the runner refused it", and this command refuses from a dozen places —
+ * no model for the stage, an admission refusal, a prompt-size decline, input
+ * validation — each of which reports by notification and returns normally, so
+ * the relay saw a plain success and the viewer dropped the user's typed text
+ * (verification review, 2026-09-17). Persisting the message is the one
+ * observable fact that means the send was accepted: it happens in
+ * `preInvocationHook`, i.e. only after every precondition passed.
+ *
+ * A short ring buffer rather than a single slot, because the runner drains
+ * relayed requests concurrently; entries are consumed by the relay and the
+ * buffer is bounded, so nothing accumulates.
+ */
+const acceptedSendsV1: { taskFolderPath: string; message: string }[] = [];
+const MAX_ACCEPTED_SENDS_V1 = 20;
+
+function noteSendAcceptedV1(taskFolderPath: string, message: string): void {
+  acceptedSendsV1.push({ taskFolderPath: normalizePath(taskFolderPath), message });
+  if (acceptedSendsV1.length > MAX_ACCEPTED_SENDS_V1) {
+    acceptedSendsV1.shift();
+  }
+}
+
+/**
+ * Whether this exact send was accepted (and forget it). False means the
+ * command refused before persisting anything — the reason was reported as a
+ * notification, which a viewer sees through the notification mirror.
+ */
+export function consumeSendAcceptedV1(taskFolderPath: string, message: string): boolean {
+  const wanted = normalizePath(taskFolderPath);
+  const index = acceptedSendsV1.findIndex((entry) => entry.taskFolderPath === wanted && entry.message === message);
+  if (index === -1) {
+    return false;
+  }
+  acceptedSendsV1.splice(index, 1);
+  return true;
 }
 
 export type ChatSendValidationResultV1 =
@@ -787,6 +828,7 @@ async function chatWithStageSendV1(
             taskFolderPath: task.taskFolderPath,
           });
           userMessagePersisted = true;
+          noteSendAcceptedV1(task.taskFolderPath, message);
         }
       },
     });
@@ -1204,7 +1246,10 @@ async function chatWithStageInViewerV1(
       taskName: validated.task.progress.displayName,
       message: normalized.message,
     });
-    if (!sent) {
+    if (!sent.ok && sent.indeterminate !== true) {
+      // Definitely not sent, so hand the text back. When the runner TOOK it
+      // and merely has not finished, handing it back would invite a duplicate
+      // send of a message that is still on its way through.
       chatViewProvider.restoreUnsentDraftV1(normalized.message);
     }
   }

@@ -78,6 +78,13 @@ export interface RunnerOperationsSnapshotV1 {
   readonly operations: readonly MirroredOperationV1[];
   /** The writing runner's activation (see `runnerActivationIdV1`). */
   readonly activationId?: string;
+  /**
+   * Work that was still running when this runner shut down. A clean stop
+   * publishes an empty snapshot with a FRESH timestamp, so staleness alone
+   * cannot tell a viewer that the work was abandoned — dropping the rows then
+   * looks exactly like completion (verification review, 2026-09-17).
+   */
+  readonly stoppedWhileRunning?: readonly { readonly label: string; readonly taskName: string }[];
 }
 
 /** Runner side: write the snapshot atomically, in order. Never throws. */
@@ -113,6 +120,17 @@ export async function readRunnerOperationsSnapshotV1(dir: string): Promise<Runne
       writtenAt: record.writtenAt,
       operations: record.operations.filter(isMirroredOperation),
       ...(typeof record.activationId === "string" ? { activationId: record.activationId } : {}),
+      ...(Array.isArray(record.stoppedWhileRunning)
+        ? {
+            stoppedWhileRunning: record.stoppedWhileRunning.filter(
+              (entry): entry is { label: string; taskName: string } =>
+                typeof entry === "object" &&
+                entry !== null &&
+                typeof (entry as { label?: unknown }).label === "string" &&
+                typeof (entry as { taskName?: unknown }).taskName === "string"
+            ),
+          }
+        : {}),
     };
   } catch {
     return undefined;

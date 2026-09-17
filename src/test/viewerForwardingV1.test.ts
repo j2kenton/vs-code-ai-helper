@@ -40,7 +40,7 @@ void describe("viewerForwardingV1", () => {
     const forwarded: Array<[string, string | undefined]> = [];
     configureViewerCommandForwarderV1((commandId, taskFolderPath) => {
       forwarded.push([commandId, taskFolderPath]);
-      return Promise.resolve(true);
+      return Promise.resolve({ ok: true });
     });
     let ran = false;
     const wrapped = forwardInViewerV1("vs-code-ai-helper.runReviewWithAI", (_arg?: unknown) => {
@@ -73,7 +73,7 @@ void describe("viewerForwardingV1", () => {
     const warnings: string[] = [];
     initNotificationRouter({ addEntry: (message) => void warnings.push(message) });
     try {
-      assert.equal(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t"), false);
+      assert.deepEqual(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t"), { ok: false });
       assert.match(warnings[0] ?? "", /no connection to the runner/);
     } finally {
       deactivateNotificationRouter();
@@ -81,9 +81,9 @@ void describe("viewerForwardingV1", () => {
     const forwarded: unknown[] = [];
     configureViewerCommandForwarderV1((commandId, taskFolderPath, commandArg) => {
       forwarded.push([commandId, taskFolderPath, commandArg]);
-      return Promise.resolve(true);
+      return Promise.resolve({ ok: true });
     });
-    assert.equal(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }), true);
+    assert.deepEqual(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }), { ok: true });
     assert.deepEqual(forwarded, [["vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }]]);
     await assert.rejects(forwardToRunnerV1("vs-code-ai-helper.commitAndPushTask", "/t"), /RELAYABLE_COMMAND_IDS_V1/);
   });

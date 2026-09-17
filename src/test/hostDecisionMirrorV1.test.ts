@@ -48,7 +48,7 @@ function decision(overrides: Partial<WorkflowDecisionV1> = {}): WorkflowDecision
         effect: { kind: "command", command: "vs-code-ai-helper.resumeAndSetTaskStage", args: [{ stage: "publish" }] },
       },
     ],
-    recommendation: { kind: "none", reason: "the trade-off is the user's" },
+    recommendation: { kind: "none", reasoning: "the trade-off is the user's" },
     createdAt: "2026-09-17T16:00:00.000Z",
     state: "pending",
     ...overrides,
@@ -114,6 +114,26 @@ void describe("hostDecisionMirrorV1", () => {
     assert.equal(decodeMirroredDecisionV1(undefined), undefined);
     assert.equal(decodeMirroredDecisionV1({ ...decision(), options: [] }), undefined);
     assert.ok(decodeMirroredDecisionV1(decision({ options: [{ optionId: "o", label: "L", consequence: "", effect: { kind: "doNothing" } }] })));
+  });
+
+  void it("rejects a record the webview would throw on: no recommendation, junk evidence, a fabricated stage, a settled state", () => {
+    const base = decision();
+    assert.ok(decodeMirroredDecisionV1(base, (stage) => stage === base.stage));
+    // The webview dereferences recommendation.kind unguarded; one bad card
+    // aborted the render loop and took every later card with it.
+    assert.equal(decodeMirroredDecisionV1({ ...base, recommendation: undefined }), undefined);
+    assert.equal(decodeMirroredDecisionV1({ ...base, recommendation: { kind: "option", optionId: "nope", reasoning: "x" } }), undefined);
+    assert.ok(decodeMirroredDecisionV1({ ...base, recommendation: { kind: "option", optionId: "advance", reasoning: "x" } }));
+    assert.equal(decodeMirroredDecisionV1({ ...base, evidence: [null] }), undefined);
+    assert.equal(decodeMirroredDecisionV1({ ...base, evidence: [{ label: "a" }] }), undefined);
+    assert.ok(decodeMirroredDecisionV1({ ...base, evidence: [{ label: "a", detail: "b" }] }));
+    assert.equal(decodeMirroredDecisionV1({ ...base, state: "resolved" }), undefined, "a viewer shows open questions only");
+    assert.equal(decodeMirroredDecisionV1({ ...base, createdAt: undefined }), undefined);
+    assert.equal(
+      decodeMirroredDecisionV1({ ...base, stage: "made-up-stage" }, (stage) => stage === base.stage),
+      undefined,
+      "a fabricated stage would route the card into a conversation that does not exist"
+    );
   });
 
   void it("a decision is only answerable while the runner is still reporting", () => {

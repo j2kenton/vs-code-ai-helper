@@ -85,29 +85,84 @@ function decodeOption(value: unknown): value is WorkflowDecisionV1["options"][nu
   return isNonEmptyString(command) && (args === undefined || Array.isArray(args));
 }
 
-/** One mirrored decision, structurally — only the fields the UI and the resolution touch. */
-export function decodeMirroredDecisionV1(value: unknown): WorkflowDecisionV1 | undefined {
+/**
+ * The recommendation, which the webview dereferences unguarded
+ * (`dcs.recommendation.kind`). A record missing it renders one broken card
+ * and aborts the loop, taking every card after it with it — so it is
+ * validated here, not hoped for (verification review, 2026-09-17).
+ */
+function decodeRecommendation(value: unknown, optionIds: ReadonlySet<string>): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const recommendation = value as Record<string, unknown>;
+  if (typeof recommendation.reasoning !== "string") {
+    return false;
+  }
+  if (recommendation.kind === "none") {
+    return true;
+  }
+  return recommendation.kind === "option" && isNonEmptyString(recommendation.optionId) && optionIds.has(recommendation.optionId);
+}
+
+function decodeEvidence(value: unknown): boolean {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  return value.every((item) => {
+    if (typeof item !== "object" || item === null) {
+      return false;
+    }
+    const entry = item as Record<string, unknown>;
+    return typeof entry.label === "string" && typeof entry.detail === "string";
+  });
+}
+
+/**
+ * One mirrored decision, structurally — every field the tree, the webview and
+ * the resolution dereference. `stage` must be a real stage and `state` must be
+ * `pending`: a viewer only ever shows the runner's OPEN questions, and a
+ * fabricated stage would route a card (and its acknowledgement) into a
+ * conversation that does not exist.
+ */
+export function decodeMirroredDecisionV1(
+  value: unknown,
+  isKnownStage: (stage: string) => boolean = () => true
+): WorkflowDecisionV1 | undefined {
   if (typeof value !== "object" || value === null) {
     return undefined;
   }
   const decision = value as Record<string, unknown>;
+  const options = decision.options;
+  if (!Array.isArray(options) || options.length === 0 || !options.every(decodeOption)) {
+    return undefined;
+  }
+  const optionIds = new Set(options.map((option) => (option as { optionId: string }).optionId));
   const ok =
     isNonEmptyString(decision.decisionId) &&
     isNonEmptyString(decision.decisionKey) &&
     isNonEmptyString(decision.taskCanonicalId) &&
     isNonEmptyString(decision.stage) &&
-    isNonEmptyString(decision.state) &&
+    isKnownStage(decision.stage) &&
+    decision.state === "pending" &&
+    isNonEmptyString(decision.createdAt) &&
     typeof decision.whatHappened === "string" &&
     typeof decision.whyUserNeeded === "string" &&
-    Array.isArray(decision.options) &&
-    decision.options.length > 0 &&
-    decision.options.every(decodeOption) &&
-    (decision.evidence === undefined || Array.isArray(decision.evidence));
+    decodeRecommendation(decision.recommendation, optionIds) &&
+    (decision.evidence === undefined || decodeEvidence(decision.evidence)) &&
+    (decision.gating === undefined || (typeof decision.gating === "object" && decision.gating !== null));
   return ok ? (decision as unknown as WorkflowDecisionV1) : undefined;
 }
 
-/** Viewer side: the runner's snapshot, or undefined when there is none or it is unreadable. */
-export async function readRunnerDecisionsSnapshotV1(dir: string): Promise<RunnerDecisionsSnapshotV1 | undefined> {
+/**
+ * Viewer side: the runner's snapshot, or undefined when there is none or it is
+ * unreadable. `isKnownStage` is passed in (the stage list lives in the
+ * extension's types) so this module stays VS Code-free and testable.
+ */
+export async function readRunnerDecisionsSnapshotV1(
+  dir: string,
+  isKnownStage: (stage: string) => boolean = () => true
+): Promise<RunnerDecisionsSnapshotV1 | undefined> {
   try {
     const parsed: unknown = JSON.parse(await fs.readFile(path.join(dir, HOST_DECISIONS_MIRROR_FILENAME_V1), "utf8"));
     if (typeof parsed !== "object" || parsed === null) {
@@ -119,7 +174,7 @@ export async function readRunnerDecisionsSnapshotV1(dir: string): Promise<Runner
     }
     const decisions: WorkflowDecisionV1[] = [];
     for (const candidate of record.decisions) {
-      const decoded = decodeMirroredDecisionV1(candidate);
+      const decoded = decodeMirroredDecisionV1(candidate, isKnownStage);
       if (decoded !== undefined) {
         decisions.push(decoded);
       }

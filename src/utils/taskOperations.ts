@@ -1320,6 +1320,19 @@ function armReleaseTriggeredContinuationRetryV1(taskPath: string): void {
 }
 
 export async function showTaskBusyWarning(taskPath: string): Promise<void> {
+  // When it is the OTHER window's work holding the task, say so and say where
+  // to stop it — the generic "please wait" reads as this window being stuck,
+  // and the owed-continuation explanation below would be about something else
+  // entirely (verification review, 2026-09-17). Nothing is written to the
+  // task folder either: the runner is actively writing there.
+  const mirrored = taskOperations.getMirroredTaskOperations(taskPath);
+  const mirroredHolder = mirrored.find((op) => op.exclusive) ?? mirrored.find((op) => op.parentId === undefined);
+  if (mirroredHolder) {
+    NotificationRouter.showInformation(
+      `The runner is running "${mirroredHolder.label}" for this task. Stop it from the Notifications view (or wait for it to finish), then try again.`
+    );
+    return;
+  }
   const label = taskOperations.busyLabel(taskPath) ?? "An operation";
   const genericMessage = `${label} is already in progress for this task. Please wait for it to finish.`;
 

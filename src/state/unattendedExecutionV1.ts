@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 /**
  * Marks work the runner is doing ON BEHALF OF a viewer (hostRelayV1.ts).
  *
@@ -10,46 +12,36 @@
  * entry point, because the modals live deep inside (a prompt-size
  * confirmation, a drafted-edit confirmation).
  *
- * So a relayed command runs with this flag set, and each confirmation site
- * declines instead of asking, with a reason the relay hands back to the
+ * So a relayed command runs inside `runUnattendedV1`, and each confirmation
+ * site declines instead of asking, with a reason the relay hands back to the
  * viewer. Nothing is silently assumed: an unanswerable confirmation becomes a
  * refusal the user can see and retry deliberately (on the runner's own screen
  * if they want the dialog).
  *
- * Deliberately a plain module flag rather than a parameter threaded through
- * every call: the sites are several layers below the relay executor, and a
- * parameter would have to be added to every command signature in between.
- * The runner executes relayed requests one at a time per lane and never runs
- * a relayed and a local command in the same tick, so there is no interleaving
- * to get wrong; `runUnattendedV1` restores the previous value regardless.
+ * Scoped with `AsyncLocalStorage`, NOT a module flag (verification review,
+ * 2026-09-17). The runner runs relayed requests concurrently, and its own
+ * scheduled work runs alongside them; a process-wide flag therefore gagged
+ * confirmations belonging to work the user WAS driving, and leaked
+ * permanently whenever the relay's deadline abandoned a command that kept
+ * running. A context tracks exactly the call tree it was opened around.
  */
 
-let unattendedDepth = 0;
+const unattended = new AsyncLocalStorage<true>();
 
-/** Run `body` as unattended relayed work. Nestable; always restores. */
+/** Run `body` as unattended relayed work. Nestable; scoped to this call tree. */
 export async function runUnattendedV1<T>(body: () => Promise<T>): Promise<T> {
-  unattendedDepth += 1;
-  try {
-    return await body();
-  } finally {
-    unattendedDepth -= 1;
-  }
+  return unattended.run(true, body);
 }
 
 /**
- * True while this window is executing a request relayed from another window,
- * i.e. while no human can answer a dialog raised here.
+ * True while THIS call tree is executing a request relayed from another
+ * window, i.e. while no human can answer a dialog raised here.
  */
 export function isUnattendedExecutionV1(): boolean {
-  return unattendedDepth > 0;
+  return unattended.getStore() === true;
 }
 
 /** The refusal a confirmation site reports instead of opening a modal. */
 export function unattendedRefusalV1(what: string): string {
   return `${what} needs a confirmation, which cannot be answered on the runner. Nothing was changed — do this from the runner's own screen, or from a window that runs the workflow itself.`;
-}
-
-/** Tests only: clear any leaked depth between cases. */
-export function resetUnattendedExecutionForTestV1(): void {
-  unattendedDepth = 0;
 }

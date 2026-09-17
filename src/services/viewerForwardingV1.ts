@@ -97,12 +97,23 @@ export const VIEWER_DECISION_EFFECT_COMMANDS_V1: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.commitAndPushTask",
 ]);
 
+/**
+ * What a forwarded action came back as. `indeterminate` means the runner took
+ * the request and did not finish within the wait: it may still be running, so
+ * a caller must NOT treat it as "did not happen" and retry it (verification
+ * review, 2026-09-17).
+ */
+export interface ViewerForwardResultV1 {
+  readonly ok: boolean;
+  readonly indeterminate?: boolean;
+}
+
 export type ViewerCommandForwarderV1 = (
   commandId: string,
   taskFolderPath: string | undefined,
   /** Extra fields for the runner's command argument, beside the task. */
   commandArg?: Readonly<Record<string, unknown>>
-) => Promise<boolean>;
+) => Promise<ViewerForwardResultV1>;
 
 let forwarder: ViewerCommandForwarderV1 | undefined;
 
@@ -122,13 +133,13 @@ export async function forwardToRunnerV1(
   commandId: string,
   taskFolderPath: string | undefined,
   commandArg?: Readonly<Record<string, unknown>>
-): Promise<boolean> {
+): Promise<ViewerForwardResultV1> {
   if (!RELAYABLE_COMMAND_IDS_V1.has(commandId)) {
     throw new Error(`${commandId} is not in RELAYABLE_COMMAND_IDS_V1 — the runner would refuse to run it`);
   }
   if (forwarder === undefined) {
     NotificationRouter.showWarning("This viewer window has no connection to the runner yet.");
-    return false;
+    return { ok: false };
   }
   return forwarder(commandId, taskFolderPath, commandArg);
 }
