@@ -38,6 +38,13 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai \
   && claude --version && codex --version && opencode --version
 
+# pnpm on the SYSTEM path: the workflow's rounds run `pnpm run …` from the
+# runner's and viewer's VS Code processes, which never read a login profile —
+# a per-user corepack install was invisible to them ("pnpm: command not
+# found", seen live 2026-09-17).
+RUN corepack enable --install-directory /usr/local/bin
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
 # One non-root user who owns the workspace and the logins. uid 1000 is
 # `node` in this base image: reuse the uid under a clearer name.
 RUN usermod -l dev -d /home/dev -m node \

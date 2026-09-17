@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm run *)",
+      "Bash(pnpm exec *)",
+      "Bash(pnpm install *)",
+      "Bash(npm run *)",
+      "Bash(npx tsc *)",
+      "Bash(npx eslint *)",
+      "Bash(npx vsce *)",
+      "Bash(node esbuild.js)",
+      "Bash(node --test *)",
+      "Bash(timeout 180 pnpm run test)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}
