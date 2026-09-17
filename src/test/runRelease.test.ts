@@ -223,14 +223,19 @@ void describe("isSafeReleaseIndirectionTarget", () => {
 });
 
 void describe("resolveReleaseWorkspace", () => {
-  const workspace = { uri: { fsPath: "C:\\Projects\\Helper" } };
+  // Host-native absolute paths: a "C:\…" string is one relative segment on
+  // POSIX, where containment can never hold. Case folds only on Windows.
+  const windows = process.platform === "win32";
+  const projectRoot = windows ? "C:\\Projects\\Helper" : "/projects/helper";
+  const metaRoot = windows ? "C:\\EnsembleMeta" : "/ensemble-meta";
+  const workspace = { uri: { fsPath: projectRoot } };
 
   void it("uses persisted project ownership for an external metadata root", () => {
     const resolved = resolveReleaseWorkspace(
-      "C:\\EnsembleMeta\\tasks\\task-a",
+      path.join(metaRoot, "tasks", "task-a"),
       {
-        metaRoot: "C:\\EnsembleMeta",
-        projectRoot: "c:\\projects\\helper",
+        metaRoot,
+        projectRoot: windows ? "c:\\projects\\helper" : "/projects/helper/",
       },
       [workspace]
     );
@@ -240,10 +245,10 @@ void describe("resolveReleaseWorkspace", () => {
 
   void it("rejects a task that is outside its persisted metadata root", () => {
     const resolved = resolveReleaseWorkspace(
-      "C:\\Elsewhere\\task-a",
+      windows ? "C:\\Elsewhere\\task-a" : "/elsewhere/task-a",
       {
-        metaRoot: "C:\\EnsembleMeta",
-        projectRoot: "C:\\Projects\\Helper",
+        metaRoot,
+        projectRoot,
       },
       [workspace]
     );

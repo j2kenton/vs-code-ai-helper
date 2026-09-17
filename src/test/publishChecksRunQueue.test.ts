@@ -94,11 +94,17 @@ void describe("queuePublishChecksRunV1", () => {
 
   void it("treats paths that normalize to the same task identically (case/slash-insensitive), matching runPublishChecks's own lockKey", async () => {
     const order: string[] = [];
-    const first = queuePublishChecksRunV1("C:\\Tasks\\Task-F", async () => {
+    // Case folds only on Windows (normalizePath); on every host the same task
+    // spelled with redundant separators and dot segments is still one task.
+    const [spellingA, spellingB] =
+      process.platform === "win32"
+        ? ["C:\\Tasks\\Task-F", "c:/tasks/task-f"]
+        : ["/tasks/task-f", "/tasks//./task-f"];
+    const first = queuePublishChecksRunV1(spellingA, async () => {
       await new Promise((resolve) => setTimeout(resolve, 15));
       order.push("first-end");
     });
-    const second = queuePublishChecksRunV1("c:/tasks/task-f", () => {
+    const second = queuePublishChecksRunV1(spellingB, () => {
       order.push("second-end");
       return Promise.resolve();
     });

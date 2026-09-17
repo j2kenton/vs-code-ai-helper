@@ -20,6 +20,7 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import { isAuthenticationFailure } from "../utils/quota";
+import { resetCliCommandLookupCacheForTest } from "../runners/cliAgentRunner";
 import {
   LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
   LegacyAiActionSafetyGateErrorV0,
@@ -4170,6 +4171,8 @@ void describe("runImplementationForModel", () => {
   });
 
   void it("keeps provider-qualified CLI model IDs on the CLI implementation path", async () => {
+    // The stubbed `which` below must be what answers "is codex installed".
+    resetCliCommandLookupCacheForTest();
     const originalSpawn = childProcess.spawn;
     const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
 

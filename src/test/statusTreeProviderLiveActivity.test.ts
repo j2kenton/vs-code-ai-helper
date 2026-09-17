@@ -529,10 +529,11 @@ void describe("provider-exit propagation shape (source-shape proof backing the F
 });
 
 void describe("in-flight activity reporting stays out of chat and introduces no new persistence", () => {
-  const taskOperationsSource = fs.readFileSync(
-    path.join(process.cwd(), "src", "utils", "taskOperations.ts"),
-    "utf8"
-  );
+  // Line endings normalized: a CRLF checkout (core.autocrlf on Windows) made
+  // the multi-line anchor below unfindable.
+  const taskOperationsSource = fs
+    .readFileSync(path.join(process.cwd(), "src", "utils", "taskOperations.ts"), "utf8")
+    .replace(/\r\n/g, "\n");
   const statusViewSource = fs.readFileSync(
     path.join(process.cwd(), "src", "views", "statusView.ts"),
     "utf8"

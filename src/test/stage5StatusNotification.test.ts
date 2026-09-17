@@ -1138,8 +1138,12 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const win = getWindowStub();
       const workspace = getWorkspaceStub();
       const origWorkspaceFolders = workspace.workspaceFolders;
-      const firstFolder = { uri: vscode.Uri.file("/repo-a"), name: "repo-a", index: 0 };
-      const secondFolder = { uri: vscode.Uri.file("/repo-b"), name: "repo-b", index: 1 };
+      // Real, writable folders: creation takes real locks under every
+      // workspace folder's meta root. "/repo-a" only worked on Windows, where
+      // it silently created C:\repo-a; on Linux it is EACCES at the root.
+      const multiRootParent = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-multi-root-"));
+      const firstFolder = { uri: vscode.Uri.file(path.join(multiRootParent, "repo-a")), name: "repo-a", index: 0 };
+      const secondFolder = { uri: vscode.Uri.file(path.join(multiRootParent, "repo-b")), name: "repo-b", index: 1 };
       workspace.workspaceFolders = [firstFolder, secondFolder];
 
       const origCreateDirectory = workspace.fs.createDirectory;
@@ -1205,6 +1209,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();
+        fs.rmSync(multiRootParent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
       }
     });
   });
