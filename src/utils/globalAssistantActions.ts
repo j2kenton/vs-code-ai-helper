@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "./currentTaskStore";
+import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattendedExecutionV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   STAGE_DISPLAY_NAMES,
@@ -1088,6 +1089,12 @@ export async function executeProposedAction(
   }
 
   if (operation.requiresConfirmation) {
+    if (isUnattendedExecutionV1()) {
+      // Relayed from a viewer (unattendedExecutionV1.ts): no dialog here can
+      // be answered, so the action is declined rather than left hanging.
+      await appendAudit(ctx, operation.id, proposal.payload, [], "declined: no confirmation possible on the runner");
+      return `_${unattendedRefusalV1(`Running "${operation.id}"`)}_`;
+    }
     const affected = operation.affectedTasks(ctx, proposal.payload);
     const taskList =
       affected.length > 0

@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { writeMirrorSnapshotV1 } from "./hostMirrorWriteV1";
 
 /**
  * What the runner is doing right now, visible in every viewer window
@@ -22,6 +23,16 @@ import * as path from "node:path";
 export const HOST_OPERATIONS_MIRROR_FILENAME_V1 = "operations-v1.json";
 export const RUNNER_OPERATIONS_HEARTBEAT_MS_V1 = 30 * 1000;
 export const RUNNER_OPERATIONS_STALE_MS_V1 = 3 * RUNNER_OPERATIONS_HEARTBEAT_MS_V1;
+
+/**
+ * Identifies ONE runner activation. Operation ids restart at `op-1` every
+ * time the runner's extension host starts, so a Stop pressed on a row the
+ * viewer had not refreshed yet would otherwise cancel whatever the RESTARTED
+ * runner happens to be calling `op-1` now (review, 2026-09-17). A cancel
+ * request carries the activation it was read from and the runner refuses it
+ * unless that is still its own.
+ */
+export const runnerActivationIdV1 = crypto.randomUUID();
 
 export interface MirroredOperationV1 {
   readonly id: string;
@@ -65,19 +76,13 @@ export function liveMirroredOperationsV1(
 export interface RunnerOperationsSnapshotV1 {
   readonly writtenAt: number;
   readonly operations: readonly MirroredOperationV1[];
+  /** The writing runner's activation (see `runnerActivationIdV1`). */
+  readonly activationId?: string;
 }
 
-/** Runner side: write the snapshot atomically. Never throws. */
+/** Runner side: write the snapshot atomically, in order. Never throws. */
 export async function writeRunnerOperationsSnapshotV1(dir: string, snapshot: RunnerOperationsSnapshotV1): Promise<void> {
-  const file = path.join(dir, HOST_OPERATIONS_MIRROR_FILENAME_V1);
-  const temp = `${file}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(temp, JSON.stringify(snapshot), "utf8");
-    await fs.rename(temp, file);
-  } catch {
-    await fs.rm(temp, { force: true }).catch(() => undefined);
-  }
+  await writeMirrorSnapshotV1(dir, HOST_OPERATIONS_MIRROR_FILENAME_V1, snapshot);
 }
 
 function isMirroredOperation(value: unknown): value is MirroredOperationV1 {
@@ -104,10 +109,24 @@ export async function readRunnerOperationsSnapshotV1(dir: string): Promise<Runne
     if (typeof record.writtenAt !== "number" || !Array.isArray(record.operations)) {
       return undefined;
     }
-    return { writtenAt: record.writtenAt, operations: record.operations.filter(isMirroredOperation) };
+    return {
+      writtenAt: record.writtenAt,
+      operations: record.operations.filter(isMirroredOperation),
+      ...(typeof record.activationId === "string" ? { activationId: record.activationId } : {}),
+    };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether the runner is reporting at all right now. The runner writes this
+ * snapshot on a heartbeat even while idle, so silence past the stale limit
+ * means its VS Code is not running (or is wedged) — a viewer must say so
+ * instead of sending it work and waiting out the relay timeout.
+ */
+export function isRunnerReportingV1(snapshot: RunnerOperationsSnapshotV1 | undefined, now: number): boolean {
+  return snapshot !== undefined && now - snapshot.writtenAt <= RUNNER_OPERATIONS_STALE_MS_V1;
 }
 
 export type RunnerActivityViewV1 =

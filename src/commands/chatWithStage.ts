@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { isViewerHostV1 } from "../state/hostRoleV1";
+import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattendedExecutionV1";
 import { forwardToRunnerV1 } from "../services/viewerForwardingV1";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
@@ -976,6 +977,18 @@ export async function dispatchProposedBlockerSupersessionEditV1(
     );
     return;
   }
+  if (isUnattendedExecutionV1()) {
+    // Relayed from a viewer (unattendedExecutionV1.ts): the confirmation this
+    // write requires cannot be answered on the runner, so the draft stays in
+    // the transcript unapplied rather than being written unconfirmed.
+    await chatViewProvider.append(
+      "assistant",
+      `_${unattendedRefusalV1(`Applying the drafted update to \`${proposedEdit.relPath}\``)}_`,
+      targetStage,
+      chatTarget
+    );
+    return;
+  }
   const choice = await vscode.window.showWarningMessage(
     `Apply the drafted update to "${proposedEdit.relPath}"?\n\nThis would resolve the blocker:\n"${proposedEdit.blockerDescription}"\n\n` +
       "A fresh review is the stronger confirmation, but is not required for this write to land.",
@@ -1181,11 +1194,19 @@ async function chatWithStageInViewerV1(
     taskName: validated.task.progress.displayName,
   });
   if (normalized.message?.trim()) {
-    await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", validated.task.taskFolderPath, {
+    // The runner persists the message itself, but only once every one of its
+    // own preconditions passed — so a refusal (no model for the stage, a
+    // prompt-size decline, admission) would otherwise leave the user with an
+    // empty input box, nothing in the transcript, and no way to retry what
+    // they typed (review, 2026-09-17). A failed send hands the text back.
+    const sent = await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", validated.task.taskFolderPath, {
       stage: validated.targetStage,
       taskName: validated.task.progress.displayName,
       message: normalized.message,
     });
+    if (!sent) {
+      chatViewProvider.restoreUnsentDraftV1(normalized.message);
+    }
   }
 }
 

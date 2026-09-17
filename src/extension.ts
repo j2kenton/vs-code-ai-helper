@@ -2,13 +2,19 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
-import { configureViewerCommandForwarderV1, RELAYABLE_COMMAND_IDS_V1 } from "./services/viewerForwardingV1";
+import {
+  configureViewerCommandForwarderV1,
+  decodeRelayedCommandArgV1,
+  RELAYABLE_COMMAND_IDS_V1,
+} from "./services/viewerForwardingV1";
 import {
   createMirroredDecisionsMementoV1,
   HOST_DECISIONS_MIRROR_FILENAME_V1,
+  liveMirroredDecisionsV1,
   readRunnerDecisionsSnapshotV1,
   writeRunnerDecisionsSnapshotV1,
 } from "./services/hostDecisionMirrorV1";
+import { runUnattendedV1 } from "./state/unattendedExecutionV1";
 import {
   notifyWorkflowDecisionsChangedV1,
   WORKFLOW_DECISIONS_STORAGE_KEY_V1,
@@ -17,8 +23,11 @@ import {
 import {
   describeRunnerActivityV1,
   HOST_OPERATIONS_MIRROR_FILENAME_V1,
+  isRunnerReportingV1,
   liveMirroredOperationsV1,
   readRunnerOperationsSnapshotV1,
+  runnerActivationIdV1,
+  RUNNER_OPERATIONS_STALE_MS_V1,
   RUNNER_OPERATIONS_HEARTBEAT_MS_V1,
   writeRunnerOperationsSnapshotV1,
 } from "./services/hostOperationsMirrorV1";
@@ -541,11 +550,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     { label: "Next Stage", command: "vs-code-ai-helper.nextStage" },
     { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks" },
   ];
+  /**
+   * What a relayed action is called when a viewer reports on it. Every id in
+   * `RELAYABLE_COMMAND_IDS_V1` needs one: without it the progress toast read
+   * "Running on the runner: vs-code-ai-helper.renameTaskWithAI" (review,
+   * 2026-09-17). The picker above is the subset a user can start by hand.
+   */
+  const RELAYED_ACTION_LABELS_V1: Readonly<Record<string, string>> = {
+    ...Object.fromEntries(RUN_ON_RUNNER_ACTIONS_V1.map((action) => [action.command, action.label])),
+    "vs-code-ai-helper.generateImplementationWithAI": "Generate Implementation with AI",
+    "vs-code-ai-helper.runReviewWithAI": "Run Review with AI",
+    "vs-code-ai-helper.applyReviewWithAI": "Apply Review with AI",
+    "vs-code-ai-helper.applyReviewEditWithAI": "Apply Review Edit with AI",
+    "vs-code-ai-helper.fastForwardReviewWithAI": "Fast-Forward Review",
+    "vs-code-ai-helper.applyHighLevelReviewChanges": "Apply High-Level Review Changes",
+    "vs-code-ai-helper.applyLowLevelReviewChanges": "Apply Low-Level Review Changes",
+    "vs-code-ai-helper.runLintingFixes": "Fix Linting & Code Errors",
+    "vs-code-ai-helper.renameTaskWithAI": "Rename Task with AI",
+    "vs-code-ai-helper.chatWithStage": "Chat reply",
+  };
   const RELAYED_ACTION_TIMEOUT_MS_V1 = 30 * 60 * 1000;
   const relayRoot = resolveTaskRootCandidates()[0]?.absolutePath;
+  const relayDirPath = relayRoot !== undefined ? path.join(relayRoot, HOST_RELAY_DIRNAME_V1) : undefined;
   const hostRelay =
     relayRoot !== undefined ? createHostRelayV1({ dir: path.join(relayRoot, HOST_RELAY_DIRNAME_V1) }) : undefined;
   const relayUnavailable = { ok: false as const, reason: "no workspace folder — nothing to relay to the runner" };
+  /**
+   * Why the runner cannot be sent work right now, or undefined when it is
+   * reporting normally. The runner heartbeats its operations snapshot even
+   * while idle, so this is a liveness check: without it, pressing an action
+   * in a viewer while the runner's VS Code was down showed "Running on the
+   * runner: …" for the full 30-minute relay wait before failing (review,
+   * 2026-09-17).
+   */
+  async function describeRunnerNotReportingV1(): Promise<string | undefined> {
+    if (relayDirPath === undefined) {
+      return relayUnavailable.reason;
+    }
+    const snapshot = await readRunnerOperationsSnapshotV1(relayDirPath);
+    if (isRunnerReportingV1(snapshot, Date.now())) {
+      return undefined;
+    }
+    return snapshot === undefined
+      ? "the runner has never reported here — is the runner VS Code running on the box?"
+      : `the runner has not reported for ${Math.round((Date.now() - snapshot.writtenAt) / 60000)} min — is the runner VS Code running on the box?`;
+  }
   async function relayInteraction<T extends { readonly ok: boolean }>(
     request: Omit<Extract<HostRelayRequestV1, { kind: "interaction" }>, "id" | "createdAt" | "kind" | "timeoutMs">,
     timeoutMs: number
@@ -585,11 +634,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     validateSend: (target, text) =>
       runnerInteractionServices.validateSend?.(target, text) ?? Promise.resolve({ ok: true }),
     // The decision is the runner's: it resolves it and runs the chosen
-    // option's effect there, exactly as a click on the runner would.
+    // option's effect there, exactly as a click on the runner would — except
+    // for effects that belong where the user is, which come back to be run
+    // here (VIEWER_DECISION_EFFECT_COMMANDS_V1).
     resolveWorkflowDecision: async (decisionId, optionId) => {
       if (hostRelay === undefined) {
         NotificationRouter.showWarning(relayUnavailable.reason);
-        return;
+        return { ok: false, message: relayUnavailable.reason };
+      }
+      const notReporting = await describeRunnerNotReportingV1();
+      if (notReporting !== undefined) {
+        NotificationRouter.showWarning(`Your answer was not sent: ${notReporting}`);
+        return { ok: false, message: notReporting };
       }
       try {
         const response = await vscode.window.withProgress(
@@ -601,15 +657,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             )
         );
         if (!response.ok) {
-          NotificationRouter.showWarning(`The runner could not apply your decision: ${response.reason ?? "unknown reason"}`);
+          const reason = response.reason ?? "unknown reason";
+          NotificationRouter.showWarning(`The runner could not apply your decision: ${reason}`);
+          return { ok: false, message: reason };
         }
+        // The runner hands back an effect that belongs in this window.
+        const outcome = (response.result ?? {}) as {
+          ok?: boolean;
+          message?: string;
+          viewerEffect?: { command: string; args?: readonly unknown[] };
+        };
+        if (outcome.ok === false && outcome.message) {
+          NotificationRouter.showWarning(`The runner could not apply your decision: ${outcome.message}`);
+        }
+        return {
+          ok: outcome.ok !== false,
+          ...(outcome.message ? { message: outcome.message } : {}),
+          ...(outcome.viewerEffect ? { viewerEffect: outcome.viewerEffect } : {}),
+        };
       } catch (error) {
-        NotificationRouter.showWarning(
-          `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
-        );
+        const reason = error instanceof Error ? error.message : String(error);
+        NotificationRouter.showWarning(`Could not reach the runner: ${reason}`);
+        return { ok: false, message: reason };
       }
     },
   };
+  if (viewerHost && viewerDecisions !== undefined) {
+    // A decision this window raised itself is still answered here; only the
+    // runner's mirrored ones are relayed (hostDecisionMirrorV1.ts).
+    chatViewProvider.configureRemoteDecisionPredicateV1((decisionId) => viewerDecisions.isMirrored(decisionId));
+  }
   chatViewProvider.setInteractionServices(viewerHost ? viewerInteractionServices : runnerInteractionServices);
 
   if (hostRole === "runner" && hostRelay !== undefined && relayRoot !== undefined) {
@@ -661,11 +738,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return relayedResume(request);
         }
         if (request.kind === "resolveDecision") {
-          await chatViewProvider.resolveWorkflowDecision(request.decisionId, request.optionId);
-          return undefined;
+          if (typeof request.decisionId !== "string" || typeof request.optionId !== "string") {
+            throw new Error("the decision request is malformed");
+          }
+          return runUnattendedV1(() =>
+            chatViewProvider.resolveWorkflowDecisionForRelayV1(request.decisionId, request.optionId)
+          );
         }
         if (request.kind === "cancelOperation") {
-          // A viewer's Stop button on a row it mirrors from this runner.
+          // A viewer's Stop button on a row it mirrors from this runner. The
+          // activation must be ours: operation ids restart at op-1 every time
+          // this extension host starts, so a Stop pressed on a row a viewer
+          // read from a PREVIOUS runner would otherwise cancel whatever that
+          // id names now (review, 2026-09-17).
+          if (request.activationId !== runnerActivationIdV1) {
+            throw new Error("that operation belonged to an earlier run of the runner — reload the window to refresh what it is doing");
+          }
           if (!taskOperations.cancelOperation(request.operationId)) {
             throw new Error("the operation can no longer be cancelled (it may have just finished)");
           }
@@ -684,16 +772,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (taskFolderPath !== undefined) {
           await currentTaskStore.set(taskFolderPath);
         }
-        // A command that needs more than the task (a chat send's stage and
-        // message) sends it as its first argument; the task stays the one
-        // named by the request.
-        const extraArg = request.args?.[0];
-        const extra = typeof extraArg === "object" && extraArg !== null ? (extraArg as Record<string, unknown>) : {};
+        // Only the fields a relayed command is DEFINED to carry cross the
+        // boundary, decoded one by one (review, 2026-09-17): spreading the
+        // request's argument let a relay writer set internal fields the
+        // commands trust for provenance — `automationDispatch: true` alone
+        // turns an Implementation run into an automatic advance-and-apply.
+        // Everything else about the invocation comes from the request's own
+        // validated task path.
+        const relayedArg = decodeRelayedCommandArgV1(request.command, request.args?.[0]);
         const taskArg =
-          taskFolderPath !== undefined ? { ...extra, taskFolderPath, canonicalId: taskFolderPath } : undefined;
-        const result: unknown = await vscode.commands.executeCommand(request.command, taskArg);
+          taskFolderPath !== undefined ? { ...relayedArg, taskFolderPath, canonicalId: taskFolderPath } : undefined;
+        const result: unknown = await runUnattendedV1(async () =>
+          vscode.commands.executeCommand(request.command, taskArg)
+        );
         if (result === false) {
-          throw new Error("the runner declined the action (see its Notifications view)");
+          throw new Error("the runner declined the action (see the Notifications view)");
         }
         return result;
       })();
@@ -773,19 +866,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     commandId: string,
     taskFolderPath: string | undefined,
     commandArg?: Readonly<Record<string, unknown>>
-  ): Promise<void> {
+  ): Promise<boolean> {
     const task = taskFolderPath ?? currentTaskStore.get();
-    const label =
-      commandId === "vs-code-ai-helper.chatWithStage"
-        ? "Chat reply"
-        : RUN_ON_RUNNER_ACTIONS_V1.find((action) => action.command === commandId)?.label ?? commandId;
+    const label = RELAYED_ACTION_LABELS_V1[commandId] ?? commandId;
     if (hostRelay === undefined) {
       NotificationRouter.showWarning("No workspace folder is open — there is no runner to send this to.");
-      return;
+      return false;
     }
     if (task === undefined) {
       NotificationRouter.showWarning("Select a task first — the action runs on the runner for that task.");
-      return;
+      return false;
+    }
+    // Do not claim to be running something on a runner that is not there.
+    const notReporting = await describeRunnerNotReportingV1();
+    if (notReporting !== undefined) {
+      NotificationRouter.showWarning(`${label} was not started: ${notReporting}`);
+      return false;
     }
     try {
       const response = await vscode.window.withProgress(
@@ -803,11 +899,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       if (!response.ok) {
         NotificationRouter.showWarning(`The runner could not run ${label}: ${response.reason ?? "unknown reason"}`);
+        return false;
       }
+      return true;
     } catch (error) {
       NotificationRouter.showWarning(
-        `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+        `${label}: could not reach the runner — ${error instanceof Error ? error.message : String(error)}`
       );
+      return false;
     }
   }
   configureViewerCommandForwarderV1(viewerHost ? forwardCommandToRunner : undefined);
@@ -862,7 +961,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // appends every notification to the shared mirror file, and a viewer shows
   // those entries in its own Notifications view — otherwise a forwarded
   // action the runner refused looked like it silently did nothing.
-  const relayDir = relayRoot !== undefined ? path.join(relayRoot, HOST_RELAY_DIRNAME_V1) : undefined;
+  const relayDir = relayDirPath;
   if (hostRole === "runner" && relayDir !== undefined) {
     initNotificationRouter({
       addEntry: (message, level, filePath, resultTargetUri, sourceOperationId, actionCommand) => {
@@ -1273,7 +1372,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(op.activityStartedAt !== undefined ? { activityStartedAt: op.activityStartedAt } : {}),
           ...(op.resultTargetUri !== undefined ? { resultTargetUri: op.resultTargetUri } : {}),
         }));
-      void writeRunnerOperationsSnapshotV1(relayDir, { writtenAt: Date.now(), operations });
+      void writeRunnerOperationsSnapshotV1(relayDir, {
+        writtenAt: Date.now(),
+        operations,
+        activationId: runnerActivationIdV1,
+      });
     };
     // Debounced: activity reports can arrive many times a second.
     const scheduleSnapshot = (): void => {
@@ -1289,12 +1392,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const writeDecisions = (): void => {
       const pending = decisionStore.listPending();
       const signature = JSON.stringify(pending);
-      if (signature !== lastDecisionsSignature) {
-        lastDecisionsSignature = signature;
-        void writeRunnerDecisionsSnapshotV1(relayDir, pending);
+      // The signature is only remembered once the write actually LANDED, and
+      // a heartbeat rewrites it regardless, so a failed or superseded write
+      // cannot leave a viewer showing a settled question forever (review,
+      // 2026-09-17). Writes are serialized in hostMirrorWriteV1.ts.
+      void writeRunnerDecisionsSnapshotV1(relayDir, pending).then((written) => {
+        if (written) {
+          lastDecisionsSignature = signature;
+        }
+      });
+    };
+    const writeDecisionsIfChanged = (): void => {
+      if (JSON.stringify(decisionStore.listPending()) !== lastDecisionsSignature) {
+        writeDecisions();
       }
     };
-    const decisionsListener = decisionStore.onDidChange(writeDecisions);
+    const decisionsListener = decisionStore.onDidChange(writeDecisionsIfChanged);
+    // Unconditional on the heartbeat: it also refreshes `writtenAt`, which is
+    // how a viewer knows these decisions are still answerable at all.
     const decisionsHeartbeat = setInterval(writeDecisions, RUNNER_OPERATIONS_HEARTBEAT_MS_V1);
     writeDecisions();
     context.subscriptions.push(decisionsListener, { dispose: () => clearInterval(decisionsHeartbeat) });
@@ -1309,6 +1424,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (writeTimer !== undefined) {
           clearTimeout(writeTimer);
         }
+        // A clean shutdown publishes "nothing is running" so viewers stop
+        // showing this runner's work as live for the whole stale window.
+        void writeRunnerOperationsSnapshotV1(relayDir, {
+          writtenAt: Date.now(),
+          operations: [],
+          activationId: runnerActivationIdV1,
+        });
       },
     });
   }
@@ -1316,9 +1438,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // The runner's operations go into this window's own registry, so the
     // stage-row spinners, the Notifications rows, the progress bar and the
     // badges all render them exactly as they render a local run.
+    let runnerActivationSeenV1: string | undefined;
     taskOperations.configureMirroredOperationCancel((operationId) => {
       void hostRelay
-        ?.send({ kind: "cancelOperation", operationId }, { timeoutMs: 60 * 1000 })
+        ?.send(
+          { kind: "cancelOperation", operationId, ...(runnerActivationSeenV1 ? { activationId: runnerActivationSeenV1 } : {}) },
+          { timeoutMs: 60 * 1000 }
+        )
         .then((response) => {
           if (!response.ok) {
             NotificationRouter.showWarning(`The runner could not cancel the operation: ${response.reason ?? "unknown reason"}`);
@@ -1332,11 +1458,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
     const runnerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     runnerStatus.command = `${STATUS_VIEW_ID}.focus`;
+    let mirroredRootsShownV1: readonly { label: string; taskName: string }[] = [];
     const refreshRunnerStatus = async (): Promise<void> => {
       const snapshot = await readRunnerOperationsSnapshotV1(relayDir);
       const now = Date.now();
+      runnerActivationSeenV1 = snapshot?.activationId;
+      const live = liveMirroredOperationsV1(snapshot, now);
+      // The runner going silent mid-work must not look like the work
+      // finishing: dropping the rows is visually identical to a clean
+      // completion, which had users going to look for output that was never
+      // produced (review, 2026-09-17). Say it once, per root that vanished.
+      if (live.length === 0 && mirroredRootsShownV1.length > 0 && !isRunnerReportingV1(snapshot, now)) {
+        for (const root of mirroredRootsShownV1) {
+          NotificationRouter.showWarning(
+            `${root.label} — "${root.taskName}": the runner stopped reporting while this was running, so its outcome is unknown. Check the runner VS Code on the box.`
+          );
+        }
+      }
+      mirroredRootsShownV1 = live
+        .filter((op) => op.parentId === undefined)
+        .map((op) => ({ label: op.label, taskName: op.taskName }));
       taskOperations.setMirroredOperations(
-        liveMirroredOperationsV1(snapshot, now).map((op) => ({
+        live.map((op) => ({
           ...op,
           stage: op.stage as TaskStage | undefined,
           kind: op.kind as OperationKind | undefined,
@@ -1361,7 +1504,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     operationsWatcher.onDidCreate(() => void refreshRunnerStatus());
     operationsWatcher.onDidChange(() => void refreshRunnerStatus());
     const refreshRunnerDecisions = async (): Promise<void> => {
-      if (viewerDecisions?.setDecisions(await readRunnerDecisionsSnapshotV1(relayDir))) {
+      const snapshot = await readRunnerDecisionsSnapshotV1(relayDir);
+      // A decision is only answerable while the runner is there to take the
+      // answer, so a stale snapshot shows nothing rather than a card that
+      // waits out the relay timeout when pressed.
+      const live = liveMirroredDecisionsV1(snapshot, Date.now(), RUNNER_OPERATIONS_STALE_MS_V1);
+      if (viewerDecisions?.setDecisions(live)) {
         notifyWorkflowDecisionsChangedV1(decisionsState);
       }
     };

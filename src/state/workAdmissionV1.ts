@@ -1722,6 +1722,19 @@ export interface WorkAdmissionFsFailureInjectionV1 {
    * never used by production code paths. */
   readonly onBeforeFenceInitWriteAsync?: () => Promise<void>;
   /**
+   * The other half of the same interleaving: awaited immediately AFTER
+   * `readOrInitPauseFenceGenerationV1` successfully created `g0`, before its
+   * post-write re-list. Holding an initializer here while a concurrent
+   * `advancePauseFenceGenerationV1` publishes `g1` forces the exact ordering
+   * the doc comment on that re-list describes — "the advancer's generation
+   * lands strictly between the initializer's own write and its re-list" —
+   * which `onBeforeFenceInitWriteAsync` alone cannot produce, since an
+   * initializer parked before its write always loses `g0` to the advancer and
+   * exercises only the EEXIST path (test-integrity review, 2026-09-17).
+   * `undefined` outside tests; never used by production code paths.
+   */
+  readonly onAfterFenceInitWriteAsync?: () => Promise<void>;
+  /**
    * Part 1b revocation barrier (plan step 12): awaited immediately before
    * `revokeStalePauseCommitClaimV1` renames the observed-stale `pauseCommit`
    * marker to its `pause-revocation.pending.*` barrier name, after that
@@ -2581,6 +2594,9 @@ export async function readOrInitPauseFenceGenerationV1(taskFolderPath: string): 
   }
   try {
     await fs.promises.writeFile(zeroPath, "", { flag: "wx" });
+    if (fsFailureInjectionV1?.onAfterFenceInitWriteAsync) {
+      await fsFailureInjectionV1.onAfterFenceInitWriteAsync();
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
       throw error;

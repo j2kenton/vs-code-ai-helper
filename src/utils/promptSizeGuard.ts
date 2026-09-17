@@ -10,6 +10,7 @@ import {
   setLargeTokenRequestWarningEnabled,
 } from "../config/settings";
 import { NotificationRouter } from "./notificationRouter";
+import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattendedExecutionV1";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -68,6 +69,17 @@ export async function checkAndConfirmPromptSize(
   if (bytes > CONTEXT_CONFIRM_THRESHOLD_BYTES) {
     if (!isLargeTokenRequestWarningEnabled()) {
       return "confirmed";
+    }
+    if (isUnattendedExecutionV1()) {
+      // Relayed from a viewer (unattendedExecutionV1.ts): nobody can answer
+      // this dialog here. Declining is the safe answer — it is the user's
+      // quota — and the relay reports the reason instead of hanging.
+      const kb = Math.round(bytes / 1024);
+      NotificationRouter.showWarning(
+        unattendedRefusalV1(`Sending a ~${kb} KB prompt to ${providerLabel}`) +
+          " (turn off the large-request warning in Ensemble Settings to send prompts this size without asking.)"
+      );
+      return "declined";
     }
     const kb = Math.round(bytes / 1024);
     const tokens = estimateTokensFromUtf8Bytes(bytes);

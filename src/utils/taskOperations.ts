@@ -7,6 +7,7 @@ import { OperationKind } from "./operationTaxonomy";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { describeOwedContinuationRefusalV1 } from "./owedContinuationRefusalV1";
 import { writeRunLog } from "./runLog";
+import { isViewerHostV1 } from "../state/hostRoleV1";
 
 /**
  * Lifecycle states of a tracked operation (contract C1):
@@ -444,6 +445,35 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return id.startsWith(MIRRORED_OPERATION_ID_PREFIX);
   }
 
+  /** This window's OWN operations for a task — never the runner's mirrored ones. */
+  getLocalTaskOperations(taskPath: string): readonly TaskOperationSnapshot[] {
+    const keyMap = this.operations.get(taskKey(taskPath));
+    return keyMap ? Array.from(keyMap.values()).sort((a, b) => a.startedAt - b.startedAt) : [];
+  }
+
+  /** The mirrored (other window's) operations for a task. */
+  getMirroredTaskOperations(taskPath: string): readonly TaskOperationSnapshot[] {
+    const keyMap = this.mirrored.get(taskKey(taskPath));
+    return keyMap ? Array.from(keyMap.values()).sort((a, b) => a.startedAt - b.startedAt) : [];
+  }
+
+  /**
+   * Whether ANY window has a root operation for this task — display-only
+   * ("is something running for this task"), unlike `rootOperationIdFor`,
+   * whose id is only meaningful for work running HERE.
+   */
+  hasRootOperationForTask(taskPath: string): boolean {
+    const key = taskKey(taskPath);
+    for (const keyMap of [this.operations.get(key), this.mirrored.get(key)]) {
+      for (const op of keyMap?.values() ?? []) {
+        if (op.parentId === undefined) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /** Where a cancel of a mirrored operation goes (receives the owning window's id). */
   configureMirroredOperationCancel(handler: ((operationId: string) => void) | undefined): void {
     this.mirroredCancel = handler;
@@ -460,9 +490,16 @@ export class TaskOperationRegistry implements vscode.Disposable {
     // are atomic with registration — nothing can slip in between.
     const conflictKeys = isChild ? undefined : spec.conflictKeys;
     if (!isChild) {
-      const active = this.operations.get(key);
-      if (active) {
-        for (const snap of active.values()) {
+      // Mirrored work counts here (review, 2026-09-17): the runner holding a
+      // task's exclusive lock is exactly what must stop a viewer starting a
+      // second writer against the same artifacts — "Revert Stage Changes" in
+      // a viewer was admitted while the runner was mid-write, which a
+      // standalone window would have refused as busy. Mirrored entries are
+      // display-only everywhere else, but admission is the one place where
+      // "someone else owns this task" is the whole point.
+      const active = [...(this.operations.get(key)?.values() ?? []), ...(this.mirrored.get(key)?.values() ?? [])];
+      if (active.length > 0) {
+        for (const snap of active) {
           // Rule 1: at most one exclusive operation per task.
           if (exclusive && snap.exclusive) {
             return null; // Refused
@@ -1072,7 +1109,21 @@ export async function cancelRunningOperationsForTask(
   taskFolderPath: string,
   timeoutMs = 15_000
 ): Promise<{ ok: boolean; reason?: string }> {
-  const ops = taskOperations.getTaskOperations(taskFolderPath);
+  // Another window's work is not ours to cancel as a side effect of a local
+  // action (review, 2026-09-17): archiving or moving a stage in a viewer used
+  // to relay a cancel that killed the runner's round with no warning, then
+  // time out because the mirror only clears on the next refresh. Say what is
+  // running and where, and let the user stop it deliberately (the Stop button
+  // on its Notifications row relays a cancel).
+  const mirrored = taskOperations.getMirroredTaskOperations(taskFolderPath);
+  const mirroredRoot = mirrored.find((op) => op.parentId === undefined) ?? mirrored[0];
+  if (mirroredRoot) {
+    return {
+      ok: false,
+      reason: `The runner is running "${mirroredRoot.label}" for this task. Stop it from the Notifications view (or wait for it to finish), then try again.`,
+    };
+  }
+  const ops = taskOperations.getLocalTaskOperations(taskFolderPath);
   if (ops.length === 0) {
     return { ok: true };
   }
@@ -1085,7 +1136,7 @@ export async function cancelRunningOperationsForTask(
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (taskOperations.getTaskOperations(taskFolderPath).length === 0) {
+    if (taskOperations.getLocalTaskOperations(taskFolderPath).length === 0) {
       return { ok: true };
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -1212,6 +1263,13 @@ const armedContinuationRetries = new Set<string>();
  * release and missed exactly this window).
  */
 function armReleaseTriggeredContinuationRetryV1(taskPath: string): void {
+  if (isViewerHostV1()) {
+    // Continuations belong to the runner, which arms its own (hostRoleV1.ts).
+    // A viewer arming one would dispatch work the user never asked for — the
+    // same rule Resume and the scheduler already follow — and could never
+    // fire anyway, since mirrored operations never emit `onDidEnd`.
+    return;
+  }
   const key = taskKey(taskPath);
   if (armedContinuationRetries.has(key)) {
     return;

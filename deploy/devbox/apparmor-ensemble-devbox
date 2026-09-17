@@ -12,7 +12,10 @@ include <tunables/global>
 # Measured on the box: seccomp=unconfined alone fails ("Failed to make / slave"),
 # adding apparmor=unconfined still fails ("loopback: Failed RTM_NEWADDR") —
 # only a profile that grants `userns` works. It applies to this container
-# alone; the host-wide restriction stays on.
+# alone; the host-wide restriction stays on. This profile is `unconfined` apart
+# from that grant, so the syscall filter is what still confines the container:
+# run.sh pairs it with Docker's default seccomp profile plus the namespace
+# syscalls (seccomp-allow-userns.mjs), NOT with seccomp=unconfined.
 #
 # Install on the HOST (run.sh does it):
 #   sudo install -m 0644 apparmor-ensemble-devbox /etc/apparmor.d/ensemble-devbox

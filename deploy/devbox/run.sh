@@ -14,17 +14,36 @@ mkdir -p "$keys_dir"
 cp "$AUTHORIZED_KEY_FILE" "$keys_dir/dev"
 chmod 0644 "$keys_dir/dev"
 
-# Codex's review sandbox (bubblewrap) needs a user namespace, which the host
-# denies to containers by default — see apparmor-ensemble-devbox for what was
-# measured. The profile grants that to THIS container only; with it, the
-# container also runs without Docker's seccomp filter, which blocks the same
-# calls. Set DEVBOX_CODEX_SANDBOX=0 to keep the stock confinement instead
-# (Codex reviews on the box then cannot run commands).
+# Codex's review sandbox (bubblewrap) needs its own user namespace, which two
+# separate layers deny a container by default: Ubuntu 24.04's AppArmor
+# restriction, and Docker's seccomp filter. Both are relaxed as narrowly as
+# measured to work (2026-09-17):
+#   - AppArmor: a profile for THIS container only, granting `userns`
+#     (apparmor-ensemble-devbox). The host-wide restriction stays on.
+#   - seccomp: Docker's own default profile with ONLY the namespace syscalls
+#     allowed (seccomp-allow-userns.mjs) — all ~350 other rules stay. This is
+#     what `--security-opt seccomp=unconfined` would have thrown away.
+# Set DEVBOX_CODEX_SANDBOX=0 to keep the stock confinement instead; Codex
+# reviews on the box then cannot run any command, so they verify nothing.
 sandbox_opts=""
 if [ "${DEVBOX_CODEX_SANDBOX:-1}" = "1" ]; then
   sudo install -m 0644 apparmor-ensemble-devbox /etc/apparmor.d/ensemble-devbox
   sudo apparmor_parser -r /etc/apparmor.d/ensemble-devbox
-  sandbox_opts="--security-opt seccomp=unconfined --security-opt apparmor=ensemble-devbox"
+  sandbox_opts="--security-opt apparmor=ensemble-devbox"
+  # Docker's default profile is compiled into the daemon, so the patch starts
+  # from moby's published copy of it.
+  seccomp_base="${DEVBOX_SECCOMP_BASE:-}"
+  if [ -z "$seccomp_base" ] && curl -fsS -o /tmp/devbox-seccomp-base.json \
+      https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json; then
+    seccomp_base=/tmp/devbox-seccomp-base.json
+  fi
+  if [ -n "$seccomp_base" ] && node seccomp-allow-userns.mjs "$seccomp_base" /tmp/devbox-seccomp.json; then
+    sandbox_opts="$sandbox_opts --security-opt seccomp=/tmp/devbox-seccomp.json"
+  else
+    echo "WARNING: could not build the narrowed seccomp profile; falling back to seccomp=unconfined." >&2
+    echo "         (Set DEVBOX_SECCOMP_BASE=<path to moby's default.json> to avoid this.)" >&2
+    sandbox_opts="$sandbox_opts --security-opt seccomp=unconfined"
+  fi
 fi
 
 sudo docker rm -f ensemble-devbox >/dev/null 2>&1 || true

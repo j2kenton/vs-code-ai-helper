@@ -35,7 +35,7 @@
     },
     {
       "file": "src/extension.ts",
-      "line": 1640,
+      "line": 1788,
       "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision."
     },
     {
@@ -50,7 +50,7 @@
     },
     {
       "file": "src/utils/promptSizeGuard.ts",
-      "line": 80,
+      "line": 92,
       "reason": "Direct synchronous pre-dispatch size warning inline in whichever command is about to send an oversized prompt — a cost/quota guard on the calling command's own flow, not a review/round outcome to record in chat."
     },
     {
@@ -73,7 +73,7 @@
   "directActionEntries": [
     {
       "file": "src/commands/chatWithStage.ts",
-      "line": 700,
+      "line": 701,
       "reason": "Synchronous pre-dispatch gate inline in the user-invoked Chat Send command when no model is configured for the stage — points to Ensemble Settings to fix the configuration, not a review/round decision. (Line moved 589 → 601 → 612 → 605 → 633 → 653 → 659 → 667 → 677 → 689 → 695 as admission-registration edits, including the 2026-09-14 ownership-legitimacy-signal doc-comment update, landed on this route; call is unchanged.)"
     },
     {
@@ -193,7 +193,7 @@
     },
     {
       "file": "src/views/chatView.ts",
-      "line": 2079,
+      "line": 2208,
       "reason": "Chat-history recovery notice (plan §5.1) — a corrupted local chat-v1.json needs 'Reset Chat History' or manual inspection via 'Ensemble: Open Chat Data'; a data-recovery affordance, not a task review/round workflow decision."
     },
     {

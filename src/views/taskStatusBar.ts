@@ -343,7 +343,7 @@ export class TaskStatusBar implements vscode.Disposable {
       entries: store.listForTask(taskId),
       owedContinuation: deriveOwedContinuationRecordV1(taskId, store.getOwedContinuation(taskId)),
       hasCoverage: store.hasCoverage(taskId),
-      inFlight: taskOperations.rootOperationIdFor(taskId) !== undefined,
+      inFlight: taskOperations.hasRootOperationForTask(taskId),
     });
     const rendered = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture));
     return {

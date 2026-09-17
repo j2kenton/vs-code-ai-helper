@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
 import { isViewerHostV1 } from "../state/hostRoleV1";
+import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
@@ -151,7 +152,15 @@ export interface ChatInteractionServicesV1 {
    * to the runner that raised it. Unset everywhere else: the decision is
    * resolved and its effect run in this window.
    */
-  resolveWorkflowDecision?(decisionId: string, optionId: string): Promise<void>;
+  resolveWorkflowDecision?(
+    decisionId: string,
+    optionId: string
+  ): Promise<{
+    readonly ok: boolean;
+    readonly message?: string;
+    /** An effect the runner handed back to run here (viewerForwardingV1.ts). */
+    readonly viewerEffect?: { readonly command: string; readonly args?: readonly unknown[] };
+  } | undefined>;
   /**
    * Resolve a task's current lifecycle status from the shared inventory.
    * Used by render() to hide (never delete) the stored conversation of a
@@ -601,6 +610,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private readonly schedulingIntentStore: SchedulingIntentStoreV1;
   private readonly schedulingIntentSub: vscode.Disposable;
+  /**
+   * Set while resolving on behalf of another window — see
+   * `resolveWorkflowDecisionForRelayV1`.
+   */
+  private relayedDecisionIdentityV1: ChatIdentity | undefined;
+  private skipRelayedDecisionEffectV1 = false;
+  /** Decision ids whose answer is in flight to the runner (hostRelayV1.ts). */
+  private readonly decisionsBeingAnsweredV1 = new Set<string>();
+  /**
+   * Whether a decision id belongs to another window (the runner), so its
+   * answer must be relayed rather than recorded here. extension.ts installs
+   * this in a viewer (hostDecisionMirrorV1.ts); unset everywhere else.
+   */
+  private isRemoteDecisionV1: ((decisionId: string) => boolean) | undefined;
 
   constructor(private readonly state: vscode.Memento) {
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
@@ -657,6 +680,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** Wire the production Chat interaction services (plan §5.4/§6.1); see ChatInteractionServicesV1. */
+  /**
+   * Put a message the send could not deliver back in the input box, so the
+   * user still has what they typed (a viewer's send is only persisted once
+   * the runner accepts it — see `chatWithStageInViewerV1`).
+   */
+  restoreUnsentDraftV1(text: string): void {
+    void this.view?.webview.postMessage({ type: "restoreDraft", text });
+  }
+
+  /** See `isRemoteDecisionV1`. */
+  configureRemoteDecisionPredicateV1(predicate: ((decisionId: string) => boolean) | undefined): void {
+    this.isRemoteDecisionV1 = predicate;
+  }
+
   setInteractionServices(services: ChatInteractionServicesV1): void {
     this.interactionServices = services;
   }
@@ -1640,6 +1677,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * no worse than today's silence.
    */
   private identityForDecision(decision: WorkflowDecisionV1): ChatIdentity | undefined {
+    if (this.relayedDecisionIdentityV1) {
+      // Resolving on behalf of another window (see
+      // `resolveWorkflowDecisionForRelayV1`): the panel here is not what the
+      // user clicked in — on a headless runner there is no panel at all, and
+      // on one left open elsewhere it names a DIFFERENT task, which is where
+      // every acknowledgement was landing (review, 2026-09-17).
+      return this.relayedDecisionIdentityV1;
+    }
     return this.target &&
       this.target.kind !== "global" &&
       this.target.canonicalId === decision.taskCanonicalId &&
@@ -1867,24 +1912,89 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * target switch mid-race still acknowledges the task the click actually
    * came from, not whatever is open when the store call returns.
    */
-  async resolveWorkflowDecision(decisionId: string, optionId: string): Promise<void> {
-    if (this.interactionServices?.resolveWorkflowDecision) {
-      await this.interactionServices.resolveWorkflowDecision(decisionId, optionId);
-      return;
+  /**
+   * Resolve a decision on behalf of a VIEWER window (hostRelayV1.ts).
+   *
+   * Two things differ from a local click: the acknowledgement identity comes
+   * from the decision's own record rather than this window's panel (there may
+   * not be one), and an effect that belongs where the user is — a view to
+   * open, a confirmation to answer — is handed back for the viewer to run
+   * instead of being executed into an empty screen
+   * (VIEWER_DECISION_EFFECT_COMMANDS_V1).
+   */
+  async resolveWorkflowDecisionForRelayV1(
+    decisionId: string,
+    optionId: string
+  ): Promise<{ ok: boolean; message?: string; viewerEffect?: { command: string; args?: readonly unknown[] } }> {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    if (!decision) {
+      return { ok: false, message: "the runner no longer has that decision" };
+    }
+    // A canonical id IS the normalized task-folder path (taskRoot.ts).
+    this.relayedDecisionIdentityV1 = {
+      canonicalId: decision.taskCanonicalId,
+      taskFolderPath: decision.taskCanonicalId,
+    };
+    const option = decision.options.find((candidate) => candidate.optionId === optionId);
+    const viewerEffect =
+      option?.effect.kind === "command" && VIEWER_DECISION_EFFECT_COMMANDS_V1.has(option.effect.command)
+        ? { command: option.effect.command, ...(option.effect.args ? { args: option.effect.args } : {}) }
+        : undefined;
+    this.skipRelayedDecisionEffectV1 = viewerEffect !== undefined;
+    try {
+      const outcome = await this.resolveWorkflowDecision(decisionId, optionId);
+      return { ...outcome, ...(viewerEffect ? { viewerEffect } : {}) };
+    } finally {
+      this.relayedDecisionIdentityV1 = undefined;
+      this.skipRelayedDecisionEffectV1 = false;
+    }
+  }
+
+  async resolveWorkflowDecision(
+    decisionId: string,
+    optionId: string
+  ): Promise<{ ok: boolean; message?: string }> {
+    if (this.interactionServices?.resolveWorkflowDecision && this.isRemoteDecisionV1?.(decisionId) !== false) {
+      // The runner raised it, so the runner resolves it and runs its effect
+      // (hostDecisionMirrorV1.ts). A decision this window raised itself
+      // (`isRemoteDecisionV1` false) is still resolved here.
+      this.decisionsBeingAnsweredV1.add(decisionId);
+      await this.render();
+      try {
+        const relayed = await this.interactionServices.resolveWorkflowDecision(decisionId, optionId);
+        if (relayed?.viewerEffect) {
+          await this.runDecisionEffectV1(relayed.viewerEffect);
+        }
+        if (relayed?.ok === false) {
+          // It did not land: the card must come back, so the user can retry
+          // rather than be left with a question that vanished unanswered.
+          this.decisionsBeingAnsweredV1.delete(decisionId);
+        }
+        return { ok: relayed?.ok !== false, ...(relayed?.message ? { message: relayed.message } : {}) };
+      } catch (error) {
+        this.decisionsBeingAnsweredV1.delete(decisionId);
+        throw error;
+      } finally {
+        await this.render();
+      }
     }
     const clickIdentity =
       this.target && this.target.kind !== "global" ? this.target : undefined;
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
+    let outcome: { ok: boolean; message?: string } = { ok: true };
     if (result.kind === "missing") {
       const message = "This decision is no longer pending — it may have already been resolved elsewhere.";
+      outcome = { ok: false, message };
       NotificationRouter.showWarning(message);
       if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else if (result.kind === "rejected") {
       const message = `Could not record your choice: ${result.reason}`;
+      outcome = { ok: false, message };
       NotificationRouter.showWarning(message);
       if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else if (result.kind === "alreadySettled") {
       const message = "This decision was already submitted.";
+      outcome = { ok: true, message };
       NotificationRouter.showInformation(message);
       const identity = this.identityForDecision(result.decision) ?? clickIdentity;
       if (identity) await this.append("assistant", message, result.decision.stage, identity);
@@ -1895,6 +2005,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // rather than leaving the click looking lost.
       const message =
         "This decision's operation has already ended, so this answer can no longer be applied. It will clear on its own.";
+      outcome = { ok: false, message };
       NotificationRouter.showInformation(message);
       if (clickIdentity) await this.append("assistant", message, clickIdentity.stage, clickIdentity);
     } else {
@@ -1907,7 +2018,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             : `Recorded: "${option.label}" — applying now. ${option.consequence}`;
         await this.append("assistant", ackText, decision.stage, identity);
       }
-      if (option.effect.kind === "command") {
+      if (option.effect.kind === "command" && !this.skipRelayedDecisionEffectV1) {
         try {
           // Some dispatched commands (e.g. goToReviewAndApplyV1) report a
           // failed multi-step sequence by resolving `false` rather than
@@ -1945,6 +2056,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     await this.render();
+    return outcome;
+  }
+
+  /**
+   * Run a decision effect that belongs in THIS window (a view to open, a
+   * confirmation to answer) once the other window has recorded the answer —
+   * see `resolveWorkflowDecisionForRelayV1`.
+   */
+  private async runDecisionEffectV1(effect: { command: string; args?: readonly unknown[] }): Promise<void> {
+    try {
+      await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
+    } catch (error) {
+      NotificationRouter.showWarning(
+        `Your answer was recorded, but the follow-up could not run here: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
   }
 
   private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
@@ -2105,7 +2234,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       target && target.kind !== "global"
         ? await this.withdrawStaleDecisionsV1(
             target,
-            this.workflowDecisionStore.listPending(target.canonicalId).filter((d) => d.stage === target.stage)
+            this.workflowDecisionStore
+              .listPending(target.canonicalId)
+              .filter((d) => d.stage === target.stage)
+              // An answer already on its way to the runner: the card is gone
+              // the moment it is pressed, exactly as a local click removes it,
+              // instead of coming back enabled on the next re-render and
+              // inviting a second press (review, 2026-09-17). It reappears
+              // only if the relay reports the answer did not land.
+              .filter((d) => !this.decisionsBeingAnsweredV1.has(d.decisionId))
           )
         : [];
     // Distinguish genuinely-running work from an operation that is merely
@@ -2366,7 +2503,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           entries: this.schedulingIntentStore.listForTask(target.canonicalId),
           owedContinuation: deriveOwedContinuationRecordV1(target.canonicalId, ledgerOwedSource),
           hasCoverage: this.schedulingIntentStore.hasCoverage(target.canonicalId),
-          inFlight: taskOperations.rootOperationIdFor(target.canonicalId) !== undefined,
+          inFlight: taskOperations.hasRootOperationForTask(target.canonicalId),
           owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
         });
         schedulingPostureLine = formatChatSchedulingPostureLineV1(posture, progress?.implRecovery?.leaseUntil);
@@ -2933,7 +3070,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
       }
       window.addEventListener('message', event=>{
-        const s=event.data;if(s.type!=='state')return;
+        const s=event.data;if(s.type==='restoreDraft'){if(!i.value){i.value=s.text;i.focus();}return;}if(s.type!=='state')return;
         const nextKey=targetKey(s.target);
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();

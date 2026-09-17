@@ -44,14 +44,41 @@ void describe("TaskOperationRegistry mirrored operations", () => {
     assert.equal(registry.getTaskOperations(TASK).length, 2);
   });
 
-  void it("never locks, tokens or ids for local work: a local begin still succeeds and owns the task", () => {
+  void it("holds the task's exclusive lock: a second writer here is refused while the runner owns it", () => {
     registry.setMirroredOperations([mirrored({ id: "op-1", stage: "impl" })]);
+    assert.equal(
+      registry.begin(TASK, { label: "Revert Stage Changes" }),
+      null,
+      "starting a local writer against a task the runner is mid-write on would race its artifacts"
+    );
+    assert.equal(registry.busyLabel(TASK), "Fast Forward Review", "and the refusal can name what holds it");
+    // Advisory (non-exclusive) work is unaffected, exactly as it is locally.
+    const advisory = registry.begin(TASK, { label: "Chat", exclusive: false });
+    assert.ok(advisory);
+    registry.end(advisory);
+    // Ids, tokens and root-id lookups stay local-only: nothing here can
+    // cancel or stamp the runner's work by accident.
+    assert.equal(registry.rootOperationIdFor(TASK), undefined);
+    assert.equal(registry.tokenFor(TASK), undefined);
+    registry.setMirroredOperations([]);
     const local = registry.begin(TASK, { label: "Pause Task" });
-    assert.ok(local, "the runner's work does not refuse local admission");
-    assert.equal(registry.rootOperationIdFor(TASK), local.id);
+    assert.ok(local, "and the lock is released as soon as the runner's work is gone");
     assert.notEqual(local.id, "runner:op-1");
     registry.end(local);
-    assert.equal(registry.tokenFor(TASK), undefined);
+  });
+
+  void it("separates its own operations from the runner's, for the code that must not touch theirs", () => {
+    registry.setMirroredOperations([mirrored({ id: "op-1", stage: "impl" })]);
+    const local = registry.begin(TASK, { label: "Chat", exclusive: false });
+    assert.ok(local);
+    assert.deepEqual(registry.getLocalTaskOperations(TASK).map((op) => op.label), ["Chat"]);
+    assert.deepEqual(registry.getMirroredTaskOperations(TASK).map((op) => op.id), ["runner:op-1"]);
+    assert.equal(registry.getTaskOperations(TASK).length, 2, "display sees both");
+    assert.equal(registry.hasRootOperationForTask(TASK), true);
+    registry.end(local);
+    assert.equal(registry.hasRootOperationForTask(TASK), true, "the runner's root still counts");
+    registry.setMirroredOperations([]);
+    assert.equal(registry.hasRootOperationForTask(TASK), false);
   });
 
   void it("a waiting runner operation shows waiting, not spinning", () => {

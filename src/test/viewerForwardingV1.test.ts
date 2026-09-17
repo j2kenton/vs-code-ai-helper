@@ -5,10 +5,13 @@
 import * as assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { configureEnsembleHostRoleForTestV1 } from "../state/hostRoleV1";
+import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import {
   configureViewerCommandForwarderV1,
+  decodeRelayedCommandArgV1,
   forwardInViewerV1,
   forwardToRunnerV1,
+  VIEWER_DECISION_EFFECT_COMMANDS_V1,
   RELAYABLE_COMMAND_IDS_V1,
   taskFolderPathFromCommandArgV1,
 } from "../services/viewerForwardingV1";
@@ -37,7 +40,7 @@ void describe("viewerForwardingV1", () => {
     const forwarded: Array<[string, string | undefined]> = [];
     configureViewerCommandForwarderV1((commandId, taskFolderPath) => {
       forwarded.push([commandId, taskFolderPath]);
-      return Promise.resolve();
+      return Promise.resolve(true);
     });
     let ran = false;
     const wrapped = forwardInViewerV1("vs-code-ai-helper.runReviewWithAI", (_arg?: unknown) => {
@@ -64,15 +67,61 @@ void describe("viewerForwardingV1", () => {
   });
 
   void it("forwards one invocation directly, with the extra command argument (a chat send)", async () => {
-    await assert.rejects(forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t"), /no connection/);
+    // With no runner connection it REPORTS and resolves false — it must never
+    // reject, since a rejection from a webview handler is VS Code's raw
+    // "Error running command" toast.
+    const warnings: string[] = [];
+    initNotificationRouter({ addEntry: (message) => void warnings.push(message) });
+    try {
+      assert.equal(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t"), false);
+      assert.match(warnings[0] ?? "", /no connection to the runner/);
+    } finally {
+      deactivateNotificationRouter();
+    }
     const forwarded: unknown[] = [];
     configureViewerCommandForwarderV1((commandId, taskFolderPath, commandArg) => {
       forwarded.push([commandId, taskFolderPath, commandArg]);
-      return Promise.resolve();
+      return Promise.resolve(true);
     });
-    await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" });
+    assert.equal(await forwardToRunnerV1("vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }), true);
     assert.deepEqual(forwarded, [["vs-code-ai-helper.chatWithStage", "/t", { stage: "plan", message: "why?" }]]);
     await assert.rejects(forwardToRunnerV1("vs-code-ai-helper.commitAndPushTask", "/t"), /RELAYABLE_COMMAND_IDS_V1/);
+  });
+
+  void it("only the fields a relayed command defines cross the boundary", () => {
+    // The runner used to spread this straight into the command argument, so a
+    // relay writer could set internal provenance fields.
+    assert.deepEqual(
+      decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", {
+        message: "why?",
+        stage: "impl-low-review",
+        taskName: "Spacing",
+        automationDispatch: true,
+        admissionHandoffTokenV1: "stolen",
+        task: { folderUri: { fsPath: "/elsewhere" } },
+      }),
+      { message: "why?", stage: "impl-low-review", taskName: "Spacing" }
+    );
+    assert.deepEqual(decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", { stage: "not-a-stage", message: "" }), {});
+    assert.deepEqual(
+      decodeRelayedCommandArgV1("vs-code-ai-helper.runImplementationWithAI", { automationDispatch: true, message: "x" }),
+      {},
+      "every other command takes nothing but its task"
+    );
+    for (const junk of [undefined, null, "x", 7, []]) {
+      assert.deepEqual(decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", junk), {});
+    }
+  });
+
+  void it("Commit & Push is not relayable, and its decision effect runs where the user is", () => {
+    assert.equal(RELAYABLE_COMMAND_IDS_V1.has("vs-code-ai-helper.commitAndPushTask"), false);
+    assert.equal(VIEWER_DECISION_EFFECT_COMMANDS_V1.has("vs-code-ai-helper.commitAndPushTask"), true);
+    assert.equal(VIEWER_DECISION_EFFECT_COMMANDS_V1.has("vs-code-ai-helper.openAiModels"), true);
+    assert.equal(
+      VIEWER_DECISION_EFFECT_COMMANDS_V1.has("vs-code-ai-helper.resumeAndApplyCurrentStageAction"),
+      false,
+      "workflow work stays on the runner"
+    );
   });
 
   void it("refuses to wrap a command the runner would not run", () => {

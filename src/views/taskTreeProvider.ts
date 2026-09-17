@@ -1404,7 +1404,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       entries: this.schedulingIntentStore.listForTask(taskId),
       owedContinuation: deriveOwedContinuationRecordV1(taskId, ledgerOwedSource),
       hasCoverage: this.schedulingIntentStore.hasCoverage(taskId),
-      inFlight: taskOperations.rootOperationIdFor(task.canonicalId ?? task.folderUri.fsPath) !== undefined,
+      inFlight: taskOperations.hasRootOperationForTask(task.canonicalId ?? task.folderUri.fsPath),
     });
   }
 

@@ -1,4 +1,6 @@
 import { isViewerHostV1 } from "../state/hostRoleV1";
+import { NotificationRouter } from "../utils/notificationRouter";
+import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 
 /**
  * In a VIEWER window (hostRoleV1.ts) the workflow's action buttons, tree
@@ -42,12 +44,65 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.chatWithStage",
 ]);
 
+/**
+ * A relayed command's argument, decoded field by field.
+ *
+ * The runner used to spread the request's first argument into the command's
+ * own argument. Anything that can write the relay directory — including the
+ * provider CLIs the workflow runs in this very workspace — could therefore
+ * set internal fields the commands trust as provenance: `automationDispatch:
+ * true` alone makes an Implementation request advance the stage and dispatch
+ * Apply Review instead (review, 2026-09-17). Only the fields a relayed
+ * command is DEFINED to carry are accepted, and only for the command that
+ * defines them; the task always comes from the request's own validated path.
+ */
+export function decodeRelayedCommandArgV1(commandId: string, arg: unknown): Record<string, unknown> {
+  if (commandId !== "vs-code-ai-helper.chatWithStage") {
+    return {};
+  }
+  const record = typeof arg === "object" && arg !== null ? (arg as Record<string, unknown>) : {};
+  const decoded: Record<string, unknown> = {};
+  if (typeof record.message === "string" && record.message.length > 0) {
+    decoded.message = record.message;
+  }
+  if (typeof record.stage === "string" && Object.prototype.hasOwnProperty.call(STAGE_DISPLAY_NAMES, record.stage)) {
+    decoded.stage = record.stage;
+  }
+  if (typeof record.taskName === "string") {
+    decoded.taskName = record.taskName;
+  }
+  return decoded;
+}
+
+/**
+ * Decision effects that must run where the USER is, not on the runner.
+ *
+ * Answering a decision relays it to the runner, which resolves the record and
+ * then runs the chosen option's effect. That is right for effects that are
+ * workflow work (resume, apply, advance) — they belong to the window that
+ * runs the workflow. It is wrong for effects that only open a view or ask for
+ * a confirmation: those would open on a desktop nobody is watching, so the
+ * card would vanish and nothing would appear to happen (review, 2026-09-17).
+ * The runner hands these back and the viewer runs them itself.
+ */
+export const VIEWER_DECISION_EFFECT_COMMANDS_V1: ReadonlySet<string> = new Set([
+  "vs-code-ai-helper.openAiModels",
+  "vs-code-ai-helper.openSettings",
+  "vs-code-ai-helper.openPlanFinal",
+  "vs-code-ai-helper.openPlanNonGoals",
+  "vs-code-ai-helper.viewStageChanges",
+  "vs-code-ai-helper.setStageBackupModel",
+  // Commit & Push confirms with a modal and is deliberately not relayable at
+  // all — the user answers it in their own window.
+  "vs-code-ai-helper.commitAndPushTask",
+]);
+
 export type ViewerCommandForwarderV1 = (
   commandId: string,
   taskFolderPath: string | undefined,
   /** Extra fields for the runner's command argument, beside the task. */
   commandArg?: Readonly<Record<string, unknown>>
-) => Promise<void>;
+) => Promise<boolean>;
 
 let forwarder: ViewerCommandForwarderV1 | undefined;
 
@@ -56,17 +111,24 @@ export function configureViewerCommandForwarderV1(next: ViewerCommandForwarderV1
   forwarder = next;
 }
 
-/** Forward one invocation to the runner directly (a command that forwards only some invocations). */
-export function forwardToRunnerV1(
+/**
+ * Forward one invocation to the runner directly (for a command that forwards
+ * only some of its invocations). Resolves false when the action did not run,
+ * having already reported why — it never rejects, because a rejection from a
+ * webview handler or command handler surfaces as VS Code's raw "Error running
+ * command" toast, which is what this module exists to avoid.
+ */
+export async function forwardToRunnerV1(
   commandId: string,
   taskFolderPath: string | undefined,
   commandArg?: Readonly<Record<string, unknown>>
-): Promise<void> {
+): Promise<boolean> {
   if (!RELAYABLE_COMMAND_IDS_V1.has(commandId)) {
-    return Promise.reject(new Error(`${commandId} is not in RELAYABLE_COMMAND_IDS_V1 — the runner would refuse to run it`));
+    throw new Error(`${commandId} is not in RELAYABLE_COMMAND_IDS_V1 — the runner would refuse to run it`);
   }
   if (forwarder === undefined) {
-    return Promise.reject(new Error("This viewer window has no connection to the runner yet."));
+    NotificationRouter.showWarning("This viewer window has no connection to the runner yet.");
+    return false;
   }
   return forwarder(commandId, taskFolderPath, commandArg);
 }
@@ -119,8 +181,9 @@ export function forwardInViewerV1<A extends unknown[], R>(
       return handler(...args);
     }
     if (forwarder === undefined) {
-      return Promise.reject(new Error("This viewer window has no connection to the runner yet."));
+      NotificationRouter.showWarning("This viewer window has no connection to the runner yet.");
+      return Promise.resolve();
     }
-    return forwarder(commandId, taskFolderPathFromCommandArgV1(args[0]));
+    return forwarder(commandId, taskFolderPathFromCommandArgV1(args[0])).then(() => undefined);
   };
 }

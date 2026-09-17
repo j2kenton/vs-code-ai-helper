@@ -71,6 +71,13 @@ export type HostRelayRequestV1 =
       readonly kind: "cancelOperation";
       /** The runner's own id for a running operation it mirrored (hostOperationsMirrorV1.ts). */
       readonly operationId: string;
+      /**
+       * The runner activation the cancelled row was read from. Operation ids
+       * restart at `op-1` on every runner start, so the runner refuses a
+       * request from an earlier activation rather than cancelling whatever
+       * that id names now.
+       */
+      readonly activationId?: string;
       readonly timeoutMs?: number;
       readonly createdAt: string;
     };
@@ -84,6 +91,34 @@ export interface HostRelayResponseV1 {
   readonly completedAt: string;
 }
 
+/**
+ * WHAT THE RELAY TRUSTS (stated plainly, because it is not obvious):
+ *
+ * The queue lives inside the task workspace, so every process that can write
+ * that workspace can write a request — including the provider CLIs the
+ * workflow itself runs there with write access. A request is therefore NOT
+ * proof that the user asked for anything; it is an instruction from something
+ * inside the workspace. What bounds it is not authentication (a shared secret
+ * would have to live where those same processes could read it) but WHAT a
+ * request is allowed to ask for:
+ *
+ *  - `command`: only `RELAYABLE_COMMAND_IDS_V1`, and only with the fields
+ *    `decodeRelayedCommandArgV1` decodes for that specific command — never
+ *    arbitrary properties, which is how internal provenance flags such as
+ *    `automationDispatch` could otherwise be forged (review, 2026-09-17).
+ *  - `resolveDecision`: only a decision the runner itself is holding, and
+ *    only one of the options that decision defines. Effects that ask for a
+ *    confirmation decline under `unattendedExecutionV1`, and effects that
+ *    belong in the user's own window are handed back rather than run here.
+ *  - `cancelOperation`: only an operation of THIS runner activation, and
+ *    cancelling is the one thing that cannot leave work half-done.
+ *
+ * The residual risk a hostile in-workspace process keeps is "it can trigger
+ * workflow actions the user can already trigger from the viewer, against the
+ * task it is already working in". That is inherent to running provider CLIs
+ * with write access in the workspace at all; it is not made worse here. Any
+ * NEW request kind must be judged against this list, not added beside it.
+ */
 export const HOST_RELAY_DIRNAME_V1 = "relay-v1";
 const REQUEST_PREFIX = "req-";
 const RESPONSE_PREFIX = "res-";

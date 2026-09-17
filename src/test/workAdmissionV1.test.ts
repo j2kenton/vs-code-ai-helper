@@ -2123,6 +2123,32 @@ void test("readOrInitPauseFenceGenerationV1 called many times concurrently while
   assert.ok(fs.existsSync(path.join(dir, "pause-fence.g1")), "the advancer's generation 1 must be durably published");
 });
 
+void test("readOrInitPauseFenceGenerationV1 that WON g0 still reports the generation an advancer published before its re-list", async () => {
+  // The interleaving the re-list exists for, forced deterministically: this
+  // initializer creates g0 itself, the advancer publishes g1 while it is held
+  // just past that write, and it must then report 1 — a build that returned
+  // early on a successful create would report a stale 0 here (test-integrity
+  // review, 2026-09-17; the before-write hook alone can only ever exercise
+  // the EEXIST path, since a parked initializer always loses g0).
+  const task = freshTaskFolder("pause-fence-init-won-g0-race");
+  let advanced: number | undefined;
+  setWorkAdmissionFsFailureInjectionForTestV1({
+    onAfterFenceInitWriteAsync: async () => {
+      if (advanced === undefined) {
+        advanced = await advancePauseFenceGenerationV1(task);
+      }
+    },
+  });
+  try {
+    const observed = await readOrInitPauseFenceGenerationV1(task);
+    assert.equal(advanced, 1, "the advancer published g1 inside the initializer's own window");
+    assert.equal(observed, 1, "the initializer must re-list and report the true maximum, never its own stale 0");
+  } finally {
+    setWorkAdmissionFsFailureInjectionForTestV1(undefined);
+  }
+  assert.equal(await readOrInitPauseFenceGenerationV1(task), 1);
+});
+
 void test("advancePauseFenceGenerationV1 publishes strictly the next generation past whatever currently exists", async () => {
   const task = freshTaskFolder("pause-fence-advance-basic");
   assert.equal(await readOrInitPauseFenceGenerationV1(task), 0);

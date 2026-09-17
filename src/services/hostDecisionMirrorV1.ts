@@ -1,7 +1,8 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as vscode from "vscode";
+import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { writeMirrorSnapshotV1 } from "./hostMirrorWriteV1";
 
 /**
  * The runner's pending workflow decisions, visible and answerable in every
@@ -14,67 +15,190 @@ import type * as vscode from "vscode";
  * question the user could not see (seen live 2026-09-17).
  *
  * The runner writes its pending decisions to `<relay dir>/decisions-v1.json`
- * whenever they change. A viewer hands its decision store a Memento whose
- * decisions key reads that file (everything else stays the viewer's own
- * workspaceState), so the tree and chat render the runner's decisions with
- * their ordinary code. An answer is never recorded here: the viewer relays it
- * to the runner, which resolves the decision and runs its effect exactly as
- * a click on the runner would. VS Code-free (type imports only), so it is
- * unit-testable.
+ * whenever they change and on a heartbeat. A viewer hands its decision store
+ * a Memento whose decisions key returns the runner's records ALONGSIDE its
+ * own (decisions raised by viewer-local commands must keep working), so the
+ * tree and chat render both with their ordinary code. An answer to one of the
+ * runner's decisions is never recorded here: it is relayed to the runner,
+ * which resolves it and runs the option's effect exactly as a click there
+ * would.
+ *
+ * Everything read back is UNTRUSTED input: the relay directory sits inside
+ * the task workspace, which the workflow's own provider CLIs can write. Each
+ * record is therefore structurally decoded before any UI sees it — a
+ * malformed `options` array would otherwise throw inside the chat webview and
+ * leave the panel unusable while a real question was waiting (review,
+ * 2026-09-17). VS Code-free (type imports only), so it is unit-testable.
  */
 
 export const HOST_DECISIONS_MIRROR_FILENAME_V1 = "decisions-v1.json";
 
-/** Runner side: write the pending decisions atomically. Never throws. */
-export async function writeRunnerDecisionsSnapshotV1(dir: string, decisions: readonly unknown[]): Promise<void> {
-  const file = path.join(dir, HOST_DECISIONS_MIRROR_FILENAME_V1);
-  const temp = `${file}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+export interface RunnerDecisionsSnapshotV1 {
+  readonly writtenAt: number;
+  readonly decisions: readonly WorkflowDecisionV1[];
+}
+
+/**
+ * Runner side: publish the pending decisions. Resolves false when the write
+ * failed or was superseded, so the caller's heartbeat can retry rather than
+ * caching a signature for state that never reached disk.
+ */
+export async function writeRunnerDecisionsSnapshotV1(
+  dir: string,
+  decisions: readonly WorkflowDecisionV1[]
+): Promise<boolean> {
+  return writeMirrorSnapshotV1(dir, HOST_DECISIONS_MIRROR_FILENAME_V1, {
+    writtenAt: Date.now(),
+    decisions,
+  });
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * One option, structurally. `effect` is what the resolution actually runs, so
+ * a `command` effect must name a command and nothing else is accepted.
+ */
+function decodeOption(value: unknown): value is WorkflowDecisionV1["options"][number] {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const option = value as Record<string, unknown>;
+  if (!isNonEmptyString(option.optionId) || !isNonEmptyString(option.label) || typeof option.consequence !== "string") {
+    return false;
+  }
+  const effect = option.effect;
+  if (typeof effect !== "object" || effect === null) {
+    return false;
+  }
+  const kind = (effect as Record<string, unknown>).kind;
+  if (kind === "doNothing") {
+    return true;
+  }
+  if (kind !== "command") {
+    return false;
+  }
+  const command = (effect as Record<string, unknown>).command;
+  const args = (effect as Record<string, unknown>).args;
+  return isNonEmptyString(command) && (args === undefined || Array.isArray(args));
+}
+
+/** One mirrored decision, structurally — only the fields the UI and the resolution touch. */
+export function decodeMirroredDecisionV1(value: unknown): WorkflowDecisionV1 | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const decision = value as Record<string, unknown>;
+  const ok =
+    isNonEmptyString(decision.decisionId) &&
+    isNonEmptyString(decision.decisionKey) &&
+    isNonEmptyString(decision.taskCanonicalId) &&
+    isNonEmptyString(decision.stage) &&
+    isNonEmptyString(decision.state) &&
+    typeof decision.whatHappened === "string" &&
+    typeof decision.whyUserNeeded === "string" &&
+    Array.isArray(decision.options) &&
+    decision.options.length > 0 &&
+    decision.options.every(decodeOption) &&
+    (decision.evidence === undefined || Array.isArray(decision.evidence));
+  return ok ? (decision as unknown as WorkflowDecisionV1) : undefined;
+}
+
+/** Viewer side: the runner's snapshot, or undefined when there is none or it is unreadable. */
+export async function readRunnerDecisionsSnapshotV1(dir: string): Promise<RunnerDecisionsSnapshotV1 | undefined> {
   try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(temp, JSON.stringify({ writtenAt: Date.now(), decisions }), "utf8");
-    await fs.rename(temp, file);
+    const parsed: unknown = JSON.parse(await fs.readFile(path.join(dir, HOST_DECISIONS_MIRROR_FILENAME_V1), "utf8"));
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.writtenAt !== "number" || !Array.isArray(record.decisions)) {
+      return undefined;
+    }
+    const decisions: WorkflowDecisionV1[] = [];
+    for (const candidate of record.decisions) {
+      const decoded = decodeMirroredDecisionV1(candidate);
+      if (decoded !== undefined) {
+        decisions.push(decoded);
+      }
+    }
+    return { writtenAt: record.writtenAt, decisions };
   } catch {
-    await fs.rm(temp, { force: true }).catch(() => undefined);
+    // No runner has written yet, or a torn read: nothing to show.
+    return undefined;
   }
 }
 
-/** Viewer side: the runner's pending decisions; empty when there is no readable snapshot. */
-export async function readRunnerDecisionsSnapshotV1(dir: string): Promise<readonly unknown[]> {
-  try {
-    const parsed: unknown = JSON.parse(await fs.readFile(path.join(dir, HOST_DECISIONS_MIRROR_FILENAME_V1), "utf8"));
-    if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).decisions)) {
-      return ((parsed as Record<string, unknown>).decisions as unknown[]).filter(
-        (decision) => typeof decision === "object" && decision !== null
-      );
-    }
-  } catch {
-    // No runner has written yet, or a torn read: nothing to show.
+/**
+ * Viewer side: the runner's decisions to show as answerable — none once the
+ * runner has stopped reporting, because answering one relays a request to a
+ * process that is not there to take it (review, 2026-09-17). `staleMs` is the
+ * operations mirror's own staleness limit, passed in so the two surfaces can
+ * never disagree about whether the runner is alive.
+ */
+export function liveMirroredDecisionsV1(
+  snapshot: RunnerDecisionsSnapshotV1 | undefined,
+  now: number,
+  staleMs: number
+): readonly WorkflowDecisionV1[] {
+  if (snapshot === undefined || now - snapshot.writtenAt > staleMs) {
+    return [];
   }
-  return [];
+  return snapshot.decisions;
 }
 
 export interface MirroredDecisionsMementoV1 {
   readonly memento: vscode.Memento;
   /** Replace the mirrored decisions; true when they changed. */
-  setDecisions(decisions: readonly unknown[]): boolean;
+  setDecisions(decisions: readonly WorkflowDecisionV1[]): boolean;
+  /** Whether `decisionId` belongs to the runner (so its answer must be relayed). */
+  isMirrored(decisionId: string): boolean;
 }
 
 /**
- * A Memento that is `base` for every key except `decisionsKey`, which reads
- * the mirrored decisions and ignores writes (the runner owns the records).
+ * A Memento that is `base` for every key, except that `decisionsKey` also
+ * carries the runner's mirrored decisions.
+ *
+ * Reads return `base`'s own records FIRST and the runner's after, so a
+ * decision this window raised itself keeps rendering and keeps being
+ * answerable locally. Writes go to `base` untouched: resolving one of the
+ * runner's decisions never writes here (the relay does it on the runner), and
+ * `isMirrored` is how the caller tells the two apart.
  */
 export function createMirroredDecisionsMementoV1(base: vscode.Memento, decisionsKey: string): MirroredDecisionsMementoV1 {
-  let decisions: readonly unknown[] = [];
+  let mirrored: readonly WorkflowDecisionV1[] = [];
+  let mirroredIds = new Set<string>();
   let signature = "[]";
   const memento: vscode.Memento = {
     keys: () => base.keys(),
     get: (<T>(key: string, defaultValue?: T): T | undefined => {
-      if (key === decisionsKey) {
-        return decisions as unknown as T;
+      if (key !== decisionsKey) {
+        return defaultValue === undefined ? base.get<T>(key) : base.get<T>(key, defaultValue);
       }
-      return defaultValue === undefined ? base.get<T>(key) : base.get<T>(key, defaultValue);
+      const own = base.get<readonly unknown[]>(decisionsKey, []);
+      const combined: unknown[] = Array.isArray(own) ? Array.from(own as readonly unknown[]) : [];
+      combined.push(...mirrored);
+      return combined as unknown as T;
     }) as vscode.Memento["get"],
-    update: (key: string, value: unknown) => (key === decisionsKey ? Promise.resolve() : base.update(key, value)),
+    update: (key: string, value: unknown) => {
+      if (key !== decisionsKey) {
+        return base.update(key, value);
+      }
+      // A store write starts from what `get` returned, which now includes the
+      // runner's records — persisting those into THIS window's state would
+      // duplicate every mirrored decision (once from disk, once from the
+      // mirror) and keep them after the runner dropped them. Only this
+      // window's own records are ever written back.
+      const own = Array.isArray(value)
+        ? value.filter((record) => {
+            const id = (record as { decisionId?: unknown } | null)?.decisionId;
+            return typeof id !== "string" || !mirroredIds.has(id);
+          })
+        : value;
+      return base.update(key, own);
+    },
   };
   return {
     memento,
@@ -84,8 +208,12 @@ export function createMirroredDecisionsMementoV1(base: vscode.Memento, decisions
         return false;
       }
       signature = nextSignature;
-      decisions = next;
+      mirrored = next;
+      mirroredIds = new Set(next.map((decision) => decision.decisionId));
       return true;
+    },
+    isMirrored(decisionId) {
+      return mirroredIds.has(decisionId);
     },
   };
 }
