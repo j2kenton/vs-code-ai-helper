@@ -1,0 +1,22 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# The Ensemble dev box container: unconfined, plus the right to create user
+# namespaces, which Ubuntu 24.04 otherwise denies to unprivileged processes
+# (kernel.apparmor_restrict_unprivileged_userns=1).
+#
+# Why: Codex runs every review inside its bubblewrap sandbox (the extension
+# never opts out of it), and bubblewrap needs a user namespace. Without this,
+# every Codex review on the box reports that it could not verify anything
+# ("bwrap: No permissions to create a new namespace", seen 2026-09-17).
+# Measured on the box: seccomp=unconfined alone fails ("Failed to make / slave"),
+# adding apparmor=unconfined still fails ("loopback: Failed RTM_NEWADDR") —
+# only a profile that grants `userns` works. It applies to this container
+# alone; the host-wide restriction stays on.
+#
+# Install on the HOST (run.sh does it):
+#   sudo install -m 0644 apparmor-ensemble-devbox /etc/apparmor.d/ensemble-devbox
+#   sudo apparmor_parser -r /etc/apparmor.d/ensemble-devbox
+profile ensemble-devbox flags=(unconfined) {
+  userns,
+}
