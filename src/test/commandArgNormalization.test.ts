@@ -1021,12 +1021,15 @@ void describe("resumePausedTask integration (full command path)", () => {
         undefined,
         "resumePausedTask must not schedule the stage's action — Resume only flips the status"
       );
-      // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch): arming
-      // this scheduledRun means automation acts next.
+      // v1 fixes 2, Wave I chokepoint, reconciled with "Resume only flips the
+      // status" at the merge (2026-09-18): `nextActor: "automation"` is
+      // recorded by whoever ARMS a dispatch. A bare Resume arms nothing, so
+      // claiming automation acts next would tell the user to wait for work
+      // nobody scheduled. The field is left exactly as it was.
       assert.strictEqual(
         stored!.nextActor,
-        "automation",
-        "arranging a scheduledRun dispatch must record nextActor as automation"
+        undefined,
+        "a Resume that starts nothing must not claim automation acts next"
       );
     } finally {
       msgs.restore();
