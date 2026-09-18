@@ -4173,6 +4173,23 @@ void describe("runImplementationForModel", () => {
   void it("keeps provider-qualified CLI model IDs on the CLI implementation path", async () => {
     // The stubbed `which` below must be what answers "is codex installed".
     resetCliCommandLookupCacheForTest();
+    // This run takes the workspace-scoped session lease
+    // (primarySessionLock.ts) for the checkout the suite runs FROM, so the
+    // test failed outright ("Unable to acquire Ensemble state lock") wherever
+    // an extension host holds that lease — which is every run on the cloud
+    // runner, where the workflow executes this suite in the runner's own
+    // workspace to verify a task (seen live 2026-09-18, deterministic). The
+    // lease is not what this test is about, so it is stubbed out, exactly as
+    // stage5StatusNotification.test.ts does for the creation path.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+    const stateStore = require("../state/taskStateStore") as {
+      withMetaRootLock: <T>(root: string, operation: () => Promise<T>) => Promise<T>;
+      withTaskLock: <T>(taskFolderPath: string, operation: () => Promise<T>) => Promise<T>;
+    };
+    const originalMetaRootLock = stateStore.withMetaRootLock;
+    const originalTaskLock = stateStore.withTaskLock;
+    stateStore.withMetaRootLock = <T>(_root: string, operation: () => Promise<T>): Promise<T> => operation();
+    stateStore.withTaskLock = <T>(_taskFolderPath: string, operation: () => Promise<T>): Promise<T> => operation();
     const originalSpawn = childProcess.spawn;
     const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
 
@@ -4212,6 +4229,8 @@ void describe("runImplementationForModel", () => {
       assert.deepStrictEqual(spawnCalls[0]?.args, ["codex"]);
     } finally {
       childProcess.spawn = originalSpawn;
+      stateStore.withMetaRootLock = originalMetaRootLock;
+      stateStore.withTaskLock = originalTaskLock;
     }
   });
 
