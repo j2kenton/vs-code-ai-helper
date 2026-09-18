@@ -81,6 +81,15 @@ const RUN_TIMEOUT_MS = 60 * 60 * 1000;
 const COMMAND_EXISTS_CACHE_TTL_MS = 60 * 1000;
 const commandExistsCache = new Map<string, { exists: boolean; expiresAt: number }>();
 
+/**
+ * Tests that stub `spawn` to decide whether a CLI is "installed" must start
+ * from an empty cache: an earlier test's real lookup otherwise answers for
+ * them wherever that CLI really is installed (seen on the Linux dev box).
+ */
+export function resetCliCommandLookupCacheForTest(): void {
+  commandExistsCache.clear();
+}
+
 function cliCommandCandidates(
   command: string,
   aliases: readonly string[] = []

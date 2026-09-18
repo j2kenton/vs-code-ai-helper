@@ -71,6 +71,9 @@ class FakeNode {
   getAttribute(name: string): string | undefined {
     return this.attributes.get(name);
   }
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
   scrollIntoView(): void {
     /* no-op */
   }
@@ -511,5 +514,188 @@ void describe("AI Models view — save path (skip/clear semantics)", () => {
     await session.byId("save-btn").dispatch("click");
     assert.ok(session.posted.some((message) => message.type === "validationError"));
     assert.ok(!session.posted.some((message) => message.type === "saveSettings"));
+  });
+});
+
+void describe("AI Models view — provider-disabled note follows the model, not the slot", () => {
+  const CLINE_PROVIDER = { ...CLAUDE_PROVIDER, id: "cline-cli", label: "Cline CLI" };
+
+  // The fake DOM's innerHTML setter never actually parses markup (see
+  // FakeNode above), so addExtraBackupCombobox's `holder.firstChild` lookup
+  // — used to render a backup row from settings.impl.backups on init — has
+  // nothing to return. These two tests sidestep that pre-existing harness
+  // gap by pre-seeding the exact FakeNode the × handler's own
+  // `row.querySelector('.extra-backups .model-row')` lookup will resolve
+  // to, rather than routing a backup row through the (unsupported) render
+  // path.
+  function seedFirstBackup(
+    row: FakeNode,
+    id: string,
+    label: string,
+    enabled: boolean
+  ): void {
+    const firstBackup = row.querySelector(".extra-backups .model-row");
+    firstBackup.querySelector('input[type="hidden"]').value = id;
+    firstBackup.querySelector(".model-combo-input").value = label;
+    firstBackup.querySelector(".row-enabled").checked = enabled;
+  }
+
+  void it("clears a stale note when an unavailable first choice is removed and an available backup is promoted", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [{ id: "cline-cli:kimi", name: "Kimi", providerLabel: "Cline CLI" }],
+        providers: [CLAUDE_PROVIDER, CLINE_PROVIDER],
+        enabledProviders: { "cline-cli": true },
+        settings: { impl: { primary: "claude-cli:sonnet", strategy: "switch-to-backup" } },
+      })
+    );
+    const row = session.tbodyRows()[0]!;
+    assert.ok(
+      row.innerHTML.includes('id="primary-note-impl" class="provider-disabled-note" >'),
+      "the note starts visible: the stored first choice's provider (claude-cli) is disabled"
+    );
+    seedFirstBackup(row, "cline-cli:kimi", "Kimi — Cline CLI", true);
+    const primaryRow = row.querySelector(".primary-container .model-row");
+    await primaryRow.querySelector(".remove-backup").dispatch("click");
+    assert.equal(
+      session.byId("primary-impl").value,
+      "cline-cli:kimi",
+      "the available backup is promoted into the primary slot"
+    );
+    assert.equal(
+      session.byId("primary-note-impl").hidden,
+      true,
+      "the note must not stay attached to the slot once an available model occupies it"
+    );
+  });
+
+  void it("shows the note on a promoted backup whose own provider is disabled", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [],
+        providers: [CLAUDE_PROVIDER, CLINE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet", strategy: "switch-to-backup" } },
+      })
+    );
+    const row = session.tbodyRows()[0]!;
+    // Force the note hidden before promotion so the assertion below can only
+    // pass if the × handler's syncProviderDisabledNote call actually flips it
+    // back to visible — FakeNode.hidden defaults to false, so leaving this
+    // unset would let the assertion pass even with no source fix at all.
+    session.byId("primary-note-impl").hidden = true;
+    seedFirstBackup(row, "cline-cli:kimi", "Kimi — Cline CLI", true);
+    const primaryRow = row.querySelector(".primary-container .model-row");
+    await primaryRow.querySelector(".remove-backup").dispatch("click");
+    assert.equal(session.byId("primary-impl").value, "cline-cli:kimi", "the backup is promoted");
+    assert.equal(
+      session.byId("primary-note-impl").hidden,
+      false,
+      "the promoted model's own provider is disabled, so the note must show on it"
+    );
+  });
+
+  void it("removing the only model in a row clears the note along with the primary id", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    const row = session.tbodyRows()[0]!;
+    const primaryRow = row.querySelector(".primary-container .model-row");
+    await primaryRow.querySelector(".remove-backup").dispatch("click");
+    assert.equal(session.byId("primary-impl").value, "", "removing the only model empties the primary id");
+    assert.equal(
+      session.byId("primary-note-impl").hidden,
+      true,
+      "an empty row must show no provider-disabled note"
+    );
+  });
+
+  void it("hides the note immediately while typing, then re-derives it once a replacement is confirmed on blur", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [{ id: "cline-cli:kimi", name: "Kimi", providerLabel: "Cline CLI" }],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    const row = session.tbodyRows()[0]!;
+    const input = row.querySelector("#primary-input-impl");
+    const note = row.querySelector("#primary-note-impl");
+    input.value = "Kimi — Cline CLI";
+    await input.dispatch("input");
+    assert.equal(note.hidden, true, "the stale note must hide as soon as typing clears the stored selection");
+    await input.dispatch("blur");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(row.querySelector("#primary-impl").value, "cline-cli:kimi", "blur confirms the typed replacement");
+    assert.equal(note.hidden, true, "the confirmed replacement's provider is enabled, so the note stays hidden");
+  });
+
+  void it("resolves a typed-but-unconfirmed replacement on save and clears its note (reconcileModelInput)", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [{ id: "cline-cli:kimi", name: "Kimi", providerLabel: "Cline CLI" }],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    const collectRow = session.byId("row-impl");
+    collectRow.querySelector(".primary-container .model-row").querySelector(".row-enabled").checked = true;
+    session.byId("fallback-enabled-impl").checked = false;
+    session.byId("primary-input-impl").value = "Kimi — Cline CLI";
+    session.byId("primary-impl").value = "";
+    await session.byId("save-btn").dispatch("click");
+    const saved = session.posted.find((message) => message.type === "saveSettings") as
+      | { settings: Record<string, { primary?: string }> }
+      | undefined;
+    assert.equal(saved?.settings.impl?.primary, "cline-cli:kimi", "save resolves the typed text to the model");
+    assert.equal(
+      session.byId("primary-note-impl").hidden,
+      true,
+      "the note must clear once the unconfirmed text resolves to an available model"
+    );
+  });
+
+  void it("renders the note unhidden when the stored model's provider is disabled, and hidden when it is available", async () => {
+    const disabledSession = runWebviewSession(extractWebviewScript());
+    await disabledSession.deliver(
+      initMessage({
+        models: [],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    const disabledRow = disabledSession.tbodyRows()[0]!;
+    assert.ok(
+      disabledRow.innerHTML.includes('id="primary-note-impl" class="provider-disabled-note" >'),
+      "the note element renders without the hidden attribute for a disabled provider"
+    );
+
+    const availableSession = runWebviewSession(extractWebviewScript());
+    await availableSession.deliver(
+      initMessage({
+        models: [{ id: "claude-cli:sonnet", name: "Sonnet", providerLabel: "Claude Code" }],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: { "claude-cli": true },
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    const availableRow = availableSession.tbodyRows()[0]!;
+    assert.ok(
+      availableRow.innerHTML.includes('id="primary-note-impl" class="provider-disabled-note" hidden>'),
+      "the note element renders hidden when the stored model is available"
+    );
   });
 });

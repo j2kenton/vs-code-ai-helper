@@ -2084,13 +2084,30 @@ void test("readOrInitPauseFenceGenerationV1 called many times concurrently while
   const initsHeld = new Promise<void>((resolve) => {
     releaseInits = resolve;
   });
+  // The interleaving under test is "every initializer saw an empty directory
+  // and is about to write g0 when the advance lands". Starting the advance
+  // only once all five are parked at that point makes it deterministic: on
+  // Linux some initializers otherwise reached their first listing after the
+  // advance's own g0 and before its g1, and correctly returned 0 — a plain
+  // earlier read, not the stale one this test exists to catch.
+  const INIT_COUNT = 5;
+  let parked = 0;
+  let allParked: (() => void) | undefined;
+  const everyInitParked = new Promise<void>((resolve) => {
+    allParked = resolve;
+  });
   setWorkAdmissionFsFailureInjectionForTestV1({
     onBeforeFenceInitWriteAsync: async () => {
+      parked += 1;
+      if (parked === INIT_COUNT) {
+        allParked!();
+      }
       await initsHeld;
     },
   });
   try {
-    const initPromises = Array.from({ length: 5 }, () => readOrInitPauseFenceGenerationV1(task));
+    const initPromises = Array.from({ length: INIT_COUNT }, () => readOrInitPauseFenceGenerationV1(task));
+    await everyInitParked;
     const advanceResult = await advancePauseFenceGenerationV1(task);
     assert.equal(advanceResult, 1);
     releaseInits!();

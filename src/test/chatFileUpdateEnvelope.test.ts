@@ -53,7 +53,10 @@ void test("extracts every envelope and strips them all from the text", () => {
 // planFileUpdate — the all-or-nothing policy
 // ---------------------------------------------------------------------------
 
-const TASK_FOLDER = path.join("C:", "tasks", "2026-07-16_task_1");
+// An absolute path on whichever host runs the suite: "C:\tasks" is a RELATIVE
+// path on POSIX, where every resolve() prefixed the cwd onto it.
+const TASKS_ROOT = path.resolve(path.sep, "tasks");
+const TASK_FOLDER = path.join(TASKS_ROOT, "2026-07-16_task_1");
 
 void test("plans no write when the response carries no envelope", () => {
   assert.deepEqual(planFileUpdate(TASK_FOLDER, []), { action: "none" });
@@ -118,7 +121,7 @@ void test("rejects a path that escapes the task folder via ..", () => {
 
 void test("rejects an absolute path outside the task folder", () => {
   assert.equal(
-    resolveMarkdownUpdateTarget(TASK_FOLDER, path.join("C:", "tasks", "other", "plan.md")),
+    resolveMarkdownUpdateTarget(TASK_FOLDER, path.join(TASKS_ROOT, "other", "plan.md")),
     undefined
   );
 });

@@ -212,10 +212,13 @@ function makeGitFixtureWithRemote(): string {
     path.join(os.tmpdir(), "ensemble-commit-message-review-")
   );
   git(repoRoot, ["init"]);
-  git(repoRoot, [
-    "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
-    "commit", "--allow-empty", "-m", "initial",
-  ]);
+  // The identity lives in the fixture repo, not in the machine running the
+  // suite: the command under test commits with the ambient identity, and a
+  // host with no global one (the Linux dev box) failed every commit here.
+  git(repoRoot, ["config", "user.email", "test@example.invalid"]);
+  git(repoRoot, ["config", "user.name", "Test"]);
+  git(repoRoot, ["config", "commit.gpgsign", "false"]);
+  git(repoRoot, ["commit", "--allow-empty", "-m", "initial"]);
   git(repoRoot, ["remote", "add", "origin", "https://example.invalid/repo.git"]);
   fs.mkdirSync(path.join(repoRoot, "src"), { recursive: true });
   fs.writeFileSync(path.join(repoRoot, "src", "foo.ts"), "export const x = 1;\n");

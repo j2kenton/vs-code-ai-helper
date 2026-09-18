@@ -161,6 +161,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewInvalidatedByRound",
   "incompleteRoundContinuations",
   "pausedReason",
+  "watchdogPauseClaimId",
+  "watchdogPauseFenceGeneration",
   "implRecovery",
   "quotaParkRecord",
 ] as const satisfies readonly (keyof TaskProgress)[];
@@ -2202,6 +2204,30 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.pausedReason = value;
+        break;
+      }
+      case "watchdogPauseClaimId": {
+        // Mirrors pausedReason's bound — this is the pauseCommit claim id
+        // bound to that same pause, not free text.
+        if (typeof value !== "string" || value.length === 0 || value.length > 2000) {
+          return recovery(
+            "invalidFieldValue",
+            "watchdogPauseClaimId must be a bounded non-empty string"
+          );
+        }
+        draft.watchdogPauseClaimId = value;
+        break;
+      }
+      case "watchdogPauseFenceGeneration": {
+        // The durable pause-fence generation captured when this pause's
+        // committing claim was acquired — a plain generation counter.
+        if (!isNonNegativeInteger(value)) {
+          return recovery(
+            "invalidFieldValue",
+            "watchdogPauseFenceGeneration must be a non-negative integer"
+          );
+        }
+        draft.watchdogPauseFenceGeneration = value;
         break;
       }
       case "lintPayload": {

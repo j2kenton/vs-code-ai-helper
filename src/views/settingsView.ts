@@ -1015,6 +1015,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // provider section's own discard button shows the identical icon,
           // for the same reason SAVE_ICON_SVG exists above.
           const DISCARD_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.78 1.72a.75.75 0 0 1 0 1.06L4.06 5.5H9a5.75 5.75 0 0 1 0 11.5H4.25a.75.75 0 0 1 0-1.5H9a4.25 4.25 0 0 0 0-8.5H4.06l2.72 2.72a.75.75 0 1 1-1.06 1.06l-4-4a.75.75 0 0 1 0-1.06l4-4a.75.75 0 0 1 1.06 0z"/></svg>';
+          const PROVIDER_DISABLED_NOTE_TEXT = 'This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.';
           // Provider Selection dirty-tracking, independent of the model
           // form's formDirty: pending checkbox states keyed by provider id,
           // fed by the delegated change listener on #provider-selection.
@@ -1404,6 +1405,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return enabledProviders[providerId] !== true;
           }
 
+          // The provider-disabled note belongs to whichever model id is
+          // currently selected in this row, not to the DOM slot the row
+          // happens to occupy — so a removal, promotion, or replacement
+          // that changes selectedId must re-derive the note instead of
+          // leaving a stale one behind. Tolerates a missing note element.
+          function syncProviderDisabledNote(note, selectedId) {
+            if (!note) return;
+            note.hidden = !(selectedId && !findModelById(selectedId) && isStoredModelProviderDisabled(selectedId));
+          }
+
           function modelComboboxHtml(kind, stage, selectedId, disabled) {
             const selectedModel = findModelById(selectedId);
             // A stored selection whose provider is disabled (or that is
@@ -1417,9 +1428,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 : '';
             const hiddenValue = selectedId || '';
             const disabledAttr = disabled ? 'disabled aria-disabled="true"' : '';
-            const disabledNote = providerDisabled
-              ? '<div class="provider-disabled-note">This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.</div>'
-              : '';
+            const noteHiddenAttr = providerDisabled ? '' : 'hidden';
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
                 <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue)}">
@@ -1436,7 +1445,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   \${disabledAttr}
                 >
                 <div id="\${kind}-list-\${stage}" class="model-options" role="listbox" hidden></div>
-                \${disabledNote}
+                <div id="\${kind}-note-\${stage}" class="provider-disabled-note" \${noteHiddenAttr}>\${PROVIDER_DISABLED_NOTE_TEXT}</div>
               </div>
             \`;
           }
@@ -1469,17 +1478,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 : providerDisabled
                   ? selectedId + ' (provider disabled)'
                   : 'Unknown model: ' + selectedId;
-              let note = box.querySelector('.provider-disabled-note');
-              if (providerDisabled) {
-                if (!note) {
-                  note = document.createElement('div');
-                  note.className = 'provider-disabled-note';
-                  note.textContent = 'This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.';
-                  box.appendChild(note);
-                }
-              } else if (note) {
-                note.remove();
-              }
+              syncProviderDisabledNote(box.querySelector('.provider-disabled-note'), selectedId);
             });
           }
 
@@ -1487,6 +1486,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const hidden = row.querySelector('#' + CSS.escape(kind + '-' + stage));
             const input = row.querySelector('#' + CSS.escape(kind + '-input-' + stage));
             const list = row.querySelector('#' + CSS.escape(kind + '-list-' + stage));
+            const note = row.querySelector('#' + CSS.escape(kind + '-note-' + stage));
             if (!hidden || !input || !list) {
               return;
             }
@@ -1536,6 +1536,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               delete hidden.dataset.lastValid;
               input.value = id ? label : '';
               closeList();
+              syncProviderDisabledNote(note, id);
               markDirty();
             }
 
@@ -1589,6 +1590,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               // typed-but-unmatched text can save its stored id unchanged.
               if (hidden.value) hidden.dataset.lastValid = hidden.value;
               hidden.value = '';
+              syncProviderDisabledNote(note, '');
               renderOptions();
             });
 
@@ -1652,6 +1654,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               hidden.value = match.id;
               delete hidden.dataset.lastValid;
               input.value = modelLabel(match);
+              syncProviderDisabledNote(document.getElementById(kind + '-note-' + stage), match.id);
             }
             return hidden.value;
           }
@@ -1809,6 +1812,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 checkbox.checked = true;
                 primaryRow.classList.remove('skipped');
               }
+              syncProviderDisabledNote(document.getElementById('primary-note-' + stage), hidden.value);
               setRowComboDisabled(primaryRow, !checkbox.checked);
               syncBackupLimitFor(row);
               markDirty();

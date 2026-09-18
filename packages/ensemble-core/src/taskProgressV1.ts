@@ -255,6 +255,12 @@ export interface TaskProgress {
    * provider chain). Meaningful only while `status === "paused"`; cleared by
    * any status change away from paused. */
   pausedReason?: string;
+  /** The pauseCommit work-admission claim id bound to the current watchdog
+   * pause; cleared by the same rule as `pausedReason`. */
+  watchdogPauseClaimId?: string;
+  /** The durable pause-fence generation current when that pause's claim was
+   * acquired; a pause is effective only while it still equals the task's. */
+  watchdogPauseFenceGeneration?: number;
   /** Durable record that an implementation round finished without a usable
    * report and a recovery continuation is owed. See the extension's
    * `src/types/taskProgress.ts` for the full state-machine commentary. */
