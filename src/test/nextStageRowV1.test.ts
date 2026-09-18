@@ -141,6 +141,28 @@ void describe("nextStage.v1 registry row", () => {
     );
   });
 
+  void it("validateNextStageInputV1 accepts nextActorOnAdvance, rejecting invalid values", () => {
+    assert.deepEqual(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        nextActorOnAdvance: "automation",
+      }),
+      {
+        ok: true,
+        input: { taskFolderPath: "/x", expectedSourceStage: "plan", nextActorOnAdvance: "automation" },
+      }
+    );
+    assert.equal(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        nextActorOnAdvance: "robot",
+      }).ok,
+      false
+    );
+  });
+
   void it("declares the expected route/eligibility/lease contract", () => {
     const row = createNextStageRowV1();
     assert.equal(row.kind, "lifecycle");
@@ -449,6 +471,46 @@ void describe("nextStage.v1 registry row", () => {
       assert.equal(strict.decoded.progress.currentStage, "impl");
       assert.ok(strict.decoded.progress.implRecovery !== undefined, "implRecovery must survive the refused transition");
       assert.deepEqual(strict.decoded.progress.pendingImplReviewFiles, ["src/a.ts"]);
+    }
+  });
+
+  // 2026-09-17 review fix: `applyNextStagePolicyV1` used to unconditionally
+  // clear `nextActor` to `undefined` on every transition, discarding whatever
+  // eligibility signal the caller (`advanceStageViaNextStageRowV1`,
+  // reviewActions.ts) had already computed — the review's narrowed completion
+  // blocker on the checked Wave I `nextActor` item ("nextStageRowV1.ts ...
+  // still transitions without setting nextActor"). This exercises the row's
+  // own atomic write of a caller-supplied value.
+  void it("writes the caller-supplied nextActorOnAdvance atomically into the same transition write", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-nextactor-automation-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
+
+    const outcome = await executeNextStageV1(
+      contextForWith(fixture.folder, { expectedSourceStage: "plan", nextActorOnAdvance: "automation" })
+    );
+    assert.equal(outcome.kind, "completed");
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "plan-high-review");
+      assert.equal(strict.decoded.progress.nextActor, "automation");
+    }
+  });
+
+  void it("clears nextActor to unknown when nextActorOnAdvance is omitted, even if a stale value was set", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-nextactor-cleared-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan", nextActor: "automation" });
+    fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan");
+
+    const outcome = await executeNextStageV1(contextFor(fixture.folder, "plan"));
+    assert.equal(outcome.kind, "completed");
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.nextActor, undefined);
     }
   });
 

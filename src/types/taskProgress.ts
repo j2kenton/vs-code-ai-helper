@@ -642,6 +642,52 @@ export interface TaskProgress {
    * markTaskDone/reopen), matching `implRecovery`'s policy.
    */
   quotaParkRecord?: QuotaParkRecordV1;
+
+  /**
+   * Who is expected to act next before this task makes further progress
+   * (v1 fixes 2, item 8/31, 2026-09-17): `"automation"` means a dispatch,
+   * schedule, or recovery is expected to run on its own; `"human"` means the
+   * task is waiting on a person and nothing further will happen without
+   * them. Set only at the fixed set of chokepoints that settle a round,
+   * arrange a stage dispatch, arm a schedule, owe/clear a recovery, or
+   * transition a stage — see
+   * `docs/verification/v1-fixes-2-wave1-inventory.md` for the enumerated
+   * list. Absent means unknown; read it only through
+   * `effectiveNextActorV1` (`taskWatchdogV1.ts`), which preserves the
+   * distinction rather than collapsing it. A consumer may use an EXPLICIT
+   * `"human"` to add a new exemption (never pause/gate); it must never treat
+   * `"unknown"` as equivalent to a confirmed `"human"` for that purpose
+   * (assuming a human is waiting when the value has simply never been set
+   * would silently stand down the stall protection this field exists to
+   * sharpen, not weaken), and must never treat `"unknown"` as sufficient on
+   * its own to add a NEW restrictive consequence that only a confirmed
+   * `"automation"` should justify.
+   */
+  nextActor?: "human" | "automation";
+
+  /**
+   * Per-stage review-pass counter (v1 fixes 2, item 32, 2026-09-17): reserved
+   * (incremented) the moment a review round is DISPATCHED for a stage,
+   * before the round runs — so a review that fails or is cancelled still
+   * consumes its reservation rather than rolling it back. Rolling back would
+   * let a stale artifact from an earlier, abandoned attempt reuse the same
+   * pass number as a later one and read as current. The dispatched pass
+   * number is echoed into the review artifact as `<!-- review-pass: N -->`
+   * and recorded on the matching `reviewScoreHistory` entry as `reviewPass`.
+   * A review artifact whose stamped pass does not equal the stage's current
+   * counter — or that carries no pass marker at all — is stale and must
+   * never be read as a fresh verdict for that stage (see item 32, "A review
+   * stage can 'pass' on a review left over from an earlier visit").
+   *
+   * Keyed by `TaskStage` rather than a single scalar because a task can
+   * revisit a review stage (a plan revision sends `impl-high-review` back
+   * through `impl`, for example) and each stage's pass history is
+   * independent of every other stage's. Never decreases and is never reset
+   * by a stage transition — the counter's only job is to distinguish "this
+   * visit's review" from "an earlier visit's review", which requires it to
+   * keep counting up across visits, not restart at each one.
+   */
+  stageReviewPasses?: Partial<Record<TaskStage, number>>;
 }
 
 /**
@@ -946,6 +992,13 @@ export interface ReviewScoreHistoryEntry {
    * now visible instead of silent.
    */
   reviewerChallengedNonGoal?: ReviewerChallengedNonGoalV1[];
+  /**
+   * The stage's review-pass number (`TaskProgress.stageReviewPasses`)
+   * reserved for the round that produced this entry, recorded from durable
+   * progress rather than the artifact's own marker (v1 fixes 2, item 32/4,
+   * Wave I). Absent on entries written before this field existed.
+   */
+  reviewPass?: number;
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */

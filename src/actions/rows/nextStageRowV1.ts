@@ -82,6 +82,17 @@ export interface NextStageActionInputV1 {
   readonly expectedReviewAttemptId?: string;
   /** Only the explicit human "Complete Anyway" command may set this. */
   readonly artifactOverride?: "user";
+  /**
+   * v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): the fresh
+   * `nextActor` value for the arriving stage, computed by the caller BEFORE
+   * this action runs (mirroring legacy `advanceStage`'s own
+   * `shouldAutoReview` eligibility test in `stageTransition.ts`) so it lands
+   * in the same atomic CAS write `applyNextStagePolicyV1` performs, instead
+   * of a second, race-prone patch after the fact. Omitted callers (e.g. the
+   * plain "Complete Stage & Move On" button, which arranges no automated
+   * follow-up itself) get the same unconditional clear-to-unknown as before.
+   */
+  readonly nextActorOnAdvance?: "human" | "automation";
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -113,12 +124,20 @@ export function validateNextStageInputV1(rawInput: unknown): TaskActionInputVali
   if (raw.artifactOverride !== undefined && raw.artifactOverride !== "user") {
     return { ok: false, reason: 'input has an invalid "artifactOverride" value' };
   }
+  if (
+    raw.nextActorOnAdvance !== undefined &&
+    raw.nextActorOnAdvance !== "human" &&
+    raw.nextActorOnAdvance !== "automation"
+  ) {
+    return { ok: false, reason: 'input has an invalid "nextActorOnAdvance" value' };
+  }
   const allowedKeys = new Set([
     "taskFolderPath",
     "expectedSourceStage",
     "targetStage",
     "expectedReviewAttemptId",
     "artifactOverride",
+    "nextActorOnAdvance",
   ]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
@@ -133,6 +152,9 @@ export function validateNextStageInputV1(rawInput: unknown): TaskActionInputVali
       ? { expectedReviewAttemptId: raw.expectedReviewAttemptId }
       : {}),
     ...(raw.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
+    ...(raw.nextActorOnAdvance !== undefined
+      ? { nextActorOnAdvance: raw.nextActorOnAdvance as "human" | "automation" }
+      : {}),
   };
   return { ok: true, input: validated };
 }
@@ -201,6 +223,7 @@ export async function executeNextStageV1(
           completionArtifactsPresent: missingArtifacts.length === 0,
           artifactOverride: input.artifactOverride,
           missingArtifacts,
+          nextActorOnAdvance: input.nextActorOnAdvance,
         });
         if (!result.ok) {
           throw new LifecyclePolicyFailureError(result.code);

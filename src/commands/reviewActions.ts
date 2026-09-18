@@ -75,10 +75,13 @@ import {
   promotePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
   resolveRoundV1,
+  reserveStageReviewPassV1,
   setZeroChangeImplRounds,
   latestReviewBlockerNamedPathsV1,
   pauseTaskWithReason,
   recordTaskMdSizeBandAnnouncedV1,
+  setNextActorV1,
+  shouldRecordHumanNextActorAfterAdvanceRefusalV1,
   updateImplReviewFiles,
   updateLintPayload,
   updateTaskStatus,
@@ -288,6 +291,7 @@ import {
   markReviewInProgressBannerV1,
   isStaleReviewArtifactV1,
   upsertArtifactChangeStaleBannerV1,
+  isReviewPassCurrentV1,
   ReviewBlocker,
   splitTaskFixableBlockersByOriginV1,
 } from "../utils/reviewReadiness";
@@ -618,7 +622,16 @@ export async function claimReviewAttempt(
           // different, already-ended round and must not be attached here.
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
-    return upsertRoundLedgerEntryV1({ ...effectiveCurrent, reviewAttemptId }, openRow);
+    // v1 fixes 2, item 32/Wave I: reserve this stage's next review-pass
+    // number in the SAME transaction that opens the round-ledger row, so the
+    // reservation and the claim can never observably disagree (a claim that
+    // landed with no reservation, or vice versa). See
+    // `TaskProgress.stageReviewPasses`'s own doc comment — reserved here,
+    // before the round runs, and never rolled back on failure.
+    return upsertRoundLedgerEntryV1(
+      reserveStageReviewPassV1({ ...effectiveCurrent, reviewAttemptId }, targetStage),
+      openRow
+    );
   });
 }
 
@@ -2757,6 +2770,21 @@ export async function handleReviewRoutingOutcome(options: {
    * forwarded the same way as `taskMdSizeBand`, onto both `terminalizeRoundV1`
    * outcome branches below. */
   identityAttachmentDegraded?: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
+  /** v1 fixes 2, item 32 review fix (architectural blocker
+   * `aee6555b-c4ba-4e4b-9734-f0a39477fbb0-0`): the review-pass number
+   * `claimReviewAttempt`/`claimReviewAttemptWithLiveLeaseV1` reserved for
+   * THIS round, captured by the caller at dispatch time (before the provider
+   * ran) and echoed back via `ctx.variables.reviewPass`. Re-reading
+   * `progressBefore.stageReviewPasses[targetStage]` here instead — AFTER the
+   * provider round completed — is wrong whenever a second review round for
+   * the same target stage was reserved (by a concurrent or a since-started
+   * dispatch) while this round was in flight: that later reservation bumps
+   * the durable counter, and this round's own history entry would then
+   * silently claim the WRONG (someone else's, newer) pass. Absent only for
+   * callers that never captured a reservation (direct unit-test callers of
+   * this function, or a legacy caller predating this field) — those fall
+   * back to the old (imperfect but previously-only) source below. */
+  reservedReviewPass?: number;
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
   const {
     folderUri,
@@ -2773,6 +2801,7 @@ export async function handleReviewRoutingOutcome(options: {
     coordinatorExtraAttemptIds,
     taskMdSizeBand,
     identityAttachmentDegraded,
+    reservedReviewPass,
   } = options;
   try {
     const resilience = getResilienceSettings();
@@ -3075,6 +3104,18 @@ export async function handleReviewRoutingOutcome(options: {
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
       blockers: resolveBlockerLineageV1(blockers, priorEntryForStage?.blockers, reviewAttemptId),
+      // v1 fixes 2, item 32/4/Wave I (review fix: prefer the pass actually
+      // reserved for THIS round over a fresh re-read of durable progress,
+      // which can have moved on if another review round for the same target
+      // stage was reserved while this round was in flight — see
+      // `reservedReviewPass`'s own doc comment above). Falls back to the
+      // old progress-snapshot read only when no caller-captured reservation
+      // was supplied (direct test callers / legacy callers).
+      ...(reservedReviewPass !== undefined
+        ? { reviewPass: reservedReviewPass }
+        : progressBefore.stageReviewPasses?.[targetStage] !== undefined
+          ? { reviewPass: progressBefore.stageReviewPasses[targetStage] }
+          : {}),
       ...(reviewer ? { reviewer } : {}),
       ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
       ...(challengedMatches.length > 0
@@ -3910,7 +3951,16 @@ async function routeReviewOutcomeV1(
     chatViewProvider,
     promptLength,
     providerId,
+    variables,
   } = ctx;
+  // v1 fixes 2, item 32 review fix: the pass `claimReviewAttempt` reserved
+  // for THIS round, echoed into the prompt variables at dispatch time (see
+  // `runReviewForFolder`/`buildReviewResumeVariablesV1`) — carried through to
+  // `handleReviewRoutingOutcome` so its history entry records the pass this
+  // round actually reserved, not whatever the durable counter reads at the
+  // (later) time this outcome is being routed.
+  const parsedReservedReviewPass = Number(variables.reviewPass);
+  const reservedReviewPass = Number.isInteger(parsedReservedReviewPass) ? parsedReservedReviewPass : undefined;
   if (outcome.kind === "completed") {
     let transitionToTarget: StageTransitionResult | undefined;
     try {
@@ -4009,6 +4059,7 @@ async function routeReviewOutcomeV1(
           ...(ctx.identityAttachmentDegraded
             ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
             : {}),
+          ...(reservedReviewPass !== undefined ? { reservedReviewPass } : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -5383,6 +5434,16 @@ export async function runReviewForFolder(
   // in the `finally` below regardless of outcome.
   const claimed = await claimReviewAttemptWithLiveLeaseV1(folderUri, reviewAttemptId, targetStage);
   if (!claimed) return;
+  // v1 fixes 2, item 32/Wave I: `claimReviewAttempt` reserved this stage's
+  // next review-pass number in the same transaction that opened this round's
+  // ledger row (see that function). Echo it into the prompt so the reviewer
+  // stamps it back onto the artifact as `<!-- review-pass: N -->` — read back
+  // by `isReviewPassCurrentV1` to tell this visit's review from a leftover
+  // one belonging to an earlier visit to the stage.
+  const reservedReviewPass = claimed.stageReviewPasses?.[targetStage];
+  if (reservedReviewPass !== undefined) {
+    variables.reviewPass = String(reservedReviewPass);
+  }
 
   // Item 9 (Part 16 step 44): a one-time-per-size-band nudge when task.md
   // itself is eating a large share of the review-input limit — "the same
@@ -5841,25 +5902,59 @@ export function isUnusableAsExistingReview(content: string): boolean {
  * cause and the real recovery: rerun the implementation, or (once a usable
  * summary exists) use "Apply Review Changes".
  *
+ * v1 fixes 2, item 1 (Wave II escape hatches): this is Fast Forward's own
+ * unusable-summary refusal surface, and previously the only one of the three
+ * (alongside `runReviewForFolder`'s and `buildReviewResumeVariablesV1`'s
+ * matching branches) that never offered "Restore Last Usable Summary" even
+ * when `impl-summary_prev.md` held perfectly usable content — leaving
+ * "rerun the implementation" as the only named recovery, which is a dead end
+ * exactly when the plan's remaining items are not implementation's to fix.
+ *
  * Falls back to the generic message for every other way a review can fail to
  * produce usable output (provider error, empty response, etc.), where
  * "try running Review manually" remains the right next step.
  *
  * @internal exported for testing
  */
-export async function describeUnusableReviewBlockV1(folderUri: vscode.Uri): Promise<string> {
+export async function describeUnusableReviewBlockV1(
+  folderUri: vscode.Uri,
+  targetStage?: TaskStage
+): Promise<{
+  warning: string;
+  /** Present only when `impl-summary_prev.md` is itself usable — callers build
+   * the literal `{ command, title, args }` actionCommand at their own call
+   * site (rather than this function returning one) so the workflow-safety
+   * verifier's static `command:\s*["']...["']` scan can see the dispatched
+   * command directly in each `NotificationRouter.showWarning` call, the same
+   * way every other direct-action toast in this file is detectable. */
+  canRestorePreviousImplSummary: boolean;
+}> {
   const summary = await readTextIfExists(getImplementationSummaryUri(folderUri));
   if (summary !== undefined && isUnusableImplementationSummaryV1(summary)) {
-    return (
-      "Fast Forward Review: a prior implementation round was rejected and left no usable " +
-      "implementation summary, so review could not run and there is nothing to fast-forward from. " +
-      'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
-      "fast-forwarding."
+    const previousImplSummary = await readTextIfExists(
+      previousVersionUri(getImplementationSummaryUri(folderUri))
     );
+    const canRestorePreviousImplSummary =
+      targetStage !== undefined &&
+      previousImplSummary !== undefined &&
+      !isUnusableImplementationSummaryV1(previousImplSummary);
+    return {
+      warning:
+        "Fast Forward Review: a prior implementation round was rejected and left no usable " +
+        "implementation summary, so review could not run and there is nothing to fast-forward from. " +
+        (canRestorePreviousImplSummary
+          ? "Restore the last usable summary, or rerun the implementation to produce fresh notes, " +
+            "before fast-forwarding."
+          : 'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
+            "fast-forwarding."),
+      canRestorePreviousImplSummary,
+    };
   }
-  return (
-    "Fast Forward Review: the initial review did not produce usable output. Try running Review manually."
-  );
+  return {
+    warning:
+      "Fast Forward Review: the initial review did not produce usable output. Try running Review manually.",
+    canRestorePreviousImplSummary: false,
+  };
 }
 
 /**
@@ -7211,7 +7306,16 @@ export async function fastForwardReviewWithAI(
       // deliberately preserved) — it must not be treated as a current
       // baseline. Refusing it here routes into the same fresh-review path a
       // stale placeholder takes.
-      resolved.progress.reviewInvalidatedByRound?.stage === targetStage)
+      resolved.progress.reviewInvalidatedByRound?.stage === targetStage ||
+      // v1 fixes 2, item 32/6 (Wave II): a leftover review from an EARLIER
+      // visit to this stage — no `<!-- review-pass: N -->` marker at all, or
+      // one behind the stage's current reservation — must never be trusted
+      // as this run's zero-attempt baseline; that is exactly the "stopped
+      // after 0 attempt(s)" false pass item 32 exists to close. Scoped to the
+      // stages that actually stamp the marker (mirrors REVIEWED_COMMIT_STAGES'
+      // own scoping for the sibling reviewed-commit staleness check above).
+      (REVIEWED_COMMIT_STAGES.has(targetStage) &&
+        !isReviewPassCurrentV1(initialContent, resolved.progress.stageReviewPasses, targetStage)))
   ) {
     initialContent = undefined;
   }
@@ -7258,14 +7362,43 @@ export async function fastForwardReviewWithAI(
       initialContent = undefined;
     }
     if (!initialContent) {
-      NotificationRouter.showWarning(await describeUnusableReviewBlockV1(resolved.folderUri));
+      const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
+      NotificationRouter.showWarning(
+        block.warning,
+        undefined,
+        undefined,
+        undefined,
+        block.canRestorePreviousImplSummary
+          ? {
+              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+              title: "Restore Last Usable Summary",
+              // Restoring from this surface should re-enter Fast Forward, the
+              // command whose own refusal this is — same rationale as
+              // `runReviewForFolder`'s `rerunCommandId` default.
+              args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+            }
+          : undefined
+      );
       return;
     }
   }
 
   const initialScore = parseReadiness(initialContent).score;
   if (initialScore === null) {
-    NotificationRouter.showWarning(await describeUnusableReviewBlockV1(resolved.folderUri));
+    const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
+    NotificationRouter.showWarning(
+      block.warning,
+      undefined,
+      undefined,
+      undefined,
+      block.canRestorePreviousImplSummary
+        ? {
+            command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+            title: "Restore Last Usable Summary",
+            args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+          }
+        : undefined
+    );
     return;
   }
   const baselineScore = initialScore;
@@ -7848,8 +7981,8 @@ export async function fastForwardReviewWithAI(
     );
   } else if (outcome.stalled) {
     NotificationRouter.showWarning(
-      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the review did not change. ` +
-        "Check the run log — the provider may have failed or been blocked." +
+      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the last rounds changed nothing, so the review did not move. ` +
+        "If the review is clean and plan steps remain, run Implementation to build them; otherwise check the run log for a failed or blocked round." +
         (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
       undefined,
       undefined,
@@ -8467,6 +8600,27 @@ async function advanceStageViaNextStageRowV1(
   // already run. A `summaryRejected` recovery whose blocking condition is
   // already satisfied must not go on refusing this transition.
   await retireSatisfiedSummaryRejectedRecoveryV1(folderUri);
+  // v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): computed BEFORE
+  // dispatch, from inputs already known here (optIn/isPaused/currentStage/
+  // next) — identical eligibility test to legacy `advanceStage`'s own
+  // `shouldAutoReview` (`stageTransition.ts`) — so the row can fold the fresh
+  // `nextActor` value into its own atomic CAS write
+  // (`applyNextStagePolicyV1`) instead of a second, race-prone patch after
+  // the fact. This also resolves the retire call above: whatever it wrote (it
+  // writes nothing today — see its own doc comment) is superseded by this
+  // same-function, sequentially-awaited write the moment the transition below
+  // succeeds.
+  const shouldAutoReviewForWrite =
+    optIn && !isPaused && isReviewStage(next) && AUTO_REVIEW_TRANSITIONS[currentStage] === next;
+  // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker: "make
+  // that repair conditional on the stage/recovery state remaining
+  // unchanged"): captured HERE, immediately before dispatch, so the
+  // best-effort refusal-path write below (this attempt's own "human" guess)
+  // can detect whether a DIFFERENT, winning concurrent transition or dispatch
+  // already recorded a fresher `nextActor` — or moved the stage — by the time
+  // this attempt's own write actually runs. See
+  // `shouldRecordHumanNextActorAfterAdvanceRefusalV1`'s own doc comment.
+  const baselineForRefusalGuard = await readTaskProgressAdvisoryV1(folderUri);
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,
@@ -8484,10 +8638,39 @@ async function advanceStageViaNextStageRowV1(
       targetStage: next,
       ...(expectedReviewAttemptId !== undefined ? { expectedReviewAttemptId } : {}),
       ...(artifactOverride === "user" ? { artifactOverride } : {}),
+      // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker):
+      // always pass a fresh value rather than omitting it on the
+      // not-auto-review-eligible branch — omitting left the CAS write
+      // clearing nextActor to unknown exactly where TaskProgress.nextActor's
+      // own doc comment requires "human" (a completed stage action that
+      // hands control back, with nothing further arranged).
+      nextActorOnAdvance: shouldAutoReviewForWrite ? "automation" as const : "human" as const,
     },
     beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
   if (outcome.kind !== "completed") {
+    // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker): "the
+    // advancement-gate retirement call still supplies no actor — if its
+    // subsequent lifecycle action is refused or fails, retirement remains
+    // settled without a fresh actor." retireSatisfiedSummaryRejectedRecoveryV1
+    // above may already have cleared an owed recovery on the assumption that
+    // THIS transition's own atomic write would supersede it with a fresh
+    // nextActor; when the transition is refused/fails instead, that write
+    // never happens. Every refusal path below shows the user a notification
+    // naming a remedy they must act on, so "human" is the plain fact of what
+    // happened — a best-effort record, since losing it must never mask the
+    // real refusal being thrown below. Guarded (2026-09-17 review fix): only
+    // written if the stage this attempt observed, the nextActor it observed,
+    // and the recovery state it observed all still match what is on disk at
+    // write time — otherwise a different, winning concurrent transition or
+    // dispatch already recorded a fresher, more informed nextActor (e.g.
+    // "automation" for genuinely arranged work), and this failed attempt's
+    // stale "human" guess must defer to it rather than clobber it.
+    await patchTaskProgressStrictV1(folderUri, (current) =>
+      shouldRecordHumanNextActorAfterAdvanceRefusalV1(currentStage, baselineForRefusalGuard, current)
+        ? setNextActorV1(current, "human")
+        : undefined
+    ).catch(() => undefined);
     // 2026-09-15 post-freeze findings, item 5's general requirement: "every
     // refusal must name a remedy the system can reach, or an action the user
     // can actually take" — `nextStage.implRecoveryOwed` alone named neither.
@@ -8509,9 +8692,10 @@ async function advanceStageViaNextStageRowV1(
     }
     throw new Error(outcome.kind === "failed" ? outcome.code : outcome.kind);
   }
-  const shouldAutoReview =
-    optIn && !isPaused && isReviewStage(next) && AUTO_REVIEW_TRANSITIONS[currentStage] === next;
-  return { persisted: true, newStage: next, shouldAutoReview };
+  // Reuse the single eligibility computation from above (already folded into
+  // the atomic write's `nextActorOnAdvance`) rather than re-deriving it,
+  // keeping one source of truth for the same test.
+  return { persisted: true, newStage: next, shouldAutoReview: shouldAutoReviewForWrite };
 }
 
 /**
@@ -13801,6 +13985,17 @@ export async function resumeReviewInteractionV1(
       // until the still-unbuilt reconciliation sweep exists at all.
       await terminalizeRoundV1(reviewAttemptId, "failed", undefined, { taskFolderUri: taskFolderUri });
       return { ok: false, reason: variablesResult.warning };
+    }
+    // v1 fixes 2, item 32/Wave I (mirrors `runReviewForFolder`'s matching
+    // echo): `claimReviewAttemptWithLiveLeaseV1` above already reserved this
+    // stage's next review-pass number in the same transaction that opened
+    // this resumed round's ledger row — echo it into the prompt variables so
+    // a resumed review stamps `<!-- review-pass: N -->` too, and so
+    // `routeReviewOutcomeV1` can carry the correct reservation through to
+    // `handleReviewRoutingOutcome` (see `reservedReviewPass`'s doc comment).
+    const resumedReservedReviewPass = claimed.stageReviewPasses?.[targetStage];
+    if (resumedReservedReviewPass !== undefined) {
+      variablesResult.variables.reviewPass = String(resumedReservedReviewPass);
     }
 
     // 2026-08-27 review, blocker "lifecycle identity", fourth pass: "Resume

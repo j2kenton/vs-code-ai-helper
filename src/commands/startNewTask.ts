@@ -3,6 +3,8 @@ import * as path from "path";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
+import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
+import { setNextActorV1 } from "../utils/taskProgressTransforms";
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -452,7 +454,14 @@ async function createTask(
       commitCreationSentinelV1(metaFolderPath, taskFolderPath)
     );
 
-    await writeTaskProgressV1(taskFolderUri, { ...progress, status: initialStatus });
+    // v1 fixes 2, item 8: a freshly created task starts at the "desc" stage,
+    // which never auto-dispatches — the very next step is always the human
+    // filling in the description, so this is the chokepoint that produces
+    // the task's first `nextActor` write.
+    await writeTaskProgressV1(
+      taskFolderUri,
+      setNextActorV1({ ...progress, status: initialStatus }, "human") as PersistedTaskProgressV1
+    );
     // task-progress.json was just rewritten (status flipped from "creating" to
     // its real initial value) -- re-read it so the journal's recorded hash for
     // this path reflects the FINAL bytes, not the transient "creating" write

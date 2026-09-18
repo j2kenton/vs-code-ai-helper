@@ -25,6 +25,7 @@ import {
 import {
   DirectoryEntryV1,
   DiscoveryMatchV1,
+  MAX_CONSECUTIVE_DISCOVERY_CALLS_V1,
   MAX_DIRECTORY_ENTRIES_V1,
   MAX_FIND_RESULTS_V1,
   MAX_RANGED_READ_SOURCE_BYTES_V1,
@@ -62,6 +63,10 @@ const MAX_DISCOVERY_DIRECTORIES_V1 = 512;
 /** Total files a single textSearch call may read. */
 const MAX_TEXT_SEARCH_FILES_V1 = 512;
 const MATCH_PREVIEW_MAX_LENGTH_V1 = 200;
+/** Discovery-returned paths kept so a refusal can name them. */
+const MAX_REMEMBERED_DISCOVERY_PATHS_V1 = 40;
+/** How many of those one refusal message lists. */
+const MAX_SUGGESTED_DISCOVERY_PATHS_V1 = 8;
 
 export interface ReadToolSessionHandlerOptionsV1 {
   readonly view: WorkflowReadOnlyFileViewV1;
@@ -217,8 +222,107 @@ export function createReadToolSessionHandlerV1(
   const { view, rootId, ledger } = options;
   const violations = createViolationCounterV1();
 
+  /**
+   * Discovery calls (`findFiles`/`textSearch`) since the last exact-path read.
+   *
+   * Searching is the one thing in this session that feels like progress and
+   * cannot produce any: a discovery observation never authorizes an operation
+   * (`AUTHORIZING_SOURCES_V1`, preflightPlanV1.ts), and the session's cap is on
+   * REPLIES, so a reply spent searching is a reply not spent planning. Observed
+   * 2026-09-18 across four rounds on one task: 76 searches to 11 reads, then 20
+   * to 2, each ending with an empty plan after the model ran out of replies.
+   * Two rounds of preamble wording asking it to search less changed nothing.
+   *
+   * So the tool stops answering instead. The counter resets on any exact-path
+   * read, which makes this a "search, then read what you found" rhythm rather
+   * than a session-wide quota: a model that reads between searches never sees
+   * this at all.
+   */
+  let discoveryCallsSinceExactRead = 0;
+  /** See `RequestLocalToolHandlerV1.exactPathObservationCount`. */
+  let exactPathObservations = 0;
+  /** Paths the refused call can point at, newest last, capped. */
+  const recentDiscoveryPaths: string[] = [];
+
+  function rememberDiscoveryPaths(paths: readonly string[]): void {
+    for (const relativePath of paths) {
+      if (!recentDiscoveryPaths.includes(relativePath)) {
+        recentDiscoveryPaths.push(relativePath);
+      }
+    }
+    while (recentDiscoveryPaths.length > MAX_REMEMBERED_DISCOVERY_PATHS_V1) {
+      recentDiscoveryPaths.shift();
+    }
+  }
+
+  /**
+   * The refusal, which has to leave the model somewhere to go: it names the
+   * paths it already has and the one call that clears the gate.
+   */
+  function discoveryBudgetReasonV1(tool: string): string {
+    const known =
+      recentDiscoveryPaths.length > 0
+        ? ` You already have these exact paths: ${recentDiscoveryPaths.slice(-MAX_SUGGESTED_DISCOVERY_PATHS_V1).join(", ")}.`
+        : "";
+    return (
+      `${discoveryCallsSinceExactRead} searches in a row without opening a file. ` +
+      "A search result can never authorize an edit — only an exact-path " +
+      "`ensemble_readFile`, `ensemble_stat` or `ensemble_readDirectory` can — and this " +
+      "session is capped on replies, so more searching cannot produce a plan." +
+      known +
+      ` Read one of them (use startLine/endLine on a large file), then write your plan. ` +
+      `${tool} answers again after any exact-path read.`
+    );
+  }
+
   function locator(relativePath: string): WorkflowFileLocatorV1 {
     return { rootId, relativePath };
+  }
+
+  /**
+   * Mint a directory observation for each existing ancestor of `relativePath`
+   * that this session has not observed yet, so a `createFile`/`createDirectory`
+   * on that path passes the parent-chain check without the model having to
+   * stat every level itself. See the call site for why the host does this.
+   *
+   * Stops at the first ancestor that is not an existing directory: below such a
+   * path nothing can be resolved anyway, and the plan validator's own message
+   * is the right place to explain that.
+   */
+  async function observeAncestorDirectoriesV1(relativePath: string, callId: string): Promise<void> {
+    const segments = relativePath.split("/");
+    segments.pop();
+    let ancestorPath = "";
+    for (const segment of segments) {
+      ancestorPath = ancestorPath === "" ? segment : `${ancestorPath}/${segment}`;
+      const alreadyObserved = ledger
+        .records()
+        .some(
+          (record) =>
+            record.rootId === rootId &&
+            record.relativePath === ancestorPath &&
+            record.kind === "directory"
+        );
+      if (alreadyObserved) {
+        continue;
+      }
+      const stat = await view.stat(locator(ancestorPath));
+      if (stat.kind === "unavailable" || stat.kind === "failed" || stat.value.kind !== "directory") {
+        return;
+      }
+      ledger.mint({
+        callId,
+        rootId,
+        relativePath: ancestorPath,
+        // Existence only, exactly as a model's own stat of this directory would
+        // record it: `dir:unverified` can prove an ancestor exists and can
+        // never stand in for the complete listing an emptiness proof needs.
+        kind: "directory",
+        revision: "dir:unverified",
+        complete: true,
+        source: "stat",
+      });
+    }
   }
 
   /**
@@ -383,6 +487,22 @@ export function createReadToolSessionHandlerV1(
         return errorResult(callId, tool, "readFailed", stat.code);
       }
       const kind = stat.value.kind;
+      if (kind === "missing") {
+        // Statting a path is how a model authorizes creating it — and creating
+        // a file also needs every ancestor directory observed, which the model
+        // must otherwise do by hand, one stat per level.
+        //
+        // It does not. Runs 2067 and 2068 (2026-09-18) both produced a correct,
+        // complete plan to add a new test file and both were refused for not
+        // having observed `src`, in a repository that obviously has one — the
+        // second even after the refusal text was rewritten to say exactly which
+        // call to make. The information was never in doubt: the host can see
+        // those directories, and the edit broker re-verifies every ancestor at
+        // execution time anyway (§7.7 (4)), so nothing is taken on trust by
+        // resolving them here. Asking the model for paperwork the host can do
+        // itself only loses rounds.
+        await observeAncestorDirectoriesV1(relativePath, callId);
+      }
       const record = ledger.mint({
         callId,
         rootId,
@@ -598,15 +718,40 @@ export function createReadToolSessionHandlerV1(
       if (!(READ_TOOL_NAMES_V1 as readonly string[]).includes(call.name)) {
         violations.record();
         result = errorResult(call.callId, call.name, "unknownTool", "not a preflight read tool");
-      } else if (call.name === "ensemble_findFiles") {
-        result = await handleFindFiles(call.callId, call.input);
-      } else if (call.name === "ensemble_textSearch") {
-        result = await handleTextSearch(call.callId, call.input);
+      } else if (call.name === "ensemble_findFiles" || call.name === "ensemble_textSearch") {
+        // The gate is here rather than inside each handler so the decision is
+        // made once, before any walk runs, and so a refusal costs nothing.
+        // NOT a protocol violation: the call is well-formed, it just cannot
+        // help. See `discoveryCallsSinceExactRead`.
+        if (discoveryCallsSinceExactRead >= MAX_CONSECUTIVE_DISCOVERY_CALLS_V1) {
+          result = errorResult(
+            call.callId,
+            call.name,
+            "discoveryBudgetExceeded",
+            discoveryBudgetReasonV1(call.name)
+          );
+        } else {
+          discoveryCallsSinceExactRead += 1;
+          result =
+            call.name === "ensemble_findFiles"
+              ? await handleFindFiles(call.callId, call.input)
+              : await handleTextSearch(call.callId, call.input);
+          if (result.ok) {
+            rememberDiscoveryPaths((result.matches ?? []).map((match) => match.relativePath));
+          }
+        }
       } else {
         result = await handleExactPath(call.name as ReadToolNameV1, call.callId, call.input);
+        // Any successful exact-path observation clears the gate — that read is
+        // the thing a plan can actually be built on.
+        if (result.ok) {
+          discoveryCallsSinceExactRead = 0;
+          exactPathObservations += 1;
+        }
       }
       return canonicalJsonStringifyV1(result as unknown as Record<string, unknown>);
     },
     violationCount: () => violations.count(),
+    exactPathObservationCount: () => exactPathObservations,
   };
 }

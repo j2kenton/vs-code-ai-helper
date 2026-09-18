@@ -575,6 +575,58 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
         restore();
       }
     });
+
+    // v1 fixes 2, Wave I chokepoint (clears a recovery, sweep call site only):
+    // per this function's own doc comment, `armPendingImplRecoveries`
+    // (`scheduleTaskResume.ts`) `continue`s the loop the moment this returns
+    // `true` — nothing further is arranged for this task in that sweep pass —
+    // so THAT call site passes `{ nextActorOnRetire: "human" }`, folded into
+    // this function's own atomic CAS write (2026-09-17 review fix: no longer
+    // a second, separately-locked patch). Driven through the real
+    // `TaskActionScheduler.armAll()` sweep, not a direct call, so this
+    // exercises the actual wiring rather than just the function under test.
+    void it("armAll's sweep sets nextActor: human immediately after retiring a satisfied summaryRejected recovery", async () => {
+      const { folderPath } = makeTaskFolder("sweep_retire_next_actor");
+      fs.writeFileSync(path.join(folderPath, "impl-summary.md"), "## Files Changed\n\n_none_\n", "utf8");
+      seedProgress(folderPath, {
+        updatedAt: new Date(BASE_NOW).toISOString(),
+        implRecovery: pendingRecord({ trigger: "summaryRejected" }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      initNotificationRouter(new StatusTreeProvider());
+      const clock = {
+        now: (): number => BASE_NOW,
+        setTimeout: (callback: () => void, delay: number): ReturnType<typeof setTimeout> =>
+          setTimeout(callback, Math.min(delay, 10)),
+        clearTimeout: (timer: ReturnType<typeof setTimeout>): void => clearTimeout(timer),
+      };
+      const inventory = {
+        getTasks: () => [
+          { taskFolderPath: folderPath, canonicalId: folderPath, progress: readProgress(folderPath) },
+        ],
+      } as unknown as TaskInventory;
+      const scheduler = new TaskActionScheduler(inventory, clock, undefined, OWNER);
+      try {
+        await scheduler.armAll();
+        const after = readProgress(folderPath);
+        assert.equal(
+          after.implRecovery,
+          undefined,
+          "the recovery must actually have been retired for this test to be meaningful"
+        );
+        assert.equal(
+          after.nextActor,
+          "human",
+          "the sweep's own call site continues immediately after retiring — nothing further is arranged for this task in this pass"
+        );
+      } finally {
+        scheduler.dispose();
+        deactivateNotificationRouter();
+        restore();
+      }
+    });
   });
 
   void describe("discardOwedImplRecoveryV1", () => {
@@ -601,6 +653,14 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
         assert.ok(
           !(after.implReviewFiles ?? []).includes("src/should-not-be-reviewed.ts"),
           "a discarded continuation's files must never enter review scope — that is the difference from retiring"
+        );
+        // v1 fixes 2, Wave I chokepoint (clears a recovery): discard is only
+        // ever reached from an explicit user click and dispatches nothing of
+        // its own, so nextActor must read "human" afterward.
+        assert.equal(
+          after.nextActor,
+          "human",
+          "discarding an owed continuation is a human act with no automated follow-up"
         );
       } finally {
         restore();

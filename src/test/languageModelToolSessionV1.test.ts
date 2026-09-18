@@ -234,12 +234,37 @@ void describe("languageModelToolSessionV1", () => {
       assert.deepEqual(exit, { kind: "completed" });
       assert.equal(writer.text(), FRAMED_FINAL_ANSWER);
       assert.deepEqual(windDownNotices(model.sent[0]!), []);
-      assert.deepEqual(windDownNotices(model.sent[1]!), [toolRoundWindDownNoticeV1(2)]);
+      // makeRequest() is a preflight session, so it gets the plan-authoring
+      // wording (2026-09-18, run 2060: the generic notice was answered with an
+      // empty plan after 59 rounds of reads).
+      assert.deepEqual(windDownNotices(model.sent[1]!), [toolRoundWindDownNoticeV1(2, "preflight")]);
       assert.deepEqual(windDownNotices(model.sent[2]!), [
-        toolRoundWindDownNoticeV1(2),
-        toolRoundWindDownNoticeV1(1),
+        toolRoundWindDownNoticeV1(2, "preflight"),
+        toolRoundWindDownNoticeV1(1, "preflight"),
       ]);
-      assert.match(toolRoundWindDownNoticeV1(1), /LAST one this session allows/);
+      assert.match(toolRoundWindDownNoticeV1(1, "preflight"), /An empty plan discards everything/);
+      assert.match(toolRoundWindDownNoticeV1(2, "preflight"), /an empty plan is not a way to stop early/);
+
+      // The text-mode wording is pinned EXACTLY, not by substring: adding the
+      // preflight branch must leave a review session's notice byte-identical,
+      // and a substring check would pass through any accidental rewrite
+      // (2026-09-18 adversarial review, area 6).
+      const legacyLastRound =
+        "Tool round limit: your next reply is the LAST one this session allows. If it calls a tool, " +
+        "the session ends with no result and everything you have read is lost. Reply now with your " +
+        "complete final result frame, as the result contract requires, based on what you have " +
+        "already read. Where you could not verify something, say so in the result as a confidence " +
+        "limitation.";
+      const legacyEarlier =
+        "Tool round limit: 2 rounds remain in this session. Read only what your answer " +
+        "still depends on, putting the remaining reads in as few replies as you can, then reply with " +
+        "your complete final result frame. A session that runs out of rounds produces no result at all.";
+      assert.equal(toolRoundWindDownNoticeV1(1), legacyLastRound);
+      assert.equal(toolRoundWindDownNoticeV1(1, "text"), legacyLastRound);
+      assert.equal(toolRoundWindDownNoticeV1(2), legacyEarlier);
+      assert.equal(toolRoundWindDownNoticeV1(2, "text"), legacyEarlier);
+      assert.notEqual(toolRoundWindDownNoticeV1(1, "preflight"), legacyLastRound);
+      assert.notEqual(toolRoundWindDownNoticeV1(2, "preflight"), legacyEarlier);
 
       // The notice follows the tool results; it never separates a call from its result.
       const last = model.sent[2]!;

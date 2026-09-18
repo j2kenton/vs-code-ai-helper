@@ -22,7 +22,10 @@ import { PreflightOperationV1, PreflightPlanCompletedV1 } from "../types/aiResul
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { EditExecutionScriptV1 } from "../types/editExecutionProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
-import { buildPreflightToolSessionPreambleV1 } from "../prompts/toolSessionPreambleV1";
+import {
+  buildPreflightClosingOverrideV1,
+  buildPreflightToolSessionPreambleV1,
+} from "../prompts/toolSessionPreambleV1";
 
 const WORKSPACE_ROOT_ID = "workspace:revision-chaining-test";
 const PRIVATE_ROOT_ID = "private:revision-chaining-test";
@@ -306,5 +309,89 @@ void describe("toolSessionPreambleV1 vs validatePreflightPlanAgainstLedgerV1 —
     } finally {
       fixture.cleanup();
     }
+  });
+});
+
+// 2026-09-17 (v1 fixes 2, run 2057): Fast Forward dispatches the review-fix
+// round on every attempt, including after a clean review, and relies on it to
+// keep building the plan. The review-fix framing only named blockers as the
+// round's work, so a zero-blocker review with 74 steps unbuilt produced an
+// empty plan and the task stalled. Pins that the framing covers both jobs.
+void describe("toolSessionPreambleV1 — a review-fix round with no blockers builds the next plan steps", () => {
+  const preambleFor = (purpose?: "checklist" | "review-fixes" | "lint-fixes"): string =>
+    buildPreflightToolSessionPreambleV1({
+      rootId: WORKSPACE_ROOT_ID,
+      rootBindingId: "cd".repeat(32),
+      requestDigest: "ab".repeat(32),
+      ...(purpose ? { purpose } : {}),
+    });
+
+  void it("review-fixes: blockers come first, and a clean review means build the next steps", () => {
+    const preamble = preambleFor("review-fixes");
+    assert.ok(preamble.includes("Any blockers it lists come FIRST"));
+    assert.ok(preamble.includes("### When the review lists NO blockers, build the next plan steps"));
+    assert.ok(preamble.includes("BUILD THE\nNEXT STEPS"));
+    assert.ok(
+      preamble.includes("only honest when BOTH hold"),
+      "an empty plan must be framed as honest only when no blocker AND no unbuilt step remains"
+    );
+    assert.ok(
+      !preamble.includes("The blockers it lists ARE this\nround's work"),
+      "the blockers-only framing is what produced the empty plan"
+    );
+  });
+
+  void it("checklist and lint-fixes framings are unchanged by the zero-blocker section", () => {
+    for (const purpose of [undefined, "checklist", "lint-fixes"] as const) {
+      assert.ok(!preambleFor(purpose).includes("When the review lists NO blockers"));
+    }
+    assert.ok(preambleFor("checklist").includes("An empty `operations` array is a valid answer when nothing needs to change."));
+  });
+
+  // 2026-09-18 adversarial review, finding 1: apply-impl-review-code.md is
+  // appended AFTER the preamble and tells the model to edit files directly,
+  // run tests, and answer with a Markdown summary — none of which a read-only
+  // planning session can do. The override has to come last, and has to name
+  // what it is overriding.
+  void it("the closing override contradicts the executor template the round actually carries", () => {
+    const override = buildPreflightClosingOverrideV1();
+    const template = fs.readFileSync(
+      path.join(__dirname, "..", "..", "resources", "prompts", "apply-impl-review-code.md"),
+      "utf8"
+    );
+
+    // Each of these is a real instruction in the template that a preflight
+    // session cannot obey; if one is reworded there, this test should be
+    // revisited rather than silently passing.
+    assert.match(template, /making actual changes to the codebase/);
+    assert.match(template, /Edit files directly in the workspace/);
+    assert.match(template, /make sure the workspace files were actually changed/);
+    assert.match(override, /do NOT edit, write or delete any file/);
+    assert.match(override, /do NOT run commands, tests or type-checks/);
+    assert.match(override, /do NOT write the Markdown summary/);
+    assert.match(override, /one `preflight-plan\.v1` result frame/);
+
+    // It must be last: the assembled prompt is preamble + caller prompt +
+    // override, and this text only wins because nothing follows it.
+    const assembled =
+      buildPreflightToolSessionPreambleV1({
+        rootId: WORKSPACE_ROOT_ID,
+        rootBindingId: "cd".repeat(32),
+        requestDigest: "ab".repeat(32),
+        purpose: "review-fixes",
+      }) +
+      "\n\n" +
+      template +
+      "\n\n" +
+      override;
+    assert.ok(
+      assembled.trimEnd().endsWith(override.trimEnd()),
+      "the override must be the last thing the model reads"
+    );
+    assert.ok(
+      assembled.indexOf("Edit files directly in the workspace") <
+        assembled.indexOf("do NOT edit, write or delete any file"),
+      "the override must come after the instruction it overrides"
+    );
   });
 });

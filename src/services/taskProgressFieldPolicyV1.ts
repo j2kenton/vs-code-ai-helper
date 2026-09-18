@@ -119,6 +119,18 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Clear.",
     reopen: "Clear — reopening starts the streak over for the newly selected stage.",
   },
+  nextActor: {
+    migration: "Validate exact \"human\"/\"automation\" enum/current optionality; absent on new tasks and on any record predating this field.",
+    nextStage: "Clear — describes who acts next for the CURRENT stage state only; whichever chokepoint the new stage reaches next (dispatch, schedule, recovery) sets it fresh.",
+    markTaskDone: "Clear.",
+    reopen: "Clear — reopening restarts the cycle for the newly selected stage.",
+  },
+  stageReviewPasses: {
+    migration: "Validate a per-canonical-stage non-negative-integer map/current optionality; absent on new tasks and on any record predating this field.",
+    nextStage: "Preserve exactly — never reset by a stage transition. A task can revisit a review stage (e.g. a plan revision cycling impl-high-review back through impl), and each stage's counter must keep reserving strictly increasing numbers across visits so a leftover artifact from an earlier visit can never read as current.",
+    markTaskDone: "Preserve exactly.",
+    reopen: "Preserve exactly — same reasoning as nextStage.",
+  },
   nameIsDefault: {
     migration: "Validate exact boolean/current optionality; derive during creation.",
     nextStage: "Preserve.",
@@ -518,6 +530,24 @@ export function applyNextStagePolicyV1(
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
     zeroChangeImplRounds: undefined,
+    // v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): describes who
+    // acts next for the CURRENT stage state only — a transition moves that
+    // state, so this always overwrites whatever was there. Previously always
+    // cleared to `undefined` regardless of the caller's own
+    // `shouldAutoReview`-equivalent eligibility test, discarding that signal
+    // on every nextStage.v1 transition (the review's "stage-transition
+    // writers omit nextActor" blocker). Now the caller
+    // (`advanceStageViaNextStageRowV1`, `reviewActions.ts`) computes that
+    // eligibility BEFORE invoking this row and passes the fresh value in, so
+    // it lands atomically in this same CAS write; omitting it still clears to
+    // unknown exactly as before.
+    nextActor: input.nextActorOnAdvance,
+    // v1 fixes 2, item 32/Wave I: never reset by a stage transition — see
+    // TaskProgress.stageReviewPasses's own doc comment. Carried forward so a
+    // later revisit to an already-visited review stage keeps reserving
+    // strictly increasing numbers rather than restarting at 1 and colliding
+    // with an earlier visit's artifact.
+    stageReviewPasses: progress.stageReviewPasses,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -594,6 +624,17 @@ export function applyMarkTaskDonePolicyV1(
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
     zeroChangeImplRounds: undefined,
+    // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
+    // stage state only — a transition moves that state, so the field is
+    // cleared here; whichever dispatch chokepoint the new stage reaches next
+    // sets it fresh.
+    nextActor: undefined,
+    // v1 fixes 2, item 32/Wave I: never reset by a stage transition — see
+    // TaskProgress.stageReviewPasses's own doc comment. Carried forward so a
+    // later revisit to an already-visited review stage keeps reserving
+    // strictly increasing numbers rather than restarting at 1 and colliding
+    // with an earlier visit's artifact.
+    stageReviewPasses: progress.stageReviewPasses,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: input.now,
@@ -705,6 +746,17 @@ export function applyReopenPolicyV1(
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
     zeroChangeImplRounds: undefined,
+    // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
+    // stage state only — a transition moves that state, so the field is
+    // cleared here; whichever dispatch chokepoint the new stage reaches next
+    // sets it fresh.
+    nextActor: undefined,
+    // v1 fixes 2, item 32/Wave I: never reset by a stage transition — see
+    // TaskProgress.stageReviewPasses's own doc comment. Carried forward so a
+    // later revisit to an already-visited review stage keeps reserving
+    // strictly increasing numbers rather than restarting at 1 and colliding
+    // with an earlier visit's artifact.
+    stageReviewPasses: progress.stageReviewPasses,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -816,6 +868,17 @@ export function applyPlanRevisionPolicyV1(
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
     zeroChangeImplRounds: undefined,
+    // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
+    // stage state only — a transition moves that state, so the field is
+    // cleared here; whichever dispatch chokepoint the new stage reaches next
+    // sets it fresh.
+    nextActor: undefined,
+    // v1 fixes 2, item 32/Wave I: never reset by a stage transition — see
+    // TaskProgress.stageReviewPasses's own doc comment. Carried forward so a
+    // later revisit to an already-visited review stage keeps reserving
+    // strictly increasing numbers rather than restarting at 1 and colliding
+    // with an earlier visit's artifact.
+    stageReviewPasses: progress.stageReviewPasses,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,

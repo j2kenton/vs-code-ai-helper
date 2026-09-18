@@ -49,6 +49,17 @@ export interface NextStagePolicyInputV1 {
   readonly artifactOverride?: "user";
   /** Names recorded when the human supplied the override. */
   readonly missingArtifacts?: readonly string[];
+  /**
+   * v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): the fresh
+   * `nextActor` value for the arriving stage, computed by the caller BEFORE
+   * this transition (from the same `shouldAutoReview`-style eligibility test
+   * the legacy `advanceStage` helper uses — see `stageTransition.ts`), so it
+   * can be folded into this SAME atomic CAS write instead of a second,
+   * race-prone patch after the fact. Omit to clear to unknown, exactly like
+   * every other transition (`TaskProgress.nextActor`'s own doc comment: it
+   * describes who acts next for the CURRENT stage state only).
+   */
+  readonly nextActorOnAdvance?: "human" | "automation";
 }
 
 export interface MarkTaskDonePolicyInputV1 {

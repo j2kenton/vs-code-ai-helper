@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { clearEscalation } from "../utils/taskProgressTransforms";
+import { clearEscalation, setNextActorV1 } from "../utils/taskProgressTransforms";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
@@ -421,13 +422,27 @@ export async function resumePausedTask(
         const activated = await activateTask(
           inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId,
           {
-            mutateTarget: (current) => ({
-              ...clearEscalation(current),
-              updatedAt: new Date().toISOString(),
-              ...(arrangeStageDispatch && current.scheduledRun === undefined
-                ? { scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } }
-                : {}),
-            }),
+            mutateTarget: (current) => {
+              const cleared = { ...clearEscalation(current), updatedAt: new Date().toISOString() };
+              // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch):
+              // when this resume is the one arming the durable
+              // `scheduledRun`, automation acts next — the same fact
+              // `scheduleTaskResume`/`scheduleQuotaResumeAtV1` already record
+              // at their own arming sites. When no NEW dispatch is arranged
+              // here (arrangeStageDispatch: false, or an existing
+              // `scheduledRun` — e.g. a quota-park's own future intent — is
+              // left standing), `nextActor` is left untouched rather than
+              // guessed: a caller-specific `resumeAndXxxV1` variant that
+              // dispatches its own action separately is responsible for its
+              // own chokepoint, per the inventory.
+              if (arrangeStageDispatch && current.scheduledRun === undefined) {
+                return setNextActorV1(
+                  { ...cleared, scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } },
+                  "automation"
+                );
+              }
+              return cleared;
+            },
           }
         );
         if (!activated) {
@@ -573,14 +588,38 @@ export async function resumePausedTask(
  * BEFORE any admission attempt specifically so a task that cannot even be
  * resolved (deleted, moved) short-circuits on `!reread.ok` without ever
  * touching the admission directory for a folder that may not exist.
+ *
+ * `options.dispatchesAutomationWork` (default `true`, v1 fixes 2 Wave I
+ * chokepoint — "arranges a stage dispatch", per-target `resumeAndXxxV1`
+ * variants): when true, writes `nextActor: "automation"` immediately before
+ * `dispatch()` runs, since `dispatch` is about to start a review or
+ * implementation round (or an admission-wired stage action) the task did not
+ * have running a moment ago — the same fact the generic resume's own
+ * `scheduledRun` arming and `scheduleTaskResume`/`scheduleQuotaResumeAtV1`
+ * already record at their own arming sites. `resumeAndSetTaskStageV1` passes
+ * `false`: its `dispatch` only moves `currentStage` (`setTaskStage`), which
+ * does not itself start a round — asserting `"automation"` there would be a
+ * guess this function cannot verify (the correct value depends on whether the
+ * entered stage's default action auto-dispatches, which is `advanceStage`'s
+ * own still-open stage-transition chokepoint, not this one's to pre-empt).
+ *
+ * The `"automation"` stamp above is provisional, not final (2026-09-17 review
+ * completion blocker): once `dispatch()` resolves, a `false` result — the
+ * boolean-refusal contract `applyCurrentStageAction` and
+ * `goToReviewAndApplyV1` both use to report "refused before dispatching
+ * anything" — clears the stamp back to unknown rather than leaving a false
+ * claim standing. See the clearing logic just after the `dispatch()` call
+ * below.
  */
 async function resumeThenDispatchV1<T>(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg: ResumeTaskArg | undefined,
   taskFolderPath: string,
-  dispatch: (admissionHandoffToken: string | undefined) => Promise<T> | Thenable<T>
+  dispatch: (admissionHandoffToken: string | undefined) => Promise<T> | Thenable<T>,
+  options?: { readonly dispatchesAutomationWork?: boolean }
 ): Promise<T | undefined> {
+  const dispatchesAutomationWork = options?.dispatchesAutomationWork ?? true;
   const resumed = await resumePausedTask(inventory, currentTaskStore, explicitArg, {
     arrangeStageDispatch: false,
     holdAdmissionForCaller: true,
@@ -643,7 +682,33 @@ async function resumeThenDispatchV1<T>(
 
   const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
   try {
-    return await dispatch(handoffToken);
+    if (dispatchesAutomationWork) {
+      // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch): written
+      // under the admission this function already holds, immediately before
+      // the follow-up command starts a round — the moment automation
+      // genuinely becomes the next actor for this per-target dispatch.
+      await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (p) => setNextActorV1(p, "automation"));
+    }
+    const result = await dispatch(handoffToken);
+    // 2026-09-17 review completion blocker: the stamp above is written BEFORE
+    // `dispatch` runs, on the assumption that it is about to start a round —
+    // but a dispatched command can itself refuse without arranging anything
+    // (`applyCurrentStageAction`'s own contract: "Returns whether a
+    // downstream stage command was actually dispatched (`true`) or this call
+    // refused before dispatching anything (`false` ...)"; `goToReviewAndApplyV1`
+    // follows the same boolean contract). Leaving `"automation"` stamped after
+    // such a refusal would claim automation is acting when nothing was
+    // arranged — exactly the false state this field exists to prevent. Clear
+    // back to unknown (never assert `"human"`, which would itself be a guess
+    // this function cannot verify — see `setNextActorV1`'s own doc comment)
+    // whenever the dispatch's own boolean contract reports a refusal. Commands
+    // whose return type carries no such signal (`runReviewWithAI`,
+    // `runImplementationWithAI` — both resolve `void`) are left as stamped:
+    // there is no refusal signal available to act on here.
+    if (dispatchesAutomationWork && (result as unknown) === false) {
+      await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (p) => setNextActorV1(p, undefined));
+    }
+    return result;
   } finally {
     revokeWorkAdmissionHandoffV1(taskFolderPath);
     await release();
@@ -932,11 +997,22 @@ export async function resumeAndSetTaskStageV1(
   // admission-wired on its own (separate, still-open plan item), but that is
   // not a conflict here — it never calls acquireOrAdoptWorkAdmissionV1, so
   // holding through its dispatch can only add protection, not refuse it.
-  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, () =>
-    vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
-      taskFolderPath: target.taskFolderPath,
-      stage,
-    })
+  // dispatchesAutomationWork: false (v1 fixes 2, Wave I chokepoint) — a bare
+  // stage MOVE does not itself start a round; whether the destination
+  // stage's default action then auto-dispatches is `advanceStage`'s own
+  // still-unwired stage-transition chokepoint to answer, not a guess this
+  // call site should make.
+  await resumeThenDispatchV1(
+    inventory,
+    currentTaskStore,
+    explicitArg,
+    target.taskFolderPath,
+    () =>
+      vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
+        taskFolderPath: target.taskFolderPath,
+        stage,
+      }),
+    { dispatchesAutomationWork: false }
   );
 }
 

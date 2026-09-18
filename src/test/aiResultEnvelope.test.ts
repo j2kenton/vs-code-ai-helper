@@ -6,6 +6,8 @@ import {
   FRAME_END_V1,
   FRAME_START_V1,
   parseAiResultEnvelopeV1,
+  EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1,
+  isUninformedEmptyPreflightPlanV1,
   RESULT_FRAME_NUDGE_MESSAGE_V1,
   roundDeliverableContractV1,
   setInertTrailingObserverV1,
@@ -483,6 +485,79 @@ void describe("parseAiResultEnvelopeV1 — preflight-plan.v1 and edit-execution.
       assert.equal(opFields.replacementText, undefined);
     } else {
       assert.fail(`expected completed preflight-plan.v1, got: ${JSON.stringify(result)}`);
+    }
+  });
+
+  // 2026-09-18 (v1 fixes 2, run 2061): the session preamble asks the model to
+  // "say so in the plan's reasoning", and a 61-tool-round Copilot plan that did
+  // exactly that was rejected whole as an unknown field. The contract now names
+  // the field, and these pin both halves of that agreement.
+  void it("accepts the optional reasoning the preamble asks for, and truncates rather than rejects a long one", () => {
+    const planWith = (reasoning: unknown): string =>
+      frame({
+        version: 1,
+        correlation: correlation(),
+        kind: "completed",
+        content: {
+          contentType: "preflight-plan.v1",
+          schemaVersion: 1,
+          requestDigest: "digest-1",
+          rootBindingId: "root-binding-1",
+          operations: [
+            {
+              stepId: "step-1",
+              kind: "patchFile",
+              rootId: "root-1",
+              relativePath: "src/a.ts",
+              targetObservationId: "obs-file",
+              parentChain: [],
+              findText: "a",
+              replacementText: "b",
+            },
+          ],
+          reasoning,
+        },
+      });
+
+    const kept = parseAiResultEnvelopeV1(planWith("Built the first unticked item; Wave II not reached."));
+    assert.equal(kept.kind, "completed");
+    if (kept.kind === "completed" && kept.content.contentType === "preflight-plan.v1") {
+      assert.equal(kept.content.reasoning, "Built the first unticked item; Wave II not reached.");
+      assert.equal(kept.content.operations.length, 1);
+    } else {
+      assert.fail(`expected completed preflight-plan.v1, got: ${JSON.stringify(kept)}`);
+    }
+
+    const long = parseAiResultEnvelopeV1(planWith("x".repeat(10_000)));
+    assert.equal(long.kind, "completed");
+    if (long.kind === "completed" && long.content.contentType === "preflight-plan.v1") {
+      assert.equal(long.content.reasoning?.length, 4000);
+    }
+
+    // The cut must not keep half of an astral character: 3999 units + an emoji
+    // is 4001 units, and a plain slice would end on a lone high surrogate that
+    // encodes to U+FFFD (2026-09-18 adversarial review).
+    const astral = parseAiResultEnvelopeV1(planWith(`${"x".repeat(3999)}😀`));
+    assert.equal(astral.kind, "completed");
+    if (astral.kind === "completed" && astral.content.contentType === "preflight-plan.v1") {
+      const kept = astral.content.reasoning ?? "";
+      assert.equal(kept.length, 3999, "one unit short rather than a split pair");
+      assert.ok(!/[\uD800-\uDBFF]$/.test(kept), "must not end on a lone high surrogate");
+      assert.equal(Buffer.from(kept, "utf8").toString("utf8"), kept, "round-trips through UTF-8");
+    }
+
+    // A pair that ends exactly ON the boundary is kept whole, not trimmed.
+    const exact = parseAiResultEnvelopeV1(planWith(`${"x".repeat(3998)}😀`));
+    if (exact.kind === "completed" && exact.content.contentType === "preflight-plan.v1") {
+      assert.equal(exact.content.reasoning?.length, 4000);
+      assert.ok(exact.content.reasoning?.endsWith("😀"));
+    }
+
+    // A non-string is still a schema error: the field is prose or absent.
+    const wrongType = parseAiResultEnvelopeV1(planWith({ note: "structured" }));
+    assert.equal(wrongType.kind, "malformed");
+    if (wrongType.kind === "malformed") {
+      assert.match(wrongType.reason, /non-string "reasoning"/);
     }
   });
 
@@ -1496,5 +1571,103 @@ void describe("parseAiResultEnvelopeV1 — a real model-authored clarifying ques
       const result = parseAiResultEnvelopeV1(raw, correlation());
       assert.equal(result.kind, "malformed", `fresh "${field}" must be rejected`);
     }
+  });
+});
+
+// 2026-09-18 (v1 fixes 2, run 2066): the model answered on its FIRST reply with
+// no tool calls at all and `operations: []`, its own reasoning saying it "was
+// unable to obtain any exact-path file observations before the response needed
+// to be finalized" — with 63 replies unused. An empty plan from a session that
+// never opened a file is not a judgement about the code.
+void describe("isUninformedEmptyPreflightPlanV1", () => {
+  const emptyPlan = frame({
+    version: 1,
+    correlation: correlation(),
+    kind: "completed",
+    content: {
+      contentType: "preflight-plan.v1",
+      schemaVersion: 1,
+      requestDigest: "digest-1",
+      rootBindingId: "root-binding-1",
+      operations: [],
+    },
+  });
+
+  const base = {
+    responseText: emptyPlan,
+    exactPathObservations: 0,
+    nudgesUsed: 0,
+    maxNudges: 1,
+    attemptsRemaining: true,
+  };
+
+  void it("sends back an empty plan from a session that read nothing", () => {
+    assert.equal(isUninformedEmptyPreflightPlanV1(base), true);
+  });
+
+  void it("accepts an empty plan once the session has actually read something", () => {
+    // The round looked and concluded there is nothing to build. That is a
+    // legitimate answer and must not be argued with.
+    assert.equal(
+      isUninformedEmptyPreflightPlanV1({ ...base, exactPathObservations: 1 }),
+      false
+    );
+  });
+
+  void it("pushes back at most once, and never on the last available reply", () => {
+    assert.equal(isUninformedEmptyPreflightPlanV1({ ...base, nudgesUsed: 1 }), false);
+    assert.equal(isUninformedEmptyPreflightPlanV1({ ...base, attemptsRemaining: false }), false);
+  });
+
+  void it("leaves a non-empty plan alone", () => {
+    const withOperation = frame({
+      version: 1,
+      correlation: correlation(),
+      kind: "completed",
+      content: {
+        contentType: "preflight-plan.v1",
+        schemaVersion: 1,
+        requestDigest: "digest-1",
+        rootBindingId: "root-binding-1",
+        operations: [
+          {
+            stepId: "step-1",
+            kind: "patchFile",
+            rootId: "root-1",
+            relativePath: "src/a.ts",
+            targetObservationId: "obs-file",
+            parentChain: [],
+            findText: "a",
+            replacementText: "b",
+          },
+        ],
+      },
+    });
+    assert.equal(
+      isUninformedEmptyPreflightPlanV1({ ...base, responseText: withOperation }),
+      false
+    );
+  });
+
+  void it("leaves other content types and unparseable text alone", () => {
+    const chat = frame({
+      version: 1,
+      correlation: correlation(),
+      kind: "completed",
+      content: { contentType: "chat-message.v1", schemaVersion: 1, text: "hello" },
+    });
+    assert.equal(isUninformedEmptyPreflightPlanV1({ ...base, responseText: chat }), false);
+    assert.equal(
+      isUninformedEmptyPreflightPlanV1({ ...base, responseText: "no frame here" }),
+      false
+    );
+  });
+
+  void it("the message it sends names the tools that authorize an operation and forbids more searching", () => {
+    assert.match(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1, /has not opened a single file/);
+    assert.match(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1, /ensemble_readFile/);
+    assert.match(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1, /do not spend them searching/);
+    // It must leave "nothing to build" available as an answer.
+    assert.match(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1, /return the empty plan again/);
   });
 });

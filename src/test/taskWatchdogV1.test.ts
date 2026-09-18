@@ -12,6 +12,7 @@ import * as assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import {
   STALE_DISPATCH_GRACE_MS,
+  effectiveNextActorV1,
   hasOpenRoundLedgerRowV1,
   isImpossibleActiveStateV1,
   isReconstructableImplRecoveryV1,
@@ -400,5 +401,55 @@ void describe("stale-dispatch + reconstructability evidence — the single defin
     assert.equal(isUnrecoverableImplRecoveryV1(reconstructable, progressWithFiles, pastGrace), false);
     // stale, not reconstructable -> unrecoverable, the only true cell
     assert.equal(isUnrecoverableImplRecoveryV1(bare, baseProgress(), pastGrace), true);
+  });
+});
+
+void describe("effectiveNextActorV1 (v1 fixes 2, item 8, Wave I)", () => {
+  void it("reads an absent nextActor as \"unknown\", not silently as automation or human", () => {
+    assert.equal(effectiveNextActorV1(baseProgress()), "unknown");
+  });
+
+  void it("reads an explicit \"automation\" as automation", () => {
+    assert.equal(effectiveNextActorV1(baseProgress({ nextActor: "automation" })), "automation");
+  });
+
+  void it("reads an explicit \"human\" as human", () => {
+    assert.equal(effectiveNextActorV1(baseProgress({ nextActor: "human" })), "human");
+  });
+});
+
+void describe("isImpossibleActiveStateV1 consults nextActor as an ADD-ONLY exemption (v1 fixes 2, item 8)", () => {
+  let fakeContext: { restore: () => void };
+  before(() => { fakeContext = installFakeMemento(); });
+  after(() => { fakeContext.restore(); });
+
+  void it("never pauses a task with an explicit \"human\" nextActor, even though every other evidence combination would flag it", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({ nextActor: "human" }),
+        taskCanonicalId: "task-a",
+      }),
+      false,
+      "an explicit human-next state must be exempt regardless of the (otherwise stall-flagging) evidence"
+    );
+  });
+
+  void it("still pauses a genuinely dead automated state with an explicit \"automation\" nextActor", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: baseProgress({ nextActor: "automation" }),
+        taskCanonicalId: "task-a",
+      }),
+      true,
+      "a confirmed automation-next state with no live evidence is still the impossible state"
+    );
+  });
+
+  void it("still pauses on an unknown nextActor when every other evidence combination says stalled — unknown never grants a new exemption", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({ progress: baseProgress(), taskCanonicalId: "task-a" }),
+      true,
+      "unknown must not be treated like a confirmed human for gating — that would silently stand down existing stall protection"
+    );
   });
 });

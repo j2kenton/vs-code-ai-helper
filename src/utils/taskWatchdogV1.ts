@@ -32,6 +32,58 @@ export function hasOpenRoundLedgerRowV1(progress: TaskProgress): boolean {
 }
 
 /**
+ * The conservative read of `TaskProgress.nextActor` every consumer must use
+ * instead of comparing the raw field directly (v1 fixes 2, item 8, Wave I).
+ *
+ * Returns the field's TRUE state — `"human"`, `"automation"`, or `"unknown"`
+ * when absent — rather than collapsing absence into either named value.
+ * Collapsing was tried both directions in earlier rounds and both were wrong:
+ * folding unknown into `"human"` would silently exempt every task written
+ * before this field existed from the existing stall protection the moment a
+ * consumer started calling this helper (the "unverified count reads as
+ * verified" failure mode this project's other gates, e.g. the checklist
+ * latch, exist to avoid); folding unknown into `"automation"` erases the
+ * distinction a consumer needs to satisfy the plan's own requirement —
+ * "the watchdog: never pause on unknown alone" — since once a value is
+ * merged into `"automation"` at the READ boundary, no downstream consumer can
+ * ever tell "genuinely confirmed automation" apart from "never written" to
+ * treat them differently, no matter how carefully it is written.
+ *
+ * Seven chokepoints write it in production so far: task creation
+ * (`startNewTask.ts`, `"human"`), the generic resume's own `scheduledRun`
+ * arming (`resumeTask.ts`'s `resumePausedTask`, `"automation"`), arming a
+ * schedule (`scheduleTaskResume.ts`'s `scheduleTaskResume` and
+ * `scheduleQuotaResumeAtV1`, `"automation"`), owing a recovery
+ * (`implementationRecoveryV1.ts`'s `beginImplementationRecoveryV1`,
+ * `"automation"` when leased, `"human"` when the continuation budget is
+ * already exhausted and nothing will fire it automatically), four of the five
+ * per-target `resumeAndXxxV1` dispatches (`resumeTask.ts`'s shared
+ * `resumeThenDispatchV1`, `"automation"` — `resumeAndSetTaskStageV1` is
+ * deliberately excluded, since its dispatch is a bare stage move with no
+ * round attached), and discarding a recovery
+ * (`implementationRecoveryV1.ts`'s `discardOwedImplRecoveryV1`, `"human"` —
+ * only ever reached from an explicit, user-confirmed click). Still unwired:
+ * the other recovery-clear path (`retireSatisfiedSummaryRejectedRecoveryV1`)
+ * and stage transitions — see
+ * `docs/verification/v1-fixes-2-wave1-inventory.md`. Every task created
+ * before this field existed, and every task whose next mutation has not yet
+ * been wired, still reads as `"unknown"`. Consumers must treat `"unknown"` at least as
+ * permissively as `"automation"` for any gate that PREVENTS an action (never
+ * use unknown to newly justify skipping existing protection), while never
+ * treating `"unknown"` as sufficient on its own to ADD a new restrictive
+ * consequence (e.g. a new pause) that a fully wired `"automation"` value
+ * would justify — see `isImpossibleActiveStateV1`, which only ever uses this
+ * helper to ADD an exemption (explicit `"human"`), never to add a new reason
+ * to pause.
+ */
+export function effectiveNextActorV1(progress: TaskProgress): "human" | "automation" | "unknown" {
+  if (progress.nextActor === "human" || progress.nextActor === "automation") {
+    return progress.nextActor;
+  }
+  return "unknown";
+}
+
+/**
  * A `dispatched` recovery record's lease dates from the transition, and the
  * round it covers can legitimately run for the full CLI timeout (60
  * minutes) — only well past that is silence evidence of a dead round. The
@@ -194,6 +246,15 @@ export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1):
   const { progress, taskCanonicalId } = input;
   const now = input.now ?? Date.now();
   if (progress.status !== "active") {
+    return false;
+  }
+  // v1 fixes 2, item 8: a task whose next step is explicitly the human's is
+  // never paused as stalled — it is waiting for a person, not stuck. Only an
+  // EXPLICIT "human" write exempts; "unknown" (the value for every task until
+  // Wave II's chokepoint writers land) falls through to the existing,
+  // unchanged evidence-based checks below, so this can only ever ADD an
+  // exemption and never remove the existing stall protection.
+  if (effectiveNextActorV1(progress) === "human") {
     return false;
   }
   // Recently touched: not yet evidence of a stall. See the constant above.

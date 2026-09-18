@@ -56,6 +56,17 @@ function seedProgress(store: MemStore, folderUri: vscode.Uri, progress: TaskProg
   store.set(uri.toString(), JSON.stringify(progress, null, 2));
 }
 
+// `patchTaskProgressStrictV1`'s write path (`writeAtomic`) writes through raw
+// Node `fs` (a real temp file + rename), bypassing the `vscode.workspace.fs`
+// stub installed above entirely — so a write this test needs to observe never
+// reaches `store`. Read the REAL file on disk instead (installMemStore's own
+// readFile override already bridges reads the same way once the file exists).
+function readProgress(folderUri: vscode.Uri): TaskProgress {
+  const filePath = vscode.Uri.joinPath(folderUri, "task-progress.json").fsPath;
+  assert.ok(fs.existsSync(filePath), `expected task-progress.json to exist at ${filePath}`);
+  return JSON.parse(fs.readFileSync(filePath, "utf8")) as TaskProgress;
+}
+
 const ALL_KINDS: TransitionKind[] = [
   "complete-and-move-on",
   "auto-advance",
@@ -137,6 +148,70 @@ void test("advanceStage(kind=\"complete-and-move-on\", optIn=false) never auto-r
 
   assert.ok(result?.persisted);
   assert.equal(result.shouldAutoReview, false);
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-17 review fix: advanceStage's own CAS write now folds the fresh
+// `nextActor` value in atomically (see stageTransition.ts, "computed BEFORE
+// the patch" comment) instead of leaving the stage-transition chokepoint
+// unwired — this was the review's narrowed completion blocker on the
+// already-checked Wave I `nextActor` item ("both stage-transition writers ...
+// omit nextActor").
+// ---------------------------------------------------------------------------
+
+void test("advanceStage writes nextActor: \"automation\" atomically when the transition is auto-review eligible", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("nextactor-auto-review-eligible");
+  seedProgress(store, folderUri, {
+    taskFolder: "nextactor-auto-review-eligible",
+    currentStage: "plan",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+  });
+
+  const result = await advanceStage(folderUri, "plan", "plan-high-review", false, "auto-advance", true);
+
+  assert.ok(result?.persisted);
+  assert.equal(result.shouldAutoReview, true);
+  assert.equal(
+    readProgress(folderUri).nextActor,
+    "automation",
+    "the successful CAS write itself must already carry nextActor: \"automation\" — not a later, separate patch"
+  );
+});
+
+void test("advanceStage writes nextActor: \"human\" when the transition is not auto-review eligible, even if a stale value was set", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("nextactor-ineligible-writes-human");
+  seedProgress(store, folderUri, {
+    taskFolder: "nextactor-ineligible-writes-human",
+    currentStage: "plan",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+    // A stale value from a previous stage's own dispatch — the arriving
+    // stage's transition must not let it survive (nextActor describes the
+    // CURRENT stage state only).
+    nextActor: "automation",
+  });
+
+  // kind="jump" is the only kind the legacy advanceStage helper ever
+  // receives in production (Set Task Stage) — its own comment records
+  // "there is nothing to hand off to here", so landing at the new stage
+  // with nothing further arranged must persist nextActor: "human" (v1
+  // fixes 2 review fix, 2026-09-17 narrowed completion blocker: "non-
+  // automated stage transitions deliberately persist undefined rather
+  // than the required human").
+  const result = await advanceStage(folderUri, "plan", "plan-high-review", false, "jump", true);
+
+  assert.ok(result?.persisted);
+  assert.equal(result.shouldAutoReview, false);
+  assert.equal(
+    readProgress(folderUri).nextActor,
+    "human",
+    "an ineligible transition must persist nextActor: \"human\", not clear to unknown or carry a stale value forward"
+  );
 });
 
 // ---------------------------------------------------------------------------

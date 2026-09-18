@@ -560,6 +560,9 @@ void test("scheduleQuotaResumeAtV1 arms a scheduledRun at resetAt plus the buffe
       new Date(resetAt.getTime() + QUOTA_RESUME_SCHEDULE_BUFFER_MS).toISOString()
     );
     assert.equal(persisted.scheduledRun?.stage, "impl");
+    // v1 fixes 2, Wave I chokepoint (arms a schedule): arming a scheduled
+    // run means automation acts next.
+    assert.equal(persisted.nextActor, "automation");
   } finally {
     window.showInputBox = originalInputBox;
     // Awaited cancel (rather than a bare `scheduler.dispose()`) releases the

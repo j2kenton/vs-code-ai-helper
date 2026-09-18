@@ -42,7 +42,20 @@ import { isMachineMaintainedArtifactPathV1 } from "./implReviewFileSelection";
  */
 export function updateTaskProgressStage(
   progress: TaskProgress,
-  newStage: TaskStage
+  newStage: TaskStage,
+  /**
+   * v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): `nextActor`
+   * describes who acts next for the CURRENT stage state only (see
+   * `TaskProgress.nextActor`'s own doc comment) — a stage transition always
+   * moves that state, so this always clears the field, same as
+   * `applyNextStagePolicyV1`'s unconditional `nextActor: undefined`. Pass the
+   * freshly-known value (computed from the same `shouldAutoReview` signal the
+   * caller already derives, BEFORE the patch, from already-known inputs) to
+   * fold the correct fresh value into this SAME atomic write instead of
+   * leaving it unknown and requiring a second, race-prone patch afterward.
+   * Omit to clear to unknown, exactly like every other transition.
+   */
+  nextActor?: "human" | "automation"
 ): TaskProgress {
   const fallbackActive = { ...progress.fallbackActive };
   const fallbackModelId = { ...progress.fallbackModelId };
@@ -102,6 +115,7 @@ export function updateTaskProgressStage(
   return {
     ...withoutEscalation,
     currentStage: newStage,
+    nextActor,
     ...(completedStages !== undefined ? { completedStages } : {}),
     fallbackActive: Object.keys(fallbackActive).length > 0
       ? fallbackActive
@@ -1119,6 +1133,120 @@ export function clearImplementationTypeCheckFailure(progress: TaskProgress): Tas
   const { implementationTypeCheckFailure: _unused, ...rest } = progress;
   return {
     ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Record who is expected to act next (v1 fixes 2, item 8/31/Wave I — see
+ * `TaskProgress.nextActor`'s own doc comment). Callers pass `undefined` to
+ * fall back to unknown rather than asserting a stale actor; consumers read
+ * unknown through `effectiveNextActorV1`, which never uses it to add a new
+ * exemption a consumer would otherwise have granted only to a confirmed
+ * `"human"`, so clearing is always safe.
+ */
+export function setNextActorV1(
+  progress: TaskProgress,
+  nextActor: "human" | "automation" | undefined
+): TaskProgress {
+  if (progress.nextActor === nextActor) {
+    return progress;
+  }
+  if (nextActor === undefined) {
+    const { nextActor: _unused, ...rest } = progress;
+    return {
+      ...rest,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    ...progress,
+    nextActor,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Guards the best-effort `nextActor: "human"` write `reviewActions.ts`'s
+ * `advanceStageViaNextStageRowV1` makes after a refused/failed NEXT_STAGE
+ * transition (v1 fixes 2 review fix, 2026-09-17: "the post-refusal nextActor
+ * repair can overwrite a concurrent transition or dispatch's valid automation
+ * actor"). The refused attempt observed the task's stage and recovery state
+ * BEFORE dispatching; by the time the patch actually runs (at the fresh read
+ * inside `patchTaskProgressStrictV1`'s retry loop), a *different*, WINNING
+ * concurrent transition or dispatch may already have advanced the stage or
+ * recorded a fresher `nextActor: "automation"` reflecting real arranged work.
+ * That fresher state is strictly more informed than this failed attempt's own
+ * "human" guess, so the write must defer to it instead of clobbering it.
+ *
+ * Fails closed toward NOT writing: any mismatch between what was observed and
+ * what is currently on disk (a stage move, a nextActor change, or a recovery
+ * change) skips the write; an unreadable baseline also skips the write rather
+ * than falling back to the old unconditional behavior; and a currently
+ * recorded `"automation"` actor is never overwritten regardless of what the
+ * baseline held, since it may itself have been the concurrent write this
+ * guard exists to protect. The worst case of skipping is a stale `nextActor`
+ * left in place until the next chokepoint corrects it — never a real
+ * automation actor silently downgraded to "human".
+ */
+export function shouldRecordHumanNextActorAfterAdvanceRefusalV1(
+  attemptedFromStage: TaskStage,
+  baseline: Pick<TaskProgress, "currentStage" | "nextActor" | "implRecovery"> | undefined,
+  current: Pick<TaskProgress, "currentStage" | "nextActor" | "implRecovery">
+): boolean {
+  if (current.currentStage !== attemptedFromStage) {
+    return false;
+  }
+  // A valid `automation` actor already recorded — whether it was there at
+  // baseline (this attempt's own dispatch arranged it, or a concurrent one
+  // did just before the baseline read) or appeared afterwards (a winning
+  // concurrent dispatch) — must never be downgraded to "human" by this
+  // stale refusal-path write. Checked before the baseline-availability
+  // branch so an unavailable baseline can never bypass it either.
+  if (current.nextActor === "automation") {
+    return false;
+  }
+  if (!baseline) {
+    // No baseline could be read (e.g. the task was mid-creation, or the read
+    // itself failed). Fail closed toward NOT writing: without a baseline
+    // there is nothing to compare current state against, so an unconditional
+    // "human" write could just as easily clobber state this attempt never
+    // observed. Skipping leaves nextActor exactly as it was, to be corrected
+    // by the next chokepoint — strictly safer than guessing.
+    return false;
+  }
+  if (baseline.currentStage !== attemptedFromStage) {
+    // The baseline itself was already stale relative to the attempt — do not
+    // compound that uncertainty with a forced write.
+    return false;
+  }
+  if (current.nextActor !== baseline.nextActor) {
+    return false;
+  }
+  if (JSON.stringify(current.implRecovery ?? null) !== JSON.stringify(baseline.implRecovery ?? null)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Reserve the next review-pass number for `stage` (v1 fixes 2, item 32/Wave
+ * I — see `TaskProgress.stageReviewPasses`'s own doc comment). Must be called
+ * at review DISPATCH time, before the round runs, and the reservation must
+ * never be rolled back on failure or cancellation — a failed round still
+ * consumes its number so a later, different attempt can never collide with
+ * it. Returns the new progress; the reserved number is
+ * `result.stageReviewPasses[stage]` after the caller persists it (e.g. via
+ * `patchTaskProgressStrictV1`).
+ */
+export function reserveStageReviewPassV1(progress: TaskProgress, stage: TaskStage): TaskProgress {
+  const current = progress.stageReviewPasses?.[stage] ?? 0;
+  return {
+    ...progress,
+    stageReviewPasses: {
+      ...progress.stageReviewPasses,
+      [stage]: current + 1,
+    },
     updatedAt: new Date().toISOString(),
   };
 }

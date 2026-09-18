@@ -1673,6 +1673,58 @@ void describe("claimReviewAttempt — opens the round-ledger row at the round's 
       assert.deepEqual(row?.attemptIds, ["claim-attempt-1"]);
       assert.ok(row?.startedAt, "the row must carry a real start timestamp");
       assert.equal(row?.endedAt, undefined);
+
+      // v1 fixes 2, item 32/3/Wave I: the stage's review-pass number is
+      // reserved in this SAME transaction, so the claim and the reservation
+      // can never observably disagree.
+      assert.equal(
+        claimed.stageReviewPasses?.["impl-high-review"],
+        1,
+        "claimReviewAttempt must reserve the stage's next review-pass number atomically with the claim"
+      );
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("reserves a new, higher review-pass number on each subsequent visit to the same stage", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_review_attempt_ledger_repeat");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_review_attempt_ledger_repeat",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+      const folderUri = vscode.Uri.file(folderPath);
+
+      const first = await claimReviewAttempt(folderUri, "claim-attempt-a", "impl-high-review");
+      assert.equal(first?.stageReviewPasses?.["impl-high-review"], 1);
+
+      // Simulates a later, unrelated visit to the same review stage (e.g. a
+      // plan revision cycling the task back through impl and into
+      // impl-high-review again) — the first attempt's reservation is never
+      // rolled back, so the second claim must reserve the NEXT number, never
+      // reuse "1".
+      const second = await claimReviewAttempt(folderUri, "claim-attempt-b", "impl-high-review");
+      assert.equal(second?.stageReviewPasses?.["impl-high-review"], 2);
     } finally {
       wsStub.restore();
       fsBridge.restore();
@@ -2797,6 +2849,57 @@ void describe(
 
           const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
           assert.equal(raw.roundLedger?.[0]?.operationId, "owning-op", "the existing owner must never be overwritten");
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
+
+    void it(
+      "adopts a row owned by an earlier operation when the caller sets allowOperationTakeover " +
+        "(2026-09-18, run 2061: the malformed-result retry's fresh operation could never attach)",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_takeover");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "impl-round-takeover",
+            intentId: undefined,
+            operationId: "first-op",
+            attemptIds: ["impl-round-takeover", "first-attempt"],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_takeover", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          await attachCoordinatorIdentityToRoundV1({
+            taskFolderUri: folderUri,
+            roundId: "impl-round-takeover",
+            operationId: "retry-op",
+            attemptId: "retry-attempt",
+            allowOperationTakeover: true,
+          });
+
+          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+          const attached = raw.roundLedger?.[0];
+          assert.equal(attached?.operationId, "retry-op", "the retry's operation takes the row over");
+          assert.ok(
+            attached?.attemptIds.includes("retry-attempt"),
+            "the retry's attempt is recorded"
+          );
+          assert.ok(
+            attached?.attemptIds.includes("first-attempt"),
+            "the earlier operation's attempts stay on the round — the row is the whole round's record"
+          );
         } finally {
           fsBridge.restore();
         }

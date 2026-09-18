@@ -67,6 +67,7 @@ Record which commit you reviewed. End your response with this marker on its own 
 
 ```
 <!-- reviewed-commit: {{reviewedCommitSha}} -->
+<!-- review-pass: {{reviewPass}} -->
 ```
 
 ## Context Pack (implementation review files)

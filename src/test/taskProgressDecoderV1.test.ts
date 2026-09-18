@@ -643,4 +643,106 @@ void describe("taskProgressDecoderV1", () => {
       assert.equal(result.ok, false, `recovery/${file} must fail closed`);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // nextActor / stageReviewPasses (v1 fixes 2, item 2/3, Wave I)
+  // -------------------------------------------------------------------------
+
+  void it("decodes nextActor when exactly \"human\" or \"automation\"", () => {
+    const human = decodeTaskProgressTextV1(doc({ ensembleProgressVersion: 1, nextActor: "human" }));
+    assert.equal(human.ok, true);
+    if (human.ok) {
+      assert.equal(human.decoded.progress.nextActor, "human");
+    }
+    const automation = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, nextActor: "automation" })
+    );
+    assert.equal(automation.ok, true);
+    if (automation.ok) {
+      assert.equal(automation.decoded.progress.nextActor, "automation");
+    }
+  });
+
+  void it("rejects nextActor values other than the exact two allowed strings", () => {
+    expectRecovery(doc({ ensembleProgressVersion: 1, nextActor: "ai" }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, nextActor: true }), "invalidFieldValue");
+  });
+
+  void it("decodes a stageReviewPasses per-stage counter map", () => {
+    const result = decodeTaskProgressTextV1(
+      doc({
+        ensembleProgressVersion: 1,
+        stageReviewPasses: { "impl-high-review": 2, publish: 1 },
+      })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.stageReviewPasses, {
+        "impl-high-review": 2,
+        publish: 1,
+      });
+    }
+  });
+
+  void it("rejects a stageReviewPasses map with an unrecognized stage key or a non-integer count", () => {
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, stageReviewPasses: { "not-a-stage": 1 } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, stageReviewPasses: { "impl-high-review": -1 } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, stageReviewPasses: { "impl-high-review": 1.5 } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, stageReviewPasses: [1, 2] }),
+      "invalidFieldValue"
+    );
+  });
+
+  void it("decodes a reviewScoreHistory entry's optional reviewPass field", () => {
+    const result = decodeTaskProgressTextV1(
+      doc({
+        ensembleProgressVersion: 1,
+        reviewScoreHistory: [
+          {
+            stage: "impl-high-review",
+            score: 8,
+            attemptId: "attempt-1",
+            at: "2026-07-01T10:00:00.000Z",
+            blockerCount: 0,
+            taskFixableCount: 0,
+            reviewPass: 3,
+          },
+        ],
+      })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.decoded.progress.reviewScoreHistory?.[0]?.reviewPass, 3);
+    }
+  });
+
+  void it("rejects a reviewScoreHistory entry whose reviewPass is not a non-negative integer", () => {
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        reviewScoreHistory: [
+          {
+            stage: "impl-high-review",
+            score: 8,
+            attemptId: "attempt-1",
+            at: "2026-07-01T10:00:00.000Z",
+            blockerCount: 0,
+            taskFixableCount: 0,
+            reviewPass: -1,
+          },
+        ],
+      }),
+      "invalidFieldValue"
+    );
+  });
 });
