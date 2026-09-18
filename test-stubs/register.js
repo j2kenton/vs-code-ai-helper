@@ -7,6 +7,23 @@
 const path = require("node:path");
 const Module = require("node:module");
 
+// The unit suite must not inherit the HOST ROLE of whatever started it.
+//
+// `deploy/devbox/runner.sh` exports ENSEMBLE_HOST_ROLE=runner, and every
+// process the runner's VS Code spawns inherits it — including the workflow's
+// own `pnpm run verify`. Product code reads that variable
+// (src/state/hostRoleV1.ts), so suites that assert on role-dependent
+// behaviour changed answer purely because of WHERE they ran: on 2026-09-18 a
+// cloud task sat blocked on a red acceptance gate whose only cause was this,
+// with `settingsScopeMigration` and `draftTaskWithAIWorkAdmission` failing on
+// the box (4 of 16) and the identical tree passing 16 of 16 over SSH. Any
+// task on that box would have hit it.
+//
+// Tests that want a role set it explicitly, through
+// `configureEnsembleHostRoleForTestV1` or by assigning this variable inside
+// the test and restoring it afterwards.
+delete process.env.ENSEMBLE_HOST_ROLE;
+
 const stubPath = path.join(__dirname, "vscode", "index.js");
 const originalResolveFilename = Module._resolveFilename;
 
