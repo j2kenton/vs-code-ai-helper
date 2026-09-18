@@ -18,10 +18,6 @@ import {
 } from "./services/hostDecisionMirrorV1";
 import { runUnattendedV1 } from "./state/unattendedExecutionV1";
 import {
-  describeAbandonedOperationV1,
-  findAbandonedOperationsV1,
-} from "./state/abandonedOperationReaperV1";
-import {
   notifyWorkflowDecisionsChangedV1,
   WORKFLOW_DECISIONS_STORAGE_KEY_V1,
   WorkflowDecisionStoreV1,
@@ -49,7 +45,6 @@ import {
   describeWorkAdmissionRefusalV1,
   revokeWorkAdmissionHandoffV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
-  workAdmissionRenewalAgeMsV1,
 } from "./state/workAdmissionV1";
 import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
 // Side-effect only: registers `effectivePauseStatusV1.ts`'s pause-revocation
@@ -771,7 +766,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             throw new Error("that operation belonged to an earlier run of the runner — reload the window to refresh what it is doing");
           }
           if (!taskOperations.cancelOperation(request.operationId)) {
-            throw new Error("the operation can no longer be cancelled (it may have just finished)");
+            // The viewer prefixes this with "The runner could not cancel the
+            // operation: ", so it reads as one sentence about the row the
+            // user is looking at.
+            throw new Error(taskOperations.describeCancelRefusalV1(request.operationId));
           }
           return undefined;
         }
@@ -1307,7 +1305,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (typeof operationId !== "string") return;
       if (!taskOperations.cancelOperation(operationId)) {
         NotificationRouter.showInformation(
-          "This operation can no longer be cancelled (it may have just finished)."
+          taskOperations.describeCancelRefusalV1(operationId)
         );
       }
     }
@@ -1365,31 +1363,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  // ── Rounds that stopped without saying so (abandonedOperationReaperV1.ts) ──
-  // A provider that exits without unwinding its round leaves an operation the
-  // whole UI keeps reporting as running — for seven hours, on 2026-09-17, with
-  // Stop unable to clear it. A viewer runs no work, so it reaps nothing; it
-  // sees the runner's own reaping through the operations mirror.
-  if (!viewerHost) {
-    const reapAbandonedOperations = (): void => {
-      for (const abandoned of findAbandonedOperationsV1(taskOperations.getAll(), (taskPath) =>
-        workAdmissionRenewalAgeMsV1(taskPath)
-      )) {
-        if (taskOperations.endAbandonedOperation(abandoned.id)) {
-          NotificationRouter.showWarning(describeAbandonedOperationV1(abandoned));
-        }
-      }
-    };
-    const reaperTimer = setInterval(reapAbandonedOperations, 2 * 60 * 1000);
-    context.subscriptions.push({ dispose: () => clearInterval(reaperTimer) });
-  }
-
   const progressBinder = new ViewProgressBinder(taskOperations);
   context.subscriptions.push(progressBinder);
 
   // ── Runner activity, visible in viewers (hostOperationsMirrorV1.ts) ─────
   if (hostRole === "runner" && relayDir !== undefined) {
     let writeTimer: NodeJS.Timeout | undefined;
+    /** When this runner started publishing — see the duplicate check below. */
+    const runnerActivatedAtV1 = Date.now();
     const writeSnapshot = (): void => {
       writeTimer = undefined;
       const operations = taskOperations
@@ -1460,9 +1441,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // runner stopped writing".
     const heartbeat = setInterval(writeSnapshot, RUNNER_OPERATIONS_HEARTBEAT_MS_V1);
     writeSnapshot();
+    // TWO runner windows on ONE task root — two worktrees pointed at the same
+    // `metaResourcesPath`, or the same workspace opened twice — silently
+    // corrupt each other: relay requests are claimed by whichever sweeps
+    // first (so a round can run in the wrong checkout), the two overwrite
+    // each other's snapshot, and Stop starts failing with "that operation
+    // belonged to an earlier run of the runner". A runner cannot refuse to
+    // start, but it must not stay quiet about it (verification review,
+    // 2026-09-18). Detected by a snapshot NEWER than our own last write and
+    // carrying another activation id, which a restart of this same runner
+    // can never produce.
+    let duplicateRunnerWarnedV1 = false;
+    const duplicateRunnerCheck = setInterval(() => {
+      if (duplicateRunnerWarnedV1) {
+        return;
+      }
+      void readRunnerOperationsSnapshotV1(relayDir).then((snapshot) => {
+        if (
+          duplicateRunnerWarnedV1 ||
+          snapshot?.activationId === undefined ||
+          snapshot.activationId === runnerActivationIdV1 ||
+          // Written AFTER this runner activated. A snapshot from this
+          // runner's own previous life also carries a different activation id
+          // but can only be older than our activation, so this one comparison
+          // separates "someone else is writing" from "we restarted". The
+          // earlier version compared against our own last write instead,
+          // which the heartbeat refreshed to `now` immediately before every
+          // read — the check could never fire (verification review,
+          // 2026-09-18).
+          snapshot.writtenAt <= runnerActivatedAtV1
+        ) {
+          return;
+        }
+        duplicateRunnerWarnedV1 = true;
+        NotificationRouter.showWarning(
+          "Another runner window is publishing to this task root as well. Two runners on one task root claim " +
+            "each other's actions and overwrite each other's status — close one of them, or give each workspace " +
+            "its own task root (the `metaResourcesPath` setting)."
+        );
+      });
+    }, RUNNER_OPERATIONS_HEARTBEAT_MS_V1);
     context.subscriptions.push(operationsListener, {
       dispose: () => {
         clearInterval(heartbeat);
+        clearInterval(duplicateRunnerCheck);
         if (writeTimer !== undefined) {
           clearTimeout(writeTimer);
         }
@@ -1509,6 +1531,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     runnerStatus.command = `${STATUS_VIEW_ID}.focus`;
     let mirroredRootsShownV1: readonly { label: string; taskName: string }[] = [];
     let lastAbandonedWarnedAtV1: number | undefined;
+    let undecodableDecisionsWarnedV1 = false;
     const refreshRunnerStatus = async (): Promise<void> => {
       const snapshot = await readRunnerOperationsSnapshotV1(relayDir);
       const now = Date.now();
@@ -1524,10 +1547,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : undefined;
       if (abandoned !== undefined) {
         // The runner said so itself as it stopped (a reload, a restart).
+        // DATED rather than suppressed when old: the likeliest reader is
+        // someone opening a viewer the next morning, and "an Implementation
+        // round was abandoned overnight" is exactly what they need to know.
+        // An earlier attempt at this hid the notice for anything over an
+        // hour, which removed it from that journey entirely (verification
+        // review, 2026-09-18).
         lastAbandonedWarnedAtV1 = snapshot!.writtenAt;
+        const stoppedAt = new Date(snapshot!.writtenAt).toLocaleString();
         for (const root of abandoned) {
           NotificationRouter.showWarning(
-            `${root.label} — "${root.taskName}": the runner stopped while this was running, so its outcome is unknown. Check the runner VS Code on the box.`
+            `${root.label} — "${root.taskName}": the runner stopped at ${stoppedAt} while this was running, so its outcome is unknown. Check the runner VS Code on the box.`
           );
         }
       } else if (live.length === 0 && mirroredRootsShownV1.length > 0 && !isRunnerReportingV1(snapshot, now)) {
@@ -1557,6 +1587,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         runnerStatus.text = "$(warning) Runner not responding";
         runnerStatus.tooltip = `The runner stopped reporting ${Math.round(view.sinceMs / 60000)} min ago while work was listed as running. Is the runner VS Code on the box up?`;
         runnerStatus.show();
+      } else if (!isRunnerReportingV1(snapshot, now)) {
+        // Idle and "there is no runner" used to look identical: nothing was
+        // shown, the tree and Chat rendered normally, and the user learned
+        // only on pressing an action that nothing could run. With one runner
+        // window per workspace (7fecd58) a missing runner is an everyday
+        // state, so it is said up front (verification review, 2026-09-18).
+        runnerStatus.text = "$(warning) No runner for this workspace";
+        runnerStatus.tooltip =
+          snapshot === undefined
+            ? "The runner has never reported here — is the runner VS Code running on the box for this workspace? Actions pressed here cannot run until it is."
+            : `The runner has not reported for ${Math.round((now - snapshot.writtenAt) / 60000)} min — is the runner VS Code running on the box for this workspace? Actions pressed here cannot run until it is.`;
+        runnerStatus.show();
       } else {
         runnerStatus.hide();
       }
@@ -1576,6 +1618,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const live = liveMirroredDecisionsV1(snapshot, Date.now(), RUNNER_OPERATIONS_STALE_MS_V1);
       if (viewerDecisions?.setDecisions(live)) {
         notifyWorkflowDecisionsChangedV1(decisionsState);
+      }
+      // A question this window cannot render is still a question the round is
+      // waiting on: saying nothing left the panel asserting "Waiting for your
+      // answer" with no card to answer.
+      //
+      // Latched, NOT keyed on the snapshot's timestamp: the runner rewrites
+      // that file every 30 seconds with a fresh `writtenAt`, so keying on it
+      // meant a new warning — and a Notifications view stealing focus — every
+      // 30 seconds for as long as the question stayed open. And gated on the
+      // runner still reporting, so a snapshot left behind by a runner that is
+      // long gone does not announce a question nobody can answer
+      // (verification review, 2026-09-18).
+      const undecodable =
+        snapshot !== undefined && Date.now() - snapshot.writtenAt <= RUNNER_OPERATIONS_STALE_MS_V1
+          ? snapshot.undecodable
+          : 0;
+      if (undecodable === 0) {
+        undecodableDecisionsWarnedV1 = false;
+      } else if (!undecodableDecisionsWarnedV1) {
+        undecodableDecisionsWarnedV1 = true;
+        NotificationRouter.showWarning(
+          `The runner is waiting on ${undecodable} question${undecodable === 1 ? "" : "s"} this ` +
+            "window cannot show (its format is not one this version understands). Answer it in the runner VS Code " +
+            "on the box, or update this window's extension to the runner's version."
+        );
       }
     };
     const decisionsWatcher = vscode.workspace.createFileSystemWatcher(

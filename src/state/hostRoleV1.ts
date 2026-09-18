@@ -61,6 +61,22 @@ export function resolveEnsembleHostRoleV1(env: NodeJS.ProcessEnv = process.env):
   return cachedRole;
 }
 
+/**
+ * True only when the RUNNER PROCESS ITSELF declared the role, through the
+ * environment variable `deploy/devbox/runner.sh` exports.
+ *
+ * Deliberately stricter than {@link isRunnerHostV1}: `ensemble.hostRole` is a
+ * `machine-overridable` setting, so a checked-in `.vscode/settings.json` — or
+ * a user trying the runner/viewer split on their laptop — can claim the
+ * runner role. That is fine for deciding which window executes work, and
+ * unsafe for anything that treats the role as CONSENT (settings.ts's
+ * auto-implement acknowledgement), which no repository may grant on the
+ * user's behalf (verification review, 2026-09-18).
+ */
+export function isRunnerProcessFromEnvironmentV1(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[HOST_ROLE_ENV_VAR_V1] === "runner";
+}
+
 /** Test seam: pin (or clear, with undefined) the cached role. */
 export function configureEnsembleHostRoleForTestV1(role: EnsembleHostRoleV1 | undefined): void {
   cachedRole = role;

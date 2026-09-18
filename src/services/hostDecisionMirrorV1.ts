@@ -36,6 +36,13 @@ export const HOST_DECISIONS_MIRROR_FILENAME_V1 = "decisions-v1.json";
 export interface RunnerDecisionsSnapshotV1 {
   readonly writtenAt: number;
   readonly decisions: readonly WorkflowDecisionV1[];
+  /**
+   * Records in the snapshot this window could not decode. Dropping them
+   * silently left a viewer showing "Waiting for your answer" with no card and
+   * no way to learn that a question existed at all, so the count is reported
+   * (verification review, 2026-09-18).
+   */
+  readonly undecodable: number;
 }
 
 /**
@@ -173,13 +180,16 @@ export async function readRunnerDecisionsSnapshotV1(
       return undefined;
     }
     const decisions: WorkflowDecisionV1[] = [];
+    let undecodable = 0;
     for (const candidate of record.decisions) {
       const decoded = decodeMirroredDecisionV1(candidate, isKnownStage);
       if (decoded !== undefined) {
         decisions.push(decoded);
+      } else {
+        undecodable += 1;
       }
     }
-    return { writtenAt: record.writtenAt, decisions };
+    return { writtenAt: record.writtenAt, decisions, undecodable };
   } catch {
     // No runner has written yet, or a torn read: nothing to show.
     return undefined;

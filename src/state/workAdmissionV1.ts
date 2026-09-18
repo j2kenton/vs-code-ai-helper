@@ -230,15 +230,43 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
   // real start, so both facts are named for what they are.
   const renewedSeconds = Math.round(outcome.ageMs / 1000);
   const startedAtMs = outcome.owner ? Date.parse(outcome.owner.startedAt) : Number.NaN;
-  const runningFor = Number.isFinite(startedAtMs)
-    ? `running for ~${Math.round((Date.now() - startedAtMs) / 60000)} min`
+  // `startedAt` comes off ANOTHER machine's clock (a runner on the box, this
+  // window on the laptop), so the subtraction can go negative on a skew.
+  // "running for ~-3 min" is worse than saying nothing.
+  const runningMinutes = Number.isFinite(startedAtMs) ? Math.round((Date.now() - startedAtMs) / 60000) : Number.NaN;
+  const runningFor = Number.isFinite(runningMinutes)
+    ? `running for ~${Math.max(0, runningMinutes)} min`
     : "start time unknown";
   const ownerDetail = outcome.owner
     ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
     : "held by an unreadable record";
+  // Past FIVE missed heartbeats the owner is not renewing, whatever the
+  // 20-minute `likelyStale` threshold says. Saying so in plain words matters
+  // because the raw "last renewed ~347s ago" only means something to a reader
+  // who knows the heartbeat is 2 minutes — the user in the 2026-09-18
+  // incident read it as normal progress and waited on a round that could
+  // never resume.
+  //
+  // Five, not two: `setInterval` does not fire while the machine sleeps, so a
+  // closed laptop, a paused VM or a forward clock correction can leave a
+  // perfectly healthy round several minutes "unrenewed" until its next tick.
+  // Telling that user their running task is stuck would be the same class of
+  // lie in the other direction (verification review, 2026-09-18).
+  if (Number.isFinite(outcome.ageMs) && outcome.ageMs > 5 * WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) {
+    const renewedMinutes = Math.round(outcome.ageMs / 60000);
+    return (
+      `This task looks stuck rather than busy: nothing has renewed its claim for ~${renewedMinutes} min, ` +
+      `and a running action renews every ${Math.round(WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 / 60000)}. ` +
+      `The claim is ${ownerDetail}, ${runningFor}, at ${outcome.markerPath}. ` +
+      "Nothing will resume it on its own, and reloading this window does not release it. If that window " +
+      "or machine is gone, the claim is reclaimed — or offered for one-click takeover in the Notifications " +
+      "panel — once it has been unrenewed long enough to be sure, which can take up to about half an hour."
+    );
+  }
+  const renewedAgo = Number.isFinite(outcome.ageMs) ? `~${renewedSeconds}s ago` : "at an unknown time";
   return (
     `This task already has a stage action in progress (${ownerDetail}, ${runningFor}, last renewed ` +
-    `~${renewedSeconds}s ago at ${outcome.markerPath})${
+    `${renewedAgo} at ${outcome.markerPath})${
       outcome.likelyStale
         ? " — this looks stale. A determinately dead owner is reclaimed automatically on the next sweep; " +
           "a live-but-unresponsive, foreign-machine, or unreadable owner that stays stale will offer a " +
@@ -247,6 +275,9 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
     }.`
   );
 }
+
+/** Admission directories whose marker touch has already been reported failing. */
+const utimesFailureLoggedV1 = new Set<string>();
 
 const processStartTimeV1 = Date.now() - Math.floor(process.uptime() * 1000);
 
@@ -2336,6 +2367,14 @@ async function acquireWorkAdmissionCoreV1(
             throw injected;
           }
           await fs.promises.rename(currentPath, nextPath);
+          // The rename HAS happened: record it before doing anything else that
+          // can fail. Updating these after the touch below meant a transient
+          // `utimes` error left this closure pointing at a path that no longer
+          // exists — every later heartbeat then renamed nothing (ENOENT,
+          // treated as harmless) and release unlinked the wrong path, leaking
+          // the claim for good (review, 2026-09-18).
+          currentGeneration = nextGeneration;
+          currentPath = nextPath;
           // A rename does not change a file's mtime, and EVERY staleness check
           // in this module measures exactly that mtime
           // (`WORK_ADMISSION_LIKELY_STALE_MS_V1` against `statSync(...).mtimeMs`).
@@ -2346,7 +2385,28 @@ async function acquireWorkAdmissionCoreV1(
           // made a genuine stall indistinguishable from work in progress.
           // Touching the marker is what makes "unrenewed" mean unrenewed.
           const renewedAt = new Date();
-          await fs.promises.utimes(nextPath, renewedAt, renewedAt);
+          // Best-effort, and deliberately separate: the renewal itself has
+          // already succeeded, so a filesystem that refuses `utimes` must not
+          // turn a healthy heartbeat into a thrown error (its caller's
+          // interval would then report a failure for work that is fine). The
+          // cost of a missed touch is only that this one renewal is invisible
+          // to the staleness readers.
+          await fs.promises.utimes(nextPath, renewedAt, renewedAt).catch((error: unknown) => {
+            // Silence here would be its own trap: every staleness reader in
+            // this module measures the touch, so a filesystem that keeps
+            // refusing it makes a perfectly healthy round look abandoned —
+            // and the refusal message now says so in plain words. Log it
+            // once per marker so the cause is findable (verification review,
+            // 2026-09-18).
+            if (!utimesFailureLoggedV1.has(dir)) {
+              utimesFailureLoggedV1.add(dir);
+              console.warn(
+                `workAdmissionV1: could not touch the admission marker in ${dir} — renewals will look stale to ` +
+                  "the staleness checks even though the work is running.",
+                error
+              );
+            }
+          });
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             // Displaced: nothing in v1a removes another owner's marker, so
@@ -2355,8 +2415,6 @@ async function acquireWorkAdmissionCoreV1(
           }
           throw error;
         }
-        currentGeneration = nextGeneration;
-        currentPath = nextPath;
       });
     },
     release(): Promise<void> {

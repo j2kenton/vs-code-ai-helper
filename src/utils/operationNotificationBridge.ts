@@ -56,8 +56,11 @@ export function terminalEntryFor(
     snap.state === "failed" ? "error" : snap.state === "succeeded" ? "info" : "warning";
   // The live detail is meaningful on a settled row ("iteration 3/5", a new
   // task's folder name) except for the transient "cancelling…" placeholder,
-  // which the cancelled state already expresses.
-  const detail = snap.state === "cancelled" ? undefined : snap.detail;
+  // which the cancelled state already expresses. A FORCED end is the one
+  // cancellation whose detail must survive: "cancelled" on its own would say
+  // the work stopped, and a row removed after Stop was ignored has not
+  // necessarily stopped (verification review, 2026-09-18).
+  const detail = snap.state === "cancelled" && snap.forcedEndV1 !== true ? undefined : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
   return {
     // The quoted name is a render-time decision: the snapshot's semantic

@@ -9,6 +9,7 @@ import {
   migrateSettingsScope,
   targetFor,
 } from "../config/settings";
+import { configureEnsembleHostRoleForTestV1 } from "../state/hostRoleV1";
 
 /**
  * Fake WorkspaceConfiguration backed by two plain maps (workspace/global),
@@ -351,6 +352,55 @@ void describe("automatic implementation confirmation gate", () => {
       assert.equal(getAutoImplementAfterReviewMode(), "auto");
     } finally {
       controller.dispose();
+      resetAutoImplementConfirmationForTests();
+      workspace.getConfiguration = originalConfiguration;
+    }
+  });
+
+  void it("a cloud runner is armed by its own launcher, and a settings file can never claim that consent", () => {
+    // The runner deliberately skips the acknowledgement modal (nobody can
+    // click it on a headless box). That left the machine-local confirmation
+    // false for ever, so a runner configured for "auto" behaved as "off" and
+    // every round simply stopped after its review.
+    //
+    // The trust is in the ENVIRONMENT VARIABLE runner.sh exports, not in the
+    // `ensemble.hostRole` setting: that setting is machine-overridable, so a
+    // repository's own .vscode/settings.json could otherwise ship
+    // hostRole:runner + autoImplementAfterReview:auto and have a laptop make
+    // unsupervised file changes without ever asking (verification review,
+    // 2026-09-18).
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    const originalEnv = process.env.ENSEMBLE_HOST_ROLE;
+    workspace.getConfiguration = () => ({
+      get: (): unknown => "auto",
+      inspect: () => ({ globalValue: "auto", workspaceValue: undefined }),
+      update: (): Promise<void> => Promise.resolve(),
+    });
+    try {
+      delete process.env.ENSEMBLE_HOST_ROLE;
+      configureEnsembleHostRoleForTestV1("standalone");
+      assert.equal(getAutoImplementAfterReviewMode(), "off", "an ordinary window still has to confirm");
+
+      // A workspace that merely CLAIMS the runner role, with no runner
+      // process behind it: still gated.
+      configureEnsembleHostRoleForTestV1("runner");
+      assert.equal(
+        getAutoImplementAfterReviewMode(),
+        "off",
+        "a settings value must not stand in for the supervision acknowledgement"
+      );
+
+      // The real cloud runner: launched with the variable set.
+      process.env.ENSEMBLE_HOST_ROLE = "runner";
+      assert.equal(getAutoImplementAfterReviewMode(), "auto");
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.ENSEMBLE_HOST_ROLE;
+      } else {
+        process.env.ENSEMBLE_HOST_ROLE = originalEnv;
+      }
+      configureEnsembleHostRoleForTestV1(undefined);
       resetAutoImplementConfirmationForTests();
       workspace.getConfiguration = originalConfiguration;
     }

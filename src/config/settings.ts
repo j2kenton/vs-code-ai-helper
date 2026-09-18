@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { isRunnerHostV1 } from "../state/hostRoleV1";
+import { isRunnerHostV1, isRunnerProcessFromEnvironmentV1 } from "../state/hostRoleV1";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings, StageModelSetting, normalizeBackupChain } from "../utils/modelFallback";
 import {
@@ -853,7 +853,20 @@ export function resetAutoImplementConfirmationForTests(): void {
 
 export function getAutoImplementAfterReviewMode(): "off" | "auto" {
   const raw = readSetting<unknown>(AUTO_IMPLEMENT_AFTER_REVIEW_KEY, "off");
-  return raw === "auto" && autoImplementConfirmed ? "auto" : "off";
+  // On the cloud RUNNER the acknowledgement modal is deliberately never shown
+  // (nobody can click it there, and it blocked the window). That left
+  // `autoImplementConfirmed` false for ever, so a runner configured for
+  // "auto" silently behaved as "off" and the round simply stopped after the
+  // review — the opposite of what the operator configured.
+  //
+  // The test is the ENVIRONMENT VARIABLE the runner process is launched with,
+  // never the `ensemble.hostRole` setting: that setting is
+  // machine-overridable, so a repository's own `.vscode/settings.json` could
+  // otherwise ship `hostRole: runner` + `autoImplementAfterReview: auto` and
+  // have a laptop start making unsupervised file changes without ever asking
+  // (verification review, 2026-09-18). Launching a runner process is the
+  // consent; opening a folder is not.
+  return raw === "auto" && (autoImplementConfirmed || isRunnerProcessFromEnvironmentV1()) ? "auto" : "off";
 }
 
 export function isAutoImplementAfterReviewEnabled(): boolean {

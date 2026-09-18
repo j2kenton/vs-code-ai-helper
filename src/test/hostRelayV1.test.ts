@@ -118,6 +118,130 @@ void describe("hostRelayV1", () => {
     }
   });
 
+  void it("a later sweep never expires the request an earlier sweep is still running", async () => {
+    // The blocker this guards (verification review, 2026-09-18): sweeps run
+    // concurrently, so the 10-second periodic sweep re-lists a request whose
+    // round is still going, fails to claim it, and used to treat the live
+    // claim as one a dead sweep had left behind — answering the viewer
+    // "expired" about an action that was running perfectly well, exactly
+    // 10 minutes in.
+    const dir = await tempDir();
+    try {
+      let clock = new Date("2026-09-17T10:00:00Z");
+      const relay = createHostRelayV1({ dir, now: () => clock, maxAgeMs: 60_000 });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const pending = relay.send({ kind: "command", command: "long" }, { pollMs: 10, timeoutMs: 30 * 60 * 1000 });
+      pending.catch(() => undefined);
+      await waitForRequestFile(dir);
+      let runs = 0;
+      const first = relay.drain(async () => {
+        runs += 1;
+        await gate;
+        return "done";
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50)); // the claim is taken
+      // Well past maxAgeMs, and past the claim file's own age.
+      clock = new Date("2026-09-17T10:30:00Z");
+      assert.equal(await relay.drain(() => Promise.resolve("second")), 0, "nothing left to claim");
+      release();
+      assert.equal(await first, 1);
+      const response = await pending;
+      assert.equal(response.ok, true, `the round's own answer, not an expiry (${response.reason ?? ""})`);
+      assert.equal(response.result, "done");
+      assert.equal(runs, 1, "and it ran once");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("a claim left behind by a runner that restarted is expired at once, not at the viewer's 30-minute wait", async () => {
+    // The blocker (verification review, 2026-09-18): judging a claim by the
+    // REQUEST's timeout meant a runner that reloaded mid-round left a claim
+    // nothing would expire for 30 minutes, while the new runner sat idle
+    // beside it — and the viewer was then told the runner "took this but has
+    // not finished". The claim's own heartbeat is the liveness signal.
+    const dir = await tempDir();
+    try {
+      const clock = new Date("2026-09-17T10:00:00Z");
+      const relay = createHostRelayV1({ dir, now: () => clock, maxAgeMs: 10 * 60 * 1000 });
+      const pending = relay.send({ kind: "command", command: "implement" }, { pollMs: 10, timeoutMs: 30 * 60 * 1000 });
+      pending.catch(() => undefined);
+      await waitForRequestFile(dir);
+      const [name] = (await fs.readdir(dir)).filter((entry) => entry.startsWith("req-"));
+      const claimPath = path.join(dir, `${name!}.claimed`);
+      await fs.writeFile(claimPath, "");
+      // Last touched five minutes ago: three missed heartbeats and then some.
+      const lastBeat = new Date("2026-09-17T09:55:00Z");
+      await fs.utimes(claimPath, lastBeat, lastBeat);
+      assert.equal(await relay.drain(() => Promise.resolve("ran")), 0);
+      const response = await pending;
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "expired", "a definite answer the user can retry from");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("another extension host's sweep leaves a claim alone while its heartbeat is arriving", async () => {
+    // Two relay instances on one directory stand in for two extension hosts:
+    // the second has no memory of the first's claims and must judge the claim
+    // by the file alone.
+    const dir = await tempDir();
+    try {
+      const runner = createHostRelayV1({ dir, maxAgeMs: 60_000, claimHeartbeatMs: 100 });
+      const otherHost = createHostRelayV1({ dir, maxAgeMs: 60_000, claimHeartbeatMs: 100 });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const pending = runner.send({ kind: "command", command: "long" }, { pollMs: 10, timeoutMs: 60_000 });
+      pending.catch(() => undefined);
+      await waitForRequestFile(dir);
+      const running = runner.drain(async () => {
+        await gate;
+        return "done";
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(await otherHost.drain(() => Promise.resolve("stolen")), 0, "it is not the other host's to claim");
+      release();
+      await running;
+      const response = await pending;
+      assert.equal(response.ok, true, `the round's own answer (${response.reason ?? ""})`);
+      assert.equal(response.result, "done");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("a claim an abandoned sweep left behind is still expired, so the viewer is not left waiting", async () => {
+    const dir = await tempDir();
+    try {
+      let clock = new Date("2026-09-17T10:00:00Z");
+      const relay = createHostRelayV1({ dir, now: () => clock, maxAgeMs: 60_000 });
+      // A claim written by a PREVIOUS extension host (no live sweep owns it).
+      const pending = relay.send({ kind: "command", command: "x" }, { pollMs: 10 });
+      pending.catch(() => undefined);
+      await waitForRequestFile(dir);
+      const [name] = (await fs.readdir(dir)).filter((entry) => entry.startsWith("req-"));
+      const claimPath = path.join(dir, `${name!}.claimed`);
+      await fs.writeFile(claimPath, "");
+      // The claim's own age is read from its mtime, which is real time here:
+      // backdate it to sit on the injected clock's timeline.
+      const claimedAt = new Date("2026-09-17T09:00:00Z");
+      await fs.utimes(claimPath, claimedAt, claimedAt);
+      clock = new Date("2026-09-17T10:05:00Z");
+      assert.equal(await relay.drain(() => Promise.resolve("ran")), 0, "it is claimed, so it is not run here");
+      const response = await pending;
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "expired");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   void it("expiry follows the viewer's own wait when the request states one", async () => {
     const dir = await tempDir();
     try {

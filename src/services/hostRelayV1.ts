@@ -148,10 +148,32 @@ export function createHostRelayV1(options: {
   readonly now?: () => Date;
   /** Requests older than this when claimed are refused as expired. Default 10 minutes. */
   readonly maxAgeMs?: number;
+  /** How often a claim being executed touches its own claim file. Default 30 seconds. */
+  readonly claimHeartbeatMs?: number;
 }): HostRelayV1 {
   const { dir } = options;
   const now = options.now ?? ((): Date => new Date());
   const maxAgeMs = options.maxAgeMs ?? 10 * 60 * 1000;
+  const claimHeartbeatMs = options.claimHeartbeatMs ?? 30 * 1000;
+  /** A claim untouched for this long is not being executed by anyone. */
+  const claimStaleMs = 3 * claimHeartbeatMs;
+  /**
+   * Claims THIS process is executing right now. Sweeps run concurrently
+   * (extension.ts), so a sweep that starts while a relayed Implementation
+   * round is still running finds that round's claim and must not mistake it
+   * for one an earlier, dead sweep left behind: without this, a round longer
+   * than `maxAgeMs` was answered "expired" to the viewer — the user was told
+   * their action had failed while it was running normally on the runner
+   * (verification review, 2026-09-18).
+   *
+   * In-process memory alone is not enough, because the case where a claim IS
+   * dead is exactly the case where this set is empty — a runner that reloaded
+   * or crashed mid-round leaves its claim behind and comes back with a fresh
+   * set. So a live claim also HEARTBEATS its own file (`claimHeartbeatMs`),
+   * and a claim that has stopped being touched is dead whoever left it
+   * (verification review, 2026-09-18).
+   */
+  const executingClaimsV1 = new Set<string>();
 
   async function writeComplete(finalPath: string, body: unknown): Promise<void> {
     await fs.mkdir(dir, { recursive: true });
@@ -258,6 +280,7 @@ export function createHostRelayV1(options: {
         try {
           const claim = await fs.open(claimPath, "wx");
           await claim.close();
+          executingClaimsV1.add(claimPath);
           claimed.push({ id, requestPath, claimPath });
         } catch {
           // Claimed by the other sweep — unless that sweep died mid-way and
@@ -271,6 +294,17 @@ export function createHostRelayV1(options: {
 
       async function runClaimed(id: string, requestPath: string, claimPath: string): Promise<void> {
         let response: HostRelayResponseV1 | undefined;
+        // While this round runs, its claim file says so — on disk, where the
+        // next extension host can read it. Best-effort: a failed touch must
+        // never fail the round, and three missed touches are what marks a
+        // claim dead.
+        const beat = setInterval(() => {
+          const at = now();
+          void fs.utimes(claimPath, at, at).catch(() => undefined);
+        }, claimHeartbeatMs);
+        // A 30-second timer must not hold the extension host (or a test
+        // process) open on its own.
+        beat.unref?.();
         try {
           const request = (await readJson(requestPath)) as HostRelayRequestV1;
           const age = now().getTime() - new Date(request.createdAt).getTime();
@@ -297,26 +331,42 @@ export function createHostRelayV1(options: {
             };
           }
         }
-        if (response !== undefined) {
-          await writeComplete(path.join(dir, `${RESPONSE_PREFIX}${id}.json`), response);
+        try {
+          if (response !== undefined) {
+            await writeComplete(path.join(dir, `${RESPONSE_PREFIX}${id}.json`), response);
+          }
+        } finally {
+          // In the `finally`: a failed response write (writeComplete gives up
+          // after its retries) must still clear the request and the claim,
+          // or the viewer waits out its whole timeout on a round that has
+          // already run (verification review, 2026-09-18).
+          clearInterval(beat);
+          await fs.rm(requestPath, { force: true }).catch(() => undefined);
+          await fs.rm(claimPath, { force: true }).catch(() => undefined);
+          executingClaimsV1.delete(claimPath);
         }
-        await fs.rm(requestPath, { force: true });
-        await fs.rm(claimPath, { force: true });
       }
 
       /** Answers nobody collected (a viewer that timed out) and stray temp files. */
       async function collectGarbage(names: readonly string[]): Promise<void> {
         const cutoffResponses = now().getTime() - 60 * 60 * 1000;
         const cutoffTemps = now().getTime() - 10 * 60 * 1000;
+        const cutoffClaims = now().getTime() - claimStaleMs;
         for (const name of names) {
           const isResponse = name.startsWith(RESPONSE_PREFIX) && name.endsWith(".json");
           const isTemp = name.endsWith(".tmp");
-          if (!isResponse && !isTemp) {
+          // A claim whose request is gone (the viewer withdrew it at its own
+          // timeout) is never listed as pending again, so nothing else would
+          // ever remove it and it accumulated in the relay directory for ever.
+          const isOrphanClaim =
+            name.endsWith(CLAIMED_SUFFIX) && !names.includes(name.slice(0, -CLAIMED_SUFFIX.length));
+          if (!isResponse && !isTemp && !isOrphanClaim) {
             continue;
           }
+          const cutoff = isResponse ? cutoffResponses : isTemp ? cutoffTemps : cutoffClaims;
           try {
             const stat = await fs.stat(path.join(dir, name));
-            if (stat.mtimeMs < (isResponse ? cutoffResponses : cutoffTemps)) {
+            if (stat.mtimeMs < cutoff) {
               await fs.rm(path.join(dir, name), { force: true });
             }
           } catch {
@@ -326,9 +376,20 @@ export function createHostRelayV1(options: {
       }
 
       async function expireDeadClaim(id: string, requestPath: string, claimPath: string): Promise<void> {
+        if (executingClaimsV1.has(claimPath)) {
+          // A live sweep in this process is running it. Not abandoned.
+          return;
+        }
         try {
           const claimed = await fs.stat(claimPath);
-          if (now().getTime() - claimed.mtimeMs <= maxAgeMs) {
+          // The claim's own heartbeat is the liveness signal, not the
+          // request's age: a round that legitimately runs for half an hour
+          // keeps touching its claim, and a runner that died two minutes ago
+          // stopped. Judging by the request's timeout instead left the user
+          // waiting the full 30 minutes after a runner restart, and then told
+          // them the runner "has not finished" something it never picked up
+          // (verification review, 2026-09-18).
+          if (now().getTime() - claimed.mtimeMs <= claimStaleMs) {
             return;
           }
         } catch {

@@ -2023,6 +2023,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // (hostDecisionMirrorV1.ts). A decision this window raised itself
       // (`isRemoteDecisionV1` false) is still resolved here.
       this.decisionsBeingAnsweredV1.add(decisionId);
+      // Captured BEFORE the relay: answering transitions the decision out of
+      // `pending` on the runner, and the next mirror refresh (watcher or the
+      // 10-second timer) then drops the record from this window — so reading
+      // it back after the relay to correct a failed follow-up was a race
+      // whose loss left the transcript asserting "applying now" for ever
+      // (verification review, 2026-09-18).
+      const answered = this.workflowDecisionStore.get(decisionId);
+      const answeredIdentityV1 =
+        answered !== undefined ? { stage: answered.stage, taskCanonicalId: answered.taskCanonicalId } : undefined;
       await this.render();
       try {
         const relayed = await this.interactionServices.resolveWorkflowDecision(decisionId, optionId);
@@ -2030,7 +2039,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // answer: `alreadySettled` means another window already applied it,
         // and running it again would be a second Commit & Push.
         if (relayed?.viewerEffect && relayed.ok !== false) {
-          await this.runDecisionEffectV1(relayed.viewerEffect, decisionId);
+          await this.runDecisionEffectV1(relayed.viewerEffect, decisionId, answeredIdentityV1);
         } else if (relayed?.message) {
           // e.g. "This decision was already submitted." — never silent.
           NotificationRouter.showInformation(relayed.message);
@@ -2144,13 +2153,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private async runDecisionEffectV1(
     effect: { command: string; args?: readonly unknown[] },
-    decisionId: string
+    decisionId: string,
+    /** The decision's stage/task as read BEFORE the answer was relayed — the
+     * mirrored record is normally gone by now (see the caller). */
+    capturedV1?: { readonly stage: WorkflowDecisionV1["stage"]; readonly taskCanonicalId: string }
   ): Promise<void> {
     // The runner has already written "applying now" against this decision, so
     // a failure HERE must correct that line exactly as a local click's failure
     // does — otherwise the transcript permanently claims something that never
     // happened, and the card is gone (verification review, 2026-09-17).
-    const decision = this.workflowDecisionStore.get(decisionId);
+    const stored = this.workflowDecisionStore.get(decisionId);
+    const decision =
+      stored !== undefined ? { stage: stored.stage, taskCanonicalId: stored.taskCanonicalId } : capturedV1;
     const reportFailure = async (reason: string): Promise<void> => {
       NotificationRouter.showWarning(`Your answer was recorded, but the follow-up did not complete: ${reason}`);
       if (decision) {
@@ -2238,20 +2252,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       console.error("Ensemble chat panel could not be rendered", error);
+      const message = `This conversation could not be refreshed. (${reason}) What you see may be out of date.`;
+      // A banner, NOT a fresh empty state: see the webview's `renderFailed`
+      // handler. Anything already painted for THIS conversation — the
+      // transcript, a pending decision card, the busy banner — stays usable.
+      // The target travels with it so the panel can tell "this conversation
+      // could not be refreshed" from "this conversation was never shown",
+      // and never leaves another task's transcript on screen.
       await this.view?.webview.postMessage({
-        type: "state",
+        type: "renderFailed",
         target: this.target,
         label: this.target && this.target.kind !== "global" ? this.target.taskName ?? "Chat" : "Chat",
-        entries: [],
-        timeline: [],
-        interactions: [],
-        decisions: [],
-        busy: false,
-        waitingForUser: false,
-        errorMessage: `This conversation could not be shown. (${reason}) Check the Notifications view, then reload the window.`,
+        errorMessage: message,
+        unpaintedMessage: `This conversation could not be shown. (${reason}) Check the Notifications view for details.`,
       });
+      // "Check the Notifications view" was a lie while the only record of the
+      // failure was console.error. Post it there, at most once every five
+      // minutes per distinct reason, because render runs on a timer.
+      // Keyed by reason, not a single slot: two failures alternating (two
+      // stage chats failing differently as the user clicks between them)
+      // defeated a one-slot cache and notified on every paint.
+      const now = Date.now();
+      for (const [seen, at] of this.renderFailureNoticesV1) {
+        if (now - at > 5 * 60 * 1000) {
+          this.renderFailureNoticesV1.delete(seen);
+        }
+      }
+      if (!this.renderFailureNoticesV1.has(reason)) {
+        this.renderFailureNoticesV1.set(reason, now);
+        try {
+          NotificationRouter.showError(message);
+        } catch {
+          // The router may not be initialized yet (activation order): the
+          // panel's own banner has already gone out, which is what the user
+          // actually looks at.
+        }
+      }
     }
   }
+
+  /** Failed-paint reasons already reported to Notifications, and when. */
+  private readonly renderFailureNoticesV1 = new Map<string, number>();
 
   private async renderInnerV1(): Promise<void> {
     // No target chosen yet: restore whatever conversation was last open
@@ -3210,7 +3251,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // conversation sits on the loading placeholder for ever, with nothing
         // logged anywhere (2026-09-18). Escapes are banned in here for the
         // same reason, comments included.
-        if(s.type==='restoreDraft'){i.value=i.value?i.value+String.fromCharCode(10)+s.text:s.text;i.focus();return;}
+        // A message that could not be sent is handed back here. When the box
+        // already holds something the user typed during the wait, the two are
+        // separated by a visible marker: merging them silently produced one
+        // mashed-up message that the next press of Send posted as it stood
+        // (verification review, 2026-09-18).
+        if(s.type==='restoreDraft'){
+          const mark='--- below: a message that could not be sent ---';
+          const typed=i.value;
+          // Whitespace is not something the user wants kept, and a second
+          // failed send must not stack a second marker (nor make the first
+          // one's wording false about what sits above it).
+          if(typed.trim()===''){i.value=s.text;}
+          else if(typed.indexOf(mark)>=0){i.value=typed+String.fromCharCode(10)+s.text;}
+          else{i.value=typed+String.fromCharCode(10)+mark+String.fromCharCode(10)+s.text;}
+          i.focus();return;
+        }
+        // A failed paint is a BANNER over whatever is already on screen, not a
+        // new state: the empty state it used to send removed the transcript,
+        // the busy banner and any pending decision card, so a round that was
+        // waiting on an answer could no longer be answered from here
+        // (verification review, 2026-09-18).
+        if(s.type==='renderFailed'){
+          const failedKey=targetKey(s.target);
+          if(failedKey!==currentKey){
+            // Nothing on screen belongs to the conversation that failed: this
+            // is either the first paint (the panel is still showing the
+            // loading placeholder) or a switch to another task whose paint
+            // failed. Leaving the PREVIOUS task's transcript under this
+            // banner was worse than the empty state it replaced — Send and
+            // every Reply control post to the new target, so the user would
+            // have been answering task B while reading task A
+            // (verification review, 2026-09-18).
+            m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);
+            en.textContent='';en.style.display='none';
+            b.style.display='none';bs.style.display='none';
+            c.textContent=s.label??'Chat';
+            currentKey=failedKey;
+            e.textContent=s.unpaintedMessage??s.errorMessage??'';
+          }else{
+            e.textContent=s.errorMessage??'';
+          }
+          e.style.display=e.textContent?'block':'none';return;
+        }
         if(s.type!=='state')return;
         const nextKey=targetKey(s.target);
         const switchedChat=nextKey!==currentKey;

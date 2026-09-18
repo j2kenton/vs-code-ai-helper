@@ -71,6 +71,27 @@ void describe("hostDecisionMirrorV1", () => {
     }
   });
 
+  void it("counts the records it could not decode, so the viewer can say a question exists", async () => {
+    // Dropping them silently left the panel asserting "Waiting for your
+    // answer" with no card and no way to find out why (verification review,
+    // 2026-09-18).
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-undecodable-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "decisions-v1.json"),
+        JSON.stringify({
+          writtenAt: Date.now(),
+          decisions: [decision(), { decisionId: "from-a-newer-version", options: [] }, { nonsense: true }],
+        })
+      );
+      const snapshot = await readRunnerDecisionsSnapshotV1(dir);
+      assert.deepEqual(snapshot?.decisions, [decision()]);
+      assert.equal(snapshot?.undecodable, 2);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   void it("the newest snapshot wins, whichever write finishes last", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-order-"));
     try {
@@ -139,8 +160,8 @@ void describe("hostDecisionMirrorV1", () => {
   void it("a decision is only answerable while the runner is still reporting", () => {
     const now = Date.parse("2026-09-17T17:00:00Z");
     const STALE = 90_000;
-    assert.deepEqual(liveMirroredDecisionsV1({ writtenAt: now, decisions: [decision()] }, now, STALE), [decision()]);
-    assert.deepEqual(liveMirroredDecisionsV1({ writtenAt: now - STALE - 1, decisions: [decision()] }, now, STALE), []);
+    assert.deepEqual(liveMirroredDecisionsV1({ writtenAt: now, decisions: [decision()], undecodable: 0 }, now, STALE), [decision()]);
+    assert.deepEqual(liveMirroredDecisionsV1({ writtenAt: now - STALE - 1, decisions: [decision()], undecodable: 0 }, now, STALE), []);
     assert.deepEqual(liveMirroredDecisionsV1(undefined, now, STALE), []);
   });
 

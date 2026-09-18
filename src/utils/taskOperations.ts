@@ -221,6 +221,13 @@ export interface TaskOperationSnapshot {
    * `filePath` field.
    */
   readonly resultTargetUri?: string;
+  /**
+   * True when the row was REMOVED after its cancellation was ignored rather
+   * than cancelled by the work itself — see `cancelOperation`. Surfaces must
+   * not report this as work that stopped: the provider may still be running
+   * (verification review, 2026-09-18).
+   */
+  readonly forcedEndV1?: boolean;
 }
 
 /**
@@ -250,6 +257,10 @@ interface MutableOperation {
   resultTargetUri?: string;
   waitingForUser: boolean;
   conflictKeys?: readonly string[];
+  /** When cancellation was first requested for it — see `cancelOperation`. */
+  cancelRequestedAt?: number;
+  /** See TaskOperationSnapshot.forcedEndV1. */
+  forcedEndV1?: boolean;
 }
 
 /**
@@ -443,24 +454,6 @@ export class TaskOperationRegistry implements vscode.Disposable {
 
   isMirroredOperation(id: string): boolean {
     return id.startsWith(MIRRORED_OPERATION_ID_PREFIX);
-  }
-
-  /**
-   * End an operation whose work has stopped without unwinding, reporting it
-   * as cancelled (abandonedOperationReaperV1.ts decides which). Returns false
-   * when the id is unknown here, or is another window's mirrored entry.
-   */
-  endAbandonedOperation(id: string): boolean {
-    if (this.isMirroredOperation(id)) {
-      return false;
-    }
-    for (const keyMap of this.operations.values()) {
-      const op = keyMap.get(id);
-      if (op) {
-        return this.forceEndSubtreeV1(keyMap, op);
-      }
-    }
-    return false;
   }
 
   /** This window's OWN operations for a task — never the runner's mirrored ones. */
@@ -832,19 +825,67 @@ export class TaskOperationRegistry implements vscode.Disposable {
           this.triggerChange(true);
           return true;
         }
-        // Already cancelled and still here: its owner never observed the
-        // token, so asking again can achieve nothing. Seen live 2026-09-17: a
-        // Fast Forward whose provider exited on a quota limit left an
-        // operation nothing unwound, and Stop then answered "can no longer be
-        // cancelled (it may have just finished)" about a row the registry was
-        // still advertising as running — a dead end only a window reload
-        // cleared. The second press now FORCES the subtree out of the
-        // registry, which is the honest end state: the work is not running
-        // (nothing is listening to its token), so nothing should say it is.
+        if (this.tokenSources.get(op.id) === undefined) {
+          // Not cancellable at all (it holds no token): there is nothing to
+          // ignore, so there is nothing to force. Removing it would tell every
+          // caller that waits for the task to be free — archive, "Set as
+          // Current Stage" — that the work had stopped while it carried on
+          // writing the task's artifacts (review, 2026-09-18).
+          return false;
+        }
+        if (
+          op.cancelRequestedAt === undefined ||
+          Date.now() - op.cancelRequestedAt < FORCE_END_AFTER_IGNORED_CANCEL_MS_V1
+        ) {
+          // Cancellation was only just asked for. A provider winding down
+          // needs a moment, and forcing the row out now would unlock the task
+          // while it is still writing (review, 2026-09-18).
+          return false;
+        }
+        // Cancellation was requested long enough ago that the owner plainly is
+        // not going to unwind. Seen live 2026-09-17: a Fast Forward whose
+        // provider exited on a quota limit left an operation nothing ended,
+        // and Stop answered "can no longer be cancelled" about a row still
+        // advertised as running — a dead end only a window reload cleared.
+        // Forcing it out is the user's escape hatch, and the record it leaves
+        // says plainly that the work itself may still be finishing.
         return this.forceEndSubtreeV1(keyMap, op);
       }
     }
     return false;
+  }
+
+  /**
+   * Why a `cancelOperation` call returned false, for the surfaces that tell
+   * the user. Three different situations used to be rendered as one sentence
+   * — "This operation can no longer be cancelled (it may have just finished)"
+   * — including the case where the row is still on screen, still spinning,
+   * and Stop WILL remove it shortly. Being told it was unreachable is what
+   * stopped users pressing again, so the escape hatch was never reached
+   * (verification review, 2026-09-18).
+   */
+  describeCancelRefusalV1(id: string): string {
+    for (const keyMap of this.operations.values()) {
+      const op = keyMap.get(id);
+      if (op === undefined) {
+        continue;
+      }
+      if (this.tokenSources.get(op.id) === undefined) {
+        return `"${op.label}" cannot be stopped from here — it holds nothing to cancel. It ends when it finishes.`;
+      }
+      if (op.cancelRequestedAt !== undefined) {
+        const seconds = Math.max(
+          1,
+          Math.ceil((FORCE_END_AFTER_IGNORED_CANCEL_MS_V1 - (Date.now() - op.cancelRequestedAt)) / 1000)
+        );
+        return (
+          `"${op.label}" has been asked to stop and has not responded yet. Give it a moment — if it is still ` +
+          `here in ${seconds}s, press Stop again to remove the row (the work itself may carry on).`
+        );
+      }
+      return `"${op.label}" did not accept the request to stop. Press Stop again to remove the row.`;
+    }
+    return "This operation can no longer be cancelled (it may have just finished).";
   }
 
   /**
@@ -870,7 +911,13 @@ export class TaskOperationRegistry implements vscode.Disposable {
       cts.dispose();
     }
     op.state = "cancelled";
-    op.detail = "stopped — it was not responding";
+    // Honest wording: this removes the ROW. It cannot stop a provider that is
+    // still running, so nothing that reads this record may imply it did.
+    // `forcedEndV1` is what carries that distinction to the Notifications
+    // surface, which otherwise drops `detail` for a cancelled row and printed
+    // a bare "cancelled" — indistinguishable from work that really stopped.
+    op.forcedEndV1 = true;
+    op.detail = "the row was removed after Stop was ignored; the work may still be running underneath";
     op.finishedAt = Date.now();
     this._onDidEnd.fire(op);
     this.triggerChange(true);
@@ -887,6 +934,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const cts = this.tokenSources.get(op.id);
     if (cts && !cts.token.isCancellationRequested) {
       op.detail = "cancelling…";
+      op.cancelRequestedAt = Date.now();
       cts.cancel();
       requested = true;
     }
@@ -1102,6 +1150,15 @@ export class TaskOperationRegistry implements vscode.Disposable {
     this._onDidEnd.dispose();
   }
 }
+
+/**
+ * How long an operation may ignore a cancellation before a second Stop press
+ * may force its row out of the registry. Long enough that a provider winding
+ * down, or a round running its cleanup, is never mistaken for one that will
+ * never unwind; short enough to be an escape hatch rather than a wait
+ * (review, 2026-09-18).
+ */
+export const FORCE_END_AFTER_IGNORED_CANCEL_MS_V1 = 60 * 1000;
 
 /** Namespace for operations mirrored from another window (see `setMirroredOperations`). */
 export const MIRRORED_OPERATION_ID_PREFIX = "runner:";
