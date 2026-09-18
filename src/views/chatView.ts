@@ -3201,8 +3201,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
       }
       window.addEventListener('message', event=>{
-        const s=event.data;if(s.type==='restoreDraft'){i.value=i.value?i.value+'
-'+s.text:s.text;i.focus();return;}if(s.type!=='state')return;
+        const s=event.data;
+        // String.fromCharCode(10) rather than a backslash escape: this whole
+        // script is emitted from a TypeScript template literal, where such an
+        // escape becomes a REAL line break inside the single-quoted JS string
+        // it sits in. That is a syntax error, it stops the entire panel script
+        // parsing, and the panel then installs no listener at all: every
+        // conversation sits on the loading placeholder for ever, with nothing
+        // logged anywhere (2026-09-18). Escapes are banned in here for the
+        // same reason, comments included.
+        if(s.type==='restoreDraft'){i.value=i.value?i.value+String.fromCharCode(10)+s.text:s.text;i.focus();return;}
+        if(s.type!=='state')return;
         const nextKey=targetKey(s.target);
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();
