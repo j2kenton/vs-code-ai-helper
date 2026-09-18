@@ -18,6 +18,10 @@ import {
 } from "./services/hostDecisionMirrorV1";
 import { runUnattendedV1 } from "./state/unattendedExecutionV1";
 import {
+  describeAbandonedOperationV1,
+  findAbandonedOperationsV1,
+} from "./state/abandonedOperationReaperV1";
+import {
   notifyWorkflowDecisionsChangedV1,
   WORKFLOW_DECISIONS_STORAGE_KEY_V1,
   WorkflowDecisionStoreV1,
@@ -45,6 +49,7 @@ import {
   describeWorkAdmissionRefusalV1,
   revokeWorkAdmissionHandoffV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  workAdmissionRenewalAgeMsV1,
 } from "./state/workAdmissionV1";
 import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
 // Side-effect only: registers `effectivePauseStatusV1.ts`'s pause-revocation
@@ -1359,6 +1364,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return chatViewProvider.open(target);
     })
   );
+
+  // ── Rounds that stopped without saying so (abandonedOperationReaperV1.ts) ──
+  // A provider that exits without unwinding its round leaves an operation the
+  // whole UI keeps reporting as running — for seven hours, on 2026-09-17, with
+  // Stop unable to clear it. A viewer runs no work, so it reaps nothing; it
+  // sees the runner's own reaping through the operations mirror.
+  if (!viewerHost) {
+    const reapAbandonedOperations = (): void => {
+      for (const abandoned of findAbandonedOperationsV1(taskOperations.getAll(), (taskPath) =>
+        workAdmissionRenewalAgeMsV1(taskPath)
+      )) {
+        if (taskOperations.endAbandonedOperation(abandoned.id)) {
+          NotificationRouter.showWarning(describeAbandonedOperationV1(abandoned));
+        }
+      }
+    };
+    const reaperTimer = setInterval(reapAbandonedOperations, 2 * 60 * 1000);
+    context.subscriptions.push({ dispose: () => clearInterval(reaperTimer) });
+  }
 
   const progressBinder = new ViewProgressBinder(taskOperations);
   context.subscriptions.push(progressBinder);

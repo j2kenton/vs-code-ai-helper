@@ -41,6 +41,7 @@ import {
   PAUSE_COMMIT_LIKELY_STALE_MS_V1,
   WORK_ADMISSION_LIKELY_STALE_MS_V1,
   WORK_ADMISSION_TOMBSTONE_RETENTION_MS_V1,
+  workAdmissionRenewalAgeMsV1,
 } from "../state/workAdmissionV1";
 import {
   configureHostIdentityRootV1,
@@ -3622,4 +3623,45 @@ void test("garbageCollectStaleWorkAdmissionTombstonesV1: a real unlink failure o
   assert.equal(fs.existsSync(failPath), false, "a subsequent pass must retry and collect the previously-failed tombstone");
   assert.equal(fs.existsSync(okPath), false);
   assert.ok(retry.outcome === "collected" || retry.outcome === "nothingToCollect");
+});
+
+void test("heartbeat renews the marker's mtime, so \"unrenewed\" means unrenewed", async () => {
+  // Every staleness check in this module measures the marker's MTIME, but a
+  // heartbeat only renames it — and a rename leaves mtime untouched. So a
+  // faithfully-renewed marker still read as "unrenewed for ~20 minutes": a
+  // false stuck-owner alarm on every long run (seen live 2026-09-17 at 22:37
+  // while the run was healthy), which also made a genuine stall
+  // indistinguishable from work in progress.
+  const task = freshTaskFolder("heartbeat-renews-mtime");
+  const admitted = await acquireWorkAdmissionV1({
+    taskFolderPath: task,
+    purpose: "admission",
+    commandId: "test.heartbeatMtime",
+  });
+  assert.equal(admitted.outcome, "acquired");
+  if (admitted.outcome !== "acquired") return;
+  const dir = path.join(task, ADMISSION_DIRNAME_V1);
+  const markerPath = (): string => {
+    const name = fs.readdirSync(dir).find((n) => n.startsWith("admission.") && !n.endsWith(".claim"));
+    assert.ok(name, "a marker must exist while admission is held");
+    return path.join(dir, name);
+  };
+  try {
+    // Backdate it past the staleness bound, which is what a long round's
+    // genesis timestamp amounts to.
+    const old = new Date(Date.now() - (WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000));
+    fs.utimesSync(markerPath(), old, old);
+    assert.ok(
+      (workAdmissionRenewalAgeMsV1(task) ?? 0) > WORK_ADMISSION_LIKELY_STALE_MS_V1,
+      "precondition: it now reads as unrenewed"
+    );
+
+    await admitted.handle.heartbeat();
+
+    const age = workAdmissionRenewalAgeMsV1(task);
+    assert.ok(age !== undefined && age < 60_000, `a renewed marker must read as fresh, got ${String(age)}ms`);
+  } finally {
+    await admitted.handle.release();
+  }
+  assert.equal(workAdmissionRenewalAgeMsV1(task), undefined, "and no admission at all once released");
 });

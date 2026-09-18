@@ -762,6 +762,35 @@ function listMarkersSyncV1(dir: string): readonly { readonly filePath: string; r
 }
 
 /**
+ * How long since this task's work-admission was last renewed, in ms — or
+ * undefined when the task holds no admission at all.
+ *
+ * The renewal signal is the marker's mtime, which `heartbeat()` now touches on
+ * every rename (see that method). A running round renews every
+ * `WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1` (2 min), so an age far past that
+ * means the holder is gone or wedged: it is the one durable, cross-process
+ * signal that an operation the in-memory registry still advertises as running
+ * has in fact stopped (the 2026-09-17 overnight stall — a provider exited on a
+ * quota limit and nothing unwound the round). When several markers exist, the
+ * FRESHEST wins: any live holder means the task is genuinely held.
+ */
+export function workAdmissionRenewalAgeMsV1(taskFolderPath: string, now = Date.now()): number | undefined {
+  let youngest: number | undefined;
+  for (const marker of listMarkersSyncV1(admissionDirV1(taskFolderPath))) {
+    let age: number;
+    try {
+      age = now - fs.statSync(marker.filePath).mtimeMs;
+    } catch {
+      continue; // Vanished between listing and stat: not a held marker.
+    }
+    if (youngest === undefined || age < youngest) {
+      youngest = age;
+    }
+  }
+  return youngest;
+}
+
+/**
  * Generous upper bound for every string field on a claim/marker record. This
  * module's own writer ({@link acquireWorkAdmissionCoreV1}) only ever produces
  * short, fixed-shape values — a UUID `claimId`/`ownerToken` suffix, a
@@ -2296,6 +2325,17 @@ async function acquireWorkAdmissionCoreV1(
             throw injected;
           }
           await fs.promises.rename(currentPath, nextPath);
+          // A rename does not change a file's mtime, and EVERY staleness check
+          // in this module measures exactly that mtime
+          // (`WORK_ADMISSION_LIKELY_STALE_MS_V1` against `statSync(...).mtimeMs`).
+          // So a faithfully-renewed marker still looked "unrenewed for ~20
+          // minutes" to the takeover sweep — a false stuck-owner alarm on every
+          // legitimate long run (that is the "held by pid N, unrenewed" warning
+          // seen live 2026-09-17 at 22:37, while the run was healthy), and it
+          // made a genuine stall indistinguishable from work in progress.
+          // Touching the marker is what makes "unrenewed" mean unrenewed.
+          const renewedAt = new Date();
+          await fs.promises.utimes(nextPath, renewedAt, renewedAt);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             // Displaced: nothing in v1a removes another owner's marker, so

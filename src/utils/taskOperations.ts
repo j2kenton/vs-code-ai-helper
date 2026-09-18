@@ -445,6 +445,24 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return id.startsWith(MIRRORED_OPERATION_ID_PREFIX);
   }
 
+  /**
+   * End an operation whose work has stopped without unwinding, reporting it
+   * as cancelled (abandonedOperationReaperV1.ts decides which). Returns false
+   * when the id is unknown here, or is another window's mirrored entry.
+   */
+  endAbandonedOperation(id: string): boolean {
+    if (this.isMirroredOperation(id)) {
+      return false;
+    }
+    for (const keyMap of this.operations.values()) {
+      const op = keyMap.get(id);
+      if (op) {
+        return this.forceEndSubtreeV1(keyMap, op);
+      }
+    }
+    return false;
+  }
+
   /** This window's OWN operations for a task — never the runner's mirrored ones. */
   getLocalTaskOperations(taskPath: string): readonly TaskOperationSnapshot[] {
     const keyMap = this.operations.get(taskKey(taskPath));
@@ -810,11 +828,53 @@ export class TaskOperationRegistry implements vscode.Disposable {
       const op = keyMap.get(id);
       if (op) {
         const requested = this.cancelSubtree(keyMap, op);
-        if (requested) {this.triggerChange(true);}
-        return requested;
+        if (requested) {
+          this.triggerChange(true);
+          return true;
+        }
+        // Already cancelled and still here: its owner never observed the
+        // token, so asking again can achieve nothing. Seen live 2026-09-17: a
+        // Fast Forward whose provider exited on a quota limit left an
+        // operation nothing unwound, and Stop then answered "can no longer be
+        // cancelled (it may have just finished)" about a row the registry was
+        // still advertising as running — a dead end only a window reload
+        // cleared. The second press now FORCES the subtree out of the
+        // registry, which is the honest end state: the work is not running
+        // (nothing is listening to its token), so nothing should say it is.
+        return this.forceEndSubtreeV1(keyMap, op);
       }
     }
     return false;
+  }
+
+  /**
+   * Remove `op` and its descendants, reporting each as cancelled. Only for an
+   * operation whose cancellation was already requested and ignored — see
+   * `cancelOperation`. Fires `onDidEnd` exactly as a normal end does, so the
+   * Notifications surface records a terminal entry rather than a row that
+   * simply vanishes.
+   */
+  private forceEndSubtreeV1(keyMap: Map<string, MutableOperation>, op: MutableOperation): boolean {
+    for (const candidate of [...keyMap.values()]) {
+      if (candidate.parentId === op.id) {
+        this.forceEndSubtreeV1(keyMap, candidate);
+      }
+    }
+    keyMap.delete(op.id);
+    if (keyMap.size === 0) {
+      this.operations.delete(op.key);
+    }
+    const cts = this.tokenSources.get(op.id);
+    if (cts) {
+      this.tokenSources.delete(op.id);
+      cts.dispose();
+    }
+    op.state = "cancelled";
+    op.detail = "stopped — it was not responding";
+    op.finishedAt = Date.now();
+    this._onDidEnd.fire(op);
+    this.triggerChange(true);
+    return true;
   }
 
   private cancelSubtree(keyMap: Map<string, MutableOperation>, op: MutableOperation): boolean {
