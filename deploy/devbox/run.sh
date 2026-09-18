@@ -10,8 +10,12 @@
 # To restart ONE runner (seconds, nothing else touched) name its workspace —
 # with two runners the bare pattern kills both, including the one running
 # somebody else's task (verification review, 2026-09-18):
-#   ssh ensemble-devbox "pkill -f '[c]ode --wait.*/workspace/vs-code-ai-helper$'"
-# runner.sh brings a fresh window for that workspace straight back up.
+#   ssh ensemble-devbox "pkill -f '[c]ode --wait.*/workspace/vs-code-ai-helper'"
+# NOT anchored with `$`: VS Code's own main process carries the workspace in
+# the MIDDLE of its command line (`--waitMarkerFilePath <workspace> <marker>`),
+# so an anchored pattern matches only the wrapper processes and leaves the
+# window itself running. runner.sh brings a fresh window for that workspace
+# straight back up.
 # The home (logins, VS Code server, extensions) and the workspace are named
 # volumes: rebuilding or restarting the container keeps both.
 set -eu
@@ -92,11 +96,20 @@ fi
 sudo docker rm -f ensemble-devbox >/dev/null 2>&1 || true
 # SSH only on the host's loopback: reached through the host's own SSH
 # (ProxyJump), never exposed to the internet directly.
+#
+# --shm-size 2g: Docker's default /dev/shm is 64 MB, which two Electron
+# renderers and x11vnc's framebuffer exhaust. The renderers then die with
+# "renderer process gone (reason: crashed, code: 133)" and VS Code leaves each
+# window sitting on a "Reopen" dialog — every runner on the box went down that
+# way inside two minutes on 2026-09-18, after five hours of two runners
+# running happily, when a VNC viewer was attached. runner.sh additionally
+# passes --disable-dev-shm-usage, which is what protects a box whose container
+# predates this line.
 sudo docker run -d --name ensemble-devbox \
   --restart unless-stopped \
   --hostname ensemble-devbox \
   -p 127.0.0.1:2222:2222 \
-  --memory 12g --cpus 3 --pids-limit 4096 \
+  --memory 12g --cpus 3 --pids-limit 4096 --shm-size 2g \
   $sandbox_opts \
   "$@" \
   -v ensemble-devbox-home:/home/dev \

@@ -125,11 +125,57 @@ run_runner() {
       fi
     fi
     echo "$(date -u +%FT%TZ) starting runner $index VS Code on $workspace" >>"$log"
-    # --wait keeps this process in the foreground until the window closes.
+    # --disable-dev-shm-usage: Chromium puts its renderer's shared memory in
+    # /tmp instead of /dev/shm, which Docker fixes at 64 MB by default. On
+    # 2026-09-18 every runner window on the box died within two minutes of
+    # each other — "renderer process gone (reason: crashed, code: 133)" — and
+    # a 64 MB /dev/shm shared by two renderers and x11vnc's framebuffer is the
+    # documented cause of exactly that. run.sh also raises the limit; this
+    # flag is what protects a box that has not been recreated yet.
     # shellcheck disable=SC2086 # data_dir_args is deliberately word-split
-    dbus-run-session -- code --wait --no-sandbox --disable-gpu --password-store=basic \
-      $data_dir_args --new-window "$workspace" >>"$log" 2>&1
-    echo "$(date -u +%FT%TZ) runner $index VS Code exited ($?); restarting in 10s" >>"$log"
+    dbus-run-session -- code --wait --no-sandbox --disable-gpu --disable-dev-shm-usage \
+      --password-store=basic $data_dir_args --new-window "$workspace" >>"$log" 2>&1 &
+    code_pid=$!
+    # A CRASHED renderer is not an exit. VS Code keeps the window open on its
+    # own "The window terminated unexpectedly … Reopen" dialog, so `code
+    # --wait` never returns, the loop below never fires, and the runner is
+    # dead while still looking alive to everything — including this
+    # supervisor (seen live 2026-09-18: both runners sat on that dialog until
+    # someone happened to look at the screen).
+    #
+    # The extension publishes its operations mirror every 30 seconds, so a
+    # mirror that EXISTS and has stopped moving is that state. A window that
+    # never wrote one (no task root yet) is left alone.
+    mirror="$workspace/.ensemble/relay-v1/operations-v1.json"
+    while kill -0 "$code_pid" 2>/dev/null; do
+      sleep 60
+      kill -0 "$code_pid" 2>/dev/null || break
+      if [ -f "$mirror" ] && [ -z "$(find "$mirror" -maxdepth 0 -mmin -5 2>/dev/null)" ]; then
+        echo "$(date -u +%FT%TZ) runner $index stopped reporting for 5 min; restarting the window" >>"$log"
+        # BOTH: `$code_pid` is dbus-run-session, and VS Code's own main
+        # process is three levels below it (dbus-run-session → sh /usr/bin/code
+        # → cli.js → code), so signalling only the pid can leave the window
+        # itself running — which would then be a second runner on this
+        # workspace. The pattern matches this window's whole chain; the
+        # workspace path is what distinguishes it from the other runner's.
+        kill -TERM "$code_pid" 2>/dev/null || true
+        pkill -TERM -f "[c]ode --wait.*$workspace" 2>/dev/null || true
+        waited=0
+        while pgrep -f "[c]ode --wait.*$workspace" >/dev/null 2>&1 && [ "$waited" -lt 10 ]; do
+          waited=$((waited + 1))
+          sleep 1
+        done
+        kill -KILL "$code_pid" 2>/dev/null || true
+        pkill -KILL -f "[c]ode --wait.*$workspace" 2>/dev/null || true
+        break
+      fi
+    done
+    wait "$code_pid"
+    # Captured IMMEDIATELY: `$(date …)` inside the message would reset `$?`
+    # first, which is why every one of these lines has always read "(0)"
+    # whatever happened to the window.
+    rc=$?
+    echo "$(date -u +%FT%TZ) runner $index VS Code exited ($rc); restarting in 10s" >>"$log"
     sleep 10
   done
 }
