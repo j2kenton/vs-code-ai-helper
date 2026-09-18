@@ -135,6 +135,27 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     assert.match(html, /className\s*=\s*x\.role\s*===\s*'user'\s*\?\s*'msg-user'\s*:\s*'msg-agent'/);
   });
 
+  void it("gives consecutive messages a clearly larger gap than the spacing within a single message", () => {
+    const html = chatWebviewHtml();
+
+    // Each message block (bubble + Copy/time row) must be separated from the
+    // next by the larger --ensemble-space-4 token, not the tighter
+    // --ensemble-space-2 used for spacing within a single message.
+    const msgRowRule = /\.msg-row\s*\{([^}]*)\}/.exec(html);
+    assert.ok(msgRowRule, "expected a .msg-row CSS rule");
+    assert.match(msgRowRule[1]!, /margin:\s*0\s+0\s+var\(--ensemble-space-4\)/);
+
+    // The Copy/time row's own spacing from its message bubble must stay
+    // untouched by this change.
+    const msgMetaRule = /\.msg-meta\s*\{([^}]*)\}/.exec(html);
+    assert.ok(msgMetaRule, "expected a .msg-meta CSS rule");
+    assert.match(msgMetaRule[1]!, /margin-top:\s*2px/);
+
+    // Pin the token itself so the rule above can't silently start
+    // referencing a --ensemble-space-4 that no longer means 16px.
+    assert.match(html, /--ensemble-space-4:\s*16px/);
+  });
+
   void it("renders the stage-chat header with the task name in quotes", () => {
     // The header label is composed host-side in render(); the source-wiring
     // assertion pins that it goes through the shared quoted-name formatter
