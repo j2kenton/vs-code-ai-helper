@@ -7,9 +7,11 @@
 # through — the round's work-admission claim is then left behind, so the task
 # refuses new actions until that claim ages out (~20 min). Run it only when
 # nothing is running, and only when the image itself needs rebuilding.
-# To restart just the runner (seconds, nothing else touched):
-#   ssh ensemble-devbox "pkill -f '/usr/share/code/[c]ode --wait'"
-# runner.sh brings a fresh window straight back up.
+# To restart ONE runner (seconds, nothing else touched) name its workspace —
+# with two runners the bare pattern kills both, including the one running
+# somebody else's task (verification review, 2026-09-18):
+#   ssh ensemble-devbox "pkill -f '[c]ode --wait.*/workspace/vs-code-ai-helper$'"
+# runner.sh brings a fresh window for that workspace straight back up.
 # The home (logins, VS Code server, extensions) and the workspace are named
 # volumes: rebuilding or restarting the container keeps both.
 set -eu
@@ -48,11 +50,43 @@ if [ "${DEVBOX_CODEX_SANDBOX:-1}" = "1" ]; then
   fi
   if [ -n "$seccomp_base" ] && node seccomp-allow-userns.mjs "$seccomp_base" /tmp/devbox-seccomp.json; then
     sandbox_opts="$sandbox_opts --security-opt seccomp=/tmp/devbox-seccomp.json"
-  else
-    echo "WARNING: could not build the narrowed seccomp profile; falling back to seccomp=unconfined." >&2
-    echo "         (Set DEVBOX_SECCOMP_BASE=<path to moby's default.json> to avoid this.)" >&2
+  elif [ "${DEVBOX_SECCOMP_UNCONFINED:-0}" = "1" ]; then
+    echo "WARNING: DEVBOX_SECCOMP_UNCONFINED=1 — running with seccomp=unconfined." >&2
+    echo "         Every syscall filter is off, not only the namespace ones." >&2
     sandbox_opts="$sandbox_opts --security-opt seccomp=unconfined"
+  else
+    # FAILS CLOSED. A download that returned an error page, a truncated file
+    # or a profile from another Docker version used to end up as
+    # seccomp=unconfined — silently throwing away ~350 syscall rules to gain
+    # the one thing we wanted (user namespaces). The box then still works;
+    # only Codex's own sandboxed reviews on it do not (verification review,
+    # 2026-09-18).
+    # STOPS HERE, before `docker rm -f` below: continuing would destroy a
+    # working box and replace it with one whose Codex reviews verify nothing,
+    # and still exit 0 (verification review, 2026-09-18).
+    echo "ERROR: could not build the narrowed seccomp profile. Nothing has been changed." >&2
+    echo "       Set DEVBOX_SECCOMP_BASE=<path to moby's seccomp/default.json> to fix it," >&2
+    echo "       DEVBOX_CODEX_SANDBOX=0 to deploy without the relaxation (Codex reviews on" >&2
+    echo "       the box then cannot run commands), or DEVBOX_SECCOMP_UNCONFINED=1 to accept" >&2
+    echo "       an unconfined container." >&2
+    exit 1
   fi
+fi
+
+# One runner VS Code per workspace, for parallel tasks (runner.sh). Passed
+# into the container so the list is not lost on a restart:
+#   ENSEMBLE_RUNNER_WORKSPACES=/workspace/vs-code-ai-helper:/workspace/wt-b sh run.sh
+# Unset, runner.sh falls back to ~/.devbox-runner-workspaces on the home
+# volume (which survives even a recreate) and then to the single original
+# workspace.
+# Held in the POSITIONAL PARAMETERS, not a string: a workspace path with a
+# space in it would be word-split into two docker arguments, and the run would
+# fail AFTER the old container had already been removed below (verification
+# review, 2026-09-18).
+if [ -n "${ENSEMBLE_RUNNER_WORKSPACES:-}" ]; then
+  set -- --env "ENSEMBLE_RUNNER_WORKSPACES=$ENSEMBLE_RUNNER_WORKSPACES"
+else
+  set --
 fi
 
 sudo docker rm -f ensemble-devbox >/dev/null 2>&1 || true
@@ -64,6 +98,7 @@ sudo docker run -d --name ensemble-devbox \
   -p 127.0.0.1:2222:2222 \
   --memory 12g --cpus 3 --pids-limit 4096 \
   $sandbox_opts \
+  "$@" \
   -v ensemble-devbox-home:/home/dev \
   -v ensemble-devbox-workspace:/workspace \
   -v "$keys_dir:/run/devbox-keys:ro" \
