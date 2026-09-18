@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { TaskProgress } from "../types/taskProgress";
+import { MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskProgress } from "../types/taskProgress";
 import {
   beginImplementationRecoveryV1,
   claimImplRecoveryDispatchV1,
@@ -65,7 +65,11 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
   return { restore: (): void => { ws.workspaceFolders = orig; } };
 }
 
-function makeTaskFolder(name: string, roundLedger: TaskProgress["roundLedger"]): { folderPath: string; folderUri: vscode.Uri } {
+function makeTaskFolder(
+  name: string,
+  roundLedger: TaskProgress["roundLedger"],
+  extra?: Partial<TaskProgress>
+): { folderPath: string; folderUri: vscode.Uri } {
   const folderPath = path.join(REAL_ROOT, "plans", name);
   fs.mkdirSync(folderPath, { recursive: true });
   const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
@@ -82,6 +86,7 @@ function makeTaskFolder(name: string, roundLedger: TaskProgress["roundLedger"]):
       boundAt: "2026-01-01T00:00:00.000Z",
     },
     roundLedger,
+    ...extra,
   };
   fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
   return { folderPath, folderUri: vscode.Uri.file(folderPath) };
@@ -120,6 +125,60 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
       const outcomeMessages = messages.filter((m) => m.kind === "outcome" && m.roundId === begun.sourceAttemptId);
       assert.equal(outcomeMessages.length, 1);
       assert.match(outcomeMessages[0]?.text ?? "", /rejected/);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("v1 fixes 2, Wave I chokepoint: a leased (not cap-reached) recovery records nextActor as automation", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("recovery_leased_next_actor", undefined, {
+        incompleteRoundContinuations: 0,
+      });
+
+      await beginImplementationRecoveryV1(folderUri, {
+        trigger: "summaryRejected",
+        reason: "the provider did not return a usable summary",
+        terminatedExternally: false,
+        filesChanged: ["src/a.ts"],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+      });
+
+      const raw = readProgress(folderPath);
+      assert.equal(raw.implRecovery?.dispatch, "pending");
+      assert.ok(raw.implRecovery?.leaseOwner, "a leased recovery must carry a leaseOwner");
+      assert.equal(raw.nextActor, "automation");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("v1 fixes 2, Wave I chokepoint: a cap-reached (unleased) recovery records nextActor as human", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("recovery_capreached_next_actor", undefined, {
+        incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 - 1,
+      });
+
+      await beginImplementationRecoveryV1(folderUri, {
+        trigger: "summaryRejected",
+        reason: "the provider did not return a usable summary",
+        terminatedExternally: false,
+        filesChanged: ["src/a.ts"],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+      });
+
+      const raw = readProgress(folderPath);
+      assert.equal(raw.implRecovery?.dispatch, "pending");
+      assert.equal(raw.implRecovery?.leaseOwner, undefined, "a cap-reached recovery must carry no lease");
+      assert.equal(raw.nextActor, "human");
     } finally {
       wsStub.restore();
       fsBridge.restore();

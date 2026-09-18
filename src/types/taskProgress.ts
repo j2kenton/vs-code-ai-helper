@@ -652,11 +652,16 @@ export interface TaskProgress {
    * arrange a stage dispatch, arm a schedule, owe/clear a recovery, or
    * transition a stage — see
    * `docs/verification/v1-fixes-2-wave1-inventory.md` for the enumerated
-   * list. Absent means unknown; every consumer (the stall watchdog first
-   * among them) must treat unknown exactly like `"automation"` for gating
-   * purposes — assuming a human is waiting when the value has simply never
-   * been set would silently stand down the stall protection this field
-   * exists to sharpen, not weaken.
+   * list. Absent means unknown; read it only through
+   * `effectiveNextActorV1` (`taskWatchdogV1.ts`), which preserves the
+   * distinction rather than collapsing it. A consumer may use an EXPLICIT
+   * `"human"` to add a new exemption (never pause/gate); it must never treat
+   * `"unknown"` as equivalent to a confirmed `"human"` for that purpose
+   * (assuming a human is waiting when the value has simply never been set
+   * would silently stand down the stall protection this field exists to
+   * sharpen, not weaken), and must never treat `"unknown"` as sufficient on
+   * its own to add a NEW restrictive consequence that only a confirmed
+   * `"automation"` should justify.
    */
   nextActor?: "human" | "automation";
 

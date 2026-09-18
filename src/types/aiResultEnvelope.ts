@@ -127,6 +127,21 @@ export interface PreflightPlanCompletedV1 {
   readonly requestDigest: string;
   readonly rootBindingId: string;
   readonly operations: readonly PreflightOperationV1[];
+  /**
+   * Optional prose: why this slice, what the round could not reach, or why an
+   * empty plan is honest. Carries no authority — nothing downstream reads it
+   * to decide anything; it is recorded for the operator.
+   *
+   * Accepted because the preamble ASKS for it ("say so in the plan's
+   * reasoning", `toolSessionPreambleV1.ts`) while the decoder rejected every
+   * field it did not name. On 2026-09-18 (v1 fixes 2, run 2061) Copilot read
+   * for 61 tool rounds, returned a valid `patchFile` plan with one extra
+   * `reasoning` string, and the whole round was thrown away over that one
+   * key — the model did exactly what it was told. Truncated, never rejected,
+   * when it runs long: losing a round's work to prose length would repeat the
+   * same mistake in a smaller way.
+   */
+  readonly reasoning?: string;
 }
 
 export interface EditExecutionCompletedV1 {
@@ -215,6 +230,23 @@ const MAX_JSON_VALUES_V1 = 100_000;
 const MAX_CONTAINER_MEMBERS_V1 = 4_096;
 
 const MAX_PREFLIGHT_OPERATIONS_V1 = 128;
+/** See `PreflightPlanCompletedV1.reasoning` — prose is truncated here, never rejected. */
+const MAX_PREFLIGHT_REASONING_CHARS_V1 = 4000;
+
+/**
+ * Cut `text` to at most `maxLength` UTF-16 code units without leaving a lone
+ * high surrogate at the end: `"x".repeat(3999) + "😀"` is 4001 units long, and
+ * a plain `slice` would keep half of that emoji, which encodes to U+FFFD
+ * (2026-09-18 adversarial review). One character short is the right price.
+ */
+function truncateWithoutSplittingSurrogatePairV1(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  const cut = text.slice(0, maxLength);
+  const lastUnit = cut.charCodeAt(cut.length - 1);
+  return lastUnit >= 0xd800 && lastUnit <= 0xdbff ? cut.slice(0, -1) : cut;
+}
 const MAX_PREFLIGHT_FILE_BYTES_V1 = 2 * 1024 * 1024;
 const MAX_PREFLIGHT_AGGREGATE_WRITE_BYTES_V1 = 8 * 1024 * 1024;
 const PREFLIGHT_OP_KINDS_V1 = new Set<string>([
@@ -1013,9 +1045,27 @@ function decodePreflightPlan(raw: Record<string, unknown>): ContentDecodeResult 
     }
   }
 
+  // See `PreflightPlanCompletedV1.reasoning`: informational only, and
+  // truncated rather than rejected — a plan is not worth discarding over the
+  // length of its own explanation.
+  if (raw.reasoning !== undefined && typeof raw.reasoning !== "string") {
+    return { ok: false, reason: "preflight-plan.v1 has a non-string \"reasoning\"" };
+  }
+  const reasoning =
+    typeof raw.reasoning === "string" && raw.reasoning.length > 0
+      ? truncateWithoutSplittingSurrogatePairV1(raw.reasoning, MAX_PREFLIGHT_REASONING_CHARS_V1)
+      : undefined;
+
   const unknownField = rejectUnknownFields(
     raw,
-    new Set(["schemaVersion", "contentType", "requestDigest", "rootBindingId", "operations"]),
+    new Set([
+      "schemaVersion",
+      "contentType",
+      "requestDigest",
+      "rootBindingId",
+      "operations",
+      "reasoning",
+    ]),
     "preflight-plan.v1"
   );
   if (unknownField) {
@@ -1030,6 +1080,7 @@ function decodePreflightPlan(raw: Record<string, unknown>): ContentDecodeResult 
       requestDigest: raw.requestDigest,
       rootBindingId: raw.rootBindingId,
       operations,
+      ...(reasoning !== undefined ? { reasoning } : {}),
     },
   };
 }
@@ -1442,6 +1493,54 @@ export function shouldNudgeForMissingResultFrameV1(options: {
     return false;
   }
   return !containsResultFrameV1(options.responseText);
+}
+
+/**
+ * What the model is told when it answers with an empty plan having opened
+ * nothing. Deliberately not phrased as a refusal of a wrong answer: "nothing
+ * to do" may well be right, and the round is allowed to say so again — but it
+ * has to say so from having looked.
+ */
+export const EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1 =
+  "Your plan is empty and this session has not opened a single file. Every operation " +
+  "needs a `targetObservationId` from an exact-path `ensemble_readFile`, `ensemble_stat` " +
+  "or `ensemble_readDirectory` in THIS session, so a plan written before reading anything " +
+  "could not have contained a valid operation. You have replies left — do not spend them " +
+  "searching. Open the file you would change (use `startLine`/`endLine` if it is large), " +
+  "then return a plan that patches it. If, having read it, you still conclude there is " +
+  "genuinely nothing to build, return the empty plan again and say why in `reasoning`.";
+
+/**
+ * Whether a tool-free response is an empty preflight plan produced without a
+ * single exact-path read.
+ *
+ * Observed 2026-09-18 (v1 fixes 2, run 2066): the model answered on its FIRST
+ * reply, called no tool at all, and returned `operations: []` — its own
+ * `reasoning` said it "was unable to obtain any exact-path file observations
+ * before the response needed to be finalized", with 63 replies still unused.
+ * An empty plan from a session that never looked is not a finding about the
+ * code; it is a round that gave up, and the host can tell the two apart
+ * without guessing because the observation ledger is empty either way.
+ */
+export function isUninformedEmptyPreflightPlanV1(options: {
+  readonly responseText: string;
+  readonly exactPathObservations: number;
+  readonly nudgesUsed: number;
+  readonly maxNudges: number;
+  readonly attemptsRemaining: boolean;
+}): boolean {
+  if (options.exactPathObservations > 0) {
+    return false;
+  }
+  if (options.nudgesUsed >= options.maxNudges || !options.attemptsRemaining) {
+    return false;
+  }
+  const parsed = parseAiResultEnvelopeV1(options.responseText);
+  return (
+    parsed.kind === "completed" &&
+    parsed.content.contentType === "preflight-plan.v1" &&
+    parsed.content.operations.length === 0
+  );
 }
 
 /**

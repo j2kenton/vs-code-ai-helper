@@ -131,26 +131,87 @@ afterEach(() => {
 });
 
 void describe("describeUnusableReviewBlockV1", () => {
-  void it("names the rejected-round cause when impl-summary.md is still the shape-gate stamp", async () => {
-    const stamped = buildUnusableImplementationSummaryV1(
-      "the final response is missing Verification",
-      "run-log-2026-08-13.md"
-    );
-    const mem = installMemStore(
-      seed({ [getImplementationSummaryUri(FOLDER).toString()]: stamped })
-    );
-    activeStore = mem;
+  void it(
+    "names the rejected-round cause and offers no restore action when there is no usable _prev backup",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const mem = installMemStore(
+        seed({ [getImplementationSummaryUri(FOLDER).toString()]: stamped })
+      );
+      activeStore = mem;
 
-    const message = await describeUnusableReviewBlockV1(FOLDER);
+      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
 
-    assert.match(message, /prior implementation round was rejected/);
-    assert.match(message, /Rerun the implementation/);
-    assert.match(message, /Apply Review Changes/);
-    // Must NOT suggest the dead-end recovery: re-running the review or
-    // hand-editing a Readiness line cannot work while the summary is stamped.
-    assert.doesNotMatch(message, /Readiness: N\/10/);
-    assert.doesNotMatch(message, /run the review again/i);
-  });
+      assert.match(warning, /prior implementation round was rejected/);
+      assert.match(warning, /Rerun the implementation/);
+      assert.match(warning, /Apply Review Changes/);
+      // Must NOT suggest the dead-end recovery: re-running the review or
+      // hand-editing a Readiness line cannot work while the summary is stamped.
+      assert.doesNotMatch(warning, /Readiness: N\/10/);
+      assert.doesNotMatch(warning, /run the review again/i);
+      assert.equal(canRestorePreviousImplSummary, false);
+    }
+  );
+
+  void it(
+    "reports canRestorePreviousImplSummary and wording for 'Restore the last usable summary' when " +
+      "impl-summary_prev.md is usable (v1 fixes 2, item 1 — Fast Forward is the third unusable-summary " +
+      "refusal surface, alongside runReviewForFolder and buildReviewResumeVariablesV1, that must offer the " +
+      "restore action; the caller — fastForwardReviewWithAI — builds the literal actionCommand from this " +
+      "flag so the workflow-safety toast-allowlist verifier's static scan can see the dispatched command " +
+      "directly in the NotificationRouter.showWarning call, not behind an opaque variable)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const summaryUri = getImplementationSummaryUri(FOLDER);
+      const mem = installMemStore(
+        seed({
+          [summaryUri.toString()]: stamped,
+          [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+        })
+      );
+      activeStore = mem;
+
+      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
+
+      assert.match(warning, /Restore the last usable summary/);
+      assert.doesNotMatch(warning, /^Rerun the implementation/m);
+      assert.equal(canRestorePreviousImplSummary, true);
+    }
+  );
+
+  void it(
+    "reports canRestorePreviousImplSummary: false when no targetStage is supplied, even with a usable _prev " +
+      "backup — the caller has nothing to route a restore's rerun back to",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const summaryUri = getImplementationSummaryUri(FOLDER);
+      const mem = installMemStore(
+        seed({
+          [summaryUri.toString()]: stamped,
+          [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+        })
+      );
+      activeStore = mem;
+
+      const { canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(FOLDER);
+      assert.equal(canRestorePreviousImplSummary, false);
+    }
+  );
 
   void it("falls back to the generic message when there is no rejection stamp", async () => {
     const mem = installMemStore(
@@ -158,16 +219,24 @@ void describe("describeUnusableReviewBlockV1", () => {
     );
     activeStore = mem;
 
-    const message = await describeUnusableReviewBlockV1(FOLDER);
-    assert.match(message, /Try running Review manually/);
+    const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+      FOLDER,
+      "impl-low-review"
+    );
+    assert.match(warning, /Try running Review manually/);
+    assert.equal(canRestorePreviousImplSummary, false);
   });
 
   void it("falls back to the generic message when impl-summary.md does not exist yet", async () => {
     const mem = installMemStore();
     activeStore = mem;
 
-    const message = await describeUnusableReviewBlockV1(FOLDER);
-    assert.match(message, /Try running Review manually/);
+    const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+      FOLDER,
+      "impl-low-review"
+    );
+    assert.match(warning, /Try running Review manually/);
+    assert.equal(canRestorePreviousImplSummary, false);
   });
 });
 

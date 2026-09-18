@@ -27,7 +27,7 @@ import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
-import { pauseTaskWithReasonForClaimV1 } from "../utils/taskProgressTransforms";
+import { pauseTaskWithReasonForClaimV1, setNextActorV1 } from "../utils/taskProgressTransforms";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
@@ -700,7 +700,23 @@ export class TaskActionScheduler implements vscode.Disposable {
       // would just re-review an already-usable summary. Independent of
       // `effectivelyActive` below: a satisfied recovery should retire
       // whether or not the task currently reads as active.
-      if (await retireSatisfiedSummaryRejectedRecoveryV1(vscode.Uri.file(task.taskFolderPath))) {
+      // v1 fixes 2, Wave I chokepoint (clears a recovery, this call site
+      // only): per retireSatisfiedSummaryRejectedRecoveryV1's own doc
+      // comment, THIS sweep call site `continue`s immediately — nothing
+      // further is arranged for this task in this pass — so "human" is the
+      // plain fact of what happens next here, unlike the advancement-gate
+      // call site (reviewActions.ts), which may itself fall straight into a
+      // stage transition that dispatches a review and must not be guessed at
+      // from this function. 2026-09-17 review fix: folded into the SAME
+      // atomic CAS write the retirement itself performs (via
+      // `options.nextActorOnRetire`) instead of a second, separately-locked
+      // patch — the prior two-write shape left a window where a concurrent,
+      // newer-and-correct write (e.g. a dispatch starting between the two
+      // patches) could be clobbered by this stale "human" guess.
+      if (await retireSatisfiedSummaryRejectedRecoveryV1(
+        vscode.Uri.file(task.taskFolderPath),
+        { nextActorOnRetire: "human" }
+      )) {
         continue;
       }
       // Part 1b step 13 ("automation gates"): this sweep automatically
@@ -1285,7 +1301,12 @@ export async function scheduleTaskResume(
     if (value) NotificationRouter.showWarning("Enter a future date/time.");
     return;
   }
-  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => ({ ...p, scheduledRun: { runAt: runAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }));
+  // v1 fixes 2, Wave I chokepoint (arms a schedule): arming a scheduled run
+  // means automation, not the human, acts next — see `nextActor`'s own doc
+  // comment (`effectiveNextActorV1`). Composed via `setNextActorV1` on the
+  // SAME progress object the schedule write already produces, rather than a
+  // follow-up patch, so no reader ever observes the schedule armed without it.
+  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => setNextActorV1({ ...p, scheduledRun: { runAt: runAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }, "automation"));
   await scheduler.arm(task.taskFolderPath, task.canonicalId);
   NotificationRouter.showInformation(`Current-stage action scheduled for ${runAt.toLocaleString()}.`);
 }
@@ -1355,7 +1376,10 @@ export async function scheduleQuotaResumeAtV1(
   // provider's block may already have lifted, so an immediate rerun is
   // exactly the right remedy.
   const effectiveRunAt = runAt.getTime() <= clock.now() ? new Date(clock.now() + QUOTA_RESUME_SCHEDULE_BUFFER_MS) : runAt;
-  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => ({ ...p, scheduledRun: { runAt: effectiveRunAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }));
+  // v1 fixes 2, Wave I chokepoint (arms a schedule) — same reasoning as
+  // scheduleTaskResume above: arming a quota-park rerun means automation
+  // acts next.
+  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => setNextActorV1({ ...p, scheduledRun: { runAt: effectiveRunAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }, "automation"));
   await scheduler.arm(task.taskFolderPath, task.canonicalId);
   NotificationRouter.showInformation(`Rerun scheduled for ${effectiveRunAt.toLocaleString()}, once the quota resets.`);
 }

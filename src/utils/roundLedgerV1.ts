@@ -1076,6 +1076,26 @@ export interface AttachCoordinatorIdentityToRoundOptionsV1 {
   readonly roundId: string;
   readonly operationId: string;
   readonly attemptId: string;
+  /**
+   * Adopt the row when it already carries a DIFFERENT `operationId`, instead
+   * of failing `wrongOwner`.
+   *
+   * Set only by a caller that owns this round for the whole dispatch and
+   * holds its round lease (`runTwoPhaseEditActionV1` via
+   * `executeImplementationRun`'s `withRoundLeaseV1`), because that caller can
+   * legitimately make several operations for one round: a malformed result
+   * makes `withMalformedResultRetryV1`
+   * (`productionTaskActionRuntimeV1.ts`) call `executeAction` again, and a
+   * fresh `executeAction` allocates a fresh `operationId`.
+   *
+   * Without this the retry could never run. On 2026-09-18 (v1 fixes 2, run
+   * 2061) a Copilot round read for 61 tool rounds, had its plan rejected over
+   * one unknown field, and the retry died here — the user saw "round ledger
+   * row … belongs to another operation", which describes the bookkeeping and
+   * not one word of what happened. Every other caller (review rounds, which
+   * claim a fresh `reviewAttemptId` per round) still fails closed.
+   */
+  readonly allowOperationTakeover?: boolean;
 }
 
 /**
@@ -1210,7 +1230,11 @@ export async function attachCoordinatorIdentityToRoundV1(
           `round ledger row ${options.roundId} is not live`
         );
       }
-      if (row.operationId !== undefined && row.operationId !== options.operationId) {
+      if (
+        row.operationId !== undefined &&
+        row.operationId !== options.operationId &&
+        options.allowOperationTakeover !== true
+      ) {
         throw new AttachCoordinatorIdentityErrorV1(
           "wrongOwner",
           `round ledger row ${options.roundId} belongs to another operation`

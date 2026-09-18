@@ -17,8 +17,15 @@ import {
   ReadToolCallEventV1,
   setReadToolCallObserverV1,
 } from "../services/readToolSessionHandlerV1";
-import { createObservationLedgerV1 } from "../types/preflightPlanV1";
-import { ReadToolResultV1 } from "../types/workflowToolProtocolV1";
+import { createHash } from "node:crypto";
+import {
+  createObservationLedgerV1,
+  validatePreflightPlanAgainstLedgerV1,
+} from "../types/preflightPlanV1";
+import {
+  MAX_CONSECUTIVE_DISCOVERY_CALLS_V1,
+  ReadToolResultV1,
+} from "../types/workflowToolProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 
 const ROOT_ID = "workspace:test";
@@ -442,6 +449,184 @@ void describe("editReadToolContractV1 — read session", () => {
       assert.deepEqual(events, [{ tool: "ensemble_readFile", relativePath: "src/app.ts", startLine: 1, endLine: 2 }]);
     } finally {
       setReadToolCallObserverV1(undefined);
+      h.cleanup();
+    }
+  });
+});
+
+// 2026-09-18: four Copilot rounds on one task spent their reply budget
+// searching (76 searches to 11 reads in one, 20 to 2 in another) and each ended
+// with an empty plan. Two rounds of asking the model to search less in the
+// preamble changed nothing, so the tool stops answering instead.
+void describe("editReadToolContractV1 — discovery budget", () => {
+  void it("refuses a run of searches with no exact-path read, and an exact-path read clears it", async () => {
+    const h = installHarness();
+    try {
+      for (let i = 0; i < MAX_CONSECUTIVE_DISCOVERY_CALLS_V1; i++) {
+        const allowed = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+        assert.equal(allowed.ok, true, `search ${i + 1} must still be answered`);
+      }
+
+      const refused = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+      assert.equal(refused.ok, false);
+      if (!refused.ok) {
+        assert.equal(refused.code, "discoveryBudgetExceeded");
+        // The refusal has to leave somewhere to go: the paths already in hand,
+        // and the one call that lifts it.
+        assert.match(refused.reason, /src\/app\.ts/);
+        assert.match(refused.reason, /startLine\/endLine/);
+        assert.match(refused.reason, /ensemble_readFile/);
+      }
+      // findFiles is gated by the same counter, not its own.
+      const refusedFind = await h.call("ensemble_findFiles", { rootId: ROOT_ID, pathContains: "app" });
+      assert.equal(refusedFind.ok, false);
+      if (!refusedFind.ok) {
+        assert.equal(refusedFind.code, "discoveryBudgetExceeded");
+      }
+
+      // A refused call is not a protocol violation — the call was well-formed.
+      assert.equal(h.handler.violationCount?.() ?? 0, 0);
+
+      const read = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/app.ts" });
+      assert.equal(read.ok, true);
+
+      const afterRead = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+      assert.equal(afterRead.ok, true, "reading any exact path clears the gate");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("a rejected read does not clear the gate, but an observed missing path does", async () => {
+    const h = installHarness();
+    try {
+      for (let i = 0; i < MAX_CONSECUTIVE_DISCOVERY_CALLS_V1; i++) {
+        await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+      }
+      // Rejected input mints no observation, so it is not the read the gate wants.
+      const bad = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "../escape.ts" });
+      assert.equal(bad.ok, false);
+
+      const stillRefused = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+      assert.equal(stillRefused.ok, false);
+      if (!stillRefused.ok) {
+        assert.equal(stillRefused.code, "discoveryBudgetExceeded");
+      }
+
+      // A stat of a path that does not exist still mints an observation, and is
+      // the legitimate way to prepare a createFile — so it DOES clear the gate.
+      const statMissing = await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "src/new.ts" });
+      assert.equal(statMissing.ok, true);
+      const allowedAgain = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "marker" });
+      assert.equal(allowedAgain.ok, true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// Runs 2067 and 2068 (2026-09-18) each produced a correct plan to add a new
+// test file and each was refused for not having observed `src`, in a repository
+// that has one. The model statted the new FILE — which is how a create is
+// authorized — but not the directories above it. The host can see them, and the
+// broker re-verifies every ancestor at execution anyway, so it resolves them
+// here instead of spending rounds asking.
+void describe("editReadToolContractV1 — ancestors of a path being created", () => {
+  void it("statting a missing path also observes its existing ancestor directories", async () => {
+    const h = installHarness();
+    try {
+      fs.mkdirSync(path.join(h.root, "src", "test"), { recursive: true });
+
+      const stat = await h.call("ensemble_stat", {
+        rootId: ROOT_ID,
+        relativePath: "src/test/new.test.ts",
+      });
+      assert.equal(stat.ok, true);
+      if (stat.ok) {
+        assert.equal(stat.kind, "missing", "the model still gets the missing observation it asked for");
+      }
+
+      const records = h.ledger.records();
+      for (const ancestor of ["src", "src/test"]) {
+        const observed = records.find(
+          (record) => record.relativePath === ancestor && record.kind === "directory"
+        );
+        assert.ok(observed, `${ancestor} must be observed as a directory`);
+        assert.equal(observed?.source, "stat");
+        // Existence only: never mistakable for the complete listing an
+        // emptiness proof requires.
+        assert.equal(observed?.revision, "dir:unverified");
+      }
+
+      // The whole point: a createFile with an empty parentChain now validates.
+      const missingRecord = records.find((r) => r.relativePath === "src/test/new.test.ts");
+      assert.ok(missingRecord);
+      const validation = validatePreflightPlanAgainstLedgerV1(
+        {
+          contentType: "preflight-plan.v1",
+          schemaVersion: 1,
+          requestDigest: "d",
+          rootBindingId: "b",
+          operations: [
+            {
+              stepId: "step-1",
+              kind: "createFile",
+              rootId: ROOT_ID,
+              relativePath: "src/test/new.test.ts",
+              targetObservationId: missingRecord.observationId,
+              parentChain: [],
+              contentBase64: Buffer.from("test", "utf8").toString("base64"),
+              decodedByteLength: 4,
+              contentSha256: createHash("sha256").update(Buffer.from("test", "utf8")).digest("hex"),
+            },
+          ],
+        },
+        h.ledger,
+        ROOT_ID
+      );
+      assert.deepEqual(validation, { ok: true });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("stops at an ancestor that does not exist, leaving the plan validator to explain", async () => {
+    const h = installHarness();
+    try {
+      const stat = await h.call("ensemble_stat", {
+        rootId: ROOT_ID,
+        relativePath: "brand/new/tree/file.ts",
+      });
+      assert.equal(stat.ok, true);
+
+      const records = h.ledger.records();
+      assert.equal(
+        records.some((r) => r.relativePath === "brand" && r.kind === "directory"),
+        false,
+        "a directory that does not exist is not invented"
+      );
+      // And nothing below it was attempted either.
+      assert.equal(
+        records.some((r) => r.relativePath === "brand/new" && r.kind === "directory"),
+        false
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  void it("does not re-stat an ancestor the session already observed", async () => {
+    const h = installHarness();
+    try {
+      fs.mkdirSync(path.join(h.root, "src", "test"), { recursive: true });
+      await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "src/test/one.test.ts" });
+      await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "src/test/two.test.ts" });
+
+      const srcRecords = h.ledger
+        .records()
+        .filter((r) => r.relativePath === "src" && r.kind === "directory");
+      assert.equal(srcRecords.length, 1, "one observation per ancestor per session");
+    } finally {
       h.cleanup();
     }
   });

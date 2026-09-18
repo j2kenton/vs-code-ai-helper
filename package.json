@@ -1396,7 +1396,8 @@
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "test:unit": "node -e \"require('fs').rmSync('out/test',{recursive:true,force:true})\" && tsc --project tsconfig.test.json && node test-stubs/run-unit-tests.js",
-    "test:targeted:tmp": "node --require ./test-stubs/register.js --test-timeout=20000 --test out/test/startNewTaskLifecycle.test.js",
+    "test:targeted:tmp": "node --require ./test-stubs/register.js --test-timeout=20000 --test out/test/taskProgressTransforms.test.js out/test/reviewPassV1.test.js out/test/taskWatchdogV1.test.js out/test/restoreRejectedImplementationRound.test.js",
+
     "test:host": "node esbuild.js && tsc --project tsconfig.test.json && vscode-test",
     "vsix": "vsce package",
     "test": "npm run test:unit",

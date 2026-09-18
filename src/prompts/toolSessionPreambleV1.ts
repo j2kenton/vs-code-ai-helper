@@ -23,7 +23,11 @@
  * These are opaque host-issued identifiers, not paths or anything derivable.
  * Stating them verbatim is the whole contract.
  */
-import { MAX_READ_FILE_BYTES_V1 } from "../types/workflowToolProtocolV1";
+import {
+  MAX_CONSECUTIVE_DISCOVERY_CALLS_V1,
+  MAX_READ_FILE_BYTES_V1,
+  MAX_TOOL_ROUNDS_V1,
+} from "../types/workflowToolProtocolV1";
 
 /** Everything the model must know before it can plan a single edit. */
 export interface PreflightToolSessionPreambleInputV1 {
@@ -74,10 +78,10 @@ export type PreflightRoundPurposeV1 = "checklist" | "review-fixes" | "lint-fixes
 function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
   if (purpose === "review-fixes") {
     return [
-      "### Your job this round: fix what the review found",
+      "### Your job this round: fix what the review found, then keep building",
       "",
-      "A review of this code is included below. The blockers it lists ARE this",
-      "round's work. Fix as many as you can.",
+      "A review of this code is included below. Any blockers it lists come FIRST:",
+      "they are this round's work. Fix as many as you can.",
       "",
       "Most of them are defects in code that already exists, so do NOT expect to",
       "find them as unticked items on the plan checklist — a checklist that looks",
@@ -101,6 +105,44 @@ function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
       "each blocker its own narrow `patchFile` rather than widening a single patch",
       "to span unrelated regions — see the rule below. (Whole-file `replaceFile`",
       "is the exception: a path may carry only one of those.)",
+      "",
+      // Observed 2026-09-17 (v1 fixes 2, run 2057): a review with ZERO blockers
+      // and 74 plan steps unbuilt produced an empty plan. The section above
+      // said the blockers ARE the round's work and the checklist is not the
+      // authority, so with nothing to fix an empty plan was the honest answer
+      // to the question asked — while rule 8 of apply-impl-review-code.md
+      // ("no blockers → build the next steps") sat 150 lines further down.
+      // Fast Forward keeps dispatching this round on a clean review precisely
+      // so the plan keeps being built, so the framing must say so up here.
+      // The next attempt (run 2058) did find rule 8, read for five minutes,
+      // then declared `failed` with a model-invented `scope-too-large-for-budget`
+      // — this framing, unlike the checklist one, never said a slice is enough.
+      "### When the review lists NO blockers, build the next plan steps",
+      "",
+      "\"No blockers\" means nothing is wrong with what exists. It does NOT mean the",
+      "task is finished. Check the plan checklist and the review's",
+      "`<!-- progress: N/M -->` marker: if steps remain unbuilt (N is less than M,",
+      "or the checklist still has `- [ ]` items), this round's work is to BUILD THE",
+      "NEXT STEPS, in the plan's own order, starting from the earliest unbuilt item.",
+      "The same applies once every blocker you can fix is fixed and the plan has",
+      "room left.",
+      "",
+      "Plan a COHERENT SLICE that fits comfortably in one response and stop there:",
+      "whole units, a file finished rather than three half-written, so that what",
+      "lands type-checks. This runs as repeated rounds — you are called again for",
+      "the rest — so a slice is normal and expected.",
+      "",
+      "**Never refuse because the remaining work is too large** — not with an empty",
+      "plan, and not with a `failed` result. One test scenario, one function, one",
+      "wired call site is a valid slice. If the earliest unbuilt item needs more",
+      "reading than this session allows, land the part of it you CAN see clearly",
+      "(use `ensemble_textSearch` and line-range reads to reach it in a large file),",
+      "and say in the plan's reasoning what is left of that item.",
+      "",
+      "An empty `operations` array is therefore only honest when BOTH hold: no",
+      "fixable blocker remains, AND no plan step remains unbuilt. An empty plan",
+      "while steps remain stalls the task: the next review reports the same",
+      "progress, and nothing moves.",
     ];
   }
   if (purpose === "lint-fixes") {
@@ -135,6 +177,136 @@ function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
   ];
 }
 
+/**
+ * Round at which the model should be writing its plan, not still reading:
+ * two thirds of the cap, leaving the wind-down notices as a backstop rather
+ * than the only signal.
+ */
+export const PREFLIGHT_PLAN_BY_ROUND_V1 = Math.floor((MAX_TOOL_ROUNDS_V1 * 2) / 3);
+
+/**
+ * The model is never otherwise told how many tool rounds it has, or that the
+ * session removes older tool results once the conversation is large. Observed
+ * 2026-09-17/18 (v1 fixes 2, runs 2059 and 2060): a "build the next steps"
+ * round read for 59 of 64 rounds — every request succeeding — then answered
+ * the wind-down notice with an empty plan (2060) or a `failed` result blaming
+ * its own exhausted budget (2059). Both had read enough to author a slice by
+ * round 20; neither knew a cap existed until six rounds from it.
+ *
+ * Run 2062 then showed WHERE the budget goes, once the Tool Sessions log
+ * existed to count it: 59 replies carrying 76 `textSearch` calls, 7
+ * `findFiles` and 11 `readFile` — about 1.6 calls per reply, and five sixths
+ * of them searches that cannot authorize an operation. The cap is on REPLIES,
+ * so batching is worth more than any amount of "read less" advice.
+ */
+function budgetSectionV1(): string[] {
+  return [
+    `### Your budget: ${MAX_TOOL_ROUNDS_V1} tool rounds — write the plan before they run out`,
+    "",
+    `This session allows at most ${MAX_TOOL_ROUNDS_V1} replies in total. A reply carrying one or more`,
+    "tool calls consumes one; so does a reply that calls no tool at all, including",
+    "your final answer, which also ends the session. A session that reaches the cap",
+    "without a plan produces NOTHING: every observation is discarded and the round",
+    "is wasted. Once the conversation grows large, older tool results are removed",
+    "and would have to be re-read, so put text you intend to use as `findText` into",
+    "the plan soon after you read it.",
+    "",
+    "**Put several calls in ONE reply.** Against this cap, five small calls in one",
+    "reply cost what one call costs. They are not free in other ways — every result",
+    "still consumes the conversation's byte budget, and when one reply returns",
+    "several LARGE results the host may withhold all but one and ask you to re-read",
+    "the rest — so batch small searches and line ranges, not several whole big",
+    "files. One call per reply is how a session spends sixty replies on discovery",
+    "and never writes a plan; it is the single most common way a round is lost.",
+    "",
+    "A reply used only for `ensemble_textSearch` or `ensemble_findFiles` still",
+    "consumes one, and their observations can NEVER authorize an operation — only",
+    "an exact-path `ensemble_readFile`, `ensemble_stat` or `ensemble_readDirectory`",
+    "can. Searching repeatedly to build a complete picture is the slowest possible",
+    "use of this budget: search once, broadly, then read the few places you",
+    "actually intend to change.",
+    "",
+    `**This is enforced.** After ${MAX_CONSECUTIVE_DISCOVERY_CALLS_V1} searches in a row with no exact-path read,`,
+    "`ensemble_textSearch` and `ensemble_findFiles` stop returning results and",
+    "answer `discoveryBudgetExceeded` instead, naming the paths you already have.",
+    "Reading any exact path clears it. This is not a punishment and not an error",
+    "on your part — it exists because a session that keeps searching runs out of",
+    "replies and delivers nothing, which is worse for you than reading an",
+    "imperfectly chosen file.",
+    "",
+    "Work in this order:",
+    "",
+    "  1. In your first two or three replies, choose the slice: the earliest work",
+    "     you can finish this round (from the review's blockers, then the",
+    "     checklist's first unticked items).",
+    "  2. Read only what that slice touches: the signatures it calls, the exact",
+    "     region you will patch, the end of the test file you will extend. Locate",
+    "     with `ensemble_textSearch`, then read the line range.",
+    `  3. Be writing the plan by round ${PREFLIGHT_PLAN_BY_ROUND_V1} at the latest. A plan authored at round`,
+    "     20 from a few exact reads lands; a complete understanding reached at",
+    `     round ${MAX_TOOL_ROUNDS_V1} lands nothing. Shrink the slice rather than keep reading.`,
+  ];
+}
+
+/**
+ * Appended AFTER the caller's rendered prompt on a preflight row, because the
+ * prompt it follows was written for a different kind of agent.
+ *
+ * `apply-impl-review-code.md` — the template every Apply Review round carries —
+ * opens with "You are addressing an implementation review by making actual
+ * changes to the codebase", tells the model to "Edit files directly in the
+ * workspace", to "make sure the workspace files were actually changed" and to
+ * "report that failure" if it cannot write, to run the tests covering its
+ * changes, and to answer with a Markdown summary. None of that is possible in a
+ * read-only planning session, and all of it arrives AFTER the preamble that
+ * says so (2026-09-18 adversarial review, finding 1). Run 2058 did exactly what
+ * the template asks of an agent that cannot write: it reported failure. Runs
+ * 2060 and 2062 inspected exhaustively, as an executor would, and never
+ * authored a plan.
+ *
+ * The contradiction is resolved where the model reads last, rather than by
+ * forking the template: the same file must keep working verbatim for CLI
+ * providers, which really do edit files directly.
+ */
+export function buildPreflightClosingOverrideV1(): string {
+  return [
+    "## Before you answer — this phase is read-only (this overrides the instructions above)",
+    "",
+    "The instructions above were written for an agent that edits the workspace",
+    "directly. Everything in them about editing or writing files, running commands,",
+    "tests or type-checks, confirming that files really changed, and producing a",
+    "Markdown summary describes the SEALED SECOND PHASE and Ensemble's own",
+    "verification — not this reply. Nothing you can do here writes anything.",
+    "",
+    "In this session you:",
+    "",
+    "  - do NOT edit, write or delete any file;",
+    "  - do NOT run commands, tests or type-checks — and do not report being unable",
+    "    to, or treat it as a reason the work cannot be done;",
+    "  - do NOT write the Markdown summary, the `## Files Changed` section or the",
+    "    `## Plan Item Checklist` — Ensemble collects those after the edits land;",
+    "  - DO end by returning one `preflight-plan.v1` result frame containing the",
+    "    operations you want applied.",
+    "",
+    // 2026-09-18, run 2066: the model answered on its FIRST reply with no tool
+    // calls at all and an empty plan, explaining that it "was unable to obtain
+    // any exact-path file observations before the response needed to be
+    // finalized". Nothing was rushing it — 64 replies were available. The
+    // wording above said "in this reply", which reads as "answer now".
+    "**Nothing here asks you to answer immediately.** Read first: the plan is your",
+    "LAST reply, not your first. Every operation needs a `targetObservationId`",
+    "from a file you opened in this session, so a plan written before you have read",
+    "anything cannot contain a single valid operation. Spend the replies you need,",
+    "then plan.",
+    "",
+    "Read the instructions above for WHAT to change and in what order. The plan you",
+    "return is how it gets done: describing an edit here IS making it. A plan that",
+    "lands one coherent slice is a successful round. A Markdown summary, an",
+    "apology for being unable to edit, or an empty plan while work remains, is a",
+    "wasted one.",
+  ].join("\n");
+}
+
 export function buildPreflightToolSessionPreambleV1(
   input: PreflightToolSessionPreambleInputV1
 ): string {
@@ -150,6 +322,8 @@ export function buildPreflightToolSessionPreambleV1(
     "performed.",
     "",
     ...purposeSectionV1(input.purpose ?? "checklist"),
+    "",
+    ...budgetSectionV1(),
     "",
     "### Session identifiers",
     "",
@@ -197,6 +371,18 @@ export function buildPreflightToolSessionPreambleV1(
     "",
     "So stat a path you intend to create even when you expect it to be absent — the",
     "`missing` observation is what authorizes creating it.",
+    "",
+    // Run 2067 (2026-09-18) lost a real plan to exactly this: it statted the
+    // new FILE and had read several files inside src/test, but never observed
+    // src or src/test themselves, and a file observation does not prove its
+    // parent directory.
+    "**Creating a file also needs its directories observed.** Before a `createFile`,",
+    "`ensemble_stat` every ancestor directory of the new path — for",
+    "`src/test/new.test.ts` that is `src` and `src/test` — so the host can resolve",
+    "them. Reading a file inside a directory does NOT observe the directory. An",
+    "ancestor that already exists needs no `parentChain` entry once observed; only",
+    "one you observed as `missing` needs a `createDirectory` step earlier in the",
+    "same plan, linked with `createdByStep`.",
     "",
     "`parentChain` is required ONLY for `createFile` and `createDirectory`. For any",
     "operation on a file that already exists — `patchFile`, `replaceFile`,",

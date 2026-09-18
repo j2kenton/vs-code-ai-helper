@@ -197,21 +197,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   });
 
+  // The four tool-session observers below also write to a log output
+  // channel, which VS Code persists under its logs folder. `console.info`
+  // reaches only the extension host console: on 2026-09-18 a Copilot round
+  // (v1 fixes 2, run 2060) read for 59 rounds and planned nothing, and no
+  // record of what it read survived the session.
+  const toolSessionLog = vscode.window.createOutputChannel("Ensemble: Tool Sessions", { log: true });
+  context.subscriptions.push(toolSessionLog);
+
   // A Copilot tool session can run up to MAX_TOOL_ROUNDS_V1 rounds emitting
   // nothing observable, which on 2026-08-17 made a working run
   // indistinguishable from a wedged one and got it cancelled. Tool NAMES and
   // byte counts only — never tool arguments or result content, which carry
   // workspace file data (§2.2).
   setLmToolSessionObserverV1((round) => {
-    console.info(
-      "[ensemble:toolSession] round",
-      JSON.stringify({
-        round: `${round.round}/${round.maxRounds}`,
-        tools: round.toolNames,
-        roundResultBytes: round.roundResultBytes,
-        totalResultBytes: round.totalResultBytes,
-      })
-    );
+    const line = JSON.stringify({
+      round: `${round.round}/${round.maxRounds}`,
+      tools: round.toolNames,
+      roundResultBytes: round.roundResultBytes,
+      totalResultBytes: round.totalResultBytes,
+    });
+    console.info("[ensemble:toolSession] round", line);
+    toolSessionLog.info(`round ${line}`);
   });
 
   // Workflow-6 Item 18 fix 2: the pre-request boundary. Fix 1's per-round
@@ -221,10 +228,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // request and then never answered" (present, with no round-completion or
   // timeout line following it) — the diagnosis fix 1 alone does not give.
   setLmToolSessionRequestIssuedObserverV1((event) => {
-    console.info(
-      "[ensemble:toolSession] sendRequest issued",
-      JSON.stringify({ round: `${event.round}/${event.maxRounds}` })
-    );
+    const line = JSON.stringify({ round: `${event.round}/${event.maxRounds}` });
+    console.info("[ensemble:toolSession] sendRequest issued", line);
+    toolSessionLog.info(`sendRequest issued ${line}`);
   });
 
   // Item 3b-2 (2026-08-17..19 workflow-defects batch): a sanitized read-
@@ -234,15 +240,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // limit, a dropped connection) still leaves a record of what it read
   // instead of nothing at all.
   setReadToolCallObserverV1((event) => {
-    console.info(
-      "[ensemble:toolSession] read",
-      JSON.stringify({
-        tool: event.tool,
-        relativePath: event.relativePath,
-        ...(event.startLine !== undefined ? { startLine: event.startLine } : {}),
-        ...(event.endLine !== undefined ? { endLine: event.endLine } : {}),
-      })
-    );
+    const line = JSON.stringify({
+      tool: event.tool,
+      relativePath: event.relativePath,
+      ...(event.startLine !== undefined ? { startLine: event.startLine } : {}),
+      ...(event.endLine !== undefined ? { endLine: event.endLine } : {}),
+    });
+    console.info("[ensemble:toolSession] read", line);
+    toolSessionLog.info(`read ${line}`);
   });
 
   // --- View provider registrations come first, before any other activation

@@ -28,6 +28,7 @@ import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { validatePreflightPlanAgainstLedgerV1 } from "../../types/preflightPlanV1";
 import { getEditPlanBrokerV1 } from "../../services/workflowRuntimeServicesV1";
 import {
+  buildPreflightClosingOverrideV1,
   buildPreflightToolSessionPreambleV1,
   PreflightRoundPurposeV1,
 } from "../../prompts/toolSessionPreambleV1";
@@ -93,6 +94,42 @@ export function validateEditPreflightInputV1(
   return { ok: true, input: validated };
 }
 
+/**
+ * The last plan `reasoning` each operation's preflight produced, held only
+ * until its own dispatch reads it back (`takePreflightPlanReasoningV1`).
+ *
+ * Why a side channel: `TaskActionOutcomeV1` is the closed coordinator
+ * contract (plan §3.7) and must not grow a field that carries no authority —
+ * the same reason `assembledPrompt` is captured out-of-band. But the prose is
+ * the only account of WHY a round planned what it planned, and on 2026-09-18
+ * (v1 fixes 2, runs 2060/2062) two Copilot rounds each read for five minutes
+ * and returned an empty plan with no way to ask why. "No changes were needed"
+ * is not an answer when 74 plan steps are unbuilt.
+ *
+ * Bounded by construction: an entry is deleted when read, and the map is
+ * capped so an unread entry from a dispatch that died mid-flight cannot
+ * accumulate.
+ */
+const MAX_RETAINED_PLAN_REASONINGS_V1 = 8;
+const planReasoningByOperationV1 = new Map<string, string>();
+
+function recordPreflightPlanReasoningV1(operationId: string, reasoning: string): void {
+  if (planReasoningByOperationV1.size >= MAX_RETAINED_PLAN_REASONINGS_V1) {
+    const oldest = planReasoningByOperationV1.keys().next();
+    if (!oldest.done) {
+      planReasoningByOperationV1.delete(oldest.value);
+    }
+  }
+  planReasoningByOperationV1.set(operationId, reasoning);
+}
+
+/** Read and forget this operation's plan reasoning. See the map's doc comment. */
+export function takePreflightPlanReasoningV1(operationId: string): string | undefined {
+  const reasoning = planReasoningByOperationV1.get(operationId);
+  planReasoningByOperationV1.delete(operationId);
+  return reasoning;
+}
+
 class EditPreflightPromotionErrorV1 extends Error {
   constructor(message: string) {
     super(message);
@@ -121,6 +158,12 @@ async function promoteEditPreflightContentV1(
   const validation = validatePreflightPlanAgainstLedgerV1(content, preflight.ledger, input.rootId);
   if (!validation.ok) {
     throw new EditPreflightPromotionErrorV1(`${validation.code}: ${validation.reason}`);
+  }
+  // AFTER validation, so only a plan that actually settles can leave an entry
+  // behind: a rejected plan throws above, and its text is already preserved
+  // for recovery by the coordinator (2026-09-18 adversarial review, area 3).
+  if (content.reasoning !== undefined) {
+    recordPreflightPlanReasoningV1(context.correlation.operationId, content.reasoning);
   }
   if (content.operations.length === 0) {
     // §7.4: an empty plan settles as completed/noChanges — no edit session.
@@ -188,7 +231,11 @@ function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTas
           purpose: config.purpose,
         }) +
         "\n\n" +
-        input.prompt
+        input.prompt +
+        // Last, deliberately: the caller's template tells an agent to edit files
+        // directly, which is impossible here. See buildPreflightClosingOverrideV1.
+        "\n\n" +
+        buildPreflightClosingOverrideV1()
       );
     },
     promoteCompletedContent: promoteEditPreflightContentV1,

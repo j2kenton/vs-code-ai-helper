@@ -2856,6 +2856,57 @@ void describe(
     );
 
     void it(
+      "adopts a row owned by an earlier operation when the caller sets allowOperationTakeover " +
+        "(2026-09-18, run 2061: the malformed-result retry's fresh operation could never attach)",
+      async () => {
+        const fsBridge = installFsBridge();
+        try {
+          const folderPath = path.join(REAL_ROOT, "plans", "attach_identity_takeover");
+          fs.mkdirSync(folderPath, { recursive: true });
+          const row = makeBaseEntry({
+            roundId: "impl-round-takeover",
+            intentId: undefined,
+            operationId: "first-op",
+            attemptIds: ["impl-round-takeover", "first-attempt"],
+            state: "open",
+          });
+          fs.writeFileSync(
+            path.join(folderPath, "task-progress.json"),
+            JSON.stringify(
+              { ...makeProgress({ taskFolder: "attach_identity_takeover", roundLedger: [row] }) },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          const folderUri = vscode.Uri.file(folderPath);
+
+          await attachCoordinatorIdentityToRoundV1({
+            taskFolderUri: folderUri,
+            roundId: "impl-round-takeover",
+            operationId: "retry-op",
+            attemptId: "retry-attempt",
+            allowOperationTakeover: true,
+          });
+
+          const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+          const attached = raw.roundLedger?.[0];
+          assert.equal(attached?.operationId, "retry-op", "the retry's operation takes the row over");
+          assert.ok(
+            attached?.attemptIds.includes("retry-attempt"),
+            "the retry's attempt is recorded"
+          );
+          assert.ok(
+            attached?.attemptIds.includes("first-attempt"),
+            "the earlier operation's attempts stay on the round — the row is the whole round's record"
+          );
+        } finally {
+          fsBridge.restore();
+        }
+      }
+    );
+
+    void it(
       "retries after a transient read failure and durably attaches on a later attempt " +
         "(2026-09-15 post-freeze findings, item 2: \"retry the write before giving up\")",
       async () => {

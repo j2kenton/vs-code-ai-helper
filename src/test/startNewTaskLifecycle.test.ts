@@ -180,6 +180,11 @@ void describe("startNewTask — active/paused lifecycle", () => {
       const taskFolderPath = path.join(harness.metaFolderPath, folderName);
       const progress = readProgress(taskFolderPath);
       assert.equal(progress.status, "active", "the first task with nothing else active must start active");
+      assert.equal(
+        progress.nextActor,
+        "human",
+        "startNewTask's nextActor chokepoint must persist \"human\" on a freshly created task (v1 fixes 2, item 8)"
+      );
 
       assert.equal(
         harness.currentTaskStore.get(),
@@ -222,6 +227,11 @@ void describe("startNewTask — active/paused lifecycle", () => {
       const taskFolderPath = path.join(harness.metaFolderPath, folderName);
       const progress = readProgress(taskFolderPath);
       assert.equal(progress.status, "paused", "a new task must start paused when another task is already active");
+      assert.equal(
+        progress.nextActor,
+        "human",
+        "the nextActor chokepoint fires regardless of active/paused status (v1 fixes 2, item 8)"
+      );
 
       assert.equal(
         harness.currentTaskStore.get(),

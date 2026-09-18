@@ -62,6 +62,19 @@ export const MAX_TEXT_SEARCH_QUERY_LENGTH_V1 = 512;
  * observed benefit, so it stays at 64 pending a concrete report otherwise.
  */
 export const MAX_TOOL_ROUNDS_V1 = 64;
+
+/**
+ * Consecutive `findFiles`/`textSearch` calls a preflight session may make with
+ * no exact-path read between them, before the discovery tools refuse with
+ * `discoveryBudgetExceeded` (`readToolSessionHandlerV1.ts`).
+ *
+ * Five, not one or two: locating unfamiliar code legitimately takes a few
+ * searches, and the gate exists to end a loop, not to make orientation
+ * awkward. Lives here, with the protocol's other limits, because the preamble
+ * states the rule to the model and the handler enforces it — the two must not
+ * be able to disagree.
+ */
+export const MAX_CONSECUTIVE_DISCOVERY_CALLS_V1 = 5;
 export const MAX_TOOL_PROTOCOL_VIOLATIONS_V1 = 8;
 
 const RELATIVE_PATH_MAX_LENGTH_V1 = 1_024;
@@ -289,7 +302,16 @@ export type ReadToolResultV1 =
         | "unknownRoot"
         | "pathUnsafe"
         | "readFailed"
-        | "readLimitExceeded";
+        | "readLimitExceeded"
+        /**
+         * Too many `findFiles`/`textSearch` calls in a row without opening any
+         * of the paths they returned. Not a protocol violation — the call was
+         * well-formed — but the session has a hard cap on replies and a search
+         * observation can never authorize an edit, so continuing to search can
+         * only end the round empty-handed (2026-09-18: one round spent 76 of
+         * its 94 tool calls searching and opened 11 files).
+         */
+        | "discoveryBudgetExceeded";
       readonly reason: string;
     };
 

@@ -611,11 +611,22 @@ async function handleGeneratePlanOutcomeV1(
     // tree/progress indicator and review eligibility stay aligned with what
     // actually runs next.
     const destinationStage: TaskStage = ctx.effectiveReviewMode !== "off" ? "plan-high-review" : "plan";
+    // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker on the
+    // checked nextActor item): a review is about to be dispatched right
+    // after this write exactly when effectiveReviewMode !== "off" (see
+    // `triggerAutoReview` below) — "automation" then, "human" otherwise
+    // (landing on "plan" with nothing further arranged, matching every
+    // other stage-transition writer's nextActor: human default for a
+    // completed action that hands control back).
     await patchTaskProgressStrictV1(taskFolderUri, (existing) => {
       if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
         return existing;
       }
-      return updateTaskProgressStage(existing, destinationStage);
+      return updateTaskProgressStage(
+        existing,
+        destinationStage,
+        ctx.effectiveReviewMode !== "off" ? "automation" : "human"
+      );
     });
     succeeded = true;
     triggerAutoReview = ctx.effectiveReviewMode !== "off";

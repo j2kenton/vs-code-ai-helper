@@ -212,6 +212,20 @@ async function advanceStageLocked(
     };
   }
 
+  // v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): computed BEFORE the
+  // patch, from inputs already known to the caller (kind/optIn/isPaused/
+  // sourceStage/newStage), so the correct fresh `nextActor` can be folded
+  // into the SAME atomic CAS write below instead of a second, race-prone
+  // patch after the fact. Identical eligibility test to the one below that
+  // computes the returned `shouldAutoReview` — kept as one source of truth by
+  // computing it once, here, and reusing it for both.
+  const shouldAutoReviewForWrite =
+    AUTO_REVIEW_ELIGIBLE_KINDS.has(kind) &&
+    optIn &&
+    !isPaused &&
+    isReviewStage(newStage) &&
+    AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;
+
   // Persist the stage transition before any other action.
   // patchTaskProgress preserves all unrelated fields (implReviewFiles,
   // scheduledAt, lintPayload, status, etc.).
@@ -226,7 +240,19 @@ async function advanceStageLocked(
     if (expectedReviewAttemptId !== undefined && current.reviewAttemptId !== expectedReviewAttemptId) {
       throw new Error("Review result is stale; a newer review attempt owns this transition.");
     }
-    return updateTaskProgressStage(current, newStage);
+    return updateTaskProgressStage(
+      current,
+      newStage,
+      // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker):
+      // "not auto-review eligible" must persist the plain fact that this
+      // transition hands control back to the human — see
+      // TaskProgress.nextActor's own doc comment ("completed stage actions
+      // that hand control back persist nextActor: human"). Clearing to
+      // unknown here was itself the defect: a task landing at a new stage
+      // with nothing further arranged then had no durable record that a
+      // human, not automation, is expected to act next.
+      shouldAutoReviewForWrite ? "automation" : "human"
+    );
   }, { beforeWrite: publishArtifact });
 
   if (!patched) {
@@ -243,17 +269,14 @@ async function advanceStageLocked(
     await ensurePublishReviewArtifactExistsV1(taskFolderUri);
   }
 
-  // Compute exactly-once auto-review eligibility.
-  // Conditions are evaluated AFTER persistence so a failed write never
-  // triggers a review on stale data. `kind` is a hard gate: only
+  // Exactly-once auto-review eligibility, computed once above (before the
+  // write, so its `"automation"`/unknown result could be folded into the same
+  // atomic patch) and reused here unchanged — the write already happened only
+  // on a successful `patched` result, so this is still effectively evaluated
+  // only after persistence succeeds. `kind` is a hard gate: only
   // AUTO_REVIEW_ELIGIBLE_KINDS can ever reach `shouldAutoReview: true`, no
   // matter what `optIn` is — see TransitionKind's doc comment.
-  const shouldAutoReview =
-    AUTO_REVIEW_ELIGIBLE_KINDS.has(kind) &&
-    optIn &&
-    !isPaused &&
-    isReviewStage(newStage) &&
-    AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;
+  const shouldAutoReview = shouldAutoReviewForWrite;
 
   // Commit and push (the Publish command) must never be scheduled
   // automatically for any transition, no matter the destination stage or

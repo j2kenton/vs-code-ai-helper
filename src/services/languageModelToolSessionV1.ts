@@ -22,6 +22,7 @@ import {
 } from "../runners/copilotModelResolution";
 import { COPILOT_LM_RUNNER_ID } from "../runners/copilotLanguageModelRunner";
 import {
+  AgentExecutionModeV1,
   AgentExecutionRequestV1,
   AgentTransportExitV1,
   AgentTransportV1,
@@ -33,6 +34,8 @@ import {
   MAX_TOOL_ROUNDS_V1,
 } from "../types/workflowToolProtocolV1";
 import {
+  EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1,
+  isUninformedEmptyPreflightPlanV1,
   RESULT_FRAME_NUDGE_MESSAGE_V1,
   roundDeliverableContractV1,
   shouldNudgeForMissingResultFrameV1,
@@ -161,6 +164,13 @@ export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
  * produce the frame at all.
  */
 const MAX_NARRATION_NUDGES_V1 = 2;
+/**
+ * How many times one session may be sent back for answering with an empty plan
+ * having read nothing. One: the round is allowed to conclude there is nothing
+ * to build, it just has to look first — a second push would be arguing with
+ * it. See `isUninformedEmptyPreflightPlanV1`.
+ */
+const MAX_EMPTY_PLAN_NUDGES_V1 = 1;
 
 /**
  * How many rounds before the cap a text or preflight session starts being told
@@ -174,8 +184,34 @@ const MAX_NARRATION_NUDGES_V1 = 2;
  */
 export const TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1 = 6;
 
-/** The notice appended after a round when `roundsLeft` rounds remain. */
-export function toolRoundWindDownNoticeV1(roundsLeft: number): string {
+/**
+ * The notice appended after a round when `roundsLeft` rounds remain.
+ *
+ * A preflight session gets its own wording: its "final result" is a plan of
+ * operations, and the generic "answer from what you have read" was answered
+ * on 2026-09-18 (v1 fixes 2, run 2060) with an EMPTY plan after 59 rounds of
+ * successful reads — the model treated the notice as "stop", not "commit".
+ * Everything it read gave it an observationId and exact text, which is all a
+ * `patchFile` needs; the notice has to say so.
+ */
+export function toolRoundWindDownNoticeV1(roundsLeft: number, mode?: AgentExecutionModeV1): string {
+  if (mode === "preflight") {
+    if (roundsLeft <= 1) {
+      return (
+        "Tool round limit: your next reply is the LAST one this session allows. If it calls a tool, " +
+        "the session ends with no result and everything you have read is lost. Reply now with your " +
+        "`preflight-plan.v1`, authored from the observations you already hold: every file you read " +
+        "gave you an observationId and exact text, which is all a `patchFile` needs. A smaller slice " +
+        "than you intended is expected. An empty plan discards everything this session read."
+      );
+    }
+    return (
+      `Tool round limit: ${roundsLeft} rounds remain in this session. Stop exploring: choose the ` +
+      "slice you can author from what you have already read, spend at most one more reply on reads " +
+      "that slice still depends on, then reply with your `preflight-plan.v1`. A session that runs " +
+      "out of rounds produces no result at all, and an empty plan is not a way to stop early."
+    );
+  }
   if (roundsLeft <= 1) {
     return (
       "Tool round limit: your next reply is the LAST one this session allows. If it calls a tool, " +
@@ -565,6 +601,7 @@ export function createCopilotLmToolSessionTransportV1(
 
       let totalResultBytes = 0;
       let narrationNudges = 0;
+      let emptyPlanNudges = 0;
 
       // Conversation-size budget (see TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1
       // and MAX_TOOL_SESSION_CONTEXT_TOKENS_V1). The advertised limit only
@@ -1016,6 +1053,29 @@ export function createCopilotLmToolSessionTransportV1(
             fixedTokens += (await count(roundText)) + (await count(RESULT_FRAME_NUDGE_MESSAGE_V1));
             continue;
           }
+          // The frame IS present, and says "no operations" — from a session
+          // that never opened a file, so it cannot have been a judgement about
+          // the code. Send it back once, with somewhere to go. Sibling of the
+          // nudge above and bounded the same way; `attemptsRemaining` matters
+          // for the same reason (see that comment).
+          if (
+            isUninformedEmptyPreflightPlanV1({
+              responseText: roundText,
+              exactPathObservations: options.toolHandler.exactPathObservationCount?.() ?? 1,
+              nudgesUsed: emptyPlanNudges,
+              maxNudges: MAX_EMPTY_PLAN_NUDGES_V1,
+              attemptsRemaining: round + 1 < maxRounds,
+            })
+          ) {
+            emptyPlanNudges += 1;
+            messages.push(createLmAssistantMessageWithPartsV1(vscodeModule, assistantRawParts));
+            messages.push(
+              vscode.LanguageModelChatMessage.User(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1)
+            );
+            fixedTokens +=
+              (await count(roundText)) + (await count(EMPTY_PLAN_WITHOUT_READS_NUDGE_MESSAGE_V1));
+            continue;
+          }
           // Final round: only THIS round's text is the provider result —
           // interim narration between tool rounds is deliberately discarded.
           if (!output.write(roundText)) {
@@ -1044,7 +1104,7 @@ export function createCopilotLmToolSessionTransportV1(
           roundsLeft > 0 &&
           roundsLeft <= TOOL_ROUND_WIND_DOWN_NOTICE_ROUNDS_V1
         ) {
-          const notice = toolRoundWindDownNoticeV1(roundsLeft);
+          const notice = toolRoundWindDownNoticeV1(roundsLeft, request.mode);
           messages.push(vscode.LanguageModelChatMessage.User(notice));
           fixedTokens += await count(notice);
         }

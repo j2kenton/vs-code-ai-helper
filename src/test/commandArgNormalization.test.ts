@@ -826,6 +826,7 @@ import {
   resumeAndRerunReviewV1,
   resumeAndDispatchImplementationV1,
   resumeAndApplyCurrentStageActionV1,
+  resumeAndSetTaskStageV1,
   resumeIfPausedThenGoToReviewAndApplyV1,
 } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
@@ -1025,6 +1026,13 @@ void describe("resumePausedTask integration (full command path)", () => {
         stored!.scheduledRun.stage,
         "impl-high-review",
         "the arranged scheduledRun must target the task's actual current stage"
+      );
+      // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch): arming
+      // this scheduledRun means automation acts next.
+      assert.strictEqual(
+        stored!.nextActor,
+        "automation",
+        "arranging a scheduledRun dispatch must record nextActor as automation"
       );
     } finally {
       msgs.restore();
@@ -1482,6 +1490,14 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         stored!.status,
         "active",
         "the task must actually be resumed, not just have implementation dispatched"
+      );
+      // v1 fixes 2, Wave I chokepoint (per-target resumeAndXxxV1 dispatch):
+      // this call is about to start an implementation round, so nextActor
+      // must read "automation" the moment the resume+dispatch completes.
+      assert.equal(
+        stored!.nextActor,
+        "automation",
+        "resumeAndDispatchImplementationV1 dispatches a round — nextActor must be automation"
       );
 
       const implDispatch = execCmd.captured.find(
@@ -2242,6 +2258,143 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
     } finally {
       execCmd.restore();
       msgs.restore();
+    }
+  });
+
+  // 2026-09-17 review completion blocker: resumeThenDispatchV1 used to stamp
+  // nextActor: "automation" unconditionally before dispatch() ran and never
+  // revisited it afterward — so a dispatch that itself refused (per
+  // applyCurrentStageAction's own documented boolean contract: "Returns ...
+  // `false` — no task resolved, still paused, model not configured, unknown
+  // stage, no review artifact yet") left the task falsely reading as if
+  // automation were about to act.
+  void it("clears nextActor back to unknown when applyCurrentStageAction reports a refusal (false)", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = (
+      command: string
+    ): Promise<unknown> => {
+      if (command === "vs-code-ai-helper.applyCurrentStageAction") {
+        return Promise.resolve(false);
+      }
+      return Promise.resolve(undefined);
+    };
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-refused");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-apply-refused",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndApplyCurrentStageActionV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.status, "active", "the task must still actually be resumed");
+      assert.strictEqual(
+        stored!.nextActor,
+        undefined,
+        "a refused dispatch must clear the provisional automation stamp back to unknown, never leave it standing"
+      );
+    } finally {
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resumeAndSetTaskStageV1 — v1 fixes 2, Wave I chokepoint (per-target
+// resumeAndXxxV1 dispatch): unlike its four siblings, this dispatches a bare
+// stage MOVE (setTaskStage), not a round-starting command, so it must leave
+// `nextActor` untouched rather than assert "automation" — the correct value
+// depends on whether the destination stage's default action auto-dispatches,
+// which is the still-open stage-transition chokepoint's job to answer, not
+// this call site's to guess.
+// ---------------------------------------------------------------------------
+
+void describe("resumeAndSetTaskStageV1 (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumes and dispatches setTaskStage, but does not assert nextActor: automation for a bare stage move", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-set-stage");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-set-stage",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndSetTaskStageV1(inv, currentStore, {
+        taskFolderPath: folderPath,
+        stage: "plan",
+      });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.status, "active", "the task must actually be resumed");
+
+      const dispatch = execCmd.captured.find((e) => e.command === "vs-code-ai-helper.setTaskStage");
+      assert.ok(dispatch !== undefined, "must dispatch setTaskStage after resuming");
+
+      assert.strictEqual(
+        stored!.nextActor,
+        undefined,
+        "a bare stage move must not assert nextActor: automation — that would be a guess this call site cannot verify"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
     }
   });
 });

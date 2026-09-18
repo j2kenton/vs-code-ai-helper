@@ -44,6 +44,7 @@ import {
   FAST_FORWARD_ACTION_KEY_V1,
   IMPLEMENTATION_ACTION_KEY_V1,
   LINT_ACTION_KEY_V1,
+  takePreflightPlanReasoningV1,
 } from "../actions/rows/editPreflightRowsV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
@@ -425,12 +426,22 @@ export type TwoPhaseEditResultV1 =
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
       /** See `AllocatedAttemptIdsV1`. */
       readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
+      /** The plan's own account of what it chose and what it left — see the
+       * `noChanges` variant's own `planReasoning`. */
+      readonly planReasoning?: string;
     }
   | {
       readonly kind: "noChanges";
       readonly assembledPrompt?: AssembledPromptCaptureV1;
       readonly assembledPromptAttempts?: AssembledPromptAttemptsV1;
       readonly allocatedAttemptIds?: AllocatedAttemptIdsV1;
+      /**
+       * The empty plan's own account of itself, when it gave one — the only
+       * thing that distinguishes "there is genuinely nothing to do" from a
+       * round that spent its budget and gave up. See
+       * `takePreflightPlanReasoningV1`.
+       */
+      readonly planReasoning?: string;
     }
   | {
       readonly kind: "questions";
@@ -581,6 +592,13 @@ export async function runTwoPhaseEditActionV1(
           operationId: info.operationId,
           attemptId: info.attemptId,
           taskFolderUri: options.taskFolderUri,
+          // This dispatch owns the round for its whole lifetime (its caller
+          // holds the round lease), and one round here can span several
+          // operations — a malformed result retries through a FRESH
+          // `executeAction`, which allocates a fresh operationId. Refusing
+          // that retry as a foreign owner is what killed run 2061; see
+          // `allowOperationTakeover`'s doc comment.
+          allowOperationTakeover: true,
         });
       }
     },
@@ -625,16 +643,24 @@ export async function runTwoPhaseEditActionV1(
   }
   if (preflightOutcome.code === "noChanges") {
     // §7.4: an empty plan settles as completed/noChanges — no edit session.
+    const planReasoning = takePreflightPlanReasoningV1(preflightOutcome.correlation.operationId);
+    const planReasoningField = planReasoning !== undefined ? { planReasoning } : {};
     return capturedAssembledPrompt !== undefined
       ? {
           kind: "noChanges",
           assembledPrompt: capturedAssembledPrompt,
           ...capturedAttemptsField,
           ...capturedAllocatedAttemptIdsField,
+          ...planReasoningField,
         }
-      : { kind: "noChanges", ...capturedAllocatedAttemptIdsField };
+      : { kind: "noChanges", ...capturedAllocatedAttemptIdsField, ...planReasoningField };
   }
 
+  // Drained on EVERY terminal path, not just the empty-plan one: a plan that
+  // seals and executes has just as much to say about what it chose and what it
+  // left for the next round, and an entry no one reads sits in the map until
+  // it is evicted (2026-09-18 adversarial review, area 3).
+  const sealedPlanReasoning = takePreflightPlanReasoningV1(preflightOutcome.correlation.operationId);
   const executionResult = await continueSealedEditExecutionV1(
     coordinator,
     preflightOutcome.correlation.operationId,
@@ -646,6 +672,7 @@ export async function runTwoPhaseEditActionV1(
         ...(capturedAssembledPrompt !== undefined ? { assembledPrompt: capturedAssembledPrompt } : {}),
         ...capturedAttemptsField,
         ...capturedAllocatedAttemptIdsField,
+        ...(sealedPlanReasoning !== undefined ? { planReasoning: sealedPlanReasoning } : {}),
       }
     : executionResult;
 }
@@ -1077,6 +1104,14 @@ export async function runSealedImplementationV1(
       // just the one that ultimately completed.
       return {
         ...completionResult,
+        // A round that DID land edits still has an account of what it chose
+        // and what it left for the next round — the reviewer and the operator
+        // both read this summary (2026-09-18 adversarial review, area 3).
+        ...(result.planReasoning !== undefined
+          ? {
+              summary: `${completionResult.summary?.trimEnd() ?? ""}\n\nThe model's own account of the round:\n\n${result.planReasoning}`,
+            }
+          : {}),
         ...(result.assembledPrompt !== undefined ? { assembledPrompt: result.assembledPrompt } : {}),
         ...(result.assembledPromptAttempts !== undefined
           ? { assembledPromptAttempts: result.assembledPromptAttempts }
@@ -1099,7 +1134,14 @@ export async function runSealedImplementationV1(
         return {
           status: "completed",
           filesChanged: [],
-          summary: "The preflight produced an empty plan — no changes were needed.",
+          summary:
+            "The preflight produced an empty plan — no changes were needed." +
+            // Without this the round's own explanation was discarded and the
+            // operator was left with a sentence that is only true when the
+            // task is finished (2026-09-18, runs 2060/2062).
+            (result.planReasoning !== undefined
+              ? `\n\nThe model's own account of the round:\n\n${result.planReasoning}`
+              : ""),
           // Runner-authored too. Without this the summary shape gate rejected
           // this sentence for lacking the prompt's headings and paused a
           // legitimate no-change completion instead of routing it to review.
@@ -1820,10 +1862,18 @@ export async function resumeEditPreflightInteractionV1(
       });
     }
   } else if (outcome.kind === "completed" && outcome.code === "noChanges") {
+    // Same reason the fresh path surfaces it, and the same drain of the map
+    // (2026-09-18 adversarial review, area 3): a resumed round that answers a
+    // question with "nothing to change" is exactly where the model's own
+    // account of why is worth the most.
+    const resumedPlanReasoning = takePreflightPlanReasoningV1(outcome.correlation.operationId);
     NotificationRouter.showInformation(
-      "Resumed edit preflight produced an empty plan — no changes were needed."
+      "Resumed edit preflight produced an empty plan — no changes were needed." +
+        (resumedPlanReasoning !== undefined ? ` The model's account: ${resumedPlanReasoning}` : "")
     );
   } else if (outcome.kind === "completed") {
+    // Drained so a resumed sealed plan cannot strand its entry either.
+    const resumedSealedReasoning = takePreflightPlanReasoningV1(outcome.correlation.operationId);
     // A sealed plan exists for the resumed attempt: continue into the
     // mutation-only session exactly like a fresh two-phase run.
     const execution = await continueSealedEditExecutionV1(
@@ -1840,7 +1890,10 @@ export async function resumeEditPreflightInteractionV1(
       `# Resumed ${actionKey} run\n\nResult: ${execution.kind}\n\n` +
       ("changedPaths" in execution && execution.changedPaths.length > 0
         ? `Files changed:\n${execution.changedPaths.map((p) => `- ${p}`).join("\n")}`
-        : "_no files changed_");
+        : "_no files changed_") +
+      (resumedSealedReasoning !== undefined
+        ? `\n\nThe model's own account of the round:\n\n${resumedSealedReasoning}`
+        : "");
     const logUri = await writeRunLog(taskFolderUri, "copilot-lm", modelStage, logContent);
     if (execution.kind === "completed") {
       NotificationRouter.showInformation(

@@ -1,7 +1,8 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
+import { isReviewPassCurrentV1, parseReviewPass } from "../utils/reviewReadiness";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -1104,6 +1105,89 @@ void test("setNextActorV1 is a no-op (same reference) when the value is already 
 });
 
 // ---------------------------------------------------------------------------
+// shouldRecordHumanNextActorAfterAdvanceRefusalV1 (v1 fixes 2 review fix,
+// 2026-09-17: "the post-refusal nextActor repair can overwrite a concurrent
+// transition or dispatch's valid automation actor")
+// ---------------------------------------------------------------------------
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 allows the write when nothing changed since baseline",
+  () => {
+    const baseline = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    const current = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), true);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when no baseline could be read (fail closed)",
+  () => {
+    const current = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", undefined, current), false);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when automation is already present at baseline and unchanged",
+  () => {
+    // The gap the review found: a valid pre-existing "automation" actor —
+    // recorded by an earlier concurrent dispatch before this attempt even
+    // read its baseline — must not be overwritten just because it matches
+    // the (equally automation) baseline this attempt observed.
+    const baseline = { currentStage: "impl" as TaskStage, nextActor: "automation" as const, implRecovery: undefined };
+    const current = { currentStage: "impl" as TaskStage, nextActor: "automation" as const, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), false);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when a concurrent transition moved the stage",
+  () => {
+    // A different, WINNING transition succeeded and advanced the stage while
+    // this attempt's own dispatch was refused — its own write already
+    // recorded the correct nextActor for the new stage; stomping "human" on
+    // top would be wrong regardless of what nextActor now reads.
+    const baseline = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    const current = { currentStage: "impl-low-review" as TaskStage, nextActor: "automation" as const, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), false);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when a concurrent dispatch already recorded automation",
+  () => {
+    // The regression this test pins: a fresher, winning dispatch recorded
+    // nextActor: "automation" for genuinely arranged work, WITHOUT moving the
+    // stage. The stale refusal-path write must defer to it, not overwrite it.
+    const baseline = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    const current = { currentStage: "impl" as TaskStage, nextActor: "automation" as const, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), false);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when recovery state changed concurrently",
+  () => {
+    const baseline = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    const current = {
+      currentStage: "impl" as TaskStage,
+      nextActor: undefined,
+      implRecovery: { trigger: "summaryRejected", dispatch: "pending" } as unknown as TaskProgress["implRecovery"],
+    };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), false);
+  }
+);
+
+void test(
+  "shouldRecordHumanNextActorAfterAdvanceRefusalV1 refuses the write when the baseline itself was already stale",
+  () => {
+    const baseline = { currentStage: "impl-low-review" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    const current = { currentStage: "impl" as TaskStage, nextActor: undefined, implRecovery: undefined };
+    assert.equal(shouldRecordHumanNextActorAfterAdvanceRefusalV1("impl", baseline, current), false);
+  }
+);
+
+// ---------------------------------------------------------------------------
 // reserveStageReviewPassV1 (v1 fixes 2, item 32/Wave I)
 // ---------------------------------------------------------------------------
 
@@ -1147,3 +1231,133 @@ void test("reserveStageReviewPassV1 never rolls back — a failed/cancelled roun
   assert.equal(afterFirst, 1);
   assert.equal(progress.stageReviewPasses?.["impl-high-review"], 2);
 });
+
+void test(
+  "reserveStageReviewPassV1 reserves against the mapped TARGET stage, not the task's current stage " +
+    "(scenario i: a source-stage review targeting a later stage)",
+  () => {
+    // A review can be dispatched while the task's own currentStage is still
+    // the source stage (e.g. currentStage is "impl" but the review targets
+    // "impl-high-review") — the reservation must be keyed by the mapped
+    // target stage the review will actually publish against, never by
+    // whatever currentStage happens to read at dispatch time.
+    let progress = makeProgress();
+    progress = { ...progress, currentStage: "impl" };
+    const reserved = reserveStageReviewPassV1(progress, "impl-high-review");
+    assert.equal(reserved.stageReviewPasses?.["impl-high-review"], 1);
+    // The source stage itself must be untouched by this reservation.
+    assert.equal(reserved.stageReviewPasses?.["impl" as TaskStage], undefined);
+  }
+);
+
+void test(
+  "reserveStageReviewPassV1 issues a fresh, higher pass on manual re-entry to a previously visited stage " +
+    "(scenario iv: manual re-entry)",
+  () => {
+    // A stage visited, left, and manually re-entered later must reserve a
+    // NEW pass number rather than reusing (or being blocked by) the one from
+    // its earlier visit, so a review produced during the earlier visit can
+    // never be mistaken for covering the later one.
+    let progress = makeProgress();
+    progress = reserveStageReviewPassV1(progress, "impl-low-review");
+    const firstVisitPass = progress.stageReviewPasses?.["impl-low-review"];
+    // Simulate leaving the stage (task moves on) and later manually
+    // re-entering it — no rollback of the counter occurs on exit.
+    progress = reserveStageReviewPassV1(progress, "impl-low-review");
+    assert.equal(firstVisitPass, 1);
+    assert.equal(progress.stageReviewPasses?.["impl-low-review"], 2);
+  }
+);
+
+/** `<!-- review-pass: N -->`, the marker a review artifact publishes back —
+ * mirrors what `runReviewForFolder` templates into the prompt/artifact from
+ * `stageReviewPasses[targetStage]` at claim time (`ctx.variables.reviewPass`,
+ * `resources/prompts/review-*.md`). */
+function reviewArtifactWithPass(pass: number): string {
+  return `Readiness: 9/10\n\nNo blockers.\n\n<!-- review-pass: ${pass} -->`;
+}
+
+void test(
+  "reserveStageReviewPassV1 + isReviewPassCurrentV1 model Apply Review's in-place inline re-review " +
+    "(scenario ii): a same-stage re-dispatch bumps the pass, and the PRIOR artifact reads stale against it",
+  () => {
+    // First dispatch (the stage's normal review) reserves and publishes pass 1.
+    let progress = reserveStageReviewPassV1(makeProgress(), "impl-high-review");
+    const firstArtifact = reviewArtifactWithPass(progress.stageReviewPasses!["impl-high-review"]!);
+    assert.equal(isReviewPassCurrentV1(firstArtifact, progress.stageReviewPasses, "impl-high-review"), true);
+
+    // Apply Review's inline re-review dispatches a SECOND claim against the
+    // SAME stage (no stage transition in between) — reserves pass 2 before
+    // the new round has produced anything.
+    progress = reserveStageReviewPassV1(progress, "impl-high-review");
+    assert.equal(progress.stageReviewPasses?.["impl-high-review"], 2);
+
+    // Until the re-review lands, the only artifact on disk still carries
+    // pass 1 — it must now read as stale, never as a valid stand-in for the
+    // re-review that was just claimed.
+    assert.equal(isReviewPassCurrentV1(firstArtifact, progress.stageReviewPasses, "impl-high-review"), false);
+
+    // Once the re-review lands and publishes pass 2, it reads current again.
+    const reReviewArtifact = reviewArtifactWithPass(2);
+    assert.equal(isReviewPassCurrentV1(reReviewArtifact, progress.stageReviewPasses, "impl-high-review"), true);
+  }
+);
+
+void test(
+  "reserveStageReviewPassV1 + isReviewPassCurrentV1 model auto-advance after a threshold pass " +
+    "(scenario iii): only the LATEST reservation's artifact ever reads current, no earlier pass ever does again",
+  () => {
+    let progress = makeProgress();
+    const artifactsByPass = new Map<number, string>();
+    // Simulate several within-stage review/apply rounds building toward a
+    // passing score, each reserving and then publishing its own pass.
+    for (let round = 0; round < 4; round++) {
+      progress = reserveStageReviewPassV1(progress, "impl-low-review");
+      const pass = progress.stageReviewPasses!["impl-low-review"]!;
+      artifactsByPass.set(pass, reviewArtifactWithPass(pass));
+    }
+    assert.equal(progress.stageReviewPasses?.["impl-low-review"], 4);
+    // Auto-advance may only trust the LATEST pass's artifact — every earlier
+    // round's own artifact (rounds 1-3, superseded before the threshold that
+    // triggers auto-advance was reached) must never again read as current,
+    // even though each was genuinely current for its own round at the time.
+    for (let pass = 1; pass <= 3; pass++) {
+      assert.equal(
+        isReviewPassCurrentV1(artifactsByPass.get(pass)!, progress.stageReviewPasses, "impl-low-review"),
+        false,
+        `pass ${pass}'s artifact must not read current once pass 4 is reserved`
+      );
+    }
+    assert.equal(
+      isReviewPassCurrentV1(artifactsByPass.get(4)!, progress.stageReviewPasses, "impl-low-review"),
+      true
+    );
+  }
+);
+
+void test(
+  "reserveStageReviewPassV1 + isReviewPassCurrentV1 model a dispatched review that fails to publish " +
+    "(scenario v): the consumed reservation is never reused, and the never-published pass reads stale forever",
+  () => {
+    // A round is dispatched and reserves pass 1, then fails/is cancelled
+    // before writing any artifact content at all (no marker ever published
+    // for pass 1 — the degenerate case parseReviewPass returns undefined for).
+    let progress = reserveStageReviewPassV1(makeProgress(), "impl-high-review");
+    assert.equal(progress.stageReviewPasses?.["impl-high-review"], 1);
+    const neverPublished = "Readiness: N/A\n\n(round failed before producing a review)";
+    assert.equal(parseReviewPass(neverPublished), undefined);
+    assert.equal(isReviewPassCurrentV1(neverPublished, progress.stageReviewPasses, "impl-high-review"), false);
+
+    // The NEXT dispatch reserves a fresh, higher pass rather than retrying
+    // pass 1 — the reservation is consumed, never rolled back (see the
+    // "never rolls back" test above) — and its own published artifact reads
+    // current once it lands.
+    progress = reserveStageReviewPassV1(progress, "impl-high-review");
+    assert.equal(progress.stageReviewPasses?.["impl-high-review"], 2);
+    const secondAttempt = reviewArtifactWithPass(2);
+    assert.equal(isReviewPassCurrentV1(secondAttempt, progress.stageReviewPasses, "impl-high-review"), true);
+    // The orphaned pass-1 artifact (or lack thereof) can never retroactively
+    // become current again — there is no path back to "1" once "2" exists.
+    assert.equal(isReviewPassCurrentV1(neverPublished, progress.stageReviewPasses, "impl-high-review"), false);
+  }
+);

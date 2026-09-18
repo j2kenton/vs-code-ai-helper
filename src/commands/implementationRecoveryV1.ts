@@ -83,6 +83,7 @@ import {
   recordReviewInvalidatedByRound,
   resolveRoundV1,
   setIncompleteRoundContinuations,
+  setNextActorV1,
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -568,7 +569,17 @@ export async function beginImplementationRecoveryV1(
               leaseUntil: new Date(Date.now() + RECOVERY_TRANSITION_LEASE_MS).toISOString(),
             }),
       };
-      return { ...afterTermination, implRecovery: record, updatedAt: new Date().toISOString() };
+      // v1 fixes 2, Wave I chokepoint (owes a recovery): a `dispatch:
+      // "pending"` recovery with a lease is picked up automatically by the
+      // continuation chain (`scheduleAutomationChain`/the sweep's
+      // `armPendingImplRecoveries`) — automation acts next. A cap-reached
+      // record gets no lease and nothing will ever fire it automatically
+      // (see the comment above on `capReachedNow`); the only way out is a
+      // human choosing to discard it (item 15), so the human acts next.
+      return setNextActorV1(
+        { ...afterTermination, implRecovery: record, updatedAt: new Date().toISOString() },
+        capReachedNow ? "human" : "automation"
+      );
     },
   });
   const persisted = terminalization.ok ? terminalization.progress : undefined;
@@ -1257,9 +1268,37 @@ export function isImplRecoveryDiscardOfferableV1(
  * (`scheduleTaskResume.ts`'s `armPendingImplRecoveries`) and the advancement
  * gate itself (`advanceStageViaNextStageRowV1`), so neither depends on the
  * other having already run. Returns whether anything was actually retired.
+ *
+ * v1 fixes 2, Wave I chokepoint (clears a recovery). Its two call sites
+ * diverge in what happens immediately afterward, and only one side of that
+ * fork is this function's to know — so `nextActor` is never guessed
+ * unconditionally inside this function's own callback; a caller that DOES
+ * know the fact opts in via `options.nextActorOnRetire`, applied atomically
+ * in the SAME CAS write that clears the recovery (2026-09-17 review fix: a
+ * caller that instead wrote `nextActor` in a SEPARATE, later
+ * `patchTaskProgressStrictV1` call left a window where a concurrent write
+ * with a newer, correct value could be clobbered by this stale guess —
+ * folding it into one transaction closes that race).
+ *
+ * - The sweep call site (`armPendingImplRecoveries`, `scheduleTaskResume.ts`)
+ *   `continue`s the loop the moment this returns `true` — nothing further is
+ *   arranged for this task in that pass — so it passes
+ *   `{ nextActorOnRetire: "human" }`.
+ * - The advancement-gate call site (`advanceStageViaNextStageRowV1`,
+ *   `reviewActions.ts`) instead falls straight through into
+ *   `invokeLifecycleRowV1`, which may itself transition the stage and — via
+ *   `applyNextStagePolicyV1`'s own `nextActorOnAdvance` input (now wired from
+ *   that caller's `shouldAutoReview`-equivalent eligibility test) —
+ *   immediately dispatch a review. That subsequent write is unconditional
+ *   (`applyNextStagePolicyV1` always sets `nextActor` from its input, never
+ *   preserves a prior value) and happens later in the same sequentially
+ *   awaited async function, so it always supersedes whatever this call left
+ *   behind — passing no option here is correct, not merely "still unwired":
+ *   any value passed here would just be immediately overwritten.
  */
 export async function retireSatisfiedSummaryRejectedRecoveryV1(
-  taskFolderUri: vscode.Uri
+  taskFolderUri: vscode.Uri,
+  options?: { readonly nextActorOnRetire?: "human" | "automation" }
 ): Promise<boolean> {
   // Cheap pre-check outside the lock: skip reading impl-summary.md at all for
   // the overwhelmingly common case (no recovery, or a trigger this
@@ -1285,7 +1324,10 @@ export async function retireSatisfiedSummaryRejectedRecoveryV1(
       return undefined;
     }
     retired = true;
-    return promotePendingImplReviewFiles(current);
+    const promoted = promotePendingImplReviewFiles(current);
+    return options?.nextActorOnRetire !== undefined
+      ? setNextActorV1(promoted, options.nextActorOnRetire)
+      : promoted;
   });
   return retired;
 }
@@ -1303,6 +1345,17 @@ export async function retireSatisfiedSummaryRejectedRecoveryV1(
  * this action — no longer trusted to be worth reviewing. Callers are
  * responsible for confirming with the user before calling this; it performs
  * no confirmation of its own. Returns whether anything was actually cleared.
+ *
+ * v1 fixes 2, Wave I chokepoint (clears a recovery): unlike
+ * `retireSatisfiedSummaryRejectedRecoveryV1` below — reachable from an
+ * unattended sweep AND from an advancement gate that may itself immediately
+ * dispatch further automation, so the correct next-actor value there is not
+ * this function's to guess — this function is ONLY ever reached from an
+ * explicit user click (its own doc comment above: "callers are responsible
+ * for confirming with the user"), and it dispatches nothing of its own. A
+ * human just acted, and nothing here arranges automated follow-up work, so
+ * `nextActor: "human"` is not a guess but the plain fact of what this write
+ * did.
  */
 export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Promise<boolean> {
   // Same reasoning as `retireSatisfiedSummaryRejectedRecoveryV1` above: the
@@ -1315,7 +1368,7 @@ export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Prom
     }
     discarded = true;
     const { implRecovery: _recovery, pendingImplReviewFiles: _pending, ...rest } = current;
-    return { ...rest, updatedAt: new Date().toISOString() };
+    return setNextActorV1({ ...rest, updatedAt: new Date().toISOString() }, "human");
   });
   return discarded;
 }

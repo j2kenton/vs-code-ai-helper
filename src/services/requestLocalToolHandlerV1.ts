@@ -29,6 +29,16 @@ export interface RequestLocalToolHandlerV1 {
   handleToolCall(call: LmToolCallPartV1): Promise<string>;
   /** Model protocol violations observed so far (unknown tool, bad input, order breaks). */
   violationCount(): number;
+  /**
+   * Exact-path observations this session has minted — successful `readFile`,
+   * `stat` or `readDirectory` calls. Zero means the session has not opened
+   * anything, so no operation it could plan would have a valid
+   * `targetObservationId` and an empty plan is uninformed rather than
+   * considered (2026-09-18, run 2066: a first-reply empty plan with no tool
+   * calls at all). Optional: a handler with no notion of observations (the
+   * edit-execution broker) simply does not implement it.
+   */
+  exactPathObservationCount?(): number;
 }
 
 /** Shared violation counter helper for the concrete handlers. */

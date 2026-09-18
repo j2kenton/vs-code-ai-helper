@@ -369,10 +369,39 @@ export function validatePreflightPlanAgainstLedgerV1(
 
       for (const ancestorPath of unresolvedAncestors) {
         if (!suppliedStepPathsV1.has(ancestorPath)) {
+          // WHY the ancestor is unresolved decides what the model should do,
+          // and the two remedies are opposites. An ancestor observed as
+          // `missing` really does have to be created by an earlier step. An
+          // ancestor never observed at all is usually one that exists — the
+          // session simply never looked at it — and the fix is one `stat`.
+          //
+          // 2026-09-18 (v1 fixes 2, run 2067): a round that had finally
+          // produced a real plan was rejected with "ancestor src ... does not
+          // yet exist on disk and must be created by an earlier step", for
+          // `src` in this very repository. The model had read files INSIDE
+          // `src/test` but never statted the directories, and a file
+          // observation does not prove its parent. Told that `src` does not
+          // exist, the only thing a model can do is add a createDirectory for
+          // a directory that is already there — which fails differently.
+          const observedMissing = ledger
+            .records()
+            .some(
+              (record) =>
+                record.rootId === operation.rootId &&
+                record.relativePath === ancestorPath &&
+                record.kind === "missing"
+            );
           return failure(
             "parentChainMismatch",
-            `${where} is missing a createdByStep link for ancestor ${ancestorPath} — it does not yet ` +
-              "exist on disk and must be created by an earlier step in this same plan"
+            observedMissing
+              ? `${where} is missing a createdByStep link for ancestor ${ancestorPath} — you observed ` +
+                  "it as missing, so an earlier createDirectory step in this same plan must create it"
+              : `${where} cannot be created yet: its ancestor directory ${ancestorPath} has not been ` +
+                  `observed in this session. If ${ancestorPath} already exists, call ensemble_stat (or ` +
+                  "ensemble_readDirectory) on it and keep that observation — the host then resolves the " +
+                  "ancestor for you and no parentChain link is needed. Reading a file INSIDE a directory " +
+                  "does not observe the directory. Add a createDirectory step only for an ancestor you " +
+                  "have observed as missing."
           );
         }
       }

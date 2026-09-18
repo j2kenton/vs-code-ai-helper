@@ -179,6 +179,41 @@ void describe("editPreflightContractV1 — parent-chain proofs", () => {
     );
     assert.equal(result.ok, false);
     assert.equal(result.ok === false && result.code, "parentChainMismatch");
+
+    // 2026-09-18, run 2067: the refusal said the ancestor "does not yet exist
+    // on disk and must be created by an earlier step" about `src` in a
+    // repository that plainly has one. The session had simply never observed
+    // it. Told that, the only move a model has is to create a directory that
+    // already exists. An UNOBSERVED ancestor must be told to stat, not create.
+    const reason = result.ok === false ? result.reason : "";
+    assert.match(reason, /has not been\s+observed in this session/);
+    assert.match(reason, /ensemble_stat/);
+    assert.doesNotMatch(reason, /does not yet exist on disk/);
+  });
+
+  void it("tells a model that observed its ancestor as missing to create it, not to stat it again", () => {
+    const ledger = createObservationLedgerV1();
+    const missing = mintMissing(ledger, "apps/new.ts");
+    mintMissing(ledger, "apps"); // looked, and it really is absent
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "createFile",
+          relativePath: "apps/new.ts",
+          targetObservationId: missing,
+          parentChain: [],
+          contentBase64: "aGk=",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(result.ok, false);
+    const reason = result.ok === false ? result.reason : "";
+    assert.match(reason, /you observed\s+it as missing/);
+    assert.match(reason, /createDirectory/);
   });
 
   void it("refuses an observed-kind parentChain link now that ancestors are host-resolved", () => {
