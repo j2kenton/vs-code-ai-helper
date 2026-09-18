@@ -1887,6 +1887,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return { stale: false };
   }
 
+  /** `withdrawStaleDecisionsV1`, but a failure costs the check, not the panel. */
+  private async withdrawStaleDecisionsSafelyV1(
+    target: ChatTarget,
+    decisions: readonly WorkflowDecisionV1[]
+  ): Promise<readonly WorkflowDecisionV1[]> {
+    try {
+      return await this.withdrawStaleDecisionsV1(target, decisions);
+    } catch (error) {
+      console.error("Ensemble: the stale-decision check failed; showing the decisions as posted", error);
+      return decisions;
+    }
+  }
+
   private async withdrawStaleDecisionsV1(
     target: ChatTarget,
     decisions: readonly WorkflowDecisionV1[]
@@ -1903,7 +1916,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const stale: { decision: WorkflowDecisionV1; reason: string }[] = [];
     for (const decision of checkable) {
       const predicate = this.staleDecisionPredicates[decision.decisionKey];
-      const result = predicate ? await predicate(target, decision) : { stale: false as const };
+      // A predicate that cannot read what it needs proves nothing: the
+      // decision stays as posted rather than being withdrawn on a guess.
+      const result = predicate
+        ? await predicate(target, decision).catch(() => ({ stale: false as const }))
+        : { stale: false as const };
       if (result.stale) {
         stale.push({ decision, reason: result.reason });
       } else {
@@ -2205,7 +2222,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return next.then(() => result);
   }
 
+  /**
+   * Paint the panel. Whatever happens, the webview gets a state message.
+   *
+   * Everything this method reads beyond the transcript is a secondary detail
+   * — a decision card, a score in the header, a scheduling line — and none of
+   * them is worth leaving the panel on "Loading chat…" for ever with no way
+   * to tell why, which is exactly what one unguarded rejection did (seen live
+   * 2026-09-18: every stage chat stuck on the placeholder). A failure now
+   * names itself in the panel.
+   */
   private async render(): Promise<void> {
+    try {
+      await this.renderInnerV1();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error("Ensemble chat panel could not be rendered", error);
+      await this.view?.webview.postMessage({
+        type: "state",
+        target: this.target,
+        label: this.target && this.target.kind !== "global" ? this.target.taskName ?? "Chat" : "Chat",
+        entries: [],
+        timeline: [],
+        interactions: [],
+        decisions: [],
+        busy: false,
+        waitingForUser: false,
+        errorMessage: `This conversation could not be shown. (${reason}) Check the Notifications view, then reload the window.`,
+      });
+    }
+  }
+
+  private async renderInnerV1(): Promise<void> {
     // No target chosen yet: restore whatever conversation was last open
     // (e.g. after a window reload) before falling back to the global
     // assistant, so the panel is usable immediately either way. The
@@ -2311,9 +2359,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // scoped). Read fresh on every render so a decision resolved from
     // elsewhere (or superseded by a repost) disappears without a stale
     // control lingering in the panel.
+    // Guarded on purpose (see `render`): these predicates read the task's own
+    // files, and a read that fails must cost at most the cards.
     const pendingDecisions: readonly WorkflowDecisionV1[] =
       target && target.kind !== "global"
-        ? await this.withdrawStaleDecisionsV1(
+        ? await this.withdrawStaleDecisionsSafelyV1(
             target,
             this.workflowDecisionStore
               .listPending(target.canonicalId)
