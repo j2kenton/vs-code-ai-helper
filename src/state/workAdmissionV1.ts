@@ -221,13 +221,24 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
   if (outcome.outcome === "writeFailed") {
     return `Could not start this stage action: ${outcome.error.message}`;
   }
-  const ageSeconds = Math.round(outcome.ageMs / 1000);
+  // `ageMs` is the age of the marker's last RENEWAL, not of the claim: the
+  // heartbeat touches the marker every couple of minutes (see `heartbeat`).
+  // Reporting it as "started ~Ns ago" therefore described an abandoned claim
+  // — one whose owner died seconds after its last renewal — as if work had
+  // just begun, which is exactly backwards (seen live 2026-09-18, after a
+  // container was recreated mid-round). The claim's own record carries the
+  // real start, so both facts are named for what they are.
+  const renewedSeconds = Math.round(outcome.ageMs / 1000);
+  const startedAtMs = outcome.owner ? Date.parse(outcome.owner.startedAt) : Number.NaN;
+  const runningFor = Number.isFinite(startedAtMs)
+    ? `running for ~${Math.round((Date.now() - startedAtMs) / 60000)} min`
+    : "start time unknown";
   const ownerDetail = outcome.owner
     ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
     : "held by an unreadable record";
   return (
-    `This task already has a stage action in progress (${ownerDetail}, started ~${ageSeconds}s ago at ` +
-    `${outcome.markerPath})${
+    `This task already has a stage action in progress (${ownerDetail}, ${runningFor}, last renewed ` +
+    `~${renewedSeconds}s ago at ${outcome.markerPath})${
       outcome.likelyStale
         ? " — this looks stale. A determinately dead owner is reclaimed automatically on the next sweep; " +
           "a live-but-unresponsive, foreign-machine, or unreadable owner that stays stale will offer a " +

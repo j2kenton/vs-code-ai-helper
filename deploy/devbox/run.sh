@@ -1,6 +1,15 @@
 #!/bin/sh
 # Build and (re)start the dev box on the cloud host. Idempotent.
 #   AUTHORIZED_KEY_FILE=~/.ssh/devbox_authorized_key sh run.sh
+#
+# DESTRUCTIVE: this DELETES and RECREATES the container (docker rm -f below),
+# which kills the runner's VS Code and any workflow round it is part-way
+# through — the round's work-admission claim is then left behind, so the task
+# refuses new actions until that claim ages out (~20 min). Run it only when
+# nothing is running, and only when the image itself needs rebuilding.
+# To restart just the runner (seconds, nothing else touched):
+#   ssh ensemble-devbox "pkill -f '/usr/share/code/[c]ode --wait'"
+# runner.sh brings a fresh window straight back up.
 # The home (logins, VS Code server, extensions) and the workspace are named
 # volumes: rebuilding or restarting the container keeps both.
 set -eu
