@@ -97,6 +97,17 @@ sudo docker rm -f ensemble-devbox >/dev/null 2>&1 || true
 # SSH only on the host's loopback: reached through the host's own SSH
 # (ProxyJump), never exposed to the internet directly.
 #
+# --memory 20g: the VM has 23 GB and the container was capped at 12. Two
+# desktop runners, their extension hosts, a renderer that had leaked to 2.4 GB
+# and a couple of viewers reached that cap on 2026-09-20; the kernel killed
+# four processes and took a review round with it. The cap was the shortage, not
+# the machine. ~3 GB is left for the VM itself.
+#
+# -p 8082: the serve-web VIEWER (runner.sh starts it) published on the VM's
+# loopback, so a PHONE needs one SSH hop to the VM instead of two. Still
+# nothing on the internet — loopback only, and the viewer requires its
+# connection token.
+#
 # --shm-size 2g: Docker's default /dev/shm is 64 MB, which two Electron
 # renderers and x11vnc's framebuffer exhaust. The renderers then die with
 # "renderer process gone (reason: crashed, code: 133)" and VS Code leaves each
@@ -109,7 +120,8 @@ sudo docker run -d --name ensemble-devbox \
   --restart unless-stopped \
   --hostname ensemble-devbox \
   -p 127.0.0.1:2222:2222 \
-  --memory 12g --cpus 3 --pids-limit 4096 --shm-size 2g \
+  -p 127.0.0.1:8082:8082 \
+  --memory 28g --cpus 15 --pids-limit 4096 --shm-size 2g \
   $sandbox_opts \
   "$@" \
   -v ensemble-devbox-home:/home/dev \

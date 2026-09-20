@@ -53,6 +53,60 @@ x11vnc -display :99 -localhost -forever -shared -nopw -quiet >>"$HOME/.devbox-lo
 # then open http://localhost:6080/vnc.html . Loopback only.
 websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 >>"$HOME/.devbox-logs/novnc.log" 2>&1 &
 
+# The browser/phone VIEWER: one `code serve-web` for the whole box, serving the
+# real Ensemble panel to any device. run.sh publishes this port on the VM's
+# loopback, so a phone needs a single SSH hop.
+#
+# A VIEWER, never a runner — set in the environment AND in the server's machine
+# settings. A runner publishes the task's status every 30 seconds, so a second
+# runner on one workspace overwrites the first's view and progress flickers in
+# and out; a viewer publishes nothing and cannot collide (seen live 2026-09-20).
+# It also makes serve-web's one disqualifying property harmless: it disposes its
+# extension host as soon as a browser disconnects gracefully, which would kill a
+# round but costs a viewer nothing.
+#
+# Any workspace, one URL:  http://localhost:8082/?tkn=<token>&folder=/workspace/<name>
+VIEWER_PORT=8082
+VIEWER_DIR="$HOME/.serve-web-viewer"
+VIEWER_TOKEN="$HOME/.serve-web-viewer.token"
+mkdir -p "$VIEWER_DIR/data/Machine" "$VIEWER_DIR/data/User"
+[ -f "$VIEWER_TOKEN" ] || node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))' > "$VIEWER_TOKEN"
+chmod 600 "$VIEWER_TOKEN"
+printf '%s\n' '{' '  "ensemble.hostRole": "viewer",' '  "update.mode": "none"' '}' \
+  > "$VIEWER_DIR/data/Machine/settings.json"
+# The server keeps its OWN extensions directory, separate from ~/.vscode and
+# ~/.vscode-server: an empty one looks exactly like a dead extension host.
+VIEWER_SERVER="$(ls -d "$HOME"/.vscode/cli/serve-web/*/bin/code-server 2>/dev/null | head -1)"
+if [ -n "$VIEWER_SERVER" ] && [ -f "$HOME/ensemble.vsix" ] &&
+   ! grep -q 'j2kenton' "$VIEWER_DIR/extensions/extensions.json" 2>/dev/null; then
+  "$VIEWER_SERVER" --extensions-dir "$VIEWER_DIR/extensions" \
+    --install-extension "$HOME/ensemble.vsix" >>"$HOME/.devbox-logs/serve-web-viewer.log" 2>&1 || true
+fi
+ENSEMBLE_HOST_ROLE=viewer code serve-web \
+  --host 0.0.0.0 --port "$VIEWER_PORT" \
+  --connection-token-file "$VIEWER_TOKEN" \
+  --server-data-dir "$VIEWER_DIR" \
+  --default-folder /workspace/vs-code-ai-helper \
+  --accept-server-license-terms --disable-telemetry \
+  >>"$HOME/.devbox-logs/serve-web-viewer.log" 2>&1 &
+echo "$(date -u +%FT%TZ) viewer on :$VIEWER_PORT token $(cat "$VIEWER_TOKEN")" >>"$SUPERVISOR_LOG"
+
+# The PUSH WATCHER: tells the user's phone when a round finishes, needs an
+# answer, complains, or when a runner goes quiet with work in flight. It reads
+# only what the runners publish and can start nothing.
+#
+# Started here because it is the one thing a rebuild kept silently killing: it
+# lives in $HOME (which survives) but nothing restarted it, so notifications
+# just stopped — twice, unnoticed for hours. It covers every workspace on the
+# box automatically, so a new instance needs no setup.
+#
+# Sends nothing unless ~/.devbox-notify-url exists: deleting that file is the
+# off switch, and without it the watcher only logs what it would have sent.
+if [ -f "$HOME/notify-watch.mjs" ]; then
+  setsid nohup node "$HOME/notify-watch.mjs" >>"$HOME/.devbox-logs/notify-watch.out" 2>&1 < /dev/null &
+  echo "$(date -u +%FT%TZ) push watcher started" >>"$SUPERVISOR_LOG"
+fi
+
 # One restart loop per workspace. $1 = workspace folder, $2 = runner index
 # (1 = the original, which keeps the default user-data directory so nothing
 # about the existing runner changes).
