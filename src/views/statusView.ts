@@ -547,10 +547,66 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         activityStartedAt: op.activityStartedAt,
         startedAt: op.startedAt,
       }));
-      return [...runningNodes, ...this.entries.filter((entry) => this.levelFilter.has(entry.level))];
+      return [...runningNodes, ...this.filteredEntries()];
     }
     return [];
   }
+
+  /** Entries surviving the level filter AND the active search. */
+  private filteredEntries(): StatusEntry[] {
+    return this.entries.filter(
+      (entry) => this.levelFilter.has(entry.level) && notificationMatchesSearchV1(entry, this.searchQuery)
+    );
+  }
+
+  /**
+   * Session-only free-text search over the notification messages, applied
+   * with the level filter to stored entries only — running-operation rows
+   * are live state and are never hidden. Not written to workspace state: a
+   * filter that survives a reload makes notifications look missing with
+   * nothing to explain why.
+   */
+  private searchQuery = "";
+
+  getSearchQuery(): string {
+    return this.searchQuery;
+  }
+
+  setSearchQuery(query: string): void {
+    this.searchQuery = query.trim();
+    this.refresh();
+  }
+
+  clearSearch(): void {
+    this.setSearchQuery("");
+  }
+
+  /** How many of the level-filtered entries the search keeps; `undefined` with no active search. */
+  getSearchSummary(): { matched: number; total: number } | undefined {
+    if (!this.searchQuery) {
+      return undefined;
+    }
+    const total = this.entries.filter((entry) => this.levelFilter.has(entry.level));
+    return {
+      matched: total.filter((entry) => notificationMatchesSearchV1(entry, this.searchQuery)).length,
+      total: total.length,
+    };
+  }
+}
+
+/**
+ * Search match for the Notifications pane: case-insensitive, every
+ * whitespace-separated word of `query` must appear in the FULL, untruncated
+ * `entry.message` (the row's label may be shortened; the message is not). An
+ * empty query matches everything. Exported for direct unit testing.
+ */
+export function notificationMatchesSearchV1(entry: Pick<StatusEntry, "message">, query: string): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter((word) => word.length > 0);
+  if (words.length === 0) {
+    return true;
+  }
+  const message = entry.message.toLowerCase();
+  return words.every((word) => message.includes(word));
 }
 
 /** JSON-safe minimal representation of a root operation surviving reload. */

@@ -13,7 +13,7 @@ import * as vscode from "vscode";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isPlanReviewStage, TaskProgress, TaskStage } from "../types/taskProgress";
 import { ChecklistProgressV1 } from "./implementationChecklist";
-import { readPlanOfRecordV1 } from "./implementationArtifactResolver";
+import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "./implementationArtifactResolver";
 import { NotificationRouter } from "./notificationRouter";
 import {
   parseReviewProgress,
@@ -98,6 +98,28 @@ export async function readEffectivePlanChecklistProgressV1(
     return undefined;
   }
   const advisory = await readTaskProgressForChecklistV1(folderUri, policy);
+  if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
+    return undefined;
+  }
+  return counted;
+}
+
+/**
+ * Display-only twin of `readEffectivePlanChecklistProgressV1` (lenient policy,
+ * same `checklistProgressUnreliable` / unreadable-file stand-down) built on
+ * `readPlanOfRecordForDisplayV1`, so refreshing a percentage while a run is
+ * ticking boxes never saves an open `plan-final.md` editor. Read-only end to
+ * end: the advisory task-progress read decodes and never writes.
+ */
+export async function readEffectivePlanChecklistProgressForDisplayV1(
+  folderUri: vscode.Uri
+): Promise<ChecklistProgressV1 | undefined> {
+  const plan = await readPlanOfRecordForDisplayV1(folderUri);
+  const counted = plan.counts;
+  if (!plan.hasChecklist || !counted) {
+    return undefined;
+  }
+  const advisory = await readTaskProgressForChecklistV1(folderUri, "lenient");
   if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
     return undefined;
   }

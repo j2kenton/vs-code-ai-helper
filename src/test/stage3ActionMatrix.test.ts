@@ -186,7 +186,9 @@ void describe("Stage 3 action matrix contracts", () => {
       "vs-code-ai-helper.runLintingFixes",
       "vs-code-ai-helper.viewStageChanges",
       "vs-code-ai-helper.chatWithStage",
-      "vs-code-ai-helper.commitAndPushTask",
+      // The inline button targets the keybinding-free alias so VS Code's
+      // tooltip shows no shortcut; see commitAndPushTaskInline in package.json.
+      "vs-code-ai-helper.commitAndPushTaskInline",
       "vs-code-ai-helper.release",
       "vs-code-ai-helper.markTaskDone",
     ]);

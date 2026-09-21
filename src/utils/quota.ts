@@ -755,10 +755,18 @@ export function getQuotaLedgerEntry(
 /**
  * Enumerate every currently-parked ledger entry (quota/model-entitlement
  * blocks the ledger's own clearing rules haven't retired) — the read side
- * for a settings-panel surface, since `getQuotaLedgerEntry` requires already
- * knowing which provider+account+model to ask about. `quotaLedgerKey`'s
- * `::`-joined format is parsed back apart here rather than storing the parts
- * redundantly in each entry.
+ * for enumeration, since `getQuotaLedgerEntry` requires already knowing which
+ * provider+account+model to ask about. `quotaLedgerKey`'s `::`-joined format
+ * is parsed back apart here rather than storing the parts redundantly in each
+ * entry.
+ *
+ * The settings panel used to render every entry as a standing warning and no
+ * longer does: an entry is only a past observation (only a later observation
+ * clears it, so a provider nobody uses stays parked indefinitely), and its
+ * remedy text (`buildQuotaRemedyTextV1`) is written for the stage-scoped
+ * notification a failing round raises. Anything that displays these entries
+ * must say what is known ("last seen quota-exhausted <date> — not retried
+ * since"), never a present-tense claim.
  */
 export function listParkedQuotaLedgerEntriesV1(
   context: vscode.ExtensionContext

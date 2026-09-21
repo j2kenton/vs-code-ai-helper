@@ -72,6 +72,7 @@ import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress";
 import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
+import { formatDisplayTimestampPairV1 } from "../utils/timeFormat";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -303,9 +304,106 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       const decisions = lastDecisions(fake);
       assert.equal(decisions.length, 1);
       assert.equal(decisions[0]!.decisionId, "decision-1");
+
+      // The card carries the same copy/time affordances as a regular message.
+      const card = decisions[0] as unknown as { atLabel: string; atTitle: string; copyText: string };
+      assert.ok(card.atLabel.length > 0, "a valid createdAt yields a time label");
+      assert.ok(card.atTitle.length > 0);
+      assert.match(card.copyText, /^(Decision needed|Optional)\n/);
+      assert.doesNotMatch(`${card.atLabel}${card.atTitle}`, /Invalid|NaN/);
     } finally {
       notify.restore();
       cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  // The store refuses an unparsable `createdAt` on post, so these cases damage
+  // the persisted record (workspaceState) and the chat file after the fact —
+  // the only way such a card can reach render() — and assert what is posted.
+  async function postedDecisionTimeFor(options: {
+    createdAt: string;
+    anchorAt?: string;
+  }): Promise<{ atLabel: string; atTitle: string }> {
+    const folder = makeFolder();
+    const memento = makeMemento();
+    const provider = new ChatViewProvider(memento);
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      const posted = await provider.workflowDecisionStore.post(decisionInput(folder));
+      assert.equal(posted.ok, true);
+      const stored = memento.get<WorkflowDecisionV1[]>("workflowDecisions", []);
+      await memento.update(
+        "workflowDecisions",
+        stored.map((d) => ({ ...d, createdAt: options.createdAt }))
+      );
+      if (options.anchorAt !== undefined) {
+        await writeChatHistory(
+          folder,
+          [
+            {
+              role: "assistant",
+              text: "Decision needed",
+              stage: "impl",
+              at: options.anchorAt,
+              decisionId: "decision-1",
+            },
+          ],
+          folder
+        );
+      }
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      const decisions = lastDecisions(fake);
+      assert.equal(decisions.length, 1);
+      const card = decisions[0] as unknown as { atLabel: string; atTitle: string; copyText: string };
+      assert.match(card.copyText, /^(Decision needed|Optional)\n/);
+      assert.doesNotMatch(`${card.atLabel}${card.atTitle}`, /Invalid|NaN/);
+      return { atLabel: card.atLabel, atTitle: card.atTitle };
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  }
+
+  void it("an unparsable createdAt with no anchoring message posts empty time labels", async () => {
+    const time = await postedDecisionTimeFor({ createdAt: "not-a-date" });
+    assert.deepEqual(time, { atLabel: "", atTitle: "" });
+  });
+
+  void it("an unparsable anchor message time falls back to the decision's createdAt", async () => {
+    const createdAt = "2026-01-15T10:30:00.000Z";
+    const time = await postedDecisionTimeFor({ createdAt, anchorAt: "not-a-date" });
+    assert.deepEqual(time, formatDisplayTimestampPairV1(createdAt));
+    assert.notEqual(time.atLabel, "");
+  });
+
+  void it("an unparsable createdAt AND anchor message time post empty time labels", async () => {
+    const time = await postedDecisionTimeFor({ createdAt: "not-a-date", anchorAt: "also-not-a-date" });
+    assert.deepEqual(time, { atLabel: "", atTitle: "" });
+  });
+
+  void it("a valid anchor message time wins over createdAt", async () => {
+    const anchorAt = "2026-02-20T08:15:00.000Z";
+    const time = await postedDecisionTimeFor({ createdAt: "2026-01-15T10:30:00.000Z", anchorAt });
+    assert.deepEqual(time, formatDisplayTimestampPairV1(anchorAt));
+  });
+
+  void it("the store refuses an unparsable createdAt on post", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    try {
+      const posted = await provider.workflowDecisionStore.post(decisionInput(folder, { createdAt: "not-a-date" }));
+      assert.equal(posted.ok, false);
+    } finally {
       provider.dispose();
       fs.rmSync(folder, { recursive: true, force: true });
     }

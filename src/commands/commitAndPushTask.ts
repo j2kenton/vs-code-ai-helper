@@ -3387,10 +3387,20 @@ export function registerCommitAndPushTaskCommand(
     (arg?: CommitAndPushTaskArg) =>
       commitAndPushTask(inventory, arg, currentTaskStore, undefined, context, chatViewProvider)
   );
+  // The Tasks-tree inline button's own command id. VS Code appends the
+  // keybinding of a button's command to its tooltip ("Commit and Push
+  // (Ctrl+Shift+Alt+P)"); the keybinding stays on `commitAndPushTask`, so
+  // the inline button targets this keybinding-free alias instead. Same
+  // handler, same arguments.
+  const inlineDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.commitAndPushTaskInline",
+    (arg?: CommitAndPushTaskArg) =>
+      commitAndPushTask(inventory, arg, currentTaskStore, undefined, context, chatViewProvider)
+  );
   const completeDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.completeCommitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
       completeCommitAndPushTask(inventory, arg, currentTaskStore, context, chatViewProvider)
   );
-  context.subscriptions.push(disposable, completeDisposable);
+  context.subscriptions.push(disposable, inlineDisposable, completeDisposable);
 }
