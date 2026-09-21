@@ -542,7 +542,12 @@ function reportCandidateSkipped(
   }
 }
 
+/** Pause before the single same-candidate retry of a transport-flagged network fault. */
+const DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1 = 750;
+
 export interface TaskActionCoordinatorDepsV1 {
+  /** Delay before a network-fault retry; defaults to 750 ms. Tests pass 0. */
+  readonly networkFaultRetryDelayMs?: number;
   readonly registry: TaskActionRegistryV1;
   readonly leaseStore: WorkflowLeaseStoreV1;
   /**
@@ -1126,10 +1131,55 @@ function attemptOutcomeReasonTextV1(
   // fault can appear (see RecordedAttemptOutcomeV1.detail). Appended rather
   // than substituted so the stable phrase stays greppable in older records.
   const suffix = detail !== undefined && detail.length > 0 ? ` - ${detail}` : "";
-  return attemptOutcomeReasonPhraseV1(outcome) + suffix;
+  return attemptOutcomeReasonPhraseV1(outcome, detail) + suffix;
 }
 
-function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1): string {
+/**
+ * Names a transport failure by the fault class its code (the first token of
+ * the recorded evidence, `code` or `code: detail`) carries, so a clock limit,
+ * a tool-round limit, a malformed request or an empty response is never
+ * reported as the provider being unavailable or as "no response arrived"
+ * (v1 fixes 2, items 17/23/26/27/28). `undefined` when the class is unknown.
+ *
+ * @internal exported for testing
+ */
+export function describeTransportFaultClassV1(evidence: string | undefined): string | undefined {
+  if (evidence === undefined) {
+    return undefined;
+  }
+  const code = /^[A-Za-z0-9_.]+/.exec(evidence)?.[0] ?? "";
+  switch (code) {
+    case "cliRunTimeout":
+      return "the round was stopped by its wall-clock time limit";
+    case "cliRunInactivityTimeout":
+      return "the round was stopped by the inactivity watchdog (no output for too long)";
+    case "copilotRequestTimedOut":
+    case "copilotModelSelectionTimedOut":
+      return "Copilot did not finish within its time limit";
+    case "toolRoundLimitExceeded":
+      return "the tool session used all of its tool rounds without finishing";
+    case "toolSessionResultBudgetExceeded":
+    case "toolSessionContextBudgetExceeded":
+      return "the tool session used up its reading budget without finishing";
+    default:
+      break;
+  }
+  if (/invalid_request_body/i.test(evidence)) {
+    return "the provider rejected the request as malformed";
+  }
+  if (/empty response|no choices/i.test(evidence)) {
+    return "the provider returned an empty response";
+  }
+  return undefined;
+}
+
+function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1, detail?: string): string {
+  if (outcome === "transportFailurePreResponse" || outcome === "transportFailureResponseStarted") {
+    const faultClass = describeTransportFaultClassV1(detail);
+    if (faultClass !== undefined) {
+      return `invoked, but ${faultClass}`;
+    }
+  }
   switch (outcome) {
     case "completed":
       return "invoked and completed";
@@ -1154,9 +1204,11 @@ function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1): string {
     case "callerCancelled":
       return "invocation cancelled by the caller";
     case "transportFailureResponseStarted":
-      return "invoked, but the transport failed after the response started";
+      return "invoked, but the request failed after the response started";
     case "transportFailurePreResponse":
-      return "invoked, but the transport failed before any response arrived";
+      // Deliberately silent on whether any response arrived: a tool session
+      // that failed on round 3 had already been answered twice.
+      return "invoked, but the request failed";
     case "providerUnavailablePreInvocation":
       return "could not be invoked (unavailable before invocation)";
   }
@@ -2018,9 +2070,18 @@ export function createTaskActionCoordinatorV1(
           // the closed kind, so every pre-response failure read as the same
           // generic sentence in a chain-exhaustion report (workflow 5 run 039,
           // three providers, three identical lines). Carry code plus detail.
+          // v1 fixes 2, item 27: a network-fault candidate gets one same-model
+          // retry, so say which of the two attempts this evidence belongs to
+          // ("Copilot returned an empty response on attempt 1 of 2").
+          const networkFaultAttemptSuffixV1 =
+            raw.networkFault === true && !raw.responseStarted
+              ? `${raw.code === "copilotEmptyResponse" ? " on" : " —"} attempt ${networkFaultRetriesUsedV1 + 1} of ${
+                  MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 + 1
+                }`
+              : "";
           const transportEvidence = raw.detail !== undefined
-            ? `${raw.code}: ${raw.detail}`
-            : raw.code;
+            ? `${raw.code}: ${raw.detail}${networkFaultAttemptSuffixV1}`
+            : `${raw.code}${networkFaultAttemptSuffixV1}`;
           if (raw.responseStarted) {
             session.reportAttemptOutcome(
               attemptId,
@@ -2056,6 +2117,12 @@ export function createTaskActionCoordinatorV1(
             !(malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1)
           ) {
             networkFaultRetriesUsedV1++;
+            // A dropped connection or empty reply usually clears within a
+            // moment; retrying in the same tick hits the same fault.
+            const retryDelayMs = deps.networkFaultRetryDelayMs ?? DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1;
+            if (retryDelayMs > 0) {
+              await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+            }
             const retryAttemptId = session.allocateAttempt();
             const retryAllocationReport = await reportAttemptAllocatedV1(retryAttemptId);
             if (!retryAllocationReport.ok) {

@@ -270,6 +270,13 @@ const StatusBarAlignment = {
   Right: 2,
 };
 
+const ColorThemeKind = {
+  Light: 1,
+  Dark: 2,
+  HighContrast: 3,
+  HighContrastLight: 4,
+};
+
 const ConfigurationTarget = {
   Global: 1,
   Workspace: 2,
@@ -491,6 +498,11 @@ class TreeView {
 const quickPickResults = [];
 const inputBoxResults = [];
 const window = {
+  // Defaults to Dark; tests set `window.activeColorTheme = { kind: ... }`
+  // and (optionally) fire `window._colorThemeChanges`.
+  activeColorTheme: { kind: ColorThemeKind.Dark },
+  _colorThemeChanges: new EventEmitter(),
+  onDidChangeActiveColorTheme: (listener) => window._colorThemeChanges.event(listener),
   showInformationMessage: notImplemented("window.showInformationMessage"),
   showErrorMessage: notImplemented("window.showErrorMessage"),
   showWarningMessage: notImplemented("window.showWarningMessage"),
@@ -582,6 +594,7 @@ module.exports = {
   Range,
   WorkspaceEdit,
   StatusBarAlignment,
+  ColorThemeKind,
   TextDocumentSaveReason,
   ConfigurationTarget,
   ProgressLocation,

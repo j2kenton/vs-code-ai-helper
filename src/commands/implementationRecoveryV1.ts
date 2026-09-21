@@ -69,7 +69,7 @@ import {
 } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
-import { readTextIfExists } from "../utils/fileUtils";
+import { readTextIfExists, statIfExists } from "../utils/fileUtils";
 import { parseReadiness, isStaleReviewArtifactV1 } from "../utils/reviewReadiness";
 import {
   getImplementationSummaryUri,
@@ -1205,13 +1205,25 @@ export function describeOwedImplRecoveryRefusalV1(
   progress: TaskProgress,
   now: number = Date.now()
 ): string {
+  // Computed once, up front, so the "Status: pending" line below and the
+  // trailing discard line never disagree about whether the sweep will still
+  // retry this record — item 21/3's "conflicting surfaces" finding was
+  // exactly this predicate being checked only at the end while an earlier,
+  // unconditional line kept telling the user the sweep would dispatch a
+  // record `armPendingImplRecoveries` explicitly skips re-arming.
+  const discardOfferable = isImplRecoveryDiscardOfferableV1(recovery, progress, now);
   const lines = [
     "An implementation recovery continuation is still owed for the current stage, so it may not advance yet.",
     `- Waiting on: ${describeImplRecoveryTriggerV1(recovery.trigger)} (recorded ${recovery.at}).`,
     `- Source round: ${recovery.sourceRoundId ?? recovery.sourceAttemptId} (quoted in its run log).`,
   ];
   if (recovery.dispatch === "pending") {
-    lines.push("- Status: pending — the next sweep or a manual retry will dispatch its continuation round.");
+    lines.push(
+      discardOfferable
+        ? "- Status: pending, continuation budget exhausted — automated recovery has stopped; the sweep " +
+          "will not dispatch this record."
+        : "- Status: pending — the next sweep or a manual retry will dispatch its continuation round."
+    );
   } else {
     const leaseDescription =
       recovery.leaseUntil !== undefined && Date.parse(recovery.leaseUntil) > now
@@ -1219,15 +1231,16 @@ export function describeOwedImplRecoveryRefusalV1(
         : "its lease has expired; the sweep will reclaim it automatically if it still can";
     lines.push(`- Status: dispatched — ${leaseDescription}.`);
   }
-  lines.push(
-    recovery.trigger === "summaryRejected"
-      ? "- Clears automatically once a usable Implementation Summary exists for this stage."
-      : "- Clears automatically once its continuation round completes with a usable report."
-  );
-  if (isImplRecoveryDiscardOfferableV1(recovery, progress, now)) {
+  if (discardOfferable) {
     lines.push(
-      "- This continuation has no automated way back (its round is stale and there is no reconstructable " +
-        'change set to re-arm from). Use "Discard this owed continuation" to clear it by hand.'
+      '- This continuation has no automated way back. Use "Discard this owed continuation" to clear it by ' +
+        "hand — that is the one action that will actually resolve this."
+    );
+  } else {
+    lines.push(
+      recovery.trigger === "summaryRejected"
+        ? "- Clears automatically once a usable Implementation Summary exists for this stage."
+        : "- Clears automatically once its continuation round completes with a usable report."
     );
   }
   return lines.join("\n");
@@ -1305,11 +1318,31 @@ export async function retireSatisfiedSummaryRejectedRecoveryV1(
   // self-heal does not apply to). Re-checked again, from the FRESH read,
   // inside the CAS callback below — this is only an optimization, never
   // relied on for correctness.
-  const summaryContent = await readTextIfExists(getImplementationSummaryUri(taskFolderUri));
+  //
+  // The content and the mtime must describe the SAME version of the file: a
+  // continuation can replace the preserved usable summary with an unusable
+  // stamp between a read and a later stat, which would pair the old usable
+  // content with the new (post-recovery) mtime. So the mtime is snapshotted
+  // before the read and re-checked after it; any change means the file moved
+  // underneath us and the recovery stays in place (fail closed — the next
+  // sweep retries against a stable file).
+  const summaryUri = getImplementationSummaryUri(taskFolderUri);
+  const mtimeBeforeRead = (await statIfExists(summaryUri))?.mtime;
+  const summaryContent = await readTextIfExists(summaryUri);
   const summaryIsUsable = summaryContent !== undefined && !isUnusableImplementationSummaryV1(summaryContent);
   if (!summaryIsUsable) {
     return false;
   }
+  const mtimeAfterRead = (await statIfExists(summaryUri))?.mtime;
+  if (mtimeBeforeRead !== mtimeAfterRead) {
+    return false;
+  }
+  // A form-rejected round leaves the last usable summary in place (it is not
+  // stamped over), so "usable" alone no longer means "the continuation
+  // produced it". A summary no newer than the recovery record (equal timestamps fail closed) is the preserved
+  // one and does not satisfy the debt; an unreadable mtime keeps the legacy
+  // behaviour.
+  const summaryMtimeMs = mtimeAfterRead;
   // `retired` is set only from INSIDE the callback that actually decided to
   // write a change — never derived from `patchTaskProgressStrictV1`'s return
   // value, which is the pre-existing `current` (still carrying whatever
@@ -1319,43 +1352,165 @@ export async function retireSatisfiedSummaryRejectedRecoveryV1(
   // undefined` would misreport both a genuine no-op (no recovery at all) and
   // a failed read as "retired".
   let retired = false;
-  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
-    if (current.implRecovery?.trigger !== "summaryRejected") {
-      return undefined;
+  let beforeRetire: TaskProgress | undefined;
+  let afterRetire: TaskProgress | undefined;
+  try {
+    await patchTaskProgressStrictV1(
+      taskFolderUri,
+      (current) => {
+        if (current.implRecovery?.trigger !== "summaryRejected") {
+          return undefined;
+        }
+        const recordedAtMs = Date.parse(current.implRecovery.at);
+        if (
+          summaryMtimeMs !== undefined &&
+          Number.isFinite(recordedAtMs) &&
+          summaryMtimeMs <= recordedAtMs
+        ) {
+          return undefined;
+        }
+        retired = true;
+        beforeRetire = current;
+        const promoted = promotePendingImplReviewFiles(current);
+        afterRetire =
+          options?.nextActorOnRetire !== undefined
+            ? setNextActorV1(promoted, options.nextActorOnRetire)
+            : promoted;
+        return afterRetire;
+      },
+      {
+        // The update callback is synchronous, so it cannot re-read the summary.
+        // `beforeWrite` runs under the same progress lock, after the decision
+        // and immediately before the write, and a throw from it prevents the
+        // write. Revalidate the summary here: if it was rewritten (mtime moved)
+        // or is no longer usable since the snapshot above, a continuation has
+        // replaced it and the owed continuation must stay in place.
+        beforeWrite: async () => {
+          const mtimeBeforeContent = (await statIfExists(summaryUri))?.mtime;
+          const contentNow = await readTextIfExists(summaryUri);
+          const mtimeAfterContent = (await statIfExists(summaryUri))?.mtime;
+          if (
+            mtimeBeforeContent !== mtimeAfterRead ||
+            mtimeAfterContent !== mtimeAfterRead ||
+            contentNow === undefined ||
+            isUnusableImplementationSummaryV1(contentNow)
+          ) {
+            throw new SummaryChangedBeforeRetireV1();
+          }
+        },
+      }
+    );
+  } catch (error) {
+    if (error instanceof SummaryChangedBeforeRetireV1) {
+      return false;
     }
-    retired = true;
-    const promoted = promotePendingImplReviewFiles(current);
-    return options?.nextActorOnRetire !== undefined
-      ? setNextActorV1(promoted, options.nextActorOnRetire)
-      : promoted;
-  });
+    throw error;
+  }
+  if (retired && beforeRetire && afterRetire) {
+    // The `beforeWrite` re-check cannot see a rewrite that lands between its
+    // read and the durable commit (the writer awaits journal I/O in between,
+    // and the summary writer shares no lock with it). Close that gap after the
+    // fact: revalidate once the commit is durable and, if the summary moved or
+    // is now unusable, put the owed continuation back so the gate it provides
+    // is never silently lost.
+    const mtimeBeforeFinal = (await statIfExists(summaryUri))?.mtime;
+    const finalContent = await readTextIfExists(summaryUri);
+    const mtimeAfterFinal = (await statIfExists(summaryUri))?.mtime;
+    const stillValid =
+      mtimeBeforeFinal === mtimeAfterRead &&
+      mtimeAfterFinal === mtimeAfterRead &&
+      finalContent !== undefined &&
+      !isUnusableImplementationSummaryV1(finalContent);
+    if (!stillValid) {
+      await restoreRetiredSummaryRejectedRecoveryV1(taskFolderUri, beforeRetire, afterRetire);
+      return false;
+    }
+    // Residual window (after the check above, before this returns): closed by
+    // ORDERING, not by a lock the summary writer does not share. The only
+    // writer that stamps `impl-summary.md` unusable (`reviewActions.ts`'s
+    // post-run summary gate) first durably records a fresh `implRecovery` via
+    // `beginImplementationRecoveryV1` under the progress lock, and only then
+    // writes the stamp. A stamp that lands here therefore always has its own
+    // owed-continuation record already committed (or, if it was committed
+    // before our CAS, our CAS read it and declined to retire). The gate the
+    // advancement path enforces is that durable `implRecovery`, never this
+    // function's return value.
+  }
   return retired;
 }
 
 /**
- * Part 5 step 34: the user-reachable escape for a `dispatched` recovery that
- * has no automated way back (per `isImplRecoveryDiscardOfferableV1` /
- * `isUnrecoverableImplRecoveryV1`) — waiting out its lease plus the 90-minute
- * stale-dispatch grace only to reach a round that will fail the same way is
- * not an exit. Unlike `retireSatisfiedSummaryRejectedRecoveryV1` (which
- * treats the pending files as real, reviewable work and unions them into
- * review scope), this is an explicit abandonment: it removes the recovery
- * record and its quarantined pending-review paths WITHOUT promoting them,
- * since a discarded continuation's edits are — by definition of reaching
- * this action — no longer trusted to be worth reviewing. Callers are
- * responsible for confirming with the user before calling this; it performs
- * no confirmation of its own. Returns whether anything was actually cleared.
+ * Compensating write for `retireSatisfiedSummaryRejectedRecoveryV1`: re-instates
+ * the retired recovery fields from the pre-retire snapshot, but only while the
+ * task is still in exactly the state the retire left (no recovery re-armed by
+ * anyone else, promoted review scope untouched) so a newer write is never
+ * clobbered.
+ */
+async function restoreRetiredSummaryRejectedRecoveryV1(
+  taskFolderUri: vscode.Uri,
+  before: TaskProgress,
+  after: TaskProgress
+): Promise<void> {
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
+    if (
+      current.implRecovery !== undefined ||
+      JSON.stringify(current.implReviewFiles) !== JSON.stringify(after.implReviewFiles)
+    ) {
+      return undefined;
+    }
+    const { nextActor: _nextActor, implReviewFiles: _files, ...rest } = current;
+    return {
+      ...rest,
+      ...(before.implReviewFiles !== undefined ? { implReviewFiles: before.implReviewFiles } : {}),
+      ...(before.implRecovery !== undefined ? { implRecovery: before.implRecovery } : {}),
+      ...(before.pendingImplReviewFiles !== undefined
+        ? { pendingImplReviewFiles: before.pendingImplReviewFiles }
+        : {}),
+      ...(before.incompleteRoundContinuations !== undefined
+        ? { incompleteRoundContinuations: before.incompleteRoundContinuations }
+        : {}),
+      ...(before.nextActor !== undefined ? { nextActor: before.nextActor } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/** Thrown from `retireSatisfiedSummaryRejectedRecoveryV1`'s `beforeWrite` to abort the write. */
+class SummaryChangedBeforeRetireV1 extends Error {
+  constructor() {
+    super("impl-summary.md changed before the owed continuation could be retired");
+    this.name = "SummaryChangedBeforeRetireV1";
+  }
+}
+
+/**
+ * Part 5 step 34 / item 21's release scope: the user-reachable escape for an
+ * owed continuation with no automated way back (per
+ * `isImplRecoveryDiscardOfferableV1` / `isUnrecoverableImplRecoveryV1`) —
+ * waiting out its lease plus the 90-minute stale-dispatch grace only to reach
+ * a round that will fail the same way is not an exit. What this discards is
+ * the OWED CONTINUATION — the obligation to keep chasing a conforming
+ * re-report of a round that already made real edits — never the edits
+ * themselves. Per the task's own release-scope wording ("offer 'Discard this
+ * owed continuation' (promoting the quarantined files to review scope)") and
+ * the plan's Part 1 step 5 ("Discard promotes `pendingImplReviewFiles` to
+ * review scope and clears `implRecovery`/`incompleteRoundContinuations`"),
+ * this reuses the SAME `promotePendingImplReviewFiles` transform as
+ * `retireSatisfiedSummaryRejectedRecoveryV1` above: the quarantined paths are
+ * real, already-applied edits, and letting the ordinary review pass judge
+ * them is strictly safer than letting them silently vanish from review scope
+ * while the stage is free to advance. Callers are responsible for confirming
+ * with the user before calling this; it performs no confirmation of its own.
+ * Returns whether anything was actually cleared.
  *
- * v1 fixes 2, Wave I chokepoint (clears a recovery): unlike
- * `retireSatisfiedSummaryRejectedRecoveryV1` below — reachable from an
- * unattended sweep AND from an advancement gate that may itself immediately
- * dispatch further automation, so the correct next-actor value there is not
- * this function's to guess — this function is ONLY ever reached from an
- * explicit user click (its own doc comment above: "callers are responsible
- * for confirming with the user"), and it dispatches nothing of its own. A
- * human just acted, and nothing here arranges automated follow-up work, so
- * `nextActor: "human"` is not a guess but the plain fact of what this write
- * did.
+ * v1 fixes 2, Wave I chokepoint (clears a recovery): this function is ONLY
+ * ever reached from an explicit user click (its own doc comment above:
+ * "callers are responsible for confirming with the user"), and it dispatches
+ * nothing of its own — the caller (`reviewActions.ts`'s registered command)
+ * separately re-invokes `nextStage` afterward, which supersedes this value
+ * with whatever `applyNextStagePolicyV1` computes if it does transition the
+ * stage. `nextActor: "human"` here is not a guess but the plain fact of what
+ * THIS write did.
  */
 export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Promise<boolean> {
   // Same reasoning as `retireSatisfiedSummaryRejectedRecoveryV1` above: the
@@ -1367,8 +1522,8 @@ export async function discardOwedImplRecoveryV1(taskFolderUri: vscode.Uri): Prom
       return undefined;
     }
     discarded = true;
-    const { implRecovery: _recovery, pendingImplReviewFiles: _pending, ...rest } = current;
-    return setNextActorV1({ ...rest, updatedAt: new Date().toISOString() }, "human");
+    const promoted = promotePendingImplReviewFiles(current);
+    return setNextActorV1(promoted, "human");
   });
   return discarded;
 }

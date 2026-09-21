@@ -40,6 +40,7 @@ import * as vscode from "vscode";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** `announceAutoStartBestEffortV1` reads task-progress.json via
  * `readTaskProgressStrictV1`, which goes through `vscode.workspace.fs.readFile`
@@ -561,7 +562,7 @@ void describe("announceAutoStartBestEffortV1 (review-flagged 2026-08-23: schema-
       assert.equal(messages[0]!.stage, "impl", "the persisted message must carry the task's real current TaskStage, never null");
     } finally {
       restore();
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -580,7 +581,7 @@ void describe("announceAutoStartBestEffortV1 (review-flagged 2026-08-23: schema-
       const messages = await readChatHistory(fixture.folder);
       assert.equal(messages.length, 0, "no message should be written when the stage cannot be established");
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -606,7 +607,7 @@ void describe("announceAutoStartBestEffortV1 (review-flagged 2026-08-23: schema-
       assert.equal(messages[0]!.intentId, "intent-abc-123");
     } finally {
       restore();
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -625,7 +626,7 @@ void describe("announceAutoStartBestEffortV1 (review-flagged 2026-08-23: schema-
       assert.equal(messages[0]!.intentId, undefined);
     } finally {
       restore();
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 });

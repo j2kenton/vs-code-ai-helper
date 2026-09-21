@@ -56,6 +56,7 @@ import {
 import { createWorkflowFileStoreV1 } from "../services/workflowFileStoreV1";
 import { createWorkflowPathRegistryV1 } from "../services/workflowPathRegistryV1";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const FIXTURE_DIR = path.resolve(__dirname, "..", "..", "test-fixtures", "chat-transactions");
 const SCHEMA_PATH = path.resolve(
@@ -181,7 +182,7 @@ before(() => {
 });
 
 after(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  safeRemoveDir(tmpRoot);
 });
 
 void describe("chatInteractionTransactionV1 decoder fixtures", () => {
@@ -605,7 +606,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
       expectOk(reloaded);
       assert.ok(typeof reloaded.transaction.resumeInvocationClaimedAt === "string");
     } finally {
-      fs.rmSync(raceRoot, { recursive: true, force: true });
+      safeRemoveDir(raceRoot);
     }
   });
 
@@ -679,7 +680,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
       expectOk(freshRecord);
       assert.equal(freshRecord.transaction.state, "questionsPosted");
     } finally {
-      fs.rmSync(sweepRoot, { recursive: true, force: true });
+      safeRemoveDir(sweepRoot);
     }
   });
 
@@ -723,7 +724,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
       const secondSweep = await sweepStore.sweepExpired();
       assert.deepEqual(secondSweep, { expired: 0, removed: 0 });
     } finally {
-      fs.rmSync(sweepRoot, { recursive: true, force: true });
+      safeRemoveDir(sweepRoot);
     }
   });
 
@@ -760,7 +761,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
       // transaction record is still present (as it would be if the process
       // died immediately after the marker deletion landed but before the
       // record's).
-      fs.rmSync(claimMarkerPath(sweepRoot, operationId));
+      fs.rmSync(claimMarkerPath(sweepRoot, operationId)); // deliberate: removal is the behaviour under test, not teardown
       assert.equal(fs.existsSync(recordPath(sweepRoot, operationId)), true);
 
       // The next sweep must finish the removal in this round: the transaction
@@ -775,7 +776,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
       assert.equal(fs.existsSync(recordPath(sweepRoot, operationId)), false);
       assert.equal(fs.existsSync(operationDirPath(sweepRoot, operationId)), false);
     } finally {
-      fs.rmSync(sweepRoot, { recursive: true, force: true });
+      safeRemoveDir(sweepRoot);
     }
   });
 

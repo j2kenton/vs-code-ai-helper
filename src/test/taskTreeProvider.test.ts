@@ -2284,4 +2284,57 @@ void describe("StageNode — owed-continuation indicator on the current stage ro
   });
 });
 
+void describe("StageNode — waiting for you on the current stage row (v1 fixes 2, item 8)", () => {
+  function taskAt(stage: TaskStage, overrides: Record<string, unknown> = {}): IncompleteTask {
+    return {
+      folderUri: vscode.Uri.file("/workspace/tasks/waiting-stage-task"),
+      folderName: "waiting-stage-task",
+      canonicalId: "/workspace/tasks/waiting-stage-task",
+      progress: {
+        currentStage: stage,
+        status: "active",
+        taskFolder: "waiting-stage-task",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+        ...overrides,
+      },
+    } as unknown as IncompleteTask;
+  }
+
+  void it("reads 'waiting for you' on a new task's current stage when the human acts next", () => {
+    const node = new StageNode(taskAt("desc", { nextActor: "human" }), "desc", "current", undefined);
+    assert.strictEqual(node.description, "waiting for you");
+  });
+
+  void it("keeps the row's own number and appends the posture (a review awaiting the user)", () => {
+    const node = new StageNode(
+      taskAt("impl-high-review", { nextActor: "human" }),
+      "impl-high-review",
+      "current",
+      undefined,
+      { label: "9/10" }
+    );
+    assert.strictEqual(node.description, "9/10 · waiting for you");
+  });
+
+  void it("says nothing extra for an unknown or automation next actor — absence is not a claim", () => {
+    for (const nextActor of [undefined, "automation"]) {
+      const node = new StageNode(taskAt("desc", { nextActor }), "desc", "current", undefined);
+      assert.doesNotMatch(String(node.description ?? ""), /waiting for you/);
+    }
+  });
+
+  void it("does not claim waiting while an operation is running for the task", () => {
+    const task = taskAt("desc", { nextActor: "human" });
+    const handle = taskOperations.begin(task.folderUri.fsPath, { label: "Committing and pushing", exclusive: true });
+    assert.ok(handle);
+    try {
+      const node = new StageNode(task, "desc", "current", undefined);
+      assert.doesNotMatch(String(node.description ?? ""), /waiting for you/);
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+});
+
 

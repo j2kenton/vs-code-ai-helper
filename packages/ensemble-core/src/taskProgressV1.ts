@@ -269,11 +269,15 @@ export interface TaskProgress {
    * failure (mirror of `src/types/taskProgress.ts`). See the extension's
    * copy for the full state-machine commentary. */
   quotaParkRecord?: QuotaParkRecordV1;
-  /** Who is expected to act next (mirror of `src/types/taskProgress.ts`);
-   * absent means unknown. See the extension's copy for the full contract. */
+  /** Who is expected to act next before this task makes further progress
+   * (mirror of `src/types/taskProgress.ts`, v1 fixes 2, item 8/31). Absent
+   * means unknown and must NOT be read as "human". See the extension's copy
+   * for the full commentary. */
   nextActor?: "human" | "automation";
-  /** Per-stage review-pass counter (mirror of `src/types/taskProgress.ts`).
-   * See the extension's copy for the full contract. */
+  /** Per-stage review-pass counter (mirror of `src/types/taskProgress.ts`,
+   * v1 fixes 2, item 32). Never decreases and is never reset by a stage
+   * transition. See the extension's copy for the full state-machine
+   * commentary. */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
 }
 
@@ -464,6 +468,12 @@ export interface ReviewScoreHistoryEntry {
    * entry (mirror of `src/types/taskProgress.ts`). Absent when nothing
    * matched. */
   reviewerChallengedNonGoal?: ReviewerChallengedNonGoalV1[];
+  /** `"open-editors"` when the review fell back to open editors for want of a
+   * tracked implementation file set (mirror of `src/types/taskProgress.ts`). */
+  scope?: "open-editors";
+  /** The `reviewPass` this round reserved at dispatch (mirror of
+   * `src/types/taskProgress.ts`); absent on older entries. */
+  reviewPass?: number;
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */

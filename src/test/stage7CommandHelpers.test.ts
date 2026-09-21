@@ -15,6 +15,7 @@ import {
   snapshotDirtyPaths,
   snapshotStageResponseState,
 } from "../utils/stageResponseScope";
+import { safeRemoveDir } from "./testFsUtils";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -147,7 +148,7 @@ void test("stage response scope compares nested-workspace paths in git-root coor
       outOfScope: ["workspace/src/other.ts"],
     });
   } finally {
-    fs.rmSync(repoRoot, { recursive: true, force: true });
+    safeRemoveDir(repoRoot);
   }
 });
 
@@ -168,7 +169,7 @@ void test("stage response dirty snapshot protects individual untracked files", a
     assert.ok(dirty?.has("workspace/notes/draft.md"));
     assert.equal(dirty?.has("workspace/notes/"), false);
   } finally {
-    fs.rmSync(repoRoot, { recursive: true, force: true });
+    safeRemoveDir(repoRoot);
   }
 });
 
@@ -205,7 +206,7 @@ void test("stage response dirty snapshot lines up with nested Copilot paths", as
     assert.deepEqual(changed, ["workspace/src/other.ts"]);
     assert.ok(dirty?.has(changed[0]!));
   } finally {
-    fs.rmSync(repoRoot, { recursive: true, force: true });
+    safeRemoveDir(repoRoot);
   }
 });
 
@@ -244,7 +245,7 @@ void test("stage response state diff catches out-of-scope edits hidden by fallba
       "workspace/src/outside.ts",
     ]);
   } finally {
-    fs.rmSync(repoRoot, { recursive: true, force: true });
+    safeRemoveDir(repoRoot);
   }
 });
 
@@ -269,6 +270,6 @@ void test("stage response cleanup removes out-of-scope untracked directories", a
     });
     assert.equal(fs.existsSync(outDir), false);
   } finally {
-    fs.rmSync(repoRoot, { recursive: true, force: true });
+    safeRemoveDir(repoRoot);
   }
 });

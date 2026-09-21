@@ -23,6 +23,7 @@ import {
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
 import { KnownFlakyCheck } from "../config/settings";
+import { safeRemoveDir } from "./testFsUtils";
 
 const EPERM_FLAKE: KnownFlakyCheck = {
   match: "npm run test",
@@ -188,7 +189,7 @@ void describe("classifyKnownFlakeFailures", () => {
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-known-flake-test-"));
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeWorkspace(name: string, testScript: string): string {

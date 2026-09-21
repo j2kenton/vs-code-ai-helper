@@ -15,6 +15,7 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
+import { stepProgressLabelV1 } from "../../utils/stepLabelsV1";
 
 export const APPLY_REVIEW_ACTION_KEY_V1 = "applyReview.v1";
 
@@ -124,7 +125,7 @@ export function createApplyReviewRowV1(): ProviderTaskActionRowV1 {
     ],
     eligibility: { statuses: ["active"], stages: ["plan-high-review", "plan-low-review", "plan"] },
     requiresTaskOperationLease: true,
-    progressLabel: "Applying review fixes…",
+    progressLabel: stepProgressLabelV1("apply-review"),
     validateInput: validateApplyReviewInputV1,
     loggingPolicy: { channel: "action.applyReview", includeResultMetrics: true },
     providerMode: "text",

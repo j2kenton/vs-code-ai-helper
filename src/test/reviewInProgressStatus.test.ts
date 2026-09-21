@@ -39,6 +39,7 @@ import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { StageNode } from "../views/taskTreeProvider";
 import { IncompleteTask } from "../types/incompleteTask";
 import { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Ends every currently-registered operation — the registry is a shared
  * singleton, so tests that register operations must not leak them across
@@ -360,7 +361,7 @@ void describe("StageNode — review row running detection for a rerun launched f
  * surface (which the stub `vscode` module leaves unimplemented). */
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-review-inprogress-"));
 after(() => {
-  fs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 function installFsStub(): () => void {

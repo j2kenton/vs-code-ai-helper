@@ -50,6 +50,7 @@ import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRunti
 import { appendChatMessageV1, readChatHistory } from "../utils/chatHistoryStore";
 import { deactivateNotificationRouter, initNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import * as taskProgressWriterV1Module from "../services/taskProgressWriterV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 interface PatchedFn { readonly restore: () => void }
 
@@ -63,7 +64,7 @@ const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-plan-revision-
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-plan-revision-test-private-"));
 configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
 after(() => {
-  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_ROOT);
 });
 
 function installFsBridge(): { restore: () => void } {

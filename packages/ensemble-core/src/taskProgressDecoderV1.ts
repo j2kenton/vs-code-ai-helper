@@ -812,6 +812,8 @@ function validateReviewScoreHistory(
       "reviewer",
       "supersededBlockers",
       "reviewerChallengedNonGoal",
+      "reviewPass",
+      "scope",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -864,6 +866,14 @@ function validateReviewScoreHistory(
       if (challengedError) {
         return challengedError;
       }
+    }
+    const reviewPass = entry["reviewPass"];
+    if (reviewPass !== undefined && !isNonNegativeInteger(reviewPass)) {
+      return "reviewScoreHistory entry reviewPass must be a non-negative integer";
+    }
+    const historyScope = entry["scope"];
+    if (historyScope !== undefined && historyScope !== "open-editors") {
+      return 'reviewScoreHistory entry scope must be "open-editors"';
     }
     const reviewer = entry["reviewer"];
     if (reviewer !== undefined) {

@@ -823,8 +823,10 @@ export interface ChecklistProgressV1 {
  */
 function itemsInLatestRendering(
   content: string
-): { text: string; checked: boolean; excluded: boolean; nested: boolean }[] {
-  const items: { text: string; checked: boolean; excluded: boolean; nested: boolean }[] = [];
+): { text: string; checked: boolean; excluded: boolean; nested: boolean; section: string }[] {
+  const items: { text: string; checked: boolean; excluded: boolean; nested: boolean; section: string }[] = [];
+  /** The nearest preceding markdown heading — what area of the plan an item sits under. */
+  let section = "";
   // Scoped to the latest rendering, then cut at a run summary's `## Files
   // Changed` — but only when that heading really is a summary boundary.
   //
@@ -849,6 +851,11 @@ function itemsInLatestRendering(
     if (line.fenced) {
       continue;
     }
+    const heading = /^#{1,6}[ \t]+(.*\S)/.exec(line.text);
+    if (heading) {
+      section = heading[1] ?? "";
+      continue;
+    }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
       const text = match[3] ?? "";
@@ -857,10 +864,111 @@ function itemsInLatestRendering(
         checked: match[2]?.toLowerCase() === "x",
         excluded: isExcludedChecklistItemText(text),
         nested: (match[1]?.length ?? 0) > 0,
+        section,
       });
     }
   }
   return items;
+}
+
+/** A plan area whose unticked boxes are checks for a person (or Ensemble's own verification run), not work a round can build. */
+const HANDOFF_SECTION_PATTERN = /\b(verification|hand-?off)\b/i;
+
+export interface UncheckedItemClassificationV1 {
+  /** Unticked items a round could still build, in document order. */
+  readonly buildable: readonly string[];
+  /** Unticked items under a `## Verification` / hand-off heading — checks, not work. */
+  readonly handoff: readonly string[];
+}
+
+/**
+ * Splits the plan of record's outstanding (unticked, non-excluded, top-level)
+ * items into work a round can still build and hand-off checks (v1 fixes 2,
+ * item 31). Excluded items are settled and never appear; nested items belong
+ * to their parent and are not counted, matching {@link countChecklistProgressV1}.
+ */
+export function classifyUncheckedChecklistItemsV1(planOfRecord: string): UncheckedItemClassificationV1 {
+  const buildable: string[] = [];
+  const handoff: string[] = [];
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.excluded || item.checked || item.nested) {
+      continue;
+    }
+    const text = unescapeChecklistItemTextV1(item.text);
+    (HANDOFF_SECTION_PATTERN.test(item.section) ? handoff : buildable).push(text);
+  }
+  return { buildable, handoff };
+}
+
+/** Result of {@link tickHandoffChecksV1}. */
+export interface TickHandoffChecksResultV1 {
+  /** The updated plan text — `planOfRecord` itself when nothing was ticked. */
+  readonly content: string;
+  /** The plan's own text of each item that was ticked. */
+  readonly tickedItemTexts: readonly string[];
+}
+
+/**
+ * Ticks hand-off checks on the user's word (v1 fixes 2, item 31, step 13): an
+ * unticked, non-excluded, top-level item under a `## Verification` / hand-off
+ * heading. Each tick records why — `— Checked: <note>.` — so a later reader can
+ * tell a check a person confirmed from a box a round ticked.
+ *
+ * Deliberately narrow: an item outside a hand-off section, a nested item, an
+ * excluded item and an already-ticked one are never touched, so this cannot be
+ * used to settle buildable work. Only the checkbox glyph and the appended note
+ * change; every other byte is preserved. Each requested target is ticked once,
+ * matched by normalized text.
+ */
+export function tickHandoffChecksV1(
+  planOfRecord: string,
+  ticks: readonly { readonly itemText: string; readonly note: string }[]
+): TickHandoffChecksResultV1 {
+  const pending = new Map<string, string>();
+  for (const tick of ticks) {
+    const key = normalizeChecklistItemTextV1(tick.itemText);
+    if (!pending.has(key)) {
+      pending.set(key, tick.note.replace(/\s+/g, " ").trim().replace(/\.$/, ""));
+    }
+  }
+  const tickedItemTexts: string[] = [];
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  let section = "";
+  const mergedRegion = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced) {
+        return line.raw;
+      }
+      const heading = /^#{1,6}[ \t]+(.*\S)/.exec(line.text);
+      if (heading) {
+        section = heading[1] ?? "";
+        return line.raw;
+      }
+      if (!HANDOFF_SECTION_PATTERN.test(section)) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          if (state !== " " || /^[ \t]/.test(open) || isExcludedChecklistItemText(text)) {
+            return whole;
+          }
+          const key = normalizeChecklistItemTextV1(text);
+          const note = pending.get(key);
+          if (note === undefined) {
+            return whole;
+          }
+          pending.delete(key);
+          tickedItemTexts.push(unescapeChecklistItemTextV1(text));
+          return `${open}x${close}${text} — Checked: ${note.length > 0 ? note : "confirmed by you"}.${trailing}`;
+        }
+      );
+    })
+    .join("");
+  return {
+    content: tickedItemTexts.length > 0 ? `${prefix}${mergedRegion}` : planOfRecord,
+    tickedItemTexts,
+  };
 }
 
 /**

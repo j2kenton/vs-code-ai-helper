@@ -28,6 +28,7 @@ import {
   AgentTransportV1,
   boundedTransportDetailV1,
   BoundedResultWriterV1,
+  classifyNetworkFaultV1,
 } from "../types/agentExecutionV1";
 import {
   MAX_TOOL_PROTOCOL_VIOLATIONS_V1,
@@ -293,6 +294,10 @@ export const MAX_TOOL_SESSION_CONTEXT_TOKENS_V1 = 128_000;
  * down to half the conversation's current size.
  */
 const MAX_ORPHANED_RESULT_RETRIES_V1 = 2;
+// v1 fixes 2, item 27: one in-transport resend of a round that hit a transient
+// fault, for edit sessions the coordinator cannot safely re-run from the top.
+const MAX_TRANSIENT_ROUND_RETRIES_V1 = 1;
+const TRANSIENT_ROUND_RETRY_DELAY_MS_V1 = 500;
 
 /**
  * The provider's rejection when its own over-budget pruning removed a tool
@@ -615,6 +620,7 @@ export function createCopilotLmToolSessionTransportV1(
       );
       let contextBudgetTokens = Math.floor(budgetBasisTokens * TOOL_SESSION_CONTEXT_BUDGET_FRACTION_V1);
       let orphanedResultRetries = 0;
+      let transientRoundRetries = 0;
       // After one timeout the tokenizer is treated as unavailable for the rest
       // of the session: otherwise every later result would wait out the same
       // deadline before falling back.
@@ -717,6 +723,34 @@ export function createCopilotLmToolSessionTransportV1(
         return contextBudgetExceededExit(conversationTokens(), 0);
       }
 
+      // Re-running a whole session is safe unless an edit session has already
+      // acted on a tool result: read-only modes have nothing to duplicate.
+      const retrySafeAtRound = (round: number): boolean => request.mode !== "edit" || round === 0;
+      // An edit session past its first round cannot be re-run from the top,
+      // but the CURRENT round can be resent once while nothing in it has been
+      // acted on: earlier rounds' edits stay applied and are not replayed.
+      const resendRoundOnce = async (round: number, sawToolCall: boolean): Promise<boolean> => {
+        if (
+          retrySafeAtRound(round) ||
+          sawToolCall ||
+          transientRoundRetries >= MAX_TRANSIENT_ROUND_RETRIES_V1
+        ) {
+          return false;
+        }
+        transientRoundRetries += 1;
+        await new Promise<void>((resolve) => setTimeout(resolve, TRANSIENT_ROUND_RETRY_DELAY_MS_V1));
+        return !request.cancellationToken.isCancellationRequested;
+      };
+
+      // Once the in-session resend has been spent, the terminal failure must
+      // say so: it bypasses the coordinator's "attempt N of 2" accounting.
+      const noteResendAttempts = (detail: string | undefined): string | undefined =>
+        transientRoundRetries === 0
+          ? detail
+          : `${detail === undefined ? "" : `${detail} `}(attempt ${transientRoundRetries + 1} of ${
+              MAX_TRANSIENT_ROUND_RETRIES_V1 + 1
+            } on this tool round)`;
+
       for (let round = 0; round < maxRounds; round++) {
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
@@ -731,6 +765,7 @@ export function createCopilotLmToolSessionTransportV1(
         const roundResults: TrackedToolResultV1[] = [];
         let roundToolCallBytes = 0;
         let orphanedRejectionDetail: string | undefined;
+        let resendTransientFault = false;
         const roundToolNames: string[] = [];
         let roundResultBytes = 0;
         let sawToolCall = false;
@@ -968,17 +1003,30 @@ export function createCopilotLmToolSessionTransportV1(
             orphanedResultRetries < MAX_ORPHANED_RESULT_RETRIES_V1
           ) {
             orphanedRejectionDetail = detail;
+          } else if (classifyNetworkFaultV1(error) && (await resendRoundOnce(round, sawToolCall))) {
+            resendTransientFault = true;
           } else {
+            // v1 fixes 2, item 27: a dropped connection is a fault of the
+            // pipe, not the model, so the coordinator may retry this
+            // candidate once. Only while re-running is safe: an edit session
+            // past its first round has already acted on tool results.
+            const networkFault = classifyNetworkFaultV1(error) && retrySafeAtRound(round);
+            const failureDetail = noteResendAttempts(detail);
             return {
               kind: "transportFailure",
               code: "copilotRequestFailed",
-              ...(detail !== undefined ? { detail } : {}),
+              ...(failureDetail !== undefined ? { detail: failureDetail } : {}),
+              ...(networkFault ? { networkFault: true } : {}),
             };
           }
         } finally {
           clearTimeout(roundTimer);
           callerCancelSub.dispose();
           roundCts.dispose();
+        }
+        if (resendTransientFault) {
+          round -= 1;
+          continue;
         }
         if (orphanedRejectionDetail !== undefined) {
           // Halve the budget and shed to it, then resend the same round. If
@@ -1018,6 +1066,22 @@ export function createCopilotLmToolSessionTransportV1(
         });
 
         if (!sawToolCall) {
+          // An empty reply is a transient fault of the pipe, not a finished
+          // answer: report it so the coordinator retries once instead of the
+          // frame parser rejecting "" and pausing the task for a human
+          // (v1 fixes 2, item 27).
+          if (roundText.trim().length === 0 && assistantRawParts.length === 0) {
+            if (await resendRoundOnce(round, sawToolCall)) {
+              round -= 1;
+              continue;
+            }
+            return {
+              kind: "transportFailure",
+              code: "copilotEmptyResponse",
+              detail: noteResendAttempts(`Copilot returned an empty response on tool round ${round + 1}`),
+              ...(retrySafeAtRound(round) ? { networkFault: true } : {}),
+            };
+          }
           // A round with no tool calls ENDS the session, so a model that uses
           // one to think out loud loses its real answer. Observed 2026-08-18
           // (jester review): after reading the files it wrote a paragraph of

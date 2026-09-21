@@ -36,6 +36,7 @@ import { createChatSendRowV1 } from "../actions/rows/chatSendRowV1";
 import { TaskActionExecutionContextV1 } from "../actions/taskActionRegistryV1";
 import { CompletedContentV1 } from "../types/aiResultEnvelope";
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring
  * globalAssistantSendRowV1.test.ts's installReadFileBridge — the dispatch
@@ -456,7 +457,7 @@ void test("every bracket envelope token this prompt advertises is consumed by th
     }
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -517,7 +518,7 @@ void test("dispatchProposedStageActionV1 executes a confirmed action and appends
     win.showWarningMessage = originalWarning;
     commandsObj._executeCommandOverride = originalExecOverride;
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -566,7 +567,7 @@ void test("dispatchProposedStageActionV1 appends a declined-confirmation refusal
     win.showWarningMessage = originalWarning;
     commandsObj._executeCommandOverride = originalExecOverride;
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -614,7 +615,7 @@ void test("dispatchProposedStageActionV1 refuses a malformed setTaskStage payloa
   } finally {
     win.showWarningMessage = originalWarning;
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -649,7 +650,7 @@ void test("dispatchProposedStageActionV1 refuses an unrecognized action id witho
     assert.match(history[0]!.text, /not one of this task's recognized stage actions/);
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -720,7 +721,7 @@ void test("a plan.md edit marked [[RESOLVES_BLOCKER]] during a sole-blocker plan
     assert.ok(!fs.existsSync(`${folder}/plan.md`), "plan.md must not be written until the user confirms");
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -781,7 +782,7 @@ void test("a plan.md edit that shares the blocker's vocabulary but omits [[RESOL
     assert.match(last.text, /_Updated `plan\.md`\._/);
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -851,7 +852,7 @@ void test("an unrelated plan.md edit during a sole-blocker plan-review chat stil
     assert.match(written, /typo fixed/, "the unrelated edit must still auto-apply, exactly like any ordinary chat edit");
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -920,7 +921,7 @@ void test("an edit restating the blocker as still pending (with no marker) still
     assert.match(last.text, /_Updated `plan\.md`\._/);
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -987,7 +988,7 @@ void test("an edit merely promising future approval (with no marker) still auto-
     assert.match(last.text, /_Updated `plan\.md`\._/);
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -1056,7 +1057,7 @@ void test("an edit describing sign-off as outstanding (with no marker) still aut
     assert.match(last.text, /_Updated `plan\.md`\._/);
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -1117,7 +1118,7 @@ void test("a plan.md edit marked [[RESOLVES_BLOCKER]] during a multi-blocker pla
     assert.ok(fs.existsSync(`${folder}/plan.md`), "an ordinary chat edit with no candidate must still auto-apply");
   } finally {
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -1159,7 +1160,7 @@ void test("dispatchProposedBlockerSupersessionEditV1 applies the write only on c
   } finally {
     win.showWarningMessage = originalWarning;
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -1192,7 +1193,7 @@ void test("dispatchProposedBlockerSupersessionEditV1 writes nothing when the con
   } finally {
     win.showWarningMessage = originalWarning;
     bridge.restore();
-    fs.rmSync(folder, { recursive: true, force: true });
+    safeRemoveDir(folder);
   }
 });
 
@@ -1239,7 +1240,7 @@ void test("readStageArtifactsForChat annotates a blocker superseded via chat, wi
     assert.match(context, /`plan\.md`/);
   } finally {
     bridge.restore();
-    fs.rmSync(dir, { recursive: true, force: true });
+    safeRemoveDir(dir);
   }
 });
 
@@ -1276,7 +1277,7 @@ void test("readStageArtifactsForChat never masks a blocker a fresher review re-a
     assert.doesNotMatch(context, /Superseded: the blocker/);
   } finally {
     bridge.restore();
-    fs.rmSync(dir, { recursive: true, force: true });
+    safeRemoveDir(dir);
   }
 });
 
@@ -1309,6 +1310,6 @@ void test("readStageArtifactsForChat ignores a supersession recorded against a d
     assert.doesNotMatch(context, /Superseded: the blocker/);
   } finally {
     bridge.restore();
-    fs.rmSync(dir, { recursive: true, force: true });
+    safeRemoveDir(dir);
   }
 });

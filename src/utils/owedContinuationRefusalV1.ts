@@ -78,7 +78,12 @@ export function describeOwedContinuationRefusalV1(
       : " Reload the window to release a dead owner and rerun the implementation manually if this " +
         "persists — it will not restart by itself."
     : budgetExhausted
-      ? " Review the task and rerun the implementation manually to continue; it will not retry on its own."
+      ? // v1 fixes 2, item 15: "rerun the implementation manually" is refused
+        // by this very record — a pending, cap-reached continuation blocks
+        // every dispatch that would rerun it. Name the action that actually
+        // clears the record instead.
+        ' Review the run log for what the round actually changed, then use "Discard this owed ' +
+        'continuation" to clear it by hand — rerunning will not help, it is refused by this same record.'
       : " Wait — no action is needed from you.";
   return `${blocker}${leaseClause}${retryClause}${filesClause}${remedyClause}`;
 }

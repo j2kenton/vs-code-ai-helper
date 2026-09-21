@@ -21,10 +21,11 @@ import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import { collectCompletionLint, CompletionCheckDescriptor } from "../utils/completionLint";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-completionlint-observer-test-"));
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function writeJson(filePath: string, value: unknown): void {
@@ -223,8 +224,9 @@ void describe("collectCompletionLint — onCheckEvent observer", () => {
   void it("runCompletionLint (the commit/push and Publish-Checks-command entry point) has no way to pass an observer", () => {
     // `runCompletionLint` — used by runPublishChecks.ts (commit/push),
     // publishPreflight.ts's persisted-preflight branch, and
-    // runLintingFixes.ts — takes only `(folderUri, relevantFiles?)` and
-    // forwards to `collectCompletionLintPreview` with no `onCheckEvent`.
+    // runLintingFixes.ts — takes only `(folderUri, relevantFiles?, { token }?)`
+    // (the token lets Publish Checks be cancelled, item 29) and forwards to
+    // `collectCompletionLintPreview` with no `onCheckEvent`.
     // This is a structural (not just conventional) guarantee: there is no
     // parameter through which one of those callers COULD publish activity,
     // matching the plan's requirement that only the workflow completion-
@@ -235,8 +237,8 @@ void describe("collectCompletionLint — onCheckEvent observer", () => {
     );
     assert.match(
       source,
-      /export async function runCompletionLint\(folderUri: vscode\.Uri, relevantFiles\?: readonly string\[\]\): Promise<CompletionLintResult> \{\s*const result = await collectCompletionLintPreview\(folderUri, relevantFiles, \{ allowScopePrompt: true \}\);/,
-      "runCompletionLint must take no onCheckEvent-shaped option and must not forward one to collectCompletionLintPreview"
+      /export async function runCompletionLint\(folderUri: vscode\.Uri, relevantFiles\?: readonly string\[\], options\?: \{ token\?: vscode\.CancellationToken \}\): Promise<CompletionLintResult> \{\s*const result = await collectCompletionLintPreview\(folderUri, relevantFiles, \{ allowScopePrompt: true, token: options\?\.token \}\);/,
+      "runCompletionLint must take no onCheckEvent-shaped option (only a cancellation token) and must not forward an observer to collectCompletionLintPreview"
     );
 
     const preflightSource = nodeFs.readFileSync(

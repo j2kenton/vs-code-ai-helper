@@ -333,9 +333,9 @@ void describe("audit blocks", () => {
       const groups = partitionSeedByBlock(provider as AuditProviderId, models ?? []);
       assert.deepEqual(groups.map((g) => [g.block, g.scope]), [["default", "picker"]], provider);
     }
-    for (const slug of catalog.copilotRuleSlugs) {
-      assert.equal(blockForSeedId("copilot", slug).block, "default");
-    }
+    // No Copilot loop: since v1 fixes 2 item 19 Copilot has no static seed
+    // (base ids only, discovered through the VS Code LM API), so there are no
+    // Copilot ids for this audit to partition.
     for (const id of catalog.geminiFallbackIds) {
       assert.equal(blockForSeedId("gemini-cli", id).block, "default");
     }
@@ -348,7 +348,6 @@ void describe("audit blocks", () => {
   });
 
   void it("exposes the audit accessor without seed data moving", () => {
-    assert.ok(catalog.copilotRuleSlugs.includes("claude-fable-5"));
     assert.ok(catalog.geminiFallbackIds.includes("gemini-2.5-pro"));
     assert.deepEqual(catalog.strippedFreeMarkerIds, []);
     assert.ok((catalog.seeded["claude-cli"] ?? []).some((m) => m.model === "fable"));

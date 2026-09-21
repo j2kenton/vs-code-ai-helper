@@ -29,6 +29,7 @@ import {
   readTaskImplementationBaselineShaV1,
   recordTaskImplementationBaselineShaIfAbsentV1,
 } from "../utils/taskImplementationBaselineV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -84,7 +85,7 @@ git(REPO_ROOT, ["add", "-A"]);
 git(REPO_ROOT, ["commit", "-m", "repo seed"]);
 
 after(() => {
-  nodeFs.rmSync(REPO_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REPO_ROOT);
 });
 
 void describe("taskImplementationBaselineV1 (workflow round 8, item 1's re-review-only baseline gap)", () => {

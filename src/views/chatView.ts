@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import { isViewerHostV1 } from "../state/hostRoleV1";
 import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
 import * as path from "path";
+import { normalizePath } from "../utils/taskRoot";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
@@ -28,7 +29,7 @@ import {
   settleChatInteraction,
 } from "../utils/chatHistoryStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
-import { formatTimestampForDisplay } from "../utils/timeFormat";
+import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
 import {
   decodeStructuredAnswersArrayV1,
   DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
@@ -49,7 +50,10 @@ import {
 } from "../state/workAdmissionV1";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
-import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import {
+  readEffectivePlanChecklistProgressForDisplayV1,
+  readEffectivePlanChecklistProgressV1,
+} from "../utils/effectiveReviewProgress";
 import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import {
@@ -461,6 +465,60 @@ export function formatChatSchedulingPostureLineV1(
     case "unknown":
       return "unknown — cannot determine this task's scheduling posture";
   }
+}
+
+/** Plain text a decision card puts on the clipboard: everything the card
+ * shows that a person would want to paste elsewhere, one item per line. The
+ * webview cannot import host code, so this is built here and posted as
+ * `copyText`. Exported for direct unit testing. */
+export function buildDecisionCopyTextV1(
+  decision: Pick<WorkflowDecisionV1, "whatHappened" | "whyUserNeeded" | "options" | "recommendation" | "evidence">,
+  gatingLine: string,
+  isBlockingDecision: boolean
+): string {
+  const lines = [
+    isBlockingDecision ? "Decision needed" : "Optional",
+    decision.whatHappened,
+    decision.whyUserNeeded,
+    gatingLine,
+  ];
+  for (const item of decision.evidence ?? []) {
+    lines.push(`${item.label}: ${item.detail}`);
+  }
+  for (const option of decision.options) {
+    const recommended =
+      option.disabled !== true &&
+      decision.recommendation.kind === "option" &&
+      decision.recommendation.optionId === option.optionId;
+    lines.push(
+      `- ${option.label}${recommended ? " (Recommended)" : ""} — ${option.consequence}` +
+        (option.disabled === true
+          ? ` (unavailable: ${option.disabledReason ?? "this option cannot run right now"})`
+          : "")
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Plain text an interaction card puts on the clipboard: each question's
+ * prompt (with its required/optional marker), help text and option labels.
+ * Exported for direct unit testing. */
+export function buildInteractionCopyTextV1(
+  interaction: Pick<ChatDocumentInteractionV1, "questions">
+): string {
+  const lines: string[] = ["Needs your reply"];
+  for (const question of interaction.questions) {
+    lines.push(`${question.prompt}${question.required ? " *" : " (optional)"}`);
+    if (question.helpText) {
+      lines.push(question.helpText);
+    }
+    if (question.kind !== "text") {
+      for (const option of question.options) {
+        lines.push(`- ${option.label}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 /** Merge durable transcript records and workspace-state decision cards by
@@ -2237,6 +2295,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * Repaint the panel so its header shows the implementation checklist's
+   * current percentage, when — and only when — the panel is showing THIS
+   * task's Implementation chat. Resolves `true` when it repainted, `false`
+   * when it did nothing (no view, no target, the global assistant, another
+   * stage, another task). Never throws for a non-matching target.
+   *
+   * A pure repaint: it persists nothing — no chat-history write, no target
+   * change, no appended message, no scheduling. That is what makes it safe
+   * to call from a file watcher while a run is ticking boxes.
+   */
+  public async refreshImplementationProgressForTaskV1(taskFolderUri: vscode.Uri): Promise<boolean> {
+    const target = this.target;
+    if (
+      !this.view ||
+      !target ||
+      target.kind === "global" ||
+      target.stage !== "impl" ||
+      normalizePath(target.taskFolderPath) !== normalizePath(taskFolderUri.fsPath)
+    ) {
+      return false;
+    }
+    await this.render();
+    return true;
+  }
+
+  /**
    * Paint the panel. Whatever happens, the webview gets a state message.
    *
    * Everything this method reads beyond the transcript is a secondary detail
@@ -2519,7 +2603,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // chat header showed no number whatsoever — the same "is it working, and
     // how far along" question the task tree already answers for that stage.
     if (target && target.kind !== "global" && target.stage === "impl") {
-      const implCounted = await readEffectivePlanChecklistProgressV1(
+      // Display read: this header refreshes while a run ticks boxes and must
+      // never save a `plan-final.md` editor the user is mid-edit in.
+      const implCounted = await readEffectivePlanChecklistProgressForDisplayV1(
         vscode.Uri.file(target.taskFolderPath)
       ).catch(() => undefined);
       if (!sameRenderTarget(target, this.target)) return;
@@ -2594,14 +2680,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // without every option being guaranteed to unblock it (e.g. a "wait"
     // choice), and conflating the two either falsely denies pause ownership
     // or falsely promises an unblock.
-    const displayDecisions = pendingDecisions.map((decision) => ({
-      ...decision,
-      gatingLine: renderHandoffFieldLineV1(
+    const decisionAnchorAt = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.decisionId) decisionAnchorAt.set(entry.decisionId, entry.at);
+    }
+    const displayDecisions = pendingDecisions.map((decision) => {
+      const gatingLine = renderHandoffFieldLineV1(
         "decisionRecord",
         "gating",
         decision.gating !== undefined ? { gating: decision.gating } : undefined,
         "unknown"
-      ).text,
+      ).text;
+      const isBlockingDecision =
+        decision.gating === undefined ||
+        decision.gating.holdsTaskPaused === true ||
+        decision.gating.unblocksProgress === true;
+      // Same time the timeline sorts by: the message that announced the
+      // decision, else its own `createdAt`. An unparsable anchor falls back
+      // to `createdAt`; both unparsable shows no time rather than "Invalid".
+      const anchored = formatDisplayTimestampPairV1(decisionAnchorAt.get(decision.decisionId));
+      const { atLabel, atTitle } = anchored.atLabel
+        ? anchored
+        : formatDisplayTimestampPairV1(decision.createdAt);
+      return {
+      ...decision,
+      gatingLine,
+      atLabel,
+      atTitle,
+      copyText: buildDecisionCopyTextV1(decision, gatingLine, isBlockingDecision),
       isGating: decision.gating?.holdsTaskPaused === true,
       // Headline/severity predicate — distinct from `isGating` above (which
       // deliberately tracks `holdsTaskPaused` alone for the border
@@ -2611,10 +2717,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // forward still deserves the blocking "Decision needed" headline.
       // Unknown gating (undefined, predates the field) defaults to blocking —
       // absence is never positive evidence.
-      isBlockingDecision:
-        decision.gating === undefined ||
-        decision.gating.holdsTaskPaused === true ||
-        decision.gating.unblocksProgress === true,
+      isBlockingDecision,
+      };
+    });
+    const displayInteractions = interactions.map((interaction) => ({
+      ...interaction,
+      ...formatDisplayTimestampPairV1(interaction.postedAt),
+      copyText: buildInteractionCopyTextV1(interaction),
     }));
     // "What happens next" — the chat panel's half of the always-present
     // scheduling posture (task "Actionable Hand-offs", PART 6; the task-tree
@@ -2711,7 +2820,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       schedulingPostureLine,
       entries: displayEntries,
       timeline: buildChatTimelineV1(displayEntries, displayDecisions),
-      interactions,
+      interactions: displayInteractions,
       decisions: displayDecisions,
       busy,
       busyDetail,
@@ -2735,7 +2844,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           --ensemble-border-width: 1px;
           --ensemble-focus-width: 2px;
           --ensemble-radius: 3px;
+          /* Informational helper copy reads at full contrast; disabled text
+             takes the readable muted grey that helper copy used to have.
+             Both flip per theme kind below. */
+          --ensemble-info-foreground: var(--vscode-foreground);
+          --ensemble-disabled-foreground: var(--vscode-descriptionForeground);
         }
+        body.vscode-light { --ensemble-info-foreground: #000000; }
+        body.vscode-dark { --ensemble-info-foreground: #ffffff; }
         body {
           font-family: var(--vscode-font-family);
           color: var(--vscode-foreground);
@@ -2752,7 +2868,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           border-bottom: var(--ensemble-border-width) solid var(--vscode-panel-border);
         }
         #scheduling-posture {
-          color: var(--vscode-descriptionForeground);
+          color: var(--ensemble-info-foreground);
           font-size: 0.9em;
           margin: 0 0 var(--ensemble-space-3);
           display: none;
@@ -2766,6 +2882,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .msg-row {
           margin: 0 0 var(--ensemble-space-4);
         }
+        /* .msg-meta, .msg-copy, #busy-indicator and #empty-notice stay on the
+           muted colour on purpose: they are metadata/status, not info blocks. */
         .msg-meta {
           display: flex;
           align-items: center;
@@ -2902,7 +3020,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .interaction-title { font-weight: bold; margin-bottom: var(--ensemble-space-2); color: var(--vscode-inputValidation-warningForeground); }
         .interaction-question { margin-bottom: var(--ensemble-space-3); }
         .interaction-prompt { margin-bottom: var(--ensemble-space-1); }
-        .interaction-help { font-size: 0.9em; color: var(--vscode-descriptionForeground); margin-bottom: var(--ensemble-space-1); }
+        .interaction-help { font-size: 0.9em; color: var(--ensemble-info-foreground); margin-bottom: var(--ensemble-space-1); }
         .interaction-option { display: block; margin: var(--ensemble-space-1) 0; }
         .interaction-question textarea {
           width: 100%; box-sizing: border-box; font-family: inherit; font-size: inherit;
@@ -2958,15 +3076,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         .decision-evidence-title { font-weight: bold; margin-bottom: var(--ensemble-space-1); }
         .decision-option { display: block; margin: var(--ensemble-space-2) 0; }
-        .decision-option-consequence { margin: 0 0 0 1.5em; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+        .decision-option-consequence { margin: 0 0 0 1.5em; font-size: 0.9em; color: var(--ensemble-info-foreground); }
         .decision-option-destructive { color: var(--vscode-inputValidation-errorForeground); font-weight: bold; }
-        .decision-option-disabled { opacity: 0.6; cursor: not-allowed; }
+        .decision-option-disabled { color: var(--ensemble-disabled-foreground); cursor: not-allowed; }
+        .decision-option-disabled .decision-option-consequence { color: var(--ensemble-disabled-foreground); }
         .decision-option-disabled-reason { margin: 0 0 0 1.5em; font-size: 0.9em; font-style: italic; color: var(--vscode-inputValidation-warningForeground, var(--vscode-descriptionForeground)); }
-        .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--vscode-descriptionForeground); }
-        .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+        .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--ensemble-info-foreground); }
+        .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--ensemble-info-foreground); }
         .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
         .decision-gating.decision-gating-active { color: var(--vscode-inputValidation-warningForeground); font-weight: bold; }
-        .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+        #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+        .interaction-actions + .msg-meta { margin-top: var(--ensemble-space-2); }
+        .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div><div id="scheduling-posture" role="status"></div>
@@ -2975,8 +3096,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">No task is running.</span></div>
+      <div id="steering-note" role="note">Messages here are not passed to the next round. To change what a round does, edit <code>plan-final.md</code> &mdash; rounds read it.</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -2998,6 +3120,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // answers already recorded on the interaction (e.g. a crash-recovered
       // submission — see chatHistoryStore.ts's RECONCILIATION section) are
       // hydrated into the controls instead of always starting blank.
+      // The copy-button + timestamp row shared by transcript messages and the
+      // interaction/decision cards, so every kind of chat entry copies and
+      // dates the same way. An empty atLabel means the record carried no
+      // usable time: the span stays (layout is stable) but is empty and
+      // untitled. type=button so a press never submits or selects anything.
+      function buildMsgMeta(text,atLabel,atTitle){
+        const meta=document.createElement('div');meta.className='msg-meta';
+        const time=document.createElement('span');time.className='msg-time';
+        if(atLabel){time.textContent=atLabel;if(atTitle)time.title=atTitle;}
+        const copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='msg-copy';copyBtn.title='Copy message';copyBtn.setAttribute('aria-label','Copy message');copyBtn.textContent='⧉';
+        let copyTimer;
+        copyBtn.addEventListener('click',()=>{
+          navigator.clipboard.writeText(text);
+          // Re-clicking restarts the ~1 s "copied" confirmation instead of
+          // letting a stale timer revert the fresh checkmark early.
+          if(copyTimer!==undefined)clearTimeout(copyTimer);
+          copyBtn.textContent='✓';copyBtn.setAttribute('aria-label','Copied');copyBtn.title='Copied';
+          copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
+        });
+        meta.appendChild(copyBtn);meta.appendChild(time);
+        return meta;
+      }
       function renderInteraction(interaction,append){
         if(!append) ic.replaceChildren();
         if(!interaction){ ic.style.display='none'; return; }
@@ -3119,6 +3263,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         cancelBtn.addEventListener('click',()=>{ v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); });
         actions.appendChild(confirmBtn); actions.appendChild(chatBtn); actions.appendChild(cancelBtn);
         ic.appendChild(actions);
+        ic.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
         // A question is an interruption that needs a visible reply, not a
         // passive transcript item. Focus its first control when the block is
         // initially rendered; later unresolved questions keep their own
@@ -3238,6 +3383,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           });
           actions.appendChild(confirmBtn);
           card.appendChild(actions);
+          card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
           root.appendChild(card);
         }
       }
@@ -3299,22 +3445,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
+        sn.style.display=(s.target&&s.target.kind!=='global')?'block':'none';
         sp.textContent=s.schedulingPostureLine??'';sp.classList.toggle('visible',!!s.schedulingPostureLine);
         function renderMessage(x){
           const row=document.createElement('div');row.className='msg-row';
-          const meta=document.createElement('div');meta.className='msg-meta';
-          const time=document.createElement('span');time.className='msg-time';time.textContent=x.atLabel??'';time.title=x.atTitle??'';
-          const copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='msg-copy';copyBtn.title='Copy message';copyBtn.setAttribute('aria-label','Copy message');copyBtn.textContent='⧉';
-          let copyTimer;
-          copyBtn.addEventListener('click',()=>{
-            navigator.clipboard.writeText(x.text);
-            // Re-clicking restarts the ~1 s "copied" confirmation instead of
-            // letting a stale timer revert the fresh checkmark early.
-            if(copyTimer!==undefined)clearTimeout(copyTimer);
-            copyBtn.textContent='✓';copyBtn.setAttribute('aria-label','Copied');copyBtn.title='Copied';
-            copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
-          });
-          meta.appendChild(copyBtn);meta.appendChild(time);
+          const meta=buildMsgMeta(x.text,x.atLabel,x.atTitle);
           const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+'] '+x.text+(x.endingPendingReconciliation?' — ending pending reconciliation':'');
           row.appendChild(d);row.appendChild(meta);
           // Part 10 item 13e: a pending legacy question's OWN bound reply
@@ -3351,22 +3486,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         m.replaceChildren();
         dc.replaceChildren();dc.style.display='none';
-        const activities=[];
         for(const item of (s.timeline||s.entries.map(value=>({type:'message',value})))){
           if(item.type==='decision'){
             const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
             renderDecisions([item.value],decisionWrap);m.appendChild(decisionWrap);
-          }else if(item.value.kind==='activity'||(item.value.kind===undefined&&typeof item.value.text==='string'&&item.value.text.trim().startsWith('_Auto-starting:'))){
-            activities.push(item.value);
+          }else if(item.value.kind==='activity'||item.value.kind==='outcome'){
+            // Machine status, not conversation: stored unchanged in chat-v1.json
+            // (and mirrored in the notification store), never a transcript turn.
+            // An untyped entry is conversation — absence never means activity.
+            continue;
           }else{
             m.appendChild(renderMessage(item.value));
           }
-        }
-        if(activities.length){
-          const group=document.createElement('details');group.className='activity-group';
-          const summary=document.createElement('summary');summary.textContent='Activity ('+activities.length+')';group.appendChild(summary);
-          for(const activity of activities){group.appendChild(renderMessage(activity));}
-          m.appendChild(group);
         }
         renderInteractions(s.interactions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';

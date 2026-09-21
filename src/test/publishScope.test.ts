@@ -46,6 +46,7 @@ import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Route NotificationRouter to the vscode stub's window methods, mirroring
 // completedTaskResume.test.ts, so command-level flows can complete.
@@ -63,7 +64,7 @@ initNotificationRouter({
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-scope-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeDirs(...segments: string[][]): void {

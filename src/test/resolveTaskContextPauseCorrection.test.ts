@@ -8,6 +8,7 @@ import { TaskProgress } from "../types/taskProgress";
 import { TaskWithProgress } from "../state/taskInventory";
 import { correctResolvedForRevokedWatchdogPauseV1 } from "../utils/resolveTaskContext";
 import { advancePauseFenceGenerationV1, readOrInitPauseFenceGenerationV1 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * Part 1b step 13 ("audit every pause-sensitive read ... command
@@ -26,7 +27,7 @@ void describe("correctResolvedForRevokedWatchdogPauseV1", () => {
     const container = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-resolve-ctx-pause-"));
     const folder = path.join(container, name);
     fs.mkdirSync(folder, { recursive: true });
-    return { folder, cleanup: () => fs.rmSync(container, { recursive: true, force: true }) };
+    return { folder, cleanup: () => safeRemoveDir(container) };
   }
 
   function makeProgress(overrides: Partial<TaskProgress>): TaskProgress {

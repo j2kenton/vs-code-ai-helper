@@ -20,6 +20,7 @@ import * as vscode from "vscode";
 
 import { generateImplReviewContextPack } from "../utils/contextPack";
 import { IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS } from "../utils/implReviewFileSelection";
+import { safeRemoveDir } from "./testFsUtils";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -56,7 +57,7 @@ git(REPO_ROOT, ["config", "user.email", "test@example.com"]);
 git(REPO_ROOT, ["config", "user.name", "Test"]);
 
 after(() => {
-  nodeFs.rmSync(REPO_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REPO_ROOT);
 });
 
 void describe("generateImplReviewContextPack — git-diff-derived changed-region excerpts (workflow round 8, item 1)", () => {

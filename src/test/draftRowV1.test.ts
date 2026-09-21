@@ -63,6 +63,7 @@ import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { AgentTransportV1 } from "../types/agentExecutionV1";
 import { V1ReserveNextResultV1 } from "../runners/runnerRegistry";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 const INITIAL_TASK_MD = [
   "## Task Description",
@@ -280,8 +281,8 @@ function setUpTestEnvV1(): TestEnvV1 {
     },
     tearDown(): void {
       resetWorkflowRuntimeServicesForTestV1();
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
-      fs.rmSync(privateStorageDir, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
+      safeRemoveDir(privateStorageDir);
     },
   };
 }

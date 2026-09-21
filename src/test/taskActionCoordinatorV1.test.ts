@@ -101,6 +101,7 @@ import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
 } from "../services/workflowLeaseStoreV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ACTION_KEY = "coordinatorTestAction.v1";
 const TEST_ROUTE = "vs-code-ai-helper.coordinatorTestRoute";
@@ -370,7 +371,7 @@ void describe("taskActionCoordinatorV1", () => {
   });
   after(() => {
     (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).delete(TEST_ACTION_KEY);
-    fs.rmSync(orchestratorTmpRoot, { recursive: true, force: true });
+    safeRemoveDir(orchestratorTmpRoot);
   });
 
   /**
@@ -1000,7 +1001,7 @@ void describe("taskActionCoordinatorV1", () => {
       const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as { purpose?: string };
       assert.equal(meta.purpose, "recovery");
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -1085,7 +1086,7 @@ void describe("taskActionCoordinatorV1", () => {
         "the preserved bytes must be the exact unsealed response text"
       );
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -1131,7 +1132,7 @@ void describe("taskActionCoordinatorV1", () => {
       );
       assert.equal(harness.promoted.length, 0);
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -1964,8 +1965,8 @@ void describe("taskActionCoordinatorV1", () => {
       assert.deepEqual(
         outcome.chainExhaustion?.candidates.map((candidate) => candidate.reason),
         [
-          "invoked, but the transport failed before any response arrived - connectFailed",
-          "invoked, but the transport failed before any response arrived - connectFailed",
+          "invoked, but the request failed - connectFailed",
+          "invoked, but the request failed - connectFailed",
         ],
         "each candidate's placeholder reason must be replaced with its actual recorded per-attempt outcome"
       );
@@ -1975,11 +1976,79 @@ void describe("taskActionCoordinatorV1", () => {
       // no remedy (workflow 5 run 039). cliRunTimeout, cliNotInstalled and
       // cliExit.1 must not read the same.
       for (const candidate of outcome.chainExhaustion?.candidates ?? []) {
-        assert.match(candidate.reason, /^invoked, but the transport failed before any response arrived/);
+        assert.match(candidate.reason, /^invoked, but the request failed/);
+        assert.doesNotMatch(candidate.reason, /before any response arrived/);
         assert.match(candidate.reason, /connectFailed/);
       }
     }
   );
+
+  void it("waits before the same-candidate network-fault retry instead of retrying in the same tick (v1 fixes 2, item 27)", async () => {
+    const invokedAt: number[] = [];
+    const resetTransport: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: () => {
+        invokedAt.push(Date.now());
+        return Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "copilotRequestFailed",
+          detail: "Error Code: net::ERR_HTTP2_PROTOCOL_ERROR.",
+          networkFault: true,
+        });
+      },
+    };
+    const exhaustion = {
+      stage: "impl-high-review",
+      candidates: [
+        {
+          storedModelId: "copilot:test",
+          providerLabel: "Test Provider",
+          runnerId: "scripted-transport",
+          reason: "not attempted",
+        },
+      ],
+    };
+    const harness = makeHarness([resetTransport], {}, [], undefined, exhaustion);
+    await harness.coordinator.executeAction(baseRequest());
+    assert.equal(invokedAt.length, 2, "exactly one same-candidate retry");
+    assert.ok(
+      invokedAt[1]! - invokedAt[0]! >= 500,
+      `the retry must not fire in the same tick (gap ${invokedAt[1]! - invokedAt[0]!}ms)`
+    );
+  });
+
+  void it("names the attempt count when a Copilot empty response exhausts its one retry (v1 fixes 2, item 27)", async () => {
+    const emptyReply: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: () =>
+        Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "copilotEmptyResponse",
+          detail: "Copilot returned an empty response",
+          networkFault: true,
+        }),
+    };
+    const exhaustion = {
+      stage: "impl-high-review",
+      candidates: [
+        {
+          storedModelId: "copilot:test",
+          providerLabel: "Test Provider",
+          runnerId: "scripted-transport",
+          reason: "not attempted",
+        },
+      ],
+    };
+    const harness = makeHarness([emptyReply], {}, [], undefined, exhaustion);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "unavailable");
+    if (outcome.kind !== "unavailable") {
+      assert.fail("expected unavailable");
+    }
+    const reason = outcome.chainExhaustion?.candidates[0]?.reason ?? "";
+    assert.match(reason, /Copilot returned an empty response on attempt 2 of 2/);
+    assert.doesNotMatch(reason, /before any response arrived|temporarily unavailable/);
+  });
 
   void it(
     "reports candidatesDeferred (not candidatesExhausted) when every invoked candidate was quota-blocked",

@@ -42,6 +42,7 @@ import { TaskProgress } from "../types/taskProgress";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { ReviewBlocker } from "../utils/reviewReadiness";
+import { safeRemoveDir } from "./testFsUtils";
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -88,7 +89,7 @@ function installMemStore(store: MemStore): void {
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-escalation-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolderUri(name: string): vscode.Uri {
@@ -419,7 +420,7 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
         assert.equal(decision.recommendation.optionId, "keepIterating");
       }
       const keepIterating = decision.options.find((option) => option.optionId === "keepIterating");
-      assert.equal(keepIterating?.label, "Keep iterating");
+      assert.equal(keepIterating?.label, "Keep iterating: run the next implementation round");
       // Not plain resumeTask: that only clears the pause and dispatches
       // nothing, silently stranding the task active-but-idle until some
       // other trigger picks it back up. resumeAndDispatchImplementation

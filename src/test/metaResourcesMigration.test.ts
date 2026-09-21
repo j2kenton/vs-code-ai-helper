@@ -34,6 +34,7 @@ import {
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { initNotificationRouter } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // toggleMetaResourcesGitIgnore is required (not `import`ed) so its exported
 // ensureAutomaticMetaGitIgnore can be replaced with a recorder — the real
@@ -54,7 +55,7 @@ initNotificationRouter({
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-meta-migration-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 beforeEach(() => {
   routedNotifications.length = 0;
@@ -598,7 +599,7 @@ void describe("repairLegacyOwnership", () => {
       assert.equal(await finishMigrationOwnershipRewrite(target), false);
       assert.ok(fs.existsSync(path.join(target, ".ensemble-migration.json")));
 
-      fs.rmSync(unreadable, { recursive: true, force: true });
+      safeRemoveDir(unreadable);
       assert.equal(await finishMigrationOwnershipRewrite(target), true);
       assert.equal(fs.existsSync(path.join(target, ".ensemble-migration.json")), false);
     } finally {

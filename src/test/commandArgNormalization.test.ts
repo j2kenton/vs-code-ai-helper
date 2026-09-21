@@ -82,7 +82,7 @@ import * as assert from "node:assert/strict";
 import * as nodeFs from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 // ---------------------------------------------------------------------------
@@ -431,7 +431,7 @@ const REAL_TASK_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-cmdargs-test-")
 );
 after(() => {
-  nodeFs.rmSync(REAL_TASK_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_TASK_ROOT);
 });
 
 // runReviewForFolder runs through the real production coordinator
@@ -486,6 +486,31 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
     },
   };
+}
+
+/**
+ * Items 14 + 25: resume checks the arranged action's preconditions, so a task
+ * at an impl-review stage needs a plan, implementation notes and a review
+ * artifact for "apply review" to be a valid action.
+ */
+function seedImplReviewArtifacts(
+  store: Map<string, string>,
+  folderUri: vscode.Uri,
+  reviewText = "Readiness: 6/10\n\nProse.\n"
+): void {
+  for (const [name, text] of [
+    ["plan.md", "# Plan\n"],
+    ["plan-final.md", "# Plan\n"],
+    ["impl-summary.md", "# Summary\n"],
+    ["impl-high-review.md", reviewText],
+  ] as const) {
+    store.set(vscode.Uri.joinPath(folderUri, name).toString(), text);
+  }
+}
+
+/** The artifact `runImplementationWithAI` requires, so the resume preflight lets it through. */
+function seedImplementationPlan(store: Map<string, string>, folderUri: vscode.Uri): void {
+  store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), "# Plan\n");
 }
 
 function seedProgress(
@@ -838,6 +863,7 @@ import {
   acquireOrAdoptWorkAdmissionV1,
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 void describe("pauseTask integration (full command path)", () => {
   void it("TaskNode-shaped arg pauses the exact named task", async () => {
@@ -1197,6 +1223,7 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-and-rerun-review");
+      seedImplReviewArtifacts(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-and-rerun-review",
@@ -1283,6 +1310,7 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
     let folderPath = "";
     try {
       const folderUri = makeTaskFolderUri("resume-releases-admission-before-dispatch");
+      seedImplReviewArtifacts(store, folderUri);
       folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-releases-admission-before-dispatch",
@@ -1364,6 +1392,7 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
     let folderPath = "";
     try {
       const folderUri = makeTaskFolderUri("resume-adopts-admission-not-busy");
+      seedImplReviewArtifacts(store, folderUri);
       folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-adopts-admission-not-busy",
@@ -1467,6 +1496,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-and-dispatch-impl");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-and-dispatch-impl",
@@ -1567,6 +1597,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-dispatch-active-real-owner");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-dispatch-active-real-owner",
@@ -1641,6 +1672,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     let folderPath = "";
     try {
       const folderUri = makeTaskFolderUri("resume-dispatch-active-no-owner");
+      seedImplementationPlan(store, folderUri);
       folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-dispatch-active-no-owner",
@@ -1702,6 +1734,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-busy-then-winner-releases");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-busy-then-winner-releases",
@@ -1735,17 +1768,24 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         uri: vscode.Uri
       ) => Promise<Uint8Array>;
       let winnerSimulated = false;
+      let progressReads = 0;
       (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
         uri: vscode.Uri
       ): Promise<Uint8Array> => {
-        if (!winnerSimulated && uri.fsPath === progressUri.fsPath) {
-          winnerSimulated = true;
-          nodeFs.writeFileSync(
-            progressUri.fsPath,
-            JSON.stringify({ ...progress, status: "active" }, null, 2),
-            "utf8"
-          );
-          nodeFs.rmSync(markerPath, { force: true });
+        if (uri.fsPath === progressUri.fsPath) {
+          progressReads += 1;
+          // Read 1 is the fixed-target preflight's authoritative read, which
+          // legitimately precedes admission. Only a read AFTER that is the
+          // forbidden post-busy re-read this test guards against.
+          if (progressReads >= 2 && !winnerSimulated) {
+            winnerSimulated = true;
+            nodeFs.writeFileSync(
+              progressUri.fsPath,
+              JSON.stringify({ ...progress, status: "active" }, null, 2),
+              "utf8"
+            );
+            nodeFs.rmSync(markerPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
+          }
         }
         return origReadFile(uri);
       };
@@ -1802,6 +1842,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-superseded-by-already-released-winner");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-superseded-by-already-released-winner",
@@ -1889,6 +1930,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-post-admission-reread-throws");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-post-admission-reread-throws",
@@ -1978,6 +2020,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-post-admission-reread-invalid");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-post-admission-reread-invalid",
@@ -2065,6 +2108,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
     const execCmd = installExecuteCommandStub();
     try {
       const folderUri = makeTaskFolderUri("resume-reread-fails-once-then-concurrent-active");
+      seedImplementationPlan(store, folderUri);
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-reread-fails-once-then-concurrent-active",
@@ -2085,11 +2129,13 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
       ): Promise<Uint8Array> => {
         if (uri.fsPath === progressUri.fsPath) {
           progressReadCount++;
-          if (progressReadCount === 1) {
+          // Read 1 is the fixed-target preflight's stage read; read 2 is
+          // resumeThenDispatchV1's post-admission re-read.
+          if (progressReadCount === 2) {
             // Simulate a different, concurrent invocation completing its own
             // resume in the gap right after THIS call's own post-admission
             // re-read: by the time any subsequent read of this file happens,
-            // disk already shows "active". The first read itself is a
+            // disk already shows "active". This read itself is a
             // transient, one-shot failure for this call only.
             nodeFs.writeFileSync(
               progressUri.fsPath,
@@ -2118,7 +2164,7 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
       );
       assert.strictEqual(
         progressReadCount,
-        1,
+        2,
         "resumeThenDispatchV1 must stop on 'failed' and never perform its own later re-read of the progress " +
           "file at all — reaching a second read is itself the fallthrough this test guards against"
       );
@@ -2142,6 +2188,181 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Fixed-target resumes (resumeAndRerunReviewV1 / resumeAndDispatchImplementationV1)
+// — v1 fixes 2, item 14: a resume that names its action must not reactivate the
+// task for an action whose own preconditions are known to fail.
+// ---------------------------------------------------------------------------
+
+void describe("fixed-target resume preflight (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("resumeAndRerunReviewV1 stays paused and names the missing artifact when the review cannot run", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("fixed-resume-review-missing-artifacts");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "fixed-resume-review-missing-artifacts",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      // No plan and no implementation notes: Review would be refused.
+
+      await resumeAndRerunReviewV1(makeInventoryStub(folderPath, folderPath, "paused"), makeCurrentTaskStoreStub(undefined), {
+        taskFolderPath: folderPath,
+      });
+
+      assert.strictEqual(execCmd.captured.length, 0, "no review may be dispatched into a guaranteed refusal");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some((m) => m.method === "warning" && m.message.includes("stays paused")),
+        `expected a 'stays paused' warning naming the precondition; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("resumeAndRerunReviewV1 stays paused and names the restore remedy for an unusable implementation summary", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("fixed-resume-review-unusable-summary");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "fixed-resume-review-unusable-summary",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      seedImplReviewArtifacts(store, folderUri);
+      store.set(
+        vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
+        "<!-- ensemble:implementation-summary-unusable -->\n\nThe round produced nothing usable.\n"
+      );
+      store.set(vscode.Uri.joinPath(folderUri, "impl-summary_prev.md").toString(), "# Summary\n\nUsable notes.\n");
+
+      await resumeAndRerunReviewV1(makeInventoryStub(folderPath, folderPath, "paused"), makeCurrentTaskStoreStub(undefined), {
+        taskFolderPath: folderPath,
+      });
+
+      assert.strictEqual(execCmd.captured.length, 0, "no review may be dispatched into a guaranteed refusal");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some(
+          (m) =>
+            m.method === "warning" && m.message.includes("stays paused") && m.message.includes("Restore the last usable summary")
+        ),
+        `expected a 'stays paused' warning naming the restore remedy; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("resumeAndDispatchImplementationV1 stays paused and names the missing plan when the implementation stage cannot run", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("fixed-resume-impl-missing-plan");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "fixed-resume-impl-missing-plan",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      // No plan-final.md / implementation.md.
+
+      await resumeAndDispatchImplementationV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath }
+      );
+
+      assert.strictEqual(execCmd.captured.length, 0, "no implementation round may be dispatched into a guaranteed refusal");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some((m) => m.method === "warning" && m.message.includes("stays paused")),
+        `expected a 'stays paused' warning naming the precondition; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("resumeAndRerunReviewV1 fails closed — stays paused, dispatches nothing — when the progress file cannot be read for the preflight", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("fixed-resume-review-unreadable-progress");
+      const folderPath = folderUri.fsPath;
+      // Nothing seeded: the persisted progress cannot be read.
+
+      await resumeAndRerunReviewV1(makeInventoryStub(folderPath, folderPath, "paused"), makeCurrentTaskStoreStub(undefined), {
+        taskFolderPath: folderPath,
+      });
+
+      assert.strictEqual(execCmd.captured.length, 0, "an unverified action must not be dispatched");
+      assert.ok(
+        msgs.captured.some((m) => m.method === "warning" && m.message.includes("stays paused")),
+        `expected a 'stays paused' warning; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // resumeAndApplyCurrentStageActionV1 — the review-stage plateau card's "Keep
 // iterating" button and the providerChainExhausted card's "Retry now" button
 // must both actually resume AND dispatch genuine work (A1, 1.0.0 gate, Part
@@ -2151,6 +2372,21 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
 // ---------------------------------------------------------------------------
 
 void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
+  // The resume planner refuses to arrange a review-stage action when the stage
+  // has no model configured (the command would refuse after resuming), so
+  // these tests stub a configured model — the no-model refusal has its own
+  // planner tests in resumeActionPlanV1.test.ts.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
+  const originalResolveModelForStage = modelSelectionModule.resolveModelForStage;
+  before(() => {
+    modelSelectionModule.resolveModelForStage = (): Promise<{ source: string; modelId: string }> =>
+      Promise.resolve({ source: "workspace", modelId: "stub:model" });
+  });
+  after(() => {
+    modelSelectionModule.resolveModelForStage = originalResolveModelForStage;
+  });
+
   function installExecuteCommandStub(): {
     captured: Array<{ command: string; arg: unknown }>;
     restore: () => void;
@@ -2188,10 +2424,14 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
         taskFolder: "resume-and-apply-current-stage",
         currentStage: "impl-high-review",
         status: "paused",
+        // A current review pass, so the planner arranges Apply Review rather
+        // than a fresh Review (a pass-less review is stale by design).
+        stageReviewPasses: { "impl-high-review": 1 },
         createdAt: "2026-08-24T00:00:00.000Z",
         updatedAt: "2026-08-24T00:00:00.000Z",
       };
       await seedProgress(store, folderUri, progress);
+      seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
 
       const inv = makeInventoryStub(folderPath, folderPath, "paused");
       const currentStore = makeCurrentTaskStoreStub(undefined);
@@ -2226,6 +2466,182 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
       assert.equal(dispatchArg?.taskFolderPath, folderPath);
       assert.equal(typeof dispatchArg?.admissionHandoffTokenV1, "string");
       assert.ok((dispatchArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // Items 14 + 25: a stale review arranges Review, never an Apply Review the
+  // product already knows would be refused.
+  void it("arranges Review, not Apply Review, when the stage's review carries the stale banner", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-stale-review");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "resume-and-apply-stale-review",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      seedImplReviewArtifacts(store, folderUri, "# Review Stale\n\nThe workspace changed.\n");
+      // `runReviewWithAI` resolves `true` only when a round actually started;
+      // anything else is a refusal, which puts the task back to paused.
+      const capturingExecute = (vscode.commands as unknown as Record<string, unknown>).executeCommand as (
+        command: string,
+        arg?: unknown
+      ) => Promise<unknown>;
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+        command: string,
+        arg?: unknown
+      ): Promise<unknown> => {
+        await capturingExecute(command, arg);
+        return command === "vs-code-ai-helper.runReviewWithAI" ? true : undefined;
+      };
+
+      await resumeAndApplyCurrentStageActionV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath }
+      );
+
+      assert.ok(execCmd.captured.some((e) => e.command === "vs-code-ai-helper.runReviewWithAI"));
+      assert.strictEqual(
+        execCmd.captured.find((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+        undefined
+      );
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "active");
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("stays paused, dispatches nothing and names the failed precondition when no valid action exists", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-blocked");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "resume-and-apply-blocked",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      // No plan, no implementation notes: every impl-review action would be refused.
+
+      await resumeAndApplyCurrentStageActionV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath }
+      );
+
+      assert.strictEqual(execCmd.captured.length, 0, "nothing may be dispatched");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some((m) => m.method === "warning" && m.message.includes("stays paused")),
+        `expected a 'stays paused' warning naming the precondition; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // The unusable-summary stamp is a precondition of Review (runReviewForFolder
+  // refuses it), so resume must not reactivate the task for a guaranteed refusal.
+  void it("stays paused and names the restore remedy when the implementation summary carries the unusable stamp", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-unusable-summary");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "resume-and-apply-unusable-summary",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      // A stale review would otherwise arrange Review.
+      seedImplReviewArtifacts(store, folderUri, "# Review Stale\n\nThe workspace changed.\n");
+      store.set(
+        vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
+        "<!-- ensemble:implementation-summary-unusable -->\n\nThe round produced nothing usable.\n"
+      );
+      store.set(vscode.Uri.joinPath(folderUri, "impl-summary_prev.md").toString(), "# Summary\n\nUsable notes.\n");
+
+      await resumeAndApplyCurrentStageActionV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath }
+      );
+
+      assert.strictEqual(execCmd.captured.length, 0, "no Review may be dispatched into a guaranteed refusal");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some(
+          (m) =>
+            m.method === "warning" &&
+            m.message.includes("stays paused") &&
+            m.message.includes("Restore the last usable summary")
+        ),
+        `expected a 'stays paused' warning naming the restore remedy; got ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("only resumes a new task whose next step is the human's — never dispatches Draft with AI", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-apply-new-task");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "resume-and-apply-new-task",
+        currentStage: "desc",
+        status: "paused",
+        nextActor: "human",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+
+      await resumeAndApplyCurrentStageActionV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath }
+      );
+
+      assert.strictEqual(execCmd.captured.length, 0, "nothing may be dispatched for a task the human must fill in");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "active");
     } finally {
       execCmd.restore();
       msgs.restore();
@@ -2289,10 +2705,16 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
         taskFolder: "resume-and-apply-refused",
         currentStage: "impl-high-review",
         status: "paused",
+        // A current review pass: without a matching reservation the planner
+        // (correctly) arranges a fresh Review, and this test would never reach
+        // the dispatch refusal it is about.
+        stageReviewPasses: { "impl-high-review": 1 },
         createdAt: "2026-08-24T00:00:00.000Z",
         updatedAt: "2026-08-24T00:00:00.000Z",
       };
       await seedProgress(store, folderUri, progress);
+      // This test is about the dispatch's own refusal, not the planner's.
+      seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
 
       const inv = makeInventoryStub(folderPath, folderPath, "paused");
       const currentStore = makeCurrentTaskStoreStub(undefined);
@@ -2300,11 +2722,62 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
       await resumeAndApplyCurrentStageActionV1(inv, currentStore, { taskFolderPath: folderPath });
 
       const stored = await readStoredProgress(store, folderUri);
-      assert.strictEqual(stored!.status, "active", "the task must still actually be resumed");
+      assert.strictEqual(
+        stored!.status,
+        "paused",
+        "a refused dispatch must put the task back to paused, never leave it active with nothing arranged"
+      );
       assert.strictEqual(
         stored!.nextActor,
         undefined,
         "a refused dispatch must clear the provisional automation stamp back to unknown, never leave it standing"
+      );
+    } finally {
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  void it("clears nextActor and reports a refusal when the arranged Review resolves without starting a round", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    // `runReviewWithAI` resolves `false` (or nothing) on any guard-clause
+    // refusal; only `true` means a review round started.
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = (): Promise<unknown> =>
+      Promise.resolve(false);
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-review-refused");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-review-refused",
+        currentStage: "impl-high-review",
+        status: "paused",
+        // No reservation at all: the review is a leftover, so Review is arranged.
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+      seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n");
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndApplyCurrentStageActionV1(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.nextActor, undefined, "a refused review dispatch must not leave automation stamped");
+      assert.strictEqual(stored!.status, "paused", "a refused review dispatch must not leave the task active");
+      assert.ok(
+        msgs.captured.some((m) => /was refused, so nothing is running/.test(m.message)),
+        "a refused review must be reported where the user is looking, not read as success"
       );
     } finally {
       (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
@@ -2458,10 +2931,14 @@ void describe("resumeIfPausedThenGoToReviewAndApplyV1 (production code)", () => 
         taskFolder: "resume-if-paused-goto-review",
         currentStage: "impl-high-review",
         status: "paused",
+        stageReviewPasses: { "impl-high-review": 1 },
         createdAt: "2026-08-24T00:00:00.000Z",
         updatedAt: "2026-08-24T00:00:00.000Z",
       };
       await seedProgress(store, folderUri, progress);
+      // Apply Review's own preconditions must hold for the resume to dispatch it,
+      // including a review that belongs to the current pass.
+      seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
 
       const inv = makeInventoryStub(folderPath, folderPath, "paused");
       const currentStore = makeCurrentTaskStoreStub(undefined);
@@ -2491,6 +2968,99 @@ void describe("resumeIfPausedThenGoToReviewAndApplyV1 (production code)", () => 
         msgs.captured.some((m) => m.message.includes("Task is not paused")),
         false,
         "the resumed-task path must not also show the unrelated 'Task is not paused' notice"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  for (const [caseName, seedReview, expectedFragment] of [
+    ["no review exists", false, "to apply"],
+    ["the review is the stale placeholder", true, "is stale"],
+  ] as const) {
+    void it(`stays paused and dispatches nothing when ${caseName} (Apply Review would be refused)`, async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      try {
+        const name = `resume-if-paused-goto-review-refused-${seedReview ? "stale" : "missing"}`;
+        const folderUri = makeTaskFolderUri(name);
+        const folderPath = folderUri.fsPath;
+        await seedProgress(store, folderUri, {
+          taskFolder: name,
+          currentStage: "impl",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+        seedImplReviewArtifacts(store, folderUri, "# Review Stale\n\nThe workspace changed.\n");
+        if (!seedReview) {
+          store.delete(vscode.Uri.joinPath(folderUri, "impl-high-review.md").toString());
+        }
+
+        const dispatched = await resumeIfPausedThenGoToReviewAndApplyV1(
+          makeInventoryStub(folderPath, folderPath, "paused"),
+          makeCurrentTaskStoreStub(undefined),
+          { taskFolderPath: folderPath, reviewStage: "impl-high-review" }
+        );
+
+        assert.strictEqual(dispatched, false);
+        assert.strictEqual(execCmd.captured.length, 0, "no stage change or apply may be dispatched into a known refusal");
+        assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+        assert.ok(
+          msgs.captured.some(
+            (m) => m.method === "warning" && m.message.includes("stays paused") && m.message.includes(expectedFragment)
+          ),
+          `expected a 'stays paused' warning naming the precondition; got ${JSON.stringify(msgs.captured)}`
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    });
+  }
+
+  void it("refuses Apply Review on a review left over from an earlier pass, staying paused and saying to re-run the review", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+    try {
+      const folderUri = makeTaskFolderUri("resume-if-paused-goto-review-old-pass");
+      const folderPath = folderUri.fsPath;
+      await seedProgress(store, folderUri, {
+        taskFolder: "resume-if-paused-goto-review-old-pass",
+        currentStage: "impl",
+        status: "paused",
+        // The stage has been re-reserved since this review was written.
+        stageReviewPasses: { "impl-high-review": 3 },
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      });
+      seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 2 -->\n");
+
+      const dispatched = await resumeIfPausedThenGoToReviewAndApplyV1(
+        makeInventoryStub(folderPath, folderPath, "paused"),
+        makeCurrentTaskStoreStub(undefined),
+        { taskFolderPath: folderPath, reviewStage: "impl-high-review" }
+      );
+
+      assert.strictEqual(dispatched, false);
+      assert.strictEqual(execCmd.captured.length, 0, "nothing may be dispatched against a review from an earlier pass");
+      assert.strictEqual((await readStoredProgress(store, folderUri))!.status, "paused");
+      assert.ok(
+        msgs.captured.some(
+          (m) => m.method === "warning" && m.message.includes("stays paused") && m.message.includes("earlier pass")
+        ),
+        `expected a 'stays paused' warning naming the earlier pass; got ${JSON.stringify(msgs.captured)}`
       );
     } finally {
       execCmd.restore();

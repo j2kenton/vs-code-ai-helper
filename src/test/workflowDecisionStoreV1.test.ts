@@ -304,3 +304,66 @@ void describe("WorkflowDecisionStoreV1", () => {
     assert.equal(store.listPending("/tmp/tasks/task-2").length, 1);
   });
 });
+
+void describe("WorkflowDecisionStoreV1 — answered decisions are not re-posted (v1 fixes 2, item 7)", () => {
+  const suppress = { conditionFingerprint: "latched:unrecorded", answeredOptionIds: ["wait"] };
+  const newStore = (): WorkflowDecisionStoreV1 =>
+    new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+  const idOf = (posted: { ok: boolean; decision?: WorkflowDecisionV1 }): string => posted.decision?.decisionId ?? "";
+
+  void it("does not create a new record while the answered condition and answers are unchanged", async () => {
+    const store = newStore();
+    const first = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    assert.ok(first.ok && !first.suppressed);
+    await store.resolve(idOf(first), "wait");
+
+    const again = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    assert.ok(again.ok);
+    assert.equal(again.suppressed, true);
+    assert.equal(idOf(again), idOf(first));
+    assert.equal(store.listPending().length, 0);
+  });
+
+  void it("re-asks when the offered answers change", async () => {
+    const store = newStore();
+    const first = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    await store.resolve(idOf(first), "wait");
+
+    const extra = option({ optionId: "newAnswer", label: "New", consequence: "A newly available answer." });
+    const again = await store.post(
+      decisionInput({
+        suppressWhileAnswered: suppress,
+        options: [extra, option({ optionId: "wait", label: "Wait", consequence: "x", effect: { kind: "doNothing" } })],
+      })
+    );
+    assert.ok(again.ok && !again.suppressed);
+    assert.equal(store.listPending().length, 1);
+  });
+
+  void it("re-asks when the condition fingerprint changes", async () => {
+    const store = newStore();
+    const first = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    await store.resolve(idOf(first), "wait");
+    const again = await store.post(
+      decisionInput({ suppressWhileAnswered: { ...suppress, conditionFingerprint: "latched:new reason" } })
+    );
+    assert.ok(again.ok && !again.suppressed);
+  });
+
+  void it("re-asks after an answer that is not in answeredOptionIds (it cleared the condition)", async () => {
+    const store = newStore();
+    const first = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    await store.resolve(idOf(first), "doIt");
+    const again = await store.post(decisionInput({ suppressWhileAnswered: suppress }));
+    assert.ok(again.ok && !again.suppressed);
+  });
+
+  void it("never suppresses a poster that did not opt in", async () => {
+    const store = newStore();
+    const first = await store.post(decisionInput());
+    await store.resolve(idOf(first), "wait");
+    const again = await store.post(decisionInput());
+    assert.ok(again.ok && !again.suppressed);
+    assert.equal(store.listPending().length, 1);
+  });
+});

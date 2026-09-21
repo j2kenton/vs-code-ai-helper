@@ -40,12 +40,13 @@ import {
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-apply-verified-ticks-test-")
 );
 after(() => {
-  nodeFs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 const CHECKLIST_PLAN = [

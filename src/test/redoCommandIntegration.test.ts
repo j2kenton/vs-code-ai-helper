@@ -34,6 +34,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -131,7 +132,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
         assert.equal(fs.readFileSync(previousVersionUri(artifact).fsPath, "utf8"), "previous content");
       } finally {
         deactivateNotificationRouter();
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        safeRemoveDir(folderPath);
       }
     });
   });
@@ -158,7 +159,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
         assert.equal(fs.readFileSync(previousVersionUri(artifact).fsPath, "utf8"), "previous content");
       } finally {
         deactivateNotificationRouter();
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        safeRemoveDir(folderPath);
       }
     });
   });
@@ -191,7 +192,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
         assert.equal(fs.readFileSync(previousVersionUri(artifact).fsPath, "utf8"), "previous content");
       } finally {
         deactivateNotificationRouter();
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        safeRemoveDir(folderPath);
       }
     });
   });
@@ -232,7 +233,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
       } finally {
         vscode.window.showWarningMessage = originalShowWarningMessage;
         deactivateNotificationRouter();
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        safeRemoveDir(folderPath);
       }
     });
   });
@@ -275,7 +276,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
       } finally {
         vscode.window.showWarningMessage = originalShowWarningMessage;
         deactivateNotificationRouter();
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        safeRemoveDir(folderPath);
       }
     });
   });

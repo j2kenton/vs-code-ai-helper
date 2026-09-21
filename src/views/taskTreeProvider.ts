@@ -24,7 +24,7 @@ import {
   resolveImplementationArtifact,
 } from "../utils/implementationArtifactResolver";
 import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
-import { effectiveReviewProgressV1, readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
   parseReadiness,
@@ -34,12 +34,14 @@ import {
 } from "../utils/reviewReadiness";
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
+import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1 } from "../state/effectivePauseStatusV1";
 import {
@@ -213,7 +215,11 @@ function buildTaskTooltip(
    * the line is omitted rather than rendered as a false "unknown". */
   schedulingPosture?: SchedulingPostureV1
 ): vscode.MarkdownString {
-  const lines: string[] = [`**${task.folderName}**`, ""];
+  // The tooltip is built with `supportHtml` (below) so its posture sentence
+  // can carry a theme-aware colour span; every free-text value interpolated
+  // therefore goes through `escapeTooltipHtmlV1` (or `tooltipLiteralTextV1`
+  // for ids and file names, which also neutralises markdown syntax).
+  const lines: string[] = [`**${escapeTooltipHtmlV1(task.folderName)}**`, ""];
 
   // Part 1b step 13 (tree/context-key derivation): a revoked watchdog pause
   // must not display as "Paused" — the sync resolver treats it the same as
@@ -226,7 +232,7 @@ function buildTaskTooltip(
     // still thinking.
     lines.push(
       task.progress.pausedReason
-        ? `⏸ **Paused** — ${task.progress.pausedReason}`
+        ? `⏸ **Paused** — ${escapeTooltipHtmlV1(task.progress.pausedReason)}`
         : "⏸ **Paused**",
       ""
     );
@@ -236,7 +242,7 @@ function buildTaskTooltip(
   }
   if ((task.progress.completedWithMissingArtifacts?.length ?? 0) > 0) {
     const missing = task.progress.completedWithMissingArtifacts!
-      .map((entry) => `${STAGE_DISPLAY_NAMES[entry.stage]}: \`${entry.artifact}\``)
+      .map((entry) => `${STAGE_DISPLAY_NAMES[entry.stage]}: ${tooltipLiteralTextV1(entry.artifact)}`)
       .join("; ");
     lines.push(`$(warning) **Completed with missing required artifact(s)** — ${missing}.`, "");
   }
@@ -254,7 +260,7 @@ function buildTaskTooltip(
     const label =
       park.failureKind === "model-entitlement" ? "model-entitlement block" : "quota/rate limit";
     lines.push(
-      `$(clock) **Blocked by a ${label}** on \`${park.modelId}\` as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
+      `$(clock) **Blocked by a ${label}** on ${tooltipLiteralTextV1(park.modelId)} as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
       ""
     );
   }
@@ -286,7 +292,7 @@ function buildTaskTooltip(
         "unknown"
       ).text;
       lines.push(
-        `$(warning) **Decision waiting** (${STAGE_DISPLAY_NAMES[decision.stage]}) — ${decision.whatHappened} _Review it in Chat With AI._ ${gatingLine}`,
+        `$(warning) **Decision waiting** (${STAGE_DISPLAY_NAMES[decision.stage]}) — ${escapeTooltipHtmlV1(decision.whatHappened)} _Review it in Chat With AI._ ${escapeTooltipHtmlV1(gatingLine)}`,
         ""
       );
     }
@@ -302,7 +308,7 @@ function buildTaskTooltip(
     const outstandingSuffix =
       outstanding.total > 0
         ? ` Outstanding: ${outstanding.items
-            .map((item) => `${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}`)
+            .map((item) => `${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${escapeTooltipHtmlV1(item)}`)
             .join("; ")}` +
           (outstanding.total > outstanding.items.length
             ? ` (+${outstanding.total - outstanding.items.length} more)`
@@ -323,7 +329,7 @@ function buildTaskTooltip(
   const manualSteps = readOutstandingManualStepsForTooltipV1(task);
   if (manualSteps.total > 0) {
     lines.push(
-      `$(checklist) **Manual steps to do** — ${manualSteps.items.join("; ")}` +
+      `$(checklist) **Manual steps to do** — ${manualSteps.items.map(escapeTooltipHtmlV1).join("; ")}` +
         (manualSteps.total > manualSteps.items.length
           ? ` (+${manualSteps.total - manualSteps.items.length} more)`
           : "") +
@@ -343,7 +349,10 @@ function buildTaskTooltip(
     const fields = describeSchedulingPostureV1(schedulingPosture);
     const rendered = renderRequiredHandoffFieldsV1("scheduledWork", fields);
     lines.push(
-      `$(watch) **What happens next** — ${rendered.map((line) => line.text).join(" ")}`,
+      `$(watch) **What happens next** — ${renderTooltipInfoTextV1(
+        rendered.map((line) => line.text).join(" "),
+        vscode.window.activeColorTheme.kind
+      )}`,
       ""
     );
   }
@@ -363,6 +372,7 @@ function buildTaskTooltip(
   );
 
   const tooltip = new vscode.MarkdownString(lines.join("\n"), true);
+  tooltip.supportHtml = true;
   return tooltip;
 }
 
@@ -695,7 +705,7 @@ export class StageNode extends vscode.TreeItem {
      * numbers that used to compete on one review row: implementation owns
      * the percentage, review owns the score. `undefined` for every other
      * stage, and for `impl` itself whenever the task carries no checklist. */
-    implementationProgress?: { complete: number; total: number },
+    implementationProgress?: { complete: number; total: number; unverified?: boolean },
     /**
      * How many pending workflow decisions are scoped to THIS stage — the
      * chat is holding that many questions for the user here.
@@ -769,10 +779,18 @@ export class StageNode extends vscode.TreeItem {
       // score yet (its very first run), and every non-review stage — keeps
       // the plain "running" text unchanged; no case here needed a new shape
       // of its own, only the one that names a real previous verdict.
+      //
+      // The implementation row's counterpart shows the live checklist
+      // percentage while the round runs — `implementationProgress` is
+      // already undefined when there is no readable checklist or the
+      // `checklistProgressUnreliable` latch stands it down, which keeps the
+      // plain "running" rather than a number nothing is maintaining.
       this.description =
         isReviewStage(stage) && readiness?.label
           ? `running... (previous: ${readiness.label})`
-          : "running";
+          : stage === "impl" && implementationProgress
+            ? `running... (${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%)`
+            : "running";
     } else if (isWaitingForUser) {
       this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
       this.description = "waiting for you";
@@ -821,7 +839,11 @@ export class StageNode extends vscode.TreeItem {
       // fraction competing with the review row's score.
       const percentLabel =
         stage === "impl" && implementationProgress
-          ? `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
+          ? implementationProgress.unverified
+            ? // Latched count: shown but qualified — absence would read as
+              // "this task has no checklist", a different and wrong statement.
+              `${implementationProgress.complete}/${implementationProgress.total} · unverified`
+            : `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
           : undefined;
       const statusLabel = readinessLabel ?? percentLabel;
       switch (status) {
@@ -876,6 +898,16 @@ export class StageNode extends vscode.TreeItem {
             this.description = statusLabel
               ? `${owedIndicator.description} · ${statusLabel}`
               : owedIndicator.description;
+          } else if (
+            !escalated &&
+            taskOperations.getTaskOperations(tKey).length === 0 &&
+            isWaitingForHumanV1(task.progress)
+          ) {
+            // v1 fixes 2, item 8: the task's next step is the human's (a new
+            // task, a completed stage action, Publish awaiting Commit & Push)
+            // — say so, rather than leaving a bare active row that reads as
+            // "stuck" and that the watchdog would otherwise have paused.
+            this.description = statusLabel ? `${statusLabel} · waiting for you` : "waiting for you";
           } else {
             this.description = statusLabel
               ? (escalated ? `${statusLabel} · escalated` : statusLabel)
@@ -1101,8 +1133,43 @@ export function getStageNodeContextValue(
   });
 }
 
+/**
+ * Search match for the Tasks pane: case-insensitive, and every
+ * whitespace-separated word of `query` must appear somewhere across the
+ * task's display name, folder name and current stage's display name. An
+ * empty (or all-whitespace) query matches everything. Exported for direct
+ * unit testing.
+ */
+export function taskMatchesSearchV1(task: IncompleteTask, query: string): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter((word) => word.length > 0);
+  if (words.length === 0) {
+    return true;
+  }
+  const haystack = [
+    task.progress.displayName,
+    task.folderName,
+    STAGE_DISPLAY_NAMES[task.progress.currentStage],
+  ]
+    .filter((part): part is string => typeof part === "string" && part.length > 0)
+    .join("\n")
+    .toLowerCase();
+  return words.every((word) => haystack.includes(word));
+}
+
 export class EmptyTasksNode extends vscode.TreeItem {
-  constructor() {
+  /**
+   * @param searchQuery when set, the empty state is the SEARCH's doing (the
+   * status filter alone would have shown tasks), so the row says so and a
+   * click clears the search instead of resetting the status filter.
+   */
+  constructor(searchQuery?: string) {
+    if (searchQuery) {
+      super(`No tasks match '${searchQuery}'`, vscode.TreeItemCollapsibleState.None);
+      this.description = "Click to clear the search.";
+      this.iconPath = new vscode.ThemeIcon("search");
+      this.command = { command: "vs-code-ai-helper.clearTasksSearch", title: "Clear tasks search" };
+      return;
+    }
     super("No matching tasks", vscode.TreeItemCollapsibleState.None);
     this.description = "Change the status filter or reset it to view all tasks.";
     this.iconPath = new vscode.ThemeIcon("filter");
@@ -1450,6 +1517,45 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this._onDidChangeTreeData.fire();
   }
 
+  /**
+   * Session-only free-text search over the visible tasks (see
+   * `taskMatchesSearchV1`), applied after the status filter. Deliberately not
+   * persisted: a filter that survives a reload makes tasks look missing with
+   * nothing on screen to explain why.
+   */
+  private searchQuery = "";
+
+  getSearchQuery(): string {
+    return this.searchQuery;
+  }
+
+  setSearchQuery(query: string): void {
+    this.searchQuery = query.trim();
+    this._onDidChangeTreeData.fire();
+  }
+
+  clearSearch(): void {
+    this.setSearchQuery("");
+  }
+
+  /**
+   * How many of the status-filtered tasks the active search keeps, or
+   * `undefined` when no search is active.
+   */
+  getSearchSummary(): { matched: number; total: number } | undefined {
+    if (!this.searchQuery) {
+      return undefined;
+    }
+    const visible = this.inventory
+      .getTasks()
+      .map(toIncompleteTask)
+      .filter((task) => this.selectedStatuses.has(task.progress.status ?? "active"));
+    return {
+      matched: visible.filter((task) => taskMatchesSearchV1(task, this.searchQuery)).length,
+      total: visible.length,
+    };
+  }
+
   async resetStatusFilter(): Promise<void> {
     this.selectedStatuses = new Set(this.defaultStatuses());
     await this.state?.update(this.filterKey, [...this.selectedStatuses]);
@@ -1656,7 +1762,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
 
   private async getTaskNodes(): Promise<TaskTreeNode[]> {
     const tasks = this.loadTasks();
-    const visible = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
+    const statusFiltered = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
+    const visible = this.searchQuery
+      ? statusFiltered.filter(task => taskMatchesSearchV1(task, this.searchQuery))
+      : statusFiltered;
 
     const ordered = orderTasksForDisplay(visible);
     const firstActive = firstActiveInDisplayOrder(ordered);
@@ -1742,7 +1851,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     );
 
     if (nodes.length === 0 && recoveryNodes.length === 0 && tasks.length > 0) {
-      return [new EmptyTasksNode()];
+      return [new EmptyTasksNode(this.searchQuery && statusFiltered.length > 0 ? this.searchQuery : undefined)];
     }
     return [...nodes, ...recoveryNodes];
   }
@@ -1818,14 +1927,23 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // stays visible after the workflow advances past it (the same "at any
       // moment" requirement as the review score above; a done implementation
       // row previously fell back to a bare tick with no number).
-      // `readEffectivePlanChecklistProgressV1` already resolves plan-final.md
-      // the same way the advance gates do and never throws (lenient policy),
-      // so no extra try/catch is needed here.
-      let implementationProgress: { complete: number; total: number } | undefined;
+      // `readDisplayPlanChecklistProgressV1` applies the same stand-down
+      // rules as the advance gates' reader and never throws (lenient policy),
+      // so no extra try/catch is needed here. It reads the durable file only
+      // (via `readPlanOfRecordForDisplayV1`): this render fires while a run
+      // ticks boxes, and must never save a `plan-final.md` editor the user is
+      // mid-edit in. Unlike the ForDisplay twin it still reports a latched
+      // task's count, flagged `unverified`, so the tree qualifies the number
+      // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
+      let implementationProgress: { complete: number; total: number; unverified?: boolean } | undefined;
       if (stage === "impl") {
-        const counted = await readEffectivePlanChecklistProgressV1(task.folderUri);
-        if (counted) {
-          implementationProgress = { complete: counted.settled, total: counted.total };
+        const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
+        if (display) {
+          implementationProgress = {
+            complete: display.counts.settled,
+            total: display.counts.total,
+            ...(display.unverified ? { unverified: true } : {})
+          };
         }
       }
 

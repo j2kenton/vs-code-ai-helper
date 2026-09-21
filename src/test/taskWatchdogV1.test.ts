@@ -15,17 +15,24 @@ import {
   effectiveNextActorV1,
   hasOpenRoundLedgerRowV1,
   isImpossibleActiveStateV1,
+  isWaitingForHumanV1,
   isReconstructableImplRecoveryV1,
   isStaleDispatchedImplRecoveryV1,
   isUnrecoverableImplRecoveryV1,
 } from "../utils/taskWatchdogV1";
-import { ImplRecoveryV1, RoundLedgerEntryV1, TaskProgress } from "../types/taskProgress";
+import {
+  ImplRecoveryV1,
+  MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  RoundLedgerEntryV1,
+  TaskProgress,
+} from "../types/taskProgress";
 import { __extensionContextV1TestOnly, getExtensionContextV1 } from "../utils/extensionContextV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function baseProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
   return {
@@ -242,7 +249,7 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
         "once admission is released, the predicate must fire again"
       );
     } finally {
-      fs.rmSync(taskDir, { recursive: true, force: true });
+      safeRemoveDir(taskDir);
     }
   });
 
@@ -280,7 +287,7 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
           "a crashed-mid-genesis claim, per v1a's interim never-reclaim policy"
       );
     } finally {
-      fs.rmSync(taskDir, { recursive: true, force: true });
+      safeRemoveDir(taskDir);
     }
   });
 
@@ -402,6 +409,57 @@ void describe("stale-dispatch + reconstructability evidence — the single defin
     // stale, not reconstructable -> unrecoverable, the only true cell
     assert.equal(isUnrecoverableImplRecoveryV1(bare, baseProgress(), pastGrace), true);
   });
+
+  void it("isUnrecoverableImplRecoveryV1 — a pending record with an exhausted continuation budget is unrecoverable (v1 fixes 2, items 15/21)", () => {
+    const pendingCapReached: ImplRecoveryV1 = {
+      ...dispatchedRecovery(),
+      dispatch: "pending",
+      leaseOwner: undefined,
+      leaseUntil: undefined,
+    };
+    assert.equal(
+      isUnrecoverableImplRecoveryV1(
+        pendingCapReached,
+        baseProgress({ incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 }),
+        withinGrace
+      ),
+      true,
+      "beginImplementationRecoveryV1 omits the lease exactly when the cap is reached — nothing will ever dispatch this record"
+    );
+    assert.equal(
+      isUnrecoverableImplRecoveryV1(
+        pendingCapReached,
+        baseProgress({ incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 + 5 }),
+        withinGrace
+      ),
+      true,
+      "over the cap counts the same as exactly at it"
+    );
+  });
+
+  void it("isUnrecoverableImplRecoveryV1 — a pending record under budget is still recoverable regardless of lease state", () => {
+    const pendingUnderBudget: ImplRecoveryV1 = {
+      ...dispatchedRecovery(),
+      dispatch: "pending",
+      leaseOwner: undefined,
+      leaseUntil: undefined,
+    };
+    assert.equal(
+      isUnrecoverableImplRecoveryV1(
+        pendingUnderBudget,
+        baseProgress({ incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 - 1 }),
+        withinGrace
+      ),
+      false,
+      "this is exactly the transient mid-reclaim window (armPendingImplRecoveries writes 'pending' with " +
+        "no lease one transaction before re-claiming a fresh one) — must never read as unrecoverable"
+    );
+    assert.equal(
+      isUnrecoverableImplRecoveryV1(pendingUnderBudget, baseProgress(), withinGrace),
+      false,
+      "no incompleteRoundContinuations recorded at all (absent -> 0) is under budget"
+    );
+  });
 });
 
 void describe("effectiveNextActorV1 (v1 fixes 2, item 8, Wave I)", () => {
@@ -451,5 +509,33 @@ void describe("isImpossibleActiveStateV1 consults nextActor as an ADD-ONLY exemp
       true,
       "unknown must not be treated like a confirmed human for gating — that would silently stand down existing stall protection"
     );
+  });
+});
+
+void describe("isWaitingForHumanV1 (v1 fixes 2, item 8) — the row/card read agrees with the watchdog exemption", () => {
+  void it("is true only for an active task whose nextActor is explicitly human with nothing owed", () => {
+    assert.equal(isWaitingForHumanV1(baseProgress({ nextActor: "human" })), true);
+  });
+
+  void it("is false for unknown and automation — absence is not a claim that anyone is waiting", () => {
+    assert.equal(isWaitingForHumanV1(baseProgress()), false);
+    assert.equal(isWaitingForHumanV1(baseProgress({ nextActor: "automation" })), false);
+  });
+
+  void it("is false for a non-active task, and while anything is owed, scheduled or in flight", () => {
+    assert.equal(isWaitingForHumanV1(baseProgress({ nextActor: "human", status: "paused" })), false);
+    assert.equal(isWaitingForHumanV1(baseProgress({ nextActor: "human", roundLedger: [openRow("open")] })), false);
+    assert.equal(
+      isWaitingForHumanV1(
+        baseProgress({ nextActor: "human", scheduledRun: { runAt: "2026-01-02T00:00:00.000Z", stage: "impl" } })
+      ),
+      false
+    );
+  });
+
+  void it("never disagrees with the watchdog: a state it calls waiting is one the sweep leaves unpaused", () => {
+    const waiting = baseProgress({ nextActor: "human" });
+    assert.equal(isWaitingForHumanV1(waiting), true);
+    assert.equal(isImpossibleActiveStateV1({ progress: waiting, taskCanonicalId: "task-a" }), false);
   });
 });

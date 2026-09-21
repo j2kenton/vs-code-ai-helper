@@ -6,6 +6,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { captureRaisedNoticesV1 } from "../utils/notificationTaskContextV1";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
@@ -16,6 +17,11 @@ import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
+import { publishDispatchCommandV1 } from "../utils/publishStageActionsV1";
+import {
+  clearStageActionRefusalReasonV1,
+  recordStageActionRefusalReasonV1,
+} from "../utils/stageActionRefusalV1";
 
 type ApplyArg = {
   canonicalId?: string;
@@ -62,6 +68,27 @@ export async function applyCurrentStageAction(
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ApplyArg
 ): Promise<boolean> {
+  const refusal: StageActionRefusalV1 = {};
+  const dispatched = await applyCurrentStageActionCore(inventory, currentTaskStore, explicitArg, refusal);
+  const taskKey = refusal.taskFolderPath ?? explicitArg?.taskFolderPath;
+  if (taskKey) {
+    if (dispatched) {
+      clearStageActionRefusalReasonV1(taskKey);
+    } else {
+      recordStageActionRefusalReasonV1(taskKey, refusal.reason ?? "the stage action declined to start");
+    }
+  }
+  return dispatched;
+}
+
+type StageActionRefusalV1 = { reason?: string; taskFolderPath?: string };
+
+async function applyCurrentStageActionCore(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg: ApplyArg | undefined,
+  refusal: StageActionRefusalV1
+): Promise<boolean> {
   assertLegacyAiRouteAllowedV0("applyCurrentStage.v1");
   // Block on the startup gate's classification pass before this command's
   // first task-state read (plan §1.4). Runs after the synchronous route gate
@@ -75,11 +102,13 @@ export async function applyCurrentStageAction(
   );
 
   if (!resolvedTask) {
+    refusal.reason = "no task could be resolved for it";
     NotificationRouter.showWarning(
       "No active task found. Create or resume a task first."
     );
     return false;
   }
+  refusal.taskFolderPath = resolvedTask.taskFolderPath;
 
   if (resolvedTask.progress.status === "paused") {
     // A caller-presented handoff token means the caller (currently only
@@ -102,6 +131,7 @@ export async function applyCurrentStageAction(
         )).outcome !== "reversed"
       : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress);
     if (stillPaused) {
+      refusal.reason = "the task is paused, and nothing has resumed it";
       NotificationRouter.showWarning(
         "Task is paused. Resume it before using this shortcut."
       );
@@ -120,6 +150,7 @@ export async function applyCurrentStageAction(
       stage
     ))
   ) {
+    refusal.reason = `no model is configured for the ${stage} stage, or its provider is disabled`;
     return false;
   }
 
@@ -142,12 +173,28 @@ export async function applyCurrentStageAction(
     });
   };
 
+  /** Run a downstream command; when it declines, record which one did. */
+  const dispatch = async (command: string): Promise<boolean> => {
+    const { result, notices } = await captureRaisedNoticesV1(() => execute(command));
+    const started = result === true;
+    if (!started) {
+      // The command's own last warning/error is its stated cause; only when it
+      // raised none is the command's name all there is to report.
+      const name = command.replace("vs-code-ai-helper.", "");
+      const stated = notices[notices.length - 1];
+      refusal.reason = stated
+        ? `${name} declined to start: ${stated}`
+        : `${name} declined to start without saying why`;
+    }
+    return started;
+  };
+
   if (stage === "desc") {
-    return (await execute("vs-code-ai-helper.draftTaskWithAI")) === true;
+    return await dispatch("vs-code-ai-helper.draftTaskWithAI");
   }
 
   if (stage === "plan") {
-    return (await execute("vs-code-ai-helper.generatePlanWithAI")) === true;
+    return await dispatch("vs-code-ai-helper.generatePlanWithAI");
   }
 
   if (stage === "impl") {
@@ -178,7 +225,7 @@ export async function applyCurrentStageAction(
       // Moves to the review stage first: the task is at `impl` here, which is
       // precisely why this branch was reached, and every apply command
       // refuses out of stage. See goToReviewAndApplyV1.
-      return await goToReviewAndApplyV1({
+      const { result: applied, notices: applyNotices } = await captureRaisedNoticesV1(() => goToReviewAndApplyV1({
         taskFolderPath: resolvedTask.taskFolderPath,
         reviewStage:
           decision.reviewStage === "impl-high-review"
@@ -190,13 +237,22 @@ export async function applyCurrentStageAction(
         // genesis against it (2026-09-09 review completion blocker,
         // narrowed).
         admissionHandoffTokenV1: explicitArg?.admissionHandoffTokenV1,
-      });
+      }));
+      if (!applied) {
+        const stated = applyNotices[applyNotices.length - 1];
+        refusal.reason = stated
+          ? `Apply Review declined to start: ${stated}`
+          : "Apply Review declined to start without saying why";
+      }
+      return applied;
     }
-    return (await execute("vs-code-ai-helper.runImplementationWithAI")) === true;
+    return await dispatch("vs-code-ai-helper.runImplementationWithAI");
   }
 
   if (stage === "publish") {
-    return (await execute("vs-code-ai-helper.runPublishChecks")) === true;
+    // The first entry of Publish's action table is the step this button runs
+    // (the checks); the same table decides what follows them.
+    return await dispatch(publishDispatchCommandV1());
   }
 
   // `applyHighLevelReviewChanges`/`applyLowLevelReviewChanges` report whether
@@ -220,8 +276,9 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        return (await execute("vs-code-ai-helper.applyHighLevelReviewChanges")) === true;
+        return await dispatch("vs-code-ai-helper.applyHighLevelReviewChanges");
       } catch {
+        refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
@@ -240,8 +297,9 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        return (await execute("vs-code-ai-helper.applyLowLevelReviewChanges")) === true;
+        return await dispatch("vs-code-ai-helper.applyLowLevelReviewChanges");
       } catch {
+        refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );
@@ -260,8 +318,9 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        return (await execute("vs-code-ai-helper.applyHighLevelReviewChanges")) === true;
+        return await dispatch("vs-code-ai-helper.applyHighLevelReviewChanges");
       } catch {
+        refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
@@ -280,8 +339,9 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        return (await execute("vs-code-ai-helper.applyLowLevelReviewChanges")) === true;
+        return await dispatch("vs-code-ai-helper.applyLowLevelReviewChanges");
       } catch {
+        refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );

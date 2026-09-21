@@ -166,7 +166,7 @@ void describe("resumeTask.v1 registry row", () => {
 
   void it("reports recoveryRequired when task-progress.json is missing", async () => {
     const folder = makeCompletedTaskFolder("ensemble-resume-row-missing-");
-    fs.rmSync(path.join(folder, "task-progress.json"));
+    fs.rmSync(path.join(folder, "task-progress.json")); // deliberate: removal is the behaviour under test, not teardown
     const outcome = await executeResumeTaskV1(
       contextFor(folder, { selectedStage: "publish", expectedCompletedAt: COMPLETED_AT })
     );

@@ -57,6 +57,7 @@ import {
   StructuredAnswerV1,
   StructuredQuestionV1,
 } from "../types/structuredQuestionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -142,7 +143,7 @@ before(() => {
 });
 
 after(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  safeRemoveDir(tmpRoot);
 });
 
 async function postedInteraction(

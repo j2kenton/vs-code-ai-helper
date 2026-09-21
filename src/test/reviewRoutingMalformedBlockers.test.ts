@@ -14,6 +14,7 @@ import * as vscode from "vscode";
 import { dispatchDegenerateReviewBackupAdvanceV1, handleReviewRoutingOutcome } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -45,7 +46,7 @@ function installMemStore(store: MemStore): void {
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-review-routing-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolderUri(name: string): vscode.Uri {

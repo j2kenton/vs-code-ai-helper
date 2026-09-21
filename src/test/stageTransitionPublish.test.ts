@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 import * as vscode from "vscode";
 import { advanceStage } from "../utils/stageTransition";
 import type { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Regression coverage for a review finding: advanceStage's review-attempt CAS
 // used to complete (and release the task lock) before the caller renamed its
@@ -48,7 +49,7 @@ function installMemStore(store: MemStore): void {
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolderUri(name: string): vscode.Uri {

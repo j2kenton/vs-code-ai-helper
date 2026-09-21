@@ -9,7 +9,12 @@
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isReviewPassCurrentV1, parseReviewPass } from "../utils/reviewReadiness";
+import {
+  isReviewPassCurrentV1,
+  parseReviewPass,
+  reviewPredatesLatestImplementationRoundV1,
+} from "../utils/reviewReadiness";
+import type { RoundLedgerEntryV1 } from "../types/taskProgress";
 
 void describe("parseReviewPass", () => {
   void it("parses the marker's integer value", () => {
@@ -73,5 +78,76 @@ void describe("isReviewPassCurrentV1", () => {
       isReviewPassCurrentV1(content, { "impl-high-review": 1, publish: 5 }, "publish"),
       false
     );
+  });
+});
+
+void describe("reviewPredatesLatestImplementationRoundV1", () => {
+  const entry = (reviewPass: number, at: string) => ({
+    stage: "impl-high-review" as const,
+    score: 6,
+    attemptId: `a${reviewPass}`,
+    at,
+    blockerCount: 1,
+    taskFixableCount: 1,
+    reviewPass,
+  });
+  const round = (mode: "review" | "apply-review", startedAt: string): RoundLedgerEntryV1 =>
+    ({
+      roundId: `r-${startedAt}`,
+      attemptIds: [],
+      stage: "impl-high-review",
+      mode,
+      startedAt,
+      state: "completed",
+    }) as RoundLedgerEntryV1;
+
+  void it("is stale when an implementation round started after the current-pass review was published", () => {
+    assert.equal(
+      reviewPredatesLatestImplementationRoundV1(
+        {
+          stageReviewPasses: { "impl-high-review": 2 },
+          reviewScoreHistory: [entry(1, "2026-09-01T00:00:00.000Z"), entry(2, "2026-09-02T00:00:00.000Z")],
+          roundLedger: [round("apply-review", "2026-09-03T00:00:00.000Z")],
+        },
+        "impl-high-review"
+      ),
+      true
+    );
+  });
+
+  void it("is current when the round preceded the review, or the only later rows are reviews", () => {
+    const base = {
+      stageReviewPasses: { "impl-high-review": 2 },
+      reviewScoreHistory: [entry(2, "2026-09-02T00:00:00.000Z")],
+    };
+    assert.equal(
+      reviewPredatesLatestImplementationRoundV1(
+        { ...base, roundLedger: [round("apply-review", "2026-09-01T00:00:00.000Z")] },
+        "impl-high-review"
+      ),
+      false
+    );
+    assert.equal(
+      reviewPredatesLatestImplementationRoundV1(
+        { ...base, roundLedger: [round("review", "2026-09-03T00:00:00.000Z")] },
+        "impl-high-review"
+      ),
+      false
+    );
+  });
+
+  void it("reports no evidence when there is no current-pass history entry (pass staleness judges that case)", () => {
+    assert.equal(
+      reviewPredatesLatestImplementationRoundV1(
+        {
+          stageReviewPasses: { "impl-high-review": 2 },
+          reviewScoreHistory: [entry(1, "2026-09-01T00:00:00.000Z")],
+          roundLedger: [round("apply-review", "2026-09-03T00:00:00.000Z")],
+        },
+        "impl-high-review"
+      ),
+      false
+    );
+    assert.equal(reviewPredatesLatestImplementationRoundV1({}, "impl-high-review"), false);
   });
 });

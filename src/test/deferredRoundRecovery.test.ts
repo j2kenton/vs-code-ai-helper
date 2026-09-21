@@ -950,7 +950,7 @@ void describe("Apply Review continuation reconstruction (item 17b, fail-closed)"
     // The source review artifact this continuation would need to re-render
     // from is missing — the exact reconstruction failure the fail-closed fix
     // must refuse under, rather than falling through to run-implementation.md.
-    fs.rmSync(path.join(folderPath, "impl-high-review.md"), { force: true });
+    fs.rmSync(path.join(folderPath, "impl-high-review.md"), { force: true }); // deliberate: removal is the behaviour under test, not teardown
 
     const run = await runHarnessed(folderPath, progress, {
       status: "completed",
@@ -1894,8 +1894,10 @@ void describe("contradictory no-checklist-change + retroactive claims (Part 3, e
     const planFinal = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
     assert.equal(planFinal, PLAN_FINAL, "a rejected round's checklist must not be merged");
 
-    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
-    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    // v1 fixes 2, item 1 (entry point 2, a correct-but-misencoded round): the
+    // rejection is about form, so the last usable summary stays live rather
+    // than being replaced by a stub.
+    assert.equal(fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8"), PRIOR_SUMMARY);
 
     const logs = readRunLogs(folderPath);
     assert.match(logs[0]!, /no-checklist-change/);
@@ -3894,10 +3896,9 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     assert.equal(run.recoveryAtRunLogWrite.length, 1);
     assert.equal(run.recoveryAtRunLogWrite[0]?.trigger, "summaryRejected");
 
-    // The stamp is still written — and now states what happens next.
-    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
-    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
-    assert.match(summary, /continuation implementation round \(1 of 3, unconstrained\)/);
+    // v1 fixes 2, item 1: a round rejected on form does not overwrite the
+    // last usable summary; the owed continuation lives in `implRecovery`.
+    assert.equal(fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8"), PRIOR_SUMMARY);
 
     const logs = readRunLogs(folderPath);
     assert.match(logs[0]!, /Status: completed/);
@@ -3927,6 +3928,8 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     const { folderPath, progress } = makeTaskFolder("recovery_rejected_cap", {
       incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 - 1,
     });
+    // No usable prior summary, so the stamp (which carries the recovery line) is written.
+    fs.unlinkSync(path.join(folderPath, "impl-summary.md"));
     const run = await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: ["src/rejected.ts"],
@@ -3970,6 +3973,8 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
 
   void it("a known-zero-change rejected summary lands the recovery record and schedules the continuation instead of parking the task", async () => {
     const { folderPath, progress } = makeTaskFolder("recovery_zero_change");
+    // No usable prior summary, so the stamp (which carries the recovery line) is written.
+    fs.unlinkSync(path.join(folderPath, "impl-summary.md"));
     const run = await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: [],
@@ -4022,6 +4027,8 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
 
   void it("a rejected summary whose round also broke the type-check still dispatches the continuation before returning", async () => {
     const { folderPath, progress } = makeTaskFolder("recovery_typecheck");
+    // No usable prior summary, so the stamp (which carries the recovery line) is written.
+    fs.unlinkSync(path.join(folderPath, "impl-summary.md"));
     const run = await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: ["src/rejected.ts"],
@@ -4140,6 +4147,8 @@ void describe("recovery mode selection and enforcement (Part 2, end to end)", ()
     const { folderPath, progress } = makeTaskFolder("mode_fallback", {
       reviewScoreHistory: zeroBlockerHistory,
     });
+    // No usable prior summary, so the stamp (which carries the recovery line) is written.
+    fs.unlinkSync(path.join(folderPath, "impl-summary.md"));
     // The harness probe defaults to false: the resolved provider cannot
     // enforce a read-only text run, so the plan's fallback rule applies.
     const run = await runHarnessed(folderPath, progress, {

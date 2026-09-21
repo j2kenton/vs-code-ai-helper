@@ -68,12 +68,13 @@ import * as vscode from "vscode";
 
 import { runAutomaticChecklistReconciliationV1 } from "../commands/reconcilePlanChecklist";
 import { computeSyntheticRoundChecklistLatchV1 } from "../commands/reviewActions";
+import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-auto-reconcile-test-")
 );
 after(() => {
-  nodeFs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 // Back workspace.fs with the real disk — the vscode test stub's

@@ -21,6 +21,7 @@ import {
 import { createWorkflowFileStoreV1 } from "../services/workflowFileStoreV1";
 import { validateWorkflowRelativePathV1 } from "../services/workflowPathSafetyV1";
 import { CHAT_HISTORY_FILENAME } from "../utils/chatHistoryConstants";
+import { safeRemoveDir } from "./testFsUtils";
 
 const HEX_A = "a".repeat(32);
 const HEX_B = "b".repeat(32);
@@ -279,7 +280,7 @@ void describe("workflowPathRegistryV1", () => {
       assert.deepEqual(created, { kind: "ok", value: undefined });
       assert.equal(fs.statSync(path.join(tempRoot, "workflow-runtime-v1", "leases")).isDirectory(), true);
     } finally {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      safeRemoveDir(tempRoot);
     }
   });
 });

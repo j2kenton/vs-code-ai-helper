@@ -13,12 +13,13 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { generateImplReviewContextPack } from "../utils/contextPack";
+import { safeRemoveDir } from "./testFsUtils";
 
 const WORKSPACE_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-context-pack-mapping-test-")
 );
 after(() => {
-  nodeFs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true });
+  safeRemoveDir(WORKSPACE_ROOT);
 });
 
 function writeFile(relPath: string, content: string): void {

@@ -45,6 +45,7 @@ import {
 import type { TaskInventory } from "../state/taskInventory";
 import type { CurrentTaskStore } from "../utils/currentTaskStore";
 import type { TaskEscalation, TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * Re-implement the normalizeReviewArg contract for test verification.
@@ -669,7 +670,7 @@ void describe("peekFastForwardTargetsImplReviewFromPathV1 contract", () => {
       const result = await peekFastForwardTargetsImplReviewFromPathV1(fixture.folder);
       assert.equal(result, true);
     } finally {
-      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+      safeRemoveDir(path.dirname(fixture.folder));
     }
   });
 
@@ -690,7 +691,7 @@ void describe("peekFastForwardTargetsImplReviewFromPathV1 contract", () => {
       const result = await peekFastForwardTargetsImplReviewFromPathV1(folder);
       assert.equal(result, false);
     } finally {
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 
@@ -702,7 +703,7 @@ void describe("peekFastForwardTargetsImplReviewFromPathV1 contract", () => {
       const result = await peekFastForwardTargetsImplReviewFromPathV1(folder);
       assert.equal(result, undefined);
     } finally {
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 });
@@ -808,7 +809,7 @@ void describe("fastForwardReviewWithAI — read-before-gate ordering (§7.5/AC-H
       notif.restore();
       reads.restore();
       gate.restore();
-      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+      safeRemoveDir(path.dirname(fixture.folder));
     }
   });
 });
@@ -866,7 +867,7 @@ void describe("resolveBaselineReviewHistoryEntryV1 — Fast Forward baseline rev
         assert.equal(entry?.score, 9);
       } finally {
         reads.restore();
-        fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+        safeRemoveDir(path.dirname(fixture.folder));
       }
     }
   );
@@ -970,7 +971,7 @@ void describe("fastForwardCurrentTaskReview — read-before-gate ordering (§7.5
       notif.restore();
       reads.restore();
       gate.restore();
-      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+      safeRemoveDir(path.dirname(fixture.folder));
     }
   });
 

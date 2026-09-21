@@ -21,6 +21,7 @@ import { describe, it } from "node:test";
 import { CHAT_HISTORY_FILENAME, resetChatHistoryV1 } from "../utils/chatHistoryStore";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 function makeTaskFolder(): string {
   // Task conversations require the strict, ownership-backed task-folder
@@ -45,7 +46,7 @@ void describe("resetChatHistoryV1 — no-document path honors the private-storag
         "no chat-v1.json should be created when the gate refuses"
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -82,7 +83,7 @@ void describe("resetChatHistoryV1 — no-document path honors the private-storag
       assert.equal(snapshot.documentId, committed.documentId);
       assert.deepEqual(snapshot.messages, []);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

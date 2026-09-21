@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { parseReadiness } from "./reviewReadiness";
+import { publishNextStepAfterChecksV1 } from "./stageArtifactRequirementsV1";
 
 /**
  * Freshness stamp for `publish-review.md` (plan PART 2, step 6; plan item 17,
@@ -165,10 +166,15 @@ export function computePublishStatusLineTextV1(result: {
   readonly passedModuloKnownFlakes?: boolean;
   readonly failedChecks: ReadonlyArray<{ readonly command: string; readonly exitCode: number }>;
   readonly knownFlakeFailures?: ReadonlyArray<{ readonly command: string; readonly exitCode: number }>;
-}): string {
+}, nextStep: "review" | "commit-and-push" = publishNextStepAfterChecksV1()): string {
   const effectivelyPassed = result.passedModuloKnownFlakes ?? result.passed;
   if (effectivelyPassed) {
-    return "**Publish Checks passed.** Request a Publish review to finish.";
+    // Name the step that actually follows, from the stage-action table: telling
+    // the user to request a review Publish no longer has would send them looking
+    // for an action that is not there (item 33).
+    return nextStep === "commit-and-push"
+      ? "**Publish Checks passed.** Commit & Push to finish."
+      : "**Publish Checks passed.** Request a Publish review to finish.";
   }
   const unquarantinedFailureCount = result.failedChecks.filter(
     (check) =>

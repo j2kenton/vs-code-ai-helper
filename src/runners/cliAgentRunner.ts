@@ -230,6 +230,26 @@ export function analyzeCliEventStream(stdoutRaw: string): CliEditEventEvidence {
   };
 }
 
+/**
+ * How far a CLI session got before it was stopped, in the user's words, for
+ * timeout messages ("how far the session got" — shared failure-wording fix).
+ * Built from the same event stream `analyzeCliEventStream` reads.
+ * @internal exported for testing
+ */
+export function describeCliSessionProgressV1(stdoutRaw: string): string {
+  const { events } = parseJsonLineEvents(stdoutRaw);
+  if (events.length === 0) {
+    const bytes = Buffer.byteLength(stdoutRaw, "utf8");
+    return bytes === 0
+      ? "It had written nothing before it was stopped."
+      : `It had written ${bytes} byte(s) of output before it was stopped.`;
+  }
+  const toolEvents = events.filter((event) =>
+    TOOL_OR_EDIT_EVENT_PATTERN.test(JSON.stringify(event))
+  ).length;
+  return `It had emitted ${events.length} event(s), ${toolEvents} of them tool or edit activity, before it was stopped.`;
+}
+
 export interface EditRetryDecision {
   retry: boolean;
   /** Human-readable evidence/justification, recorded in the retry audit log. */
@@ -3178,8 +3198,9 @@ export async function execCliAgent(options: {
     const sessionIdOfRun = (): string | undefined =>
       def.structuredEventStream === "opencode" ? extractOpencodeSessionIdV1(stdout) : undefined;
 
-    const emitTimeout = (message: string, timeoutReason: "wall-clock" | "inactivity"): void => {
+    const emitTimeout = (baseMessage: string, timeoutReason: "wall-clock" | "inactivity"): void => {
       killProcessTree(child);
+      const message = `${baseMessage} ${describeCliSessionProgressV1(stdout)}`;
       // Edit-mode timeouts are always promoted: edit mode has its OWN
       // separate, stricter retry gate downstream that refuses to act on this
       // promotion for any provider — Cline/Antigravity included — except via
@@ -3238,7 +3259,7 @@ export async function execCliAgent(options: {
 
     const timeoutHandle = setTimeout(() => {
       emitTimeout(
-        `${cliDisplayLabel(def)} CLI timed out after ${RUN_TIMEOUT_MS / 60000} minutes.`,
+        `${cliDisplayLabel(def)} CLI hit the ${RUN_TIMEOUT_MS / 60000}-minute wall-clock limit and was stopped while still running — the provider did not report an error.`,
         "wall-clock"
       );
     }, RUN_TIMEOUT_MS);
@@ -3260,7 +3281,7 @@ export async function execCliAgent(options: {
             }
             if (Date.now() - lastActivityAt >= inactivityLimitMs) {
               emitTimeout(
-                `${cliDisplayLabel(def)} CLI produced no output for ${inactivityLimitMinutes} minute(s) and was stopped as inactive.`,
+                `${cliDisplayLabel(def)} CLI produced no output for ${inactivityLimitMinutes} minute(s) and was stopped by the inactivity watchdog (for example, a command it started may still be running in the background) — the provider did not report an error.`,
                 "inactivity"
               );
             }

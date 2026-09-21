@@ -50,6 +50,7 @@ import {
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -201,7 +202,7 @@ void describe("chatHistoryStore — durable answer backfill (readChatInteraction
         { questionId: "scope", kind: "singleChoice", state: "answered", selectedOptionId: "plan" },
       ]);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -243,7 +244,7 @@ void describe("chatHistoryStore — Reset never falsely resolves a mirror whose 
       assert.equal(raw.resetEpoch, beforeReset.resetEpoch, "resetEpoch must not bump when Reset fails as a whole");
       assert.deepEqual(raw, beforeReset, "chat-v1.json must be completely untouched when Reset fails");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -265,7 +266,7 @@ void describe("chatHistoryStore — Reset never falsely resolves a mirror whose 
       assert.ok(interaction);
       assert.equal(interaction.state, "resetByChatRecovery");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

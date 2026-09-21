@@ -29,6 +29,7 @@ import { resolveQuotaAccountKeyV1 } from "../config/settings";
 import { parseModelSelection, providerAccountIdForModelId } from "../runners/providers";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Minimal in-memory Memento-backed ExtensionContext stub — mirrors the
  * pattern in quota.test.ts's `createFakeExtensionContext`. */
@@ -750,7 +751,7 @@ void describe("resolveRunnerForModel", () => {
         lm.selectChatModels = originalSelectChatModels;
         workspace.fs.readFile = originalReadFile;
         workspace.fs.writeFile = originalWriteFile;
-        fs.rmSync(metaRoot, { recursive: true, force: true });
+        safeRemoveDir(metaRoot);
       }
     });
 
@@ -815,7 +816,7 @@ void describe("resolveRunnerForModel", () => {
         lm.selectChatModels = originalSelectChatModels;
         workspace.fs.readFile = originalReadFile;
         workspace.fs.writeFile = originalWriteFile;
-        fs.rmSync(metaRoot, { recursive: true, force: true });
+        safeRemoveDir(metaRoot);
       }
     });
 
@@ -883,7 +884,7 @@ void describe("resolveRunnerForModel", () => {
         lm.selectChatModels = originalSelectChatModels;
         workspace.fs.readFile = originalReadFile;
         workspace.fs.writeFile = originalWriteFile;
-        fs.rmSync(metaRoot, { recursive: true, force: true });
+        safeRemoveDir(metaRoot);
       }
     });
 
@@ -959,7 +960,7 @@ void describe("resolveRunnerForModel", () => {
         lm.selectChatModels = originalSelectChatModels;
         workspace.fs.readFile = originalReadFile;
         workspace.fs.writeFile = originalWriteFile;
-        fs.rmSync(metaRoot, { recursive: true, force: true });
+        safeRemoveDir(metaRoot);
       }
     });
   });
@@ -1071,7 +1072,7 @@ void describe("resolveRunnerForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -1339,7 +1340,7 @@ void describe("resolveRunnerForModel", () => {
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
       __extensionContextV1TestOnly.set(undefined);
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -1467,7 +1468,7 @@ void describe("resolveRunnerForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 });
@@ -1860,7 +1861,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2028,7 +2029,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2164,7 +2165,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2362,7 +2363,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2512,7 +2513,7 @@ void describe("runImplementationForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2695,7 +2696,7 @@ void describe("runImplementationForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2826,7 +2827,7 @@ void describe("runImplementationForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -2998,7 +2999,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3169,7 +3170,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3302,7 +3303,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3468,7 +3469,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3617,7 +3618,7 @@ void describe("runImplementationForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3742,7 +3743,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -3896,7 +3897,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -4026,7 +4027,7 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 
@@ -4166,7 +4167,7 @@ void describe("runImplementationForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
-      fs.rmSync(metaRoot, { recursive: true, force: true });
+      safeRemoveDir(metaRoot);
     }
   });
 

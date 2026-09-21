@@ -29,9 +29,20 @@ import {
 } from "../utils/notificationRouter";
 
 class RecordingSurface {
-  entries: { message: string; level: "info" | "warning" | "error" }[] = [];
-  addEntry(message: string, level: "info" | "warning" | "error"): void {
-    this.entries.push({ message, level });
+  entries: {
+    message: string;
+    level: "info" | "warning" | "error";
+    actionCommand?: { command: string; title: string; args?: unknown[] };
+  }[] = [];
+  addEntry(
+    message: string,
+    level: "info" | "warning" | "error",
+    _filePath?: string,
+    _resultTargetUri?: string,
+    _sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
+    this.entries.push({ message, level, actionCommand });
   }
 }
 
@@ -142,7 +153,13 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
     assert.doesNotMatch(message, /no action is needed from you/);
     assert.match(message, /continuation budget is exhausted/);
     assert.match(message, /retrying this action will not help either/);
-    assert.match(message, /rerun the implementation manually to continue/);
+    // v1 fixes 2, item 15: "rerun the implementation manually" is a remedy
+    // this very record refuses — the message must name the action that
+    // actually clears it (discard) instead, and say plainly that rerunning
+    // will not help.
+    assert.doesNotMatch(message, /rerun the implementation manually to continue/);
+    assert.match(message, /discard this owed continuation/i);
+    assert.match(message, /rerunning will not help/i);
   });
 
   void it("a dispatched record with no lease still tells the user to reload rather than wait forever", () => {
@@ -339,6 +356,81 @@ void describe("showTaskBusyWarning — reads a real implRecovery record and surf
       assert.match(log!.uri.fsPath, /-declined-/, "the run log filename must name this a declined action");
       assert.match(log!.content, /Status: declined \(owed continuation\)/);
       assert.match(log!.content, /A continuation round is owed for this task/);
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+
+  void it("offers 'Discard this owed continuation' when the busy refusal names a pending, cap-reached record (v1 fixes 2, item 21)", async () => {
+    stubProgress({
+      taskFolder: FOLDER_NAME,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-08-21T00:00:00.000Z",
+      updatedAt: "2026-08-21T13:33:00.000Z",
+      incompleteRoundContinuations: 3,
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-9",
+        reason: "the continuation budget is exhausted",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-08-21T13:33:00.000Z",
+        // No leaseOwner/leaseUntil — exactly what beginImplementationRecoveryV1
+        // persists once the cap is reached; nothing will ever dispatch this.
+      },
+    });
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const handle = taskOperations.begin(FOLDER.fsPath, { label: "Applying implementation review" });
+    assert.ok(handle);
+    try {
+      await showTaskBusyWarning(FOLDER.fsPath);
+      const entry = surface.entries[0];
+      assert.ok(entry?.actionCommand, "a pending, cap-reached record must offer a discard action");
+      assert.equal(entry.actionCommand?.command, "vs-code-ai-helper.discardOwedImplRecoveryV1");
+      assert.deepEqual(entry.actionCommand?.args, [FOLDER.fsPath]);
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+
+  void it("does NOT offer discard when the busy refusal names a dispatched record still within its stale-dispatch grace window", async () => {
+    // Deliberately "dispatched" (not "pending") — a "pending" record under
+    // budget with a live lease also arms the release-triggered retry
+    // (`armReleaseTriggeredContinuationRetryV1`), which is exercised by its
+    // own dedicated describe block below and is not what this test is about.
+    // Lease/`at` are relative to the real clock (`showTaskBusyWarning` calls
+    // `Date.now()` directly, unlike the injectable-clock helpers elsewhere in
+    // this suite) so the record reads as within grace regardless of when the
+    // test actually runs.
+    const now = new Date();
+    stubProgress({
+      taskFolder: FOLDER_NAME,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      incompleteRoundContinuations: 1,
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-9",
+        reason: "the provider's final response was cut short",
+        trigger: "roundIncomplete",
+        mode: "unconstrained",
+        dispatch: "dispatched",
+        at: now.toISOString(),
+        leaseOwner: "window-a:abc123",
+        leaseUntil: new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+      },
+    });
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const handle = taskOperations.begin(FOLDER.fsPath, { label: "Applying implementation review" });
+    assert.ok(handle);
+    try {
+      await showTaskBusyWarning(FOLDER.fsPath);
+      const entry = surface.entries[0];
+      assert.equal(entry?.actionCommand, undefined, "a still-recoverable record must not offer discard");
     } finally {
       taskOperations.end(handle);
     }

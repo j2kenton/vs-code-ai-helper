@@ -141,6 +141,8 @@ import {
 } from "./implContinuationTextDispatchV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
+import { stepNameV1 } from "../utils/stepLabelsV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   AUTO_REVIEW_TRANSITIONS,
@@ -161,12 +163,14 @@ import {
 } from "../utils/fileUtils";
 import {
   ChecklistProgressV1,
+  classifyUncheckedChecklistItemsV1,
   detectChecklistItemSetMutationV1,
   formatChecklistItemGlyphV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
+  truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
@@ -211,9 +215,11 @@ import {
   getImplementationSummaryUri,
   getLegacyImplementationUri,
   isUnusableImplementationSummaryV1,
+  shouldPreserveUsableImplementationSummaryV1,
   PlanOfRecordV1,
   readImplementationReviewContent,
   readPlanOfRecordV1,
+  describeUnusableSummaryRemedyV1,
   materializeCanonicalIfNeeded,
   preparePlanPromotion,
   applyDeferredPlanRevisionAdoptionV1,
@@ -267,6 +273,7 @@ import {
   runAutomaticChecklistReconciliationV1,
   AutomaticChecklistReconciliationOutcomeV1,
 } from "./reconcilePlanChecklist";
+import { postHandoffChecksDecisionV1 } from "./handoffChecksV1";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { IMPL_REVIEW_MAX_TOTAL_CHARS } from "../utils/implReviewFileSelection";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
@@ -292,6 +299,7 @@ import {
   isStaleReviewArtifactV1,
   upsertArtifactChangeStaleBannerV1,
   isReviewPassCurrentV1,
+  reviewPredatesLatestImplementationRoundV1,
   ReviewBlocker,
   splitTaskFixableBlockersByOriginV1,
 } from "../utils/reviewReadiness";
@@ -337,6 +345,7 @@ import {
   buildChurnEscalationReasonV1,
   chooseAutomaticImplementationDispatchV1,
   classifyChurnLineageV1,
+  decideHandoffOnlyStopV1,
   decidePostReviewActionV1,
   decideReviewRoute,
   degenerateReviewRejectionReason,
@@ -2428,6 +2437,49 @@ export function createCompletionCheckActivityAccumulatorV1(
   };
 }
 
+/**
+ * Item 20: HEAD is resolved once before the verified checks run and again
+ * right after them. When a commit landed in between, the review stamps the
+ * later commit (the tree the reviewer will actually read) and the checks
+ * section says they ran against the earlier one. An unresolvable HEAD after
+ * the checks keeps the earlier stamp rather than guessing.
+ *
+ * The `"dispatch-preparation"` interval is different: the context pack was
+ * already materialized against the stamped commit, so a commit landing after
+ * that point is NOT in the snapshot the reviewer will read. The stamp stays on
+ * the snapshot's commit (the review then reads as stale against the newer
+ * HEAD — it fails closed) and the checks section records the later commit.
+ *
+ * @internal exported for testing
+ */
+export function reconcileReviewedCommitAfterChecksV1(
+  stampedBeforeChecks: string | undefined,
+  headAfterChecks: string | undefined,
+  verifiedChecks: string,
+  interval: "checks" | "dispatch-preparation" = "checks"
+): { reviewedCommitSha: string; verifiedChecks: string } {
+  const before = stampedBeforeChecks ?? "unknown";
+  if (headAfterChecks === undefined || headAfterChecks === before) {
+    return { reviewedCommitSha: before, verifiedChecks };
+  }
+  if (interval === "dispatch-preparation") {
+    return {
+      reviewedCommitSha: before,
+      verifiedChecks:
+        `${verifiedChecks}\n\nNote: a commit (${headAfterChecks}) landed after this review's file ` +
+        `snapshot was taken, so the snapshot does not include it; this review is stamped with the ` +
+        `snapshot's commit ${before} and will read as stale against the newer HEAD.`,
+    };
+  }
+  const earlier = before === "unknown" ? "an earlier tree" : `an earlier tree (commit ${before})`;
+  return {
+    reviewedCommitSha: headAfterChecks,
+    verifiedChecks:
+      `${verifiedChecks}\n\nNote: a commit landed while these checks were running, so the checks ran against ` +
+      `${earlier}; this review is stamped with the later commit ${headAfterChecks}.`,
+  };
+}
+
 async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
@@ -2784,7 +2836,7 @@ export async function handleReviewRoutingOutcome(options: {
    * callers that never captured a reservation (direct unit-test callers of
    * this function, or a legacy caller predating this field) — those fall
    * back to the old (imperfect but previously-only) source below. */
-  reservedReviewPass?: number;
+  reservedReviewPass?: number; reviewScope?: "open-editors"; // open-editors: no tracked file set; recorded on the history entry so it survives a failed artifact write
 }): Promise<{ escalated: boolean; degenerateBackupAdvance?: DegenerateReviewBackupAdvanceDecisionV1 }> {
   const {
     folderUri,
@@ -2801,7 +2853,7 @@ export async function handleReviewRoutingOutcome(options: {
     coordinatorExtraAttemptIds,
     taskMdSizeBand,
     identityAttachmentDegraded,
-    reservedReviewPass,
+    reservedReviewPass, reviewScope,
   } = options;
   try {
     const resilience = getResilienceSettings();
@@ -3116,7 +3168,7 @@ export async function handleReviewRoutingOutcome(options: {
         : progressBefore.stageReviewPasses?.[targetStage] !== undefined
           ? { reviewPass: progressBefore.stageReviewPasses[targetStage] }
           : {}),
-      ...(reviewer ? { reviewer } : {}),
+      ...(reviewer ? { reviewer } : {}), ...(reviewScope ? { scope: reviewScope } : {}),
       ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
       ...(challengedMatches.length > 0
         ? {
@@ -3937,6 +3989,81 @@ export async function dispatchDegenerateReviewBackupAdvanceV1(
   return { dispatched: true };
 }
 
+/**
+ * v1 fixes 2, item 21 (2026-09-17 instance) / Part 1 step 6: the prompt
+ * variable a review dispatch sets when its context pack fell back to
+ * whatever editors happened to be open — `implReviewFiles` absent, so there
+ * was NO tracked file set. Set from the `isFallback` the context-pack writer
+ * actually returned (fresh and resumed dispatch paths both) and read back by
+ * `routeReviewOutcomeV1` from the same `variables` it already carries for
+ * `reviewPass`, so what travels is the scope the reviewer was really given,
+ * never a later re-read of progress that may have changed since.
+ */
+const REVIEW_SCOPE_FALLBACK_VARIABLE = "reviewScopeFallback";
+const REVIEW_SCOPE_FALLBACK_VALUE = "open-editors";
+const REVIEW_SCOPE_MARKER_RE = /<!--\s*review-scope:\s*open-editors\s*-->/i;
+
+/**
+ * True when this implementation-side review ran on the open-editor fallback.
+ * A verdict over "whatever was open" says nothing about the task's code (a
+ * 10/10 on no scope reads as the strongest verdict of the task), so it must
+ * never move the stage on by itself. Plan reviews never read a tracked set.
+ * An EMPTY tracked list is a different state — tracked mode with zero
+ * changes — and is not fallback mode; only the writer's `isFallback` is.
+ */
+export function reviewRanWithoutTrackedFileSetV1(
+  variables: Readonly<Record<string, string>>,
+  targetStage: TaskStage
+): boolean {
+  return (
+    !isPlanReviewStage(targetStage) &&
+    variables[REVIEW_SCOPE_FALLBACK_VARIABLE] === REVIEW_SCOPE_FALLBACK_VALUE
+  );
+}
+
+/**
+ * Durably qualify a fallback-scope review artifact so a later reader cannot
+ * meet an unqualified high score. Idempotent (the marker is checked first)
+ * and best-effort: a write failure must not block routing, which refuses to
+ * advance independently.
+ */
+export async function qualifyOpenEditorScopeInReviewV1(
+  reviewUri: vscode.Uri,
+  content: string
+): Promise<string> {
+  return (await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content)).content;
+}
+
+/**
+ * `qualifyOpenEditorScopeInReviewV1` plus what became of the on-disk artifact,
+ * so a caller can avoid showing a file that is still (or no longer) the
+ * unqualified verdict. `qualified` means the artifact on disk carries the
+ * scope note.
+ */
+export async function qualifyOpenEditorScopeWithDispositionV1(
+  reviewUri: vscode.Uri,
+  content: string
+): Promise<{ content: string; disposition: ScopeReviewDispositionV1 }> {
+  if (REVIEW_SCOPE_MARKER_RE.test(content)) {
+    return { content, disposition: "qualified" };
+  }
+  const qualified =
+    content.replace(/\s*$/, "") +
+    "\n\n> **Review scope:** this task has no tracked implementation file set, so this review covered only " +
+    "the files open in the editor when it ran. It does not assess the task's code as a whole and did not " +
+    "advance the stage automatically.\n\n<!-- review-scope: open-editors -->\n";
+  // Retried (transient locks/AV scans) so the verdict on disk is qualified
+  // whenever the file is writable at all; only a persistent failure warns
+  // (and the stage still does not advance).
+  const failure = await writeQualifiedScopeReviewWithRetryV1(reviewUri, qualified);
+  if (failure === undefined) {
+    return { content: qualified, disposition: "qualified" };
+  }
+  const disposition = await settleUnqualifiableScopeReviewV1(reviewUri, qualified); // persistent failure: node-fs write, else fail closed
+  warnOpenEditorScopeNoteUnsavedV1(failure, disposition);
+  return { content: qualified, disposition };
+}
+
 async function routeReviewOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
@@ -3993,10 +4120,27 @@ async function routeReviewOutcomeV1(
       return;
     }
     if (transitionToTarget?.persisted) {
-      await safeOpenTextDocument(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage]);
+      // Carried from dispatch (see REVIEW_SCOPE_FALLBACK_VARIABLE): the
+      // review fell back to open editors, so its verdict states that scope
+      // and never auto-advances the stage.
+      const noTrackedFileSet = reviewRanWithoutTrackedFileSetV1(variables, targetStage);
+      if (!noTrackedFileSet) {
+        await safeOpenTextDocument(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage]);
+      }
       try {
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
-        const content = new TextDecoder().decode(contentBytes);
+        let content = new TextDecoder().decode(contentBytes);
+        if (noTrackedFileSet) {
+          const qualifiedReview = await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content);
+          content = qualifiedReview.content;
+          // Open only after qualification, and only a file that now carries
+          // the scope note: a review that could not be qualified was moved
+          // aside or removed (or is left unqualified with a warning), and
+          // showing it would put the unqualified verdict in front of the user.
+          if (qualifiedReview.disposition === "qualified") {
+            await safeOpenTextDocument(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage]);
+          }
+        }
         const score = parseReadiness(content).score;
         await notifyReviewerVerifiedTicksV1(folderUri, targetStage);
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
@@ -4028,7 +4172,16 @@ async function routeReviewOutcomeV1(
         // state that could not be read.
         const progress = await effectiveReviewProgressV1(folderUri, targetStage, content, "strict");
         const planIncomplete = isPlanIncomplete(progress);
-        const meetsThreshold = readyToAdvanceStage(score, autoAdvanceThreshold, progress);
+        const meetsThreshold =
+          readyToAdvanceStage(score, autoAdvanceThreshold, progress) && !noTrackedFileSet;
+        if (noTrackedFileSet) {
+          NotificationRouter.showWarning(
+            `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score ?? "unscored"}/10, but this task has no tracked ` +
+              "implementation file set, so the review covered only the files open in the editor at the time. " +
+              "The stage was not advanced automatically — open the files you changed and re-run the review, " +
+              "or advance manually once you are satisfied."
+          );
+        }
         // Records this round in the durable score history and decides
         // whether to keep quietly iterating, get a deliberate second
         // opinion, or escalate to the human. `escalated` is true only for
@@ -4059,7 +4212,7 @@ async function routeReviewOutcomeV1(
           ...(ctx.identityAttachmentDegraded
             ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
             : {}),
-          ...(reservedReviewPass !== undefined ? { reservedReviewPass } : {}),
+          ...(reservedReviewPass !== undefined ? { reservedReviewPass } : {}), ...(noTrackedFileSet ? { reviewScope: "open-editors" as const } : {}),
         });
         // wf10 item 7d / Part 5 step 15: an "advance" verdict means the stage
         // is configured for switch-to-backup and an untried backup exists —
@@ -4133,6 +4286,19 @@ async function routeReviewOutcomeV1(
               }
             );
           }
+        }
+        // v1 fixes 2, item 33: with auto-advance off, a passed Low-Level Code
+        // Review leaves the task at the gate before Publish. Say so plainly
+        // and put the action on the notice, rather than leaving a good score
+        // that reads as a stall.
+        if (!escalated && targetStage === "impl-low-review" && meetsThreshold && !isAutoAdvanceEnabled()) {
+          NotificationRouter.showInformation(
+            "Code reviews passed — advance to Publish when you're ready.",
+            undefined,
+            undefined,
+            undefined,
+            { command: "vs-code-ai-helper.nextStage", title: "Complete Stage & Move On" }
+          );
         }
         // Say WHY a high-scoring round is not advancing. Without this the
         // task looks silently stuck at a good score — indistinguishable from
@@ -4751,19 +4917,18 @@ export async function pauseTaskForExhaustedChainV1(
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "retry",
-      label: "Retry now",
-      consequence:
-        `Resumes the task and immediately re-attempts ${STAGE_DISPLAY_NAMES[stage]}'s action against the ` +
-        "same provider chain — genuinely retries, not just unpauses.",
+      ...(await loadRetryFailedReviewOptionFieldsV1(folderUri.fsPath, stage)),
       // A1 (1.0.0 gate, Part C): "Retry now" must retry, or be renamed — a
       // prior revision dispatched plain resumeTask, which clears the pause
-      // and dispatches nothing, leaving "Retry now" indistinguishable from
-      // "Leave paused" except for its label. resumeAndApplyCurrentStageActionV1
-      // resumes AND dispatches applyCurrentStageAction, which re-attempts
-      // whichever action this stage's provider chain was exhausted running.
+      // and dispatches nothing. v1 fixes 2 (items 14 + 25): it must also
+      // retry the action that FAILED. This chain exhaustion is recorded by
+      // routeReviewOutcomeV1, i.e. a Review round exhausted it, so the retry
+      // is resumeAndRerunReviewV1 — not the stage default, which after a
+      // prior review exists is Apply Review, a different action on a
+      // different provider chain.
       effect: {
         kind: "command",
-        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        command: "vs-code-ai-helper.resumeAndRerunReview",
         args: [{ taskFolderPath: folderUri.fsPath }],
       },
     },
@@ -4837,7 +5002,7 @@ export async function pauseTaskForExhaustedChainV1(
         unblocksProgress: true,
         detail:
           "This decision is what is holding the task paused. \"Retry now\" resumes the task and immediately " +
-          "re-attempts the stage's action. \"Adjust provider settings\" opens Settings but does not " +
+          "re-runs the review that failed. \"Adjust provider settings\" opens Settings but does not " +
           "resume the task by itself — pick Retry or Wait for reset afterward." +
           (quotaParkRecord?.resetAt !== undefined
             ? ` "Wait for reset" keeps the task paused but schedules an automatic retry at ${quotaParkRecord.resetAt}.`
@@ -4850,6 +5015,29 @@ export async function pauseTaskForExhaustedChainV1(
   if (!decision) {
     NotificationRouter.showWarning(`⚠️ ${reason} The task has been paused; fix provider availability or the stage's model configuration, then resume.`);
   }
+}
+
+/**
+ * v1 fixes 2, item 1 completion blocker (2026-09-18 review): an
+ * unusable-summary refusal must never recommend "run the implementation step
+ * again" once the plan's checklist is fully settled (`remaining === 0`) —
+ * there is nothing left for another implementation round to change, so that
+ * remedy is provably inert.
+ *
+ * Reads the plan of record directly rather than through
+ * `readEffectivePlanChecklistProgressV1`: that helper is a gating/display
+ * value that stands down (`undefined`) whenever `checklistProgressUnreliable`
+ * is latched, and a latched task is exactly where this deadlock arises. The
+ * remedy text is advice only — it gates nothing — so the raw readable count
+ * is the right input.
+ *
+ * Shared by `runReviewForFolder`, `describeUnusableReviewBlockV1` (Fast
+ * Forward) and `buildReviewResumeVariablesV1` (resume preflight) so the three
+ * refusal surfaces never drift out of sync on this branch.
+ */
+async function isPlanChecklistFullySettledV1(folderUri: vscode.Uri): Promise<boolean> {
+  const plan = await readPlanOfRecordV1(folderUri);
+  return plan.hasChecklist && plan.counts !== undefined && plan.counts.remaining === 0;
 }
 
 export async function runReviewForFolder(
@@ -4906,6 +5094,14 @@ export async function runReviewForFolder(
      * initiated refusal re-enters Fast Forward specifically.
      */
     rerunCommandId?: string;
+    /**
+     * Set to `dispatched: true` once this call has claimed a review attempt
+     * (its pass is reserved and its ledger row opened) — i.e. once the review
+     * was actually dispatched rather than refused on a guard clause. The
+     * caller's tracked operation reads it to end as `refused`, never
+     * `completed`, when the review never started (v1 fixes 2, item 32/33).
+     */
+    dispatchProbe?: { dispatched: boolean };
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -5140,12 +5336,11 @@ export async function runReviewForFolder(
       );
       const canRestorePreviousImplSummary =
         previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
+      const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
       NotificationRouter.showWarning(
         "The last implementation round did not produce usable implementation notes, so there is " +
           `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
-          (canRestorePreviousImplSummary
-            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
-            : "Run the implementation step again to produce them."),
+          describeUnusableSummaryRemedyV1(canRestorePreviousImplSummary, checklistFullySettled),
         undefined,
         undefined,
         undefined,
@@ -5202,6 +5397,18 @@ export async function runReviewForFolder(
       { operation: options.operation, stageToken, stageElapsedOrigin }
     );
     variables.verifiedChecks = checks.verifiedChecks;
+    if (REVIEWED_COMMIT_STAGES.has(targetStage)) {
+      // The checks above take minutes; a commit made meanwhile must be the
+      // one this review stamps, since the reviewer reads the tree as it now
+      // stands (item 20).
+      const stamped = reconcileReviewedCommitAfterChecksV1(
+        variables.reviewedCommitSha,
+        await resolveHeadCommitSha(workspaceRoot.uri.fsPath),
+        variables.verifiedChecks ?? "",
+      );
+      variables.reviewedCommitSha = stamped.reviewedCommitSha;
+      variables.verifiedChecks = stamped.verifiedChecks;
+    }
     if (checks.planItemVerification !== undefined) {
       variables.planItemVerification = checks.planItemVerification;
     }
@@ -5319,6 +5526,11 @@ export async function runReviewForFolder(
         maxTotalChars
       );
       isFallback = written.isFallback;
+      if (isFallback) {
+        variables[REVIEW_SCOPE_FALLBACK_VARIABLE] = REVIEW_SCOPE_FALLBACK_VALUE;
+      } else {
+        delete variables[REVIEW_SCOPE_FALLBACK_VARIABLE];
+      }
       lastEmbeddedContentBytes = written.embeddedContentBytes;
       lastOmittedRelPaths = written.omittedRelPaths;
       contextPackContent = new TextDecoder().decode(
@@ -5406,7 +5618,7 @@ export async function runReviewForFolder(
     if (isFallback) {
       NotificationRouter.showWarning(
         "No tracked implementation file set found for this task. " +
-          "The review will be based on currently open editors. " +
+          "The review will be based on currently open editors and will not auto-advance the stage. " +
           "For best results, open the files you changed before running the review."
       );
     }
@@ -5556,7 +5768,7 @@ export async function runReviewForFolder(
   try {
     assertLegacyAiRouteAllowedV0("review.v1");
 
-    const prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+    let prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
     // wf10 review fix (Part 6 step 16): `promptCeilingAdvisoryV1` compares
     // this against provider Read-tool ceilings that are themselves measured
     // in bytes (see its own doc comment) — `prompt.length` is a JS UTF-16
@@ -5565,7 +5777,7 @@ export async function runReviewForFolder(
     // text, emoji, etc.), which would let an over-ceiling prompt pass the
     // advisory unflagged. Same convention as cliAgentRunner.ts's own
     // `promptBytes`.
-    const promptByteLength = Buffer.byteLength(prompt, "utf8");
+    let promptByteLength = Buffer.byteLength(prompt, "utf8");
 
     // `rootId`/`targetLocator` are hoisted above the shrink loop (see that
     // comment) so the pre-dispatch size probe measures an object shaped like
@@ -5620,6 +5832,12 @@ export async function runReviewForFolder(
         }
       );
       return;
+    }
+    // A review round only counts as dispatched once its model resolved: the
+    // claim above and the "no model configured" refusal both precede any
+    // provider work, and the latter must read as refused, not completed.
+    if (options.dispatchProbe) {
+      options.dispatchProbe.dispatched = true;
     }
 
     // wf10 item 7c / Part 6 step 16: resolve which provider this round will
@@ -5726,6 +5944,25 @@ export async function runReviewForFolder(
       reviewStatResult.kind === "ok" && reviewStatResult.value.kind === "file"
         ? reviewStatResult.value.revision
         : undefined;
+    if (REVIEWED_COMMIT_STAGES.has(targetStage)) {
+      // Item 20, second half: the stamp was last reconciled straight after the
+      // checks, but the context pack (the file snapshot the reviewer reads),
+      // size probes, model resolution and claim above all ran since. A commit
+      // landing now is not in that snapshot, so the stamp stays on the
+      // snapshot's commit and the prompt records the later one — the review
+      // then reads as stale rather than claiming a tree it did not see.
+      const restamped = reconcileReviewedCommitAfterChecksV1(
+        variables.reviewedCommitSha,
+        await resolveHeadCommitSha(workspaceRoot.uri.fsPath),
+        variables.verifiedChecks ?? "",
+        "dispatch-preparation"
+      );
+      if (restamped.verifiedChecks !== (variables.verifiedChecks ?? "")) {
+        variables.verifiedChecks = restamped.verifiedChecks;
+        prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+        promptByteLength = Buffer.byteLength(prompt, "utf8");
+      }
+    }
     const validatedInput: ReviewActionInputV1 = {
       prompt,
       targetLocator,
@@ -5938,15 +6175,22 @@ export async function describeUnusableReviewBlockV1(
       targetStage !== undefined &&
       previousImplSummary !== undefined &&
       !isUnusableImplementationSummaryV1(previousImplSummary);
+    const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
     return {
       warning:
         "Fast Forward Review: a prior implementation round was rejected and left no usable " +
         "implementation summary, so review could not run and there is nothing to fast-forward from. " +
         (canRestorePreviousImplSummary
-          ? "Restore the last usable summary, or rerun the implementation to produce fresh notes, " +
-            "before fast-forwarding."
-          : 'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
-            "fast-forwarding."),
+          ? checklistFullySettled
+            ? "Restore the last usable summary before fast-forwarding — the plan's checklist is fully " +
+              "settled, so rerunning implementation would have nothing left to change."
+            : "Restore the last usable summary, or rerun the implementation to produce fresh notes, " +
+              "before fast-forwarding."
+          : checklistFullySettled
+            ? "The plan's checklist is fully settled, so rerunning implementation would have nothing left " +
+              "to change; this needs a human decision before fast-forwarding."
+            : 'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
+              "fast-forwarding."),
       canRestorePreviousImplSummary,
     };
   }
@@ -6306,7 +6550,7 @@ export async function runReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg,
   chatViewProvider?: ChatViewProvider
-): Promise<void> {
+): Promise<boolean | void> {
   assertLegacyAiRouteAllowedV0("review.v1");
   // ── Pre-flight workspace guard ────────────────────────────────────────────
   // Fail fast if no workspace is open at all; the ownership-aware resolution
@@ -6478,17 +6722,22 @@ export async function runReviewWithAI(
     }
 
     const lockKey = resolved.folderUri.fsPath;
-    await runTrackedOperation(
+    const dispatchedReview = await runTrackedOperation(
       lockKey,
       {
-        label: "Review",
+        label: stepNameV1("review"),
         stage: resolved.progress.currentStage,
         taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
         kind: "review",
         cancellable: true,
+        // A review refused on a guard clause (stale Publish checks, unusable
+        // summary, unchanged tree, no model configured) never started: record
+        // it as refused, not completed.
+        refusedWhenFalse: true,
       },
-      (op) =>
-        runReviewForFolder(
+      async (op) => {
+        const dispatchProbe = { dispatched: false };
+        await runReviewForFolder(
           extensionUri,
           resolved.folderUri,
           workspaceRoot,
@@ -6497,6 +6746,7 @@ export async function runReviewWithAI(
           {
             operation: op,
             chatViewProvider,
+            dispatchProbe,
             // 2026-09-04 review follow-up (completion blocker, narrowed): the
             // unchanged-tree guard (Part C Step 5) moved into `runReviewForFolder`
             // itself so it is a single choke point every review dispatch passes
@@ -6504,8 +6754,13 @@ export async function runReviewWithAI(
             // doc comment for the full rationale and the automation/manual split.
             automationDispatch: isAutomationDispatchV1(arg),
           }
-        )
+        );
+        return dispatchProbe.dispatched;
+      }
     );
+    // Callers composing this command (resume-then-dispatch) read the boolean:
+    // `true` only when a review round genuinely started.
+    return dispatchedReview === true;
   } finally {
     await releaseAdmissionV1();
   }
@@ -6809,7 +7064,7 @@ export async function applyReviewWithAI(
       // Re-review after applying (no confirmation, no stage change)
       await runTrackedOperation(
         lockKey,
-        { parent: op, label: "Re-running review", stage, kind: "review" },
+        { parent: op, label: stepNameV1("re-review"), stage, kind: "review" },
         // See the impl-review branch above: anchor the deferred auto-advance
         // dispatch to the exclusive root (`op`), not this re-review's own
         // child handle, or the follow-up command fires while the root
@@ -6881,7 +7136,7 @@ export async function applyReviewWithAI(
     dispatchedV1 =
       (await runTrackedOperation(
         lockKey,
-        { label: "Apply Review", stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true },
+        { label: stepNameV1("apply-review"), stage, taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "apply-review", cancellable: true, refusedWhenFalse: true },
         runApply
       )) === true;
   }
@@ -7228,8 +7483,12 @@ export async function fastForwardReviewWithAI(
       taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
       kind: "fast-forward",
       cancellable: true,
+      // v1 fixes 2, item 32: a Fast Forward that ends because the review it
+      // needs never ran (the initial review was refused or left no usable
+      // artifact) records "refused", never "completed".
+      refusedWhenFalse: true,
     },
-    async (op) => {
+    async (op): Promise<false | void> => {
   const stage = resolved.progress.currentStage;
   // At a review stage this is the stage itself; at a pre-review stage (plan,
   // impl) it is the review that stage produces — the loop below always
@@ -7315,7 +7574,10 @@ export async function fastForwardReviewWithAI(
       // stages that actually stamp the marker (mirrors REVIEWED_COMMIT_STAGES'
       // own scoping for the sibling reviewed-commit staleness check above).
       (REVIEWED_COMMIT_STAGES.has(targetStage) &&
-        !isReviewPassCurrentV1(initialContent, resolved.progress.stageReviewPasses, targetStage)))
+        (!isReviewPassCurrentV1(initialContent, resolved.progress.stageReviewPasses, targetStage) ||
+          // ...or one written before the latest implementation round started:
+          // it describes the tree from before that round.
+          reviewPredatesLatestImplementationRoundV1(resolved.progress, targetStage))))
   ) {
     initialContent = undefined;
   }
@@ -7379,7 +7641,8 @@ export async function fastForwardReviewWithAI(
             }
           : undefined
       );
-      return;
+      // The review this run exists to build on never ran: "refused", not "completed".
+      return false;
     }
   }
 
@@ -7399,7 +7662,7 @@ export async function fastForwardReviewWithAI(
           }
         : undefined
     );
-    return;
+    return false;
   }
   const baselineScore = initialScore;
   // Evidence from the review that already produced baselineScore — lets
@@ -7704,7 +7967,7 @@ export async function fastForwardReviewWithAI(
             // standing between "checks are failing" and "clean round".
             const mechanicalBlockers = getMechanicalBlockersForStage(resolved.folderUri, targetStage);
             return {
-              score: parseReadiness(newContent).score,
+              score: await readFastForwardReviewScoreV1(resolved.folderUri, targetStage, newContent),
               taskFixableCount: detailed.blockPresent
                 ? detailed.blockers.filter((b) => b.resolver === "task-fixable").length + mechanicalBlockers.length
                 : mechanicalBlockers.length > 0
@@ -11413,14 +11676,31 @@ async function executeImplementationRun(
       // destroying the last usable summary the stamp itself promises is
       // preserved. Nothing is lost by not rewriting: the marker is identical
       // in effect, and each round's full response is in its own run log.
+      //
+      // Also skipped when the existing summary is USABLE and the rejection is
+      // about form (a report-form contradiction, an empty final response):
+      // that says nothing about the last usable summary's soundness, so
+      // `impl-summary.md` stays exactly as it is — a live summary, not a stub
+      // with the notes parked in `impl-summary_prev.md`. The owed state is
+      // carried by `implRecovery` (recorded ahead of every other write): the
+      // advancement gate refuses while it is owed, and
+      // `retireSatisfiedSummaryRejectedRecoveryV1` only accepts a summary as
+      // the continuation's answer when it was written AFTER that record. A
+      // summary-only violation is a forbidden edit, not a form rejection, and
+      // is still stamped.
       const existingSummary = await readTextIfExists(summaryUri);
-      if (!existingSummary || !isUnusableImplementationSummaryV1(existingSummary)) {
+      if (
+        !shouldPreserveUsableImplementationSummaryV1(existingSummary, summaryOnlyViolation) &&
+        (!existingSummary || !isUnusableImplementationSummaryV1(existingSummary))
+      ) {
         // The stamp states what happens next (continuation scheduled, or the
         // budget exhausted) so it is distinguishable from a plain "review
         // paused, waiting on user" state — see beginImplementationRecoveryV1.
         const recoveryLine = recovery
           ? recovery.capReached
-            ? "Automated recovery has stopped: the continuation budget is exhausted, so the task needs a human decision."
+            ? "Automated recovery has stopped: the continuation budget is exhausted, and nothing will " +
+              'retry it automatically. Review the run log for what the round actually changed, then use ' +
+              '"Discard this owed continuation" (offered on the next refused action) to clear it by hand.'
             : `A continuation implementation round (${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}) has been scheduled to produce them.`
           : undefined;
         await writeTextFile(
@@ -12019,6 +12299,58 @@ async function executeImplementationRun(
 }
 
 /**
+ * v1 fixes 2, item 31 (Part 5a): records why an unattended Implementation
+ * dispatch stopped with only hand-off checks left — a chat line listing them,
+ * `nextActor: human` so the task reads "waiting for you" (never a stall), and
+ * one notice. Best-effort on the chat write; the stop itself never depends on it.
+ *
+ * @internal exported for testing
+ */
+export async function recordHandoffOnlyStopV1(
+  folderUri: vscode.Uri,
+  displayName: string | undefined,
+  stage: TaskStage,
+  stop: { readonly reason: string; readonly checks: readonly string[] }
+): Promise<void> {
+  // The card is the surface the user acts from: it lists the checks and lets
+  // them tick each (with a note) or accept the rest. Only when there is no
+  // extension context to post it through does the stop fall back to a plain
+  // chat message — untyped, because the transcript hides `activity` entries
+  // and a stop nobody can see is not "waiting for you".
+  let posted = false;
+  try {
+    posted = await postHandoffChecksDecisionV1({
+      taskFolderPath: folderUri.fsPath,
+      stage,
+      displayName,
+      reason: stop.reason,
+      checks: stop.checks,
+    });
+  } catch {
+    // Fall through to the plain message below.
+  }
+  if (!posted) {
+    const shown = stop.checks.slice(0, 10).map((check) => `- ${truncateChecklistItemTextV1(check, 160)}`);
+    const more = stop.checks.length > shown.length ? [`- …and ${stop.checks.length - shown.length} more`] : [];
+    try {
+      await appendChatMessageV1(folderUri.fsPath, {
+        role: "assistant",
+        text: `_Waiting for you: ${stop.reason}_\n\nRemaining checks:\n${[...shown, ...more].join("\n")}`,
+        stage,
+        at: new Date().toISOString(),
+      });
+    } catch {
+      // Best-effort record only — the stop and the hand-back below are what matter.
+    }
+  }
+  await patchTaskProgressStrictV1(folderUri, (current) => setNextActorV1(current, "human")).catch(() => undefined);
+  NotificationRouter.showInformation(
+    `"${displayName ?? path.basename(folderUri.fsPath)}" is waiting for you: only hand-off checks remain, so no further ` +
+      "Implementation round was started. The remaining checks are listed in the task's chat."
+  );
+}
+
+/**
  * Run the implementation: use AI with tool-calling to make actual code changes.
  *
  * Reads from `plan-final.md` (the canonical implementation-stage artifact).
@@ -12248,7 +12580,7 @@ export async function runImplementationWithAI(
   let redirectAfterOperationV1: { reviewStage: TaskStage; reason: string } | undefined;
   const implRoundRan = await runTrackedOperation(
     lockKey,
-    { label: "Run Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "run-implementation", cancellable: true },
+    { label: stepNameV1("implementation"), stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "run-implementation", cancellable: true },
     async (op): Promise<boolean> => {
     const stageToken = reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
@@ -12583,6 +12915,20 @@ export async function runImplementationWithAI(
     // at score 6 because Implementation only reads the plan checklist and
     // was never told about the review's blockers.
     if (isAutomationDispatchV1(arg)) {
+      // v1 fixes 2, item 31 (Part 5a): nothing left to build but hand-off
+      // checks — stop, say why, and hand the task back to the human rather
+      // than dispatching a round that can only report "not buildable".
+      const handoffStop = decideHandoffOnlyStopV1({
+        history: resolved.progress.reviewScoreHistory,
+        stages: IMPL_REVIEW_STAGES_V1,
+        unchecked: classifyUncheckedChecklistItemsV1(planFinalContent),
+        continuationOwed: resolved.progress.implRecovery !== undefined,
+        pendingImplReviewFilesCount: resolved.progress.pendingImplReviewFiles?.length ?? 0,
+      });
+      if (handoffStop) {
+        await recordHandoffOnlyStopV1(resolved.folderUri, resolved.progress.displayName, resolved.progress.currentStage, handoffStop);
+        return false;
+      }
       const autoDispatch = chooseAutomaticImplementationDispatchV1({
         decision: preRunDecision,
         isAutomationDispatch: true,
@@ -13089,7 +13435,26 @@ export async function applyReviewEditWithAI(
         : "An implementation round changed the workspace after this review was written " +
           "(the round ended without a usable report), so the review no longer describes " +
           "the tree. Run the review again before applying it.";
-      NotificationRouter.showWarning(message);
+      // Item 21's release scope: "Discard this owed continuation" must
+      // appear on every refusal that names an owed continuation, not only
+      // Complete Stage & Move On's — this is Apply Review's own such
+      // refusal, and it named the recovery above without offering an exit.
+      const canDiscardOwedRecovery =
+        progressForApply.implRecovery !== undefined &&
+        isImplRecoveryDiscardOfferableV1(progressForApply.implRecovery, progressForApply);
+      NotificationRouter.showWarning(
+        message,
+        undefined,
+        undefined,
+        undefined,
+        canDiscardOwedRecovery
+          ? {
+              command: "vs-code-ai-helper.discardOwedImplRecoveryV1",
+              title: "Discard This Owed Continuation",
+              args: [resolved.folderUri.fsPath],
+            }
+          : undefined
+      );
       if (progressForApply.implRecovery) {
         try {
           await writeRunLog(
@@ -13141,7 +13506,7 @@ export async function applyReviewEditWithAI(
     if (implementSucceeded) {
       await runTrackedOperation(
         lockKey,
-        { parent: op, label: "Re-running review", stage, kind: "review" },
+        { parent: op, label: stepNameV1("re-review"), stage, kind: "review" },
         () =>
           runReviewForFolder(
             extensionUri,
@@ -13190,11 +13555,12 @@ export async function applyReviewEditWithAI(
       (await runTrackedOperation(
         lockKey,
         {
-          label: "Apply Review",
+          label: stepNameV1("apply-review"),
           stage,
           taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
           kind: "apply-review",
           cancellable: true,
+          refusedWhenFalse: true,
         },
         runApply
       )) === true;
@@ -13300,8 +13666,9 @@ export function registerReviewActionCommands(
       async (taskFolderPath: string) => {
         const confirmation = await vscode.window.showWarningMessage(
           "Discard this owed implementation continuation?\n\n" +
-            "This clears the recovery record without ever running the round it was waiting for. " +
-            "Only do this once you've confirmed the pending work is no longer needed — it cannot be undone.",
+            "This stops waiting for a conforming re-report of the round that made these edits, and moves its " +
+            "already-applied files into normal review scope so the next review judges them like any other " +
+            "change. It never runs the round it was waiting for, and it cannot be undone.",
           { modal: true },
           "Discard Continuation"
         );
@@ -13310,19 +13677,25 @@ export function registerReviewActionCommands(
         }
         const discarded = await discardOwedImplRecoveryV1(vscode.Uri.file(taskFolderPath));
         if (discarded) {
+          // 2026-09-18 review fix (narrowed blocker
+          // d1b82577-74db-4b46-880d-29a903207a6a-1): discarding an owed
+          // continuation promotes quarantined files into ordinary review
+          // scope so a review can judge them — it must NOT also
+          // auto-advance the stage. The task can carry a
+          // `reviewInvalidatedByRound` marker for this exact stage (set
+          // when the round that produced these files invalidated the
+          // stage's existing review artifact); immediately calling
+          // `nextStage` here could move an invalidated-review task straight
+          // to the next stage (and, from `impl-low-review`, on toward
+          // Publish) before anything ever reviewed the promoted files.
+          // "Complete Stage & Move On" already re-runs the ordinary
+          // advancement gate (which itself checks review freshness) and is
+          // one click away, so this leaves that decision to the gate
+          // instead of bypassing it here.
           NotificationRouter.showInformation(
-            "Discarded the owed implementation continuation. Re-evaluating Complete Stage & Move On now."
+            "Discarded the owed implementation continuation and moved its files into review scope. " +
+              "Run the review, then use Complete Stage & Move On when you're ready to advance."
           );
-          // Part 5 step 34's own wording: "record the action, and re-evaluate
-          // advancement immediately" — a discard that only cleared state and
-          // left the user to click "Complete Stage & Move On" a second time
-          // would still be friction the finding names as a dead end. `{
-          // taskFolderPath }` matches the `TaskNodeArg` shape every other
-          // notification-button command in this file passes to `resolveTask`
-          // (see this command's own registration site's neighboring comment).
-          // `nextStage` reports its own success/failure notification, so
-          // nothing further is shown here regardless of outcome.
-          await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", { taskFolderPath });
         } else {
           NotificationRouter.showInformation(
             "Nothing to discard — the owed continuation already cleared on its own."
@@ -13827,14 +14200,13 @@ async function buildReviewResumeVariablesV1(
       );
       const canRestorePreviousImplSummary =
         previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
+      const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
       return {
         ok: false,
         warning:
           "The last implementation round did not produce usable implementation notes, so there is " +
           "nothing to review it against. " +
-          (canRestorePreviousImplSummary
-            ? "Restore the last usable summary, or run the implementation step again to produce fresh notes."
-            : "Run the implementation step again to produce them."),
+          describeUnusableSummaryRemedyV1(canRestorePreviousImplSummary, checklistFullySettled),
         ...(canRestorePreviousImplSummary
           ? {
               actionCommand: {
@@ -13877,17 +14249,22 @@ async function buildReviewResumeVariablesV1(
         ? parseReviewedCommitSha(previousReviewForBaseline)
         : undefined) ?? (await readTaskImplementationBaselineShaV1(folderUri));
   }
-  const contextPackUri = isPlanReview
-    ? await writeContextPack(folderUri, workspaceUri, false)
-    : (
-        await writeImplReviewContextPack(
-          folderUri,
-          workspaceUri,
-          (await readTaskProgressAdvisoryV1(folderUri))?.implReviewFiles,
-          undefined,
-          resumeBaselineSha
-        )
-      ).contextPackUri;
+  let contextPackUri: vscode.Uri;
+  if (isPlanReview) {
+    contextPackUri = await writeContextPack(folderUri, workspaceUri, false);
+  } else {
+    const written = await writeImplReviewContextPack(
+      folderUri,
+      workspaceUri,
+      (await readTaskProgressAdvisoryV1(folderUri))?.implReviewFiles,
+      undefined,
+      resumeBaselineSha
+    );
+    contextPackUri = written.contextPackUri;
+    if (written.isFallback) {
+      variables[REVIEW_SCOPE_FALLBACK_VARIABLE] = REVIEW_SCOPE_FALLBACK_VALUE;
+    }
+  }
   variables.contextPack = new TextDecoder().decode(await vscode.workspace.fs.readFile(contextPackUri));
 
   return { ok: true, variables };
@@ -13996,6 +14373,22 @@ export async function resumeReviewInteractionV1(
     const resumedReservedReviewPass = claimed.stageReviewPasses?.[targetStage];
     if (resumedReservedReviewPass !== undefined) {
       variablesResult.variables.reviewPass = String(resumedReservedReviewPass);
+    }
+
+    // The coordinator replays the ORIGINAL prompt, but the variables above were
+    // rebuilt from CURRENT progress — if file tracking changed while the
+    // interaction sat awaiting an answer, the rebuilt scope fact can disagree
+    // with what the reviewer was actually given. Routing must act on the scope
+    // of the prompt that ran, so take it from the persisted input snapshot.
+    if (!isPlanReviewStage(targetStage)) {
+      const before = await orchestrator.loadInteraction(interactionRef);
+      const originalScope =
+        before.kind === "ok" ? reviewScopeFromInputSnapshotV1(before.record.inputSnapshot.canonicalJson) : undefined;
+      if (originalScope === "open-editors") {
+        variablesResult.variables[REVIEW_SCOPE_FALLBACK_VARIABLE] = REVIEW_SCOPE_FALLBACK_VALUE;
+      } else if (originalScope === "tracked") {
+        delete variablesResult.variables[REVIEW_SCOPE_FALLBACK_VARIABLE];
+      }
     }
 
     // 2026-08-27 review, blocker "lifecycle identity", fourth pass: "Resume
@@ -14141,7 +14534,7 @@ export async function resumeApplyReviewInteractionV1(
     if (workspaceFolder) {
       await runTrackedOperation(
         taskFolderUri.fsPath,
-        { label: "Re-running review", stage, taskName: resolveWorkflowRootTaskName(ownedTask.progress.displayName, taskFolderUri.fsPath), kind: "review" },
+        { label: stepNameV1("re-review"), stage, taskName: resolveWorkflowRootTaskName(ownedTask.progress.displayName, taskFolderUri.fsPath), kind: "review" },
         (op) =>
           runReviewForFolder(
             extensionUri,
@@ -14187,4 +14580,143 @@ export async function resumeApplyReviewInteractionV1(
     return { ok: false, reason: "Resume failed to settle the interaction" };
   }
   return { ok: true, settlement };
+}
+
+/**
+ * The scope note could not be persisted to a fallback-scope review artifact.
+ * The stage still does not advance (routing keys off the dispatch fact, not
+ * the marker), but a later reader of the file would meet an unqualified
+ * score — say so where the user is looking rather than silently handing
+ * back the unqualified text.
+ */
+const SCOPE_NOTE_WRITE_ATTEMPTS_V1 = 3;
+const SCOPE_NOTE_WRITE_RETRY_DELAY_MS_V1 = 150;
+
+/**
+ * Write the scope-qualified review artifact, retrying a transient failure.
+ * Returns `undefined` once persisted, or the last error when every attempt
+ * failed. `delayMs` is injectable so tests do not wait on the backoff.
+ */
+export async function writeQualifiedScopeReviewWithRetryV1(
+  reviewUri: vscode.Uri,
+  qualified: string,
+  delayMs: number = SCOPE_NOTE_WRITE_RETRY_DELAY_MS_V1
+): Promise<unknown> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SCOPE_NOTE_WRITE_ATTEMPTS_V1; attempt += 1) {
+    try {
+      await vscode.workspace.fs.writeFile(reviewUri, new TextEncoder().encode(qualified));
+      return undefined;
+    } catch (error) {
+      lastError = error;
+      if (attempt < SCOPE_NOTE_WRITE_ATTEMPTS_V1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs * attempt));
+      }
+    }
+  }
+  return lastError ?? new Error("write failed");
+}
+
+/**
+ * Whether a review verdict covered only open editors: the artifact's own
+ * marker, OR the durable score-history `scope` recorded at routing time. The
+ * history half is what still tells a reader when the artifact write failed
+ * persistently and the on-disk verdict is unqualified.
+ */
+export function reviewCoveredOpenEditorsOnlyV1(
+  content: string,
+  latestHistoryEntry: { scope?: "open-editors" } | undefined
+): boolean {
+  return latestHistoryEntry?.scope === "open-editors" || REVIEW_SCOPE_MARKER_RE.test(content);
+}
+
+/**
+ * The score Fast Forward measures a round by. An open-editors-only verdict is
+ * unscored (`null`) — it never satisfies the stop level — even when its scope
+ * note could not be written to the artifact.
+ */
+export async function readFastForwardReviewScoreV1(
+  folderUri: vscode.Uri,
+  targetStage: TaskStage,
+  reviewContent: string
+): Promise<number | null> {
+  const latest = (await readTaskProgressAdvisoryV1(folderUri))?.reviewScoreHistory
+    ?.filter((entry) => entry.stage === targetStage)
+    .at(-1);
+  return reviewCoveredOpenEditorsOnlyV1(reviewContent, latest) ? null : parseReadiness(reviewContent).score;
+}
+
+type ScopeReviewDispositionV1 = "qualified" | "moved-aside" | "removed" | "unqualified";
+
+/**
+ * Last resort once the workspace-fs qualification write has failed
+ * persistently, so the file on disk is still the provider's UNQUALIFIED
+ * verdict. Tries the qualified write through the node filesystem, then fails
+ * closed: an artifact that cannot be qualified is moved aside (verdict kept,
+ * no longer the stage artifact) or removed, so no reader meets its score.
+ * Returns what became of the on-disk artifact.
+ */
+export async function settleUnqualifiableScopeReviewV1(
+  reviewUri: vscode.Uri,
+  qualified: string
+): Promise<ScopeReviewDispositionV1> {
+  if (reviewUri.scheme !== "file") {
+    return "unqualified";
+  }
+  const target = reviewUri.fsPath;
+  try {
+    await fs.promises.writeFile(target, qualified, "utf8");
+    return "qualified";
+  } catch {
+    // fall through to the fail-closed steps
+  }
+  try {
+    await fs.promises.rename(target, `${target}.open-editors-unqualified`);
+    return "moved-aside";
+  } catch {
+    // fall through
+  }
+  try {
+    await fs.promises.unlink(target);
+    return "removed";
+  } catch {
+    return "unqualified";
+  }
+}
+
+function warnOpenEditorScopeNoteUnsavedV1(error: unknown, disposition: ScopeReviewDispositionV1): void {
+  if (disposition === "qualified") {
+    return;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const outcome =
+    disposition === "moved-aside"
+      ? "The unqualified verdict was moved aside (review file + .open-editors-unqualified) so it cannot be read as a task-wide score; re-run the review once the task tracks files."
+      : disposition === "removed"
+        ? "The unqualified verdict was removed so it cannot be read as a task-wide score; re-run the review once the task tracks files."
+        : "Treat its score as covering those open files only.";
+  NotificationRouter.showWarning(
+    "This review covered only the files open in the editor (the task has no tracked implementation file set), " +
+      `but the scope note could not be saved to the review file (${message}). ${outcome} The stage was not advanced.`
+  );
+}
+
+/**
+ * Recover the scope a review prompt was ACTUALLY built with from a persisted
+ * interaction input snapshot (`{ prompt, ... }` canonical JSON). The
+ * open-editor fallback context pack always carries the
+ * "## Open Editors (Fallback)" heading; a tracked-scope pack never does.
+ * Returns `undefined` when the snapshot cannot be read, so callers fall back
+ * to a rebuilt value knowingly rather than guessing.
+ */
+export function reviewScopeFromInputSnapshotV1(canonicalJson: string): "open-editors" | "tracked" | undefined {
+  try {
+    const parsed = JSON.parse(canonicalJson) as { prompt?: unknown };
+    if (typeof parsed?.prompt !== "string") {
+      return undefined;
+    }
+    return /^## Open Editors \(Fallback\)\s*$/m.test(parsed.prompt) ? "open-editors" : "tracked";
+  } catch {
+    return undefined;
+  }
 }

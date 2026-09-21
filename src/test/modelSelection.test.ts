@@ -104,40 +104,27 @@ function claudeCliReasoningVariants(
   }));
 }
 
+/**
+ * v1 fixes 2, item 19: Copilot's LM provider ignores `model_reasoning_effort`
+ * and `model_context_window`, so no `@effort` / `+long` variants are offered.
+ * The call sites keep the historical matrix (model, label, efforts) so the
+ * expectation still documents which variants are deliberately absent.
+ */
 function copilotReasoningVariants(
-  model: string,
-  label: string,
-  efforts: readonly (readonly [string, string])[]
+  _model: string,
+  _label: string,
+  _efforts: readonly (readonly [string, string])[]
 ): SelectableModel[] {
-  return efforts.map(([effort, effortLabel]) => ({
-    id: `${model}@${effort}`,
-    name: `${label} (${effortLabel})`,
-    providerLabel: "GitHub Copilot",
-  }));
+  return [];
 }
 
 function copilotReasoningAndContextVariants(
-  model: string,
-  label: string,
-  efforts: readonly (readonly [string, string])[],
-  longContext: boolean
+  _model: string,
+  _label: string,
+  _efforts: readonly (readonly [string, string])[],
+  _longContext: boolean
 ): SelectableModel[] {
-  const variants: SelectableModel[] = [];
-  for (const [effort, effortLabel] of efforts) {
-    variants.push({
-      id: `${model}@${effort}`,
-      name: `${label} (${effortLabel})`,
-      providerLabel: "GitHub Copilot",
-    });
-    if (longContext) {
-      variants.push({
-        id: `${model}@${effort}+long`,
-        name: `${label} (${effortLabel}, Long Context)`,
-        providerLabel: "GitHub Copilot",
-      });
-    }
-  }
-  return variants;
+  return [];
 }
 
 function copilotModel(
