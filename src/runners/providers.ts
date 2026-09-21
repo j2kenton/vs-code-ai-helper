@@ -440,6 +440,74 @@ function splitModelAtLastAt(
   };
 }
 
+export interface CodexModelCapability {
+  label: string;
+  /** Valid reasoning efforts for the model, as [effort, display label]. */
+  efforts: readonly (readonly [string, string])[];
+  /** Whether the fast (priority) service tier is offered for the model. */
+  supportsFast: boolean;
+}
+
+const CODEX_EFFORT_LOW_TO_XHIGH = [
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+  ["xhigh", "Extra High"],
+] as const;
+
+/**
+ * Source of truth for the seeded Codex catalog. Order is the order the models
+ * appear in the picker. It drives both catalog generation and the runner's
+ * `parseCodexModelSelection`, so a seeded entry can never offer an effort or
+ * fast tier the parser would reject.
+ */
+export const CODEX_MODEL_CAPABILITIES: Readonly<
+  Record<string, CodexModelCapability>
+> = {
+  "gpt-5.5": {
+    label: "GPT-5.5",
+    efforts: CODEX_EFFORT_LOW_TO_XHIGH,
+    supportsFast: true,
+  },
+  "gpt-5.6-terra": {
+    label: "GPT-5.6-Terra",
+    efforts: [
+      ...CODEX_EFFORT_LOW_TO_XHIGH,
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ],
+    supportsFast: true,
+  },
+  "gpt-5.6-sol": {
+    label: "GPT-5.6-SOL",
+    efforts: [
+      ...CODEX_EFFORT_LOW_TO_XHIGH,
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ],
+    supportsFast: true,
+  },
+  "gpt-5.6-luna": {
+    label: "GPT-5.6-Luna",
+    efforts: [...CODEX_EFFORT_LOW_TO_XHIGH, ["max", "Max"]],
+    supportsFast: true,
+  },
+  "gpt-5.4": {
+    label: "GPT-5.4",
+    efforts: CODEX_EFFORT_LOW_TO_XHIGH,
+    supportsFast: true,
+  },
+  "gpt-5.4-mini": {
+    label: "GPT-5.4-Mini",
+    efforts: CODEX_EFFORT_LOW_TO_XHIGH,
+    supportsFast: false,
+  },
+};
+
+/**
+ * Efforts accepted for any base id: the union of every table ladder plus the
+ * historical flat set, so saved selections keep working.
+ */
 const CODEX_REASONING_EFFORTS = new Set([
   "low",
   "medium",
@@ -447,6 +515,9 @@ const CODEX_REASONING_EFFORTS = new Set([
   "xhigh",
   "max",
   "ultra",
+  ...Object.values(CODEX_MODEL_CAPABILITIES).flatMap((capability) =>
+    capability.efforts.map(([effort]) => effort)
+  ),
 ]);
 
 const COPILOT_REASONING_EFFORTS = new Set([
@@ -496,11 +567,34 @@ export function parseCodexModelSelection(
     return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
-  return {
-    model: split.model,
-    reasoningEffort,
-    serviceTier: speedTier === "fast" ? "priority" : undefined,
-  };
+  // A base id in the capability table is held to that model's own ladder and
+  // fast support. Base ids outside the table (live or hand-typed) keep the
+  // permissive flat-set behaviour so saved selections of them keep working.
+  const capability = Object.prototype.hasOwnProperty.call(
+    CODEX_MODEL_CAPABILITIES,
+    split.model
+  )
+    ? CODEX_MODEL_CAPABILITIES[split.model]
+    : undefined;
+  if (
+    capability &&
+    !capability.efforts.some(([effort]) => effort === reasoningEffort)
+  ) {
+    return { model, reasoningEffort: undefined, serviceTier: undefined };
+  }
+
+  let serviceTier: string | undefined;
+  if (speedTier === "fast") {
+    if (capability && !capability.supportsFast) {
+      console.warn(
+        `[ensemble] Codex model "${split.model}" does not support the fast tier; ignoring "+fast".`
+      );
+    } else {
+      serviceTier = "priority";
+    }
+  }
+
+  return { model: split.model, reasoningEffort, serviceTier };
 }
 
 export interface ParsedCopilotModelSelection {

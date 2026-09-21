@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "auditDate": "2026-09-20",
+  "policy": "test-fixtures/model-catalog/audit-2026-09.md",
+  "notes": "Provider records are added by the part that audits each provider (so far: claude-cli and the non-picker opencode external block). legacyModelAliases keys match whole stored ids only (providers.ts parseModelSelection looks up the text after the provider prefix, effort suffix included), so every alias added later must list each @effort and +fast variant it keeps resolving.",
+  "providerContext": {
+    "copilot": {
+      "defaultAuthPath": "GitHub account VS Code is signed into (Copilot host, models come from the VS Code LM API)",
+      "supportedPathClasses": ["copilot-plan"]
+    },
+    "claude-cli": {
+      "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
+      "supportedPathClasses": ["subscription", "api-key"]
+    },
+    "codex-cli": {
+      "defaultAuthPath": "ChatGPT sign-in (`codex login`)",
+      "supportedPathClasses": ["chatgpt-signin", "api-key"]
+    },
+    "gemini-cli": {
+      "defaultAuthPath": "Google account sign-in (`gemini`)",
+      "supportedPathClasses": ["google-account", "api-key"]
+    },
+    "antigravity-cli": {
+      "defaultAuthPath": "Google account sign-in (`agy`)",
+      "supportedPathClasses": ["google-account"]
+    },
+    "kiro-cli": {
+      "defaultAuthPath": "Kiro login plus KIRO_API_KEY for headless runs",
+      "supportedPathClasses": ["kiro-api-key"]
+    },
+    "opencode-cli": {
+      "defaultAuthPath": "OpenCode Zen key for opencode/* models, OpenCode Go subscription for opencode-go/* models",
+      "supportedPathClasses": ["zen", "go"]
+    },
+    "cline-cli": {
+      "defaultAuthPath": "ClinePass subscription (`cline auth cline-pass`, `-P cline-pass`)",
+      "supportedPathClasses": ["cline-pass"]
+    },
+    "kimi-cli": {
+      "defaultAuthPath": "Moonshot AI / Kimi Code OAuth device-code sign-in (`kimi login`)",
+      "supportedPathClasses": ["kimi-code-oauth"]
+    },
+    "devpass-cli": {
+      "defaultAuthPath": "LLM Gateway DevPass credential (`devpass-code providers login`)",
+      "supportedPathClasses": ["devpass"]
+    }
+  },
+  "humanScopeWaivers": [],
+  "records": [
+    {
+      "provider": "claude-cli",
+      "scope": "picker",
+      "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
+      "supportedPathClasses": ["subscription", "api-key"],
+      "evidence": {
+        "authContext": "Claude Code subscription login; model list taken from the Anthropic model list in the Claude Code session environment, no CLI probe run (execution denied by the sandbox)",
+        "cliVersion": "claude 2.1.274",
+        "source": "Anthropic model list in the session environment plus `claude --help` (fable alias = latest model)",
+        "date": "2026-09-20"
+      },
+      "coverage": "entries",
+      "freeLabelsAudited": true,
+      "notes": "No live `claude --model <id> -p ok` probe was possible this round; see Part 1 findings in audit-2026-09.md.",
+      "entries": [
+        {
+          "id": "claude-fable-5-1",
+          "status": "added",
+          "checkedAt": "2026-09-20",
+          "source": "Anthropic model list in the Claude Code session environment (claude-fable-5-1); this audit session runs as claude-fable-5-1"
+        },
+        {
+          "id": "fable",
+          "status": "relabelled",
+          "checkedAt": "2026-09-20",
+          "source": "`claude --help` (claude 2.1.274) describes fable as the alias for the latest model",
+          "note": "Label changed from `Fable 5` to `Fable (latest)`: the alias already resolves to 5.1, and an unversioned label cannot go stale. The id is unchanged so stored selections keep resolving."
+        },
+        {
+          "id": "sonnet",
+          "status": "verified",
+          "checkedAt": "2026-09-20",
+          "source": "Anthropic model list in the Claude Code session environment (Sonnet 5, claude-sonnet-5); alias floating not probed"
+        },
+        {
+          "id": "opus",
+          "status": "verified",
+          "checkedAt": "2026-09-20",
+          "source": "Anthropic model list in the Claude Code session environment (Opus 5, claude-opus-5); alias floating not probed"
+        },
+        {
+          "id": "haiku",
+          "status": "verified",
+          "checkedAt": "2026-09-20",
+          "source": "Anthropic model list in the Claude Code session environment (Haiku 4.5, claude-haiku-4-5-20251001); alias floating not probed"
+        },
+        {
+          "id": "claude-fable-5",
+          "status": "not-added",
+          "reason": "The explicit pin is added only if `claude --model claude-fable-5 -p ok` accepts the id; CLI execution was denied this round so the probe could not run. The floating `fable` alias already covers the latest Fable model."
+        }
+      ]
+    },
+    {
+      "provider": "opencode-cli",
+      "block": "external",
+      "scope": "non-picker",
+      "reason": "github-copilot/* and openai/* ids are kept in the seeded opencode catalog only so saved external-provider selections keep resolving; the picker offers just the explicit Zen (opencode/*) and Go (opencode-go/*) tiers, so nothing here is user-selectable and it is outside the audit."
+    }
+  ]
+}

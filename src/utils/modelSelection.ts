@@ -15,6 +15,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "./taskProgressTransforms";
 import {
   CLI_PROVIDERS,
+  CODEX_MODEL_CAPABILITIES,
   type CliProviderId,
   type CliProviderDefinition,
   providerAccountIdForModelId,
@@ -819,8 +820,18 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
-    { model: "fable", name: "Fable 5" },
-    ...createVariants("fable", "Fable 5", [
+    { model: "claude-fable-5-1", name: "Fable 5.1" },
+    ...createVariants("claude-fable-5-1", "Fable 5.1", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    // `fable` is Claude Code's floating alias for the newest Fable model, so
+    // its label carries no version number that could go stale again.
+    { model: "fable", name: "Fable (latest)" },
+    ...createVariants("fable", "Fable (latest)", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
@@ -840,70 +851,20 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
 }
 
 function createSeededCodexModels(): readonly DiscoveredCliModel[] {
-  const createVariants = (
-    model: string,
-    label: string,
-    efforts: readonly (readonly [string, string])[]
-  ): DiscoveredCliModel[] => {
-    const variants: DiscoveredCliModel[] = [];
-    for (const [effort, effortLabel] of efforts) {
-      variants.push(createCodexReasoningVariant(model, label, effort, effortLabel));
-      variants.push(createCodexSpeedVariant(model, label, effort, effortLabel));
+  const models: DiscoveredCliModel[] = [];
+  for (const [model, capability] of Object.entries(CODEX_MODEL_CAPABILITIES)) {
+    for (const [effort, effortLabel] of capability.efforts) {
+      models.push(
+        createCodexReasoningVariant(model, capability.label, effort, effortLabel)
+      );
+      if (capability.supportsFast) {
+        models.push(
+          createCodexSpeedVariant(model, capability.label, effort, effortLabel)
+        );
+      }
     }
-    return variants;
-  };
-
-  return [
-    ...createVariants("gpt-5.5", "GPT-5.5", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-    ]),
-    ...createVariants("gpt-5.6-terra", "GPT-5.6-Terra", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-      ["ultra", "Ultra"],
-    ]),
-    ...createVariants("gpt-5.6-sol", "GPT-5.6-SOL", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-      ["ultra", "Ultra"],
-    ]),
-    ...createVariants("gpt-5.6-luna", "GPT-5.6-Luna", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-    ]),
-    ...createVariants("gpt-5.4", "GPT-5.4", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-    ]),
-    createCodexReasoningVariant("gpt-5.4-mini", "GPT-5.4-Mini", "low", "Low"),
-    createCodexReasoningVariant(
-      "gpt-5.4-mini",
-      "GPT-5.4-Mini",
-      "medium",
-      "Medium"
-    ),
-    createCodexReasoningVariant("gpt-5.4-mini", "GPT-5.4-Mini", "high", "High"),
-    createCodexReasoningVariant(
-      "gpt-5.4-mini",
-      "GPT-5.4-Mini",
-      "xhigh",
-      "Extra High"
-    ),
-  ];
+  }
+  return models;
 }
 
 function createClineReasoningVariant(
@@ -1660,6 +1621,35 @@ function createSeededDevpassModels(): readonly DiscoveredCliModel[] {
   return parseOpencodeModelsOutput(DEVPASS_SEEDED_CATALOG_RAW);
 }
 
+/**
+ * Verified-free allowlist: `<ProviderId>:<baseModelId>` of every seeded model
+ * whose "Free" label is backed by dated $0 evidence in the audit manifest
+ * (test-fixtures/model-catalog/audit-2026-09.json). In an audited block a
+ * model's name carries a free marker if and only if its base id is listed
+ * here; modelCatalogAudit.ts enforces that, and an unaudited block is frozen
+ * by its own pins instead.
+ */
+export const VERIFIED_FREE_MODEL_IDS: readonly string[] = [];
+
+/**
+ * Base ids (same `<ProviderId>:<baseModelId>` form) whose free marker the
+ * seed builders strip from the parsed name because $0 could not be
+ * confirmed; each needs a `relabelled` manifest entry.
+ */
+export const STRIPPED_FREE_MARKER_IDS: readonly string[] = [];
+
+/*
+ * Seeded catalog availability policy (full text, with the evidence rules, in
+ * test-fixtures/model-catalog/audit-2026-09.md):
+ *  - Add a model only when the provider CLI's own output or an official page
+ *    confirms its id for the provider's default auth path.
+ *  - Remove one only on a documented retirement, an entitlement-independent
+ *    catalog, or captures covering every supported path class. A single
+ *    account's listing that omits an id is context, not proof: keep the entry
+ *    (with a label qualifier when conditional).
+ *  - A free label needs dated $0 evidence and a VERIFIED_FREE_MODEL_IDS entry.
+ *  - Never alias a removed free id to a paid id.
+ */
 const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
@@ -1738,6 +1728,28 @@ const SEEDED_CLI_MODELS: Readonly<
   }
 }`),
 };
+
+/**
+ * Read-only view of the seeded catalog for the audit tests and the drift
+ * script: the seed map, the Copilot rule slugs (Copilot is discovered through
+ * the VS Code LM API, so its "seed" is the variant rule table), the Gemini CLI
+ * fallback ids from its provider definition, and the ids whose free marker was
+ * stripped. Touches no `vscode` API.
+ */
+export function getSeededCatalogForAudit(): {
+  seeded: Readonly<Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>>;
+  copilotRuleSlugs: readonly string[];
+  geminiFallbackIds: readonly string[];
+  strippedFreeMarkerIds: readonly string[];
+} {
+  const gemini = CLI_PROVIDERS.find((def) => def.id === "gemini-cli");
+  return {
+    seeded: SEEDED_CLI_MODELS,
+    copilotRuleSlugs: COPILOT_MODEL_VARIANT_RULES.map((rule) => rule.slug),
+    geminiFallbackIds: (gemini?.models ?? []).flatMap((m) => (m.model ? [m.model] : [])),
+    strippedFreeMarkerIds: STRIPPED_FREE_MARKER_IDS,
+  };
+}
 
 function createSeededCliModelCache(): Map<
   string,

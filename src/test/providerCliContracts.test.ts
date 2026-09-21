@@ -8,6 +8,7 @@ import {
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
   CLI_PROVIDERS,
   CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
+  CODEX_MODEL_CAPABILITIES,
   getCliProvider,
   getProviderAccountEntry,
   parseClineModelSelection,
@@ -20,6 +21,7 @@ import {
   PROVIDER_ACCOUNT_ENTRIES,
   type CliProviderDefinition,
 } from "../runners/providers";
+import { getSeededCatalogForAudit } from "../utils/modelSelection";
 
 void describe("provider CLI contracts", () => {
   function modelArgValue(args: readonly string[]): string | undefined {
@@ -641,6 +643,84 @@ void describe("provider CLI contracts", () => {
       "-p",
       resumed[resumed.length - 1],
     ]);
+  });
+
+  void it("every seeded Codex entry parses and builds args consistently with CODEX_MODEL_CAPABILITIES", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    const seeded = getSeededCatalogForAudit().seeded["codex-cli"] ?? [];
+    assert.ok(seeded.length > 0, "expected a seeded Codex catalog");
+
+    for (const entry of seeded) {
+      const id = entry.model;
+      const isFast = id.endsWith("+fast");
+      const parsed = parseCodexModelSelection(id);
+      const base = id.slice(0, id.lastIndexOf("@") >= 0 ? id.lastIndexOf("@") : id.length);
+      const capability = CODEX_MODEL_CAPABILITIES[base];
+      assert.ok(capability, `${id}: base model ${base} missing from capability table`);
+      assert.equal(parsed.model, base, id);
+      assert.ok(
+        capability.efforts.some(([effort]) => effort === parsed.reasoningEffort),
+        `${id}: effort ${parsed.reasoningEffort} outside the model's ladder`
+      );
+      assert.equal(parsed.serviceTier, isFast ? "priority" : undefined, id);
+      if (isFast) {
+        assert.ok(capability.supportsFast, `${id}: fast entry on a non-fast model`);
+      }
+
+      const args = codex.buildArgs("text", id);
+      assert.ok(args.includes(base), `${id}: args missing base model`);
+      assert.ok(
+        args.includes(`model_reasoning_effort="${parsed.reasoningEffort}"`),
+        `${id}: args missing reasoning effort`
+      );
+      assert.equal(
+        args.includes('service_tier="priority"'),
+        isFast,
+        `${id}: service_tier override mismatch`
+      );
+      assert.ok(
+        args.every((arg) => !arg.includes("@") && !arg.includes("+fast")),
+        `${id}: args leak the variant suffix`
+      );
+    }
+  });
+
+  void it("parseCodexModelSelection holds table models to their ladder and fast support", () => {
+    // Effort outside the model's ladder: the whole string stays the model id.
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-5.5@ultra"), {
+      model: "gpt-5.5@ultra",
+      reasoningEffort: undefined,
+      serviceTier: undefined,
+    });
+    // Stale +fast on a non-fast model: effort kept, tier dropped, one log line.
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+    try {
+      assert.deepStrictEqual(parseCodexModelSelection("gpt-5.4-mini@high+fast"), {
+        model: "gpt-5.4-mini",
+        reasoningEffort: "high",
+        serviceTier: undefined,
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(warnings.length, 1);
+    // An effort outside the flat set still leaves the whole string as the model id.
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-5.5@turbo"), {
+      model: "gpt-5.5@turbo",
+      reasoningEffort: undefined,
+      serviceTier: undefined,
+    });
+    // Unknown base id keeps the permissive flat-set behaviour.
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-9-future@ultra+fast"), {
+      model: "gpt-9-future",
+      reasoningEffort: "ultra",
+      serviceTier: "priority",
+    });
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {

@@ -165,6 +165,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "watchdogPauseFenceGeneration",
   "implRecovery",
   "quotaParkRecord",
+  "nextActor",
+  "stageReviewPasses",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -1694,6 +1696,21 @@ function validateQuotaParkRecord(value: unknown): string | undefined {
   return undefined;
 }
 
+function validateStageReviewPasses(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "stageReviewPasses must be a per-stage object map";
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (!CANONICAL_STAGES.has(key)) {
+      return `stageReviewPasses has an unrecognized stage key ${JSON.stringify(key)}`;
+    }
+    if (!isNonNegativeInteger(entry)) {
+      return `stageReviewPasses[${JSON.stringify(key)}] must be a non-negative integer`;
+    }
+  }
+  return undefined;
+}
+
 function validateImplementationTypeCheckFailure(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "implementationTypeCheckFailure must be an object";
@@ -2388,6 +2405,21 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.quotaParkRecord = value as QuotaParkRecordV1;
+        break;
+      }
+      case "nextActor": {
+        if (value !== "human" && value !== "automation") {
+          return recovery("invalidFieldValue", "nextActor must be exactly \"human\" or \"automation\"");
+        }
+        draft.nextActor = value;
+        break;
+      }
+      case "stageReviewPasses": {
+        const error = validateStageReviewPasses(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.stageReviewPasses = value as TaskProgress["stageReviewPasses"];
         break;
       }
     }

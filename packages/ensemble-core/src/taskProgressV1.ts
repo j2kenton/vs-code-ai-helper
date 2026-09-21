@@ -269,6 +269,12 @@ export interface TaskProgress {
    * failure (mirror of `src/types/taskProgress.ts`). See the extension's
    * copy for the full state-machine commentary. */
   quotaParkRecord?: QuotaParkRecordV1;
+  /** Who is expected to act next (mirror of `src/types/taskProgress.ts`);
+   * absent means unknown. See the extension's copy for the full contract. */
+  nextActor?: "human" | "automation";
+  /** Per-stage review-pass counter (mirror of `src/types/taskProgress.ts`).
+   * See the extension's copy for the full contract. */
+  stageReviewPasses?: Partial<Record<TaskStage, number>>;
 }
 
 /** One artifact deliberately accepted as absent by a human completion override. */
