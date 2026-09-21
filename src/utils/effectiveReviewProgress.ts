@@ -13,7 +13,7 @@ import * as vscode from "vscode";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isPlanReviewStage, TaskProgress, TaskStage } from "../types/taskProgress";
 import { ChecklistProgressV1 } from "./implementationChecklist";
-import { readPlanOfRecordV1 } from "./implementationArtifactResolver";
+import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "./implementationArtifactResolver";
 import { NotificationRouter } from "./notificationRouter";
 import {
   parseReviewProgress,
@@ -113,12 +113,16 @@ export async function readEffectivePlanChecklistProgressV1(
  *
  * Genuine no-value cases (no plan, no checklist, unreadable progress file)
  * still return `undefined`: those are "not applicable", not "unverified".
+ *
+ * Reads through `readPlanOfRecordForDisplayV1` (merge of `ui 12` into
+ * `v1 f2`, 2026-09-21), so refreshing a percentage while a run is ticking
+ * boxes never saves an open `plan-final.md` editor.
  */
 export async function readDisplayPlanChecklistProgressV1(
   folderUri: vscode.Uri,
   policy: EffectiveReviewProgressPolicyV1 = "lenient"
 ): Promise<{ counts: ChecklistProgressV1; unverified: boolean } | undefined> {
-  const plan = await readPlanOfRecordV1(folderUri);
+  const plan = await readPlanOfRecordForDisplayV1(folderUri);
   const counted = plan.counts;
   if (!plan.hasChecklist || !counted) {
     return undefined;
@@ -128,6 +132,32 @@ export async function readDisplayPlanChecklistProgressV1(
     return undefined;
   }
   return { counts: counted, unverified: advisory.progress?.checklistProgressUnreliable === true };
+}
+
+/**
+ * Display-only twin of `readEffectivePlanChecklistProgressV1` (lenient policy,
+ * same `checklistProgressUnreliable` / unreadable-file stand-down) built on
+ * `readPlanOfRecordForDisplayV1`, so refreshing a percentage while a run is
+ * ticking boxes never saves an open `plan-final.md` editor. Read-only end to
+ * end: the advisory task-progress read decodes and never writes.
+ *
+ * Kept alongside `readDisplayPlanChecklistProgressV1` above: this one stands
+ * down entirely when latched, that one reports the count flagged unverified.
+ * Both are pinned by tests; neither replaces the other.
+ */
+export async function readEffectivePlanChecklistProgressForDisplayV1(
+  folderUri: vscode.Uri
+): Promise<ChecklistProgressV1 | undefined> {
+  const plan = await readPlanOfRecordForDisplayV1(folderUri);
+  const counted = plan.counts;
+  if (!plan.hasChecklist || !counted) {
+    return undefined;
+  }
+  const advisory = await readTaskProgressForChecklistV1(folderUri, "lenient");
+  if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
+    return undefined;
+  }
+  return counted;
 }
 
 /**

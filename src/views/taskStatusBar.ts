@@ -14,9 +14,11 @@ import {
   describeSchedulingPostureV1,
 } from "../state/schedulingIntentV1";
 import { renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
-import { readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import { readEffectivePlanChecklistProgressForDisplayV1 } from "../utils/effectiveReviewProgress";
 import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
+import { normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1, isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
 /**
@@ -57,6 +59,30 @@ export class TaskStatusBar implements vscode.Disposable {
     this.onDidChangeSub = taskOperations.onDidChange(() => {
       this.update(this.lastTasks, this.lastCurrentTaskId);
     });
+  }
+
+  /**
+   * Re-render from the cached task list and current-task id. Used when
+   * something the render depends on changed without a new task list — the
+   * colour theme (the tooltip's informational text is coloured per theme
+   * kind) or an implementation checklist's ticked count.
+   */
+  refresh(): void {
+    this.update(this.lastTasks, this.lastCurrentTaskId);
+  }
+
+  /**
+   * Read-only: whether the task currently shown in the bar lives in
+   * `folderUri`. Lets a caller skip `refresh()` for a change to some other
+   * task's folder.
+   */
+  isShowingTaskFolder(folderUri: vscode.Uri): boolean {
+    const shown = this.lastTasks.find(
+      (t) =>
+        (t.canonicalId !== undefined && t.canonicalId === this.lastCurrentTaskId) ||
+        t.folderUri.fsPath === this.lastCurrentTaskId
+    );
+    return shown !== undefined && normalizePath(shown.folderUri.fsPath) === normalizePath(folderUri.fsPath);
   }
 
   /**
@@ -168,7 +194,7 @@ export class TaskStatusBar implements vscode.Disposable {
     icon: string,
     generation: number
   ): Promise<void> {
-    const counted = await readEffectivePlanChecklistProgressV1(task.folderUri).catch(() => undefined);
+    const counted = await readEffectivePlanChecklistProgressForDisplayV1(task.folderUri).catch(() => undefined);
     if (generation !== this.renderGeneration || !counted) {
       return;
     }
@@ -246,7 +272,7 @@ export class TaskStatusBar implements vscode.Disposable {
     const quarantinedFiles = taskToShow.progress.pendingImplReviewFiles ?? [];
     const quarantinedFilesLine =
       owedIndicator && quarantinedFiles.length > 0
-        ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${quarantinedFiles.join(", ")}`
+        ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${escapeTooltipHtmlV1(quarantinedFiles.join(", "))}`
         : undefined;
 
     // General scheduling posture (task item 11's five-value vocabulary:
@@ -278,17 +304,25 @@ export class TaskStatusBar implements vscode.Disposable {
       `${extraLabel ? ` — ${extraLabel}` : ""}` +
       `${owedIndicator ? ` — ${owedIndicator.description}` : ""}` +
       `${posture ? ` — ${posture.shortLabel}` : ""}`;
-    this.item.tooltip = new vscode.MarkdownString(
+    // `supportHtml` is what lets the posture sentence carry its theme-aware
+    // colour span (see tooltipInfoTextV1.ts), so every dynamic value
+    // interpolated below goes through `escapeTooltipHtmlV1` (or, for the
+    // folder name, `tooltipLiteralTextV1`, which also neutralises markdown).
+    const tooltip = new vscode.MarkdownString(
       [
         `**Ensemble — ${statusLabel} task**`,
         "",
-        `Task: \`${taskToShow.folderName}\``,
+        `Task: ${tooltipLiteralTextV1(taskToShow.folderName)}`,
         `Stage: **${STAGE_DISPLAY_NAMES[stage]}**`,
-        ...(implPercentLabel ? [`Checklist: **${implPercentLabel}**`] : []),
-        ...(reviewScoreLabel ? [`Review score: **${reviewScoreLabel}**`] : []),
-        ...(owedIndicator ? [`$(watch) ${owedIndicator.description}`] : []),
+        ...(implPercentLabel ? [`Checklist: **${escapeTooltipHtmlV1(implPercentLabel)}**`] : []),
+        ...(reviewScoreLabel ? [`Review score: **${escapeTooltipHtmlV1(reviewScoreLabel)}**`] : []),
+        ...(owedIndicator ? [`$(watch) ${escapeTooltipHtmlV1(owedIndicator.description)}`] : []),
         ...(quarantinedFilesLine ? [quarantinedFilesLine] : []),
-        ...(posture ? [`$(watch) **What happens next** — ${posture.detail}`] : []),
+        ...(posture
+          ? [
+              `$(watch) **What happens next** — ${renderTooltipInfoTextV1(posture.detail, vscode.window.activeColorTheme.kind)}`,
+            ]
+          : []),
         `Last updated: ${new Date(
           taskToShow.progress.updatedAt
         ).toLocaleString()}`,
@@ -296,6 +330,8 @@ export class TaskStatusBar implements vscode.Disposable {
         `_Click to open Ensemble menu_`,
       ].join("\n")
     );
+    tooltip.supportHtml = true;
+    this.item.tooltip = tooltip;
     this.item.show();
   }
 

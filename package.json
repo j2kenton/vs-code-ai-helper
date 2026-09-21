@@ -237,6 +237,30 @@
         "icon": "$(clear-all)"
       },
       {
+        "command": "vs-code-ai-helper.searchTasks",
+        "title": "Search Tasks",
+        "category": "Ensemble",
+        "icon": "$(search)"
+      },
+      {
+        "command": "vs-code-ai-helper.clearTasksSearch",
+        "title": "Clear Tasks Search",
+        "category": "Ensemble",
+        "icon": "$(close)"
+      },
+      {
+        "command": "vs-code-ai-helper.searchNotifications",
+        "title": "Search Notifications",
+        "category": "Ensemble",
+        "icon": "$(search)"
+      },
+      {
+        "command": "vs-code-ai-helper.clearNotificationsSearch",
+        "title": "Clear Notifications Search",
+        "category": "Ensemble",
+        "icon": "$(close)"
+      },
+      {
         "command": "vs-code-ai-helper.clearNotifications",
         "title": "Clear All Notifications",
         "category": "Ensemble",
@@ -273,7 +297,13 @@
       },
       {
         "command": "vs-code-ai-helper.commitAndPushTask",
-        "title": "Commit and Push [Ctrl+Shift+Alt+P]",
+        "title": "Commit and Push",
+        "category": "Ensemble",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "vs-code-ai-helper.commitAndPushTaskInline",
+        "title": "Commit and Push",
         "category": "Ensemble",
         "icon": "$(cloud-upload)"
       },
@@ -571,6 +601,10 @@
         {
           "command": "vs-code-ai-helper.runOnRunner",
           "when": "vs-code-ai-helper.hostRole == viewer"
+        },
+        {
+          "command": "vs-code-ai-helper.commitAndPushTaskInline",
+          "when": "false"
         }
       ],
       "view/title": [
@@ -600,6 +634,16 @@
           "group": "navigation@3"
         },
         {
+          "command": "vs-code-ai-helper.searchTasks",
+          "when": "view == vs-code-ai-helper.tasksView",
+          "group": "navigation@5"
+        },
+        {
+          "command": "vs-code-ai-helper.clearTasksSearch",
+          "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.tasksSearchActive",
+          "group": "navigation@7"
+        },
+        {
           "command": "vs-code-ai-helper.expandAllTasks",
           "when": "view == vs-code-ai-helper.tasksView && !vs-code-ai-helper.taskListAllExpanded",
           "group": "navigation@4"
@@ -623,6 +667,16 @@
           "command": "vs-code-ai-helper.clearNotifications",
           "when": "view == vs-code-ai-helper.statusView",
           "group": "navigation@2"
+        },
+        {
+          "command": "vs-code-ai-helper.searchNotifications",
+          "when": "view == vs-code-ai-helper.statusView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "vs-code-ai-helper.clearNotificationsSearch",
+          "when": "view == vs-code-ai-helper.statusView && vs-code-ai-helper.notificationsSearchActive",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -807,7 +861,7 @@
           "group": "inline@40"
         },
         {
-          "command": "vs-code-ai-helper.commitAndPushTask",
+          "command": "vs-code-ai-helper.commitAndPushTaskInline",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@50"
         },

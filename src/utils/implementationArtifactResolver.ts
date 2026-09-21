@@ -895,6 +895,35 @@ export async function readPlanOfRecordV1(
 }
 
 /**
+ * Display-only counterpart of `readPlanOfRecordV1`, for surfaces that show the
+ * checklist percentage (Tasks tree, status bar, chat header).
+ *
+ * Reads the DURABLE bytes with `workspace.fs.readFile` and nothing else:
+ * it never calls `document.save()` and never returns an open editor's
+ * unsaved buffer. `readPlanOfRecordV1` saves a dirty `plan-final.md` first
+ * because a gate must act on persisted state and keep the user's ticks; a
+ * display refresh that fires while a run is ticking boxes has no business
+ * saving a document the user is mid-edit in, so the number shown is "what is
+ * on disk", exactly what the advance gates would read after their own save.
+ * A missing or unreadable file reports no checklist.
+ */
+export async function readPlanOfRecordForDisplayV1(
+  taskFolderUri: vscode.Uri
+): Promise<PlanOfRecordV1> {
+  const planUri = getCanonicalImplementationUri(taskFolderUri);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8").decode(await vscode.workspace.fs.readFile(planUri));
+  } catch {
+    return { text: undefined, hasChecklist: false, counts: undefined };
+  }
+  if (!text || !hasImplementationChecklistV1(text)) {
+    return { text: text || undefined, hasChecklist: false, counts: undefined };
+  }
+  return { text, hasChecklist: true, counts: countChecklistProgressV1(text) };
+}
+
+/**
  * Returns the URI for this task's implementation-run summary
  * (impl-summary.md) — the artifact a completed run writes, kept separate from
  * the plan of record in plan-final.md.

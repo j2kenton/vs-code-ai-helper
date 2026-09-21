@@ -1725,21 +1725,6 @@ function validateImplementationTypeCheckFailure(value: unknown): string | undefi
   return undefined;
 }
 
-function validateFallbackModelId(value: unknown): string | undefined {
-  if (!isPlainObject(value)) {
-    return "fallbackModelId must be a per-stage object map";
-  }
-  for (const [key, entry] of Object.entries(value)) {
-    if (!CANONICAL_STAGES.has(key)) {
-      return `fallbackModelId has an unrecognized stage key ${JSON.stringify(key)}`;
-    }
-    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_NAME_LENGTH) {
-      return `fallbackModelId[${JSON.stringify(key)}] must be a bounded non-empty string`;
-    }
-  }
-  return undefined;
-}
-
 function validateStageReviewPasses(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "stageReviewPasses must be a per-stage object map";
@@ -1750,6 +1735,21 @@ function validateStageReviewPasses(value: unknown): string | undefined {
     }
     if (!isNonNegativeInteger(entry)) {
       return `stageReviewPasses[${JSON.stringify(key)}] must be a non-negative integer`;
+    }
+  }
+  return undefined;
+}
+
+function validateFallbackModelId(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "fallbackModelId must be a per-stage object map";
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (!CANONICAL_STAGES.has(key)) {
+      return `fallbackModelId has an unrecognized stage key ${JSON.stringify(key)}`;
+    }
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_NAME_LENGTH) {
+      return `fallbackModelId[${JSON.stringify(key)}] must be a bounded non-empty string`;
     }
   }
   return undefined;

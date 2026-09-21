@@ -271,11 +271,13 @@ export interface TaskProgress {
   quotaParkRecord?: QuotaParkRecordV1;
   /** Who is expected to act next before this task makes further progress
    * (mirror of `src/types/taskProgress.ts`, v1 fixes 2, item 8/31). Absent
-   * means unknown. See the extension's copy for the full commentary. */
+   * means unknown and must NOT be read as "human". See the extension's copy
+   * for the full commentary. */
   nextActor?: "human" | "automation";
   /** Per-stage review-pass counter (mirror of `src/types/taskProgress.ts`,
-   * v1 fixes 2, item 32). See the extension's copy for the full
-   * state-machine commentary. */
+   * v1 fixes 2, item 32). Never decreases and is never reset by a stage
+   * transition. See the extension's copy for the full state-machine
+   * commentary. */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
 }
 

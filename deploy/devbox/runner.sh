@@ -86,10 +86,24 @@ run_runner() {
     # and pinned — see install-extension.sh). Serialized across runners, since
     # they share one extensions directory; `flock` is in util-linux, present
     # in this image, but a missing one must not skip the install silently.
-    if [ -f "$HOME/ensemble.vsix" ]; then
+    #
+    # ONLY WHEN THE VSIX HAS CHANGED. Installing deletes and re-extracts the
+    # extension's folder, and that folder is shared: reinstalling on every
+    # start pulled it out from under the OTHER runner while it was scanning or
+    # running, and with two restart loops going the runners took turns
+    # breaking each other (seen live 2026-09-18). The checksum of the last
+    # installed package is kept beside the logs; the check is repeated under
+    # the lock so two runners that both notice a new build install it once.
+    if [ -f "$HOME/ensemble.vsix" ] &&
+       [ "$(cksum <"$HOME/ensemble.vsix")" != "$(cat "$HOME/.devbox-logs/installed-vsix.cksum" 2>/dev/null)" ]; then
       if command -v flock >/dev/null 2>&1; then
-        flock "$HOME/.devbox-logs/install.lock" \
-          sh /usr/local/bin/devbox-install-extension "$HOME/ensemble.vsix" >>"$log" 2>&1 || true
+        # shellcheck disable=SC2016 # expanded by the inner shell, deliberately
+        flock "$HOME/.devbox-logs/install.lock" sh -c '
+          sum="$(cksum <"$HOME/ensemble.vsix")"
+          [ "$sum" = "$(cat "$HOME/.devbox-logs/installed-vsix.cksum" 2>/dev/null)" ] && exit 0
+          sh /usr/local/bin/devbox-install-extension "$HOME/ensemble.vsix" &&
+            printf "%s\n" "$sum" >"$HOME/.devbox-logs/installed-vsix.cksum"
+        ' >>"$log" 2>&1 || true
       else
         # mkdir is atomic everywhere: the same mutual exclusion, no flock.
         lock_dir="$HOME/.devbox-logs/install.lock.d"
@@ -119,7 +133,11 @@ run_runner() {
         # the lock here would install concurrently with whoever holds it, and
         # removing it would release somebody else's.
         if [ "$lock_held" = "1" ]; then
-          sh /usr/local/bin/devbox-install-extension "$HOME/ensemble.vsix" >>"$log" 2>&1 || true
+          sum="$(cksum <"$HOME/ensemble.vsix")"
+          if [ "$sum" != "$(cat "$HOME/.devbox-logs/installed-vsix.cksum" 2>/dev/null)" ]; then
+            sh /usr/local/bin/devbox-install-extension "$HOME/ensemble.vsix" >>"$log" 2>&1 &&
+              printf '%s\n' "$sum" >"$HOME/.devbox-logs/installed-vsix.cksum"
+          fi
           rm -rf "$lock_dir"
         fi
       fi
@@ -132,10 +150,20 @@ run_runner() {
     # a 64 MB /dev/shm shared by two renderers and x11vnc's framebuffer is the
     # documented cause of exactly that. run.sh also raises the limit; this
     # flag is what protects a box that has not been recreated yet.
+    #
+    # --disable-workspace-trust: on the COMMAND LINE, not only in settings.json.
+    # The runner's settings carried `security.workspace.trust.enabled: false`
+    # until Settings Sync was switched on in the runner and replaced the file
+    # with the laptop's (2026-09-18). Trust came back on, the headless window
+    # opened in Restricted Mode, and Restricted Mode disables this extension —
+    # so the runner ran no extension at all, with a trust prompt nobody could
+    # see. A flag cannot be synced away.
     # shellcheck disable=SC2086 # data_dir_args is deliberately word-split
     dbus-run-session -- code --wait --no-sandbox --disable-gpu --disable-dev-shm-usage \
+      --disable-workspace-trust \
       --password-store=basic $data_dir_args --new-window "$workspace" >>"$log" 2>&1 &
     code_pid=$!
+    started_at="$(date +%s)"
     # A CRASHED renderer is not an exit. VS Code keeps the window open on its
     # own "The window terminated unexpectedly … Reopen" dialog, so `code
     # --wait` never returns, the loop below never fires, and the runner is
@@ -146,11 +174,28 @@ run_runner() {
     # The extension publishes its operations mirror every 30 seconds, so a
     # mirror that EXISTS and has stopped moving is that state. A window that
     # never wrote one (no task root yet) is left alone.
+    #
+    # Two rules learned the hard way the day this shipped (2026-09-18), when a
+    # window whose extension could not load at all was killed every 60 seconds
+    # for a quarter of an hour:
+    #   - THIS window gets five minutes before it is judged. The mirror left
+    #     by the previous window is already stale at startup, so judging it
+    #     at the first check killed every window a minute after it opened.
+    #   - Restarting is a cure for a crashed window, not for an extension that
+    #     never loads. After three windows in a row that never reported once,
+    #     the watchdog stands down and says so, rather than looping for ever.
     mirror="$workspace/.ensemble/relay-v1/operations-v1.json"
+    seen_report=0
     while kill -0 "$code_pid" 2>/dev/null; do
-      sleep 60
+      # Short naps so a deliberate stop (pkill) is noticed in seconds, while
+      # the staleness test below still only matters on the minute scale.
+      sleep 5
       kill -0 "$code_pid" 2>/dev/null || break
-      if [ -f "$mirror" ] && [ -z "$(find "$mirror" -maxdepth 0 -mmin -5 2>/dev/null)" ]; then
+      [ "${never_reported:-0}" -ge 3 ] && continue
+      now="$(date +%s)"
+      mirror_at="$(stat -c %Y "$mirror" 2>/dev/null || echo 0)"
+      [ "$mirror_at" -gt "$started_at" ] && seen_report=1
+      if [ -f "$mirror" ] && [ $((now - started_at)) -ge 300 ] && [ $((now - mirror_at)) -ge 300 ]; then
         echo "$(date -u +%FT%TZ) runner $index stopped reporting for 5 min; restarting the window" >>"$log"
         # BOTH: `$code_pid` is dbus-run-session, and VS Code's own main
         # process is three levels below it (dbus-run-session → sh /usr/bin/code
@@ -167,9 +212,18 @@ run_runner() {
         done
         kill -KILL "$code_pid" 2>/dev/null || true
         pkill -KILL -f "[c]ode --wait.*$workspace" 2>/dev/null || true
+        if [ "$seen_report" = "1" ]; then
+          never_reported=0
+        else
+          never_reported=$((${never_reported:-0} + 1))
+          if [ "$never_reported" -ge 3 ]; then
+            echo "$(date -u +%FT%TZ) runner $index: three windows in a row never reported at all. Restarting cannot fix that — the extension is not loading (Restricted Mode? a failed install?). The watchdog is standing down; the next window is left running." >>"$log"
+          fi
+        fi
         break
       fi
     done
+    [ "$seen_report" = "1" ] && never_reported=0
     wait "$code_pid"
     # Captured IMMEDIATELY: `$(date …)` inside the message would reset `$?`
     # first, which is why every one of these lines has always read "(0)"

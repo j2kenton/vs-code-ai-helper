@@ -26,3 +26,21 @@ export function formatTimestampForDisplay(date: Date, now: Date = new Date()): s
   const day = String(date.getDate()).padStart(2, "0");
   return `${date.getFullYear()}-${month}-${day}`;
 }
+
+/** The label/tooltip pair a chat card shows beside its copy button, from an
+ * ISO string that may be missing or unparsable (a hand-edited or legacy
+ * record). Such input yields empty strings, never `Invalid Date`/`NaN` —
+ * an absent time is honest, a nonsense one is not. */
+export function formatDisplayTimestampPairV1(
+  iso: string | undefined,
+  now: Date = new Date()
+): { atLabel: string; atTitle: string } {
+  if (!iso) {
+    return { atLabel: "", atTitle: "" };
+  }
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return { atLabel: "", atTitle: "" };
+  }
+  return { atLabel: formatTimestampForDisplay(date, now), atTitle: date.toLocaleString() };
+}

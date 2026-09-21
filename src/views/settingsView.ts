@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import {
   clearTaskStageModels,
-  describeStageSubstitutesV1,
   findTaskModelConflicts,
   getAvailableModels,
 } from "../utils/modelSelection";
@@ -25,12 +24,6 @@ import {
   ProviderSignInAction,
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { getExtensionContextV1 } from "../utils/extensionContextV1";
-import {
-  buildQuotaRemedyTextV1,
-  isQuotaResetBeyondThresholdV1,
-  listParkedQuotaLedgerEntriesV1,
-} from "../utils/quota";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -499,7 +492,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       providers: this._buildProviderViewModels(),
       showProviderAccountActions: isProviderAccountActionsEnabled(),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
-      quotaWarnings: this._buildQuotaWarnings(),
     });
   }
 
@@ -536,51 +528,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               : "Runs the provider's usage command in a visible terminal",
       enabledByDefault: provider.enabledByDefault,
     }));
-  }
-
-  /**
-   * Review completion blocker: the durable quota/model-entitlement ledger
-   * (utils/quota.ts's globalState-backed ledger) accrued entries with no
-   * consumer anywhere in this panel — a model the account cannot currently
-   * use (quota-exhausted or entitlement-blocked) read no differently from
-   * any other model in the AI Models list. Surfaces every currently-parked
-   * ledger entry as a short warning line so the operator sees the block
-   * without reading run logs or the task tree tooltip. Returns `[]` (not
-   * omitted) when the extension context isn't available yet (e.g. very
-   * early activation) or nothing is parked, so the webview can render an
-   * empty state deterministically rather than branching on `undefined`.
-   *
-   * Workflow 3 continuation, first item (Part 6 step 5): a parked entry is
-   * persistent state, not a one-off progress message — so unlike the
-   * transient withheld-cascade notice in runnerRegistry.ts, this is the
-   * place an operator who missed that notice (or opened the panel later,
-   * after a host restart) can still learn which OTHER stages a long outage
-   * silently affected. Mirrors the same far-reset-only enumeration.
-   */
-  private _buildQuotaWarnings(): Array<{ providerId: string; providerLabel: string; modelId: string; text: string }> {
-    const context = getExtensionContextV1();
-    if (!context) {
-      return [];
-    }
-    return listParkedQuotaLedgerEntriesV1(context).map((entry) => {
-      const provider = getProviderAccountEntry(entry.providerId);
-      const providerLabel = provider ? accountEntryDisplayLabel(provider) : entry.providerId;
-      const kindLabel = entry.failureKind === "model-entitlement" ? "not entitled to this model" : "quota exhausted";
-      const affectedStageDescriptions =
-        entry.resetAt !== undefined && isQuotaResetBeyondThresholdV1(entry.resetAt)
-          ? describeStageSubstitutesV1(entry.modelId)
-          : [];
-      const affectedStagesClause =
-        affectedStageDescriptions.length > 0
-          ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
-          : "";
-      return {
-        providerId: entry.providerId,
-        providerLabel,
-        modelId: entry.modelId,
-        text: `${providerLabel} — ${entry.modelId}: ${kindLabel}. ${buildQuotaRemedyTextV1(entry.resetAt)}${affectedStagesClause}`,
-      };
-    });
   }
 
   /**
@@ -633,10 +580,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // Session-observed quota status is still recorded underneath (see
-  // utils/quota.ts / runnerRegistry.ts) but is no longer rendered anywhere
-  // in this panel — the per-stage "usage observed" text was noise the user
-  // ignored. The data keeps accruing for future surfaces.
+  // Quota status is still recorded underneath (see utils/quota.ts /
+  // runnerRegistry.ts) — it drives routing and the withheld-fallback
+  // explanation — but is deliberately not rendered in this panel: a parked
+  // entry is only ever a past observation (nothing clears it but a later
+  // observation), and its remedy text is written for the stage-scoped
+  // notification a failing round raises. It is notification content, not
+  // standing state.
 
   public focusStage(stage: TaskStage, control: "primary" | "backup" = "primary"): void {
     if (!this._view) {
@@ -682,7 +632,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             --ensemble-focus-width: 2px;
             --ensemble-radius: 3px;
             --ensemble-small-font-size: 0.9em;
+            /* Informational helper copy reads at full contrast; disabled
+               text takes the readable muted grey that helper copy used to
+               have. Both flip per theme kind below. */
+            --ensemble-info-foreground: var(--vscode-foreground);
+            --ensemble-disabled-foreground: var(--vscode-descriptionForeground);
           }
+          body.vscode-light { --ensemble-info-foreground: #000000; }
+          body.vscode-dark { --ensemble-info-foreground: #ffffff; }
           body {
             font-family: var(--vscode-font-family);
             color: var(--vscode-foreground);
@@ -727,7 +684,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             padding: var(--ensemble-space-half) var(--ensemble-space-1);
           }
           .model-combo-input[disabled] {
-            opacity: 0.55;
+            color: var(--ensemble-disabled-foreground);
             cursor: not-allowed;
           }
           .model-options {
@@ -755,6 +712,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             background-color: var(--vscode-list-hoverBackground);
             color: var(--vscode-list-hoverForeground);
           }
+          /* Intentionally muted (not the info token): status/metadata text,
+             not an informational block. Same for #loading-indicator. */
           .model-option.empty {
             color: var(--vscode-descriptionForeground);
             cursor: default;
@@ -788,9 +747,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder);
             outline-offset: var(--ensemble-border-width);
           }
+          /* Primary (accent) buttons keep a mild fade; neutral ones use the
+             readable disabled colour instead of opacity so the label stays
+             legible on light themes. */
           button:disabled {
-            opacity: 0.5;
+            opacity: 0.7;
             cursor: default;
+          }
+          button.secondary:disabled {
+            opacity: 1;
+            color: var(--ensemble-disabled-foreground);
           }
           button.secondary {
             background-color: var(--vscode-button-secondaryBackground);
@@ -848,7 +814,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .provider-help {
             margin: var(--ensemble-space-2) 0 0;
             font-size: var(--ensemble-small-font-size);
-            color: var(--vscode-descriptionForeground);
+            color: var(--ensemble-info-foreground);
           }
           /* Sits directly under its provider row, indented to read as
              belonging to that provider rather than to the whole list. A
@@ -869,14 +835,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           .provider-warning p {
             margin: var(--ensemble-space-1) 0 0;
-          }
-          .quota-warning {
-            margin: 0 0 var(--ensemble-space-2);
-            padding: var(--ensemble-space-1) var(--ensemble-space-2);
-            border-left: var(--ensemble-border-width) solid var(--vscode-inputValidation-warningBorder);
-            background: var(--vscode-inputValidation-warningBackground);
-            color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
-            font-size: var(--ensemble-small-font-size);
           }
           .form-row {
             margin-bottom: var(--ensemble-space-2);
@@ -902,8 +860,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           /* A skipped row keeps its configured model and position — dimmed,
              not disabled, so it stays editable. */
-          .model-row.skipped .model-combobox {
-            opacity: 0.55;
+          .model-row.skipped .model-combobox,
+          .model-row.skipped .model-combo-input {
+            color: var(--ensemble-disabled-foreground);
           }
           /* Fallback is a boolean, so it uses the checkbox column the row
              layout has always reserved instead of making the user open a
@@ -923,10 +882,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .stage-hint {
             margin: 0 0 var(--ensemble-space-2);
             font-size: var(--ensemble-small-font-size);
-            color: var(--vscode-descriptionForeground);
+            color: var(--ensemble-info-foreground);
           }
           .model-option-detail {
-            color: var(--vscode-descriptionForeground);
+            color: var(--ensemble-info-foreground);
           }
           .add-backup {
             margin-top: var(--ensemble-space-3);
@@ -965,10 +924,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
         <div id="restored-note-container"></div>
 
-        <!-- Currently-parked quota/model-entitlement blocks (utils/quota.ts's
-             durable ledger) — empty and hidden when nothing is parked. -->
-        <div id="quota-warnings"></div>
-
         <!-- Single-column layout: one titled section per stage (stage name
              as a heading, then primary model / fallback strategy / backup
              models stacked vertically). The container keeps the historical
@@ -997,7 +952,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let stageDisplayNames = {};
           let enabledProviders = {};
           let providers = [];
-          let quotaWarnings = [];
           let stageTitleOverrides = {};
           let stageHints = {};
           let showProviderAccountActions = false;
@@ -1159,7 +1113,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               stageHints = message.stageHints || {};
               showProviderAccountActions = message.showProviderAccountActions === true;
               warnUnsavedSettings = message.warnUnsavedSettings !== false;
-              quotaWarnings = message.quotaWarnings || [];
 
               // Restore a draft preserved across a webview disposal.
               const draft = takeSavedDraft();
@@ -1170,7 +1123,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               }
 
               renderProviderSelection();
-              renderQuotaWarnings();
               renderTable();
               document.getElementById('loading-indicator').hidden = true;
               document.getElementById('settings-table').hidden = false;
@@ -1695,17 +1647,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             // With zero backups only the add button renders — no caption.
             const caption = row.querySelector('.backup-caption');
             if (caption) caption.hidden = count === 0;
-          }
-
-          function renderQuotaWarnings() {
-            const container = document.getElementById('quota-warnings');
-            if (!quotaWarnings.length) {
-              container.innerHTML = '';
-              return;
-            }
-            container.innerHTML = quotaWarnings.map(warning =>
-              '<div class="quota-warning">' + escapeHtml(warning.text) + '</div>'
-            ).join('');
           }
 
           function renderProviderSelection() {

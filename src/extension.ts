@@ -153,7 +153,8 @@ import {
 import { configureHostIdentityRootV1 } from "./state/hostIdentityV1";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
-import { TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
+import { IMPLEMENTATION_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
+import { handleImplementationChecklistChangeV1 } from "./views/implementationChecklistRefreshV1";
 import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
@@ -1301,6 +1302,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     "vs-code-ai-helper.filterNotifications",
     () => statusTreeProvider.chooseLevelFilter()
   ));
+  // Pane search (session-only; see TaskTreeProvider/StatusTreeProvider). The
+  // banner (`TreeView.message`) is what keeps an active filter from looking
+  // like missing rows, so it is refreshed whenever the counts can change, not
+  // only when the query does. The `...SearchActive` context keys gate the
+  // title-bar clear buttons and only change with the query.
+  const refreshTasksSearchBanner = (): void => {
+    const summary = taskTreeProvider.getSearchSummary();
+    tasksTreeView.message = summary
+      ? `Search: '${taskTreeProvider.getSearchQuery()}' — ${summary.matched} of ${summary.total} tasks`
+      : undefined;
+  };
+  const applyTasksSearch = async (query: string): Promise<void> => {
+    taskTreeProvider.setSearchQuery(query);
+    await vscode.commands.executeCommand(
+      "setContext",
+      "vs-code-ai-helper.tasksSearchActive",
+      taskTreeProvider.getSearchQuery().length > 0
+    );
+    refreshTasksSearchBanner();
+  };
+  const refreshNotificationsSearchBanner = (): void => {
+    const summary = statusTreeProvider.getSearchSummary();
+    statusTreeView.message = summary
+      ? `Search: '${statusTreeProvider.getSearchQuery()}' — ${summary.matched} of ${summary.total} notifications`
+      : undefined;
+  };
+  const applyNotificationsSearch = async (query: string): Promise<void> => {
+    statusTreeProvider.setSearchQuery(query);
+    await vscode.commands.executeCommand(
+      "setContext",
+      "vs-code-ai-helper.notificationsSearchActive",
+      statusTreeProvider.getSearchQuery().length > 0
+    );
+    refreshNotificationsSearchBanner();
+  };
+  context.subscriptions.push(
+    taskTreeProvider.onDidLoadTasks(refreshTasksSearchBanner),
+    statusTreeProvider.onDidChangeTreeData(refreshNotificationsSearchBanner),
+    vscode.commands.registerCommand("vs-code-ai-helper.searchTasks", async () => {
+      const query = await vscode.window.showInputBox({
+        title: "Search tasks",
+        prompt: "Show only tasks matching every word (name, folder or stage). Leave empty to clear.",
+        value: taskTreeProvider.getSearchQuery(),
+      });
+      // Esc leaves the current query untouched; an empty submit clears it.
+      if (query === undefined) return;
+      await applyTasksSearch(query);
+    }),
+    vscode.commands.registerCommand("vs-code-ai-helper.clearTasksSearch", () => applyTasksSearch("")),
+    vscode.commands.registerCommand("vs-code-ai-helper.searchNotifications", async () => {
+      const query = await vscode.window.showInputBox({
+        title: "Search notifications",
+        prompt: "Show only notifications containing every word. Leave empty to clear.",
+        value: statusTreeProvider.getSearchQuery(),
+      });
+      if (query === undefined) return;
+      await applyNotificationsSearch(query);
+    }),
+    vscode.commands.registerCommand("vs-code-ai-helper.clearNotificationsSearch", () => applyNotificationsSearch(""))
+  );
   // Inline cancel button on cancellable running-operation rows in the
   // Notifications view. Cancellation is a request: it fires the operation's
   // token (cascading to running children) and the row shows "cancelling…"
@@ -1808,6 +1869,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   progressWatcher.onDidChange(onProgressChange);
   progressWatcher.onDidDelete(onProgressChange);
 
+  // Live implementation percentage: a run ticks boxes in plan-final.md and
+  // nothing else changes on disk mid-round (task-progress.json is untouched),
+  // so the percentage on the Tasks row, status bar and chat header would only
+  // catch up when the round ended. Re-render on plan-final.md changes,
+  // debounced and coalesced per folder. The handler and everything it calls
+  // perform no document writes or saves — the surfaces re-read via the
+  // display-only `readPlanOfRecordForDisplayV1` precisely so that a refresh
+  // firing mid-run can never save a plan-final.md editor the user is typing
+  // in — and it neither refreshes the inventory nor arms schedules.
+  const implChecklistWatcher = vscode.workspace.createFileSystemWatcher(
+    `**/${IMPLEMENTATION_FILENAME}`
+  );
+  const pendingImplChecklistFiles = new Map<string, vscode.Uri>();
+  let implChecklistTimer: ReturnType<typeof setTimeout> | undefined;
+  const onImplChecklistChange = (uri: vscode.Uri): void => {
+    pendingImplChecklistFiles.set(uri.fsPath, uri);
+    if (implChecklistTimer !== undefined) {
+      clearTimeout(implChecklistTimer);
+    }
+    implChecklistTimer = setTimeout(() => {
+      implChecklistTimer = undefined;
+      const changed = [...pendingImplChecklistFiles.values()];
+      pendingImplChecklistFiles.clear();
+      void startupGateReady
+        .then(() =>
+          handleImplementationChecklistChangeV1(changed, {
+            findTaskStage: (folderFsPath) =>
+              inventory
+                .getTasks()
+                .find((task) => normalizePath(task.taskFolderPath) === normalizePath(folderFsPath))?.progress.currentStage,
+            refreshTaskTree: () => taskTreeProvider.refresh(),
+            isStatusBarShowingTaskFolder: (folderUri) => taskStatusBar.isShowingTaskFolder(folderUri),
+            refreshStatusBar: () => taskStatusBar.refresh(),
+            refreshChatImplementationProgress: (folderUri) =>
+              chatViewProvider.refreshImplementationProgressForTaskV1(folderUri),
+          })
+        )
+        .catch((error) => console.error("Implementation checklist refresh failed", error));
+    }, 500);
+  };
+  implChecklistWatcher.onDidCreate(onImplChecklistChange);
+  implChecklistWatcher.onDidChange(onImplChecklistChange);
+  implChecklistWatcher.onDidDelete(onImplChecklistChange);
+
   // A crashed window can leave a lease behind. Periodically retrying the
   // persisted schedules lets this window claim an expired lease even when no
   // task-progress file change happens after the crash.
@@ -1846,6 +1951,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void revealCurrentTask(tasksTreeView, taskTreeProvider, currentTaskStore);
   });
 
+  // The hover tooltips colour their informational sentence per theme kind
+  // (tooltipInfoTextV1.ts); rebuild them when the theme flips so a switch
+  // between light and dark never leaves black-on-dark text until reload.
+  const colorThemeListener = vscode.window.onDidChangeActiveColorTheme(() => {
+    taskTreeProvider.refresh();
+    taskStatusBar.refresh();
+  });
+
   // Track tree expand/collapse events so state survives refresh
   const onExpandListener = tasksTreeView.onDidExpandElement((event) => {
     if (event.element instanceof TaskNode) {
@@ -1869,9 +1982,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     collapseAllCommand,
     statusBarMenuCommand,
     progressWatcher,
+    implChecklistWatcher,
+    {
+      dispose: () => {
+        if (implChecklistTimer !== undefined) clearTimeout(implChecklistTimer);
+      },
+    },
     { dispose: () => { if (schedulerRecoveryTimer !== undefined) clearInterval(schedulerRecoveryTimer); } },
     configListener,
     currentTaskListener,
+    colorThemeListener,
     onExpandListener,
     onCollapseListener,
     {

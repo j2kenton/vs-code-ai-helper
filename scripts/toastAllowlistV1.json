@@ -35,7 +35,7 @@
     },
     {
       "file": "src/extension.ts",
-      "line": 1927,
+      "line": 2047,
       "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision."
     },
     {
@@ -65,7 +65,7 @@
     },
     {
       "file": "src/views/settingsView.ts",
-      "line": 619,
+      "line": 566,
       "reason": "Settings-view notice about leftover per-task model overrides from a superseded configuration shape, offering to clear them — settings hygiene, not a task workflow decision."
     }
   ],
@@ -223,7 +223,7 @@
     },
     {
       "file": "src/views/chatView.ts",
-      "line": 2378,
+      "line": 2462,
       "reason": "Chat-history recovery notice (plan §5.1) — a corrupted local chat-v1.json needs 'Reset Chat History' or manual inspection via 'Ensemble: Open Chat Data'; a data-recovery affordance, not a task review/round workflow decision."
     },
     {

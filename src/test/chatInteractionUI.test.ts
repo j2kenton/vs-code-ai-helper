@@ -185,6 +185,13 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       assert.equal(interaction.interactionId, "1".repeat(32));
       assert.equal(interaction.state, "unresolved");
 
+      // The card carries the same copy/time affordances as a regular message.
+      const card = interaction as unknown as { atLabel: string; atTitle: string; copyText: string };
+      assert.ok(card.atLabel.length > 0, "a valid postedAt yields a time label");
+      assert.ok(card.atTitle.length > 0, "a valid postedAt yields a full date/time title");
+      assert.match(card.copyText, /^Needs your reply/);
+      assert.doesNotMatch(`${card.atLabel}${card.atTitle}`, /Invalid|NaN/);
+
       const stored = await readChatInteractions(folder, folder, "impl");
       assert.equal(stored.length, 1);
       assert.equal(stored[0]!.state, "unresolved");
@@ -193,6 +200,57 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       cmds.restore();
       provider.dispose();
       safeRemoveDir(folder);
+    }
+  });
+
+  void it("an unparsable postedAt posts an empty time label/title, never Invalid Date or NaN, and keeps copyText", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId: "1".repeat(32),
+          operationId: "2".repeat(32),
+          actionKey: "generatePlan.v1",
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+        },
+        true,
+        false
+      );
+
+      // `postedAt` is store-generated, so the only way an unparsable value can
+      // reach render() is a hand-edited / damaged chat-v1.json on disk.
+      const chatFile = path.join(folder, "chat-v1.json");
+      const raw = fs.readFileSync(chatFile, "utf8");
+      assert.match(raw, /"postedAt": ?"[^"]+"/);
+      fs.writeFileSync(chatFile, raw.replace(/("postedAt": ?)"[^"]+"/g, '$1"not-a-date"'));
+
+      fake.posted.length = 0;
+      const refreshed = await provider.refreshImplementationProgressForTaskV1(vscode.Uri.file(folder));
+      assert.equal(refreshed, true);
+      const lastState = fake.posted.filter((m) => m.type === "state").pop();
+      assert.ok(lastState, "expected a posted state message");
+      const card = (
+        lastState.interactions as ReadonlyArray<{ interactionId: string; atLabel: string; atTitle: string; copyText: string }>
+      ).find((i) => i.interactionId === "1".repeat(32));
+      assert.ok(card, "the interaction is still posted");
+      assert.equal(card.atLabel, "");
+      assert.equal(card.atTitle, "");
+      assert.match(card.copyText, /^Needs your reply/);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
     }
   });
 
