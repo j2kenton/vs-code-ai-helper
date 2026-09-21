@@ -1,3 +1,5 @@
+import { attributeNotificationMessageV1, recordRaisedNoticeV1 } from "./notificationTaskContextV1";
+
 export interface StatusSurface {
   /**
    * `resultTargetUri` is a stringified vscode.Uri (parse with
@@ -65,7 +67,7 @@ export const NotificationRouter = {
     actionCommand?: { command: string; title: string; args?: unknown[] }
   ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info", filePath, resultTargetUri, sourceOperationId, actionCommand);
+    surface.addEntry(attributeNotificationMessageV1(message), "info", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**
@@ -80,7 +82,8 @@ export const NotificationRouter = {
     actionCommand?: { command: string; title: string; args?: unknown[] }
   ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "warning", filePath, resultTargetUri, sourceOperationId, actionCommand);
+    recordRaisedNoticeV1(message);
+    surface.addEntry(attributeNotificationMessageV1(message), "warning", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**
@@ -94,7 +97,8 @@ export const NotificationRouter = {
     actionCommand?: { command: string; title: string; args?: unknown[] }
   ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "error", filePath, resultTargetUri, sourceOperationId, actionCommand);
+    recordRaisedNoticeV1(message);
+    surface.addEntry(attributeNotificationMessageV1(message), "error", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**
@@ -110,6 +114,6 @@ export const NotificationRouter = {
    */
   emitProgressSummary(message: string, sourceOperationId?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info", undefined, undefined, sourceOperationId);
+    surface.addEntry(attributeNotificationMessageV1(message), "info", undefined, undefined, sourceOperationId);
   }
 };

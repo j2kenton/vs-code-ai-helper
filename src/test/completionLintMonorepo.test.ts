@@ -23,10 +23,11 @@ import {
   isMonorepoWorkspace,
   parsePnpmWorkspacePackages,
 } from "../utils/completionLint";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-monorepo-test-"));
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function writeJson(filePath: string, value: unknown): void {

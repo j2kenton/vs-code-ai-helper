@@ -7,6 +7,9 @@ import { after, test } from "node:test";
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import {
+  buildDelayedRetryDecisionV1,
+  buildOwedContinuationDecisionV1,
+  buildStalledTaskEscalationDecisionV1,
   QUOTA_RESUME_SCHEDULE_BUFFER_MS,
   SchedulerClock,
   SchedulerProgressStore,
@@ -18,6 +21,7 @@ import {
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { resetAutomationChainGuards } from "../utils/automationChain";
+import { recordStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
@@ -46,6 +50,7 @@ import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { setProcessStartTimeIoOverrideForTestV1 } from "../state/processStartTimeProbeV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * `probeWorkAdmissionOwnerLivenessV1`'s process-start-time cross-check (Part
@@ -142,7 +147,7 @@ function spawnAndWaitForDeadPidV1(): Promise<number> {
 }
 after(() => {
   setWorkAdmissionRootOverrideForTestV1(undefined);
-  fs.rmSync(admissionTestRootV1, { recursive: true, force: true });
+  safeRemoveDir(admissionTestRootV1);
 });
 
 class FakeClock implements SchedulerClock {
@@ -289,7 +294,10 @@ void test("scheduled firing restores the schedule when applyCurrentStageAction r
     clock.fireNext();
     await scheduler.waitForPendingFiresForTestV1();
 
-    assert.deepEqual(state.current().scheduledRun, { runAt: "2026-01-01T00:01:00.000Z", stage: "plan" });
+    // A refusal re-arms the schedule (adding this window's lease metadata), so
+    // assert the retained intent rather than the exact record shape.
+    assert.equal(state.current().scheduledRun?.runAt, "2026-01-01T00:01:00.000Z");
+    assert.equal(state.current().scheduledRun?.stage, "plan");
   } finally {
     commands.executeCommand = original;
     deactivateNotificationRouter();
@@ -457,7 +465,7 @@ function createRealTaskFolderV1(stage: TaskProgress["currentStage"]): {
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
   fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
-  return { taskFolderPath, progressPath, cleanup: () => fs.rmSync(container, { recursive: true, force: true }) };
+  return { taskFolderPath, progressPath, cleanup: () => safeRemoveDir(container) };
 }
 
 /** Minimal TaskInventory stub resolving exactly one task, by canonicalId or
@@ -929,14 +937,15 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     const pending = decisionStore.listPending("C:\\tasks\\task");
     const watchdogDecision = pending.find((d) => d.decisionKey === "watchdogStalledEscalation");
     assert.ok(watchdogDecision, `expected a posted watchdogStalledEscalation decision; got: ${JSON.stringify(pending)}`);
-    const resumeOption = watchdogDecision?.options.find((o) => o.optionId === "resumeAndRerun");
-    assert.ok(resumeOption, "the decision must offer a \"resumeAndRerun\" option");
-    assert.equal(resumeOption?.label, "Resume and re-run this stage");
-    assert.deepEqual(resumeOption?.effect, {
-      kind: "command",
-      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-      args: [{ taskFolderPath: "C:\\tasks\\task" }],
-    });
+    // This fixture's task folder does not exist on disk, so the stage's own
+    // prerequisites are unmet and resuming would be refused. The card must say
+    // so (items 14 + 25) rather than offer an inert "resume" — the runnable
+    // shape (button names its action) is covered by the builder test below.
+    assert.ok(
+      !watchdogDecision?.options.some((o) => o.optionId === "resumeAndRerun"),
+      "a blocked resume plan must not offer a resume option that would be refused"
+    );
+    assert.equal(watchdogDecision?.gating?.unblocksProgress, false);
     assert.equal(watchdogDecision?.gating?.holdsTaskPaused, true);
   } finally {
     fakeContext.restore();
@@ -1062,12 +1071,28 @@ void test("armAll's watchdog does not pause a task with an owed implRecovery, an
       // The `implRecovery: "pending"` case claims and fire-and-forget
       // dispatches exactly like the reclaim tests above — stub the same way
       // so its trailing async activity resolves against a registered command.
-      commands.executeCommand = (() => Promise.resolve(undefined)) as typeof commands.executeCommand;
+      let dispatched = 0;
+      commands.executeCommand = (() => {
+        dispatched += 1;
+        return Promise.resolve(undefined);
+      }) as typeof commands.executeCommand;
       resetAutomationChainGuards();
       try {
         await scheduler.armAll();
         assert.equal(state.current().status, "active", `must not pause: ${JSON.stringify(overrides)}`);
         await flushMicrotasksV1();
+        // The fire-and-forget dispatch crosses real I/O before it reaches the
+        // command; under a loaded full-suite run two macrotask turns are not
+        // enough, and the stub was restored first ("command ... is not
+        // registered" surfaced as an unhandledRejection after the test ended).
+        // Hold the stub until the dispatch has landed (bounded).
+        if ("implRecovery" in overrides) {
+          for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          // A timeout must fail here, not defer the late rejection past the test.
+          assert.ok(dispatched > 0, "the owed continuation's dispatch must land before the stub is restored");
+        }
       } finally {
         commands.executeCommand = originalExecute;
         resetAutomationChainGuards();
@@ -2165,7 +2190,7 @@ void test("armAll's takeover-notice streak resets when a DIFFERENT owner is obse
     // simulated here directly, since real acquisition would require a live
     // owner-a to release first. The identity (claimId) differs, so this
     // must count as observation 1 of a NEW streak, not observation 3.
-    fs.rmSync(markerPath2Dir(taskFolderPath), { recursive: true, force: true });
+    safeRemoveDir(markerPath2Dir(taskFolderPath));
     const markerPathB = writeFakeAdmissionMarkerV1(taskFolderPath, {
       purpose: "admission",
       pid: 2,
@@ -2548,5 +2573,360 @@ void test("takeOverStaleWorkAdmissionCommandV1 does nothing when no expectedMark
     realFs.restore();
     deactivateNotificationRouter();
     folder.cleanup();
+  }
+});
+
+void test("watchdog pause card for a blocked resume plan neither recommends nor promises an unblocking resume", () => {
+  const target = {
+    canonicalId: "task-id",
+    taskFolderPath: "/tmp/task",
+    stage: "impl-high-review" as const,
+    taskName: "t",
+  };
+  const restorable = buildStalledTaskEscalationDecisionV1(false, target, {
+    kind: "blocked",
+    precondition: "the implementation summary is unusable.",
+    restoreSummary: true,
+  });
+  assert.equal(restorable.gating?.unblocksProgress, false);
+  assert.equal(restorable.recommendation.kind, "option");
+  assert.equal(
+    restorable.recommendation.kind === "option" ? restorable.recommendation.optionId : undefined,
+    "restoreSummary"
+  );
+  assert.ok(!restorable.options.some((o) => o.optionId === "resumeAndRerun"), "no inert resume option");
+  const restore = restorable.options.find((o) => o.optionId === "restoreSummary");
+  assert.deepEqual(restore?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+    args: ["/tmp/task", "impl-high-review"],
+  });
+  assert.ok(!/immediately/.test(restorable.gating?.detail ?? ""));
+
+  const unrestorable = buildStalledTaskEscalationDecisionV1(false, target, {
+    kind: "blocked",
+    precondition: "the implementation summary is unusable.",
+  });
+  assert.equal(unrestorable.recommendation.kind, "none");
+  assert.equal(unrestorable.gating?.unblocksProgress, false);
+  assert.ok(unrestorable.options.every((o) => o.effect.kind === "doNothing"));
+
+  const runnable = buildStalledTaskEscalationDecisionV1(false, target, {
+    kind: "run-review",
+    label: "Resume and run the review again (Copilot)",
+  });
+  assert.equal(runnable.gating?.unblocksProgress, true);
+  const resumeOption = runnable.options.find((o) => o.optionId === "resumeAndRerun");
+  assert.equal(resumeOption?.label, "Resume and run the review again (Copilot)");
+  assert.deepEqual(resumeOption?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+    args: [{ taskFolderPath: "/tmp/task" }],
+  });
+});
+
+void test("the delayed-retry card offers Run now beside a default Wait, and says when the retry is due (v1 fixes 2, item 22)", () => {
+  const dueAt = new Date("2026-01-01T00:10:00.000Z");
+  const decision = buildDelayedRetryDecisionV1(
+    { canonicalId: "task-id", taskFolderPath: "/tmp/task", stage: "plan", taskName: "Demo" },
+    "refused",
+    dueAt,
+    "the review is running"
+  );
+  assert.equal(decision.decisionKey, "scheduledActionRunNow");
+  assert.match(decision.whatHappened, /"Demo"/);
+  assert.match(decision.whatHappened, /the review is running/);
+  assert.ok(decision.whatHappened.includes(dueAt.toLocaleString()), "names when the next attempt is due");
+  assert.equal(decision.recommendation.kind, "option");
+  assert.equal((decision.recommendation as { optionId: string }).optionId, "waitForRetry");
+  const wait = decision.options.find((option) => option.optionId === "waitForRetry");
+  assert.deepEqual(wait?.effect, { kind: "doNothing" });
+  const runNow = decision.options.find((option) => option.optionId === "runNow");
+  assert.deepEqual(runNow?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.runScheduledActionNow",
+    args: [{ taskFolderPath: "/tmp/task", canonicalId: "task-id" }],
+  });
+  assert.equal(decision.gating?.unblocksProgress, false);
+});
+
+void test("Run now takes the same fire() path as the timer, before the schedule is due (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T00:00:00.000Z")); // runAt is a minute away
+  const taskFolderPath = "C:\\tasks\\run-now";
+  const state = memoryStore(scheduledProgress("plan"));
+  const inventory = { getTasks: () => [] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  initNotificationRouter({ addEntry(): void {} });
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const original = commands.executeCommand;
+  const dispatchedCommands: string[] = [];
+  commands.executeCommand = ((command: string) => {
+    dispatchedCommands.push(command);
+    return Promise.resolve(true);
+  }) as typeof commands.executeCommand;
+  try {
+    await scheduler.arm(taskFolderPath, "task-id");
+    assert.deepEqual(dispatchedCommands, [], "nothing fires before the schedule is due");
+
+    const outcome = await scheduler.runNow(taskFolderPath, "task-id");
+
+    assert.equal(outcome, "started");
+    assert.deepEqual(dispatchedCommands, ["vs-code-ai-helper.applyCurrentStageAction"]);
+    assert.equal(state.current().scheduledRun, undefined, "the schedule is consumed exactly as a timer firing would");
+
+    assert.equal(await scheduler.runNow(taskFolderPath, "task-id"), "nothingScheduled");
+    assert.equal(dispatchedCommands.length, 1, "a second Run now dispatches nothing");
+  } finally {
+    commands.executeCommand = original;
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("Run now against a task another action holds is refused through fire(), naming the holder, and keeps the schedule (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T00:00:00.000Z"));
+  const taskFolderPath = "C:\\tasks\\run-now-busy";
+  const state = memoryStore(scheduledProgress("plan"));
+  const inventory = { getTasks: () => [] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const warnings: string[] = [];
+  initNotificationRouter({
+    addEntry(message: string): void {
+      if (message.includes("could not start yet")) {
+        warnings.push(message);
+      }
+    },
+  });
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const original = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(true);
+  }) as typeof commands.executeCommand;
+  const holder = await acquireWorkAdmissionV1({ taskFolderPath, purpose: "admission", commandId: "runReviewWithAI" });
+  assert.equal(holder.outcome, "acquired");
+  try {
+    await scheduler.arm(taskFolderPath, "task-id");
+    const outcome = await scheduler.runNow(taskFolderPath, "task-id");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(outcome, "refused", "a refused Run now must not report started");
+    assert.equal(dispatched, 0, "a held task is never dispatched into");
+    assert.equal(warnings.length, 1, "the refusal is reported, naming what holds the task");
+    assert.ok(state.current().scheduledRun !== undefined, "the schedule is kept");
+  } finally {
+    if (holder.outcome === "acquired") {
+      await holder.handle.release();
+    }
+    commands.executeCommand = original;
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("the owed-continuation card offers Run now beside a default Wait, both truthful about the wait (v1 fixes 2, item 22)", () => {
+  const decision = buildOwedContinuationDecisionV1(
+    { canonicalId: "task-id", taskFolderPath: "C:\\tasks\\owed", stage: "impl", taskName: "Owed" },
+    new Date("2026-01-01T01:00:00.000Z"),
+    "an earlier attempt claimed it and has not started a round"
+  );
+  assert.equal(decision.decisionKey, "owedContinuationRunNow");
+  assert.equal(decision.recommendation?.kind, "option");
+  assert.equal(decision.recommendation?.kind === "option" ? decision.recommendation.optionId : undefined, "waitForRetry");
+  assert.deepEqual(decision.options.find((option) => option.optionId === "waitForRetry")?.effect, { kind: "doNothing" });
+  assert.deepEqual(decision.options.find((option) => option.optionId === "runNow")?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.runOwedContinuationNow",
+    args: [{ taskFolderPath: "C:\\tasks\\owed", canonicalId: "task-id" }],
+  });
+  assert.equal(decision.gating?.unblocksProgress, false);
+  assert.match(decision.whatHappened, /has not started a round/);
+});
+
+void test("Run now on an owed continuation never clears another window's live lease and names the holder (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const fakeContext = installFakeExtensionContextV1();
+  const progress: TaskProgress = {
+    ...baseStalledProgress({}),
+    implRecovery: {
+      sourceAttemptId: "x",
+      reason: "x",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "other-window",
+      leaseUntil: "2026-01-01T04:00:00.000Z", // live, and NOT this window's
+    },
+  };
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  initNotificationRouter(new RecordingSurfaceV1());
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(undefined);
+  }) as typeof commands.executeCommand;
+  resetAutomationChainGuards();
+  try {
+    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id");
+    assert.equal(outcome, "refused");
+    assert.equal(state.current().implRecovery?.leaseOwner, "other-window", "the other window's claim is left intact");
+    assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(dispatched, 0, "nothing was dispatched underneath the live claim");
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    fakeContext.restore();
+  }
+});
+
+void test("Run now on an owed continuation ends this window's own lease wait and takes the sweep's claim-and-dispatch path (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const fakeContext = installFakeExtensionContextV1();
+  const progress: TaskProgress = {
+    ...baseStalledProgress({}),
+    implRecovery: {
+      sourceAttemptId: "x",
+      reason: "x",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-01-01T00:00:00.000Z",
+      leaseOwner: "test-owner",
+      leaseUntil: "2026-01-01T05:00:00.000Z", // this window's own earlier claim: the sweep would wait two hours
+    },
+  };
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  initNotificationRouter(new RecordingSurfaceV1());
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(undefined);
+  }) as typeof commands.executeCommand;
+  resetAutomationChainGuards();
+  try {
+    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id");
+    assert.equal(outcome, "started");
+    assert.equal(state.current().implRecovery?.leaseOwner, "test-owner", "this window re-claimed it, ending its own lease wait");
+    assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z", "the old two-hour lease was replaced by a fresh one");
+    for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(dispatched > 0, "the continuation chain dispatches before the stub is restored");
+
+    // Nothing owed any more -> nothing to run.
+    const cleared = memoryStore({ ...progress, implRecovery: undefined });
+    const idle = new TaskActionScheduler(inventory, clock, cleared.store, "test-owner");
+    assert.equal(await idle.runOwedContinuationNow("C:\\tasks\\task", "task-id"), "nothingOwed");
+    idle.dispose();
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    fakeContext.restore();
+  }
+});
+
+void test("two overlapping Run-now attempts in one window: the loser neither clears nor releases the winner's lease (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const fakeContext = installFakeExtensionContextV1();
+  const progress: TaskProgress = {
+    ...baseStalledProgress({}),
+    implRecovery: {
+      sourceAttemptId: "x",
+      reason: "x",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-01-01T00:00:00.000Z",
+    },
+  };
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  initNotificationRouter(new RecordingSurfaceV1());
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(undefined);
+  }) as typeof commands.executeCommand;
+  resetAutomationChainGuards();
+  try {
+    const [first, second] = await Promise.all([
+      scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id"),
+      scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id"),
+    ]);
+    assert.deepEqual([first, second].sort(), ["refused", "started"], "exactly one attempt dispatches");
+    assert.equal(state.current().implRecovery?.leaseOwner, "test-owner", "the winner's claim was not cleared by the loser");
+    assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z");
+    for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(dispatched, 1, "one chain dispatched, not two");
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    fakeContext.restore();
+  }
+});
+
+void test("Run now whose downstream dispatch declines reports refused, keeps the schedule and names the reason instead of a generic toast (v1 fixes 2, item 22)", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T00:00:00.000Z"));
+  const taskFolderPath = "C:\\tasks\\run-now-declined";
+  const state = memoryStore(scheduledProgress("plan"));
+  const inventory = { getTasks: () => [] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const notices: string[] = [];
+  initNotificationRouter({
+    addEntry(message: string): void {
+      notices.push(message);
+    },
+  });
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const original = commands.executeCommand;
+  // The stage-action router records why it declined; the card must carry that
+  // real cause, not a guess.
+  commands.executeCommand = (() => {
+    recordStageActionRefusalReasonV1(taskFolderPath, "no model is configured for the plan stage, or its provider is disabled");
+    return Promise.resolve(false);
+  }) as typeof commands.executeCommand;
+  try {
+    await scheduler.arm(taskFolderPath, "task-id");
+    const outcome = await scheduler.runNow(taskFolderPath, "task-id");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(outcome, "refused");
+    // Refusal re-arms the schedule (adding this window's lease metadata), so
+    // assert the retained intent — when and which stage — not the exact shape.
+    assert.equal(state.current().scheduledRun?.runAt, "2026-01-01T00:01:00.000Z", "the schedule is kept");
+    assert.equal(state.current().scheduledRun?.stage, "plan");
+    assert.equal(notices.filter((message) => message.includes("could not start yet")).length, 1, "one refusal notice");
+    assert.ok(
+      notices.some((message) => message.includes("no model is configured for the plan stage")),
+      "the actual failed prerequisite is named"
+    );
+    assert.ok(!notices.some((message) => message.includes("may still be paused")), "no speculative reason");
+    assert.ok(!notices.some((message) => message.includes("did not start")), "the old generic toast is gone");
+  } finally {
+    commands.executeCommand = original;
+    deactivateNotificationRouter();
+    scheduler.dispose();
   }
 });

@@ -50,6 +50,11 @@ import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { scheduleAutomationChain, resetAutomationChainGuards, type AutomationDispatch } from "../utils/automationChain";
 import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
+import {
+  buildUnusableImplementationSummaryV1,
+  getImplementationSummaryUri,
+} from "../utils/implementationArtifactResolver";
+import { previousVersionUri } from "../utils/artifactBackups";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -110,6 +115,10 @@ function makeTaskFolder(name: string, stage: TaskStage): { folderPath: string; p
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    // A tracked file set: a review with none falls back to the open editors
+    // and (v1 fixes 2, item 21) never auto-advances, which is not what this
+    // chain test is exercising.
+    implReviewFiles: ["src/tracked.ts"],
     ownership: {
       metaRoot: path.join(REAL_ROOT, "plans"),
       projectRoot: REAL_ROOT,
@@ -491,7 +500,7 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     // that early-return path, so this test can observe that cancellation
     // still happened despite the transition itself not proceeding.
     const { folderPath, progress } = makeTaskFolder(`abort-order-${Math.floor(Math.random() * 1e9)}`, "plan");
-    fs.rmSync(path.join(folderPath, "plan.md"));
+    fs.rmSync(path.join(folderPath, "plan.md")); // deliberate: removal is the behaviour under test, not teardown
     const buttonArg = makeButtonPressArg(folderPath, progress);
 
     const provider = new StatusTreeProvider();
@@ -564,7 +573,7 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     // test observes cancel-before-config-resolution without also exercising
     // the real review pipeline.
     const { folderPath, progress } = makeTaskFolder(`abort-order-cfg-${Math.floor(Math.random() * 1e9)}`, "plan");
-    fs.rmSync(path.join(folderPath, "plan.md"));
+    fs.rmSync(path.join(folderPath, "plan.md")); // deliberate: removal is the behaviour under test, not teardown
     const buttonArg = makeButtonPressArg(folderPath, progress);
 
     const provider = new StatusTreeProvider();
@@ -1172,6 +1181,107 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       settings.restore();
       wsStub.restore();
       fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * v1 fixes 2, item 1 completion blocker (2026-09-18 review): "Complete Stage
+ * & Move On" was previously justified as needing no dedicated test of its
+ * own because its auto-review dispatch reuses `runReviewForFolder` — the same
+ * function `runReviewForFolder — offers Restore Last Usable Summary on its
+ * own dispatch refusal` (`reviewActionsUnchangedTreeGuard.test.ts`) already
+ * covers directly. The review found that reasoning insufficient: the plan
+ * requires one automated check PER enumerated surface, so this drives the
+ * REAL registered `vs-code-ai-helper.nextStage` command (the exact
+ * invocation "Complete Stage & Move On" makes) through its own auto-review
+ * dispatch (`impl` → `impl-high-review`, an `AUTO_REVIEW_TRANSITIONS` pair)
+ * and proves the SAME refusal, with the SAME restore action, surfaces at
+ * THIS command boundary too — not inferred from the shared function alone.
+ */
+void describe("nextStage (Complete Stage & Move On) — offers Restore Last Usable Summary when its own auto-review dispatch hits an unusable implementation summary (v1 fixes 2, item 1)", () => {
+  void it("surfaces the restore action on the Notifications list without ever reaching model resolution", async () => {
+    const { folderPath, progress } = makeTaskFolder(`csmo_unusable_${Math.floor(Math.random() * 1e9)}`, "impl");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+    const summaryUri = getImplementationSummaryUri(vscode.Uri.file(folderPath));
+    fs.writeFileSync(
+      summaryUri.fsPath,
+      buildUnusableImplementationSummaryV1("bad shape", "run-log.md"),
+      "utf8"
+    );
+    fs.writeFileSync(
+      previousVersionUri(summaryUri).fsPath,
+      "## Files Changed\n\n- `src/a.ts` — did a thing\n\n## Verification\n\n- tests pass\n",
+      "utf8"
+    );
+    const buttonArg = makeButtonPressArg(folderPath, progress);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const bridge = installOperationNotificationBridge();
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    let modelResolutionCalled = false;
+    const patches: Patched[] = [
+      patch(settingsModule, "completeAndMoveOnTriggersAI", () => true),
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(modelSelectionModule, "resolveModelForStage", () => {
+        modelResolutionCalled = true;
+        return Promise.resolve({ source: "settings", modelId: "stub:model" });
+      }),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => {
+        modelResolutionCalled = true;
+        return Promise.resolve({ source: "settings", modelId: "stub:model" });
+      }),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+    ];
+
+    const context = makeExtensionContext();
+    registerReviewActionCommands(context);
+
+    try {
+      await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
+
+      // The transition itself persists even though the auto-started review
+      // it triggers refuses — the refusal is the review's own, not a reason
+      // to roll the transition back.
+      const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(persisted?.currentStage, "impl-high-review");
+
+      assert.equal(
+        modelResolutionCalled,
+        false,
+        "the unusable-summary refusal must fire before any model resolution or provider work starts"
+      );
+
+      const entries = provider.getEntries?.() ?? [];
+      const warning = entries.find((e) => e.message.includes("did not produce usable"));
+      assert.ok(
+        warning,
+        `expected an unusable-summary warning on the Notifications surface; got: ${JSON.stringify(entries)}`
+      );
+      assert.match(warning.message, /Restore the last usable summary/);
+      assert.deepEqual(warning.actionCommand, {
+        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+        title: "Restore Last Usable Summary",
+        args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+      });
+
+      assert.equal(
+        fs.existsSync(path.join(folderPath, "impl-high-review.md")),
+        false,
+        "no review artifact must be written when the refusal fires before any provider work"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      bridge.dispose();
       provider.dispose();
       deactivateNotificationRouter();
     }

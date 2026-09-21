@@ -15,6 +15,7 @@ import {
   validateWorkflowRelativePathV1,
   WorkflowRootV1,
 } from "../services/workflowPathSafetyV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function makeRoot(fsPath: string): WorkflowRootV1 {
   return { rootId: "test-root", fsPath, trustedForMutation: true };
@@ -26,7 +27,7 @@ void describe("workflowPathSafetyV1", () => {
     try {
       assert.equal(classifyWorkflowRootV1(tmp).ok, true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      safeRemoveDir(tmp);
     }
   });
 
@@ -102,7 +103,7 @@ void describe("workflowPathSafetyV1", () => {
       }
       assert.equal(resolveWorkflowFsPathV1(root, "../outside.txt").ok, false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      safeRemoveDir(tmp);
     }
   });
 
@@ -128,7 +129,7 @@ void describe("workflowPathSafetyV1", () => {
       const belowLink = await checkNoReparseComponentsV1(root, ["linked", "file.txt"]);
       assert.equal(belowLink.safe, false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      safeRemoveDir(tmp);
     }
   });
 });

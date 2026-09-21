@@ -24,6 +24,7 @@ import {
   analyzeCliEventStream,
   CLI_RETRY_MAX_ATTEMPTS,
   composeCliTimeoutOutcomeV1,
+  describeCliSessionProgressV1,
   execCliAgent,
   formatRetryAuditLog,
   shouldRetryReadOnlyRun,
@@ -474,8 +475,26 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     const result = await resultPromise;
     assert.equal(result.status, "failed");
     assert.equal(result.timeoutReason, "wall-clock");
-    assert.match(result.errorMessage ?? "", /timed out after 60 minutes/);
+    assert.match(result.errorMessage ?? "", /60-minute wall-clock limit/);
     // Distinct from the inactivity wording pinned above.
     assert.doesNotMatch(result.errorMessage ?? "", /produced no output/);
+    // Says how far the session got, not only that the clock ran out.
+    assert.match(result.errorMessage ?? "", /It had (?:written|emitted) /);
+  });
+
+  void it("describeCliSessionProgressV1 says how far a stopped session got", () => {
+    assert.equal(
+      describeCliSessionProgressV1(""),
+      "It had written nothing before it was stopped."
+    );
+    assert.match(describeCliSessionProgressV1("plain text"), /written 10 byte\(s\)/);
+    const stream = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "tool_use", name: "Edit" }),
+    ].join("\n");
+    assert.match(
+      describeCliSessionProgressV1(stream),
+      /emitted 2 event\(s\), 1 of them tool or edit activity/
+    );
   });
 });

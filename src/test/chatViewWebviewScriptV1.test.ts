@@ -155,6 +155,7 @@ function runPanel(): PanelHarness {
     "busy-indicator",
     "busy-spinner",
     "busy-text",
+    "steering-note",
     "form",
     "message",
   ]) {
@@ -272,6 +273,14 @@ void describe("the chat panel's inline script", () => {
     assert.equal(panel.byId("context").textContent, "My Task — Implementation");
     assert.equal(panel.byId("busy-indicator").style.display, "block");
     assert.equal(panel.byId("error").style.display, "none");
+  });
+
+  void it("shows the non-steering note on a task chat and hides it on the global chat", () => {
+    const panel = runPanel();
+    panel.post(stateMessage());
+    assert.equal(panel.byId("steering-note").style.display, "block");
+    panel.post(stateMessage({ target: { kind: "global" } }));
+    assert.equal(panel.byId("steering-note").style.display, "none");
   });
 
   void it("a failed paint shows a banner and KEEPS the conversation and the busy banner", () => {

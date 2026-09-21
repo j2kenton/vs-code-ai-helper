@@ -23,6 +23,7 @@ import {
 } from "../types/taskProgress";
 import * as vscode from "vscode";
 import { statIfExists } from "./fileUtils";
+import { PUBLISH_STAGE_ACTIONS_V1, PublishStepV1, publishNextStepFromActionsV1 } from "./publishStageActionsV1";
 
 /** Which artifact family a requirement is about — used only to group/label; the message and label strings below are the actual source of truth. */
 export type StageArtifactIdV1 = "plan" | "implementationArtifact" | "implementationNotes";
@@ -195,10 +196,32 @@ export function stageActionsForPreflightV1(stage: TaskStage): readonly StageActi
   if (stage === "impl") {
     return ["runImplementation"];
   }
-  if (stage === "impl-high-review" || stage === "impl-low-review" || stage === "publish") {
+  if (stage === "impl-high-review" || stage === "impl-low-review") {
     return ["reviewImplementation", "applyReviewImplementation"];
   }
+  if (stage === "publish") {
+    // Derived from Publish's own action table, so removing its review step
+    // (`update ll rev`) also removes the review's pre-flight requirements.
+    return PUBLISH_STAGE_ACTIONS_V1.includes("review")
+      ? ["reviewImplementation", "applyReviewImplementation"]
+      : [];
+  }
   return [];
+}
+
+/**
+ * What Publish presents once its checks have passed (v1 fixes 2, item 33). The
+ * Publish stage-action table (`publishStageActionsV1.ts`, the same table
+ * `applyCurrentStageAction` dispatches from) is the single source of truth:
+ * while it lists a review step, the review follows the checks (state B); once
+ * `update ll rev` removes it, Publish is checks then Commit & Push (state A).
+ * `publishActions` is a parameter so both states are testable against a stubbed
+ * table without editing the real one.
+ */
+export function publishNextStepAfterChecksV1(
+  publishActions: readonly PublishStepV1[] = PUBLISH_STAGE_ACTIONS_V1
+): "review" | "commit-and-push" {
+  return publishNextStepFromActionsV1(publishActions);
 }
 
 /** The requirement list for one stage action, or `[]` if the action has none recorded. */

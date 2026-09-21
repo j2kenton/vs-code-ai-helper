@@ -41,6 +41,7 @@ import { readTaskProgressForTest as readTaskProgress, fixtureOwnershipFor } from
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { initNotificationRouter } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 initNotificationRouter({
   addEntry(message, level) {
@@ -238,7 +239,7 @@ void describe("AI plan verification verdicts", () => {
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-archive-roundtrip-"));
 after(() => {
-  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_ROOT);
 });
 
 function makeTaskFolder(name: string): string {

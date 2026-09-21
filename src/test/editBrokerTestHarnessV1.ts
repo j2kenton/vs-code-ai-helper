@@ -23,6 +23,7 @@ import { PreflightOperationV1, PreflightPlanCompletedV1 } from "../types/aiResul
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { EditExecutionScriptV1 } from "../types/editExecutionProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 export const WORKSPACE_ROOT_ID = "workspace:edit-broker-test";
 export const PRIVATE_ROOT_ID = "private:edit-broker-test";
@@ -285,8 +286,8 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       return JSON.parse(text) as Record<string, unknown>;
     },
     cleanup() {
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
-      fs.rmSync(privateRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
+      safeRemoveDir(privateRoot);
     },
   };
 }

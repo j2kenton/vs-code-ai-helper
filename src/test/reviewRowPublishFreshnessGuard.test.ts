@@ -38,6 +38,7 @@ import {
   renderPublishChecksFreshnessStamp,
 } from "../utils/publishChecksFreshness";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
@@ -74,8 +75,8 @@ before(() => {
 
 after(() => {
   resetWorkflowRuntimeServicesForTestV1();
-  fs.rmSync(ROOT, { recursive: true, force: true });
-  fs.rmSync(privateStorageDir, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
+  safeRemoveDir(privateStorageDir);
 });
 
 function makeTaskFolder(name: string): string {

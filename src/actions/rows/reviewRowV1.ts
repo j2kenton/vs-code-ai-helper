@@ -20,6 +20,7 @@ import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { parseReadiness, withVisibleReviewedCommitLineV1 } from "../../utils/reviewReadiness";
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
 import { checkPublishChecksFreshnessV1 } from "../../utils/publishChecksFreshness";
+import { stepProgressLabelV1 } from "../../utils/stepLabelsV1";
 import { extractCompletionChecksSectionV1, mergeCompletionChecksSection } from "../../utils/completionLint";
 import { extractScopeCheckSectionV1, mergeScopeCheckSection } from "../../utils/publishScopeCheck";
 import {
@@ -345,7 +346,7 @@ export function createReviewRowV1(): ProviderTaskActionRowV1 {
       ],
     },
     requiresTaskOperationLease: true,
-    progressLabel: "Running review…",
+    progressLabel: stepProgressLabelV1("review"),
     validateInput: validateReviewInputV1,
     loggingPolicy: { channel: "action.review", includeResultMetrics: true },
     providerMode: "text",

@@ -103,7 +103,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   });
 
   void it("reports 'starting' at the top of the Run Implementation operation, and 'running' right before executeImplementationRun", () => {
-    const runImplLabel = source.indexOf('{ label: "Run Implementation", stage: "impl"');
+    const runImplLabel = source.indexOf('{ label: stepNameV1("implementation"), stage: "impl"');
     assert.ok(runImplLabel >= 0, "expected the Run Implementation runTrackedOperation call");
 
     const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", runImplLabel);
@@ -452,7 +452,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       // the identical `generateContextPack(resolved.folderUri,
       // workspaceRoot.uri)` call shape but lives earlier in the file, so an
       // unanchored search would match that occurrence instead of this one.
-      const runImplLabel = source.indexOf('{ label: "Run Implementation", stage: "impl"');
+      const runImplLabel = source.indexOf('{ label: stepNameV1("implementation"), stage: "impl"');
       assert.ok(runImplLabel >= 0, "expected the Run Implementation runTrackedOperation call");
       const contextIdx = indexOfFlexible(
         "const contextPackContent = await generateContextPack( resolved.folderUri, workspaceRoot.uri );",

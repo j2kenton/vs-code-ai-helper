@@ -22,6 +22,7 @@ import {
 } from "../services/taskProgressDiscoveryV1";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
@@ -135,7 +136,7 @@ void describe("taskProgressDiscoveryV1", () => {
       assert.equal(incomplete.recovery.length, 1);
     } finally {
       bridge.restore();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -151,7 +152,7 @@ void describe("taskProgressDiscoveryV1", () => {
       assert.equal(all.recovery.length, 1);
     } finally {
       bridge.restore();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 });
@@ -186,7 +187,7 @@ void describe("TaskInventory strict refresh (plan §3.12 step 4)", () => {
       bridge.restore();
       workspace.restore();
       config.restore();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 });

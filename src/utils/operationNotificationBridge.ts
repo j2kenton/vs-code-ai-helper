@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { formatTaskNameForDisplay, taskOperations, TaskOperationSnapshot } from "./taskOperations";
 import { NotificationRouter } from "./notificationRouter";
 import { policyForKind } from "./operationTaxonomy";
+import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { notificationTaskDisplayNameV1 } from "./notificationTaskContextV1";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -51,7 +53,10 @@ export function terminalEntryFor(
     return undefined;
   }
 
-  const stateText = snap.state === "succeeded" ? "completed" : snap.state;
+  // A refusal is not a completion: say the action did not start, in the
+  // words the user needs (the specific reason was already shown at the refusal).
+  const stateText =
+    snap.state === "succeeded" ? "completed" : snap.state === "refused" ? "refused — nothing was started" : snap.state;
   const level =
     snap.state === "failed" ? "error" : snap.state === "succeeded" ? "info" : "warning";
   // The live detail is meaningful on a settled row ("iteration 3/5", a new
@@ -62,10 +67,14 @@ export function terminalEntryFor(
   // necessarily stopped (verification review, 2026-09-18).
   const detail = snap.state === "cancelled" && snap.forcedEndV1 !== true ? undefined : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
+  // Name the stage where the snapshot has one, unless the label already says it.
+  const stageName = snap.stage !== undefined ? STAGE_DISPLAY_NAMES[snap.stage] : undefined;
+  const stageText =
+    stageName !== undefined && !snap.label.toLowerCase().includes(stageName.toLowerCase()) ? ` (${stageName})` : "";
   return {
     // The quoted name is a render-time decision: the snapshot's semantic
     // `taskName` (including persisted snapshots) stays unquoted.
-    message: `${snap.label} — ${formatTaskNameForDisplay(snap.taskName)}: ${stateText}${suffix}`,
+    message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}${stageText}: ${stateText}${suffix}`,
     level,
     sourceOperationId: snap.id,
     // Only present when set — keeps `terminalEntryFor` output free of

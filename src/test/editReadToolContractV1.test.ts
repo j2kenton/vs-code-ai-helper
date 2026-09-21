@@ -27,6 +27,7 @@ import {
   ReadToolResultV1,
 } from "../types/workflowToolProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT_ID = "workspace:test";
 
@@ -66,7 +67,7 @@ function installHarness(): Harness {
       });
       return JSON.parse(text) as ReadToolResultV1;
     },
-    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+    cleanup: () => safeRemoveDir(root),
   };
 }
 

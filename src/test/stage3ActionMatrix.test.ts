@@ -296,8 +296,16 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       routerSource,
-      /stage === "publish"[\s\S]{0,120}?runPublishChecks/,
-      "The current-stage router must dispatch the Publish checks as the stage's primary action"
+      /stage === "publish"[\s\S]{0,240}?publishDispatchCommandV1\(\)/,
+      "The current-stage router must dispatch Publish's first stage-action table step as its primary action"
+    );
+    const publishTableSource = readWorkspaceFile(
+      path.join("src", "utils", "publishStageActionsV1.ts")
+    );
+    assert.match(
+      publishTableSource,
+      /runPublishChecks/,
+      "The Publish stage-action table must map the checks step to the Publish checks command"
     );
   });
 

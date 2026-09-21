@@ -22,12 +22,14 @@ import * as vscode from "vscode";
 
 import {
   effectiveReviewProgressV1,
+  readDisplayPlanChecklistProgressV1,
   readEffectivePlanChecklistProgressV1,
 } from "../utils/effectiveReviewProgress";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -37,7 +39,7 @@ const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-effective-progress-test-")
 );
 after(() => {
-  nodeFs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 const PLAN_TWO_OF_FIVE = [
@@ -357,6 +359,58 @@ void describe("readEffectivePlanChecklistProgressV1", () => {
     const fsStub = installRealFs();
     try {
       assert.equal(await readEffectivePlanChecklistProgressV1(uri), undefined);
+    } finally {
+      fsStub.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Display-only reader: a latched count is qualified, never hidden
+// ---------------------------------------------------------------------------
+
+void describe("readDisplayPlanChecklistProgressV1", () => {
+  void it("returns the counts as verified for a maintained checklist", async () => {
+    const uri = makeTask("display-live", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("display-live"),
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.unverified, false);
+      assert.equal(display?.counts.settled, 2);
+      assert.equal(display?.counts.total, 5);
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("returns the same counts flagged unverified while latched, and gating still stands down", async () => {
+    const uri = makeTask("display-latched", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("display-latched", { checklistProgressUnreliable: true }),
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.unverified, true);
+      assert.equal(display?.counts.settled, 2);
+      assert.equal(display?.counts.total, 5);
+      assert.equal(await readEffectivePlanChecklistProgressV1(uri), undefined);
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("returns undefined (not applicable) for a plan with no checklist, even when latched", async () => {
+    const uri = makeTask("display-none", {
+      plan: PLAN_WITHOUT_CHECKLIST,
+      progressRaw: validProgressRaw("display-none", { checklistProgressUnreliable: true }),
+    });
+    const fsStub = installRealFs();
+    try {
+      assert.equal(await readDisplayPlanChecklistProgressV1(uri), undefined);
     } finally {
       fsStub.restore();
     }

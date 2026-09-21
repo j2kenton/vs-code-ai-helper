@@ -8,6 +8,7 @@ import * as vscode from "vscode";
 import { isQuotaError } from "../utils/quota";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { StatusTreeProvider } from "../views/statusView";
+import { safeRemoveDir } from "./testFsUtils";
 
 const { discoverUnitTests } = createRequire(__filename)("../../test-stubs/run-unit-tests.js") as {
   discoverUnitTests: (root: string) => string[];
@@ -26,7 +27,7 @@ void describe("Stage 10 test infrastructure", () => {
         path.join(root, "z.test.js"),
       ]);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 

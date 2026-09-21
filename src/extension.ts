@@ -100,6 +100,7 @@ import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerReconcilePlanChecklistCommands } from "./commands/reconcilePlanChecklist";
+import { registerHandoffChecksCommandsV1 } from "./commands/handoffChecksV1";
 import { registerApplyReviewerVerifiedTicksCommands } from "./commands/applyReviewerVerifiedTicks";
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
@@ -1224,6 +1225,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerArchiveTaskCommands(context, inventory, currentTaskStore);
   registerPinTaskCommands(context, inventory);
   registerReconcilePlanChecklistCommands(context, inventory, currentTaskStore);
+  registerHandoffChecksCommandsV1(context, inventory);
   registerApplyReviewerVerifiedTicksCommands(context, inventory, currentTaskStore);
   registerPlanRevisionCommandsV1(context, inventory, currentTaskStore);
   registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);

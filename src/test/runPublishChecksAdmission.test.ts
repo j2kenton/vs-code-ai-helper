@@ -42,6 +42,7 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
 import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-checks-admission-"));
 
@@ -721,7 +722,7 @@ void describe(
           assert.equal(called, false, "the admission hook must never fire for a candidate that fails workspace containment");
         } finally {
           ws.restore();
-          fs.rmSync(outsideRoot, { recursive: true, force: true });
+          safeRemoveDir(outsideRoot);
         }
       }
     );

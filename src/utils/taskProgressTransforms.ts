@@ -1167,6 +1167,61 @@ export function setNextActorV1(
 }
 
 /**
+ * v1 fixes 2, item 8 (narrow), Wave II Part 3: a stage action that COMPLETED
+ * and arranged nothing further hands the task back to the human — recorded
+ * in the same transaction that terminalizes its round (`terminalizeRoundV1`),
+ * so the watchdog reads "waiting for you" rather than pausing the task as
+ * stalled ten minutes later.
+ *
+ * Deliberately narrow — leaves `progress` untouched unless ALL of:
+ *  - the round `completed` (a failed/cancelled/rejected round is not a
+ *    hand-back; those have their own decisions),
+ *  - the task is still `active` on the round's own stage (a stage transition
+ *    already wrote the arriving stage's `nextActor`, including "automation"
+ *    when an auto-review follows — never clobber that),
+ *  - no owed continuation, schedule or other live ledger row exists (any of
+ *    those means automation still has work to do).
+ */
+export function handBackToHumanAfterCompletedRoundV1(
+  progress: TaskProgress,
+  entry: Pick<RoundLedgerEntryV1, "state" | "stage">
+): TaskProgress {
+  if (entry.state !== "completed" || progress.status !== "active") {
+    return progress;
+  }
+  if (progress.currentStage !== entry.stage) {
+    return progress;
+  }
+  if (
+    progress.implRecovery !== undefined ||
+    progress.scheduledRun !== undefined ||
+    progress.scheduledResumeTime !== undefined ||
+    (progress.roundLedger ?? []).some((row) => row.state === "scheduled" || row.state === "open")
+  ) {
+    return progress;
+  }
+  return setNextActorV1(progress, "human");
+}
+
+/**
+ * Publish-checks variant of {@link handBackToHumanAfterCompletedRoundV1}.
+ *
+ * Finishing the checks is always a hand-back, whether they passed or not:
+ * nothing in `runPublishChecks` schedules a follow-up (no review, no
+ * Commit & Push), so recording `automation` here would claim work nobody
+ * arranged and the watchdog would later pause the task as stalled. The next
+ * step — fixing what the checks found, requesting the Publish review while
+ * that step exists, or Commit & Push — is the user's. Delegates to
+ * {@link handBackToHumanAfterCompletedRoundV1}, which still refuses to
+ * override a recovery, schedule or open round that IS arranged.
+ */
+export function handBackToHumanAfterPublishChecksV1(
+  progress: TaskProgress
+): TaskProgress {
+  return handBackToHumanAfterCompletedRoundV1(progress, { state: "completed", stage: "publish" });
+}
+
+/**
  * Guards the best-effort `nextActor: "human"` write `reviewActions.ts`'s
  * `advanceStageViaNextStageRowV1` makes after a refused/failed NEXT_STAGE
  * transition (v1 fixes 2 review fix, 2026-09-17: "the post-refusal nextActor

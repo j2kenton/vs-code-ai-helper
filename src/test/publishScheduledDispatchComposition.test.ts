@@ -41,12 +41,15 @@ import { fixtureOwnershipFor } from "./taskFolderFixture";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
+  NotificationRouter,
 } from "../utils/notificationRouter";
+import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-schedule-composition-"));
 after(() => {
-  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_ROOT);
 });
 
 function makeTaskFolder(name: string): string {
@@ -264,6 +267,52 @@ void describe("scheduler -> applyCurrentStageAction -> runPublishChecks composit
       ws.restore();
       deactivateNotificationRouter();
       scheduler.dispose();
+    }
+  });
+});
+
+void describe("applyCurrentStageAction records the downstream command's own stated cause (v1 fixes 2, item 22)", () => {
+  void it("a downstream command that declines after raising a warning has that warning as the recorded refusal reason", async () => {
+    const taskFolderPath = makeTaskFolder("declined-downstream-cause");
+    const progress = fixtureProgress(taskFolderPath);
+    writeProgress(taskFolderPath, progress);
+
+    const inventory = makeInventory(taskFolderPath, progress);
+    const currentTaskStore = new CurrentTaskStore(fakeMemento());
+    initNotificationRouter(new RecordingSurface());
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const model = installPublishModelSetting();
+
+    const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+    const original = commands.executeCommand;
+    commands.executeCommand = ((id: string): Promise<unknown> => {
+      if (id === "vs-code-ai-helper.runPublishChecks") {
+        NotificationRouter.showWarning("Publish checks are held by another operation (pid 4242).");
+        return Promise.resolve(false);
+      }
+      return Promise.resolve(undefined);
+    }) as typeof commands.executeCommand;
+
+    try {
+      clearStageActionRefusalReasonV1(taskFolderPath);
+      const dispatched = await applyCurrentStageAction(inventory, currentTaskStore, {
+        taskFolderPath,
+        canonicalId: taskFolderPath,
+      } as never);
+      assert.equal(dispatched, false);
+      const reason = takeStageActionRefusalReasonV1(taskFolderPath);
+      assert.ok(
+        reason?.includes("Publish checks are held by another operation (pid 4242)."),
+        `the command's own cause is carried: ${reason}`
+      );
+      assert.ok(!reason?.includes("its own notice says why"), "no pointer to a separate notice");
+    } finally {
+      commands.executeCommand = original;
+      model.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
     }
   });
 });

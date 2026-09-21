@@ -165,6 +165,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "watchdogPauseFenceGeneration",
   "implRecovery",
   "quotaParkRecord",
+  "nextActor",
+  "stageReviewPasses",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -810,6 +812,8 @@ function validateReviewScoreHistory(
       "reviewer",
       "supersededBlockers",
       "reviewerChallengedNonGoal",
+      "reviewPass",
+      "scope",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -862,6 +866,14 @@ function validateReviewScoreHistory(
       if (challengedError) {
         return challengedError;
       }
+    }
+    const reviewPass = entry["reviewPass"];
+    if (reviewPass !== undefined && !isNonNegativeInteger(reviewPass)) {
+      return "reviewScoreHistory entry reviewPass must be a non-negative integer";
+    }
+    const historyScope = entry["scope"];
+    if (historyScope !== undefined && historyScope !== "open-editors") {
+      return 'reviewScoreHistory entry scope must be "open-editors"';
     }
     const reviewer = entry["reviewer"];
     if (reviewer !== undefined) {
@@ -1728,6 +1740,21 @@ function validateFallbackModelId(value: unknown): string | undefined {
   return undefined;
 }
 
+function validateStageReviewPasses(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "stageReviewPasses must be a per-stage object map";
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (!CANONICAL_STAGES.has(key)) {
+      return `stageReviewPasses has an unrecognized stage key ${JSON.stringify(key)}`;
+    }
+    if (!isNonNegativeInteger(entry)) {
+      return `stageReviewPasses[${JSON.stringify(key)}] must be a non-negative integer`;
+    }
+  }
+  return undefined;
+}
+
 function validateCompletedStages(
   value: unknown,
   family: TaskProgressFamilyV1
@@ -2388,6 +2415,21 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.quotaParkRecord = value as QuotaParkRecordV1;
+        break;
+      }
+      case "nextActor": {
+        if (value !== "human" && value !== "automation") {
+          return recovery("invalidFieldValue", "nextActor must be exactly \"human\" or \"automation\"");
+        }
+        draft.nextActor = value;
+        break;
+      }
+      case "stageReviewPasses": {
+        const error = validateStageReviewPasses(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.stageReviewPasses = value as TaskProgress["stageReviewPasses"];
         break;
       }
     }

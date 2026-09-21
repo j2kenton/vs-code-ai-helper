@@ -2310,6 +2310,25 @@ export async function collectCompletionLintPreview(
 }
 
 /**
+ * Thrown when the user cancels a Publish Checks run. A distinct class (never a
+ * generic `Error`) so the caller can settle the tracked operation as
+ * `cancelled` with a cancellation notice instead of a failure notification.
+ */
+export class PublishChecksCancelledError extends Error {
+  constructor() {
+    super("Publish checks were cancelled.");
+    this.name = "PublishChecksCancelledError";
+  }
+}
+
+/** Throws `PublishChecksCancelledError` when `token` has been cancelled. */
+export function throwIfPublishChecksCancelledV1(token: vscode.CancellationToken | undefined): void {
+  if (token?.isCancellationRequested) {
+    throw new PublishChecksCancelledError();
+  }
+}
+
+/**
  * Compute the completion lint result and persist it into task-progress.json
  * and publish-review.md's managed Completion Checks section. This is the
  * only entry point that writes lint state to disk — call it when a Publish
@@ -2318,8 +2337,12 @@ export async function collectCompletionLintPreview(
  * should use `collectCompletionLintPreview` instead (see
  * `checkPublishPreflight` in publishPreflight.ts).
  */
-export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
-  const result = await collectCompletionLintPreview(folderUri, relevantFiles, { allowScopePrompt: true });
+export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[], options?: { token?: vscode.CancellationToken }): Promise<CompletionLintResult> {
+  const result = await collectCompletionLintPreview(folderUri, relevantFiles, { allowScopePrompt: true, token: options?.token });
+  // v1 fixes 2, item 29: a cancelled run's child processes were killed by the
+  // run guards, and their output is an incomplete "[check cancelled]" record —
+  // never persist it as this task's lint result or Completion Checks report.
+  throwIfPublishChecksCancelledV1(options?.token);
   const persisted = await patchTaskProgressStrictV1(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,

@@ -60,6 +60,7 @@ import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { writeTextFileIfUnchangedV1, registerConditionalWriteSaveGuardV1, withPlanFileWriteLockV1 } from "../utils/fileUtils";
+import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -69,7 +70,7 @@ const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-reconcile-test-")
 );
 after(() => {
-  nodeFs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 const CHECKLIST_PLAN = [
@@ -810,7 +811,15 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         .listPending(canonicalId)
         .find((d) => d.decisionKey === "reconcilePlanChecklist");
       assert.ok(decision, "a decision must be posted");
-      assert.equal(decision.recommendation.kind, "none");
+      // v1 fixes 2, item 4: the options are asymmetric in reversibility, so the
+      // safe one is recommended with uncertainty as the reason — never a bare
+      // "no recommendation" beside prose that steers.
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /no basis to recommend Mark reconciled/i);
+        assert.match(decision.recommendation.reasoning, /safe choice/);
+      }
     } finally {
       win.restore();
       fs.restore();
@@ -907,8 +916,10 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       // text) must not fire once that exact blocker is recorded as
       // superseded — it would otherwise instruct the user around a blocker
       // the record shows is already resolved.
+      assert.equal(decision.recommendation.kind, "option");
       if (decision.recommendation.kind === "option") {
-        assert.notEqual(decision.recommendation.optionId, "notYet");
+        // The generic (safe-option) recommendation, not the blocker-specific one.
+        assert.match(decision.recommendation.reasoning, /no basis to recommend Mark reconciled/i);
         assert.doesNotMatch(decision.recommendation.reasoning, /live-AWS acceptance checks remain unexecuted/);
       }
     } finally {
@@ -942,6 +953,15 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         "",
         "- [x] Split the artifacts",
         "- [ ] The five live-AWS acceptance checks pass",
+        "",
+        // The sole-blocker guidance needs the plan's manual-verification
+        // section; without it this fixture only ever reached the generic
+        // branch, which used to recommend nothing and so skipped the
+        // assertions below vacuously.
+        "## Manual verification",
+        "",
+        "- [ ] Bastion stops after linger expires with no borrowers — Priority: HIGH <!-- ensemble:excluded -->",
+        "- [ ] Ctrl+C during linger stops the bastion — Priority: LOW <!-- ensemble:excluded -->",
         "",
       ].join("\n"),
       "utf8"
@@ -2284,9 +2304,10 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         .listPending(canonicalId)
         .find((d) => d.decisionKey === "reconcilePlanChecklist");
       assert.ok(decision, "a decision must be posted");
-      assert.equal(decision.recommendation.kind, "none");
-      if (decision.recommendation.kind === "none") {
-        assert.match(decision.recommendation.reasoning, /no basis to recommend/);
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /no basis to recommend/i);
         assert.doesNotMatch(decision.recommendation.reasoning, /live-AWS acceptance checks/);
       }
     } finally {

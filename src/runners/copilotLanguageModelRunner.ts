@@ -106,6 +106,18 @@ export function createCopilotLmTextTransportV1(options: {
       if (request.cancellationToken.isCancellationRequested) {
         return { kind: "callerCancelled" };
       }
+      if (output.bytesWritten === 0) {
+        // v1 fixes 2, item 27: an empty response is a transient fault of the
+        // pipe, not a finished answer. Flagged as a network fault so the
+        // coordinator retries this same candidate once before declaring it
+        // failed, instead of one empty reply pausing the task for a human.
+        return {
+          kind: "transportFailure",
+          code: "copilotEmptyResponse",
+          detail: "Copilot returned an empty response",
+          networkFault: true,
+        };
+      }
       return { kind: "completed" };
     },
   };
@@ -116,6 +128,20 @@ export function createCopilotLmTextTransportV1(options: {
  * VS Code's Language Model API. Requires no API key: authentication,
  * entitlement, and quota are handled entirely by VS Code/Copilot.
  */
+/**
+ * Run-log note for a legacy saved `@effort` / `+long` Copilot selection:
+ * Copilot ignores both, so the log must say the variant did not apply rather
+ * than let the echoed model id imply it did. Empty when no variant was saved.
+ */
+export function copilotIgnoredVariantNoteV1(parsed: {
+  reasoningEffort?: string;
+  contextWindow?: string;
+}): string {
+  return parsed.reasoningEffort !== undefined || parsed.contextWindow !== undefined
+    ? " The saved effort/context-window variant was not applied: Copilot ignores it (set it in VS Code's per-model settings)."
+    : "";
+}
+
 export class CopilotLanguageModelRunner implements AgentRunner {
   readonly id = "copilot-lm";
   readonly label = "GitHub Copilot (Language Model API)";
@@ -203,19 +229,19 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         runnerId: this.id,
         status: "completed",
         outputFile: request.outputFile,
-        // Prefer echoing back exactly what was requested, not the resolved
-        // vscode.LanguageModelChat's own `.id`: parseCopilotModelSelection
-        // strips a "@reasoningEffort" suffix (e.g. "gpt-5.4@high") before
-        // matching it to a model by base id, so `model.id` alone would
-        // silently drop that suffix — making a stage's own configured
-        // variant look, to a caller reconciling "what model actually ran"
-        // against stored qualified ids (e.g. qualifiedRanModelId in
-        // reviewActions.ts), like a completely different model just ran.
-        // Falls back to `model.id` only when no specific model was
-        // requested (the provider's own default ran), so that case still
-        // names a real, concrete model instead of reporting nothing.
-        modelId: request.modelId ?? model.id,
-        summary: `Generated ${output.length} characters using ${model.name}.`,
+        // Report the model that actually ran: the requested BASE id. Copilot
+        // ignores an "@effort" / "+long" suffix (see buildCopilotRequestOptions),
+        // so a legacy saved suffixed selection must not be echoed back as if
+        // that variant applied — the run label shows what ran, and the summary
+        // below says the saved variant was not applied. Falls back to
+        // `model.id` only when no specific model was requested (the provider's
+        // own default ran), so that case still names a real, concrete model.
+        modelId: resolved.parsedModel.model ?? model.id,
+        // v1 fixes 2, item 19: say so when a legacy variant suffix was saved
+        // but Copilot ignored it, so the run log shows what actually ran.
+        summary:
+          `Generated ${output.length} characters using ${model.name}.` +
+          copilotIgnoredVariantNoteV1(resolved.parsedModel),
       };
     } catch (error) {
       if (

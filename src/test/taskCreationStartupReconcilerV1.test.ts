@@ -23,6 +23,7 @@ import {
 } from "../services/taskCreationIntentStoreV1";
 import { resetWorkflowRuntimeServicesForTestV1 } from "../services/workflowRuntimeServicesV1";
 import { fileCreationIntentEntryV1, TaskCreationIntentEntryV1 } from "../types/taskCreationIntentV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Reads a file's actual on-disk bytes and builds its `createdV1` journal entry from them, matching startNewTask.ts's own read-back-after-write pattern. */
 function entryForV1(taskFolderPath: string, relativePath: string): TaskCreationIntentEntryV1 {
@@ -139,7 +140,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -165,7 +166,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -190,7 +191,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -225,7 +226,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -250,7 +251,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -276,7 +277,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -309,7 +310,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -340,7 +341,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -360,7 +361,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -385,7 +386,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -412,7 +413,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -448,7 +449,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 
@@ -575,7 +576,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
         TaskCreationStartupReconcilerV1.resetForTests();
         resetCreationSeedHistoryCacheForTests();
         resetWorkflowRuntimeServicesForTestV1();
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
 
@@ -631,7 +632,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
         TaskCreationStartupReconcilerV1.resetForTests();
         resetCreationSeedHistoryCacheForTests();
         resetWorkflowRuntimeServicesForTestV1();
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
 
@@ -676,7 +677,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
         TaskCreationStartupReconcilerV1.resetForTests();
         resetCreationSeedHistoryCacheForTests();
         resetWorkflowRuntimeServicesForTestV1();
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
 
@@ -724,7 +725,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
         TaskCreationStartupReconcilerV1.resetForTests();
         resetCreationSeedHistoryCacheForTests();
         resetWorkflowRuntimeServicesForTestV1();
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
 
@@ -780,7 +781,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
         TaskCreationStartupReconcilerV1.resetForTests();
         resetCreationSeedHistoryCacheForTests();
         resetWorkflowRuntimeServicesForTestV1();
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
   });
@@ -802,7 +803,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       fsBridge.restore();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetCreationSeedHistoryCacheForTests();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 });

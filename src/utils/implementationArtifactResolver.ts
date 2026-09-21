@@ -663,6 +663,27 @@ export function isUnusableImplementationSummaryV1(content: string): boolean {
 }
 
 /**
+ * True when a round rejected on how it REPORTED its work (a report-form
+ * contradiction, an empty final response) must leave the existing
+ * `impl-summary.md` untouched: it is present, non-blank and not itself the
+ * unusable stamp. The rejection says nothing about that summary's soundness,
+ * so overwriting it with a stub would leave the real notes only in
+ * `impl-summary_prev.md`. A summary-only violation is a forbidden edit, not a
+ * form rejection, and is never preserved.
+ */
+export function shouldPreserveUsableImplementationSummaryV1(
+  existingSummary: string | undefined,
+  summaryOnlyViolation: boolean
+): boolean {
+  return (
+    !summaryOnlyViolation &&
+    existingSummary !== undefined &&
+    existingSummary.trim().length > 0 &&
+    !isUnusableImplementationSummaryV1(existingSummary)
+  );
+}
+
+/**
  * Marks impl-summary.md as written by the RUNNER rather than by a model
  * answering the implementation prompt.
  *
@@ -882,6 +903,30 @@ export function getImplementationSummaryUri(
   taskFolderUri: vscode.Uri
 ): vscode.Uri {
   return vscode.Uri.joinPath(taskFolderUri, IMPLEMENTATION_SUMMARY_FILENAME);
+}
+
+/**
+ * The remedy sentence(s) appended after the shared "no usable implementation
+ * notes" lead-in at `runReviewForFolder`'s and `buildReviewResumeVariablesV1`'s
+ * matching branches, and by the resume planner (`resumeActionPlanV1.ts`) when
+ * it refuses to arrange a Review that would be refused for the same reason.
+ * Fast Forward's `describeUnusableReviewBlockV1` composes its own sentence
+ * around the same `checklistFullySettled` fact, since its lead-in differs.
+ */
+export function describeUnusableSummaryRemedyV1(
+  canRestorePreviousImplSummary: boolean,
+  checklistFullySettled: boolean
+): string {
+  if (canRestorePreviousImplSummary) {
+    return checklistFullySettled
+      ? "Restore the last usable summary — the plan's checklist is fully settled, so running the " +
+          "implementation step again would have nothing left to change."
+      : "Restore the last usable summary, or run the implementation step again to produce fresh notes.";
+  }
+  return checklistFullySettled
+    ? "The plan's checklist is fully settled, so running the implementation step again would have " +
+        "nothing left to change; this needs a human decision to proceed."
+    : "Run the implementation step again to produce them.";
 }
 
 /**

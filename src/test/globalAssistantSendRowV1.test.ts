@@ -30,6 +30,7 @@ import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 import { CompletedContentV1 } from "../types/aiResultEnvelope";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring chatStageIsolation.test.ts's installReadFileBridge. */
 function installReadFileBridge(): { restore: () => void } {
@@ -171,7 +172,7 @@ void describe("globalAssistantSendRowV1", () => {
           )
         );
       } finally {
-        fs.rmSync(folder, { recursive: true, force: true });
+        safeRemoveDir(folder);
       }
     });
 
@@ -192,7 +193,7 @@ void describe("globalAssistantSendRowV1", () => {
         assert.ok(!history[0]?.text.includes("[[ACTION:"), "the envelope must not survive into the displayed answer");
         assert.match(history[1]?.text ?? "", /could not be executed in this context/);
       } finally {
-        fs.rmSync(folder, { recursive: true, force: true });
+        safeRemoveDir(folder);
       }
     });
 
@@ -225,7 +226,7 @@ void describe("globalAssistantSendRowV1", () => {
       } finally {
         win.showWarningMessage = originalWarning;
         resetGlobalAssistantRuntimeDepsForTestV1();
-        fs.rmSync(folder, { recursive: true, force: true });
+        safeRemoveDir(folder);
       }
     });
 
@@ -241,7 +242,7 @@ void describe("globalAssistantSendRowV1", () => {
         assert.equal(history.length, 1);
         assert.equal(history[0]?.text, "The Global Assistant did not return an answer.");
       } finally {
-        fs.rmSync(folder, { recursive: true, force: true });
+        safeRemoveDir(folder);
       }
     });
   });

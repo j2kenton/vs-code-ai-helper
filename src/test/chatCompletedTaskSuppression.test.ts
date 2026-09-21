@@ -15,6 +15,7 @@ import { ChatInteractionServicesV1, ChatViewProvider } from "../views/chatView";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 function installNotificationRouterStub(): { restore: () => void } {
   const stub: StatusSurface = { addEntry: (): void => undefined };
@@ -151,7 +152,7 @@ void describe("Chat With AI — completed/archived task history suppression", ()
       cmds.restore();
       notify.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -183,7 +184,7 @@ void describe("Chat With AI — completed/archived task history suppression", ()
       cmds.restore();
       notify.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

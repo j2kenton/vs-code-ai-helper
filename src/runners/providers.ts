@@ -2135,7 +2135,7 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorder
       ],
     },
     signInGuidance:
-      "Copilot models inside VS Code use the GitHub account VS Code itself is signed into. Switch accounts from the Accounts menu if needed.",
+      "Copilot models inside VS Code use the GitHub account VS Code itself is signed into. Switch accounts from the Accounts menu if needed. Ensemble offers Copilot models by name only: reasoning effort and context size for a Copilot model are set in VS Code's own per-model configuration (Copilot Chat's model picker, Manage Models).",
     // Per the approved capability matrix Copilot usage is UNSUPPORTED: no
     // CLI or VS Code command reports Copilot quota. Because a `url` is set
     // below, the button stays enabled and opens GitHub's Copilot settings

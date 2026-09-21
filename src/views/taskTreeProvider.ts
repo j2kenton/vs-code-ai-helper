@@ -24,7 +24,7 @@ import {
   resolveImplementationArtifact,
 } from "../utils/implementationArtifactResolver";
 import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
-import { effectiveReviewProgressV1, readEffectivePlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
+import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
   parseReadiness,
@@ -34,6 +34,7 @@ import {
 } from "../utils/reviewReadiness";
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -695,7 +696,7 @@ export class StageNode extends vscode.TreeItem {
      * numbers that used to compete on one review row: implementation owns
      * the percentage, review owns the score. `undefined` for every other
      * stage, and for `impl` itself whenever the task carries no checklist. */
-    implementationProgress?: { complete: number; total: number },
+    implementationProgress?: { complete: number; total: number; unverified?: boolean },
     /**
      * How many pending workflow decisions are scoped to THIS stage — the
      * chat is holding that many questions for the user here.
@@ -821,7 +822,11 @@ export class StageNode extends vscode.TreeItem {
       // fraction competing with the review row's score.
       const percentLabel =
         stage === "impl" && implementationProgress
-          ? `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
+          ? implementationProgress.unverified
+            ? // Latched count: shown but qualified — absence would read as
+              // "this task has no checklist", a different and wrong statement.
+              `${implementationProgress.complete}/${implementationProgress.total} · unverified`
+            : `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
           : undefined;
       const statusLabel = readinessLabel ?? percentLabel;
       switch (status) {
@@ -876,6 +881,16 @@ export class StageNode extends vscode.TreeItem {
             this.description = statusLabel
               ? `${owedIndicator.description} · ${statusLabel}`
               : owedIndicator.description;
+          } else if (
+            !escalated &&
+            taskOperations.getTaskOperations(tKey).length === 0 &&
+            isWaitingForHumanV1(task.progress)
+          ) {
+            // v1 fixes 2, item 8: the task's next step is the human's (a new
+            // task, a completed stage action, Publish awaiting Commit & Push)
+            // — say so, rather than leaving a bare active row that reads as
+            // "stuck" and that the watchdog would otherwise have paused.
+            this.description = statusLabel ? `${statusLabel} · waiting for you` : "waiting for you";
           } else {
             this.description = statusLabel
               ? (escalated ? `${statusLabel} · escalated` : statusLabel)
@@ -1821,11 +1836,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // `readEffectivePlanChecklistProgressV1` already resolves plan-final.md
       // the same way the advance gates do and never throws (lenient policy),
       // so no extra try/catch is needed here.
-      let implementationProgress: { complete: number; total: number } | undefined;
+      let implementationProgress: { complete: number; total: number; unverified?: boolean } | undefined;
       if (stage === "impl") {
-        const counted = await readEffectivePlanChecklistProgressV1(task.folderUri);
-        if (counted) {
-          implementationProgress = { complete: counted.settled, total: counted.total };
+        const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
+        if (display) {
+          implementationProgress = {
+            complete: display.counts.settled,
+            total: display.counts.total,
+            ...(display.unverified ? { unverified: true } : {})
+          };
         }
       }
 

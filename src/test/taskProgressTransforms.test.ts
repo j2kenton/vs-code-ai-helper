@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, handBackToHumanAfterCompletedRoundV1, handBackToHumanAfterPublishChecksV1, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 import { isReviewPassCurrentV1, parseReviewPass } from "../utils/reviewReadiness";
 
@@ -1361,3 +1361,85 @@ void test(
     assert.equal(isReviewPassCurrentV1(neverPublished, progress.stageReviewPasses, "impl-high-review"), false);
   }
 );
+
+// ---------------------------------------------------------------------------
+// handBackToHumanAfterCompletedRoundV1 (v1 fixes 2, item 8 narrow): a completed
+// round that arranged nothing further hands the task back to the human.
+// ---------------------------------------------------------------------------
+
+function handBackProgress(extra: Partial<TaskProgress> = {}): TaskProgress {
+  return { ...makeProgress(), status: "active", currentStage: "impl", ...extra } as TaskProgress;
+}
+
+// handBackToHumanAfterPublishChecksV1: nothing in runPublishChecks arranges a
+// follow-up, so finishing the checks hands back to the human unconditionally
+// — unless a recovery, schedule or open round IS arranged.
+void test("handBackToHumanAfterPublishChecksV1: a finished run with nothing arranged hands back to the human", () => {
+  const progress = handBackProgress({ currentStage: "publish", nextActor: "automation" });
+  assert.equal(handBackToHumanAfterPublishChecksV1(progress).nextActor, "human");
+});
+
+void test("handBackToHumanAfterPublishChecksV1: an armed schedule keeps automation as the actor", () => {
+  const progress = handBackProgress({
+    currentStage: "publish",
+    nextActor: "automation",
+    scheduledResumeTime: new Date(Date.now() + 60_000).toISOString(),
+  });
+  assert.equal(handBackToHumanAfterPublishChecksV1(progress), progress);
+});
+
+void test("a completed round with nothing arranged sets nextActor to human", () => {
+  const next = handBackToHumanAfterCompletedRoundV1(handBackProgress({ nextActor: "automation" }), {
+    state: "completed",
+    stage: "impl",
+  });
+  assert.equal(next.nextActor, "human");
+});
+
+void test("a non-completed round never hands back", () => {
+  for (const state of ["failed", "rejected", "cancelled", "interrupted", "quota-blocked", "dropped"] as const) {
+    const progress = handBackProgress({ nextActor: "automation" });
+    assert.equal(handBackToHumanAfterCompletedRoundV1(progress, { state, stage: "impl" }), progress);
+  }
+});
+
+void test("a stage transition's own nextActor is not clobbered when the task moved off the round's stage", () => {
+  const progress = handBackProgress({ currentStage: "impl-low-review", nextActor: "automation" });
+  assert.equal(
+    handBackToHumanAfterCompletedRoundV1(progress, { state: "completed", stage: "impl-high-review" }),
+    progress
+  );
+});
+
+void test("an owed continuation, a schedule, or another live round keeps automation acting next", () => {
+  const entry = { state: "completed", stage: "impl" } as const;
+  const owed = handBackProgress({
+    nextActor: "automation",
+    implRecovery: { dispatch: "pending", at: "2026-07-07T00:00:00.000Z" } as TaskProgress["implRecovery"],
+  });
+  assert.equal(handBackToHumanAfterCompletedRoundV1(owed, entry), owed);
+  const scheduled = handBackProgress({
+    nextActor: "automation",
+    scheduledRun: { runAt: "2026-07-07T01:00:00.000Z", stage: "impl" },
+  });
+  assert.equal(handBackToHumanAfterCompletedRoundV1(scheduled, entry), scheduled);
+  const liveRow = handBackProgress({
+    nextActor: "automation",
+    roundLedger: [
+      {
+        roundId: "r2",
+        attemptIds: [],
+        startedAt: "2026-07-07T00:00:00.000Z",
+        state: "open",
+        stage: "impl",
+        mode: "review",
+      } as RoundLedgerEntryV1,
+    ],
+  });
+  assert.equal(handBackToHumanAfterCompletedRoundV1(liveRow, entry), liveRow);
+});
+
+void test("a paused task is left alone", () => {
+  const paused = handBackProgress({ status: "paused" });
+  assert.equal(handBackToHumanAfterCompletedRoundV1(paused, { state: "completed", stage: "impl" }), paused);
+});

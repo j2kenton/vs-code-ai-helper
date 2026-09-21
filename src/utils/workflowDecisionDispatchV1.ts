@@ -240,6 +240,13 @@ export async function postWorkflowDecisionV1(
   if (!result.ok) {
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${result.reason}`);
   }
+  if (result.suppressed) {
+    // Already answered with the same condition and answers (item 7): no new
+    // card, no chat anchor, no announcing notification. The earlier resolved
+    // record is returned so the caller still sees "a decision exists" rather
+    // than the no-extension-context `undefined`.
+    return result.decision;
+  }
   // The card itself lives in workspaceState, while the transcript is a
   // file. Write a small durable anchor beside it so the chat can place the
   // pending card at the moment it was raised rather than appending every

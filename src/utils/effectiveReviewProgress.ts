@@ -105,6 +105,32 @@ export async function readEffectivePlanChecklistProgressV1(
 }
 
 /**
+ * Display-only counterpart of `readEffectivePlanChecklistProgressV1`: the same
+ * plan-of-record counts, but a latched (`checklistProgressUnreliable`) task
+ * still yields its figure, flagged `unverified`, so the tree can qualify the
+ * number instead of hiding it. NEVER feed this to an advance gate — gating
+ * stays on the strict reader above, which stands down when latched.
+ *
+ * Genuine no-value cases (no plan, no checklist, unreadable progress file)
+ * still return `undefined`: those are "not applicable", not "unverified".
+ */
+export async function readDisplayPlanChecklistProgressV1(
+  folderUri: vscode.Uri,
+  policy: EffectiveReviewProgressPolicyV1 = "lenient"
+): Promise<{ counts: ChecklistProgressV1; unverified: boolean } | undefined> {
+  const plan = await readPlanOfRecordV1(folderUri);
+  const counted = plan.counts;
+  if (!plan.hasChecklist || !counted) {
+    return undefined;
+  }
+  const advisory = await readTaskProgressForChecklistV1(folderUri, policy);
+  if (advisory.kind === "unreadable") {
+    return undefined;
+  }
+  return { counts: counted, unverified: advisory.progress?.checklistProgressUnreliable === true };
+}
+
+/**
  * The progress a review effectively reports for `stage`:
  *
  * - Plan-review stages emit no implementation-progress marker of their own,

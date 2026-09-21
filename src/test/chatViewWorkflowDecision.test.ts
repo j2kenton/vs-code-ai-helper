@@ -60,6 +60,7 @@ import {
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { makeOwnedTaskFolder, bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import {
   LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
@@ -307,7 +308,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -329,7 +330,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -351,7 +352,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -386,7 +387,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -414,7 +415,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -440,7 +441,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -476,7 +477,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -511,7 +512,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -535,7 +536,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -560,7 +561,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -601,7 +602,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       assert.deepEqual(entry.actionCommand.args, [target]);
     } finally {
       notify.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -648,7 +649,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       assert.match(entry.message, /This does not resume the task\./);
     } finally {
       notify.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -677,7 +678,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -721,7 +722,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -764,7 +765,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -790,7 +791,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -854,7 +855,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -901,7 +902,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -951,7 +952,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1016,7 +1017,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1061,7 +1062,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1107,7 +1108,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1158,7 +1159,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1382,7 +1383,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1422,7 +1423,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1452,7 +1453,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1479,7 +1480,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1515,7 +1516,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1550,8 +1551,8 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
-      fs.rmSync(otherFolder, { recursive: true, force: true });
+      safeRemoveDir(folder);
+      safeRemoveDir(otherFolder);
     }
   });
 
@@ -1592,7 +1593,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1620,7 +1621,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1662,7 +1663,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1705,7 +1706,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1752,7 +1753,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1808,7 +1809,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1864,7 +1865,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1916,7 +1917,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2071,7 +2072,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2149,7 +2150,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2210,7 +2211,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2247,7 +2248,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("renders legacy auto-starts in the collapsed Activity group and places posture after the transcript", () => {
+  void it("omits activity and outcome entries from the transcript, keeps untyped ones, and places posture after the transcript", () => {
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
     try {
@@ -2255,8 +2256,18 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const html = fake.view.webview.html;
       assert.match(
         html,
-        /item\.value\.kind==='activity'\|\|\(item\.value\.kind===undefined&&typeof item\.value\.text==='string'&&item\.value\.text\.trim\(\)\.startsWith\('_Auto-starting:'\)\)/,
-        "legacy auto-start messages must share the collapsed Activity group with typed activity records"
+        /item\.value\.kind==='activity'\|\|item\.value\.kind==='outcome'\)\{[^}]*continue;/,
+        "activity and outcome entries are machine status, not transcript turns"
+      );
+      assert.equal(
+        html.includes("activity-group"),
+        false,
+        "no collapsed Activity group: activity is not replaced by another surface"
+      );
+      assert.equal(
+        html.includes("startsWith('_Auto-starting:')"),
+        false,
+        "an untyped entry counts as conversation; absence of a kind never means activity"
       );
       assert.ok(
         html.indexOf('<div id="messages"') < html.indexOf('<div id="scheduling-posture"'),
@@ -2341,7 +2352,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -2438,7 +2449,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2485,7 +2496,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2528,7 +2539,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -2615,7 +2626,7 @@ void describe("Chat With AI — a pending 'restoreRejectedImplementationRound' d
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2650,7 +2661,7 @@ void describe("Chat With AI — a pending 'restoreRejectedImplementationRound' d
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -2724,7 +2735,7 @@ void describe("Chat With AI — a pending 'checklistChangeProposed' decision is 
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2769,7 +2780,7 @@ void describe("Chat With AI — a pending 'checklistChangeProposed' decision is 
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -2844,7 +2855,7 @@ void describe("Chat With AI — a pending 'sterileRoundRouting' decision is re-c
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2898,7 +2909,7 @@ void describe("Chat With AI — a pending 'sterileRoundRouting' decision is re-c
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -2948,7 +2959,7 @@ void describe("Chat With AI — implementation checklist percentage in the heade
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2980,7 +2991,7 @@ void describe("Chat With AI — implementation checklist percentage in the heade
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -3019,7 +3030,7 @@ void describe("Chat With AI — review stage score in the header (A3 Part 3 / St
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -3047,7 +3058,7 @@ void describe("Chat With AI — review stage score in the header (A3 Part 3 / St
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -3077,7 +3088,7 @@ void describe("Chat With AI — review stage score in the header (A3 Part 3 / St
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -3193,7 +3204,7 @@ void describe("Chat With AI — render() drops a stale render across a same-task
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

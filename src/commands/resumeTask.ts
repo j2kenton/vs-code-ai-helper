@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { clearEscalation, setNextActorV1 } from "../utils/taskProgressTransforms";
+import { clearEscalation, pauseTaskWithReason, setNextActorV1 } from "../utils/taskProgressTransforms";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
@@ -23,6 +23,7 @@ import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
+import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -435,7 +436,15 @@ export async function resumePausedTask(
               // guessed: a caller-specific `resumeAndXxxV1` variant that
               // dispatches its own action separately is responsible for its
               // own chokepoint, per the inventory.
-              if (arrangeStageDispatch && current.scheduledRun === undefined) {
+              //
+              // v1 fixes 2, item 8: a task still at `desc` whose next step is
+              // the human's (a new or undrafted task) has nothing for
+              // automation to re-run — the stage default there is Draft with
+              // AI, which on an empty description is never a recovery.
+              // Resuming only reactivates it; it reads "waiting for you".
+              const awaitingHumanDescription =
+                current.currentStage === "desc" && current.nextActor === "human";
+              if (arrangeStageDispatch && current.scheduledRun === undefined && !awaitingHumanDescription) {
                 return setNextActorV1(
                   { ...cleared, scheduledRun: { runAt: new Date().toISOString(), stage: current.currentStage } },
                   "automation"
@@ -705,14 +714,97 @@ async function resumeThenDispatchV1<T>(
     // whose return type carries no such signal (`runReviewWithAI`,
     // `runImplementationWithAI` — both resolve `void`) are left as stamped:
     // there is no refusal signal available to act on here.
+    //
+    // A refused dispatch also puts the task back to paused (item 10: "never
+    // leave a task active with nothing arranged"). Left active with no round,
+    // no schedule and no owed continuation, the watchdog would pause it
+    // minutes later as "stalled" — the state this composed action must not
+    // manufacture. The command that refused has already told the user why.
     if (dispatchesAutomationWork && (result as unknown) === false) {
-      await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (p) => setNextActorV1(p, undefined));
+      await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (p) =>
+        p.status === "active"
+          ? pauseTaskWithReason(
+              setNextActorV1(p, undefined),
+              "Resume was refused: the action it arranged could not start, so nothing is running."
+            )
+          : setNextActorV1(p, undefined)
+      );
     }
     return result;
   } finally {
     revokeWorkAdmissionHandoffV1(taskFolderPath);
     await release();
   }
+}
+
+/**
+ * Says a resume stays paused because the action it names cannot start, and
+ * offers the restore action when the refusal is the unusable-summary stamp. No
+ * rerun command is passed: the task is still paused, so the restore only clears
+ * the refusal and the user resumes again afterwards.
+ */
+function showResumeStaysPausedV1(
+  taskName: string,
+  taskFolderPath: string,
+  stage: TaskStage,
+  precondition: string,
+  restoreSummary: boolean | undefined
+): void {
+  NotificationRouter.showWarning(
+    `"${taskName}" stays paused: ${precondition}`,
+    undefined,
+    undefined,
+    undefined,
+    restoreSummary
+      ? {
+          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+          title: "Restore Last Usable Summary",
+          args: [taskFolderPath, stage],
+        }
+      : undefined
+  );
+}
+
+/**
+ * Preflight for the fixed-target resumes: when the action they dispatch would
+ * be refused, says so and reports `true` so the caller returns without
+ * resuming. The stage is read from the persisted `task-progress.json`, never
+ * the resolved (possibly cached) snapshot: a stale stage would select the wrong
+ * action's checks and let a known refusal through. The preflight fails closed —
+ * an unreadable progress file or a failed check leaves the task paused and says
+ * so, rather than resuming into an action nothing has verified.
+ */
+async function refuseFixedDispatchV1(
+  target: ResolvedTaskContext,
+  action: "review" | "implementation" | "apply-review",
+  /** The stage the action runs at when it differs from the persisted one (Apply Review jumps to its review stage first). */
+  stageOverride?: TaskStage
+): Promise<boolean> {
+  const taskName = target.progress.displayName ?? target.folderName;
+  const persisted = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  if (!persisted.ok) {
+    NotificationRouter.showWarning(
+      `"${taskName}" stays paused: its progress file could not be read to check that the action can start. ${persisted.reason}`
+    );
+    return true;
+  }
+  const stage = stageOverride ?? persisted.decoded.progress.currentStage;
+  let refusal: Awaited<ReturnType<typeof preflightFixedDispatchV1>>;
+  try {
+    refusal = await preflightFixedDispatchV1(target.taskFolderPath, stage, action, persisted.decoded.progress);
+  } catch (error) {
+    NotificationRouter.showWarning(
+      `"${taskName}" stays paused: the action's prerequisites could not be checked. ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return true;
+  }
+  if (!refusal) {
+    return false;
+  }
+  showResumeStaysPausedV1(taskName, target.taskFolderPath, stage, refusal.precondition, refusal.restoreSummary);
+  return true;
 }
 
 /**
@@ -811,6 +903,9 @@ export async function resumeAndRerunReviewV1(
   if (!target) {
     return;
   }
+  if (await refuseFixedDispatchV1(target, "review")) {
+    return;
+  }
   // arrangeStageDispatch: false — this function dispatches its OWN specific
   // follow-up (runReviewWithAI, below) moments after resume; letting
   // resumePausedTask also durably arrange the generic current-stage action
@@ -868,6 +963,9 @@ export async function resumeAndDispatchImplementationV1(
     currentTaskStore
   );
   if (!target) {
+    return;
+  }
+  if (await refuseFixedDispatchV1(target, "implementation")) {
     return;
   }
   // arrangeStageDispatch: false — see resumeAndRerunReviewV1's identical note;
@@ -941,12 +1039,66 @@ export async function resumeAndApplyCurrentStageActionV1(
   // against the marker this function is already holding and self-refuses busy
   // (2026-09-09 review, narrowed completion blocker
   // `d5e4bc19-f7ad-4ff5-a1b2-9fdea1397736-1`).
-  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, (admissionHandoffToken) =>
-    vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", {
-      taskFolderPath: target.taskFolderPath,
-      admissionHandoffTokenV1: admissionHandoffToken,
-    })
+  //
+  // v1 fixes 2, items 14 + 25: decide WHICH action to arrange from the same
+  // preconditions that action enforces at dispatch, before touching the task —
+  // a stale review arranges Review (Apply Review would be refused), a task
+  // whose next step is the human's is only resumed, and a task with no valid
+  // action stays paused and says which precondition failed.
+  // Read the stage and `nextActor` straight off disk: the inventory snapshot
+  // `target` came from may predate the pause that put the task here.
+  const fresh = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+  const currentProgress = fresh.ok ? fresh.decoded.progress : target.progress;
+  const plan = await loadResumeActionPlanV1(target.taskFolderPath, currentProgress);
+  const taskName = currentProgress.displayName ?? target.folderName;
+  if (plan.kind === "blocked") {
+    showResumeStaysPausedV1(
+      taskName,
+      target.taskFolderPath,
+      currentProgress.currentStage,
+      plan.precondition,
+      plan.restoreSummary
+    );
+    return;
+  }
+  if (plan.kind === "resume-only") {
+    const resumed = await resumePausedTask(inventory, currentTaskStore, explicitArg, {
+      arrangeStageDispatch: false,
+    });
+    if (resumed.outcome === "resumed") {
+      NotificationRouter.showInformation(`Resumed "${taskName}". ${plan.reason}`);
+    }
+    return;
+  }
+  const dispatched = await resumeThenDispatchV1(
+    inventory,
+    currentTaskStore,
+    explicitArg,
+    target.taskFolderPath,
+    async (admissionHandoffToken) => {
+      const result = await vscode.commands.executeCommand(
+        plan.kind === "run-review"
+          ? "vs-code-ai-helper.runReviewWithAI"
+          : "vs-code-ai-helper.applyCurrentStageAction",
+        {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+        }
+      );
+      // `runReviewWithAI` resolves `true` only when a review round started
+      // (a refusal on any guard clause, including "no model configured",
+      // resolves `false` or nothing); normalise so resumeThenDispatchV1 clears
+      // its `nextActor: automation` stamp on a refusal.
+      return plan.kind === "run-review" ? result === true : result;
+    }
   );
+  // A composed action that did not start its second step must not read as
+  // success: both commands report refusal as `false`.
+  if (dispatched === false) {
+    NotificationRouter.showWarning(
+      `"${plan.label}" resumed "${taskName}" but the action was refused, so nothing is running — see the message above for the cause.`
+    );
+  }
 }
 
 /**
@@ -1061,6 +1213,12 @@ export async function resumeIfPausedThenGoToReviewAndApplyV1(
   }
   const reviewStage = explicitArg.reviewStage;
   if (target.progress.status === "paused") {
+    // Apply Review refuses a missing or stale review and unmet artifact
+    // prerequisites; check them BEFORE resuming so a known refusal leaves the
+    // task paused with the reason (v1 fixes 2, item 14).
+    if (await refuseFixedDispatchV1(target, "apply-review", reviewStage)) {
+      return false;
+    }
     // arrangeStageDispatch: false — this function dispatches
     // goToReviewAndApplyV1 itself, via resumeThenDispatchV1 below, which now
     // holds admission continuously through the whole of that dispatch (see

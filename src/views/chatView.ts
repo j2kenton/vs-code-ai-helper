@@ -2966,6 +2966,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--vscode-descriptionForeground); }
         .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
         .decision-gating.decision-gating-active { color: var(--vscode-inputValidation-warningForeground); font-weight: bold; }
+        #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
       </style>
       </head><body>
@@ -2975,8 +2976,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">No task is running.</span></div>
+      <div id="steering-note" role="note">Messages here are not passed to the next round. To change what a round does, edit <code>plan-final.md</code> &mdash; rounds read it.</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -3299,6 +3301,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
+        sn.style.display=(s.target&&s.target.kind!=='global')?'block':'none';
         sp.textContent=s.schedulingPostureLine??'';sp.classList.toggle('visible',!!s.schedulingPostureLine);
         function renderMessage(x){
           const row=document.createElement('div');row.className='msg-row';
@@ -3351,22 +3354,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         m.replaceChildren();
         dc.replaceChildren();dc.style.display='none';
-        const activities=[];
         for(const item of (s.timeline||s.entries.map(value=>({type:'message',value})))){
           if(item.type==='decision'){
             const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
             renderDecisions([item.value],decisionWrap);m.appendChild(decisionWrap);
-          }else if(item.value.kind==='activity'||(item.value.kind===undefined&&typeof item.value.text==='string'&&item.value.text.trim().startsWith('_Auto-starting:'))){
-            activities.push(item.value);
+          }else if(item.value.kind==='activity'||item.value.kind==='outcome'){
+            // Machine status, not conversation: stored unchanged in chat-v1.json
+            // (and mirrored in the notification store), never a transcript turn.
+            // An untyped entry is conversation — absence never means activity.
+            continue;
           }else{
             m.appendChild(renderMessage(item.value));
           }
-        }
-        if(activities.length){
-          const group=document.createElement('details');group.className='activity-group';
-          const summary=document.createElement('summary');summary.textContent='Activity ('+activities.length+')';group.appendChild(summary);
-          for(const activity of activities){group.appendChild(renderMessage(activity));}
-          m.appendChild(group);
         }
         renderInteractions(s.interactions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';

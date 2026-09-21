@@ -22,7 +22,7 @@ import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { runReviewForFolder } from "../commands/reviewActions";
+import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewActions";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,
@@ -32,11 +32,18 @@ import type { TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import {
+  buildUnusableImplementationSummaryV1,
+  getImplementationSummaryUri,
+} from "../utils/implementationArtifactResolver";
+import { previousVersionUri } from "../utils/artifactBackups";
+import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import {
   configureWorkflowPrivateStorageRootV1,
   getWorkflowFileStoreV1,
   getWorkflowPathRegistryV1,
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -44,6 +51,8 @@ const runnerRegistryModule = require("../runners/runnerRegistry") as Record<stri
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
+const workAdmissionModule = require("../state/workAdmissionV1") as Record<string, unknown>;
+const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-unchanged-guard-"));
@@ -69,7 +78,7 @@ setChatInteractionTransactionStoreV1(
 );
 
 after(() => {
-  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_ROOT);
 });
 
 /**
@@ -104,6 +113,68 @@ function makeUnchangedTreeTaskFolder(name: string): { folderPath: string } {
   fs.writeFileSync(
     path.join(folderPath, "impl-high-review.md"),
     `Readiness: 7/10\n\n- Looks fine.\n\n<!-- reviewed-commit: ${REAL_ROOT_HEAD_SHA} -->\n`,
+    "utf8"
+  );
+  return { folderPath };
+}
+
+/**
+ * Writes a task folder with NO existing review artifact for the target stage
+ * (so the unchanged-tree guard above has nothing to compare against and
+ * never fires) whose `impl-summary.md` is the `IMPLEMENTATION_SUMMARY_
+ * UNUSABLE_MARKER_V1` stamp a rejected round leaves behind, with a usable
+ * `impl-summary_prev.md` backup sitting right behind it — item 1's "surface
+ * 1": `runReviewForFolder`'s OWN dispatch-refusal branch (the review-prompt
+ * preparation guard, not Fast Forward's or the resume-preflight's copies of
+ * the same offer).
+ */
+function makeUnusableSummaryTaskFolder(name: string): { folderPath: string } {
+  const folderPath = path.join(REAL_ROOT, "plans", name);
+  fs.mkdirSync(folderPath, { recursive: true });
+  const progress: TaskProgress = {
+    taskFolder: name,
+    currentStage: "impl",
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ownership: {
+      metaRoot: path.dirname(folderPath),
+      projectRoot: path.dirname(folderPath),
+      workspaceRoot: REAL_ROOT,
+      boundAt: "2026-01-01T00:00:00.000Z",
+      state: "resolved",
+    },
+  };
+  fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+  fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+  const summaryUri = getImplementationSummaryUri(vscode.Uri.file(folderPath));
+  fs.writeFileSync(
+    summaryUri.fsPath,
+    buildUnusableImplementationSummaryV1("bad shape", "run-log.md"),
+    "utf8"
+  );
+  fs.writeFileSync(
+    previousVersionUri(summaryUri).fsPath,
+    "## Files Changed\n\n- `src/a.ts` — did a thing\n\n## Verification\n\n- tests pass\n",
+    "utf8"
+  );
+  return { folderPath };
+}
+
+/**
+ * Same as {@link makeUnusableSummaryTaskFolder}, except `plan-final.md`
+ * carries a fully-settled checklist (every item checked, nothing
+ * remaining) — v1 fixes 2, item 1 completion blocker (2026-09-18 review):
+ * "run the implementation step again" is provably inert here, since there
+ * is nothing left for a round to change.
+ */
+function makeUnusableSummaryFullySettledTaskFolder(name: string): { folderPath: string } {
+  const { folderPath } = makeUnusableSummaryTaskFolder(name);
+  fs.writeFileSync(
+    path.join(folderPath, "plan-final.md"),
+    "# Implementation Checklist\n\n<!-- ensemble:implementation-checklist -->\n\n- [x] Step one\n- [x] Step two\n",
     "utf8"
   );
   return { folderPath };
@@ -219,13 +290,89 @@ function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched
 }
 
 /** Records every notification instead of routing to a real tree view. */
-function installNotificationRecorder(): { notifications: { message: string; level: string }[]; restore: () => void } {
-  const notifications: { message: string; level: string }[] = [];
+function installNotificationRecorder(): {
+  notifications: {
+    message: string;
+    level: string;
+    actionCommand?: { command: string; title: string; args?: unknown[] };
+  }[];
+  restore: () => void;
+} {
+  const notifications: {
+    message: string;
+    level: string;
+    actionCommand?: { command: string; title: string; args?: unknown[] };
+  }[] = [];
   const surface: StatusSurface = {
-    addEntry: (message, level): void => { notifications.push({ message, level }); },
+    addEntry: (message, level, _filePath, _resultTargetUri, _sourceOperationId, actionCommand): void => {
+      notifications.push({ message, level, actionCommand });
+    },
   };
   initNotificationRouter(surface);
   return { notifications, restore: (): void => deactivateNotificationRouter() };
+}
+
+/**
+ * `fastForwardReviewWithAI`'s own admission acquisition is real disk-marker
+ * machinery (workAdmissionV1.ts) that this suite has no need to exercise —
+ * only the refusal wording downstream of it is under test here. Patches
+ * `acquireOrAdoptWorkAdmissionV1` to always report a fresh, trivially
+ * releasable acquisition, mirroring the shape `WorkAdmissionHandleV1`
+ * requires (heartbeat/release/handover all no-ops).
+ */
+function installAlwaysAcquiredWorkAdmissionV1(): Patched {
+  return patch(workAdmissionModule, "acquireOrAdoptWorkAdmissionV1", () =>
+    Promise.resolve({
+      outcome: "acquired",
+      handle: {
+        ownerToken: "test-owner-token",
+        claimId: "test-claim-id",
+        taskFolderPath: "",
+        commandId: "fastForwardReviewWithAI",
+        purpose: "admission",
+        heartbeat: (): Promise<void> => Promise.resolve(),
+        release: (): Promise<void> => Promise.resolve(),
+        handover: (): Promise<void> => Promise.resolve(),
+      },
+    })
+  );
+}
+
+/**
+ * §7.5's coarse host/provider gate and its edit-availability sibling are
+ * both real CLI/Copilot probes — unrelated to what this suite is testing
+ * (the unusable-summary refusal reached only once both gates pass).
+ */
+function installEditActionGatesAlwaysOkV1(): Patched[] {
+  return [
+    patch(runEditActionModule, "checkEditActionProviderPathGateV1", () => Promise.resolve({ ok: true })),
+    patch(runEditActionModule, "checkEditActionAvailabilityV1", () => Promise.resolve({ ok: true })),
+  ];
+}
+
+/** Minimal extension context with AI consent pre-granted, mirroring nextStageAutoReviewCommandChain.test.ts. */
+function makeFastForwardExtensionContext(): vscode.ExtensionContext {
+  const backing = new Map<string, unknown>([
+    [
+      `aiHelper.consent.v${DISCLAIMER_VERSION}`,
+      { acceptedAt: "2026-01-01T00:00:00.000Z", version: DISCLAIMER_VERSION },
+    ],
+  ]);
+  const memento = {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      backing.has(key) ? (backing.get(key) as T) : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+      return Promise.resolve();
+    },
+  };
+  return {
+    subscriptions: [] as vscode.Disposable[],
+    extensionUri: vscode.Uri.file(REAL_ROOT),
+    workspaceState: memento,
+    globalState: memento,
+  } as unknown as vscode.ExtensionContext;
 }
 
 void describe("runReviewForFolder — unchanged-tree guard at the command boundary (A1 1.0.0 gate, Part C Step 5)", () => {
@@ -393,6 +540,199 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
     } finally {
       windowTarget.showWarningMessage = origShowWarning;
       for (const p of patches.reverse()) { p.restore(); }
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+/**
+ * v1 fixes 2, Part 1 step 2 / item 1: "Restore the last usable summary" must
+ * be offered at EVERY surface that reads the unusable-summary stamp. Three
+ * other surfaces (Fast Forward's `describeUnusableReviewBlockV1`, the resume
+ * preflight's `buildReviewResumeVariablesV1`, and the restore mechanism
+ * itself) already have coverage in `restoreRejectedImplementationRound.
+ * test.ts`; this is the fourth and remaining one — `runReviewForFolder`'s OWN
+ * dispatch-refusal branch, reached when a plain Review (or a Complete Stage &
+ * Move On auto-review, which dispatches through this exact same function and
+ * therefore needs no separate test) tries to prepare a review prompt and
+ * finds `impl-summary.md` still stamped unusable.
+ */
+void describe("runReviewForFolder — offers Restore Last Usable Summary on its own dispatch refusal (item 1, Part 1 step 2)", () => {
+  void it("attaches the restoreRejectedImplementationRound action when a usable _prev backup exists", async () => {
+    const { folderPath } = makeUnusableSummaryTaskFolder(`unusable-summary-${Math.floor(Math.random() * 1e9)}`);
+    const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+
+    let modelResolutionCalled = false;
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () => {
+        modelResolutionCalled = true;
+        return Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" });
+      }),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => {
+        modelResolutionCalled = true;
+        return Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" });
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl" as TaskStage,
+        true,
+        { automationDispatch: true }
+      );
+
+      assert.equal(
+        modelResolutionCalled,
+        false,
+        "the unusable-summary refusal must fire before any model resolution or provider work starts"
+      );
+      const warning = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
+      assert.ok(warning, `expected an unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`);
+      assert.match(warning.message, /Restore the last usable summary/);
+      assert.deepEqual(warning.actionCommand, {
+        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+        title: "Restore Last Usable Summary",
+        args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+      });
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it(
+    "never recommends rerunning implementation once the plan's checklist is fully settled (v1 fixes 2, " +
+      "item 1 completion blocker, 2026-09-18 review)",
+    async () => {
+      const { folderPath } = makeUnusableSummaryFullySettledTaskFolder(
+        `unusable-summary-settled-${Math.floor(Math.random() * 1e9)}`
+      );
+      const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
+      const fsBridge = installFsBridge();
+      const wsStub = installWorkspaceFoldersStub();
+      const recorder = installNotificationRecorder();
+
+      const patches: Patched[] = [
+        patch(modelSelectionModule, "resolveModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+        patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      ];
+
+      try {
+        await runReviewForFolder(
+          vscode.Uri.file(REAL_ROOT),
+          vscode.Uri.file(folderPath),
+          workspaceRoot,
+          "impl" as TaskStage,
+          true,
+          { automationDispatch: true }
+        );
+
+        const warning = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
+        assert.ok(warning, `expected an unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`);
+        assert.match(warning.message, /Restore the last usable summary/);
+        assert.match(warning.message, /fully settled/);
+        assert.doesNotMatch(warning.message, /run the implementation step again/i);
+        assert.deepEqual(warning.actionCommand, {
+          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+          title: "Restore Last Usable Summary",
+          args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+        });
+      } finally {
+        for (const p of patches.reverse()) { p.restore(); }
+        recorder.restore();
+        wsStub.restore();
+        fsBridge.restore();
+      }
+    }
+  );
+});
+
+/**
+ * v1 fixes 2, item 1 completion blocker (2026-09-18 review): "Fast Forward
+ * still tests only `describeUnusableReviewBlockV1`... shared-path reasoning
+ * does not satisfy this acceptance criterion" — the helper's OWN unit tests
+ * (`restoreRejectedImplementationRound.test.ts`) prove the string it builds,
+ * but nothing before this drove the real, registered `fastForwardReviewWithAI`
+ * command through admission, the §7.5 provider-path/edit-availability gates,
+ * `resolveTask`, and its "no initial review yet" branch to prove the SAME
+ * restore action actually reaches the command boundary — not only the helper
+ * function it happens to share with the other two surfaces.
+ */
+void describe("fastForwardReviewWithAI — offers Restore Last Usable Summary when it cannot even run an initial review (item 1, Part 1 step 2)", () => {
+  void it("surfaces the Fast-Forward-specific restore action, re-entering Fast Forward itself on restore", async () => {
+    const { folderPath } = makeUnusableSummaryTaskFolder(`ff-unusable-${Math.floor(Math.random() * 1e9)}`);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+
+    // Unlike `runReviewForFolder`'s own direct-dispatch refusal (the sibling
+    // describe block above), Fast Forward's "no initial review yet" branch
+    // legitimately resolves a model BEFORE it ever reaches the unusable
+    // summary — the §7.5 edit-availability gate (`checkEditActionAvailabilityV1`,
+    // stubbed to `ok: true` above) needs `resolveFreshModelForStage` itself to
+    // decide whether the target stage's model can even run edits, strictly
+    // before any review content is read. That gate call is stubbed out here
+    // via `installEditActionGatesAlwaysOkV1`, so this only needs a model id
+    // for it to resolve against — not an assertion that resolution never runs.
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    ];
+
+    try {
+      await fastForwardReviewWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath },
+        undefined
+      );
+
+      // The INNER refusal comes from runReviewForFolder's own dispatch-refusal
+      // branch (already covered by the earlier describe block in this file);
+      // the OUTER one — Fast Forward's own `describeUnusableReviewBlockV1`
+      // wrapping, reached after that inner call returns with no artifact
+      // written — is the one this test exists to prove reaches the command
+      // boundary, distinguished by its "before fast-forwarding" wording and
+      // its rerun command naming Fast Forward itself.
+      const warning = recorder.notifications.find((n) =>
+        n.message.includes("nothing to fast-forward from")
+      );
+      assert.ok(
+        warning,
+        `expected Fast Forward's own unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      assert.match(warning.message, /Restore the last usable summary/);
+      assert.deepEqual(warning.actionCommand, {
+        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+        title: "Restore Last Usable Summary",
+        args: [folderPath, "impl-high-review", "vs-code-ai-helper.fastForwardReviewWithAI"],
+      });
+      assert.equal(
+        fs.existsSync(path.join(folderPath, "impl-high-review.md")),
+        false,
+        "no review artifact must be written when both refusals fire before any provider work"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
       recorder.restore();
       wsStub.restore();
       fsBridge.restore();

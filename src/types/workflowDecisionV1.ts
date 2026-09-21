@@ -110,6 +110,12 @@ export interface WorkflowDecisionV1 {
    * statement (`handoffGuidanceV1.ts`), never as "not gating".
    */
   readonly gating?: HandoffGatingV1;
+  /**
+   * v1 fixes 2, item 7: stable identity of the condition this decision asks
+   * about plus the answers it offers (see `workflowDecisionIdentityV1`).
+   * Set only when the poster opted in to answered-decision suppression.
+   */
+  readonly identity?: string;
   readonly createdAt: string;
   readonly state: WorkflowDecisionStateV1;
   readonly resolvedOptionId?: string;
@@ -159,7 +165,32 @@ export interface CreateWorkflowDecisionInputV1 {
    * passes it cannot pass a malformed one.
    */
   readonly gating?: HandoffGatingV1;
+  /**
+   * v1 fixes 2, item 7 (release core): opt in to "an answered decision is not
+   * re-posted". While the last settled decision for this key + task was
+   * `resolved` with one of `answeredOptionIds` and carries the same identity
+   * (`conditionFingerprint` + the enabled option ids), `post` is a no-op.
+   * Only options that leave the condition standing belong in
+   * `answeredOptionIds`: an answer that clears the condition makes any
+   * recurrence a NEW condition, which must be asked again.
+   */
+  readonly suppressWhileAnswered?: {
+    readonly conditionFingerprint: string;
+    readonly answeredOptionIds: readonly string[];
+  };
   readonly createdAt: string;
+}
+
+/** Identity of a decision: its condition fingerprint plus the answers it currently offers. */
+export function workflowDecisionIdentityV1(
+  conditionFingerprint: string,
+  options: readonly WorkflowDecisionOptionV1[]
+): string {
+  const enabled = options
+    .filter((option) => option.disabled !== true)
+    .map((option) => option.optionId)
+    .sort();
+  return `${conditionFingerprint}|${enabled.join(",")}`;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -320,6 +351,14 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       recommendation,
       ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
       ...(input.gating !== undefined ? { gating: input.gating } : {}),
+      ...(input.suppressWhileAnswered !== undefined
+        ? {
+            identity: workflowDecisionIdentityV1(
+              input.suppressWhileAnswered.conditionFingerprint,
+              input.options
+            ),
+          }
+        : {}),
       createdAt: input.createdAt,
       state: "pending",
     },

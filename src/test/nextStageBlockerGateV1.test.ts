@@ -23,6 +23,7 @@ import { deactivateNotificationRouter, initNotificationRouter } from "../utils/n
 import { OWNED_FIXTURE_BOUND_AT } from "./taskFolderFixture";
 import { IncompleteTask } from "../types/incompleteTask";
 import { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const taskOperationsModule = require("../utils/taskOperations") as Record<string, unknown>;
@@ -180,7 +181,7 @@ void describe("nextStage — blocker-gate warning on manual advance (wf10 item 1
       taskOperationsModule.cancelRunningOperationsForTask = origCancel;
       fsBridge.restore();
       deactivateNotificationRouter();
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 
@@ -220,7 +221,7 @@ void describe("nextStage — blocker-gate warning on manual advance (wf10 item 1
       taskOperationsModule.cancelRunningOperationsForTask = origCancel;
       fsBridge.restore();
       deactivateNotificationRouter();
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 });

@@ -27,6 +27,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { normalizePath } from "../utils/taskRoot";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { OWNED_FIXTURE_BOUND_AT } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const taskOperationsModule = require("../utils/taskOperations") as Record<string, unknown>;
@@ -172,7 +173,7 @@ void describe("nextStage — defaults to CurrentTaskStore's task instead of alwa
       wsBridge.restore();
       fsBridge.restore();
       deactivateNotificationRouter();
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 
@@ -210,7 +211,7 @@ void describe("nextStage — defaults to CurrentTaskStore's task instead of alwa
       wsBridge.restore();
       fsBridge.restore();
       deactivateNotificationRouter();
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 });

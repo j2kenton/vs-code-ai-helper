@@ -21,6 +21,7 @@ import {
 } from "../services/workflowRuntimeServicesV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
 
@@ -51,7 +52,7 @@ void describe("generateImplementationRowV1 — attribution header / checklist ma
   });
   after(() => {
     resetWorkflowRuntimeServicesForTestV1();
-    fs.rmSync(taskFolder, { recursive: true, force: true });
+    safeRemoveDir(taskFolder);
   });
 
   void it("stamps the attribution header ABOVE the checklist marker, and the marker stays independently detectable via .includes()", async () => {

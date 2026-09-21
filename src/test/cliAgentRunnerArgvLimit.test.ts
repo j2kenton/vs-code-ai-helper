@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { CliAgentRunner, execCliAgent, runImplementationWithCli } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
+import { safeRemoveDir } from "./testFsUtils";
 
 void describe("execCliAgent argv prompt limits", () => {
   void it("fails fast when argv prompt exceeds provider cap", async () => {
@@ -204,7 +205,7 @@ void describe("execCliAgent argv prompt limits", () => {
         continuationPrompt,
       ]);
     } finally {
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 });

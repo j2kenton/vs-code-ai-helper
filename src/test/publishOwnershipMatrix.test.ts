@@ -39,6 +39,11 @@ import { setTaskStage } from "../commands/setTaskStage";
 import { commitAndPushTask, completeCommitAndPushTask } from "../commands/commitAndPushTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentRunResult } from "../types/agentRunner";
+import {
+  buildUnusableImplementationSummaryV1,
+  getImplementationSummaryUri,
+} from "../utils/implementationArtifactResolver";
+import { previousVersionUri } from "../utils/artifactBackups";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
@@ -65,6 +70,7 @@ import {
   renderPublishChecksFreshnessStamp,
 } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -130,7 +136,7 @@ setChatInteractionTransactionStoreV1(
 // `force: true` so a failed/half-written subtree from a killed run doesn't
 // turn cleanup itself into a new source of flakiness.
 after(() => {
-  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+  safeRemoveDir(REAL_ROOT);
 });
 
 /**
@@ -172,6 +178,10 @@ function makeTaskFolder(
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    // A tracked file set: a review with none falls back to the open editors
+    // and (v1 fixes 2, item 21) never auto-advances, which is not what this
+    // matrix is exercising.
+    implReviewFiles: ["src/tracked.ts"],
     ownership: {
       metaRoot: path.dirname(folderPath),
       projectRoot: path.dirname(folderPath),
@@ -559,17 +569,20 @@ async function runPassingReview(
   dispatches: AutomationDispatch[],
   reviewText = "Readiness: 9/10\n\n- Ready.\n",
   currentStage: TaskProgress["currentStage"] = "impl-low-review",
-  reviewOptions: Parameters<typeof runReviewForFolder>[5] = {}
+  reviewOptions: Parameters<typeof runReviewForFolder>[5] = {},
+  /** `null` simulates a stage with no model configured. */
+  configuredModelId: string | null = "stub:model"
 ): Promise<void> {
+  const resolvedModelId = configuredModelId ?? undefined;
   const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
   const contextPack = path.join(folderPath, "context-pack.md");
   fs.writeFileSync(contextPack, "# Context\n", "utf8");
 
   const patches: Patched[] = [
     patch(modelSelectionModule, "resolveModelForStage", () =>
-      Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      Promise.resolve({ source: "settings", modelId: resolvedModelId })),
     patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-      Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      Promise.resolve({ source: "settings", modelId: resolvedModelId })),
     patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
       Promise.resolve(new Set(REVIEW_STAGES))),
     stubV1RunnerSelection([markdownTransportV1(reviewText)]),
@@ -1148,7 +1161,7 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
       );
     } finally {
       fsBridge.restore();
-      fs.rmSync(folderPath, { recursive: true, force: true });
+      safeRemoveDir(folderPath);
     }
   });
 
@@ -1193,7 +1206,7 @@ void describe("Fast Forward Review — a checks-only publish-review.md is not mi
       assert.ok(review.includes("All checks passed."), "the current run's results land in the same document");
     } finally {
       fsBridge.restore();
-      fs.rmSync(folderPath, { recursive: true, force: true });
+      safeRemoveDir(folderPath);
     }
   });
 });
@@ -1407,7 +1420,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
       fsBridge.restore();
       provider.dispose();
       deactivateNotificationRouter();
-      fs.rmSync(isolatedRoot, { recursive: true, force: true });
+      safeRemoveDir(isolatedRoot);
     }
   });
 
@@ -1620,6 +1633,105 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a passed Low-Level Code Review with auto-advance off says the task waits at the gate before Publish and offers the move (v1 fixes 2, item 33)", async () => {
+    const { folderPath } = makeTaskFolder(`gate-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+    ];
+    try {
+      await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "impl-low-review");
+      const gate = provider
+        .getEntries()
+        .find((entry) => entry.message === "Code reviews passed — advance to Publish when you're ready.");
+      assert.ok(gate, "expected the plain gate message");
+      assert.equal(gate?.actionCommand?.command, "vs-code-ai-helper.nextStage");
+      assert.equal(dispatches.length, 0, "the gate message must not advance anything by itself");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a Publish review refused for missing checks names the cause, offers Run Publish Checks, and reports it never dispatched (v1 fixes 2, item 33)", async () => {
+    const folderName = `no-checks-${Math.floor(Math.random() * 1e9)}`;
+    const folderPath = path.join(REAL_ROOT, "plans", folderName);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const progress: TaskProgress = {
+      taskFolder: folderName,
+      currentStage: "publish",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    try {
+      const dispatchProbe = { dispatched: false };
+      await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "publish", { dispatchProbe });
+
+      assert.equal(dispatchProbe.dispatched, false, "a refused review must not claim it was dispatched");
+      const refusal = provider
+        .getEntries()
+        .find((entry) => /Publish Checks have not been run yet/.test(entry.message));
+      assert.ok(refusal, "the refusal must name missing checks as the cause");
+      assert.equal(refusal?.actionCommand?.title, "Run Publish Checks");
+      assert.equal(refusal?.actionCommand?.command, "vs-code-ai-helper.runPublishChecks");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a review with no model configured reports it never dispatched, so it settles refused rather than completed (v1 fixes 2, item 14)", async () => {
+    const { folderPath } = makeTaskFolder(`no-model-${Math.floor(Math.random() * 1e9)}`);
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    try {
+      const dispatchProbe = { dispatched: false };
+      await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "impl-low-review", { dispatchProbe }, null);
+
+      assert.equal(dispatchProbe.dispatched, false, "the no-model refusal precedes any provider dispatch");
+      assert.ok(
+        provider.getEntries().some((entry) => /No model is configured for this stage/.test(entry.message)),
+        "the refusal must say why"
+      );
+    } finally {
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();
@@ -2197,6 +2309,148 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
       deactivateNotificationRouter();
     }
   });
+
+  /**
+   * v1 fixes 2, item 1 completion blocker (2026-09-18 review): "resume
+   * preflight still lacks a command-level action assertion" — the review
+   * found the helper's own preflight logic (`buildReviewResumeVariablesV1`)
+   * untested at this delegate's actual command boundary. This drives a real
+   * questions-returning review to a pending, answered interaction, then
+   * simulates an implementation round rejected on report form WHILE that
+   * interaction sat waiting (item 1's own scenario) by stamping
+   * impl-summary.md unusable behind a usable `_prev` backup, and proves
+   * Resume refuses — offering the same restore action — instead of resolving
+   * the stale interaction against a tree its original prompt never saw.
+   */
+  void it(
+    "refuses Resume and offers Restore Last Usable Summary when the implementation summary went " +
+      "unusable while the interaction sat waiting on answered questions",
+    async () => {
+      const { folderPath } = makeTaskFolder(`resume-review-unusable-${Math.floor(Math.random() * 1e9)}`);
+      const provider = new StatusTreeProvider();
+      initNotificationRouter(provider);
+      const fsBridge = installFsBridge();
+      const wsStub = installWorkspaceFoldersStub();
+      const execCapture = installExecuteCommandCapture();
+      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+      const contextPack = path.join(folderPath, "context-pack.md");
+      fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+      const chatViewProvider = new ChatViewProvider(makeMemento());
+      const askedRefs: ChatInteractionRefV1[] = [];
+      const originalAskInteraction = chatViewProvider.askInteraction.bind(chatViewProvider);
+      chatViewProvider.askInteraction = (async (question) => {
+        askedRefs.push({
+          operationId: question.operationId,
+          interactionId: question.interactionId,
+          taskBindingId: question.binding!.taskBindingId,
+          chatDocumentId: question.binding!.chatDocumentId,
+          sourceAttemptId: question.sourceAttemptId,
+        });
+        return originalAskInteraction(question);
+      }) as typeof chatViewProvider.askInteraction;
+
+      try {
+        const initialPatches: Patched[] = [
+          patch(modelSelectionModule, "resolveModelForStage", () =>
+            Promise.resolve({ source: "settings", modelId: "stub:model" })),
+          patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+            Promise.resolve({ source: "settings", modelId: "stub:model" })),
+          patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+            Promise.resolve(new Set(REVIEW_STAGES))),
+          stubV1RunnerSelection([questionsTransportV1()]),
+          patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+          patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+          patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+        ];
+        try {
+          await runReviewForFolder(
+            vscode.Uri.file(REAL_ROOT),
+            vscode.Uri.file(folderPath),
+            workspaceRoot,
+            "impl-low-review",
+            true,
+            { chatViewProvider }
+          );
+        } finally {
+          for (const p of initialPatches.reverse()) { p.restore(); }
+        }
+
+        assert.equal(askedRefs.length, 1, "the review's questions must reach Chat With AI exactly once");
+
+        const submitted = await getProductionActionConversationOrchestratorV1().submitAnswers(
+          askedRefs[0]!,
+          [{ questionId: "q1", kind: "text", state: "answered", value: "Favor correctness over speed." }],
+          allocateHex128IdV1()
+        );
+        assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
+
+        // The scenario: while the interaction sat answered-but-not-yet-
+        // resumed, an implementation round ran and was rejected on report
+        // form, leaving impl-summary.md stamped unusable behind a usable
+        // _prev backup — the exact "entry point 2" shape item 1 describes.
+        const summaryUri = getImplementationSummaryUri(vscode.Uri.file(folderPath));
+        fs.writeFileSync(
+          summaryUri.fsPath,
+          buildUnusableImplementationSummaryV1("bad shape", "run-log.md"),
+          "utf8"
+        );
+        fs.writeFileSync(
+          previousVersionUri(summaryUri).fsPath,
+          "## Files Changed\n\n- `src/a.ts` — did a thing\n\n## Verification\n\n- tests pass\n",
+          "utf8"
+        );
+
+        const inventory = makeBindingInventoryStub(folderPath, "impl-low-review");
+        const resumePatches: Patched[] = [
+          patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+            Promise.resolve({ source: "settings", modelId: "stub:model" })),
+          stubV1RunnerSelection([
+            markdownTransportV1("must not be invoked when the resume preflight refuses"),
+          ]),
+        ];
+        try {
+          const result = await resumeReviewInteractionV1(
+            vscode.Uri.file(REAL_ROOT),
+            inventory,
+            chatViewProvider,
+            askedRefs[0]!,
+            allocateHex128IdV1(),
+            fakeToken()
+          );
+
+          assert.equal(result.ok, false, "resume must refuse rather than resolve the interaction against a stale prompt");
+          if (!result.ok) {
+            assert.match(result.reason, /Restore the last usable summary/);
+          }
+          const entries = provider.getEntries?.() ?? [];
+          const warning = entries.find((e) => e.message.includes("did not produce usable"));
+          assert.ok(
+            warning,
+            `expected an unusable-summary warning on the Notifications surface; got: ${JSON.stringify(entries)}`
+          );
+          assert.deepEqual(warning.actionCommand, {
+            command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+            title: "Restore Last Usable Summary",
+            args: [folderPath, "impl-low-review", "vs-code-ai-helper.runReviewWithAI"],
+          });
+          assert.equal(
+            fs.existsSync(path.join(folderPath, "impl-low-review.md")),
+            false,
+            "the resume preflight refusal must fire before any provider work promotes review content"
+          );
+        } finally {
+          for (const p of resumePatches.reverse()) { p.restore(); }
+        }
+      } finally {
+        execCapture.restore();
+        wsStub.restore();
+        fsBridge.restore();
+        provider.dispose();
+        deactivateNotificationRouter();
+      }
+    }
+  );
 });
 
 /**

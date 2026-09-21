@@ -25,6 +25,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { taskOperations } from "../utils/taskOperations";
+import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
@@ -144,7 +145,7 @@ void describe("TaskInventory.refresh() — full filesystem rescan (Part 4)", () 
       // addition, a removal, and an in-place modification — all made
       // directly on disk, bypassing the inventory entirely (as an external
       // git checkout, another process, or manual edit would).
-      fs.rmSync(path.join(meta, "2026-07-01_task_removed"), { recursive: true, force: true });
+      safeRemoveDir(path.join(meta, "2026-07-01_task_removed"));
       writeTaskFixture(meta, "2026-07-01_task_added", validProgress("2026-07-01_task_added"));
       fs.writeFileSync(
         path.join(meta, "2026-07-01_task_stays", "task-progress.json"),
@@ -179,7 +180,7 @@ void describe("TaskInventory.refresh() — full filesystem rescan (Part 4)", () 
       bridge.restore();
       workspace.restore();
       config.restore();
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 });

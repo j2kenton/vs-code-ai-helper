@@ -23,6 +23,7 @@ import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 import { CompletedContentV1 } from "../types/aiResultEnvelope";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 function chatMessageContent(text: string): CompletedContentV1 {
   return { contentType: "chat-message.v1", schemaVersion: 1, text };
@@ -71,7 +72,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       assert.ok(text.startsWith("Sure, here's the updated plan."));
       assert.match(text, /_Updated `plan\.md`\._/);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -86,7 +87,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       assert.equal(code, "completed");
       assert.equal(fs.readFileSync(path.join(fixture.folder, "notes.md"), "utf8"), "fresh notes");
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -112,7 +113,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       assert.ok(!text.includes("[[UPDATE_FILE"));
       assert.match(text, /chat may update only one markdown file per response/);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -131,7 +132,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       const text = history[0]?.text ?? "";
       assert.match(text, /Could not update `\.\.\/escape\.md`/);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -149,7 +150,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       const history = await readChatHistory(fixture.folder);
       assert.match(history[0]?.text ?? "", /Could not update `src\/app\.ts`/);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -165,7 +166,7 @@ void describe("chatSendRowV1 — C4 chat-edit envelope (item 21)", () => {
       const history = await readChatHistory(fixture.folder);
       assert.equal(history[0]?.text, "The task looks ready to move to Draft — no blockers I can see.");
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 });

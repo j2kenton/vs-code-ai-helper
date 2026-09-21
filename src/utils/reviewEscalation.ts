@@ -378,12 +378,18 @@ function buildEscalationDecisionV1(
         : []),
       {
         optionId: "keepIterating",
-        label: "Keep iterating",
+        // v1 fixes 2, item 25: name the action, not just "Keep iterating".
+        label:
+          taskFixableCount > 0
+            ? `Keep iterating: run Apply Review on the ${taskFixableCount} task-fixable ` +
+              `${taskFixableCount === 1 ? "blocker" : "blockers"}`
+            : "Keep iterating: run Apply Review",
         consequence:
           taskFixableCount > 0
             ? `Resumes the task and runs Apply Review against the ${taskFixableCount} task-fixable ` +
               `${taskFixableCount === 1 ? "blocker" : "blockers"} — it edits the workspace to address ` +
-              `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict.`
+              `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict. ` +
+              "If the review is out of date it re-runs the review first instead."
             : `Resumes the task and runs Apply Review — nothing to act on: 0 of the ${blockersCount} ` +
               "remaining blocker(s) are task-fixable, so this will most likely reproduce the same verdict.",
         // A1 (1.0.0 gate, Part C): NOT resumeAndRerunReviewV1 — a prior
@@ -513,7 +519,11 @@ function buildEscalationDecisionV1(
       }
     : {
         optionId: "keepIterating",
-        label: "Keep iterating",
+        // v1 fixes 2, item 25: the button names the action it dispatches
+        // rather than a bare "Keep iterating".
+        label: IMPL_REVIEW_STAGES.includes(stage)
+          ? "Keep iterating: run Apply Review"
+          : "Keep iterating: run the next implementation round",
         // A1 (1.0.0 gate, Part C): the review-stage branch previously read
         // "reruns ${stageName}" and dispatched resumeAndRerunReview — against
         // an unchanged tree that reproduces the same verdict by construction.
@@ -521,7 +531,8 @@ function buildEscalationDecisionV1(
         // first, so this now names the actual work, matching the plateau-
         // context card's own wording above.
         consequence: IMPL_REVIEW_STAGES.includes(stage)
-          ? `Resumes the task and runs Apply Review against ${stageName}'s findings, then re-reviews.`
+          ? `Resumes the task and runs Apply Review against ${stageName}'s findings, then re-reviews. ` +
+            "If the review is out of date it re-runs the review first instead."
           : "Resumes the task and dispatches its owed continuation or next implementation action.",
         effect: {
           kind: "command",
@@ -944,6 +955,54 @@ function describeResolverClearingActionV1(
 }
 
 /**
+ * One sentence (leading space included; empty when there are no blockers)
+ * stating where the remaining blockers stand relative to earlier rounds, from
+ * the `[new]` / `[same:…]` / `[narrowed:…]` lineage marker the reviewer already
+ * declares in the artifact (v1 fixes 2, item 5). A blocker with no declared
+ * lineage is reported as such rather than guessed at. Narrowed blockers are
+ * called out as progress: a score that did not move beside a narrowed blocker
+ * is a shrinking problem, not a repeated one.
+ *
+ * @internal exported for testing
+ */
+export function describeBlockerLineageV1(blockers: readonly ReviewBlocker[]): string {
+  if (blockers.length === 0) {
+    return "";
+  }
+  const refs = (kind: "narrowed" | "same"): string =>
+    blockers
+      .flatMap((b) => (b.lineage?.kind === kind ? [`\`[${kind}:${b.lineage.refId}]\``] : []))
+      .join(", ");
+  const count = (kind: "new" | "narrowed" | "same"): number => blockers.filter((b) => b.lineage?.kind === kind).length;
+  const narrowed = count("narrowed");
+  const same = count("same");
+  const fresh = count("new");
+  const undeclared = blockers.filter((b) => b.lineage === undefined).length;
+  const plural = (n: number): string => (n === 1 ? "blocker" : "blockers");
+  const parts: string[] = [];
+  if (narrowed > 0) {
+    parts.push(
+      `${narrowed} ${plural(narrowed)} narrowed from an earlier round (declared ${refs("narrowed")}) — ` +
+        `iteration IS making progress on ${narrowed === 1 ? "it" : "them"}, ${narrowed === 1 ? "it has" : "they have"} ` +
+        "simply not cleared yet"
+    );
+  }
+  if (same > 0) {
+    parts.push(
+      `${same} ${plural(same)} unchanged from an earlier round (declared ${refs("same")}) — the last round did not ` +
+        `move ${same === 1 ? "it" : "them"}`
+    );
+  }
+  if (fresh > 0) {
+    parts.push(`${fresh} ${plural(fresh)} newly raised this round`);
+  }
+  if (undeclared > 0) {
+    parts.push(`${undeclared} ${plural(undeclared)} with no lineage declared by the reviewer`);
+  }
+  return ` Lineage: ${parts.join("; ")}.`;
+}
+
+/**
  * Build and post the `reviewPlateauEscalation` decision (item 7b's target
  * shape): quote the blocker verbatim rather than its category taxonomy, show
  * the evidence automation is done (taskFixableCount, the progress marker),
@@ -981,15 +1040,10 @@ async function postReviewPlateauDecisionV1(
   // never filtered by a supersession.
   const normalized = normalizeReviewEvidenceV1(evidence.content, evidence.blockers);
   const primaryBlocker = normalized.blockers[0];
-  const narrowedRef =
-    normalized.narrowedBlockers.length > 0 && normalized.narrowedBlockers[0]!.lineage?.kind === "narrowed"
-      ? normalized.narrowedBlockers[0]!.lineage.refId
-      : undefined;
-  const narrowedNote =
-    narrowedRef !== undefined
-      ? ` This blocker has narrowed across rounds (declared \`[narrowed:${narrowedRef}]\`) — iteration IS making ` +
-        "progress on it, it has simply not cleared yet."
-      : "";
+  // v1 fixes 2, item 5: state every remaining blocker's lineage (new / narrowed
+  // / unchanged) in the card's own summary — an unchanged score with a
+  // narrowed blocker is progress, and must not read as a repeat.
+  const narrowedNote = describeBlockerLineageV1(normalized.blockers);
   // A3 (2026-09-06): render the checklist-reconciled figure here, never
   // `normalized.progress`'s raw, self-reported marker — a reviewer that
   // invents its own denominator (46 vs plan-final.md's real 127) produced a

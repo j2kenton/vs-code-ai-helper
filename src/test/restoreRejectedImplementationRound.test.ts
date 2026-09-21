@@ -29,6 +29,7 @@ import {
 } from "../commands/reviewActions";
 import {
   buildUnusableImplementationSummaryV1,
+  getCanonicalImplementationUri,
   getImplementationSummaryUri,
 } from "../utils/implementationArtifactResolver";
 import { previousVersionUri } from "../utils/artifactBackups";
@@ -47,6 +48,13 @@ const STALE_PLACEHOLDER = [
 
 const REAL_REVIEW = "Readiness: 8/10\n\n- Looks solid, ship it.\n";
 const REAL_SUMMARY = "## Files Changed\n\n- `src/a.ts` — did a thing\n\n## Verification\n\n- tests pass\n";
+
+// v1 fixes 2, item 1 completion blocker (2026-09-18 review): a plan-final.md
+// whose checklist is fully settled (every item checked, nothing remaining) —
+// used to prove the unusable-summary refusal never recommends rerunning
+// implementation once there is provably nothing left for a round to change.
+const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
+const FULLY_SETTLED_PLAN = `# Implementation Checklist\n\n${IMPLEMENTATION_CHECKLIST_MARKER}\n\n- [x] Step one\n- [x] Step two\n`;
 
 // ---------------------------------------------------------------------------
 // In-memory vscode.workspace.fs, so these tests never touch real disk.
@@ -210,6 +218,103 @@ void describe("describeUnusableReviewBlockV1", () => {
 
       const { canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(FOLDER);
       assert.equal(canRestorePreviousImplSummary, false);
+    }
+  );
+
+  void it(
+    "never recommends rerunning implementation once the plan's checklist is fully settled, and " +
+      "points only at the restore action when one is available (v1 fixes 2, item 1 completion blocker)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const summaryUri = getImplementationSummaryUri(FOLDER);
+      const mem = installMemStore(
+        seed({
+          [summaryUri.toString()]: stamped,
+          [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+          [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+        })
+      );
+      activeStore = mem;
+
+      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
+
+      assert.equal(canRestorePreviousImplSummary, true);
+      assert.match(warning, /Restore the last usable summary/);
+      assert.match(warning, /fully settled/);
+      assert.doesNotMatch(warning, /rerun the implementation/i);
+    }
+  );
+
+  void it(
+    "still recognises a fully settled plan when checklistProgressUnreliable is latched — the deadlock's " +
+      "actual entry state — and never recommends a rerun (v1 fixes 2, item 1 completion blocker)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const summaryUri = getImplementationSummaryUri(FOLDER);
+      const latchedProgress = JSON.stringify({
+        taskFolder: "2026-08-13_restore-rejected-round",
+        currentStage: "impl-low-review",
+        status: "active",
+        createdAt: "2026-08-13T00:00:00.000Z",
+        updatedAt: "2026-08-13T00:00:00.000Z",
+        checklistProgressUnreliable: true,
+      });
+      const mem = installMemStore(
+        seed({
+          [summaryUri.toString()]: stamped,
+          [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
+          [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+          [vscode.Uri.joinPath(FOLDER, "task-progress.json").toString()]: latchedProgress,
+        })
+      );
+      activeStore = mem;
+
+      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
+
+      assert.equal(canRestorePreviousImplSummary, true);
+      assert.match(warning, /Restore the last usable summary/);
+      assert.match(warning, /fully settled/);
+      assert.doesNotMatch(warning, /rerun the implementation/i);
+    }
+  );
+
+  void it(
+    "names a human decision — never a rerun — when the checklist is fully settled and there is no " +
+      "usable _prev backup to restore (v1 fixes 2, item 1 completion blocker)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const mem = installMemStore(
+        seed({
+          [getImplementationSummaryUri(FOLDER).toString()]: stamped,
+          [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+        })
+      );
+      activeStore = mem;
+
+      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
+
+      assert.equal(canRestorePreviousImplSummary, false);
+      assert.match(warning, /fully settled/);
+      assert.match(warning, /human decision/);
+      assert.doesNotMatch(warning, /rerun the implementation/i);
     }
   );
 

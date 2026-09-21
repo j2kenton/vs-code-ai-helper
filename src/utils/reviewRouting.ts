@@ -658,6 +658,10 @@ export function latestQualifyingReviewMeetsThresholdV1(input: {
   if (!latest) {
     return false;
   }
+  // A review that covered only open editors never says the work is done.
+  if (latest.scope === "open-editors") {
+    return false;
+  }
   if (!meetsAutoAdvanceThreshold(latest.score, input.threshold)) {
     return false;
   }
@@ -1242,6 +1246,59 @@ export function decidePostReviewActionV1(input: {
     action: "none",
     reviewStage: latest.stage,
     reason: `The newest ${stageName} reports no task-fixable blockers and the plan checklist is complete.`,
+  };
+}
+
+/**
+ * v1 fixes 2, item 31 (Part 5a): the newest implementation review has nothing
+ * task-fixable left and every unticked plan item is a hand-off check (a person's
+ * check, or the verification Ensemble runs itself), so another automatic
+ * Implementation round has nothing to build — it would only report "not
+ * buildable" and the loop would repeat. The unattended path stops here and says
+ * so, and the task reads "waiting for you".
+ *
+ * Deliberately narrow, failing toward the existing behaviour: it stops only
+ * when a review has actually run for these stages, that review reports zero
+ * task-fixable blockers, no continuation or quarantine is owed, at least one
+ * hand-off check remains, and NO buildable item remains.
+ */
+export interface HandoffOnlyStopV1 {
+  readonly reason: string;
+  /** The remaining hand-off checks, in plan order. */
+  readonly checks: readonly string[];
+}
+
+export function decideHandoffOnlyStopV1(input: {
+  readonly history: readonly ReviewScoreHistoryEntry[] | undefined;
+  readonly stages: readonly TaskStage[];
+  readonly unchecked: { readonly buildable: readonly string[]; readonly handoff: readonly string[] };
+  readonly continuationOwed?: boolean;
+  readonly pendingImplReviewFilesCount?: number;
+}): HandoffOnlyStopV1 | undefined {
+  if (input.continuationOwed === true || (input.pendingImplReviewFilesCount ?? 0) > 0) {
+    return undefined;
+  }
+  if (input.unchecked.buildable.length > 0 || input.unchecked.handoff.length === 0) {
+    return undefined;
+  }
+  const latest = input.stages
+    .map((stage) => latestReviewForStageV1(input.history, stage))
+    .filter((entry): entry is ReviewScoreHistoryEntry => entry !== undefined)
+    .reduce<ReviewScoreHistoryEntry | undefined>(
+      (best, entry) => (best === undefined || entry.at >= best.at ? entry : best),
+      undefined
+    );
+  if (!latest || latest.taskFixableCount > 0) {
+    return undefined;
+  }
+  const n = input.unchecked.handoff.length;
+  return {
+    reason:
+      `The newest ${STAGE_DISPLAY_NAMES[latest.stage]} reports nothing task-fixable, and the ${n} remaining ` +
+      `plan ${n === 1 ? "item is a hand-off check" : "items are hand-off checks"} — checks for you (or for ` +
+      "Ensemble's own verification run), not work another Implementation round can build. Stopped rather than " +
+      "dispatch a round with nothing to build.",
+    checks: input.unchecked.handoff,
   };
 }
 

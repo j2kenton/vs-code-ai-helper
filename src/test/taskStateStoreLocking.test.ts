@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import { withTaskLock, withMetaRootLock } from "../state/taskStateStore";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Regression coverage for a review finding: task activation
 // (taskActivationCoordinator.ts) used to acquire a lock file at a different
@@ -20,7 +21,7 @@ import { withTaskLock, withMetaRootLock } from "../state/taskStateStore";
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lock-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 void test(

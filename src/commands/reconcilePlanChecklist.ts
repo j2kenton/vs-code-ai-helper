@@ -1582,10 +1582,23 @@ export async function postReconcilePlanChecklistDecisionV1(
                       "does not establish that THIS blocker's checks were among them."),
             }
           : {
-              kind: "none",
+              // v1 fixes 2, item 4: "no basis to recommend reconciling" is what
+              // was computed, but it is not the same as "no recommendation" —
+              // the two options are not symmetric. "Not yet" changes nothing
+              // and is undone by answering later; "Mark reconciled" re-arms
+              // the completeness gate on counts nothing on file vouches for,
+              // and an item ticked in error can let unfinished work advance.
+              // Where the system cannot verify which is right, the reversible
+              // option wins, and uncertainty is the stated reason.
+              kind: "option",
+              optionId: "notYet",
               reasoning:
-                "At least one unticked item is not named as verified complete by any implementation review " +
-                "on file — the system has no basis to recommend reconciling until you have checked it yourself." +
+                "There is no basis to recommend Mark reconciled: at least one unticked item is not named as " +
+                "verified complete by any implementation review on file, so the system cannot verify the " +
+                "checklist. The options are not equal — \"Not yet\" changes nothing and can be revisited later, " +
+                "while \"Mark reconciled\" re-arms the completeness gate on counts that may be wrong. Under that " +
+                "uncertainty, keeping the gate down is the safe choice until you have checked the unticked items " +
+                "yourself." +
                 (counted.remaining === 1
                   ? " (The sole outstanding item does not cleanly coincide with a single environmental blocker on " +
                     "the relevant review, so no more specific recommendation is available — check what the " +
@@ -1614,6 +1627,14 @@ export async function postReconcilePlanChecklistDecisionV1(
       decisionKey: "reconcilePlanChecklist",
       taskCanonicalId: canonicalId,
       stage: progress.currentStage,
+      // Item 7: "Not yet" leaves the latch standing, so re-asking with the same
+      // reason and the same options (counts moving 22→26 is not a new
+      // question) is an interruption, not a decision. Answering "Mark
+      // reconciled" clears the latch, so a later recurrence is asked afresh.
+      suppressWhileAnswered: {
+        conditionFingerprint: `latched:${progress.checklistProgressUnreliableReason ?? "unrecorded"}`,
+        answeredOptionIds: ["notYet"],
+      },
       whatHappened:
         `This task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
         `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +

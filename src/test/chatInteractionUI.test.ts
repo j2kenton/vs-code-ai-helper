@@ -31,6 +31,7 @@ import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQue
 import { bindingIdForOwnedFolder, makeOwnedTaskFolder } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { ADMISSION_DIRNAME_V1, acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** open() (invoked by askInteraction) raises an internal Notifications entry
  * and executes the webview-focus command — neither of which this test
@@ -191,7 +192,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -235,7 +236,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -301,7 +302,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -348,7 +349,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -400,7 +401,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -454,7 +455,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -497,7 +498,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -546,7 +547,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -616,7 +617,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -698,7 +699,7 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
