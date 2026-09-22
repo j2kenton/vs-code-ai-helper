@@ -74,7 +74,14 @@ RUN printf '%s\n' \
 COPY entrypoint.sh /usr/local/bin/devbox-entrypoint
 COPY runner.sh /usr/local/bin/devbox-runner
 COPY install-extension.sh /usr/local/bin/devbox-install-extension
-RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner /usr/local/bin/devbox-install-extension
+# The push watcher belongs in the image, not in $HOME. runner.sh started it
+# from `$HOME/notify-watch.mjs`, a file nothing here ever installed — so a
+# rebuilt box ran no watcher at all and sent no notifications, silently, which
+# is the exact failure the watcher was moved into runner.sh to end (review,
+# 2026-09-22). In the image it is deployed by a rebuild like everything else.
+COPY notify-watch.mjs /usr/local/lib/devbox-notify-watch.mjs
+RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner /usr/local/bin/devbox-install-extension \
+ && chmod 0644 /usr/local/lib/devbox-notify-watch.mjs
 
 EXPOSE 2222
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/devbox-entrypoint"]

@@ -93,15 +93,42 @@ else
   set --
 fi
 
+# PREFLIGHT THE PUBLISHED PORTS, before `docker rm -f` destroys the container
+# that is currently serving them. Docker only evaluates a port binding when
+# `docker run` reaches it, so a port taken by something else meant the runner
+# and its in-progress round were killed, `docker run` then failed on the bind,
+# and the box was left with no container at all — the volumes survive, the
+# round does not (review, 2026-09-22). Same fail-closed rule the seccomp block
+# above already follows: stop while the working box is still working.
+#
+# A port the container we are about to remove is publishing is fine: removing
+# it frees the port. Anything else is somebody's ssh tunnel or a stray
+# process, and this deployment must not start by breaking the box for it.
+for preflight_port in 2222 8082; do
+  if ss -ltnH "sport = :$preflight_port" 2>/dev/null | grep -q .; then
+    if ! sudo docker port ensemble-devbox 2>/dev/null | grep -q "127\.0\.0\.1:$preflight_port\$"; then
+      echo "ERROR: 127.0.0.1:$preflight_port is already in use by something other than the" >&2
+      echo "       ensemble-devbox container, so 'docker run' below would fail on its port" >&2
+      echo "       binding AFTER the running container had been removed. Nothing has been" >&2
+      echo "       changed. Find the holder with:" >&2
+      echo "         ss -ltnp \"sport = :$preflight_port\"" >&2
+      exit 1
+    fi
+  fi
+done
+
 sudo docker rm -f ensemble-devbox >/dev/null 2>&1 || true
 # SSH only on the host's loopback: reached through the host's own SSH
 # (ProxyJump), never exposed to the internet directly.
 #
-# --memory 20g: the VM has 23 GB and the container was capped at 12. Two
-# desktop runners, their extension hosts, a renderer that had leaked to 2.4 GB
-# and a couple of viewers reached that cap on 2026-09-20; the kernel killed
-# four processes and took a review round with it. The cap was the shortage, not
-# the machine. ~3 GB is left for the VM itself.
+# --memory 28g: the VM was resized to 16 OCPU / 32 GB on 2026-09-20 and the
+# container had been capped at 12 GB. Two desktop runners, their extension
+# hosts, a renderer that had leaked to 2.4 GB and a couple of viewers reached
+# that 12 GB cap that day; the kernel killed four processes and took a review
+# round with it. The cap was the shortage, not the machine. 28 GB of 32 leaves
+# ~4 GB for the VM itself. Measured since: four runners peak around 18 GB.
+# (The figures in this comment described the pre-resize 23 GB VM and a 20 GB
+# cap, neither of which had been true since the resize — review, 2026-09-22.)
 #
 # -p 8082: the serve-web VIEWER (runner.sh starts it) published on the VM's
 # loopback, so a PHONE needs one SSH hop to the VM instead of two. Still

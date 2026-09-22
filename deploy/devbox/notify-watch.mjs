@@ -69,11 +69,18 @@ function pushUrl() {
   }
 }
 
+/**
+ * Sends one event. Returns whether it was DELIVERED, because the caller uses
+ * that to decide whether to advance its de-duplication marker: an event whose
+ * marker moves on a failed send is an event nobody is ever told about (review,
+ * 2026-09-22). With no URL configured there is nothing to retry and nothing to
+ * wait for, so that counts as delivered and the watch stops re-reporting it.
+ */
 async function push(event) {
   const url = pushUrl();
   if (url === undefined) {
     log(`no ${URL_FILE}; would have sent: ${event.title} — ${event.body}`);
-    return;
+    return true;
   }
   try {
     const response = await fetch(url, {
@@ -87,12 +94,15 @@ async function push(event) {
     });
     if (!response.ok) {
       log(`push refused (${response.status}) for: ${event.title}`);
-      return;
+      return false;
     }
     log(`pushed: ${event.title} — ${event.body}`);
+    return true;
   } catch (error) {
-    // A failed push must never end the watch: the next pass tries again.
+    // A failed push must never end the watch: the next pass tries again —
+    // which is only true because the caller leaves its marker alone on false.
     log(`push failed (${String(error)}) for: ${event.title}`);
+    return false;
   }
 }
 
@@ -156,30 +166,44 @@ async function pass(state) {
     // 1. The runner went quiet with work in flight — the overnight case.
     if (age > SILENT_MS && previous.running === true) {
       if (previous.silentSince === undefined) {
-        next.silentSince = snapshot.writtenAt;
-        await push({
+        const delivered = await push({
           title: `${label}: the runner went quiet`,
           body: `No report for ${Math.round(age / 60_000)} min while "${shorten(previous.runningLabel ?? "a round", 60)}" was running. Its outcome is unknown.`,
           urgent: true,
           tags: "warning",
         });
+        // Marked only once it is out. Undelivered, the next pass sees the
+        // runner still silent and tries again — this is the overnight alert,
+        // the one worth retrying most.
+        if (delivered) {
+          next.silentSince = snapshot.writtenAt;
+        }
       }
     } else if (age <= SILENT_MS) {
       next.silentSince = undefined;
     }
 
     // 2. A round finished (roots went away while the runner kept reporting).
+    let finishedAnnounced = true;
     if (previous.running === true && !running && age <= SILENT_MS) {
       const last = tailNotifications(path.join(relay, "notifications-v1.jsonl"), 1)[0];
-      await push({
+      finishedAnnounced = await push({
         title: `${label}: finished`,
         body: shorten(last?.message ?? `"${previous.runningLabel ?? "the round"}" is no longer running.`),
         urgent: true,
         tags: "white_check_mark",
       });
     }
-    next.running = running;
-    next.runningLabel = roots[0]?.label;
+    if (finishedAnnounced) {
+      next.running = running;
+      next.runningLabel = roots[0]?.label;
+    } else {
+      // Keep believing the round is running, so the next pass detects the
+      // same finish and announces it. The transition is the only record that
+      // it ended; forget it here and the round simply never reports.
+      next.running = previous.running;
+      next.runningLabel = previous.runningLabel;
+    }
 
     // 3. It is waiting for an answer.
     const decisions = readJson(path.join(relay, "decisions-v1.json"));
@@ -189,8 +213,9 @@ async function pass(state) {
         : 0;
     const blocked = roots.some((op) => op.waitingForUser === true);
     const needsYou = pending > 0 || blocked;
+    let needsYouAnnounced = true;
     if (needsYou && previous.needsYou !== true) {
-      await push({
+      needsYouAnnounced = await push({
         title: `${label}: needs you`,
         body: blocked
           ? `A running round is paused waiting for your answer.`
@@ -199,7 +224,10 @@ async function pass(state) {
         tags: "question",
       });
     }
-    next.needsYou = needsYou;
+    // On a failed send leave the marker as it was, so the next pass still
+    // reads this as a new "needs you" and asks again. A question nobody is
+    // told about holds the task until somebody happens to look.
+    next.needsYou = needsYouAnnounced ? needsYou : (previous.needsYou ?? false);
 
     // 4. New warnings and errors, exactly as the extension worded them.
     const notes = tailNotifications(path.join(relay, "notifications-v1.jsonl"), 40);
@@ -210,18 +238,25 @@ async function pass(state) {
     }
     const problems = fresh.filter((note) => note.level === "warning" || note.level === "error");
     // One push for a burst, not one per line.
+    let problemsAnnounced = true;
     if (problems.length === 1) {
-      await push({
+      problemsAnnounced = await push({
         title: `${label}: ${problems[0].level}`,
         body: shorten(problems[0].message),
         tags: problems[0].level === "error" ? "rotating_light" : "warning",
       });
     } else if (problems.length > 1) {
-      await push({
+      problemsAnnounced = await push({
         title: `${label}: ${problems.length} problems reported`,
         body: shorten(problems.map((p) => p.message).join(" // ")),
         tags: "warning",
       });
+    }
+    // The watermark moves only once the problems behind it have been
+    // reported; otherwise the next pass treats them as already seen and the
+    // warning is lost for good.
+    if (!problemsAnnounced) {
+      next.lastNoteAt = previous.lastNoteAt;
     }
 
     state[name] = next;

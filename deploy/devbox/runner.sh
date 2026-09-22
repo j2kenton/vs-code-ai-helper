@@ -96,15 +96,32 @@ echo "$(date -u +%FT%TZ) viewer on :$VIEWER_PORT token $(cat "$VIEWER_TOKEN")" >
 # only what the runners publish and can start nothing.
 #
 # Started here because it is the one thing a rebuild kept silently killing: it
-# lives in $HOME (which survives) but nothing restarted it, so notifications
-# just stopped — twice, unnoticed for hours. It covers every workspace on the
-# box automatically, so a new instance needs no setup.
+# used to live only in $HOME (which survives) but nothing restarted it, so
+# notifications just stopped — twice, unnoticed for hours. It covers every
+# workspace on the box automatically, so a new instance needs no setup.
+#
+# It ships in the IMAGE (/usr/local/lib/devbox-notify-watch.mjs, Dockerfile).
+# This block used to require `$HOME/notify-watch.mjs`, which nothing installed
+# — so on any box built from a clean checkout the condition was simply false
+# and no watcher ran, silently, which is the same failure in a new costume
+# (review, 2026-09-22). A copy in $HOME still wins, so the file can be edited
+# in place on the box to try a change without a rebuild.
 #
 # Sends nothing unless ~/.devbox-notify-url exists: deleting that file is the
 # off switch, and without it the watcher only logs what it would have sent.
 if [ -f "$HOME/notify-watch.mjs" ]; then
-  setsid nohup node "$HOME/notify-watch.mjs" >>"$HOME/.devbox-logs/notify-watch.out" 2>&1 < /dev/null &
-  echo "$(date -u +%FT%TZ) push watcher started" >>"$SUPERVISOR_LOG"
+  notify_watcher="$HOME/notify-watch.mjs"
+else
+  notify_watcher="/usr/local/lib/devbox-notify-watch.mjs"
+fi
+if [ -f "$notify_watcher" ]; then
+  setsid nohup node "$notify_watcher" >>"$HOME/.devbox-logs/notify-watch.out" 2>&1 < /dev/null &
+  echo "$(date -u +%FT%TZ) push watcher started ($notify_watcher)" >>"$SUPERVISOR_LOG"
+else
+  # Visible, not silent: the watcher is how the user learns a round finished
+  # or needs them, so its absence is worth a line in the log that a human
+  # reads (status.sh tails this).
+  echo "$(date -u +%FT%TZ) WARNING: no push watcher found at $notify_watcher; no notifications will be sent" >>"$SUPERVISOR_LOG"
 fi
 
 # One restart loop per workspace. $1 = workspace folder, $2 = runner index
