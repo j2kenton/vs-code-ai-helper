@@ -686,6 +686,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
+    { model: "claude-fable-5", name: "Fable 5" },
+    ...createVariants("claude-fable-5", "Fable 5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
     // `fable` is Claude Code's floating alias for the newest Fable model, so
     // its label carries no version number that could go stale again.
     { model: "fable", name: "Fable (latest)" },

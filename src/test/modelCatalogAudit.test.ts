@@ -535,17 +535,23 @@ void describe("checked-in manifest against the real seed", () => {
     }
   });
 
-  void it("offers Fable 5.1 on Claude Code next to the relabelled floating alias", () => {
+  void it("offers Fable 5.1 and the explicit Fable 5 pin on Claude Code next to the relabelled floating alias", () => {
     const byModel = new Map((catalog.seeded["claude-cli"] ?? []).map((m) => [m.model, m.name]));
     assert.equal(byModel.get("claude-fable-5-1"), "Fable 5.1");
     assert.equal(byModel.get("claude-fable-5-1@high"), "Fable 5.1 (High)");
+    assert.equal(byModel.get("claude-fable-5"), "Fable 5");
+    assert.equal(byModel.get("claude-fable-5@high"), "Fable 5 (High)");
     assert.equal(byModel.get("fable"), "Fable (latest)");
     assert.equal(byModel.get("fable@max"), "Fable (latest) (Max)");
     const record = manifest.records.find((r) => r.provider === "claude-cli");
     const status = (id: string): string | undefined => record?.entries?.find((e) => e.id === id)?.status;
     assert.equal(status("claude-fable-5-1"), "added");
+    assert.equal(status("claude-fable-5"), "added");
     assert.equal(status("fable"), "relabelled");
-    assert.equal(status("claude-fable-5"), "not-added");
+    assert.equal(
+      record?.entries?.find((e) => e.id === "claude-fable-5")?.requiresCompanion,
+      "claude-fable-5-1"
+    );
   });
 
   void it("only offers Claude efforts the runner turns into a thinking budget", () => {

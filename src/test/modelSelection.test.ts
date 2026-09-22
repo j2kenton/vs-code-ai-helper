@@ -580,6 +580,22 @@ void describe("getAvailableModels", () => {
             ]
           ),
           {
+            id: "claude-cli:claude-fable-5",
+            name: "Fable 5",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "claude-fable-5",
+            "Fable 5",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
             id: "claude-cli:fable",
             name: "Fable (latest)",
             providerLabel: "Claude Code (subscription CLI)",

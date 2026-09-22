@@ -53,50 +53,52 @@
       "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
       "supportedPathClasses": ["subscription", "api-key"],
       "evidence": {
-        "authContext": "Claude Code subscription login; model list taken from the Anthropic model list in the Claude Code session environment, no CLI probe run (execution denied by the sandbox)",
+        "authContext": "Claude Code subscription login; live `claude --model <id> -p ok --output-format json` probes run on the Ensemble dev box (aarch64 container), reading the resolved id from the response's modelUsage key; credential class and account tier for that box were not captured alongside the probe output (see the Capture log's caveat in audit-2026-09.md) and still need recording",
         "cliVersion": "claude 2.1.274",
-        "source": "Anthropic model list in the session environment plus `claude --help` (fable alias = latest model)",
+        "source": "`claude --model <id> -p ok --output-format json` for each id below, plus `claude --help` (fable alias = latest model); see the Capture log section of audit-2026-09.md for the full table",
         "date": "2026-09-20"
       },
       "coverage": "entries",
       "freeLabelsAudited": true,
-      "notes": "No live `claude --model <id> -p ok` probe was possible this round; see Part 1 findings in audit-2026-09.md.",
+      "notes": "Live CLI probes ran this round for claude-fable-5-1, claude-fable-5, fable, opus, sonnet and haiku (all exit 0); see the Capture log section in audit-2026-09.md. Whether opus/sonnet/haiku float to a newer pin was not established by a single resolution, so their `(latest)` relabel was not applied.",
       "entries": [
         {
           "id": "claude-fable-5-1",
           "status": "added",
           "checkedAt": "2026-09-20",
-          "source": "Anthropic model list in the Claude Code session environment (claude-fable-5-1); this audit session runs as claude-fable-5-1"
+          "source": "`claude --model claude-fable-5-1 -p ok --output-format json`: exit 0, resolved to itself (modelUsage: claude-fable-5-1); also the Anthropic model list in the Claude Code session environment"
+        },
+        {
+          "id": "claude-fable-5",
+          "status": "added",
+          "checkedAt": "2026-09-20",
+          "source": "`claude --model claude-fable-5 -p ok --output-format json`: exit 0, resolved to itself (modelUsage: claude-fable-5), so it is not an alias and is selectable on the default path",
+          "requiresCompanion": "claude-fable-5-1"
         },
         {
           "id": "fable",
           "status": "relabelled",
           "checkedAt": "2026-09-20",
-          "source": "`claude --help` (claude 2.1.274) describes fable as the alias for the latest model",
+          "source": "`claude --model fable -p ok --output-format json`: exit 0, resolved to claude-fable-5-1 (modelUsage), confirming `fable` floats to 5.1; also `claude --help` (claude 2.1.274) describes fable as the alias for the latest model",
           "note": "Label changed from `Fable 5` to `Fable (latest)`: the alias already resolves to 5.1, and an unversioned label cannot go stale. The id is unchanged so stored selections keep resolving."
         },
         {
           "id": "sonnet",
           "status": "verified",
           "checkedAt": "2026-09-20",
-          "source": "Anthropic model list in the Claude Code session environment (Sonnet 5, claude-sonnet-5); alias floating not probed"
+          "source": "`claude --model sonnet -p ok --output-format json`: exit 0, resolved to claude-sonnet-5 (modelUsage); alias floating not established by a single resolution"
         },
         {
           "id": "opus",
           "status": "verified",
           "checkedAt": "2026-09-20",
-          "source": "Anthropic model list in the Claude Code session environment (Opus 5, claude-opus-5); alias floating not probed"
+          "source": "`claude --model opus -p ok --output-format json`: exit 0, resolved to claude-opus-5 (modelUsage); alias floating not established by a single resolution"
         },
         {
           "id": "haiku",
           "status": "verified",
           "checkedAt": "2026-09-20",
-          "source": "Anthropic model list in the Claude Code session environment (Haiku 4.5, claude-haiku-4-5-20251001); alias floating not probed"
-        },
-        {
-          "id": "claude-fable-5",
-          "status": "not-added",
-          "reason": "The explicit pin is added only if `claude --model claude-fable-5 -p ok` accepts the id; CLI execution was denied this round so the probe could not run. The floating `fable` alias already covers the latest Fable model."
+          "source": "`claude --model haiku -p ok --output-format json`: exit 0, resolved to the dated id claude-haiku-4-5-20251001 (modelUsage), unlike the other three which resolve to undated ids; alias floating not established by a single resolution"
         }
       ]
     },
