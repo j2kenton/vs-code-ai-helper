@@ -1245,3 +1245,160 @@ void describe("languageModelToolSessionV1", () => {
     }
   });
 });
+
+void describe("languageModelToolSessionV1 transient faults (v1 fixes 2, item 27)", () => {
+  function installFlakyModel(serve: (call: number) => Promise<{ stream: Generator<object> }>): {
+    restore: () => void;
+  } {
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    let call = 0;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          sendRequest: () => serve(call++),
+        },
+      ]);
+    return {
+      restore: (): void => {
+        lm.selectChatModels = original;
+      },
+    };
+  }
+
+  const emptyReply = (): Promise<{ stream: Generator<object> }> =>
+    Promise.resolve({ stream: (function* (): Generator<object> { /* no parts */ })() });
+
+  void it("reports an empty first reply as a retryable network fault", async () => {
+    const model = installFlakyModel(() => emptyReply());
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind, "transportFailure");
+      if (exit.kind === "transportFailure") {
+        assert.equal(exit.code, "copilotEmptyResponse");
+        assert.equal(exit.networkFault, true);
+        assert.match(exit.detail ?? "", /empty response/);
+      }
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("flags a connection reset as a network fault and leaves a provider refusal unflagged", async () => {
+    for (const [message, expected] of [
+      ["Error Code: net::ERR_HTTP2_PROTOCOL_ERROR.", true],
+      ["Request Failed: 400 invalid_request_body", false],
+    ] as const) {
+      const model = installFlakyModel(() => Promise.reject(new Error(message)));
+      try {
+        const transport = createCopilotLmToolSessionTransportV1({
+          model: "gpt-test",
+          toolHandler: recordingHandler(() => "{}"),
+        });
+        const exit = await transport.invoke(makeRequest(), makeWriter());
+        assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestFailed");
+        assert.equal(exit.kind === "transportFailure" && exit.networkFault === true, expected, message);
+      } finally {
+        model.restore();
+      }
+    }
+  });
+
+  const editToolRound = (): Promise<{ stream: Generator<object> }> =>
+    Promise.resolve({
+      stream: (function* (): Generator<object> {
+        yield new stubClasses.LanguageModelToolCallPart("call-1", "ensemble_readFile", {
+          rootId: "r",
+          relativePath: "a.ts",
+        });
+      })(),
+    });
+
+  void it("resends the current round once after a transient fault in an edit session, without replaying earlier rounds", async () => {
+    let calls = 0;
+    const model = installFlakyModel((call) => {
+      calls = call + 1;
+      if (call === 0) {
+        return editToolRound();
+      }
+      if (call === 1) {
+        return Promise.reject(new Error("Error Code: net::ERR_HTTP2_PROTOCOL_ERROR."));
+      }
+      return Promise.resolve({
+        stream: (function* (): Generator<object> {
+          yield new stubClasses.LanguageModelTextPart(
+            "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+          );
+        })(),
+      });
+    });
+    try {
+      let toolCalls = 0;
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => {
+          toolCalls += 1;
+          return "{}";
+        }),
+      });
+      const request = { ...makeRequest(), mode: "edit" } as unknown as AgentExecutionRequestV1;
+      const exit = await transport.invoke(request, makeWriter());
+      assert.equal(calls, 3);
+      assert.equal(toolCalls, 1, "the earlier round's tool call must not be replayed");
+      assert.notEqual(exit.kind, "transportFailure");
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("does not flag a mid-session fault in an edit session that persists past the one resend", async () => {
+    const toolRound = editToolRound;
+    const model = installFlakyModel((call) =>
+      call === 0 ? toolRound() : Promise.reject(new Error("Error Code: net::ERR_HTTP2_PROTOCOL_ERROR."))
+    );
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const request = { ...makeRequest(), mode: "edit" } as unknown as AgentExecutionRequestV1;
+      const exit = await transport.invoke(request, makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotRequestFailed");
+      assert.equal(exit.kind === "transportFailure" && exit.networkFault === true, false);
+      assert.match(
+        (exit.kind === "transportFailure" && exit.detail) || "",
+        /attempt 2 of 2 on this tool round/
+      );
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("names the attempt count when a mid-session empty response persists past the one resend", async () => {
+    const model = installFlakyModel((call) => (call === 0 ? editToolRound() : emptyReply()));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const request = { ...makeRequest(), mode: "edit" } as unknown as AgentExecutionRequestV1;
+      const exit = await transport.invoke(request, makeWriter());
+      assert.equal(exit.kind === "transportFailure" && exit.code, "copilotEmptyResponse");
+      assert.equal(exit.kind === "transportFailure" && exit.networkFault === true, false);
+      assert.match(
+        (exit.kind === "transportFailure" && exit.detail) || "",
+        /empty response on tool round 2 \(attempt 2 of 2 on this tool round\)/
+      );
+    } finally {
+      model.restore();
+    }
+  });
+});

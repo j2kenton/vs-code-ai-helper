@@ -8,6 +8,7 @@ import {
   isProviderEnabled,
   setModelSettings,
 } from "../config/settings";
+import { parseModelSelection } from "../runners/providers";
 import { chooseFallback } from "../utils/modelFallback";
 
 function installModelSettings(
@@ -266,6 +267,51 @@ void describe("getModelSettings — Antigravity legacy model ID migration", () =
       const result = getModelSettings();
       assert.strictEqual(result.impl?.primary, "antigravity-cli:Gemini 3.5 Flash (Medium)");
       assert.strictEqual(result.impl?.backup, "claude-cli:sonnet@high");
+    } finally {
+      settings.restore();
+    }
+  });
+});
+
+void describe("getModelSettings — Fable 5.1 catalog refresh", () => {
+  void it("keeps stored floating-alias and pinned Fable selections resolving unchanged", () => {
+    const settings = installModelSettings({
+      impl: {
+        primary: "claude-cli:fable@high",
+        backup: "claude-cli:claude-fable-5-1@max",
+        strategy: "switch-to-backup",
+      },
+      plan: { primary: "claude-cli:fable", strategy: "never-switch" },
+    });
+    try {
+      const result = getModelSettings();
+      assert.strictEqual(result.impl?.primary, "claude-cli:fable@high");
+      assert.strictEqual(result.impl?.backup, "claude-cli:claude-fable-5-1@max");
+      assert.strictEqual(result.plan?.primary, "claude-cli:fable");
+      assert.deepStrictEqual(parseModelSelection("claude-cli:fable@high"), {
+        provider: "claude-cli",
+        model: "fable@high",
+      });
+      assert.deepStrictEqual(parseModelSelection("claude-cli:claude-fable-5-1@max"), {
+        provider: "claude-cli",
+        model: "claude-fable-5-1@max",
+      });
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("preserves a stored Zen id the catalog does not know byte for byte", () => {
+    const stored = "opencode-cli:opencode/retired-model-free";
+    const settings = installModelSettings({
+      impl: { primary: stored, strategy: "never-switch" },
+    });
+    try {
+      assert.strictEqual(getModelSettings().impl?.primary, stored);
+      assert.deepStrictEqual(parseModelSelection(stored), {
+        provider: "opencode-cli",
+        model: "opencode/retired-model-free",
+      });
     } finally {
       settings.restore();
     }

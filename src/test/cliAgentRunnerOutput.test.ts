@@ -15,6 +15,7 @@ import {
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { attributionHeader, withAttribution } from "../utils/fileUtils";
 import { AgentRunRequest } from "../types/agentRunner";
+import { safeRemoveDir } from "./testFsUtils";
 
 void describe("quotePosixShellArg", () => {
   // Codex review finding: Node's own spawn(..., {shell:true}) joins
@@ -843,7 +844,7 @@ void describe("post-implementation type-check (2g)", () => {
       assert.match(result.typeCheckOutput ?? "", /TS2322/);
       assert.strictEqual(invokedWithCwd, workspace);
     } finally {
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 
@@ -872,7 +873,7 @@ void describe("post-implementation type-check (2g)", () => {
       assert.strictEqual(result.typeCheckFailed, undefined);
       assert.strictEqual(result.typeCheckOutput, undefined);
     } finally {
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 
@@ -926,7 +927,7 @@ void describe("post-implementation type-check (2g)", () => {
       );
       assert.strictEqual(result.typeCheckFailed, undefined);
     } finally {
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 });

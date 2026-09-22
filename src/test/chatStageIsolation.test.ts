@@ -23,6 +23,7 @@ import { ChatViewProvider } from "../views/chatView";
 import { CHAT_HISTORY_FILENAME } from "../utils/chatHistoryStore";
 import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring
  * chatViewTaskSwitch.test.ts's installReadFileBridge. */
@@ -92,7 +93,7 @@ void describe("stage chat isolation", () => {
     } finally {
       rf.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -140,8 +141,8 @@ void describe("stage chat isolation", () => {
     } finally {
       rf.restore();
       provider.dispose();
-      fs.rmSync(taskFolder, { recursive: true, force: true });
-      fs.rmSync(globalFolder, { recursive: true, force: true });
+      safeRemoveDir(taskFolder);
+      safeRemoveDir(globalFolder);
     }
   });
 });

@@ -23,10 +23,11 @@ import {
   CompletionLintResult,
   normalizeSpawnCwdV1,
 } from "../utils/completionLint";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-env-disclosure-test-"));
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeWorkspace(name: string): string {

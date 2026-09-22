@@ -21,10 +21,11 @@ import {
   CompletionLintResult,
   runWithRetry,
 } from "../utils/completionLint";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-retry-test-"));
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeWorkspace(name: string, testScript: string): string {

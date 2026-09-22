@@ -71,14 +71,6 @@ playwright-report/
 .env.local
 .env.*.local
 
-# BEGIN Ensemble managed meta resources
-# Managed by Ensemble. Do not edit this block manually.
-/artifacts/helper/
-/.ensemble/
-/.ensemble/**/chat-v1.json
-/.ensemble/**/chat-v1.corrupt.json
-# END Ensemble managed meta resources
-
 # Ensemble session lock files (transient, machine/pid-specific)
 /.ensemble-session.lock
 /.helper/
@@ -105,3 +97,9 @@ playwright-report/
 # asserted absent by scripts/verify-package-contents.js) - this keeps them out
 # of the PUBLIC repository as well.
 /docs/
+
+# BEGIN Ensemble managed meta resources
+# Managed by Ensemble. Do not edit this block manually.
+/artifacts/helper/
+/.ensemble/
+# END Ensemble managed meta resources

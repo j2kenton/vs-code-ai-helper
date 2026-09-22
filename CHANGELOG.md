@@ -2,6 +2,23 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [Unreleased] — Readable helper text, copyable choice cards, live implementation percentage, pane search
+
+### Added
+
+- **Search in the Tasks and Notifications panes.** A search action in each title bar filters the list by every typed word (case-insensitive; tasks match display name, folder and stage, notifications match the full message). A `Search: … — N of M` banner shows while a search is active and a clear action removes it; running-operation rows are never hidden. Search is session-only and composes with the existing status/type filters.
+- **The implementation percentage now moves while a run is going.** The Tasks row reads `running... (N%)`, and the status bar and chat header follow as boxes are ticked in `plan-final.md`. The display reads the saved file only and never saves an open editor.
+- **Fixed-choice cards in chat can be copied and show their time,** the same ⧉ button and timestamp as regular messages.
+
+### Changed
+
+- **Helper text is fully readable in both themes.** Informational blocks are black on light themes and white on dark; disabled text uses the muted grey they used to have (no more opacity fade). The "What happens next" sentence in the task and status-bar hovers follows the same rule and re-colours when the theme changes.
+- **The Commit and Push button's tooltip reads just "Commit and Push"** — the shortcut still works, it is no longer advertised.
+
+### Removed
+
+- **Parked quota warnings no longer appear in the AI Models panel.** They asserted a present-tense fact from an old observation and quoted stage-scoped advice ("Rerun this stage") in a view with no stage. The quota ledger itself is untouched — it still drives routing and the withheld-fallback explanation — and a quota failure still raises its notification.
+
 ## [Unreleased] — Stalled-task detection, and a decision backlog that self-heals
 
 ### Added

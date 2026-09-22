@@ -999,6 +999,14 @@ export interface ReviewScoreHistoryEntry {
    * Wave I). Absent on entries written before this field existed.
    */
   reviewPass?: number;
+  /**
+   * `"open-editors"` when this review fell back to the files open in the
+   * editor because the task had no tracked implementation file set (v1 fixes
+   * 2, item 21). Recorded durably here so a high score can never be read as a
+   * verdict on the task's code even if the artifact's own scope note could not
+   * be written. Absent for an ordinary tracked-scope review.
+   */
+  scope?: "open-editors";
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */

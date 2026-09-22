@@ -27,6 +27,7 @@ import {
 import { TaskProgress } from "../types/taskProgress";
 import { TaskRootCandidate } from "../utils/taskRoot";
 import type { AutomationDispatch } from "../utils/automationChain";
+import { safeRemoveDir } from "./testFsUtils";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const automationChainModule = require("../utils/automationChain") as {
@@ -285,7 +286,7 @@ void describe("release ownership preparation", () => {
     } finally {
       atomic.restore();
       bridge.restore();
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 
@@ -311,7 +312,7 @@ void describe("release ownership preparation", () => {
     } finally {
       atomic.restore();
       bridge.restore();
-      fs.rmSync(workspace, { recursive: true, force: true });
+      safeRemoveDir(workspace);
     }
   });
 });

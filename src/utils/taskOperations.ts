@@ -2,12 +2,15 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
+import { runWithNotificationTaskContextV1 } from "./notificationTaskContextV1";
 import { normalizePath } from "./taskRoot";
 import { OperationKind } from "./operationTaxonomy";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { describeOwedContinuationRefusalV1 } from "./owedContinuationRefusalV1";
 import { writeRunLog } from "./runLog";
 import { isViewerHostV1 } from "../state/hostRoleV1";
+import { isUnrecoverableImplRecoveryV1 } from "./taskWatchdogV1";
+import type { TaskProgress } from "../types/taskProgress";
 
 /**
  * Lifecycle states of a tracked operation (contract C1):
@@ -23,7 +26,13 @@ export type TaskOperationState =
   | "succeeded"
   | "failed"
   | "cancelled"
-  | "interrupted";
+  | "interrupted"
+  /**
+   * The operation ran to its own guard clauses and declined to start the work
+   * (missing/stale review, unmet prerequisite). Never recorded as
+   * `succeeded`: a refusal is not a completed action (v1 fixes 2, step 11).
+   */
+  | "refused";
 
 export interface TaskOperationSpec {
   label: string;              // "Run Implementation" — reused by showTaskBusyWarning
@@ -58,6 +67,13 @@ export interface TaskOperationSpec {
    * never persisted.
    */
   cancellable?: boolean;
+  /**
+   * For an operation whose callback resolves `false` when it declined to start
+   * (a refusal on its own guard clauses, already reported to the user): end it
+   * as `refused` instead of `succeeded`, so the run record and the terminal
+   * notification never call a refusal "completed".
+   */
+  refusedWhenFalse?: boolean;
   /**
    * Registers this operation as a child of `parent` (contract C1 nesting):
    * children never contend for the task's exclusive lock (the parent already
@@ -1200,17 +1216,27 @@ export async function runTrackedOperation<T>(
     await showTaskBusyWarning(taskPath);
     return undefined;
   }
-  try {
-    const result = await fn(handle);
-    taskOperations.end(handle); // derives cancelled vs succeeded from the token
-    return result;
-  } catch (error) {
-    const cancelled =
-      error instanceof vscode.CancellationError ||
-      handle.token?.isCancellationRequested === true;
-    taskOperations.end(handle, cancelled ? "cancelled" : "failed");
-    throw error;
-  }
+  // Notifications raised anywhere inside `fn`'s async call path name this
+  // operation's own task (item 6). Per-operation, not ambient: overlapping
+  // operations on other tasks attribute their own, and the context is ended
+  // when this operation settles so a late emission is left unattributed.
+  return runWithNotificationTaskContextV1(spec.taskName, taskPath, async () => {
+    try {
+      const result = await fn(handle);
+      if (spec.refusedWhenFalse === true && result === false && handle.token?.isCancellationRequested !== true) {
+        taskOperations.end(handle, "refused");
+      } else {
+        taskOperations.end(handle); // derives cancelled vs succeeded from the token
+      }
+      return result;
+    } catch (error) {
+      const cancelled =
+        error instanceof vscode.CancellationError ||
+        handle.token?.isCancellationRequested === true;
+      taskOperations.end(handle, cancelled ? "cancelled" : "failed");
+      throw error;
+    }
+  }, spec.stage);
 }
 
 /**
@@ -1437,6 +1463,19 @@ function armReleaseTriggeredContinuationRetryV1(taskPath: string): void {
 }
 
 export async function showTaskBusyWarning(taskPath: string): Promise<void> {
+  // A busy refusal fires before any operation of its own exists, so it names
+  // the task explicitly: through the holder's own snapshot (this window's or
+  // the mirrored one), falling back to the folder — never the current selection.
+  const holder = taskOperations.getTaskOperations(taskPath)[0] ?? taskOperations.getMirroredTaskOperations(taskPath)[0];
+  await runWithNotificationTaskContextV1(
+    holder?.taskName,
+    taskPath,
+    () => showTaskBusyWarningInContext(taskPath),
+    holder?.stage
+  );
+}
+
+async function showTaskBusyWarningInContext(taskPath: string): Promise<void> {
   // When it is the OTHER window's work holding the task, say so and say where
   // to stop it — the generic "please wait" reads as this window being stuck,
   // and the owed-continuation explanation below would be about something else
@@ -1454,6 +1493,7 @@ export async function showTaskBusyWarning(taskPath: string): Promise<void> {
   const genericMessage = `${label} is already in progress for this task. Please wait for it to finish.`;
 
   let record: ImplRecoveryV1 | undefined;
+  let progress: TaskProgress | undefined;
   let pendingFiles: readonly string[] = [];
   let stage: TaskStage | undefined;
   let continuations = 0;
@@ -1463,6 +1503,7 @@ export async function showTaskBusyWarning(taskPath: string): Promise<void> {
       expectedTaskFolder: path.basename(taskPath),
     });
     if (strict.ok) {
+      progress = strict.decoded.progress;
       record = strict.decoded.progress.implRecovery;
       pendingFiles = strict.decoded.progress.pendingImplReviewFiles ?? [];
       stage = strict.decoded.progress.currentStage;
@@ -1478,7 +1519,32 @@ export async function showTaskBusyWarning(taskPath: string): Promise<void> {
   }
 
   const explained = describeOwedContinuationRefusalV1(record, pendingFiles, continuations);
-  NotificationRouter.showInformation(explained);
+  // v1 fixes 2, item 21: "Discard this owed continuation" must be reachable
+  // from every refusal that names an owed continuation, not only Complete
+  // Stage & Move On (reviewActions.ts's advanceStageViaNextStageRowV1 catch
+  // site) — this busy-refusal path is the OTHER production surface that names
+  // one (see this function's own doc comment on the 2026-08-21 incident).
+  // Same predicate the watchdog's own reclaim uses, so a record this offers
+  // discard for is exactly one the watchdog would independently agree has no
+  // automated way back. The literal `{ command: ... }` at the call site
+  // (rather than a variable) is deliberate — scripts/verifyToastAllowlistV1.mjs
+  // statically scans for a `{ command: "..." }` literal in this argument
+  // position, matching this codebase's existing convention for the same
+  // reason (see reviewActions.ts's other restore/discard action sites).
+  const canDiscard = progress !== undefined && isUnrecoverableImplRecoveryV1(record, progress, Date.now());
+  NotificationRouter.showInformation(
+    explained,
+    undefined,
+    undefined,
+    undefined,
+    canDiscard
+      ? {
+          command: "vs-code-ai-helper.discardOwedImplRecoveryV1",
+          title: "Discard This Owed Continuation",
+          args: [taskPath],
+        }
+      : undefined
+  );
   if (record.dispatch === "pending" && continuations < MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
     // Same branch describeOwedContinuationRefusalV1 already tells the user
     // "will be retried automatically once any existing lease clears" for —

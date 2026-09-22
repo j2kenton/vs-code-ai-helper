@@ -19,6 +19,7 @@ import {
   patchTaskProgressStrictV1,
 } from "../services/taskProgressWriterV1";
 import { withMetaRootLock } from "../state/taskStateStore";
+import { safeRemoveDir } from "./testFsUtils";
 
 const FIXTURE_ROOT = path.resolve(__dirname, "..", "..", "test-fixtures", "task-progress");
 
@@ -215,7 +216,7 @@ void describe("taskProgressWriterV1 — patchTaskProgressStrictV1 parity", () =>
         } catch {
           /* file may not exist */
         }
-        fs.rmSync(container, { recursive: true, force: true });
+        safeRemoveDir(container);
       },
     };
   }
@@ -386,7 +387,7 @@ void describe("taskProgressWriterV1 — patchTaskProgressStrictV1 parity", () =>
             beforeWrite: (): Promise<void> => {
               // Sabotage the target so the atomic write's rename cannot land:
               // a directory now occupies the progress-file path.
-              fs.rmSync(h.progressPath, { force: true });
+              fs.rmSync(h.progressPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
               fs.mkdirSync(h.progressPath);
               return Promise.resolve();
             },

@@ -47,10 +47,11 @@ import {
   TASK_PROGRESS_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "ensemble-chat-coverage-"));
 after(() => {
-  nodeFs.rmSync(ROOT, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
 });
 
 /**

@@ -602,6 +602,48 @@ export function isReviewPassCurrentV1(
 }
 
 /**
+ * Whether an implementation round STARTED after this stage's current-pass
+ * review was published (v1 fixes 2, item 32: a review "predates the latest
+ * implementation round"). Such a review describes the tree from before that
+ * round, so it is not a verdict on what exists now — even when the round
+ * changed nothing HEAD-visible (an uncommitted edit leaves the reviewed
+ * commit stamp equal to HEAD).
+ *
+ * Compares the round's `startedAt` (never `endedAt`): an Apply Review round's
+ * own inline re-review publishes before that round's ledger row terminalizes,
+ * and must not read as predating the round it followed. Only the history entry
+ * carrying the CURRENT reservation is consulted; a review with no such entry
+ * is already judged by {@link isReviewPassCurrentV1}, so this returns `false`
+ * ("no evidence of predating") rather than double-counting it.
+ */
+export function reviewPredatesLatestImplementationRoundV1(
+  progress: Pick<TaskProgress, "stageReviewPasses" | "reviewScoreHistory" | "roundLedger">,
+  stage: TaskStage
+): boolean {
+  const current = progress.stageReviewPasses?.[stage];
+  if (current === undefined) {
+    return false;
+  }
+  const publishedAt = (progress.reviewScoreHistory ?? [])
+    .filter((entry) => entry.stage === stage && entry.reviewPass === current)
+    .at(-1)?.at;
+  if (publishedAt === undefined) {
+    return false;
+  }
+  const published = Date.parse(publishedAt);
+  if (!Number.isFinite(published)) {
+    return false;
+  }
+  return (progress.roundLedger ?? []).some((row) => {
+    if (row.mode === "review") {
+      return false;
+    }
+    const started = Date.parse(row.startedAt);
+    return Number.isFinite(started) && started > published;
+  });
+}
+
+/**
  * Stages that record a `<!-- reviewed-commit: SHA -->` marker (2i) — the
  * implementation and publish review stages, whose "previous review" a
  * re-review is told to reconcile against can go stale relative to the

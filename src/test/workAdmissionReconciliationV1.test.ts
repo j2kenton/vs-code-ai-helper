@@ -11,6 +11,7 @@ import {
   STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * Coverage for the admission-acquirer side of the resume/setup-phase race
@@ -66,7 +67,7 @@ void describe("workAdmissionReconciliationV1", () => {
       progressPath,
       restore: (): void => {
         bridge.restore();
-        fs.rmSync(container, { recursive: true, force: true });
+        safeRemoveDir(container);
       },
     };
   }

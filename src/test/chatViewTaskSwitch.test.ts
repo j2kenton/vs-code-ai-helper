@@ -19,6 +19,7 @@ import { ChatViewProvider } from "../views/chatView";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** ask() now raises an internal Notifications entry for every question
  * (see chatView.ts's notifyWaitingForFeedback) — a no-op stub surface so
@@ -209,8 +210,8 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
       rf.restore();
       cmds.restore();
       notify.restore();
-      fs.rmSync(folderA, { recursive: true, force: true });
-      fs.rmSync(folderB, { recursive: true, force: true });
+      safeRemoveDir(folderA);
+      safeRemoveDir(folderB);
     }
   });
 
@@ -242,7 +243,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
       rf.restore();
       cmds.restore();
       notify.restore();
-      fs.rmSync(folderA, { recursive: true, force: true });
+      safeRemoveDir(folderA);
     }
   });
 
@@ -271,7 +272,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
       rf.restore();
       cmds.restore();
       notify.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

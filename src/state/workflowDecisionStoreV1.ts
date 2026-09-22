@@ -123,7 +123,16 @@ export function isWorkflowDecisionOrphanedV1(decisionId: string): boolean {
 }
 
 export type PostWorkflowDecisionResultV1 =
-  | { readonly ok: true; readonly decision: WorkflowDecisionV1 }
+  | {
+      readonly ok: true;
+      readonly decision: WorkflowDecisionV1;
+      /**
+       * Set when an opted-in post was NOT recorded because the same
+       * condition + answers were already answered (`decision` is that
+       * earlier resolved record).
+       */
+      readonly suppressed?: true;
+    }
   | { readonly ok: false; readonly reason: string };
 
 export type ResolveWorkflowDecisionResultV1 =
@@ -263,6 +272,25 @@ export class WorkflowDecisionStoreV1 {
       }
       await this.saveAll(next);
       return { ok: true, decision: updated };
+    }
+    if (input.suppressWhileAnswered !== undefined && created.decision.identity !== undefined) {
+      const lastSettled = [...existing]
+        .reverse()
+        .find(
+          (decision) =>
+            decision.state !== "pending" &&
+            decision.decisionKey === input.decisionKey &&
+            normalizePath(decision.taskCanonicalId) === canonicalId
+        );
+      if (
+        lastSettled !== undefined &&
+        lastSettled.state === "resolved" &&
+        lastSettled.identity === created.decision.identity &&
+        lastSettled.resolvedOptionId !== undefined &&
+        input.suppressWhileAnswered.answeredOptionIds.includes(lastSettled.resolvedOptionId)
+      ) {
+        return { ok: true, decision: lastSettled, suppressed: true };
+      }
     }
     const next = [...existing, created.decision];
     await this.saveAll(next);

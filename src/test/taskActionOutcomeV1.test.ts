@@ -87,7 +87,7 @@ void describe("decodeTaskActionOutcomeV1 — chainExhaustion.candidates[].deferr
             storedModelId: "codex/gpt-5.6-sol",
             providerLabel: "OpenAI Codex",
             runnerId: "codex",
-            reason: "invoked, but the transport failed before any response arrived",
+            reason: "invoked, but the request failed",
             deferredFailureKind: "quota",
             deferredResetAt: "2026-09-16T16:12:00.000Z",
           },

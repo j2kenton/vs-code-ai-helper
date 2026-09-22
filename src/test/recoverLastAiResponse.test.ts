@@ -15,6 +15,7 @@ import { describe, it } from "node:test";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
 import { findMostRecentSpool } from "../commands/recoverLastAiResponse";
+import { safeRemoveDir } from "./testFsUtils";
 
 function makeCorrelation(): ActionCorrelationV1 {
   return {
@@ -44,7 +45,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
       await store.writeSpool(makeCorrelation(), allocateHex128IdV1(), Buffer.from("ordinary"));
       assert.equal(findMostRecentSpool(rootDir), undefined);
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -75,7 +76,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
       assert.equal(found.meta.operationId, recoveryRef.operationId);
       assert.equal(fs.readFileSync(found.binPath, "utf8"), "rejected response");
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -102,7 +103,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
       assert.equal(found.meta.operationId, newerRef.operationId);
       assert.equal(fs.readFileSync(found.binPath, "utf8"), "newer rejected");
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -126,7 +127,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
       assert.ok(found, "the corrupt entry must not hide the good one");
       assert.equal(found?.meta.operationId, goodRef.operationId);
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 
@@ -146,7 +147,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
 
       assert.equal(findMostRecentSpool(rootDir), undefined);
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 });

@@ -65,6 +65,7 @@ import {
   createLintPreflightRowV1,
 } from "../actions/rows/editPreflightRowsV1";
 import { createEditExecutionRowV1 } from "../actions/rows/editExecutionRowV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function installWorkspaceFoldersStub(roots: readonly string[]): { restore: () => void } {
   const target = vscode.workspace as unknown as Record<string, unknown>;
@@ -117,7 +118,7 @@ void describe("runEditActionV1 — §7.5 availability", () => {
     } finally {
       copilot.restore();
       ws.restore();
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -140,7 +141,7 @@ void describe("runEditActionV1 — §7.5 availability", () => {
     } finally {
       cli.restore();
       ws.restore();
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -164,7 +165,7 @@ void describe("runEditActionV1 — §7.5 availability", () => {
       raw.LanguageModelToolResultPart = original;
       cli.restore();
       ws.restore();
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -183,7 +184,7 @@ void describe("runEditActionV1 — §7.5 availability", () => {
     } finally {
       copilot.restore();
       ws.restore();
-      fs.rmSync(stray, { recursive: true, force: true });
+      safeRemoveDir(stray);
     }
   });
 

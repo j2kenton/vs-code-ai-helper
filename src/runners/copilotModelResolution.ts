@@ -68,16 +68,16 @@ export function resolveCopilotModel(
  * by both the simple text-completion runner and the tool-calling
  * implementation runner, and only the latter needs the post-1.93 `tools`
  * field, which `vscodeLmCompat.ts` attaches at the actual `sendRequest` call.
+ *
+ * v1 fixes 2, item 19: deliberately sends NO `model_reasoning_effort` or
+ * `model_context_window`. Copilot's LM provider never reads either (Copilot
+ * Chat 0.65.0), so forwarding a legacy `@high` / `+long` selection would only
+ * make the run record claim a setting that did not apply. The suffix is still
+ * parsed so an older saved selection resolves to its base model; effort and
+ * context size for Copilot are configured in VS Code's per-model settings.
  */
 export function buildCopilotRequestOptions(
-  parsedModel: ParsedCopilotModelSelection
+  _parsedModel: ParsedCopilotModelSelection
 ): LmChatRequestOptionsV1 {
-  const modelOptions: Record<string, unknown> = {};
-  if (parsedModel.reasoningEffort) {
-    modelOptions.model_reasoning_effort = parsedModel.reasoningEffort;
-  }
-  if (parsedModel.contextWindow) {
-    modelOptions.model_context_window = parsedModel.contextWindow;
-  }
-  return Object.keys(modelOptions).length > 0 ? { modelOptions } : {};
+  return {};
 }

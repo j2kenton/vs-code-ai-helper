@@ -28,6 +28,7 @@ import { createChatInteractionTransactionStoreV1 } from "../services/chatInterac
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -114,7 +115,7 @@ void describe("chatHistoryStore orphaned-transaction reconciliation (AC-CHAT-TX-
       const second = await readChatInteractions(folder, canonicalId, "impl");
       assert.equal(second.filter((i) => i.interactionId === interactionId).length, 1);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -158,7 +159,7 @@ void describe("chatHistoryStore orphaned-transaction reconciliation (AC-CHAT-TX-
         "a settled (cancelled) transaction with no mirror record is not an orphan to surface"
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

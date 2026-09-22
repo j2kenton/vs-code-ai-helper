@@ -104,40 +104,27 @@ function claudeCliReasoningVariants(
   }));
 }
 
+/**
+ * v1 fixes 2, item 19: Copilot's LM provider ignores `model_reasoning_effort`
+ * and `model_context_window`, so no `@effort` / `+long` variants are offered.
+ * The call sites keep the historical matrix (model, label, efforts) so the
+ * expectation still documents which variants are deliberately absent.
+ */
 function copilotReasoningVariants(
-  model: string,
-  label: string,
-  efforts: readonly (readonly [string, string])[]
+  _model: string,
+  _label: string,
+  _efforts: readonly (readonly [string, string])[]
 ): SelectableModel[] {
-  return efforts.map(([effort, effortLabel]) => ({
-    id: `${model}@${effort}`,
-    name: `${label} (${effortLabel})`,
-    providerLabel: "GitHub Copilot",
-  }));
+  return [];
 }
 
 function copilotReasoningAndContextVariants(
-  model: string,
-  label: string,
-  efforts: readonly (readonly [string, string])[],
-  longContext: boolean
+  _model: string,
+  _label: string,
+  _efforts: readonly (readonly [string, string])[],
+  _longContext: boolean
 ): SelectableModel[] {
-  const variants: SelectableModel[] = [];
-  for (const [effort, effortLabel] of efforts) {
-    variants.push({
-      id: `${model}@${effort}`,
-      name: `${label} (${effortLabel})`,
-      providerLabel: "GitHub Copilot",
-    });
-    if (longContext) {
-      variants.push({
-        id: `${model}@${effort}+long`,
-        name: `${label} (${effortLabel}, Long Context)`,
-        providerLabel: "GitHub Copilot",
-      });
-    }
-  }
-  return variants;
+  return [];
 }
 
 function copilotModel(
@@ -577,13 +564,45 @@ void describe("getAvailableModels", () => {
             ["max", "Max"],
           ]),
           {
-            id: "claude-cli:fable",
+            id: "claude-cli:claude-fable-5-1",
+            name: "Fable 5.1",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "claude-fable-5-1",
+            "Fable 5.1",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
+            id: "claude-cli:claude-fable-5",
             name: "Fable 5",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
-            "fable",
+            "claude-fable-5",
             "Fable 5",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
+            id: "claude-cli:fable",
+            name: "Fable (latest)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "fable",
+            "Fable (latest)",
             [
               ["low", "Low"],
               ["medium", "Medium"],

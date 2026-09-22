@@ -26,6 +26,7 @@ import {
   buildPreflightClosingOverrideV1,
   buildPreflightToolSessionPreambleV1,
 } from "../prompts/toolSessionPreambleV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const WORKSPACE_ROOT_ID = "workspace:revision-chaining-test";
 const PRIVATE_ROOT_ID = "private:revision-chaining-test";
@@ -74,8 +75,8 @@ async function installFixtureV1(initialContent: string): Promise<FixtureV1> {
     ledger,
     fileObservation,
     cleanup() {
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
-      fs.rmSync(privateRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
+      safeRemoveDir(privateRoot);
     },
   };
 }

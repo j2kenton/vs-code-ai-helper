@@ -11,6 +11,7 @@ import {
   TransitionKind,
 } from "../utils/stageTransition";
 import type { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Regression coverage for a review finding: advanceStage used to gate
 // auto-review dispatch on a single boolean (`triggerAutoReview`), which
@@ -44,7 +45,7 @@ function installMemStore(store: MemStore): void {
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-transition-kind-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolderUri(name: string): vscode.Uri {

@@ -186,7 +186,9 @@ void describe("Stage 3 action matrix contracts", () => {
       "vs-code-ai-helper.runLintingFixes",
       "vs-code-ai-helper.viewStageChanges",
       "vs-code-ai-helper.chatWithStage",
-      "vs-code-ai-helper.commitAndPushTask",
+      // The inline button targets the keybinding-free alias so VS Code's
+      // tooltip shows no shortcut; see commitAndPushTaskInline in package.json.
+      "vs-code-ai-helper.commitAndPushTaskInline",
       "vs-code-ai-helper.release",
       "vs-code-ai-helper.markTaskDone",
     ]);
@@ -296,8 +298,16 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       routerSource,
-      /stage === "publish"[\s\S]{0,120}?runPublishChecks/,
-      "The current-stage router must dispatch the Publish checks as the stage's primary action"
+      /stage === "publish"[\s\S]{0,240}?publishDispatchCommandV1\(\)/,
+      "The current-stage router must dispatch Publish's first stage-action table step as its primary action"
+    );
+    const publishTableSource = readWorkspaceFile(
+      path.join("src", "utils", "publishStageActionsV1.ts")
+    );
+    assert.match(
+      publishTableSource,
+      /runPublishChecks/,
+      "The Publish stage-action table must map the checks step to the Publish checks command"
     );
   });
 

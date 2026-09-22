@@ -12,6 +12,7 @@ import {
   ensureAutomaticMetaGitIgnore,
   isManagedMetaGitIgnoreHidden,
 } from "../commands/toggleMetaResourcesGitIgnore";
+import { safeRemoveDir } from "./testFsUtils";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -489,7 +490,7 @@ void describe("automatic managed .gitignore maintenance", () => {
       writeBridge.restore();
       ws.restore();
       configStub.restore();
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -514,7 +515,7 @@ void describe("automatic managed .gitignore maintenance", () => {
       writeBridge.restore();
       ws.restore();
       configStub.restore();
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -543,7 +544,7 @@ void describe("automatic managed .gitignore maintenance", () => {
       writeBridge.restore();
       ws.restore();
       configStub.restore();
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -582,7 +583,7 @@ void describe("automatic managed .gitignore maintenance", () => {
       );
 
       // A second run for the same folder is gated off (record format).
-      fs.rmSync(path.join(secondRepo, ".gitignore"));
+      fs.rmSync(path.join(secondRepo, ".gitignore")); // deliberate: removal is the behaviour under test, not teardown
       await ensureAutomaticMetaGitIgnore(context, ws.folders[1]);
       assert.equal(
         fs.existsSync(path.join(secondRepo, ".gitignore")),
@@ -593,8 +594,8 @@ void describe("automatic managed .gitignore maintenance", () => {
       writeBridge.restore();
       ws.restore();
       configStub.restore();
-      fs.rmSync(firstRepo, { recursive: true, force: true });
-      fs.rmSync(secondRepo, { recursive: true, force: true });
+      safeRemoveDir(firstRepo);
+      safeRemoveDir(secondRepo);
     }
   });
 });

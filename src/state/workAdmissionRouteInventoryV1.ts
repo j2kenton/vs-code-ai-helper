@@ -107,6 +107,10 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   choosePublishScope: { kind: "notWatchdogSusceptible", reason: "UI picker; no provider dispatch" },
   filterTasksByStatus: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
   resetTaskStatusFilter: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
+  searchTasks: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
+  clearTasksSearch: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
+  searchNotifications: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
+  clearNotificationsSearch: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
   clearNotifications: { kind: "notWatchdogSusceptible", reason: "UI state only" },
   cancelOperation: { kind: "notWatchdogSusceptible", reason: "cancels in-flight work; never starts a provider round itself" },
   runNotificationAction: {
@@ -134,6 +138,13 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
     evidence: "src/commands/applyLowLevelReviewChanges.ts — same routing shape as applyHighLevelReviewChanges.ts",
   },
   commitAndPushTask: { kind: "admissionWired", evidence: "src/commands/commitAndPushTask.ts — commitAndPushTask" },
+  commitAndPushTaskInline: {
+    kind: "delegatesTo",
+    to: "commitAndPushTask",
+    evidence:
+      "src/commands/commitAndPushTask.ts — registerCommitAndPushTaskCommand registers this keybinding-free alias for the " +
+      "Tasks-tree inline button with the same commitAndPushTask handler and arguments",
+  },
   viewDisclaimer: { kind: "notWatchdogSusceptible", reason: "opens a static document" },
   expandAllTasks: { kind: "notWatchdogSusceptible", reason: "UI state only" },
   collapseAllTasks: { kind: "notWatchdogSusceptible", reason: "UI state only" },

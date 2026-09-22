@@ -63,9 +63,9 @@ void describe("terminalEntryFor (taxonomy policy)", () => {
     assert.equal(source.taskName.includes('"'), false);
   });
 
-  void it("quotes the folder-name fallback the same way when no display name exists", () => {
+  void it("never shows the raw folder default as the task name when no display name exists", () => {
     const entry = terminalEntryFor(snap({ state: "succeeded", kind: "review", taskName: "2026-08-14_task_3" }));
-    assert.equal(entry?.message, 'Review — "2026-08-14_task_3": completed');
+    assert.equal(entry?.message, 'Review — "Task 3 (2026-08-14)": completed');
   });
 
   void it("appends the settled live detail (e.g. iteration x/y, a created folder name)", () => {
@@ -155,6 +155,62 @@ void describe("installOperationNotificationBridge (activation subscription)", ()
         { message: "Pause Task — \"bridge_task\": completed", level: "info" },
         { message: "Generate Plan — \"bridge_task\": failed", level: "error" },
       ]);
+    } finally {
+      bridge.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("records an operation that declined to start as refused — never 'completed' (v1 fixes 2, step 11)", async () => {
+    const captured: Array<{ message: string; level: string }> = [];
+    initNotificationRouter({
+      addEntry(message, level) {
+        captured.push({ message, level });
+      },
+    });
+    const bridge = installOperationNotificationBridge();
+    const folder = `/dev/bridge_refused_${Math.floor(Math.random() * 1e9)}`;
+
+    try {
+      const refused = await runTrackedOperation(
+        folder,
+        { label: "Apply Review", taskName: "bridge_task", kind: "apply-review", refusedWhenFalse: true },
+        () => Promise.resolve(false)
+      );
+      const dispatched = await runTrackedOperation(
+        folder,
+        { label: "Apply Review", taskName: "bridge_task", kind: "apply-review", refusedWhenFalse: true },
+        () => Promise.resolve(true)
+      );
+
+      assert.equal(refused, false);
+      assert.equal(dispatched, true);
+      assert.deepEqual(captured, [
+        { message: "Apply Review — \"bridge_task\": refused — nothing was started", level: "warning" },
+        { message: "Apply Review — \"bridge_task\": completed", level: "info" },
+      ]);
+    } finally {
+      bridge.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("an operation without refusedWhenFalse still completes when its callback resolves false", async () => {
+    const captured: Array<{ message: string; level: string }> = [];
+    initNotificationRouter({
+      addEntry(message, level) {
+        captured.push({ message, level });
+      },
+    });
+    const bridge = installOperationNotificationBridge();
+    const folder = `/dev/bridge_plain_${Math.floor(Math.random() * 1e9)}`;
+    try {
+      await runTrackedOperation(
+        folder,
+        { label: "Pause Task", taskName: "bridge_task", kind: "pause-task" },
+        () => Promise.resolve(false)
+      );
+      assert.deepEqual(captured, [{ message: "Pause Task — \"bridge_task\": completed", level: "info" }]);
     } finally {
       bridge.dispose();
       deactivateNotificationRouter();

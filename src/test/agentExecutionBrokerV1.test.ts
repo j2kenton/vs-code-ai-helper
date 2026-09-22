@@ -39,6 +39,7 @@ import {
   ClaimedReservationV1,
   openProviderSelectionSessionV1,
 } from "../services/providerSelectionPolicyV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ACTION_KEY = "brokerTestAction.v1";
 
@@ -471,7 +472,7 @@ void describe("agentExecutionBrokerV1", () => {
       const secondClaim = await store.claimSpoolOnce(ref, request.correlation);
       assert.deepEqual(secondClaim, { ok: false, code: "spoolAlreadyClaimed" });
     } finally {
-      fs.rmSync(rootDir, { recursive: true, force: true });
+      safeRemoveDir(rootDir);
     }
   });
 

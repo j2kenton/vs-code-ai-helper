@@ -20,7 +20,11 @@
  * window's own in-memory state, and the watchdog's job is to find a task
  * that is durably stuck, not to race a single window's bookkeeping.
  */
-import { ImplRecoveryV1, TaskProgress } from "../types/taskProgress";
+import {
+  ImplRecoveryV1,
+  MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  TaskProgress,
+} from "../types/taskProgress";
 import { hasLiveSchedulingIntentBestEffortV1 } from "../state/schedulingIntentV1";
 import { hasLiveWorkAdmissionBestEffortV1, hasLiveWorkAdmissionExcludingOwnerV1 } from "../state/workAdmissionV1";
 
@@ -81,6 +85,26 @@ export function effectiveNextActorV1(progress: TaskProgress): "human" | "automat
     return progress.nextActor;
   }
   return "unknown";
+}
+
+/**
+ * v1 fixes 2, item 8: true when the task is active, its next step is
+ * EXPLICITLY the human's, and nothing is owed, scheduled or in flight that
+ * says otherwise — the one condition under which a row or card may say
+ * "waiting for you". The same facts `isImpossibleActiveStateV1` uses to exempt
+ * such a task from the stall pause, so the surface and the watchdog cannot
+ * disagree. `"unknown"` is never enough: an unwritten `nextActor` is not a
+ * claim that anyone is waiting.
+ */
+export function isWaitingForHumanV1(progress: TaskProgress): boolean {
+  return (
+    progress.status === "active" &&
+    effectiveNextActorV1(progress) === "human" &&
+    progress.implRecovery === undefined &&
+    progress.scheduledRun === undefined &&
+    progress.scheduledResumeTime === undefined &&
+    !hasOpenRoundLedgerRowV1(progress)
+  );
 }
 
 /**
@@ -157,12 +181,32 @@ export interface StalledActiveTaskCheckInputV1 {
  * stale-but-reconstructable `dispatched` record will be reclaimed to
  * `pending` by the very next sweep. Only the fourth combination has no path
  * back on its own.
+ *
+ * v1 fixes 2, items 15/21: a `pending` record whose continuation budget is
+ * already exhausted is ALSO a dead end — `beginImplementationRecoveryV1`
+ * (`implementationRecoveryV1.ts`) deliberately omits `leaseOwner`/`leaseUntil`
+ * for exactly this case ("a cap-reached record gets no lease and nothing will
+ * ever fire it automatically"), so nothing will ever flip it to `dispatched`.
+ * Read from the durable `incompleteRoundContinuations` counter rather than
+ * "pending with no lease" — the reclaim path in `scheduleTaskResume.ts`'s
+ * `armPendingImplRecoveries` also transiently writes a stale-but-
+ * reconstructable `dispatched` record back to `pending` with no lease, one
+ * transaction before it re-claims a fresh one; a lease-shaped test would read
+ * that legitimately-recoverable mid-reclaim window as unrecoverable too. The
+ * counter is set atomically in the SAME transaction as the lease omission and
+ * never touched by the reclaim path, so it carries no such race.
  */
 export function isUnrecoverableImplRecoveryV1(
   recovery: ImplRecoveryV1,
   progress: TaskProgress,
   now: number
 ): boolean {
+  if (
+    recovery.dispatch === "pending" &&
+    (progress.incompleteRoundContinuations ?? 0) >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1
+  ) {
+    return true;
+  }
   return isStaleDispatchedImplRecoveryV1(recovery, now) && !isReconstructableImplRecoveryV1(recovery, progress);
 }
 

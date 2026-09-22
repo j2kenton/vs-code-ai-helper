@@ -37,6 +37,7 @@ import {
   getCanonicalImplementationUri,
   getImplementationSummaryUri,
   isUnusableImplementationSummaryV1,
+  shouldPreserveUsableImplementationSummaryV1,
   parseReportedFilesChangedV1,
   readImplementationReviewContent,
   withDeterministicZeroFilesChangedNoteV1,
@@ -1182,6 +1183,28 @@ void describe("a rejected round is refused by every review entry point", () => {
   void it("still recognizes the stamp when attribution precedes nothing", () => {
     const stamp = buildUnusableImplementationSummaryV1("reason", "log.md");
     assert.equal(isUnusableImplementationSummaryV1(`\n\n${stamp}`), true);
+  });
+
+  void it("a form rejection leaves a usable summary live, on both entry points", () => {
+    // Entry point 1: an empty round (no final text); entry point 2: a
+    // correct-but-misencoded round. Neither says anything about the last
+    // usable summary, so neither may replace it with a stub.
+    const usable = WELL_FORMED_SUMMARY;
+    assert.equal(shouldPreserveUsableImplementationSummaryV1(usable, false), true);
+    // A summary-only violation is a forbidden edit, not a form rejection.
+    assert.equal(shouldPreserveUsableImplementationSummaryV1(usable, true), false);
+    // Nothing usable to preserve: absent, blank, or already the stamp.
+    assert.equal(shouldPreserveUsableImplementationSummaryV1(undefined, false), false);
+    assert.equal(shouldPreserveUsableImplementationSummaryV1("  \n", false), false);
+    assert.equal(
+      shouldPreserveUsableImplementationSummaryV1(
+        buildUnusableImplementationSummaryV1("reason", "log.md"),
+        false
+      ),
+      false
+    );
+    // What is preserved is, by construction, never refused by the gate.
+    assert.equal(isUnusableImplementationSummaryV1(usable), false);
   });
 
   void it("surfaces the stamp ahead of the plan of record, so reviews see the rejection", async () => {

@@ -346,7 +346,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
           storedModelId: "claude-cli:sonnet",
           providerLabel: "Claude Code",
           runnerId: "claude-cli",
-          reason: "invoked, but the transport failed before any response arrived - some other text",
+          reason: "invoked, but the request failed - some other text",
           deferredFailureKind: "quota",
           deferredResetAt: "2099-01-01T00:00:00.000Z",
         },

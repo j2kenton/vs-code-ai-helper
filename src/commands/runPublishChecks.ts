@@ -7,10 +7,18 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import { runCompletionLint, resolvePublishScopeFolder } from "../utils/completionLint";
+import {
+  PublishChecksCancelledError,
+  resolvePublishScopeFolder,
+  runCompletionLint,
+  throwIfPublishChecksCancelledV1,
+} from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { handBackToHumanAfterPublishChecksV1 } from "../utils/taskProgressTransforms";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
+import { publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   runTrackedOperation,
@@ -452,8 +460,14 @@ export async function runPublishChecks(
         ),
         kind: "completion-checks",
         parent: parentOperation,
+        // v1 fixes 2, item 29: Cancel appears on the operation's row like it
+        // does for every other stage action, and its token reaches the check
+        // processes below. The status-bar progress stays non-cancellable
+        // (VS Code only honours `cancellable` for Notification progress).
+        cancellable: true,
       },
-      async (): Promise<true> => {
+      async (operation): Promise<true> => {
+        const cancelToken = operation.token;
         await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Window,
@@ -485,11 +499,18 @@ export async function runPublishChecks(
               const beforeSha = await resolveHeadCommitSha(scopeGuess);
               await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri);
 
+              throwIfPublishChecksCancelledV1(cancelToken);
+              // Cancellation kills the check process trees and rejects with
+              // PublishChecksCancelledError BEFORE any result is persisted;
+              // the invalidation above stands, so no stale stamp survives.
               const result = await runCompletionLint(
                 taskFolderUri,
-                resolvedTask.progress.implReviewFiles
+                resolvedTask.progress.implReviewFiles,
+                { token: cancelToken }
               );
+              throwIfPublishChecksCancelledV1(cancelToken);
               await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+              throwIfPublishChecksCancelledV1(cancelToken);
 
               const verifiedFolder = result.verifiedFolder ?? scopeGuess;
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
@@ -528,9 +549,16 @@ export async function runPublishChecks(
                 "Publish review"
               );
 
-              if (result.passed) {
+              // Same verdict the artifact's status line and the freshness stamp
+              // use: a check that failed only on a quarantined known flake is a pass.
+              if (result.passedModuloKnownFlakes ?? result.passed) {
+                const nextStepOffer = publishNextStepOfferV1();
                 NotificationRouter.showInformation(
-                  `Publish checks passed. Report saved to ${publishReviewFilename}.`
+                  `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`,
+                  undefined,
+                  undefined,
+                  undefined,
+                  nextStepOffer.action
                 );
               } else {
                 NotificationRouter.showWarning(
@@ -538,7 +566,29 @@ export async function runPublishChecks(
                     'Use "Fix Linting & Code Errors" to address the report.'
                 );
               }
+              // v1 fixes 2, item 8/33: the checks are done and the next step
+              // (Commit & Push, or fixing what they found) is the user's.
+              // Recorded here so a task that entered Publish with automation
+              // expected (an auto-review arrangement that never followed the
+              // checks) reads "waiting for you" instead of being paused as
+              // stalled. Best-effort, and a no-op unless the task is still
+              // active on Publish with nothing owed or scheduled. Nothing
+              // here schedules a follow-up, so the hand-back is unconditional
+              // (passed or failed): the next step is the user's.
+              await patchTaskProgressStrictV1(taskFolderUri, (current) => {
+                const handedBack = handBackToHumanAfterPublishChecksV1(current);
+                return handedBack === current ? undefined : handedBack;
+              }).catch(() => undefined);
             } catch (error) {
+              if (error instanceof PublishChecksCancelledError) {
+                // Not a failure: the tracked operation settles as `cancelled`
+                // (its token is cancelled) and the user is told so. No stamp
+                // was written and nothing was persisted for this run.
+                NotificationRouter.showInformation(
+                  "Publish checks were cancelled. Nothing was recorded for this run — run the checks again when you're ready."
+                );
+                return;
+              }
               NotificationRouter.showError(
                 `Publish checks failed to run: ${
                   error instanceof Error ? error.message : String(error)

@@ -15,6 +15,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "./taskProgressTransforms";
 import {
   CLI_PROVIDERS,
+  CODEX_MODEL_CAPABILITIES,
   type CliProviderId,
   type CliProviderDefinition,
   providerAccountIdForModelId,
@@ -605,154 +606,12 @@ function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
   return isAutoModel(model) ? `${model.name} (provider-chosen)` : model.name;
 }
 
-const COPILOT_REASONING_LEVELS = {
-  gpt: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-  ],
-  gpt56terra: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-    { effort: "max", label: "Max" },
-    { effort: "ultra", label: "Ultra" },
-  ],
-  gpt56luna: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-    { effort: "max", label: "Max" },
-  ],
-  claude: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-    { effort: "max", label: "Max" },
-  ],
-  claude46: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "max", label: "Max" },
-  ],
-  gemini: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-  ],
-  grok: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-  ],
-  gpt53: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-  ],
-  gpt54mini: [
-    { effort: "low", label: "Low" },
-    { effort: "medium", label: "Medium" },
-    { effort: "high", label: "High" },
-    { effort: "xhigh", label: "Extra High" },
-  ],
-} as const;
-
-const COPILOT_MODEL_VARIANT_RULES: Readonly<
-  Array<{
-    slug: string;
-    efforts: readonly { effort: string; label: string }[];
-    longContext: boolean;
-  }>
-> = [
-  { slug: "gpt-5.6-sol", efforts: COPILOT_REASONING_LEVELS.gpt56terra, longContext: true },
-  { slug: "gpt-5.6-terra", efforts: COPILOT_REASONING_LEVELS.gpt56terra, longContext: true },
-  { slug: "gpt-5.6-luna", efforts: COPILOT_REASONING_LEVELS.gpt56luna, longContext: true },
-  { slug: "gpt-5.5", efforts: COPILOT_REASONING_LEVELS.gpt, longContext: true },
-  { slug: "gpt-5.4", efforts: COPILOT_REASONING_LEVELS.gpt, longContext: true },
-  { slug: "gpt-5.3-codex", efforts: COPILOT_REASONING_LEVELS.gpt53, longContext: false },
-  { slug: "gpt-5.4-mini", efforts: COPILOT_REASONING_LEVELS.gpt54mini, longContext: false },
-  { slug: "gpt-5-mini", efforts: COPILOT_REASONING_LEVELS.gpt53, longContext: false },
-  { slug: "claude-sonnet-5", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "claude-sonnet-4.6", efforts: COPILOT_REASONING_LEVELS.claude46, longContext: true },
-  { slug: "claude-sonnet-4.5", efforts: [], longContext: false },
-  { slug: "claude-haiku-4.5", efforts: [], longContext: false },
-  { slug: "claude-fable-5", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "claude-opus-5", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "claude-opus-4.8", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "claude-opus-4.8-fast", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "claude-opus-4.7", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
-  { slug: "gemini-3.1-pro", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
-  { slug: "gemini-3.5-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
-  { slug: "gemini-3.6-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
-  { slug: "gemini-3.7-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
-  { slug: "kimi-k2.7-code", efforts: [], longContext: false },
-  { slug: "mai-code-1-flash", efforts: COPILOT_REASONING_LEVELS.gpt53, longContext: false },
-  { slug: "grok-4.6", efforts: COPILOT_REASONING_LEVELS.grok, longContext: false },
-  { slug: "claude-opus-4.6", efforts: [], longContext: false },
-  { slug: "claude-opus-4.5", efforts: [], longContext: false },
-];
-
-function createCopilotVariant(
-  modelId: string,
-  baseName: string,
-  effort: string,
-  effortLabel: string,
-  longContext: boolean
-): SelectableModel {
-  return {
-    id: `${modelId}@${effort}${longContext ? "+long" : ""}`,
-    name: `${baseName} (${effortLabel}${longContext ? ", Long Context" : ""})`,
-    providerLabel: "GitHub Copilot",
-  };
-}
-
-function createSeededCopilotReasoningVariants(
-  model: vscode.LanguageModelChat,
-  baseName: string
-): SelectableModel[] {
-  const haystack = `${model.id} ${model.name}`.toLowerCase();
-  // Pick the most specific (longest) matching slug rather than the first
-  // one in array order, so e.g. "gpt-5.4-mini" doesn't shadow-match the
-  // "gpt-5.4" rule just because it appears earlier in the list.
-  let rule: (typeof COPILOT_MODEL_VARIANT_RULES)[number] | undefined;
-  for (const candidate of COPILOT_MODEL_VARIANT_RULES) {
-    if (
-      haystack.includes(candidate.slug) &&
-      (!rule || candidate.slug.length > rule.slug.length)
-    ) {
-      rule = candidate;
-    }
-  }
-  if (!rule) {
-    return [];
-  }
-
-  const variants: SelectableModel[] = [];
-  for (const variant of rule.efforts) {
-    variants.push(
-      createCopilotVariant(model.id, baseName, variant.effort, variant.label, false)
-    );
-    if (rule.longContext) {
-      variants.push(
-        createCopilotVariant(
-          model.id,
-          baseName,
-          variant.effort,
-          variant.label,
-          true
-        )
-      );
-    }
-  }
-  return variants;
-}
+// v1 fixes 2, item 19: Copilot models are offered by base id only. Copilot's
+// LM provider ignores `model_reasoning_effort` and `model_context_window`
+// (see MAX_TOOL_SESSION_CONTEXT_TOKENS_V1), so `@effort` / `+long` variants
+// would be settings that silently do nothing. Effort and context size for a
+// Copilot model are set in VS Code's own per-model configuration (the model
+// picker's "Manage Models" entry in Copilot Chat).
 
 function createCodexReasoningVariant(
   model: string,
@@ -819,8 +678,26 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
-    { model: "fable", name: "Fable 5" },
-    ...createVariants("fable", "Fable 5", [
+    { model: "claude-fable-5-1", name: "Fable 5.1" },
+    ...createVariants("claude-fable-5-1", "Fable 5.1", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    { model: "claude-fable-5", name: "Fable 5" },
+    ...createVariants("claude-fable-5", "Fable 5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    // `fable` is Claude Code's floating alias for the newest Fable model, so
+    // its label carries no version number that could go stale again.
+    { model: "fable", name: "Fable (latest)" },
+    ...createVariants("fable", "Fable (latest)", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
@@ -840,70 +717,20 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
 }
 
 function createSeededCodexModels(): readonly DiscoveredCliModel[] {
-  const createVariants = (
-    model: string,
-    label: string,
-    efforts: readonly (readonly [string, string])[]
-  ): DiscoveredCliModel[] => {
-    const variants: DiscoveredCliModel[] = [];
-    for (const [effort, effortLabel] of efforts) {
-      variants.push(createCodexReasoningVariant(model, label, effort, effortLabel));
-      variants.push(createCodexSpeedVariant(model, label, effort, effortLabel));
+  const models: DiscoveredCliModel[] = [];
+  for (const [model, capability] of Object.entries(CODEX_MODEL_CAPABILITIES)) {
+    for (const [effort, effortLabel] of capability.efforts) {
+      models.push(
+        createCodexReasoningVariant(model, capability.label, effort, effortLabel)
+      );
+      if (capability.supportsFast) {
+        models.push(
+          createCodexSpeedVariant(model, capability.label, effort, effortLabel)
+        );
+      }
     }
-    return variants;
-  };
-
-  return [
-    ...createVariants("gpt-5.5", "GPT-5.5", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-    ]),
-    ...createVariants("gpt-5.6-terra", "GPT-5.6-Terra", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-      ["ultra", "Ultra"],
-    ]),
-    ...createVariants("gpt-5.6-sol", "GPT-5.6-SOL", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-      ["ultra", "Ultra"],
-    ]),
-    ...createVariants("gpt-5.6-luna", "GPT-5.6-Luna", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-      ["max", "Max"],
-    ]),
-    ...createVariants("gpt-5.4", "GPT-5.4", [
-      ["low", "Low"],
-      ["medium", "Medium"],
-      ["high", "High"],
-      ["xhigh", "Extra High"],
-    ]),
-    createCodexReasoningVariant("gpt-5.4-mini", "GPT-5.4-Mini", "low", "Low"),
-    createCodexReasoningVariant(
-      "gpt-5.4-mini",
-      "GPT-5.4-Mini",
-      "medium",
-      "Medium"
-    ),
-    createCodexReasoningVariant("gpt-5.4-mini", "GPT-5.4-Mini", "high", "High"),
-    createCodexReasoningVariant(
-      "gpt-5.4-mini",
-      "GPT-5.4-Mini",
-      "xhigh",
-      "Extra High"
-    ),
-  ];
+  }
+  return models;
 }
 
 function createClineReasoningVariant(
@@ -1660,6 +1487,35 @@ function createSeededDevpassModels(): readonly DiscoveredCliModel[] {
   return parseOpencodeModelsOutput(DEVPASS_SEEDED_CATALOG_RAW);
 }
 
+/**
+ * Verified-free allowlist: `<ProviderId>:<baseModelId>` of every seeded model
+ * whose "Free" label is backed by dated $0 evidence in the audit manifest
+ * (test-fixtures/model-catalog/audit-2026-09.json). In an audited block a
+ * model's name carries a free marker if and only if its base id is listed
+ * here; modelCatalogAudit.ts enforces that, and an unaudited block is frozen
+ * by its own pins instead.
+ */
+export const VERIFIED_FREE_MODEL_IDS: readonly string[] = [];
+
+/**
+ * Base ids (same `<ProviderId>:<baseModelId>` form) whose free marker the
+ * seed builders strip from the parsed name because $0 could not be
+ * confirmed; each needs a `relabelled` manifest entry.
+ */
+export const STRIPPED_FREE_MARKER_IDS: readonly string[] = [];
+
+/*
+ * Seeded catalog availability policy (full text, with the evidence rules, in
+ * test-fixtures/model-catalog/audit-2026-09.md):
+ *  - Add a model only when the provider CLI's own output or an official page
+ *    confirms its id for the provider's default auth path.
+ *  - Remove one only on a documented retirement, an entitlement-independent
+ *    catalog, or captures covering every supported path class. A single
+ *    account's listing that omits an id is context, not proof: keep the entry
+ *    (with a label qualifier when conditional).
+ *  - A free label needs dated $0 evidence and a VERIFIED_FREE_MODEL_IDS entry.
+ *  - Never alias a removed free id to a paid id.
+ */
 const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
@@ -1738,6 +1594,29 @@ const SEEDED_CLI_MODELS: Readonly<
   }
 }`),
 };
+
+/**
+ * Read-only view of the seeded catalog for the audit tests and the drift
+ * script: the seed map, the Gemini CLI fallback ids from its provider
+ * definition, and the ids whose free marker was stripped. Touches no
+ * `vscode` API.
+ *
+ * Copilot is deliberately absent: since v1 fixes 2 item 19 its models are
+ * offered by base id only, discovered through the VS Code LM API, so there is
+ * no static Copilot seed left for the audit to partition.
+ */
+export function getSeededCatalogForAudit(): {
+  seeded: Readonly<Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>>;
+  geminiFallbackIds: readonly string[];
+  strippedFreeMarkerIds: readonly string[];
+} {
+  const gemini = CLI_PROVIDERS.find((def) => def.id === "gemini-cli");
+  return {
+    seeded: SEEDED_CLI_MODELS,
+    geminiFallbackIds: (gemini?.models ?? []).flatMap((m) => (m.model ? [m.model] : [])),
+    strippedFreeMarkerIds: STRIPPED_FREE_MARKER_IDS,
+  };
+}
 
 function createSeededCliModelCache(): Map<
   string,
@@ -1940,12 +1819,6 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
         name: baseName,
         providerLabel: "GitHub Copilot",
       });
-      for (const variant of createSeededCopilotReasoningVariants(
-        model,
-        baseName
-      )) {
-        pushSelectableModel(result, seenIds, variant);
-      }
     }
   } catch {
     // Copilot not signed in / not installed — CLI providers may still work.

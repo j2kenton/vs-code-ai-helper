@@ -20,6 +20,7 @@ import {
   advancePauseFenceGenerationV1,
   readOrInitPauseFenceGenerationV1,
 } from "../state/workAdmissionV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * v1 fixes item 1, Part 1b step 13 — the centralized effective-pause-status
@@ -73,7 +74,7 @@ void describe("effectivePauseStatusV1", () => {
       progressPath,
       restore: (): void => {
         bridge.restore();
-        fs.rmSync(container, { recursive: true, force: true });
+        safeRemoveDir(container);
       },
     };
   }

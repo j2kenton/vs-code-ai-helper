@@ -16,6 +16,7 @@ import {
   createBoundedResultStoreV1,
   RESULT_SPOOL_EXPIRY_MS_V1,
 } from "../services/boundedResultStoreV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 function makeCorrelation(): ActionCorrelationV1 {
   return {
@@ -44,7 +45,7 @@ function makeStore(): StoreFixture {
     setNow: (date: Date): void => {
       current = date;
     },
-    cleanup: (): void => fs.rmSync(rootDir, { recursive: true, force: true }),
+    cleanup: (): void => safeRemoveDir(rootDir),
   };
 }
 

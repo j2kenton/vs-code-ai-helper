@@ -28,6 +28,7 @@ import {
 import { fixtureOwnershipFor } from "./taskFolderFixture";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-review-degenerate-guard-"));
 let privateStorageDir: string;
@@ -40,8 +41,8 @@ before(() => {
 
 after(() => {
   resetWorkflowRuntimeServicesForTestV1();
-  fs.rmSync(ROOT, { recursive: true, force: true });
-  fs.rmSync(privateStorageDir, { recursive: true, force: true });
+  safeRemoveDir(ROOT);
+  safeRemoveDir(privateStorageDir);
 });
 
 function makeTaskFolder(name: string): string {

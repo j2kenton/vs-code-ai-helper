@@ -17,6 +17,7 @@ import * as vscode from "vscode";
 
 import { generateImplReviewContextPack } from "../utils/contextPack";
 import { formatAtomicTempBasename } from "../state/writeAtomic";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * Built by the owner's exported complete formatter (state/writeAtomic.ts) so
@@ -34,7 +35,7 @@ const WORKSPACE_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-context-pack-privacy-test-")
 );
 after(() => {
-  nodeFs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true });
+  safeRemoveDir(WORKSPACE_ROOT);
 });
 
 function writeFile(relPath: string, content: string): void {

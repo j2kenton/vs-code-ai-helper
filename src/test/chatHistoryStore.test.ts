@@ -52,6 +52,7 @@ import {
   getWorkflowPathRegistryV1,
 } from "../services/workflowRuntimeServicesV1";
 import { bindingIdForOwnedFolder, makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Reset Chat History (plan §5.1) requires a configured private-storage root
 // to write its verified pre-reset snapshot to; this test process never runs
@@ -121,7 +122,7 @@ void describe("chatHistoryStore round-trip", () => {
     try {
       assert.deepEqual(await readChatHistory(folder), []);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -140,7 +141,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.equal(raw.resetEpoch, 0);
       assert.deepEqual(raw.interactions, []);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -159,7 +160,7 @@ void describe("chatHistoryStore round-trip", () => {
       const last = read[read.length - 1]!;
       assert.deepEqual(last.proposedStageAction, { id: "setTaskStage", payload: { stage: "impl" } });
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -184,7 +185,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.ok(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)));
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -198,7 +199,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.equal(second.documentId, first.documentId);
       assert.equal(second.resetEpoch, first.resetEpoch);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -224,7 +225,7 @@ void describe("chatHistoryStore round-trip", () => {
       );
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -245,7 +246,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.equal(raw.schemaVersion, 1);
       assert.equal(typeof raw.documentId, "string");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -262,7 +263,7 @@ void describe("chatHistoryStore round-trip", () => {
       const compaction = raw.compaction as { compactedMessageCount: number };
       assert.equal(compaction.compactedMessageCount, 50);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -272,7 +273,7 @@ void describe("chatHistoryStore round-trip", () => {
       const huge = message("x".repeat(CHAT_HISTORY_MAX_MESSAGE_BYTES + 1));
       await assert.rejects(() => writeChatHistory(folder, [huge]), /65536-byte limit/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -294,7 +295,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.ok(compaction.compactedMessageCount > 0);
       assert.equal(typeof compaction.lastCompactionDigest, "string");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -317,7 +318,7 @@ void describe("chatHistoryStore round-trip", () => {
       assert.equal(last.pending, true);
       assert.equal(last.text, "still waiting for an answer");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -343,7 +344,7 @@ void describe("chatHistoryStore round-trip", () => {
         "the legacy recovery record must survive compaction despite being the oldest, non-pending message"
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -370,7 +371,7 @@ void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a co
       );
       assert.equal(read.length, 3);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -398,7 +399,7 @@ void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a co
         );
         assert.equal(read.length, concurrency + 1, "no message may be silently discarded by another writer");
       } finally {
-        fs.rmSync(folder, { recursive: true, force: true });
+        safeRemoveDir(folder);
       }
     }
   );
@@ -410,7 +411,7 @@ void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a co
       const read = await readChatHistory(folder);
       assert.deepEqual(read.map((m) => m.text), ["first ever message"]);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -438,7 +439,7 @@ void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a co
       );
       assert.equal(read.length, 2);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -448,7 +449,7 @@ void describe("appendChatMessageV1 (review-flagged 2026-08-23: safe against a co
       const huge = message("x".repeat(CHAT_HISTORY_MAX_MESSAGE_BYTES + 1));
       await assert.rejects(() => appendChatMessageV1(folder, huge), /65536-byte limit/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -471,7 +472,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
       assert.ok(channel.lines.some((l) => l.includes("chat-v1.json was unreadable")), "expected a diagnostic line");
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -489,7 +490,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
       assert.ok(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)));
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -510,7 +511,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
       assert.ok(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)));
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -531,7 +532,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
       assert.ok(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)));
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -565,7 +566,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
       );
     } finally {
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -604,7 +605,7 @@ void describe("chatHistoryStore corrupt-file quarantine", () => {
     } finally {
       patch.restore();
       (vscode.window as unknown as Record<string, unknown>).createOutputChannel = originalCreate;
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -633,7 +634,7 @@ void describe("chatHistoryStore read failures other than not-found", () => {
       assert.equal(fs.existsSync(path.join(folder, CHAT_HISTORY_CORRUPT_FILENAME)), false);
     } finally {
       patch.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -658,7 +659,7 @@ void describe("chatHistoryStore read failures other than not-found", () => {
       );
     } finally {
       patch.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -689,7 +690,7 @@ void describe("chatHistoryStore read failures other than not-found", () => {
       assert.deepEqual(updates, [], "the legacy key must not be touched when the stat failure prevents migration");
     } finally {
       patch.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -720,7 +721,7 @@ void describe("chatHistoryStore legacy migration", () => {
       assert.deepEqual(second.map((m) => m.text), ["legacy-1", "legacy-2"]);
       assert.deepEqual(updates, []);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -735,7 +736,7 @@ void describe("chatHistoryStore legacy migration", () => {
       assert.deepEqual(result.map((m) => m.text), ["file-is-authoritative"]);
       assert.deepEqual(updates, [], "an existing file must not trigger migration or touch the legacy key");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -762,7 +763,7 @@ void describe("chatHistoryStore legacy migration", () => {
       assert.equal(fs.existsSync(targetFile), false);
     } finally {
       patch.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -773,7 +774,7 @@ void describe("chatHistoryStore legacy migration", () => {
       const result = await loadTranscriptWithMigration(folder, folder, memento);
       assert.deepEqual(result, []);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -790,7 +791,7 @@ void describe("chatHistoryStore legacy migration", () => {
       const result = await loadTranscriptWithMigration(folder, canonicalId, memento);
       assert.deepEqual(result.map((m) => m.text), ["belongs-to-this-task"]);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -821,7 +822,7 @@ void describe("chatHistoryStore legacy migration", () => {
         (error: unknown) => error instanceof ChatHistoryRecoveryErrorV1
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -871,7 +872,7 @@ void describe("chatHistoryStore structured interactions and Reset", () => {
       const resetInteractions = afterReset.interactions as Array<{ state: string }>;
       assert.equal(resetInteractions[0]!.state, "resetByChatRecovery");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -892,7 +893,7 @@ void describe("chatHistoryStore structured interactions and Reset", () => {
       await appendChatInteraction(folder, canonicalId, interaction);
       await assert.rejects(() => appendChatInteraction(folder, canonicalId, interaction));
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -911,7 +912,7 @@ void describe("chatHistoryStore structured interactions and Reset", () => {
       assert.equal(fs.readFileSync(path.join(folder, CHAT_HISTORY_FILENAME), "utf8"), before);
     } finally {
       patch.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -927,7 +928,7 @@ void describe("chatHistoryStore structured interactions and Reset", () => {
       assert.deepEqual(raw.interactions, []);
       assert.equal(raw.resetEpoch, 0);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -953,7 +954,7 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       await assert.rejects(() => writeChatHistory(folder, [message("hi")]), /has no task-progress\.json/);
       assert.equal(fs.existsSync(path.join(folder, CHAT_HISTORY_FILENAME)), false);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -972,7 +973,7 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       await assert.rejects(() => writeChatHistory(folder, [message("hi")]), /carries no ownership binding/);
       assert.equal(fs.existsSync(path.join(folder, CHAT_HISTORY_FILENAME)), false);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -984,7 +985,7 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       assert.equal(raw.taskBindingSource, "ownershipDerived");
       assert.equal(raw.taskBindingId, bindingIdForOwnedFolder(folder));
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1009,7 +1010,7 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       // The refusal happens before anything is read or written.
       assert.equal(fs.existsSync(path.join(folder, CHAT_HISTORY_FILENAME)), false);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -1031,7 +1032,7 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       assert.ok(root, "expected the assistant folder to be registered");
       assert.equal(getWorkflowPathRegistryV1().rootKind(root.rootId), "nonTaskStorage");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });

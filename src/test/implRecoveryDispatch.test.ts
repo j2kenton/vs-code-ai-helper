@@ -51,6 +51,7 @@ import {
 } from "../commands/implementationRecoveryV1";
 import { IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1 } from "../utils/implementationArtifactResolver";
 import { registerReviewActionCommands } from "../commands/reviewActions";
+import { safeRemoveDir } from "./testFsUtils";
 
 /**
  * `armAll()` (exercised throughout this file) may reach the watchdog sweep's
@@ -66,7 +67,7 @@ setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
 );
 after(() => {
   setWorkAdmissionRootOverrideForTestV1(undefined);
-  fs.rmSync(admissionTestRootV1, { recursive: true, force: true });
+  safeRemoveDir(admissionTestRootV1);
 });
 
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -454,7 +455,7 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
 void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecoveryV1 (2026-09-15 post-freeze findings, item 5)", () => {
   const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-recovery-retire-"));
   after(() => {
-    fs.rmSync(ROOT, { recursive: true, force: true });
+    safeRemoveDir(ROOT);
   });
 
   function installFsStub(): () => void {
@@ -525,6 +526,251 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
           "the previously-pending file must be promoted into review scope, not silently dropped"
         );
       } finally {
+        restore();
+      }
+    });
+
+    // v1 fixes 2, item 1: a form-rejected round leaves the last usable summary
+    // in place, so "usable" alone no longer proves the continuation answered
+    // the debt — only a summary written AFTER the recovery record does.
+    void it("does not retire a summaryRejected recovery on a preserved summary older than the record", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_preserved_older");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = Date.now();
+      fs.utimesSync(summaryPath, new Date(recordedAt - 60_000), new Date(recordedAt - 60_000));
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: new Date(recordedAt).toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> =>
+        Promise.resolve({ mtime: fs.statSync(uri.fsPath).mtimeMs });
+      try {
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), false);
+        assert.notEqual(readProgress(folderPath).implRecovery, undefined);
+
+        // The continuation then writes a fresh summary after the record.
+        const later = new Date(recordedAt + 60_000);
+        fs.writeFileSync(summaryPath, "## Files Changed\n\n- src/a.ts\n", "utf8");
+        fs.utimesSync(summaryPath, later, later);
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), true);
+        assert.equal(readProgress(folderPath).implRecovery, undefined);
+      } finally {
+        fsRecord.stat = originalStat;
+        restore();
+      }
+    });
+
+    // Equal timestamps carry no ordering evidence, so they must fail closed.
+    void it("does not retire a summaryRejected recovery when the summary mtime equals the record timestamp", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_equal_mtime");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+      fs.utimesSync(summaryPath, recordedAt, recordedAt);
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: recordedAt.toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> =>
+        Promise.resolve({ mtime: fs.statSync(uri.fsPath).mtimeMs });
+      try {
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), false);
+        const after = readProgress(folderPath);
+        assert.notEqual(after.implRecovery, undefined);
+        assert.deepEqual(after.pendingImplReviewFiles, ["src/a.ts"]);
+      } finally {
+        fsRecord.stat = originalStat;
+        restore();
+      }
+    });
+
+    // Interleaving: a continuation overwrites the preserved usable summary with
+    // an unusable stamp after the helper read the usable content but before it
+    // takes the mtime. The old content must not be paired with the new mtime.
+    void it("does not retire a summaryRejected recovery when the summary is rewritten between the content read and the mtime stat", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_interleaved_write");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+      const older = new Date(recordedAt.getTime() - 60_000);
+      fs.utimesSync(summaryPath, older, older);
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: recordedAt.toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      let statCalls = 0;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> => {
+        statCalls += 1;
+        if (statCalls === 2) {
+          // The stat that follows the content read: the file was just replaced.
+          fs.writeFileSync(
+            summaryPath,
+            `${IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1}\n\nThis round's report was not usable.\n`,
+            "utf8"
+          );
+          const later = new Date(recordedAt.getTime() + 60_000);
+          fs.utimesSync(summaryPath, later, later);
+        }
+        return Promise.resolve({ mtime: fs.statSync(uri.fsPath).mtimeMs });
+      };
+      try {
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), false);
+        const after = readProgress(folderPath);
+        assert.notEqual(after.implRecovery, undefined);
+        assert.deepEqual(after.pendingImplReviewFiles, ["src/a.ts"]);
+      } finally {
+        fsRecord.stat = originalStat;
+        restore();
+      }
+    });
+
+    // Interleaving: the summary is replaced after the helper's second stat has
+    // validated a usable, newer file but before the progress write commits. The
+    // final revalidation under the progress lock must keep the recovery.
+    void it("does not retire a summaryRejected recovery when the summary is rewritten after validation but before the progress write", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_write_window");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+      const newer = new Date(recordedAt.getTime() + 60_000);
+      fs.utimesSync(summaryPath, newer, newer);
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: recordedAt.toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      let statCalls = 0;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> => {
+        statCalls += 1;
+        // Calls 1 and 2 are the pre/post-read snapshot; call 3 is the first
+        // stat inside the pre-write revalidation. Replace the file just before.
+        if (statCalls === 3) {
+          fs.writeFileSync(
+            summaryPath,
+            `${IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1}\n\nThis round's report was not usable.\n`,
+            "utf8"
+          );
+          const later = new Date(newer.getTime() + 60_000);
+          fs.utimesSync(summaryPath, later, later);
+        }
+        return Promise.resolve({ mtime: fs.statSync(uri.fsPath).mtimeMs });
+      };
+      try {
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), false);
+        const after = readProgress(folderPath);
+        assert.notEqual(after.implRecovery, undefined);
+        assert.deepEqual(after.pendingImplReviewFiles, ["src/a.ts"]);
+      } finally {
+        fsRecord.stat = originalStat;
+        restore();
+      }
+    });
+
+    void it("restores the owed continuation when the summary is rewritten after the pre-write check but before the commit is confirmed", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_post_commit_window");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+      const newer = new Date(recordedAt.getTime() + 60_000);
+      fs.utimesSync(summaryPath, newer, newer);
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: recordedAt.toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      let statCalls = 0;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> => {
+        statCalls += 1;
+        // Calls 1-2: pre/post-read snapshot. Calls 3-4: the pre-write check
+        // (before/after its read). Call 5 is the first stat of the post-commit
+        // revalidation: rewrite the summary just before it, i.e. after the
+        // pre-write check passed and the progress write already committed.
+        if (statCalls === 5) {
+          fs.writeFileSync(
+            summaryPath,
+            `${IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1}\n\nThis round's report was not usable.\n`,
+            "utf8"
+          );
+          const later = new Date(newer.getTime() + 60_000);
+          fs.utimesSync(summaryPath, later, later);
+        }
+        return Promise.resolve({ mtime: fs.statSync(uri.fsPath).mtimeMs });
+      };
+      try {
+        assert.equal(await retireSatisfiedSummaryRejectedRecoveryV1(folderUri), false);
+        const after = readProgress(folderPath);
+        assert.notEqual(after.implRecovery, undefined);
+        assert.deepEqual(after.pendingImplReviewFiles, ["src/a.ts"]);
+        assert.equal(after.implReviewFiles?.includes("src/a.ts") ?? false, false);
+      } finally {
+        fsRecord.stat = originalStat;
+        restore();
+      }
+    });
+
+    void it("keeps the gate closed when an unusable stamp lands after the final validation, because the stamp writer arms its own recovery first", async () => {
+      const { folderUri, folderPath } = makeTaskFolder("retire_after_final_check");
+      const summaryPath = path.join(folderPath, "impl-summary.md");
+      fs.writeFileSync(summaryPath, "## Files Changed\n\n_none_\n", "utf8");
+      const recordedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+      const newer = new Date(recordedAt.getTime() + 60_000);
+      fs.utimesSync(summaryPath, newer, newer);
+      seedProgress(folderPath, {
+        implRecovery: pendingRecord({ trigger: "summaryRejected", at: recordedAt.toISOString() }),
+        pendingImplReviewFiles: ["src/a.ts"],
+      });
+
+      const restore = installFsStub();
+      const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalStat = fsRecord.stat;
+      let statCalls = 0;
+      fsRecord.stat = (uri: vscode.Uri): Promise<{ mtime: number }> => {
+        statCalls += 1;
+        const mtime = fs.statSync(uri.fsPath).mtimeMs;
+        // Call 6 is the last stat of the post-commit revalidation. Everything
+        // after it is the unobserved window: play the stamp writer's own
+        // ordering — record a fresh implRecovery first, then write the stamp.
+        if (statCalls === 6) {
+          const later = new Date(newer.getTime() + 60_000);
+          seedProgress(folderPath, {
+            implRecovery: pendingRecord({ trigger: "summaryRejected", at: later.toISOString() }),
+            pendingImplReviewFiles: ["src/b.ts"],
+          });
+          fs.writeFileSync(
+            summaryPath,
+            `${IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1}\n\nThis round's report was not usable.\n`,
+            "utf8"
+          );
+          fs.utimesSync(summaryPath, later, later);
+        }
+        return Promise.resolve({ mtime });
+      };
+      try {
+        await retireSatisfiedSummaryRejectedRecoveryV1(folderUri);
+        const after = readProgress(folderPath);
+        assert.notEqual(after.implRecovery, undefined, "the stamp's own recovery record must still gate advancement");
+        assert.deepEqual(after.pendingImplReviewFiles, ["src/b.ts"]);
+      } finally {
+        fsRecord.stat = originalStat;
         restore();
       }
     });
@@ -630,11 +876,11 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
   });
 
   void describe("discardOwedImplRecoveryV1", () => {
-    void it("clears the recovery record and its quarantined pending files WITHOUT promoting them into review scope", async () => {
+    void it("clears the owed continuation and promotes its quarantined pending files into review scope", async () => {
       const { folderUri, folderPath } = makeTaskFolder("discard_owed");
       seedProgress(folderPath, {
         implRecovery: pendingRecord({ trigger: "summaryRejected", dispatch: "dispatched" }),
-        pendingImplReviewFiles: ["src/should-not-be-reviewed.ts"],
+        pendingImplReviewFiles: ["src/should-be-reviewed.ts"],
         incompleteRoundContinuations: 2,
       });
 
@@ -647,12 +893,12 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
         assert.equal(after.pendingImplReviewFiles, undefined);
         assert.equal(
           after.incompleteRoundContinuations,
-          2,
-          "discard removes only the recovery record and quarantined pending-review paths — the continuation budget counter is unrelated state and must survive so a future recovery cannot restart its budget from zero"
+          undefined,
+          "per the release scope ('offer Discard this owed continuation, promoting the quarantined files to review scope') and Part 1 step 5, discard clears implRecovery AND incompleteRoundContinuations in the same transform as a normal promotion"
         );
         assert.ok(
-          !(after.implReviewFiles ?? []).includes("src/should-not-be-reviewed.ts"),
-          "a discarded continuation's files must never enter review scope — that is the difference from retiring"
+          (after.implReviewFiles ?? []).includes("src/should-be-reviewed.ts"),
+          "discard must promote the quarantined files into review scope, exactly as retireSatisfiedSummaryRejectedRecoveryV1 does — the continuation being discarded is the obligation to re-report, not the already-applied edits themselves"
         );
         // v1 fixes 2, Wave I chokepoint (clears a recovery): discard is only
         // ever reached from an explicit user click and dispatches nothing of
@@ -680,18 +926,17 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
     });
 
     /**
-     * Part 5 step 34's own wording: "record the action, and re-evaluate
-     * advancement immediately" — a discard that only cleared state and left
-     * the user to click "Complete Stage & Move On" a second time would still
-     * be the friction the finding names as a dead end. Driven through the
-     * REAL registered "vs-code-ai-helper.discardOwedImplRecoveryV1" command
-     * (the exact invocation the refusal's notification button makes, per
-     * reviewActions.ts's `nextStage` catch site), with only the confirmation
-     * prompt and the `nextStage` re-entry itself faked — same shape as
-     * restoreRejectedImplementationRound.test.ts's rerun-on-success wiring
-     * tests for the analogous restore action.
+     * 2026-09-18 review fix (narrowed blocker
+     * d1b82577-74db-4b46-880d-29a903207a6a-1): a successful discard must NOT
+     * auto-advance the stage — the promoted files still need a fresh review
+     * before the task can move on, since discarding only means "stop waiting
+     * for the conforming re-report", not "this stage is now reviewed".
+     * Driven through the REAL registered
+     * "vs-code-ai-helper.discardOwedImplRecoveryV1" command (the exact
+     * invocation the refusal's notification button makes), with only the
+     * confirmation prompt and the `nextStage` re-entry itself faked.
      */
-    void it("re-invokes vs-code-ai-helper.nextStage with {taskFolderPath} after a confirmed, successful discard", async () => {
+    void it("does NOT re-invoke vs-code-ai-helper.nextStage after a confirmed, successful discard", async () => {
       const { folderPath } = makeTaskFolder("discard_reevaluates");
       seedProgress(folderPath, {
         implRecovery: pendingRecord({ trigger: "summaryRejected", dispatch: "dispatched" }),
@@ -718,8 +963,16 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
           "vs-code-ai-helper.discardOwedImplRecoveryV1",
           folderPath
         );
-        assert.deepEqual(nextStageCalls, [{ taskFolderPath: folderPath }]);
+        assert.deepEqual(
+          nextStageCalls,
+          [],
+          "discard must promote files into review scope without bypassing the review gate by auto-advancing"
+        );
         assert.equal(readProgress(folderPath).implRecovery, undefined);
+        assert.ok(
+          (readProgress(folderPath).implReviewFiles ?? []).length >= 0,
+          "discard still clears implRecovery even though it no longer advances the stage"
+        );
       } finally {
         vscode.window.showWarningMessage = originalShowWarningMessage;
         deactivateNotificationRouter();
@@ -827,6 +1080,33 @@ void describe("describeOwedImplRecoveryRefusalV1 / isImplRecoveryDiscardOfferabl
     assert.equal(isImplRecoveryDiscardOfferableV1(recovery, baseProgress, BASE_NOW), false);
     const message = describeOwedImplRecoveryRefusalV1(recovery, baseProgress, BASE_NOW);
     assert.match(message, /a continuation round is running or holds an unexpired lease/);
+    assert.ok(!message.includes("Discard this owed continuation"));
+  });
+
+  void it("offers the discard hint for a pending recovery whose continuation budget is exhausted (v1 fixes 2, items 15/21)", () => {
+    // beginImplementationRecoveryV1 leaves `dispatch: "pending"` with no lease
+    // exactly when the cap is reached — nothing will ever flip it to
+    // "dispatched" or re-arm it, so it is unrecoverable despite never having
+    // gone stale in the "dispatched" sense.
+    const recovery = pendingRecord({ trigger: "roundIncomplete" });
+    const progressAtCap: TaskProgress = {
+      ...baseProgress,
+      incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+    };
+    assert.equal(isImplRecoveryDiscardOfferableV1(recovery, progressAtCap, BASE_NOW), true);
+    const message = describeOwedImplRecoveryRefusalV1(recovery, progressAtCap, BASE_NOW);
+    assert.match(message, /Status: pending/);
+    assert.match(message, /Discard this owed continuation/);
+  });
+
+  void it("does not offer the discard hint for a pending recovery still under its continuation budget", () => {
+    const recovery = pendingRecord({ trigger: "roundIncomplete" });
+    const progressUnderCap: TaskProgress = {
+      ...baseProgress,
+      incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 - 1,
+    };
+    assert.equal(isImplRecoveryDiscardOfferableV1(recovery, progressUnderCap, BASE_NOW), false);
+    const message = describeOwedImplRecoveryRefusalV1(recovery, progressUnderCap, BASE_NOW);
     assert.ok(!message.includes("Discard this owed continuation"));
   });
 });

@@ -567,7 +567,7 @@ void describe("resumeStrandedTaskDeletionsV1", () => {
           currentTaskCheckpointObserved: true,
         });
         assert.equal(requested.kind, "ok");
-        fs.rmSync(taskFolderPath, { recursive: true, force: true });
+        safeRemoveDir(taskFolderPath);
         const folderRemoved = await recordFolderRemovedV1(harness.metaFolderPath, taskFolderPath);
         assert.equal(folderRemoved.kind, "ok");
 
@@ -638,7 +638,7 @@ void describe("resumeStrandedTaskDeletionsV1", () => {
         currentTaskCheckpointObserved: false,
       });
       assert.equal(requested.kind, "ok");
-      fs.rmSync(taskFolderPath, { recursive: true, force: true });
+      safeRemoveDir(taskFolderPath);
       assert.equal((await recordFolderRemovedV1(harness.metaFolderPath, taskFolderPath)).kind, "ok");
 
       await resumeStrandedTaskDeletionsV1(harness.metaFolderPath, harness.currentTaskStore, harness.inventory);

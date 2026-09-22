@@ -27,6 +27,7 @@ import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
 import { claimReviewAttempt } from "../commands/reviewActions";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 configureWorkflowPrivateStorageRootV1(
   fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-automation-chain-private-"))
@@ -581,7 +582,7 @@ void test("a successful automation dispatch opens and closes its own round-ledge
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();
-    fs.rmSync(fixture.folder, { recursive: true, force: true });
+    safeRemoveDir(fixture.folder);
   }
 });
 
@@ -616,7 +617,7 @@ void test("a failing automation dispatch closes its round-ledger row as failed, 
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();
-    fs.rmSync(fixture.folder, { recursive: true, force: true });
+    safeRemoveDir(fixture.folder);
   }
 });
 
@@ -665,7 +666,7 @@ void test("automation disabled before dispatch closes its round-ledger row as dr
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();
-    fs.rmSync(fixture.folder, { recursive: true, force: true });
+    safeRemoveDir(fixture.folder);
   }
 });
 
@@ -706,7 +707,7 @@ void test("a root operation ending unsuccessfully closes the deferred chain's ro
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();
-    fs.rmSync(fixture.folder, { recursive: true, force: true });
+    safeRemoveDir(fixture.folder);
   }
 });
 
@@ -771,6 +772,6 @@ void test("an automation-dispatched review reuses the generic row (one identity,
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();
-    fs.rmSync(fixture.folder, { recursive: true, force: true });
+    safeRemoveDir(fixture.folder);
   }
 });

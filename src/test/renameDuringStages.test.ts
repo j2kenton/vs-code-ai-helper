@@ -35,6 +35,7 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { readTaskProgressForTest } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** The strict reader goes through vscode.workspace.fs — bridge it to the
  * real filesystem for this suite (same helper shape as
@@ -286,7 +287,7 @@ void describe("rename availability during running stages", () => {
       assert.equal(progress.updatedAt, "2026-08-14T00:00:00.000Z");
     } finally {
       bridge.restore();
-      fs.rmSync(container, { recursive: true, force: true });
+      safeRemoveDir(container);
     }
   });
 });

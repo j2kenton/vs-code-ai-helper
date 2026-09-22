@@ -13,6 +13,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 import { openPlanFinalV1, openPlanNonGoalsV1 } from "../commands/openPlanNonGoalsV1";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -23,7 +24,7 @@ class RecordingSurface {
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-open-plan-non-goals-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolder(name: string): string {

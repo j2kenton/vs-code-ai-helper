@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import * as vscode from "vscode";
 import { goToReviewAndApplyV1 } from "../commands/goToReviewAndApplyV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Commands dispatched during one test, in order. */
 let dispatched: { command: string; arg: unknown }[] = [];
@@ -96,7 +97,7 @@ beforeEach(() => {
 afterEach(() => {
   (vscode.commands as { executeCommand: unknown }).executeCommand = originalExecuteCommand;
   restoreFs();
-  fs.rmSync(tempRoot, { recursive: true, force: true });
+  safeRemoveDir(tempRoot);
 });
 
 void describe("goToReviewAndApplyV1 — stage change fails silently", () => {

@@ -30,6 +30,7 @@ import {
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
 
 const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
 
@@ -37,7 +38,7 @@ const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-publish-checks-freshness-test-")
 );
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeTaskFolder(name: string): vscode.Uri {

@@ -19,6 +19,7 @@ import { TaskStatusBar } from "../views/taskStatusBar";
 import { IncompleteTask } from "../types/incompleteTask";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -944,7 +945,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspaceFs.readFile = originalReadFile;
         workspaceFs.stat = originalStat;
         workspaceFs.writeFile = originalWriteFile;
-        fs.rmSync(root, { recursive: true, force: true });
+        safeRemoveDir(root);
       }
     });
 
@@ -1023,7 +1024,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         (workspace.fs as typeof vscode.workspace.fs).readFile = origReadFile;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
-        fs.rmSync(tempRoot, { recursive: true, force: true });
+        safeRemoveDir(tempRoot);
         deactivateNotificationRouter();
       }
     });
@@ -1209,7 +1210,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();
-        fs.rmSync(multiRootParent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+        safeRemoveDir(multiRootParent);
       }
     });
   });

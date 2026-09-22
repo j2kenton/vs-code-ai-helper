@@ -700,7 +700,13 @@ void describe("SettingsViewProvider webview — draft restore across disposal", 
     assert.match(html, /button:focus-visible, select:focus-visible, input\[type="text"\]:focus-visible/);
     assert.match(html, /role="status" aria-live="polite"/);
     assert.doesNotMatch(html, /<h2[^>]*>\s*AI Models\s*<\/h2>/i);
-    assert.doesNotMatch(html, /#[0-9a-f]{3,8}\b|\b(?:rgb|hsl)a?\(/i);
+    // No hard-coded colours, except the two documented theme-kind overrides
+    // of --ensemble-info-foreground (pure black on light, pure white on
+    // dark — the requested full-contrast helper text).
+    const withoutInfoOverrides = html
+      .replace(/body\.vscode-light\s*\{\s*--ensemble-info-foreground:\s*#000000;\s*\}/, "")
+      .replace(/body\.vscode-dark\s*\{\s*--ensemble-info-foreground:\s*#ffffff;\s*\}/, "");
+    assert.doesNotMatch(withoutInfoOverrides, /#[0-9a-f]{3,8}\b|\b(?:rgb|hsl)a?\(/i);
   });
 
   void it("restores a dirty draft, with a notice, after the document is disposed and recreated", async () => {

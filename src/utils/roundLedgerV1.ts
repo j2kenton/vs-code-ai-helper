@@ -251,8 +251,9 @@ import {
 } from "../types/taskProgress";
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { appendRoundOutcome, pauseTaskWithReason, pauseTaskWithReasonForClaimV1, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
+import { appendRoundOutcome, handBackToHumanAfterCompletedRoundV1, pauseTaskWithReason, pauseTaskWithReasonForClaimV1, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
+import { stepOutcomeNameV1 } from "./stepLabelsV1";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
  * value except the two live states. */
@@ -465,7 +466,10 @@ export type TerminalizeRoundNoLiveRowResultV1 =
  * plain-text reader of the transcript sees. */
 export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceStartedAt?: string): string {
   const stageName = STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage;
-  const parts: string[] = [`_Ended: ${stageName} — ${entry.state}`];
+  // One plain name per step across row, notification and this line
+  // (v1 fixes 2, step 10): "Apply Review (High-Level Code Review)", not a bare
+  // stage name that hides which action the round ran.
+  const parts: string[] = [`_Ended: ${stepOutcomeNameV1(entry.mode, stageName)} — ${entry.state}`];
   if (entry.continuationOf) {
     const started = sourceStartedAt
       ? new Date(sourceStartedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -668,7 +672,9 @@ export async function terminalizeRoundV1(
     if (options.postTerminalizePatch) {
       next = options.postTerminalizePatch(next, nextEntry);
     }
-    return next;
+    // v1 fixes 2, item 8: a completed round that arranged nothing further
+    // hands the task back to the human (see the transform's doc comment).
+    return handBackToHumanAfterCompletedRoundV1(next, nextEntry);
   });
 
   if (resultKind === "notFound") {

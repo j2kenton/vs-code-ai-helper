@@ -35,6 +35,7 @@ import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { computeTaskBindingIdV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { fixtureOwnershipFor, makeOwnedTaskFolder } from "./taskFolderFixture";
+import { safeRemoveDir } from "./testFsUtils";
 
 function makeTaskFolder(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-workflow-runtime-"));
@@ -88,7 +89,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       // A refused folder registers no root at all.
       assert.equal(getWorkflowPathRegistryV1().registeredRoots().length, 0);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -105,7 +106,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
         /could not be read as a regular file/
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -116,7 +117,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       writeProgress(folder, {});
       const rootId = ensureWorkflowTaskFolderRootV1(folder);
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), true);
-      fs.rmSync(path.join(folder, TASK_PROGRESS_FILENAME), { force: true });
+      fs.rmSync(path.join(folder, TASK_PROGRESS_FILENAME), { force: true }); // deliberate: removal is the behaviour under test, not teardown
       fs.mkdirSync(path.join(folder, TASK_PROGRESS_FILENAME));
       assert.throws(
         () => ensureWorkflowTaskFolderRootV1(folder),
@@ -125,7 +126,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), false);
       assert.equal(getVerifiedTaskBindingIdV1(rootId), undefined);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -148,7 +149,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       // The folder's progress now breaks re-verification (unreadable, not
       // merely absent) — `registerRoot` itself is one-time and would NOT by
       // itself withdraw trust from the already-registered root object.
-      fs.rmSync(path.join(folder, TASK_PROGRESS_FILENAME), { force: true });
+      fs.rmSync(path.join(folder, TASK_PROGRESS_FILENAME), { force: true }); // deliberate: removal is the behaviour under test, not teardown
       fs.mkdirSync(path.join(folder, TASK_PROGRESS_FILENAME));
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /could not be read as a regular file/);
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), false);
@@ -165,7 +166,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       const read = await fileStore.readFileBounded(locator, 1024);
       assert.equal(read.kind, "ok");
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -177,7 +178,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /carries no ownership binding/);
       assert.equal(getWorkflowPathRegistryV1().registeredRoots().length, 0);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -192,7 +193,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), true);
       assert.equal(getVerifiedTaskBindingIdV1(rootId), fixture.bindingId);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -216,7 +217,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
         /not contained within its persisted ownership\.metaRoot, a configured task root, or any currently open workspace folder/
       );
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -242,8 +243,8 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       );
     } finally {
       stub.restore();
-      fs.rmSync(uncontainedFolder, { recursive: true, force: true });
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(uncontainedFolder);
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -259,7 +260,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.throws(() => ensureWorkflowTaskFolderRootV1(nestedFolder), /carries no ownership binding/);
     } finally {
       stub.restore();
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -270,7 +271,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       writeProgress(folder, { taskFolder: "some-other-task-folder" });
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /does not decode as valid task progress/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -297,8 +298,8 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.equal(bindingId, computeTaskBindingIdV1(ownership, path.basename(folder)));
     } finally {
       stub.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(folder);
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -323,8 +324,8 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       );
     } finally {
       stub.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
-      fs.rmSync(otherOpenRoot, { recursive: true, force: true });
+      safeRemoveDir(folder);
+      safeRemoveDir(otherOpenRoot);
     }
   });
 
@@ -342,7 +343,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       });
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /ownership binding could not be validated/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -361,7 +362,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /does not decode as valid task progress/);
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(first), false);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -373,7 +374,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), true);
       assert.equal(getVerifiedTaskBindingIdV1(rootId), fixture.bindingId);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -393,7 +394,7 @@ void describe("workflowRuntimeServicesV1 — task-folder root trust", () => {
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), false);
       assert.equal(getVerifiedTaskBindingIdV1(rootId), undefined);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 });
@@ -411,7 +412,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
       assert.equal(isWorkflowTaskFolderRootVerifiedV1(rootId), false);
       assert.equal(getVerifiedTaskBindingIdV1(rootId), undefined);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -425,7 +426,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
       );
       assert.equal(getWorkflowPathRegistryV1().registeredRoots().length, 0);
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -439,7 +440,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
         /already registered as a taskFolder root/
       );
     } finally {
-      fs.rmSync(fixture.folder, { recursive: true, force: true });
+      safeRemoveDir(fixture.folder);
     }
   });
 
@@ -453,7 +454,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
       writeProgress(folder, {});
       assert.throws(() => ensureWorkflowTaskFolderRootV1(folder), /already registered as a nonTaskStorage root/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -464,7 +465,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
       const rootId = ensureWorkflowNonTaskStorageRootV1(folder);
       assert.throws(() => getWorkflowPathRegistryV1().creationSentinelFile(rootId), /taskFolder/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -476,7 +477,7 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
       writeProgress(folder, {});
       assert.throws(() => ensureWorkflowNonTaskStorageRootV1(folder), /carries task-progress\.json/);
     } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 });
@@ -502,8 +503,8 @@ void describe("workflowRuntimeServicesV1 — resolveWorkflowAllocatedFsPathV1", 
       assert.equal(resolved, path.join(path.resolve(folder), "chat-v1.json"));
     } finally {
       stub.restore();
-      fs.rmSync(folder, { recursive: true, force: true });
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      safeRemoveDir(folder);
+      safeRemoveDir(workspaceRoot);
     }
   });
 
@@ -576,7 +577,7 @@ void describe("workflowRuntimeServicesV1 — getProviderResultSpoolStoreV1", () 
       assert.equal(fs.readFileSync(expectedPath, "utf8"), "hello");
       assert.equal(ref.operationId, correlation.operationId);
     } finally {
-      fs.rmSync(privateRoot, { recursive: true, force: true });
+      safeRemoveDir(privateRoot);
     }
   });
 
@@ -587,7 +588,7 @@ void describe("workflowRuntimeServicesV1 — getProviderResultSpoolStoreV1", () 
       configureWorkflowPrivateStorageRootV1(privateRoot);
       assert.equal(getProviderResultSpoolStoreV1(), getProviderResultSpoolStoreV1());
     } finally {
-      fs.rmSync(privateRoot, { recursive: true, force: true });
+      safeRemoveDir(privateRoot);
     }
   });
 

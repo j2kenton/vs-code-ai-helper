@@ -1305,7 +1305,11 @@ export async function runImplementationForModel(options: {
         ? "a quota/rate limit"
         : result.failureKind === "model-entitlement"
           ? "a model-entitlement block"
-          : "the provider being temporarily unavailable";
+          : result.timeoutReason === "inactivity"
+            ? "the inactivity watchdog (no output for too long)"
+            : result.timeoutReason === "wall-clock" || result.timedOut === true
+              ? "the wall-clock time limit"
+              : "the provider being temporarily unavailable";
     // Part 15 / item 7b: resolve (never dispatch) the first enabled backup
     // that is currently available, applying the SAME skip rules the clean-
     // tree cascade loop above applies (recent zero-file breaker, cross-

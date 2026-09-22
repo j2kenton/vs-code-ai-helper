@@ -139,6 +139,8 @@ interface PanelHarness {
   byId(id: string): FakeElement;
   /** What the panel sent back to the extension. */
   readonly outbound: unknown[];
+  /** Every string the panel wrote to `navigator.clipboard`. */
+  readonly clipboardWrites: string[];
 }
 
 /** Run every inline script of the panel over a DOM stub. */
@@ -155,6 +157,7 @@ function runPanel(): PanelHarness {
     "busy-indicator",
     "busy-spinner",
     "busy-text",
+    "steering-note",
     "form",
     "message",
   ]) {
@@ -168,6 +171,7 @@ function runPanel(): PanelHarness {
   elements.get("busy-text")!.textContent = "No task is running.";
   const windowListeners = new Map<string, ((event: unknown) => void)[]>();
   const outbound: unknown[] = [];
+  const clipboardWrites: string[] = [];
   const documentElement = makeElement("html");
   const context = vm.createContext({
     console,
@@ -179,12 +183,24 @@ function runPanel(): PanelHarness {
       getState: () => undefined,
       setState: () => undefined,
     }),
-    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    navigator: {
+      clipboard: {
+        writeText: (text: string) => {
+          clipboardWrites.push(text);
+          return Promise.resolve();
+        },
+      },
+    },
     document: {
       documentElement: { ...documentElement, scrollHeight: 1000, clientHeight: 500 },
       body: makeElement("body"),
       getElementById: (id: string) => elements.get(id) ?? null,
       createElement: (tag: string) => makeElement(tag),
+      createTextNode: (text: string) => {
+        const node = makeElement("#text");
+        node.textContent = text;
+        return node;
+      },
       addEventListener: () => undefined,
     },
     JSON,
@@ -226,7 +242,19 @@ function runPanel(): PanelHarness {
       return element;
     },
     outbound,
+    clipboardWrites,
   };
+}
+
+/** Depth-first search of the fake DOM for elements with a class name. */
+function findByClass(root: FakeElement, className: string): FakeElement[] {
+  const found: FakeElement[] = [];
+  const visit = (element: FakeElement): void => {
+    if (element.className.split(/\s+/).includes(className)) found.push(element);
+    element.children.forEach(visit);
+  };
+  visit(root);
+  return found;
 }
 
 function stateMessage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -243,6 +271,94 @@ function stateMessage(overrides: Record<string, unknown> = {}): Record<string, u
     ...overrides,
   };
 }
+
+void describe("the chat panel's interaction and decision cards", () => {
+  const interaction = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    interactionId: "i1",
+    operationId: "op1",
+    questions: [
+      {
+        questionId: "q1",
+        kind: "singleChoice",
+        prompt: "Which way?",
+        required: true,
+        options: [
+          { optionId: "a", label: "Left" },
+          { optionId: "b", label: "Right" },
+        ],
+      },
+    ],
+    atLabel: "10:15",
+    atTitle: "9/20/2026, 10:15:00 AM",
+    copyText: "Needs your reply\nWhich way? *\n- Left\n- Right",
+    ...overrides,
+  });
+  const decision = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    decisionId: "d1",
+    whatHappened: "A round failed.",
+    whyUserNeeded: "Cannot decide alone.",
+    options: [{ optionId: "o1", label: "Retry", consequence: "Runs again.", destructive: false }],
+    recommendation: { kind: "none", reasoning: "No basis." },
+    gatingLine: "Unblocks: nothing",
+    isGating: false,
+    isBlockingDecision: true,
+    atLabel: "10:20",
+    atTitle: "9/20/2026, 10:20:00 AM",
+    copyText: "Decision needed\nA round failed.",
+    createdAt: "2026-09-20T10:20:00.000Z",
+    ...overrides,
+  });
+
+  void it("gives an interaction card a copy button and a timestamp; copying posts no message", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ interactions: [interaction()] }));
+    const card = panel.byId("interaction");
+    const [copy] = findByClass(card, "msg-copy");
+    const [time] = findByClass(card, "msg-time");
+    assert.ok(copy, "the interaction card must carry a copy button");
+    assert.equal(copy.type, "button");
+    assert.equal(time?.textContent, "10:15");
+    assert.equal(time?.title, "9/20/2026, 10:15:00 AM");
+    const outboundBefore = panel.outbound.length;
+    copy.listeners.get("click")![0]!({});
+    assert.deepEqual(panel.clipboardWrites, ["Needs your reply\nWhich way? *\n- Left\n- Right"]);
+    assert.equal(panel.outbound.length, outboundBefore, "copying must not post a message (no confirm/cancel/select)");
+    assert.equal(copy.textContent, "✓");
+  });
+
+  void it("gives a decision card a copy button and a timestamp; copying posts no message", () => {
+    const panel = runPanel();
+    const d = decision();
+    panel.post(stateMessage({ decisions: [d], timeline: [{ type: "decision", value: d }] }));
+    const [copy] = findByClass(panel.byId("messages"), "msg-copy");
+    const [time] = findByClass(panel.byId("messages"), "msg-time");
+    assert.ok(copy, "the decision card must carry a copy button");
+    assert.equal(time?.textContent, "10:20");
+    const outboundBefore = panel.outbound.length;
+    copy.listeners.get("click")![0]!({});
+    assert.deepEqual(panel.clipboardWrites, ["Decision needed\nA round failed."]);
+    assert.equal(panel.outbound.length, outboundBefore);
+  });
+
+  void it("renders an empty, untitled time span — never Invalid/NaN — when the record carried no usable time", () => {
+    const panel = runPanel();
+    const d = decision({ atLabel: "", atTitle: "" });
+    panel.post(
+      stateMessage({
+        interactions: [interaction({ atLabel: "", atTitle: "" })],
+        decisions: [d],
+        timeline: [{ type: "decision", value: d }],
+      })
+    );
+    for (const root of [panel.byId("interaction"), panel.byId("messages")]) {
+      const [time] = findByClass(root, "msg-time");
+      assert.ok(time, "the time span is still rendered");
+      assert.equal(time.textContent, "");
+      assert.equal(time.title, "");
+      assert.doesNotMatch(root.text(), /Invalid|NaN/);
+    }
+  });
+});
 
 void describe("the chat panel's inline script", () => {
   void it("parses as JavaScript", () => {
@@ -272,6 +388,14 @@ void describe("the chat panel's inline script", () => {
     assert.equal(panel.byId("context").textContent, "My Task — Implementation");
     assert.equal(panel.byId("busy-indicator").style.display, "block");
     assert.equal(panel.byId("error").style.display, "none");
+  });
+
+  void it("shows the non-steering note on a task chat and hides it on the global chat", () => {
+    const panel = runPanel();
+    panel.post(stateMessage());
+    assert.equal(panel.byId("steering-note").style.display, "block");
+    panel.post(stateMessage({ target: { kind: "global" } }));
+    assert.equal(panel.byId("steering-note").style.display, "none");
   });
 
   void it("a failed paint shows a banner and KEEPS the conversation and the busy banner", () => {

@@ -54,10 +54,11 @@ import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1"
 import { fixtureOwnershipFor, writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { setProcessStartTimeIoOverrideForTestV1 } from "../state/processStartTimeProbeV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-work-admission-test-"));
 after(() => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 /**
@@ -1545,7 +1546,7 @@ void test("an admission-purpose acquisition retries past a pauseCommit claim tha
   if (result.outcome === "acquired") {
     await result.handle.release();
   }
-  fs.rmSync(markerPath, { force: true });
+  fs.rmSync(markerPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
 });
 
 // 2026-09-09 review architectural blocker (fourth round): the previous fix
@@ -1605,7 +1606,7 @@ void test(
     if (result.outcome === "acquired") {
       await result.handle.release();
     }
-    fs.rmSync(markerPath, { force: true });
+    fs.rmSync(markerPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
   }
 );
 
@@ -1711,7 +1712,7 @@ void test("an admission-purpose acquisition retries past a claim that is transie
   if (result.outcome === "acquired") {
     await result.handle.release();
   }
-  fs.rmSync(markerPath, { force: true });
+  fs.rmSync(markerPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
 });
 
 void test("an admission-purpose acquisition against a permanently corrupt claim eventually reports busy (not writeFailed) rather than assuming it is free", async () => {
@@ -1734,7 +1735,7 @@ void test("an admission-purpose acquisition against a permanently corrupt claim 
   } finally {
     setWorkAdmissionClockForTestV1(undefined);
   }
-  fs.rmSync(claimPath, { force: true });
+  fs.rmSync(claimPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
 });
 
 // ── Further narrowed remainder (2026-09-09 review, third round): even after
@@ -1796,7 +1797,7 @@ void test(
     } finally {
       setWorkAdmissionFsFailureInjectionForTestV1(undefined);
       setWorkAdmissionClockForTestV1(undefined);
-      fs.rmSync(markerPath, { force: true });
+      fs.rmSync(markerPath, { force: true }); // deliberate: removal is the behaviour under test, not teardown
     }
   }
 );
@@ -3427,7 +3428,7 @@ void test("takeOverStaleWorkAdmissionMarkerV1: refuses (ownerChanged) when the e
   // Simulate the observed marker vanishing and a DIFFERENT corrupt marker
   // appearing in its place before the human clicks the takeover action —
   // the notice's confirmation must not carry over to it.
-  fs.rmSync(originalMarkerPath);
+  fs.rmSync(originalMarkerPath); // deliberate: removal is the behaviour under test, not teardown
   const replacementMarkerPath = path.join(dir, "admission.replacementcorrupt.g1.22222222");
   fs.writeFileSync(replacementMarkerPath, "also not valid json {{{");
   backdateV1(replacementMarkerPath, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000);

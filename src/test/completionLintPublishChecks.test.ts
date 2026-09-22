@@ -38,8 +38,15 @@ import {
   renderPublishChecksFreshnessStamp,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
+import { publishNextStepAfterChecksV1, stageActionsForPreflightV1 } from "../utils/stageArtifactRequirementsV1";
+import {
+  PUBLISH_STAGE_ACTIONS_V1,
+  publishNextStepFromActionsV1,
+  publishNextStepOfferV1,
+} from "../utils/publishStageActionsV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { KnownFlakyCheck } from "../config/settings";
+import { safeRemoveDir } from "./testFsUtils";
 
 /** Mirrors completionLintKnownFlakes.test.ts's helper of the same purpose —
  * stubs the `ensemble.knownFlakyChecks` setting so renderCompletionChecksSection's
@@ -67,7 +74,7 @@ const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-completion-lint-test-")
 );
 after(() => {
-  nodeFs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  safeRemoveDir(TEST_ROOT);
 });
 
 function makeWorkspace(name: string, packageJson: unknown): string {
@@ -426,6 +433,51 @@ void describe("upsertCompletionChecksReportV1", () => {
       const reviewed = "Readiness: 8/10\n\nSummary verdict: ready to publish.\n";
       const merged = mergePublishStatusLineSection(reviewed, "**Publish Checks passed.** Request a Publish review to finish.");
       assert.equal(merged, reviewed, "a landed review's own verdict must never be overwritten with a status line");
+    });
+
+    void it("names the step that follows passing checks from the stage-action table, in both states (item 33)", () => {
+      const passing = { passed: true, failedChecks: [] };
+      // State B — Publish still lists a review action: the review is next.
+      assert.equal(publishNextStepAfterChecksV1(["checks", "review"]), "review");
+      assert.match(
+        computePublishStatusLineTextV1(passing, publishNextStepAfterChecksV1(["checks", "review"])),
+        /Request a Publish review to finish/
+      );
+      // State A — the review action is gone: Commit & Push is next, and the
+      // status never sends the user looking for a review that does not exist.
+      assert.equal(publishNextStepAfterChecksV1(["checks"]), "commit-and-push");
+      // The real table is what production reads: dispatch starts at the checks,
+      // and the pre-flight review requirements exist exactly while it lists a review.
+      assert.equal(PUBLISH_STAGE_ACTIONS_V1[0], "checks");
+      assert.equal(publishNextStepAfterChecksV1(), PUBLISH_STAGE_ACTIONS_V1.includes("review") ? "review" : "commit-and-push");
+      assert.equal(stageActionsForPreflightV1("publish").length > 0, PUBLISH_STAGE_ACTIONS_V1.includes("review"));
+      const stateA = computePublishStatusLineTextV1(passing, publishNextStepAfterChecksV1(["checks"]));
+      assert.match(stateA, /Commit & Push to finish/);
+      assert.doesNotMatch(stateA, /Publish review/);
+      // A failing run names the failure in both states — the next step only follows a pass.
+      assert.match(
+        computePublishStatusLineTextV1({ passed: false, failedChecks: [{ command: "x", exitCode: 1 }] }, "commit-and-push"),
+        /Publish Checks failed/
+      );
+    });
+
+    void it("publishNextStepOfferV1 offers the step the table names after passed checks, in both states", () => {
+      // State B — a review step follows: offer the Publish review.
+      const stateB = publishNextStepOfferV1(publishNextStepFromActionsV1(["checks", "review"]));
+      assert.equal(stateB.action.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.match(stateB.sentence, /Publish review/);
+      // State A — the review action is gone: offer Commit & Push, never a review.
+      const stateA = publishNextStepOfferV1(publishNextStepFromActionsV1(["checks"]));
+      assert.equal(stateA.action.command, "vs-code-ai-helper.commitAndPushTask");
+      assert.equal(stateA.action.title, "Commit & Push");
+      assert.doesNotMatch(stateA.sentence, /review/i);
+      // The default reads the real table.
+      assert.equal(
+        publishNextStepOfferV1().action.command,
+        PUBLISH_STAGE_ACTIONS_V1.includes("review")
+          ? "vs-code-ai-helper.runReviewWithAI"
+          : "vs-code-ai-helper.commitAndPushTask"
+      );
     });
 
     void it("computePublishStatusLineTextV1 treats a quarantined-only failure as passed", () => {

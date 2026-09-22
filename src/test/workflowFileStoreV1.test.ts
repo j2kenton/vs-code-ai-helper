@@ -15,6 +15,7 @@ import {
   WorkflowFileStoreResultV1,
   WorkflowFileStoreV1,
 } from "../services/workflowFileStoreV1";
+import { safeRemoveDir } from "./testFsUtils";
 
 interface StoreFixture {
   rootDir: string;
@@ -30,7 +31,7 @@ function makeStore(trustedForMutation = true): StoreFixture {
   return {
     rootDir,
     store,
-    cleanup: (): void => fs.rmSync(rootDir, { recursive: true, force: true }),
+    cleanup: (): void => safeRemoveDir(rootDir),
   };
 }
 

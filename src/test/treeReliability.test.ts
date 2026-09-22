@@ -23,6 +23,7 @@ import { TASK_STATUSES } from "../types/taskProgress";
 import type { IncompleteTask } from "../types/incompleteTask";
 import { TaskStatusBar } from "../views/taskStatusBar";
 import { TaskNode, TaskTreeProvider } from "../views/taskTreeProvider";
+import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
 // Helper — minimal IncompleteTask stub
@@ -724,7 +725,7 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
     } finally {
       workspaceApi.workspaceFolders = originalFolders;
       workspaceApi.getConfiguration = originalGetConfiguration;
-      fs.rmSync(root, { recursive: true, force: true });
+      safeRemoveDir(root);
     }
   });
 });
