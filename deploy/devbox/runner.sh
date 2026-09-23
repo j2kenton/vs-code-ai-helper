@@ -124,6 +124,27 @@ else
   echo "$(date -u +%FT%TZ) WARNING: no push watcher found at $notify_watcher; no notifications will be sent" >>"$SUPERVISOR_LOG"
 fi
 
+# The RENDERER MEMORY LOG — a diagnostic, and temporary. Three renderers died
+# with "renderer process gone (reason: crashed, code: 133)" inside 24 hours
+# (2026-09-22/23), each taking its extension host and a live round with it; one
+# was a Fast Forward Review 96 minutes in. Neither known cause fitted the last
+# one: no OOM kill in the kernel log, /dev/shm 2 GB with nothing used. So this
+# samples every renderer's RSS while they are alive, because the process is
+# gone before anyone can look at it.
+#
+# Costs a `ps` every two minutes, writes only its own log, and starts nothing.
+# DELETE IT, and this block, once the crashes are understood — a permanent
+# diagnostic nobody reads is just another thing to maintain.
+if [ -f "$HOME/renderer-memory-log.sh" ]; then
+  renderer_logger="$HOME/renderer-memory-log.sh"
+else
+  renderer_logger="/usr/local/bin/devbox-renderer-memory-log"
+fi
+if [ -f "$renderer_logger" ]; then
+  setsid nohup sh "$renderer_logger" >/dev/null 2>&1 < /dev/null &
+  echo "$(date -u +%FT%TZ) renderer memory log started ($renderer_logger)" >>"$SUPERVISOR_LOG"
+fi
+
 # One restart loop per workspace. $1 = workspace folder, $2 = runner index
 # (1 = the original, which keeps the default user-data directory so nothing
 # about the existing runner changes).

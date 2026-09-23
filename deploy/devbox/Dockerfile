@@ -81,9 +81,13 @@ COPY install-extension.sh /usr/local/bin/devbox-install-extension
 # 2026-09-22). In the image it is deployed by a rebuild like everything else.
 COPY notify-watch.mjs /usr/local/lib/devbox-notify-watch.mjs
 COPY reap-viewers.sh /usr/local/bin/devbox-reap-viewers
+# A DIAGNOSTIC, not a feature: three renderers died with code 133 inside 24
+# hours, each taking a live round with it, and a dead renderer cannot be
+# measured after the fact. Remove this once those crashes are understood.
+COPY renderer-memory-log.sh /usr/local/bin/devbox-renderer-memory-log
 RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner /usr/local/bin/devbox-install-extension \
  && chmod 0644 /usr/local/lib/devbox-notify-watch.mjs \
- && chmod 0755 /usr/local/bin/devbox-reap-viewers
+ && chmod 0755 /usr/local/bin/devbox-reap-viewers /usr/local/bin/devbox-renderer-memory-log
 
 EXPOSE 2222
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/devbox-entrypoint"]
