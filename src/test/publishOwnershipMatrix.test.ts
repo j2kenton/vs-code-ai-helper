@@ -1959,9 +1959,9 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
     const currentStore = makeCurrentTaskStoreStub();
     const dispatchPatch = patch(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> => Promise.resolve(true));
     try {
-      const calls = await captureRelevantFiles(() =>
-        setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump")
-      );
+      const calls = await captureRelevantFiles(async () => {
+        await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
+      });
       assert.equal(calls.length, 1, "expected exactly one checkPublishPreflight call");
       assert.deepEqual(calls[0], scopeFiles);
     } finally {
@@ -2429,10 +2429,15 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
             warning,
             `expected an unusable-summary warning on the Notifications surface; got: ${JSON.stringify(entries)}`
           );
+          // Run Implementation takes priority as the toast's one action
+          // button when both it and Restore apply (2026-09-24 review,
+          // narrowed completion blocker) — Restore stays reachable via the
+          // tree row and the "Restore Last Usable Summary" command; the
+          // refusal reason text above still names it.
           assert.deepEqual(warning.actionCommand, {
-            command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-            title: "Restore Last Usable Summary",
-            args: [folderPath, "impl-low-review", "vs-code-ai-helper.runReviewWithAI"],
+            command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+            title: "Run Implementation",
+            args: [{ taskFolderPath: folderPath }],
           });
           assert.equal(
             fs.existsSync(path.join(folderPath, "impl-low-review.md")),

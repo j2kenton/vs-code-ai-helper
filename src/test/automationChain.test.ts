@@ -499,13 +499,19 @@ function installFsBridgeV1(): { restore: () => void } {
     await fs.promises.rm(dest.fsPath, { force: true });
     await fs.promises.rename(source.fsPath, dest.fsPath);
   };
+  target.createDirectory = (uri: vscode.Uri): Promise<void> =>
+    fs.promises.mkdir(uri.fsPath, { recursive: true }).then(() => undefined);
+  target.readDirectory = async (uri: vscode.Uri): Promise<[string, number][]> => {
+    const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true }).catch(() => []);
+    return entries.map((entry) => [entry.name, entry.isDirectory() ? 2 : 1] as [string, number]);
+  };
   target.stat = async (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
     const stat = await fs.promises.stat(uri.fsPath);
     return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs };
   };
   return {
     restore: (): void => {
-      for (const key of ["readFile", "writeFile", "rename", "stat"]) {
+      for (const key of ["readFile", "writeFile", "rename", "createDirectory", "readDirectory", "stat"]) {
         target[key] = orig[key];
       }
     },
@@ -614,6 +620,69 @@ void test("a failing automation dispatch closes its round-ledger row as failed, 
     assert.ok(row, "must resolve the opened row");
     assert.equal(row?.state, "failed");
     assert.equal(row?.outcome?.rejectionReason, "provider exploded");
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    safeRemoveDir(fixture.folder);
+  }
+});
+
+// Pre-1.0.0 register item 16 / plan step 10 ("a no-op continuation is not
+// `completed`"): the dispatched command resolving `false` (an early guard
+// clause declining before any provider was invoked, or any files changed —
+// exactly what `runImplementationWithAI`'s many `return false` guard sites
+// do) is a normal PROMISE RESOLUTION, not a rejection. Before this fix the
+// generic settle handler ignored the resolved value entirely and always
+// recorded "completed" on any non-throwing resolve — durably misreporting a
+// round that did nothing as a clean ending. It must record "dropped" (never
+// "completed") and leave a run-log trace, the same way a chain drop before
+// `deps.execute` already does.
+void test("a declined (false-resolving) automation dispatch closes its round-ledger row as dropped, not completed, and writes a run log", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-declined-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    const decliningDeps: AutomationChainDeps = {
+      onDidEnd: () => ({ dispose: () => undefined }),
+      execute: () => Promise.resolve(false),
+    };
+    const result = await scheduleAutomationChain(
+      {
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        taskKey: fixture.folder,
+        chainId: "impl-ledger-declined",
+      },
+      undefined,
+      decliningDeps
+    );
+    assert.equal(result, true, "the dispatch itself still ran (the command resolved, it just declined)");
+
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    assert.equal(raw.roundLedger?.length, 1);
+    const row = raw.roundLedger?.[0];
+    assert.ok(row, "must resolve the opened row");
+    assert.equal(row?.state, "dropped", "a declined resolve must never be recorded as completed");
+    assert.equal(
+      row?.outcome?.rejectionReason,
+      "the dispatched command declined to run and no round was started"
+    );
+
+    const runsDir = path.join(fixture.folder, "runs");
+    const deadline = Date.now() + 2000;
+    let entries: string[] = [];
+    for (;;) {
+      entries = fs.existsSync(runsDir) ? fs.readdirSync(runsDir) : [];
+      if (entries.length > 0 || Date.now() > deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(entries.length, 1, "a run log must be written for the no-op round, best-effort");
+    const logContent = fs.readFileSync(path.join(runsDir, entries[0] as string), "utf8");
+    assert.match(logContent, /Automation Round Not Started/);
+    assert.match(logContent, /declined to run and no round was started/);
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();

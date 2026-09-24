@@ -88,6 +88,7 @@ import {
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
+import { markFastForwardRunActiveV1, clearFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 import {
   deriveCurrentDispatchModeV1,
   deriveNextRecoverySourceV1,
@@ -124,6 +125,7 @@ import {
   buildImplementationContinuationPromptV1,
   claimImplRecoveryDispatchV1,
   ClaimedImplRecoveryV1,
+  describeImplRecoveryTriggerV1,
   describeOwedImplRecoveryRefusalV1,
   discardOwedImplRecoveryV1,
   escalateClaimedSummaryOnlyIfUnavailableV1,
@@ -131,6 +133,7 @@ import {
   isImplRecoveryDiscardOfferableV1,
   owedContinuationSourceV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
+  shouldLogNoOpContinuationRoundV1,
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
@@ -147,6 +150,9 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   AUTO_REVIEW_TRANSITIONS,
   computeNextStage,
+  enterStageV1,
+  prepareStageEntryV1,
+  runStageEntryPostCommitV1,
   StageTransitionResult,
 } from "../utils/stageTransition";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
@@ -157,6 +163,7 @@ import {
   readTextIfExists,
   resolveCurrentPlanUri,
   safeOpenTextDocument,
+  statIfExists,
   withAttribution,
   writeTextFile,
   writeTextFileIfUnchangedV1,
@@ -220,10 +227,8 @@ import {
   readImplementationReviewContent,
   readPlanOfRecordV1,
   describeUnusableSummaryRemedyV1,
+  shouldOfferRunImplementationForUnusableSummaryV1,
   materializeCanonicalIfNeeded,
-  preparePlanPromotion,
-  applyDeferredPlanRevisionAdoptionV1,
-  PlanRevisionAdoptionV1,
 } from "../utils/implementationArtifactResolver";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -1713,23 +1718,11 @@ export async function getUnrelatedWorkspaceChanges(
   });
 }
 
-/**
- * Safe stage-advance helper that uses `patchTaskProgress` to avoid
- * overwriting unrelated fields.
- */
-async function setStage(
-  folderUri: vscode.Uri,
-  newStage: TaskStage
-): Promise<void> {
-  await patchTaskProgressStrictV1(folderUri, (current) => {
-    if (current.currentStage === newStage) {
-      return current;
-    }
-    return { ...current, currentStage: newStage };
-  });
-}
-
 // REVIEW_TARGETS now lives in utils/reviewReadiness.ts (imported above)
+// setStage() was removed (pre-1.0.0 fixes register, Part 1, item 15): its
+// only caller, handleGenerateImplementationOutcomeV1, now routes through
+// enterStageV1 so a missing plan-final.md is refused rather than silently
+// producing a task on "impl" with no implementation artifact.
 // beside the freshness primitives it scopes, so taskTreeProvider.ts can
 // translate a taskOperations stage the same way without a views -> commands
 // import.
@@ -4360,42 +4353,24 @@ async function routeReviewOutcomeV1(
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
           if (next) {
-            // Advancing into "impl" must promote plan.md -> plan-final.md,
-            // mirroring nextStage's manual handling below. The write itself
-            // is deferred into advanceStageViaNextStageRowV1's publishArtifact
-            // (nextStage.v1's beforeWrite side channel) so it only lands
-            // atomically with — and only when — this review attempt actually
-            // wins the CAS. Writing it eagerly here would let a stale attempt
-            // that loses the race still materialize plan-final.md for a
-            // transition that never happens.
-            let publishArtifact: (() => Promise<void>) | undefined;
-            // Set only when publishArtifact's deferred publish() call finds a
-            // plan revision in flight — applied AFTER the transition below
-            // has released its lock (see applyDeferredPlanRevisionAdoptionV1's
-            // doc comment for why it cannot be written any earlier).
-            let deferredPlanRevisionAdoption: PlanRevisionAdoptionV1 | undefined;
+            // Advancing into "impl" must promote plan.md -> plan-final.md.
+            // Review fix (2026-09-22, architectural blocker): this used to
+            // build its own `publishArtifact` closure and thread it through
+            // advanceStageViaNextStageRowV1's `beforeWrite` side channel —
+            // the row now performs that promotion (and the deferred adoption
+            // write that follows it) internally via `enterStageV1`, so this
+            // is now only a friendly pre-check: a real plan-revision race
+            // between this read and the row's own CAS write is still caught
+            // there, refusing the transition rather than silently promoting
+            // an unpromotable stage.
             if (next === "impl") {
-              const promotion = await preparePlanPromotion(folderUri);
+              const promotion = await prepareStageEntryV1(folderUri, next);
               if (!promotion.ready) {
                 NotificationRouter.showWarning(
                   "Review score reached the auto-advance threshold, but there is no plan to promote. Advance to Implementation manually once a plan exists."
                 );
                 return;
               }
-              // This closure runs as advanceStageViaNextStageRowV1's
-              // beforeWrite side effect below — i.e. while nextStage.v1's own
-              // patchTaskProgressStrictV1 call already holds withTaskLock for
-              // this task folder. A plan-revision publish that needs its own
-              // durable adoption write must defer it (never write
-              // task-progress.json here — see finalizePlanRevisionBestEffortV1's
-              // doc comment for why that would deadlock or silently clobber
-              // the outer write's own stale-snapshot-derived write).
-              const publish = promotion.publish;
-              publishArtifact = publish
-                ? async () => {
-                    deferredPlanRevisionAdoption = await publish({ deferAdoptionWrite: true });
-                  }
-                : undefined;
             }
             // Re-check pause status immediately before advancing: the AI
             // review call above can run for minutes, during which the user
@@ -4424,19 +4399,32 @@ async function routeReviewOutcomeV1(
               next,
               isPausedForAdvance,
               true,
-              reviewAttemptId,
-              publishArtifact
+              reviewAttemptId
             );
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
-              if (deferredPlanRevisionAdoption) {
-                // Safe now: advanceStageViaNextStageRowV1's own
-                // patchTaskProgressStrictV1 call has returned, so its
-                // withTaskLock hold on this task folder has been released —
-                // this is a separate, sequential, normally-locked write, not
-                // nested inside the transition above.
-                await applyDeferredPlanRevisionAdoptionV1(folderUri, deferredPlanRevisionAdoption);
-              }
+              // Review fix (2026-09-23, narrowed blocker
+              // c2453680-fe42-461b-9652-1f87445cb9d3-0): `postEnvironmentalAdvanceNoticeV1`
+              // posts its "environmentalAdvanceNotice" card BEFORE this block
+              // runs (it is decided independently, from the same score/
+              // threshold, a few dozen lines above in this same function) and
+              // does not pause the task — so the auto-advance above can (and
+              // routinely does) actually perform the exact move that card's
+              // "Continue — advance anyway" option promises, in the very same
+              // round the card was posted. Left un-withdrawn, the stale card's
+              // option would later find the task already on its target stage —
+              // `setTaskStage` no-ops on a same-stage request, but
+              // `resumeAndSetTaskStageV1` reads that no-op as "the move just
+              // succeeded" and dispatches the destination stage's action a
+              // second time. Withdrawing here, unconditionally once ANY
+              // advance out of `targetStage` actually lands, removes the stale
+              // option before it can ever be clicked — whether the card was
+              // posted this round or an earlier one.
+              await withdrawWorkflowDecisionsByKeyV1(
+                { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+                "environmentalAdvanceNotice",
+                `the task already advanced to ${STAGE_DISPLAY_NAMES[next]} automatically, so this notice's own advance option would only repeat that stage's action`
+              );
               // Auto-advancing into Implementation must also start the
               // implementation itself (which generates the checklist first
               // when absent). runImplementationWithAI claims the task's
@@ -4918,6 +4906,7 @@ export async function pauseTaskForExhaustedChainV1(
     {
       optionId: "retry",
       ...(await loadRetryFailedReviewOptionFieldsV1(folderUri.fsPath, stage)),
+      resumeKind: "continue",
       // A1 (1.0.0 gate, Part C): "Retry now" must retry, or be renamed — a
       // prior revision dispatched plain resumeTask, which clears the pause
       // and dispatches nothing. v1 fixes 2 (items 14 + 25): it must also
@@ -4934,14 +4923,18 @@ export async function pauseTaskForExhaustedChainV1(
     },
     {
       optionId: "adjustSettings",
+      resumeKind: "unpause",
       label: "Adjust provider settings",
-      consequence: `Opens Settings focused on ${STAGE_DISPLAY_NAMES[stage]}'s model/backup configuration so you can switch providers or models.`,
+      consequence:
+        `Opens Settings focused on ${STAGE_DISPLAY_NAMES[stage]}'s model/backup configuration so you can ` +
+        "switch providers or models. Once you've changed it, choose \"Retry now\" (or resume the task) to try again.",
       effect: { kind: "command", command: "vs-code-ai-helper.setStageBackupModel", args: [{ stage }] },
     },
     ...(quotaParkRecord?.resetAt !== undefined
       ? [
           {
             optionId: "wait",
+            resumeKind: "unpause" as const,
             label: "Wait for reset",
             consequence:
               `Schedules an automatic rerun shortly after the ${quotaParkRecord.failureKind} resets at ` +
@@ -4956,6 +4949,7 @@ export async function pauseTaskForExhaustedChainV1(
       : []),
     {
       optionId: "stay",
+      resumeKind: "unpause",
       label: "Leave paused",
       consequence: "Does nothing. The task stays paused until you choose one of the other options.",
       effect: { kind: "doNothing" },
@@ -5337,6 +5331,20 @@ export async function runReviewForFolder(
       const canRestorePreviousImplSummary =
         previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
+      // Part 4 Step 12 (item 16): offer Run Implementation whenever the
+      // summary is unusable and no live implRecovery exists — unconditionally,
+      // not only when nothing is restorable (2026-09-24 review, narrowed
+      // completion blocker: this toast used to show Run Implementation only
+      // as a fallback when Restore was unavailable, which is narrower than
+      // the checked item's own applicability condition —
+      // `shouldOfferRunImplementationForUnusableSummaryV1`'s doc comment
+      // records the same correction already made for the tree row). Run
+      // Implementation takes priority as the toast's one action button when
+      // both apply, since a toast can only carry one; Restore stays fully
+      // reachable via the tree row (`hasOfferableRunImplementationForUnusableSummaryV1`
+      // shows both there) and the "Restore Last Usable Summary" command, and
+      // the remedy TEXT below still names it.
+      const hasLiveImplRecovery = (await readTaskProgressAdvisoryV1(folderUri))?.implRecovery !== undefined;
       NotificationRouter.showWarning(
         "The last implementation round did not produce usable implementation notes, so there is " +
           `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
@@ -5344,17 +5352,23 @@ export async function runReviewForFolder(
         undefined,
         undefined,
         undefined,
-        canRestorePreviousImplSummary
+        shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery)
           ? {
-              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-              title: "Restore Last Usable Summary",
-              args: [
-                folderUri.fsPath,
-                targetStage,
-                options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
-              ],
+              command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+              title: "Run Implementation",
+              args: [{ taskFolderPath: folderUri.fsPath }],
             }
-          : undefined
+          : canRestorePreviousImplSummary
+            ? {
+                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                title: "Restore Last Usable Summary",
+                args: [
+                  folderUri.fsPath,
+                  targetStage,
+                  options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
+                ],
+              }
+            : undefined
       );
       return;
     }
@@ -6012,6 +6026,14 @@ export async function runReviewForFolder(
             operationId: info.operationId,
             attemptId: info.attemptId,
             taskFolderUri: folderUri,
+            // Part 4 Step 8 static audit: `coordinator` is wrapped by
+            // `withMalformedResultRetryV1`, whose retry is THIS round's own
+            // (fresh operationId, same held `reviewAttemptId`/lease) — the
+            // case `allowOperationTakeover` exists for (see its doc comment),
+            // not a genuinely different operation. Fixes item 11's
+            // 2026-09-20 review-path addendum (row b7d3b317…). The
+            // `resumeAction` call below is unwrapped and keeps failing closed.
+            allowOperationTakeover: true,
           },
           (degraded) => {
             identityAttachmentDegradedForOutcome = degraded;
@@ -6165,6 +6187,17 @@ export async function describeUnusableReviewBlockV1(
    * command directly in each `NotificationRouter.showWarning` call, the same
    * way every other direct-action toast in this file is detectable. */
   canRestorePreviousImplSummary: boolean;
+  /** Part 4 Step 12 (item 16): true whenever no `implRecovery` is armed to fix
+   * the summary automatically — independent of `canRestorePreviousImplSummary`
+   * (2026-09-24 review, narrowed completion blocker: this used to be ANDed
+   * with `!canRestorePreviousImplSummary`, which is narrower than the checked
+   * item's own applicability condition). Callers offer "Run Implementation"
+   * (`resumeAndDispatchImplementation`) whenever this is true, built as a
+   * literal at the call site for the same static-scan reason as above, taking
+   * priority over Restore as the toast's one action button when both apply.
+   * Whether the checklist is fully settled affects only the warning TEXT
+   * above, never whether the button is offered. */
+  offerRunImplementation: boolean;
 }> {
   const summary = await readTextIfExists(getImplementationSummaryUri(folderUri));
   if (summary !== undefined && isUnusableImplementationSummaryV1(summary)) {
@@ -6176,6 +6209,7 @@ export async function describeUnusableReviewBlockV1(
       previousImplSummary !== undefined &&
       !isUnusableImplementationSummaryV1(previousImplSummary);
     const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
+    const hasLiveImplRecovery = (await readTaskProgressAdvisoryV1(folderUri))?.implRecovery !== undefined;
     return {
       warning:
         "Fast Forward Review: a prior implementation round was rejected and left no usable " +
@@ -6192,12 +6226,14 @@ export async function describeUnusableReviewBlockV1(
             : 'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
               "fast-forwarding."),
       canRestorePreviousImplSummary,
+      offerRunImplementation: shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery),
     };
   }
   return {
     warning:
       "Fast Forward Review: the initial review did not produce usable output. Try running Review manually.",
     canRestorePreviousImplSummary: false,
+    offerRunImplementation: false,
   };
 }
 
@@ -7328,6 +7364,13 @@ export async function fastForwardReviewWithAI(
       await ffHandle.release();
     }
   };
+  // Part 3, Step 3: marks this task folder as "under an active Fast Forward
+  // run" for the whole of this call's own try/finally, so an escalation
+  // raised anywhere inside it (arbitrarily deep in the call stack) can bake
+  // "resume by continuing Fast Forward" into its Advance option's own args —
+  // see activeFastForwardRunsV1.ts's doc comment for why this must be
+  // captured now rather than re-derived when a human later answers the card.
+  let ffActiveFolderPath: string | undefined;
 
   try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
@@ -7431,6 +7474,8 @@ export async function fastForwardReviewWithAI(
   if (!resolved) {
     return;
   }
+  ffActiveFolderPath = resolved.folderUri.fsPath;
+  markFastForwardRunActiveV1(ffActiveFolderPath);
 
   if (!ffHandle) {
     // No-arg QuickPick path: nothing was known to protect until resolution
@@ -7625,21 +7670,32 @@ export async function fastForwardReviewWithAI(
     }
     if (!initialContent) {
       const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
+      // Run Implementation takes priority as the toast one action button when
+      // both it and Restore apply (2026-09-24 review, narrowed completion
+      // blocker — see describeUnusableReviewBlockV1's offerRunImplementation
+      // doc comment). Restore stays reachable via the tree row and the
+      // Restore Last Usable Summary command.
       NotificationRouter.showWarning(
         block.warning,
         undefined,
         undefined,
         undefined,
-        block.canRestorePreviousImplSummary
+        block.offerRunImplementation
           ? {
-              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-              title: "Restore Last Usable Summary",
-              // Restoring from this surface should re-enter Fast Forward, the
-              // command whose own refusal this is — same rationale as
-              // `runReviewForFolder`'s `rerunCommandId` default.
-              args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+              command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+              title: "Run Implementation",
+              args: [{ taskFolderPath: resolved.folderUri.fsPath }],
             }
-          : undefined
+          : block.canRestorePreviousImplSummary
+            ? {
+                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                title: "Restore Last Usable Summary",
+                // Restoring from this surface should re-enter Fast Forward, the
+                // command whose own refusal this is — same rationale as the
+                // rerunCommandId default in runReviewForFolder.
+                args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+              }
+            : undefined
       );
       // The review this run exists to build on never ran: "refused", not "completed".
       return false;
@@ -7654,13 +7710,19 @@ export async function fastForwardReviewWithAI(
       undefined,
       undefined,
       undefined,
-      block.canRestorePreviousImplSummary
+      block.offerRunImplementation
         ? {
-            command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-            title: "Restore Last Usable Summary",
-            args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+            command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+            title: "Run Implementation",
+            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
           }
-        : undefined
+        : block.canRestorePreviousImplSummary
+          ? {
+              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+              title: "Restore Last Usable Summary",
+              args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+            }
+          : undefined
     );
     return false;
   }
@@ -8161,6 +8223,7 @@ export async function fastForwardReviewWithAI(
           options: [
             {
               optionId: "goToReviewAndApply",
+              resumeKind: "continue",
               label: "Go to Review & Apply",
               consequence:
                 `Moves the task to ${STAGE_DISPLAY_NAMES[siblingImplStage]} and opens Apply Review. ` +
@@ -8184,6 +8247,7 @@ export async function fastForwardReviewWithAI(
             },
             {
               optionId: "notNow",
+              resumeKind: "unpause",
               label: "Not now",
               consequence: "Does nothing. The blockers remain and nothing changes.",
               effect: { kind: "doNothing" },
@@ -8304,6 +8368,9 @@ export async function fastForwardReviewWithAI(
     }
   );
   } finally {
+    if (ffActiveFolderPath) {
+      clearFastForwardRunActiveV1(ffActiveFolderPath);
+    }
     await releaseFfAdmissionV1();
   }
 }
@@ -8807,9 +8874,11 @@ export async function viewReview(
  *   progress's `reviewAttemptId` (mirrors `advanceStage`'s parameter of the
  *   same name) — rejects a stale review attempt that lost the race to a
  *   newer one on the same stage.
- * @param publishArtifact  Optional side effect (e.g. renaming a staged plan
- *   into `plan-final.md`) run atomically with the row's CAS check/write via
- *   `nextStage.v1`'s `beforeWrite` side channel — see that field's header.
+ * Promoting `plan.md` to `plan-final.md` when `next === "impl"` is handled
+ * internally by the row itself (via `enterStageV1`/`prepareStageEntryV1`) —
+ * review fix (2026-09-22, architectural blocker): this function used to build
+ * its own `publishArtifact` closure and thread it through `nextStage.v1`'s
+ * `beforeWrite` side channel; callers no longer need to.
  */
 async function advanceStageViaNextStageRowV1(
   folderUri: vscode.Uri,
@@ -8820,7 +8889,6 @@ async function advanceStageViaNextStageRowV1(
   isPaused: boolean,
   optIn: boolean,
   expectedReviewAttemptId?: string,
-  publishArtifact?: () => Promise<void>,
   artifactOverride?: "user"
 ): Promise<StageTransitionResult> {
   // Plan §3.9: the task-binding identity is the digest derived from this
@@ -8909,7 +8977,6 @@ async function advanceStageViaNextStageRowV1(
       // hands control back, with nothing further arranged).
       nextActorOnAdvance: shouldAutoReviewForWrite ? "automation" as const : "human" as const,
     },
-    beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
   if (outcome.kind !== "completed") {
     // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker): "the
@@ -9114,22 +9181,23 @@ export async function nextStage(
     }
   }
 
-  // Special handling for advancing into "implementation" stage:
-  // copy the current plan to plan-final.md if not already there. Shared with
-  // the score-based auto-advance path above so neither entry point into
-  // "impl" can skip the promotion (see preparePlanPromotion). This manual
-  // transition isn't racing another review attempt's CAS, so the write can
-  // run immediately rather than being deferred into advanceStage.
+  // Special handling for advancing into "implementation" stage: copy the
+  // current plan to plan-final.md if not already there. Review fix
+  // (2026-09-22, architectural blocker, fourth narrowing): "Complete Stage &
+  // Move On"'s CAS/write step now goes through `enterStageV1` itself (via
+  // `nextStageRowV1.ts`'s `executeNextStageV1` — see that function's own
+  // header), which resolves and publishes this promotion internally,
+  // atomically with the stage move, and rolls it back on its own if the
+  // commit fails. This is now only a friendly pre-check using the same
+  // `prepareStageEntryV1` primitive, so a real race between this read and
+  // the row's own CAS write is still caught there rather than here.
   if (next === "impl") {
-    const promotion = await preparePlanPromotion(resolved.folderUri);
+    const promotion = await prepareStageEntryV1(resolved.folderUri, next);
     if (!promotion.ready) {
       NotificationRouter.showWarning(
         "No plan to promote. Write or generate a plan first."
       );
       return;
-    }
-    if (promotion.publish) {
-      await promotion.publish();
     }
   }
 
@@ -9161,7 +9229,6 @@ export async function nextStage(
       completeAndMoveOnTriggersAI()
       ,
       undefined,
-      undefined,
       artifactOverride ? "user" : undefined
     );
   } catch (error) {
@@ -9169,7 +9236,10 @@ export async function nextStage(
     // transition — e.g. an auto-advance already moved this task off the
     // expected source stage while this manual "Complete Stage & Move On"
     // was in flight. Report it like any other failed transition instead of
-    // an unhandled rejection.
+    // an unhandled rejection. Any promotion rollback for a failed publish now
+    // happens INSIDE `enterStageV1` itself (review fix, 2026-09-22,
+    // architectural blocker) — this catch no longer needs its own recovery
+    // call.
     const message = error instanceof Error ? error.message : String(error);
     // 2026-09-15 post-freeze findings, item 5 (Part 5 step 34): this is the
     // command the finding's own report named ("Complete & Move On then
@@ -9201,6 +9271,12 @@ export async function nextStage(
     );
     return;
   }
+
+  // The deferred plan-revision adoption write (and card withdrawal) that used
+  // to be applied here is now performed internally by
+  // `nextStageRowV1.ts`'s `executeNextStageV1` via `runStageEntryPostCommitV1`
+  // (review fix, 2026-09-22, architectural blocker) — this caller no longer
+  // needs its own post-commit step for it.
 
   // ── Step 2: Show stage-advance message ───────────────────────────────
   NotificationRouter.showInformation(
@@ -9446,6 +9522,17 @@ interface GenerateImplementationOutcomeContextV1 {
   readonly suppressCompletionUiV1?: boolean;
 }
 
+/**
+ * Sentinel thrown only for a provider-outcome failure inside
+ * `handleGenerateImplementationOutcomeV1`, so `runTrackedOperation` settles
+ * the operation as `failed` (via its catch clause) rather than `refused` —
+ * `refusedWhenFalse` is reserved for a genuine guard-clause decline (the
+ * `enterStageV1` refusal below). The caller catches this specific type to
+ * avoid a duplicate host-level error toast on top of the NotificationRouter
+ * message already shown here.
+ */
+class GenerateImplementationOutcomeFailureV1 extends Error {}
+
 async function handleGenerateImplementationOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: GenerateImplementationOutcomeContextV1
@@ -9454,11 +9541,43 @@ async function handleGenerateImplementationOutcomeV1(
 
   if (outcome.kind === "completed") {
     if (!ctx.suppressCompletionUiV1) {
-      await setStage(ctx.folderUri, "impl");
-      await safeOpenTextDocument(ctx.implementationUri, "plan-final.md");
-      NotificationRouter.showInformation("plan-final.md generated.");
+      // Pre-1.0.0 fixes register, Part 1 (item 15): route through the shared
+      // stage-entry primitive instead of the bare `setStage()` patch, so a
+      // task that reaches here with `plan-final.md` missing or deleted is
+      // refused with the reason rather than silently landing on "impl" with
+      // no implementation artifact. This round's Generate Implementation
+      // invocation only ever runs for a task already at "impl"
+      // (GENERATE_IMPL_ELIGIBLE_STAGES === ["impl"]), so this is always a
+      // same-stage re-entry; `enterStageV1` finds the artifact canonical
+      // (the round itself just wrote plan-final.md) and commits with
+      // nothing to publish.
+      const entryResult = await enterStageV1(
+        ctx.folderUri,
+        "impl",
+        "impl",
+        false,
+        "generate-implementation"
+      );
+      if (!entryResult.ready) {
+        // Blocker fix (2026-09-22 review): a refused stage-entry must not be
+        // reported as a successful Generate Implementation outcome. The
+        // generated plan-final.md bytes are preserved either way (this is a
+        // same-stage re-entry, so `enterStageV1` never deletes anything on
+        // refusal here), but the operation itself must settle as refused so
+        // callers (and `runTrackedOperation`) do not record "completed".
+        NotificationRouter.showWarning(
+          `plan-final.md was generated, but the task's stage could not be confirmed: ${entryResult.reason}`
+        );
+        succeeded = false;
+      } else {
+        await runStageEntryPostCommitV1(ctx.folderUri, entryResult);
+        await safeOpenTextDocument(ctx.implementationUri, "plan-final.md");
+        NotificationRouter.showInformation("plan-final.md generated.");
+        succeeded = true;
+      }
+    } else {
+      succeeded = true;
     }
-    succeeded = true;
   } else if (outcome.kind === "questions") {
     if (ctx.chatViewProvider) {
       const record = await ctx.orchestrator.getRecord({
@@ -9494,11 +9613,19 @@ async function handleGenerateImplementationOutcomeV1(
         : "Generate Implementation cancelled."
     );
   } else {
-    NotificationRouter.showError(
-      ctx.suppressCompletionUiV1
-        ? `Generating implementation checklist failed: ${describeTaskActionFailureV1(outcome)}. Implement the plan manually instead.`
-        : `Generate Implementation failed: ${describeTaskActionFailureV1(outcome)}. Use the manual workflow instead.`
-    );
+    const failureMessage = ctx.suppressCompletionUiV1
+      ? `Generating implementation checklist failed: ${describeTaskActionFailureV1(outcome)}. Implement the plan manually instead.`
+      : `Generate Implementation failed: ${describeTaskActionFailureV1(outcome)}. Use the manual workflow instead.`;
+    NotificationRouter.showError(failureMessage);
+    // Blocker fix (2026-09-22 review pass 11): a provider transport failure
+    // must settle the operation as `failed`, never `refused` — `refused` is
+    // reserved for the guard-clause decline (the enterStageV1 refusal
+    // above), which reports via `succeeded: false` under `refusedWhenFalse`.
+    // Throwing here routes through runTrackedOperation's catch
+    // (`taskOperations.end(handle, "failed")`); the sentinel type lets the
+    // caller swallow the already-reported failure without a duplicate,
+    // generic host-level error toast.
+    throw new GenerateImplementationOutcomeFailureV1(failureMessage);
   }
 
   return { succeeded };
@@ -9660,9 +9787,11 @@ export async function generateImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const opResult = await runTrackedOperation(
+  let opResult: boolean | undefined;
+  try {
+  opResult = await runTrackedOperation(
     lockKey,
-    { label: "Generate Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "generate-implementation", cancellable: true },
+    { label: "Generate Implementation", stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "generate-implementation", cancellable: true, refusedWhenFalse: true },
     async (op) => {
       // Notifications in-flight visibility (Step 5/6 audit, review defect):
       // publish "starting" immediately, before ANY await — including plan
@@ -9768,6 +9897,16 @@ export async function generateImplementationWithAI(
       return handleRes.succeeded;
     }
   );
+  } catch (error) {
+    // Blocker fix (2026-09-22 review pass 11): the provider-failure sentinel
+    // above already ended the operation as `failed` and showed its message;
+    // swallow it here so the command does not also surface a second,
+    // generic host-level error toast. Any other error still propagates.
+    if (error instanceof GenerateImplementationOutcomeFailureV1) {
+      return false;
+    }
+    throw error;
+  }
 
   return opResult || undefined;
 }
@@ -11344,6 +11483,7 @@ async function executeImplementationRun(
             options: [
               {
                 optionId: "goToReviewAndApply",
+                resumeKind: "continue",
                 label: "Go to Review & Apply",
                 consequence:
                   `Moves the task to ${STAGE_DISPLAY_NAMES[targetReviewStage]} and opens Apply Review, ` +
@@ -11360,6 +11500,7 @@ async function executeImplementationRun(
               },
               {
                 optionId: "notNow",
+                resumeKind: "unpause",
                 label: "Not now",
                 consequence:
                   "Does nothing. Review the implementation run log and use Apply Review yourself when ready.",
@@ -11725,14 +11866,59 @@ async function executeImplementationRun(
       );
     }
 
+    // Part 1 review fix (item 15 / enterStageV1 rollout): the move into
+    // "impl" is now a SEPARATE transition through `enterStageV1` (kind
+    // "implementation-run"), run BEFORE the result patch below rather than
+    // folded into it as a bare field assignment. A round that reaches this
+    // point already required the implementation artifact via
+    // `materializeCanonicalIfNeeded` earlier in this function, so
+    // `prepareStageEntryV1` always finds it canonical here and this call
+    // writes no journal — it only performs the stage's own compare-and-set.
+    // A refused entry (the source stage moved out from under us between the
+    // fresh read below and the lock, or the artifact genuinely is not
+    // canonical) is logged and does NOT abort the round: the result patch
+    // below (type-check outcome, files changed, checklist merge) must still
+    // land even if the stage itself could not move, so the round's evidence
+    // is never lost to a stage-entry race.
+    //
+    // Both current production callers of `executeImplementationRun`
+    // (`runImplementationWithAI`, gated to `IMPLEMENTATION_ELIGIBLE_STAGES` =
+    // impl/impl-high-review/impl-low-review, and `applyImplementationReviewWithAI`,
+    // always dispatched at an impl review stage) only ever reach this point
+    // with a source stage the guard below already excludes — so this branch
+    // is currently a defensive no-op for those two entry points, not a change
+    // in observable behavior. It exists so a future/continuation caller that
+    // dispatches from "desc"/"plan" cannot silently land on "impl" without
+    // going through this same, tested primitive.
+    const advisoryBeforeImplEntry = await readTaskProgressAdvisoryV1(folderUri);
+    const sourceStageBeforeImplEntry = advisoryBeforeImplEntry?.currentStage;
+    if (
+      sourceStageBeforeImplEntry !== undefined &&
+      sourceStageBeforeImplEntry !== "impl" &&
+      !isReviewStage(sourceStageBeforeImplEntry)
+    ) {
+      const implEntry = await enterStageV1(
+        folderUri,
+        sourceStageBeforeImplEntry,
+        "impl",
+        /* isPaused */ false, // Inert: "implementation-run" is never AUTO_REVIEW_ELIGIBLE.
+        "implementation-run"
+      );
+      if (!implEntry.ready) {
+        console.error(
+          "executeImplementationRun: could not move the task to \"impl\" via enterStageV1 " +
+            `(reason: ${implEntry.reason}); the round's own result is still being recorded below.`
+        );
+      } else {
+        await runStageEntryPostCommitV1(folderUri, implEntry);
+      }
+    }
+
     // Use patchTaskProgressStrictV1 to avoid overwriting unrelated fields.
+    // This patch never writes `currentStage` — the stage move (if any)
+    // already landed above via `enterStageV1`.
     const persistedAfterRun = await patchTaskProgressStrictV1(folderUri, (currentProgress) => {
-      const alreadyAtOrPastImplementation =
-        currentProgress.currentStage === "impl" ||
-        isReviewStage(currentProgress.currentStage);
-      const stageBase = alreadyAtOrPastImplementation
-        ? currentProgress
-        : { ...currentProgress, currentStage: "impl" as TaskStage };
+      const stageBase = currentProgress;
       // (2g) Record a failing post-round type-check so it surfaces even if
       // the user isn't watching this run's notifications; clear a
       // previously-recorded one once a later round's type-check passes (or
@@ -12017,6 +12203,26 @@ async function executeImplementationRun(
         automaticChecklistReconciliation?.kind === "candidatesFound"
           ? automaticChecklistReconciliation.pendingOperationEvidenceItems
           : undefined;
+      // Item 16 / Part 4 Step 13: this round's own report was just rejected
+      // under the summary-shape contract (`summaryIssue` set) — reached
+      // because this checklist-latch block (pre-existing state, possibly
+      // set by an earlier round) runs unconditionally, before the
+      // `summaryIssue` early-return further below. Without a lead, the
+      // decision this posts reads as though the checklist is the reason the
+      // round stalled, when the rejection is the actual headline event.
+      // `recovery` (begun above, before any of this round's checklist
+      // accounting) already knows whether a continuation was scheduled or
+      // the budget is exhausted — reused here rather than re-derived so this
+      // text can never disagree with `finishDispatch`'s own wording for the
+      // same round.
+      const rejectionLeadNote = summaryIssue
+        ? `⚠️ This round's report was rejected (${summaryIssue}).` +
+          (recovery
+            ? recovery.capReached
+              ? " Automated recovery has stopped: the continuation budget is exhausted, and nothing will retry it automatically."
+              : ` A continuation implementation round (${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}) has been scheduled to produce a usable report.`
+            : "")
+        : undefined;
       const reconcilePosted = persistedAfterRun
         ? await postReconcilePlanChecklistDecisionV1(
             folderUri,
@@ -12024,12 +12230,14 @@ async function executeImplementationRun(
             folderUri.fsPath,
             persistedAfterRun,
             checklistMergeResult,
-            pendingOperationEvidenceForDecision
+            pendingOperationEvidenceForDecision,
+            rejectionLeadNote
           )
         : { kind: "noContext" as const };
       if (reconcilePosted.kind !== "posted") {
         NotificationRouter.showWarning(
-          "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
+          (rejectionLeadNote ? `${rejectionLeadNote} Separately: ` : "⚠️ ") +
+            "The plan checklist is not a complete record for this task — its step counts are unverified " +
             "until reconciled, and completeness is not gating advancement. " +
             `${checklistReconcileGuidanceSentenceV1(outstandingList)}${outstandingList}`,
           undefined,
@@ -12578,24 +12786,118 @@ export async function runImplementationWithAI(
   // redirect runs here, after `runTrackedOperation` has resolved and the
   // operation has genuinely ended.
   let redirectAfterOperationV1: { reviewStage: TaskStage; reason: string } | undefined;
+  // Part 4 Step 10 (item 16) completion blocker, 2026-09-24 review: `onSettled`
+  // below used to infer "nothing happened" purely from the terminal `state`,
+  // which is wrong in two directions — a checklist-generation provider call
+  // (below) can run and then still end in a non-"succeeded" state (a refused
+  // reconstruction, a declined prompt-size confirmation, a mid-round
+  // failure), which is NOT a pre-provider no-op even though its state is not
+  // "succeeded"; and a "cancelled" state can equally be reached before ANY
+  // provider call started, which IS a pre-provider no-op that the old
+  // blanket `state === "cancelled"` exclusion silently dropped from the log.
+  // This flag is the one explicit signal every place that does real,
+  // durable work this round sets the instant it happens — a provider
+  // invocation, OR materializeCanonicalIfNeeded actually writing
+  // plan-final.md from legacy implementation.md before any provider call
+  // (narrowed further by a 2026-09-24 review: the name used to read
+  // `providerInvokedThisRound`, which this second case does not literally
+  // satisfy) — so `onSettled` can tell "nothing changed" from "something
+  // changed and this settled some other way" directly, instead of guessing
+  // from the terminal state.
+  let providerInvokedThisRound = false;
   const implRoundRan = await runTrackedOperation(
     lockKey,
-    { label: stepNameV1("implementation"), stage: "impl", taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath), kind: "run-implementation", cancellable: true },
+    {
+      label: stepNameV1("implementation"),
+      stage: "impl",
+      taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
+      kind: "run-implementation",
+      cancellable: true,
+      // Part 4 (item 8) review fix, 2026-09-24: several guard-clause declines
+      // inside this body (a declined checklist prompt-size confirmation, a
+      // checklist child that itself refused/failed, a hand-off-only stop, an
+      // automation redirect to Apply Review, a declined implementation
+      // prompt-size confirmation) `return false` without an explicit
+      // `settleAs` call — the ones that already warn-and-settle explicitly
+      // (missing plan, unavailable provider, ...) are unaffected, since an
+      // explicit outcome always takes precedence. Every one of those
+      // un-settled paths means this operation achieved nothing, so
+      // `refusedWhenFalse` is the correct uniform default rather than
+      // auditing each `return false` site individually. The only `true`
+      // return is the genuine "an implementation round actually ran" case at
+      // the end of this body.
+      refusedWhenFalse: true,
+      // Item 16 / Part 4 Step 10: a continuation round (implRecovery was
+      // owed when this run started) that settles as anything other than
+      // succeeded ended without invoking a provider or changing anything —
+      // the exact "0.8 seconds later, marked completed, with no files
+      // changed, and nothing in runs/" incident. `refusedWhenFalse` above
+      // already keeps it from being recorded "completed"; this writes the
+      // run-log entry the incident found missing, naming what it was
+      // recovering from and why it could not proceed, using the same
+      // round-less "declined" convention `describeOwedContinuationRefusalV1`
+      // already writes for the busy-refusal case (taskOperations.ts).
+      onSettled: (state, reason) => {
+        // Extracted as `shouldLogNoOpContinuationRoundV1` so the decision is
+        // directly unit-testable — see its doc comment (implementationRecoveryV1.ts)
+        // for why `providerInvokedThisRound`, not the terminal `state` alone,
+        // is what decides this.
+        if (!shouldLogNoOpContinuationRoundV1(continuationOwedAtEntry, state, providerInvokedThisRound)) {
+          return;
+        }
+        const record = resolved.progress.implRecovery;
+        const recoveringFrom = record
+          ? `${describeImplRecoveryTriggerV1(record.trigger)} (source round ${record.sourceAttemptId}): ${record.reason}`
+          : "an owed implementation continuation";
+        void writeRunLog(
+          resolved.folderUri,
+          "declined",
+          "impl",
+          `# Continuation Round Ended Without Changes\n\n` +
+            `Status: ${state}${reason ? ` (${reason})` : ""}\n\n` +
+            `Recovering from: ${recoveringFrom}\n\n` +
+            `This continuation round settled as "${state}" before invoking a provider or ` +
+            `changing anything, so no implementation work happened here. It is not recorded ` +
+            `as completed.`
+        ).catch(() => {
+          // Courtesy record only — a failure to write it must never turn an
+          // already-settled operation outcome into an unhandled error.
+        });
+      },
+    },
     async (op): Promise<boolean> => {
     const stageToken = reportStageStartingV1(op, model.modelId);
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
+    // 2026-09-24 review completion blocker (narrowed): `providerInvokedThisRound`
+    // alone answered "did a provider run", not "did anything change" —
+    // materializeCanonicalIfNeeded can copy implementation.md to
+    // plan-final.md (a real, durable file write) and a LATER guard clause in
+    // this body can still decline/refuse before any provider call, which
+    // `shouldLogNoOpContinuationRoundV1` would previously have logged as a
+    // no-op even though a file was written. Checked for existence BEFORE the
+    // call so a canonical file that was already there (the common case —
+    // nothing materialized) is not mistaken for a fresh write.
+    const canonicalExistedBeforeMaterialize =
+      (await statIfExists(getCanonicalImplementationUri(resolved.folderUri))) !== undefined;
     try {
       canonicalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
     } catch (error) {
-      NotificationRouter.showError(
-        error instanceof Error ? error.message : String(error)
-      );
+      const detail = error instanceof Error ? error.message : String(error);
+      op.settleAs("failed", detail);
+      NotificationRouter.showError(detail);
       return false;
+    }
+    if (!canonicalExistedBeforeMaterialize) {
+      // materializeCanonicalIfNeeded just copied implementation.md to
+      // plan-final.md — a genuine workspace change, whatever happens next in
+      // this round.
+      providerInvokedThisRound = true;
     }
 
     let planFinalContent = await readNonEmptyText(canonicalUri);
     if (!planFinalContent) {
+      op.settleAs("refused", "no plan-final.md or implementation.md to implement from");
       NotificationRouter.showWarning(
         stageActionRequirementMessageV1("runImplementation", 0)
       );
@@ -12622,6 +12924,7 @@ export async function runImplementationWithAI(
       op.reportActivity("generating implementation checklist", { stageToken });
       const checklistWorkspace = resolveOwnerWorkspace(resolved.progress);
       if (!checklistWorkspace) {
+        op.settleAs("failed", "could not determine the owning workspace for this task");
         NotificationRouter.showError(
           "Could not determine the owning workspace for this task. Please open the workspace that created it."
         );
@@ -12645,6 +12948,7 @@ export async function runImplementationWithAI(
       );
       const checklistModel = await resolveFreshModelForStage(resolved.folderUri, "impl");
       if (!checklistModel.modelId) {
+        op.settleAs("refused", "no model is configured for impl");
         NotificationRouter.showWarning(
           "No model is configured for impl. Open Ensemble Settings and choose a primary model before continuing.",
           undefined,
@@ -12657,6 +12961,10 @@ export async function runImplementationWithAI(
       const { availability: checklistAvailability, providerLabel: checklistProviderLabel } =
         await checkImplementationAvailabilityForModel(checklistModel.modelId, "impl");
       if (!checklistAvailability.available) {
+        op.settleAs(
+          "refused",
+          `${checklistProviderLabel} unavailable: ${checklistAvailability.reason ?? "unknown reason"}`
+        );
         NotificationRouter.showWarning(
           `${checklistProviderLabel} is unavailable: ${checklistAvailability.reason ?? "unknown reason"}. Implement the plan manually instead.`
         );
@@ -12679,7 +12987,22 @@ export async function runImplementationWithAI(
       // runner/provider boundary now rejects unconditionally.
       const generated = await runTrackedOperation(
         resolved.folderUri.fsPath,
-        { parent: op, label: "Generating implementation checklist", stage: "impl", kind: "generate-implementation" },
+        {
+          parent: op,
+          label: "Generating implementation checklist",
+          stage: "impl",
+          kind: "generate-implementation",
+          // Part 4 (item 8) audit: without this, a non-thrown false return
+          // from the callback below (a refused stage-entry, an unanswered
+          // "questions" outcome, or a "cancelled" outcome that never touched
+          // this operation's own cancellation token) settles as "succeeded"
+          // by the normal-return default — recording "completed" for a
+          // checklist that was never generated. `handleGenerateImplementationOutcomeV1`
+          // already throws for a genuine provider failure (settled "failed"
+          // via the catch clause), so `refusedWhenFalse` only needs to cover
+          // the remaining non-thrown false cases.
+          refusedWhenFalse: true,
+        },
         async (checklistOp) => {
           // `setModel`/`reportActivity` are addressed to `op` (the root),
           // not `checklistOp` (a child) — only root operations render a row
@@ -12696,6 +13019,11 @@ export async function runImplementationWithAI(
           // visible row.
           op.setModel?.(checklistModelId);
           op.reportActivity("running", { stageToken });
+          // See `providerInvokedThisRound`'s declaration comment: from this
+          // point on, whatever this round settles as is not a pre-provider
+          // no-op, even if `invokeGenerateImplementationActionV1` itself
+          // ultimately reports failure/questions/cancellation.
+          providerInvokedThisRound = true;
           const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
             folderUri: resolved.folderUri,
             workspaceUri: checklistWorkspace.uri,
@@ -12735,6 +13063,7 @@ export async function runImplementationWithAI(
     const { availability, providerLabel } =
       await checkImplementationAvailabilityForModel(model.modelId, "impl");
     if (!availability.available) {
+      op.settleAs("refused", `${providerLabel} unavailable: ${availability.reason ?? "unknown reason"}`);
       NotificationRouter.showWarning(
         `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
       );
@@ -12852,6 +13181,7 @@ export async function runImplementationWithAI(
           options: [
             {
               optionId: "goToReviewAndApply",
+              resumeKind: "continue",
               label: "Go to Review & Apply",
               consequence:
                 `Moves the task to ${STAGE_DISPLAY_NAMES[targetReviewStage]} and opens Apply Review, which ` +
@@ -12870,6 +13200,7 @@ export async function runImplementationWithAI(
             },
             {
               optionId: "letItRun",
+              resumeKind: "continue",
               // Part 11 item 13b's audit target verbatim: "Let Implementation
               // Run" named the mechanism (the Implementation round already in
               // flight) rather than the outcome for the user.
@@ -13045,6 +13376,10 @@ export async function runImplementationWithAI(
         // exactly as they were — the continuation stays owed, and a retry
         // once the missing artifact is restored can still complete it as
         // Apply Review.
+        op.settleAs(
+          "refused",
+          `Apply Review continuation could not be reconstructed: ${reconstructionError ?? "unknown reason"}`
+        );
         NotificationRouter.showWarning(
           `Apply Review continuation could not be reconstructed: ${reconstructionError ?? "unknown reason"} ` +
             "The pending changes remain quarantined; restore the missing artifact and retry."
@@ -13098,6 +13433,10 @@ export async function runImplementationWithAI(
       : "impl";
 
     reportStageRunningV1(op, stageToken);
+    // See `providerInvokedThisRound`'s declaration comment: the main
+    // implementation dispatch is about to run, so whatever this operation
+    // settles as from here on is not a pre-provider no-op.
+    providerInvokedThisRound = true;
     await executeImplementationRun(
       extensionUri,
       resolved.folderUri,
@@ -13481,7 +13820,18 @@ export async function applyReviewEditWithAI(
 
     const implementSucceeded = await runTrackedOperation(
       lockKey,
-      { parent: op, label: "Applying implementation review", stage: "impl", kind: "run-implementation" },
+      {
+        parent: op,
+        label: "Applying implementation review",
+        stage: "impl",
+        kind: "run-implementation",
+        // Part 4 (item 8) audit: applyImplementationReviewWithAI warns and
+        // returns false on its own guard-clause declines (host gate closed,
+        // provider unavailable) rather than throwing — without this, the
+        // normal-return default would settle this nested operation as
+        // "succeeded" for a round that never ran.
+        refusedWhenFalse: true,
+      },
       (child) =>
         applyImplementationReviewWithAI(
           extensionUri,
@@ -13527,6 +13877,24 @@ export async function applyReviewEditWithAI(
             }
           )
       );
+    } else if (!options.parentOperation) {
+      // Part 4 (item 8) review fix, 2026-09-24: the implementation-round
+      // dispatch above genuinely ran (that is what `return true` below
+      // reports — see the comment there), but it declined or failed on its
+      // own guard clauses (host gate closed, provider unavailable) rather
+      // than throwing. That outcome is already recorded on the CHILD
+      // operation via `refusedWhenFalse` above, but children never render
+      // their own Notifications row (operationNotificationBridge.ts) and
+      // `runApply`'s own `true` return never reaches `refusedWhenFalse` on
+      // this function's standalone root (`op` here — see the
+      // `!options.parentOperation` branch below), which would otherwise
+      // settle "completed" for a round that changed nothing. Composite
+      // dispatch (`options.parentOperation`, e.g. Fast Forward) is left
+      // alone: that root's own outcome is owned by its own loop, which may
+      // still make real progress in a later round after this one declined —
+      // settling it here could wrongly freeze a composite that goes on to
+      // succeed.
+      op.settleAs("refused", "the implementation round declined or failed; nothing to re-review");
     }
     // The implementation-round dispatch above genuinely ran (whether or not
     // it itself succeeded — `implementSucceeded` governs the re-review, not
@@ -14023,7 +14391,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   await runTrackedOperation(
     candidate,
     { label: "Release", taskName: arg?.task?.progress?.displayName ?? arg?.task?.folderName ?? path.basename(candidate), kind: "release" },
-    async () => {
+    async (releaseOp) => {
     // The release target is the explicit, per-workspace-folder persisted
     // package.json path (see resolveReleaseTargetPackageJson) — it may be a
     // nested package and can differ from any task's Publish verification
@@ -14035,7 +14403,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
       false,
       resolvePublishScopeFolder(vscode.Uri.file(candidate), progress).folder
     );
-    if (!packageJsonPath) { return; }
+    if (!packageJsonPath) { releaseOp.settleAs("refused", "no release target package.json was chosen"); return; }
     const packageDir = path.dirname(packageJsonPath);
 
     let pkg: { scripts?: Record<string, unknown> };
@@ -14044,16 +14412,25 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
       if (!parsed || typeof parsed !== "object") throw new Error("package.json is not an object");
       pkg = parsed as { scripts?: Record<string, unknown> };
     }
-    catch { NotificationRouter.showError("No valid package.json was found at the selected release target."); return; }
+    catch {
+      releaseOp.settleAs("failed", "no valid package.json was found at the selected release target");
+      NotificationRouter.showError("No valid package.json was found at the selected release target.");
+      return;
+    }
     const script = pkg.scripts?.[RELEASE_SCRIPT_NAME];
     if (script === undefined) {
+      releaseOp.settleAs("refused", `no "${RELEASE_SCRIPT_NAME}" script in package.json`);
       NotificationRouter.showWarning(
         `Release requires a "${RELEASE_SCRIPT_NAME}" script in ${path.relative(root, packageJsonPath) || "package.json"}. ` +
           `Add one, e.g. "${RELEASE_SCRIPT_NAME}": "npm run release", then try again.`
       );
       return;
     }
-    if (!isSafeReleaseScript(script)) { NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE); return; }
+    if (!isSafeReleaseScript(script)) {
+      releaseOp.settleAs("refused", "release script failed the safety check");
+      NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE);
+      return;
+    }
     // "ensemble:release" may be a one-line pass-through to another script
     // (e.g. "npm run release"); resolve that single hop so the confirmation
     // dialog below covers the script that actually runs, not just the
@@ -14066,9 +14443,17 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     const targetIsSafe = isIndirect
       ? isSafeReleaseIndirectionTarget(resolved.value)
       : isSafeReleaseScript(resolved.value);
-    if (!targetIsSafe) { NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE); return; }
+    if (!targetIsSafe) {
+      releaseOp.settleAs("refused", "release script's resolved target failed the safety check");
+      NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE);
+      return;
+    }
     const effectiveScript = resolved.value as string;
-    if (!vscode.workspace.isTrusted) { NotificationRouter.showWarning("Release requires a trusted workspace."); return; }
+    if (!vscode.workspace.isTrusted) {
+      releaseOp.settleAs("refused", "workspace is not trusted");
+      NotificationRouter.showWarning("Release requires a trusted workspace.");
+      return;
+    }
     const manager = fs.existsSync(path.join(packageDir, "pnpm-lock.yaml")) || fs.existsSync(`${root}/pnpm-lock.yaml`)
       ? "pnpm"
       : fs.existsSync(path.join(packageDir, "yarn.lock")) || fs.existsSync(`${root}/yarn.lock`)
@@ -14086,14 +14471,21 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     // the resolved target's body — what will actually run — not the
     // pass-through text.
     const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\nPackage manager: ${manager}\nScript (${scriptLabel}): ${effectiveScript}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
-    if (confirmation !== "Run Release") return;
+    if (confirmation !== "Run Release") {
+      releaseOp.settleAs("refused", "release was not confirmed");
+      return;
+    }
     // Re-read immediately before launching so a package.json edit cannot
     // change the reviewed release command between confirmation and
     // execution — both the "ensemble:release" text itself and, if it is an
     // indirection, the resolved target script it points to.
     const currentPackage = JSON.parse(await fs.promises.readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
     const currentEffective = isIndirect ? currentPackage.scripts?.[resolved.name] : currentPackage.scripts?.[RELEASE_SCRIPT_NAME];
-    if (currentPackage.scripts?.[RELEASE_SCRIPT_NAME] !== script || currentEffective !== effectiveScript) { NotificationRouter.showError("The release script changed after confirmation; release was cancelled."); return; }
+    if (currentPackage.scripts?.[RELEASE_SCRIPT_NAME] !== script || currentEffective !== effectiveScript) {
+      releaseOp.settleAs("failed", "the release script changed after confirmation");
+      NotificationRouter.showError("The release script changed after confirmation; release was cancelled.");
+      return;
+    }
     await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: packageDir, packageManager: manager, script: effectiveScript, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
     // Run in a visible IDE terminal so interactive version prompts work.
     // The extension only reports that the release was STARTED — it does not
@@ -14201,26 +14593,41 @@ async function buildReviewResumeVariablesV1(
       const canRestorePreviousImplSummary =
         previousImplSummary !== undefined && !isUnusableImplementationSummaryV1(previousImplSummary);
       const checklistFullySettled = await isPlanChecklistFullySettledV1(folderUri);
+      // See `runReviewForFolder`'s matching branch (Part 4 Step 12, item 16).
+      const hasLiveImplRecovery = (await readTaskProgressAdvisoryV1(folderUri))?.implRecovery !== undefined;
       return {
         ok: false,
         warning:
           "The last implementation round did not produce usable implementation notes, so there is " +
           "nothing to review it against. " +
           describeUnusableSummaryRemedyV1(canRestorePreviousImplSummary, checklistFullySettled),
-        ...(canRestorePreviousImplSummary
+        // Run Implementation takes priority as the toast's one action button
+        // when both apply (2026-09-24 review, narrowed completion blocker —
+        // see `describeUnusableReviewBlockV1`'s `offerRunImplementation` doc
+        // comment); Restore stays reachable via the tree row and the
+        // "Restore Last Usable Summary" command.
+        ...(shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery)
           ? {
               actionCommand: {
-                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-                title: "Restore Last Usable Summary",
-                // No record here of which top-level command originally started
-                // the interaction being resumed (Review or Fast Forward both
-                // create the same kind of interaction) — default to plain
-                // Review, same rationale as `runReviewForFolder`'s
-                // `rerunCommandId` default.
-                args: [folderUri.fsPath, targetStage, "vs-code-ai-helper.runReviewWithAI"],
+                command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+                title: "Run Implementation",
+                args: [{ taskFolderPath: folderUri.fsPath }],
               },
             }
-          : {}),
+          : canRestorePreviousImplSummary
+            ? {
+                actionCommand: {
+                  command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                  title: "Restore Last Usable Summary",
+                  // No record here of which top-level command originally started
+                  // the interaction being resumed (Review or Fast Forward both
+                  // create the same kind of interaction) — default to plain
+                  // Review, same rationale as `runReviewForFolder`'s
+                  // `rerunCommandId` default.
+                  args: [folderUri.fsPath, targetStage, "vs-code-ai-helper.runReviewWithAI"],
+                },
+              }
+            : {}),
       };
     }
     variables.implementation = implementationContent;

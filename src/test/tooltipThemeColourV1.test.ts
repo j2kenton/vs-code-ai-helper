@@ -148,6 +148,7 @@ void describe("task tree tooltip — theme-aware informational text", () => {
           label: "Restore",
           consequence: "Restores.",
           destructive: false,
+          resumeKind: "unpause",
           effect: { kind: "command", command: "vs-code-ai-helper.restoreRejectedImplementationRound" },
         },
       ],

@@ -203,7 +203,7 @@ export async function markTaskDone(
   await runTrackedOperation(
     lockKey,
     { label: "Complete Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "complete-task" },
-    async () => {
+    async (op) => {
     // Completion is an explicit user action. Reaching Publish alone never
     // changes lifecycle status, but this command is the durable terminal
     // edge — persisted through the markTaskDone.v1 registry row (plan §6.6),
@@ -214,6 +214,7 @@ export async function markTaskDone(
     // same task, so leases and audit records key on one identity per task.
     const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
     if (!derivedBinding.ok) {
+      op.settleAs("failed", "ownership binding could not be verified");
       NotificationRouter.showError(
         `Could not complete ${resolvedTask.folderName}: its ownership binding could not be verified. ` +
           `The task's progress file needs recovery.`
@@ -236,6 +237,7 @@ export async function markTaskDone(
     });
     if (outcome.kind !== "completed") {
       const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+      op.settleAs("failed", detail);
       NotificationRouter.showError(`Could not complete ${resolvedTask.folderName}: ${detail}.`);
       return;
     }

@@ -1528,6 +1528,7 @@ export async function runImplementationForModel(options: {
                 {
                   optionId: "rerunAfterReset",
                   label: "Rerun after reset",
+                  resumeKind: "continue",
                   consequence: `Schedules an automatic rerun of this stage at ${knownResetAt}.`,
                   effect: {
                     kind: "command",
@@ -1538,6 +1539,7 @@ export async function runImplementationForModel(options: {
                 {
                   optionId: "notNow",
                   label: "Not now",
+                  resumeKind: "unpause",
                   consequence: "Does nothing. No rerun is scheduled.",
                   effect: { kind: "doNothing" },
                 },

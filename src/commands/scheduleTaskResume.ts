@@ -30,6 +30,7 @@ import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
+import { recoverStageEntryJournalIfPresentV1 } from "../utils/stageEntryJournalV1";
 import { pauseTaskWithReasonForClaimV1, setNextActorV1 } from "../utils/taskProgressTransforms";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
@@ -135,6 +136,7 @@ export function buildStalledTaskEscalationDecisionV1(
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "resumeAndRerun",
+      resumeKind: "continue",
       label: resumeOption.label,
       consequence: resumeOption.consequence,
       effect: {
@@ -145,6 +147,7 @@ export function buildStalledTaskEscalationDecisionV1(
     },
     {
       optionId: "handleMyself",
+      resumeKind: "unpause",
       label: "Leave it paused — I'll review it first",
       consequence:
         "Leaves the task paused; nothing is dispatched. Review the run log for what happened before resuming.",
@@ -178,12 +181,19 @@ export function buildStalledTaskEscalationDecisionV1(
 
 /**
  * The card for a pause whose resume is blocked by an unmet precondition
- * (`resumeAndApplyCurrentStageAction` would leave the task paused and say so).
- * Offering "Resume" as a recommended, unblocking option here would be false —
- * choosing it is recorded as "applying now" and changes nothing — so the card
- * offers only what can actually change the refusing condition (restoring the
- * last usable summary, when that is the cause) and says the task stays paused
- * until then.
+ * (`resumeAndApplyCurrentStageAction` would leave the task paused and say so
+ * if dispatched directly, without first clearing the precondition). Offering
+ * "Resume" as a recommended, unblocking option here would be false — choosing
+ * it is recorded as "applying now" and changes nothing — so the card offers
+ * only what can actually change the refusing condition: restoring the last
+ * usable summary, when that is the cause. Restoring is Ensemble's own
+ * adjustment (the user does not do it by hand), so — per the "Ensemble
+ * performs it -> say so and do it" rule — this option both restores and,
+ * once the restore actually replaced something, tries again by dispatching
+ * `resumeAndApplyCurrentStageAction`. `restoreRejectedImplementationRound`'s
+ * own `rerunCommandId` guard (only re-dispatches when the restore returned
+ * true) is what keeps this safe: a no-op restore (nothing to restore, or no
+ * backup found) never fires a dispatch against the still-blocked state.
  */
 function buildBlockedStalledTaskDecisionV1(
   target: ChatTarget,
@@ -194,19 +204,25 @@ function buildBlockedStalledTaskDecisionV1(
   if (plan.restoreSummary) {
     options.push({
       optionId: "restoreSummary",
-      label: "Restore the last usable summary",
+      resumeKind: "continue",
+      label: "Restore the last usable summary and try again",
       consequence:
-        "Restores the previous usable implementation summary, which clears this refusal. The task stays " +
-        "paused — resume it afterwards (Resume Task in the task's menu).",
+        "Restores the previous usable implementation summary, which clears this refusal, then resumes " +
+        "the task and dispatches its current stage's action.",
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-        args: [target.taskFolderPath, target.stage],
+        args: [
+          target.taskFolderPath,
+          target.stage,
+          "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        ],
       },
     });
   }
   options.push({
     optionId: "handleMyself",
+    resumeKind: "unpause",
     label: "Leave it paused — I'll review it first",
     consequence: "Leaves the task paused; nothing is dispatched.",
     effect: { kind: "doNothing" },
@@ -215,7 +231,9 @@ function buildBlockedStalledTaskDecisionV1(
     ? {
         kind: "option",
         optionId: "restoreSummary",
-        reasoning: "Resuming would be refused until the last usable summary is restored; restoring clears that.",
+        reasoning:
+          "Resuming would be refused until the last usable summary is restored; restoring clears that " +
+          "and this option resumes the task automatically once it does.",
       }
     : {
         kind: "none",
@@ -233,13 +251,12 @@ function buildBlockedStalledTaskDecisionV1(
     recommendation,
     gating: {
       holdsTaskPaused: true,
-      unblocksProgress: false,
-      detail:
-        "The task stays paused whichever option you choose: resuming is refused until the missing " +
-        "prerequisite is cleared. " +
-        (plan.restoreSummary
-          ? "Restoring the summary clears it; then resume the task."
-          : "Clear it, then resume the task."),
+      unblocksProgress: Boolean(plan.restoreSummary),
+      detail: plan.restoreSummary
+        ? "Restoring the summary clears the missing prerequisite and resumes the task automatically; " +
+          "\"Leave it paused — I'll review it first\" leaves it paused and dispatches nothing."
+        : "The task stays paused whichever option you choose: resuming is refused until the missing " +
+          "prerequisite is cleared. Clear it, then resume the task.",
     },
   };
 }
@@ -282,12 +299,14 @@ export function buildDelayedRetryDecisionV1(
     options: [
       {
         optionId: "waitForRetry",
+        resumeKind: "unpause",
         label: "Wait for the automatic retry",
         consequence: `Does nothing. The scheduled action runs by itself at ${due}.`,
         effect: { kind: "doNothing" },
       },
       {
         optionId: "runNow",
+        resumeKind: "continue",
         label: "Run now",
         consequence:
           `Runs the scheduled ${target.stage} action immediately, exactly as the timer would. If something ` +
@@ -341,12 +360,14 @@ export function buildOwedContinuationDecisionV1(
     options: [
       {
         optionId: "waitForRetry",
+        resumeKind: "unpause",
         label: "Wait for the automatic retry",
         consequence: `Does nothing. The continuation is retried by itself; ${nextAttempt}.`,
         effect: { kind: "doNothing" },
       },
       {
         optionId: "runNow",
+        resumeKind: "continue",
         label: "Run now",
         consequence:
           "Retries the owed continuation immediately, exactly as the sweep would. If a continuation is " +
@@ -751,6 +772,16 @@ export class TaskActionScheduler implements vscode.Disposable {
   }
 
   async armAll(): Promise<void> {
+    // Part 2 (item 15 hardening) — proactive recovery, once per task, first:
+    // every other pass below (round-ledger reconciliation, the watchdog's
+    // stall check, ...) may read `plan-final.md` or its checked/unchecked
+    // state, and none of them should ever do that while a crashed "impl"
+    // transition's stage-entry journal is still un-recovered on disk. Ordered
+    // before every other self-healing pass for the same reason
+    // `reconcileRoundLedgerOrphans` is ordered before re-arming: later passes
+    // should see the freshest, most-trustworthy state this sweep can
+    // establish.
+    await this.recoverStageEntryJournalsV1();
     const scheduledPaths = new Set<string>();
     for (const task of this.inventory.getTasks()) {
       const run = task.progress.scheduledRun;
@@ -971,6 +1002,34 @@ export class TaskActionScheduler implements vscode.Disposable {
    * reconciliation above and `armPendingImplRecoveries` below: idempotent,
    * cheap once nothing is stuck, safe to call every sweep.
    */
+  /**
+   * Part 2 (item 15 hardening) — the activation-sweep proactive-recovery call
+   * site the plan names alongside `enterStageV1`/`prepareStageEntryV1` and
+   * `materializeCanonicalIfNeeded`: a task can sit untouched for a long time
+   * after a crash left its stage-entry journal un-recovered (no one attempts
+   * a NEW "impl" transition against it, and it may never call
+   * `materializeCanonicalIfNeeded` either), so this sweep is what eventually
+   * reconciles it without requiring either. `recoverStageEntryJournalIfPresentV1`
+   * itself is a cheap no-op existence probe for the overwhelmingly common
+   * case (no journal), so this costs one `stat` per task on every sweep.
+   * Best-effort per task, matching every other self-healing pass in
+   * `armAll`: one task's failure is logged and never stops the sweep for the
+   * rest of the inventory.
+   */
+  private async recoverStageEntryJournalsV1(): Promise<void> {
+    for (const task of this.inventory.getTasks()) {
+      try {
+        await recoverStageEntryJournalIfPresentV1(vscode.Uri.file(task.taskFolderPath));
+      } catch (error) {
+        console.error(
+          `recoverStageEntryJournalsV1: failed to recover the stage-entry journal for "${task.taskFolderPath}" ` +
+            "— leaving it for a later sweep.",
+          error
+        );
+      }
+    }
+  }
+
   private async retryStuckPlanRevisionAdoptions(): Promise<void> {
     for (const task of this.inventory.getTasks()) {
       if (task.progress.planRevision === undefined) {

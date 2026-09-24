@@ -1401,7 +1401,21 @@ export async function postReconcilePlanChecklistDecisionV1(
     blockerSupersessions?: readonly BlockerSupersessionRecordV1[];
   },
   roundSummaryChecklistClaim?: MergeChecklistProgressResultV1,
-  pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[]
+  pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[],
+  /**
+   * Pre-1.0.0 fixes register, item 16 / Part 4 Step 13: set only when THIS
+   * round's own report was just rejected under the summary-shape contract
+   * (`describeImplementationSummaryShapeIssue`) and this checklist-latch
+   * decision is being posted for the very same round. A round that failed
+   * its own report contract is the headline event — the checklist's
+   * under-recording is a pre-existing, separate condition this round did
+   * not cause, and stating it first (as the call sites that do NOT pass
+   * this leave `whatHappened` doing) reads as though the rejected round is
+   * why the checklist needs reconciling. When present, it is prepended
+   * verbatim and the checklist sentence is demoted to "Separately, …" so
+   * the rejection is always read first.
+   */
+  rejectionLeadNote?: string
 ): Promise<ReconcileDecisionPostResultV1> {
   // Reads durable bytes, saving the user's unsaved ticks first — the shared
   // resolver owns that rule so this command and the completeness gate can
@@ -1636,7 +1650,8 @@ export async function postReconcilePlanChecklistDecisionV1(
         answeredOptionIds: ["notYet"],
       },
       whatHappened:
-        `This task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
+        (rejectionLeadNote ? `${rejectionLeadNote} Separately, this` : "This") +
+        ` task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
         `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +
         (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
         `), with ${counted.remaining} outstanding, but a round changed work the checklist could not record, ` +
@@ -1658,23 +1673,25 @@ export async function postReconcilePlanChecklistDecisionV1(
             "rather than assuming they are trustworthy."),
       gating: {
         holdsTaskPaused: false,
-        unblocksProgress: false,
+        unblocksProgress: true,
         detail:
-          "This does not resume the task by itself. The completeness gate only affects automatic stage " +
-          "advancement — if this task is currently paused, that pause comes from something else entirely " +
-          "(check for a separate escalation/decision); answering this alone will not resume it.",
+          "Applying a tick or link option, or marking reconciled, restores completeness gating and then " +
+          "dispatches this stage's next action, so it can move the task forward; if this task is currently " +
+          "paused for a reason unrelated to the checklist (check for a separate escalation/decision), that " +
+          "pause is not this decision's to clear.",
       },
       options: [
         ...(coveredItemsCount > 0
           ? [
               {
                 optionId: "applyVerifiedTicks",
-                label: `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"}`,
+                label: `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"} and try again`,
+                resumeKind: "continue" as const,
                 consequence:
                   `Ticks ${coveredItemsCount} item(s) in plan-final.md that an implementation review already ` +
-                  "on file names verified complete. Does not by itself clear the unreliable-checklist flag — " +
-                  "run this again afterward (or mark reconciled directly) once every outstanding item is " +
-                  "accounted for.",
+                  "on file names verified complete, then dispatches this stage's next action. Does not by " +
+                  "itself clear the unreliable-checklist flag — mark reconciled directly once every outstanding " +
+                  "item is accounted for.",
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
@@ -1687,15 +1704,17 @@ export async function postReconcilePlanChecklistDecisionV1(
           ? [
               {
                 optionId: "linkManualChecks",
-                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} To This Blocker`,
+                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} and try again`,
+                resumeKind: "continue" as const,
                 consequence:
                   `Records a durable "Covers: Step ${soleItemStepNumberForLink}" note on each of the ` +
                   `${linkableManualItems.length} outstanding manual-verification item(s) listed above, in ` +
                   "plan-final.md — your explicit confirmation that these are the checks this blocker names " +
                   "(the plan's own text carries no such link yet, and no automated signal can establish one " +
-                  "soundly). Does not tick or complete anything by itself — do the checks, then tick the item " +
-                  "and mark reconciled. Once recorded, this same decision will show the confirmed recommendation " +
-                  "instead of the pooled one, for this plan and any future round.",
+                  "soundly) — then dispatches this stage's next action. Does not tick or complete anything by " +
+                  "itself — do the checks, then tick the item and mark reconciled. Once recorded, this same " +
+                  "decision will show the confirmed recommendation instead of the pooled one, for this plan and " +
+                  "any future round.",
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.linkManualChecksToBlockerConfirmed",
@@ -1716,11 +1735,12 @@ export async function postReconcilePlanChecklistDecisionV1(
           : []),
         {
           optionId: "reconcile",
-          label: "Mark reconciled",
+          label: "Mark reconciled and try again",
+          resumeKind: "continue",
           consequence:
-            "Clears the unreliable-checklist flag. Plan completeness will gate stage advancement again from " +
-            "these counts, so an item left unticked will hold the task open, and one ticked in error can let " +
-            "unfinished work advance.",
+            "Clears the unreliable-checklist flag, then dispatches this stage's next action. Plan completeness " +
+            "will gate stage advancement again from these counts, so an item left unticked will hold the task " +
+            "open, and one ticked in error can let unfinished work advance.",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
@@ -1730,6 +1750,7 @@ export async function postReconcilePlanChecklistDecisionV1(
         {
           optionId: "notYet",
           label: "Not yet — keep the gate down",
+          resumeKind: "unpause",
           consequence: noUncheckedItemsRemain
             ? // No unticked items exist at all (case b above) — instructing
               // the user to "tick the missed items" would send them looking
@@ -1919,6 +1940,13 @@ export async function reconcilePlanChecklistConfirmedV1(
   NotificationRouter.showInformation(
     "Plan checklist marked as reconciled — completeness now gates advancement again."
   );
+  // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
+  // it"): the option that clears the latch is the only reason to clear it, so
+  // it also tries the stage's next action again rather than leaving the task
+  // sitting on the now-cleared gate with nothing running.
+  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+    taskFolderPath: folderUri.fsPath,
+  });
 }
 
 export type ApplyReconciliationTicksResultV1 =
@@ -2057,6 +2085,10 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   NotificationRouter.showInformation(
     `Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
   );
+  // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
+  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+    taskFolderPath: folderUri.fsPath,
+  });
 }
 
 /** Argument shape for the "Link N Outstanding Check(s) To This Blocker" option
@@ -2295,6 +2327,13 @@ export async function linkManualChecksToBlockerConfirmedV1(
   NotificationRouter.showInformation(
     `Linked ${appliedCount} outstanding check(s) to Step ${stepNumber} in plan-final.md via a Covers: annotation.`
   );
+  // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
+  // Linking alone does not resolve the blocker (a human still has to do the
+  // checks and tick/reconcile), but "try again" is honest either way: a
+  // dispatch that finds the same blocker still open changes nothing new.
+  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+    taskFolderPath: folderUri.fsPath,
+  });
 }
 
 export function registerReconcilePlanChecklistCommands(

@@ -104,7 +104,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
       stage: node.stage,
       taskName: resolveWorkflowRootTaskName(node.task.progress?.displayName, node.task.folderUri.fsPath),
     },
-    async () => {
+    async (op) => {
       const artifactName = artifact.path.split("/").pop() ?? artifact.fsPath;
       const openArtifactDoc = (): vscode.TextDocument | undefined =>
         vscode.workspace.textDocuments.find(
@@ -114,6 +114,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
       // overwrite would silently clobber the open buffer's state (or a later
       // Ctrl+S would resurrect the pre-swap content over the restored one).
       if (openArtifactDoc()?.isDirty) {
+        op.settleAs("refused", "artifact has unsaved changes in an open editor");
         NotificationRouter.showWarning(
           `${artifactName} has unsaved changes in an open editor. Save or discard them before you ${verb}.`
         );
@@ -130,6 +131,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
       // Re-check after the modal: the dirty state can change while it was open.
       const doc = openArtifactDoc();
       if (doc?.isDirty) {
+        op.settleAs("refused", "artifact picked up unsaved changes while confirming");
         NotificationRouter.showWarning(
           `${artifactName} picked up unsaved changes while confirming. Save or discard them, then ${verb} again.`
         );

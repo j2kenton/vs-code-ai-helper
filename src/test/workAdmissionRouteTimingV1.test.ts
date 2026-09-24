@@ -171,6 +171,26 @@ const ROUTE_TIMING_CASES_V1: readonly RouteTimingCaseV1[] = [
     admissionCall: "beginTargetResolutionV1(taskRootCandidatePathsV1)",
     firstUnprotectedStep: "await resolve(inventory, arg,",
   },
+  // resumeAndDispatchImplementationV1 acquires no admission of its own — it
+  // delegates its whole dispatch to the shared resumeThenDispatchV1 helper
+  // (mirrored by resumeAndRerunReviewV1 and friends, none of which are
+  // contributed commands and so are outside this inventory). The
+  // race-prone step is inside that shared helper: resumeThenDispatchV1 calls
+  // resumePausedTask with `holdAdmissionForCaller: true`, which is what
+  // actually acquires (or confirms held) admission before anything else in
+  // the helper runs, and only after that does the helper write
+  // `nextActor: "automation"` via patchTaskProgressStrictV1 — the unrelated
+  // write a watchdog sweep landing in between could otherwise race. Pointing
+  // this case at the shared helper, rather than the thin per-target wrapper,
+  // mirrors the `scheduleTaskResume` case above, which does the same for its
+  // own shared `fire` method.
+  {
+    routeId: "resumeAndDispatchImplementation",
+    file: "src/commands/resumeTask.ts",
+    fn: "async function resumeThenDispatchV1<T>(",
+    admissionCall: "resumePausedTask(inventory, currentTaskStore, explicitArg, {",
+    firstUnprotectedStep: 'setNextActorV1(p, "automation")',
+  },
 ];
 
 void describe("work admission route timing (v1 fixes 2, Part 1a route-completeness invariant, step 10)", () => {

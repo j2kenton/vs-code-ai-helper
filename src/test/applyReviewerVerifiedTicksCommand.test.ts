@@ -49,6 +49,17 @@ after(() => {
   safeRemoveDir(ROOT);
 });
 
+// Part 3, Step 5: `applyReviewerVerifiedTicksConfirmedV1` now dispatches
+// "resumeAndApplyCurrentStageAction" ("and try again") once it succeeds. A
+// module-scoped no-op registration (each test file is its own node:test
+// child process, so this cannot leak into other files) keeps every existing
+// happy-path test from hitting the stub's "not registered" throw; tests that
+// care which task it was dispatched for read `resumeAndApplyCurrentStageActionCalls`.
+const resumeAndApplyCurrentStageActionCalls: unknown[] = [];
+vscode.commands.registerCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", (arg?: unknown) => {
+  resumeAndApplyCurrentStageActionCalls.push(arg);
+});
+
 const CHECKLIST_PLAN = [
   "<!-- ensemble:implementation-checklist -->",
   "",
@@ -336,22 +347,27 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
     assert.match(modal, /Apply 1 Reviewer-Verified Tick/);
     assert.match(modal, /Wire the completeness gate/);
+    // Part 3, Step 5: applying succeeds, so it also tries the stage's next
+    // action again.
+    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), { taskFolderPath: result.folder });
   });
 
   // Task "Actionable Hand-offs" PART 5: every decision this task's plan asks
   // us to populate must state whether resolving it unblocks task progress.
-  // Applying reviewer ticks never itself resumes/unblocks anything.
-  void it("states its gating metadata: applying ticks does not unblock the task", async () => {
+  // Part 3, Step 5: applying now dispatches the stage's next action, so this
+  // decision's `gating` must say so rather than claim it never unblocks.
+  void it("states its gating metadata: applying ticks dispatches the stage's next action", async () => {
     const result = await run("gating", { review: REVIEW_WITH_VERIFIED_ITEMS }, { confirm: false });
     assert.ok(result.decision, "expected a decision to be posted");
     assert.equal(result.decision.gating?.holdsTaskPaused, false);
-    assert.equal(result.decision.gating?.unblocksProgress, false);
-    assert.ok(result.decision.gating?.detail && result.decision.gating.detail.length > 0);
+    assert.equal(result.decision.gating?.unblocksProgress, true);
+    assert.match(result.decision.gating?.detail ?? "", /dispatches this stage's next action/i);
   });
 });
 
 void describe("applyReviewerVerifiedTicks — refusals that write nothing", () => {
   void it("reports no items when the review has no Verified Complete block", async () => {
+    const callsBefore = resumeAndApplyCurrentStageActionCalls.length;
     const result = await run(
       "no-block",
       { review: REVIEW_WITH_NO_VERIFIED_BLOCK },
@@ -363,6 +379,8 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
       /named no items as verified complete/
     );
     assert.equal(readPlan(result.folder), CHECKLIST_PLAN);
+    // Never applied anything, so no stage action is retried.
+    assert.equal(resumeAndApplyCurrentStageActionCalls.length, callsBefore);
   });
 
   void it("reports nothing to apply when every named item is already ticked", async () => {

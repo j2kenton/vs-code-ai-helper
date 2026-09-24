@@ -43,6 +43,7 @@ import { readTaskProgressStrictV1 } from "../../services/taskProgressReaderV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../../state/schedulingIntentV1";
 import { ensurePublishReviewArtifactExistsV1 } from "../../utils/publishChecksFreshness";
 import { missingCompletionArtifactsV1 } from "../../utils/stageArtifactRequirementsV1";
+import { computeNextStage, enterStageV1, runStageEntryPostCommitV1 } from "../../utils/stageTransition";
 import {
   LifecyclePolicyFailureError,
   LifecycleReviewAttemptMismatchError,
@@ -189,76 +190,116 @@ export async function executeNextStageV1(
   }
   const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, input.expectedSourceStage);
 
-  let patched;
-  try {
-    patched = await deps.patchTaskProgress(
-      taskFolderUri,
-      (current) => {
-        if (current.currentStage !== input.expectedSourceStage) {
-          throw new LifecycleStageMismatchError(
-            `Task changed before transition (expected ${input.expectedSourceStage}, found ${current.currentStage}).`
-          );
-        }
-        if (
-          input.expectedReviewAttemptId !== undefined &&
-          current.reviewAttemptId !== input.expectedReviewAttemptId
-        ) {
-          throw new LifecycleReviewAttemptMismatchError(
-            "Review result is stale; a newer review attempt owns this transition."
-          );
-        }
+  // Review fix (2026-09-22, architectural blocker, fourth narrowing): the
+  // CAS/write step now goes through `enterStageV1` — the same one-door
+  // primitive `setTaskStage` uses — instead of a bare `patchTaskProgress`
+  // call with its own duplicated promotion/publish handling. `enterStageV1`
+  // resolves "what does the destination need" via `prepareStageEntryV1` and,
+  // for "impl", handles the plan.md -> plan-final.md promotion (and its own
+  // failure rollback) atomically with this CAS write itself — this row no
+  // longer needs its OWN `publishArtifact`/`context.beforeWrite` plumbing for
+  // that (every production caller of this row that used to build one now
+  // relies on this instead — see `advanceStageViaNextStageRowV1` and
+  // `nextStage()` in `reviewActions.ts`).
+  //
+  // `destinationStage` must be known BEFORE the lock (to resolve entry
+  // requirements up front): every production caller of this row always
+  // supplies `targetStage` explicitly (verified 2026-09-22 across
+  // `reviewActions.ts` and `commitAndPushTask.ts`), so the `computeNextStage`
+  // fallback below only matters for a hypothetical caller that omits it — a
+  // mismatch there cannot corrupt anything: `advanceStageLocked`'s own
+  // backstop refuses a transition landing on "impl" with neither a promoted
+  // artifact nor entry work supplied.
+  const destinationStage = input.targetStage ?? computeNextStage(input.expectedSourceStage) ?? input.expectedSourceStage;
+
+  const result = await enterStageV1(
+    taskFolderUri,
+    input.expectedSourceStage,
+    destinationStage,
+    /* isPaused */ false, // Inert here: the transform below always overrides advanceStage's default write, and this row's callers separately compute their own shouldAutoReview from nextActorOnAdvance.
+    "complete-and-move-on",
+    {
+      expectedReviewAttemptId: input.expectedReviewAttemptId,
+      deps: { patchTaskProgress: deps.patchTaskProgress },
+      additionalBeforeWrite: context.beforeWrite,
+      transform: (current) => {
+        // Computed fresh on every invocation (matching the pre-reroute
+        // behavior) rather than once outside the lock — `patchTaskProgress`
+        // may re-run this callback on an internal retry, and a stale
+        // captured timestamp would then land as `updatedAt`.
+        const now = new Date().toISOString();
         // Validate lifecycle semantics first, so terminal/stale/invalid target
         // errors are not masked by an unrelated absent artifact.
         const baseResult = applyNextStagePolicyV1(current, {
-          now: new Date().toISOString(),
+          now,
           targetStage: input.targetStage,
           completionArtifactsPresent: true,
         });
         if (!baseResult.ok) {
           throw new LifecyclePolicyFailureError(baseResult.code);
         }
-        const result = applyNextStagePolicyV1(current, {
-          now: new Date().toISOString(),
+        const finalResult = applyNextStagePolicyV1(current, {
+          now,
           targetStage: input.targetStage,
           completionArtifactsPresent: missingArtifacts.length === 0,
           artifactOverride: input.artifactOverride,
           missingArtifacts,
           nextActorOnAdvance: input.nextActorOnAdvance,
         });
-        if (!result.ok) {
-          throw new LifecyclePolicyFailureError(result.code);
+        if (!finalResult.ok) {
+          throw new LifecyclePolicyFailureError(finalResult.code);
         }
-        return result.progress;
+        return finalResult.progress;
       },
-      { beforeWrite: context.beforeWrite }
-    );
-  } catch (error) {
-    if (error instanceof LifecyclePolicyFailureError) {
-      return { kind: "failed", code: `nextStage.${error.code}`, retryable: false };
     }
-    if (error instanceof LifecycleStageMismatchError) {
+  );
+
+  if (!result.ready) {
+    // `enterStageV1` flattens every failure to a string `reason`, but
+    // preserves the original thrown error on `cause` (review fix, 2026-09-22,
+    // architectural blocker) so this row's typed outcome codes survive the
+    // reroute unchanged.
+    if (result.cause instanceof LifecyclePolicyFailureError) {
+      return { kind: "failed", code: `nextStage.${result.cause.code}`, retryable: false };
+    }
+    if (result.cause instanceof LifecycleStageMismatchError) {
       return { kind: "failed", code: "nextStage.staleSourceStage", retryable: false };
     }
-    if (error instanceof LifecycleReviewAttemptMismatchError) {
+    if (result.cause instanceof LifecycleReviewAttemptMismatchError) {
       return { kind: "failed", code: "nextStage.staleReviewAttempt", retryable: false };
+    }
+    if (result.cause === undefined) {
+      // `enterStageV1`'s own refusals carry no `cause`: either the
+      // destination had unmet entry requirements ("no plan to promote") or
+      // the write reported no progress at all — both are recovery-shaped,
+      // matching this row's pre-existing `!patched` handling below.
+      return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
     }
     return {
       kind: "failed",
-      code: toSanitizedWriteFailureCodeV1("nextStage", error),
+      code: toSanitizedWriteFailureCodeV1("nextStage", result.cause),
       retryable: true,
     };
   }
 
-  if (!patched) {
-    return { kind: "recoveryRequired", code: "taskProgressRecoveryRequired" };
-  }
+  // Safe now: `enterStageV1`'s own `patchTaskProgressStrictV1` call has
+  // already returned, so its `withTaskLock` hold on this task folder has
+  // been released — applies the deferred plan-revision adoption write (and
+  // the `applyReviewerVerifiedTicks` card withdrawal it now also performs —
+  // see that function's doc comment) exactly where it used to run at every
+  // caller that built its own `publishArtifact` for this row.
+  await runStageEntryPostCommitV1(taskFolderUri, result);
 
   // Every route that can land currentStage on "publish" must guarantee the
   // stage's document exists (plan item 17, step 20a) — this is the primary
   // manual/review-driven transition writer (legacy `advanceStageLocked` in
   // `stageTransition.ts` covers the other transition kinds), so it must not
-  // be the one gap that leaves "not created yet" reachable.
-  if (patched.currentStage === "publish") {
+  // be the one gap that leaves "not created yet" reachable. `enterStageV1`'s
+  // own `advanceStage` call already does this for every destination that
+  // reaches "publish" through it, so this is now a defensive no-op restated
+  // here for clarity rather than a required duplicate — kept because
+  // `ensurePublishReviewArtifactExistsV1` is itself idempotent and cheap.
+  if (result.transition.newStage === "publish") {
     await ensurePublishReviewArtifactExistsV1(taskFolderUri);
   }
 

@@ -19,6 +19,11 @@ import {
 } from "../commands/implementationRecoveryV1";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
+import {
+  deactivateNotificationRouter,
+  initNotificationRouter,
+  StatusSurface,
+} from "../utils/notificationRouter";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-recovery-ledger-"));
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-recovery-ledger-private-"));
@@ -339,6 +344,113 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
       fsBridge.restore();
     }
   });
+
+  // Part 4 / item 105 (Step 11): a transient failure reading task-progress.json
+  // on the FIRST attempt to terminalize + persist `implRecovery` must not be
+  // accepted as final — `beginImplementationRecoveryV1` retries the whole
+  // terminalization once before giving up.
+  void it("retries the persist once and recovers from a single transient read failure (item 105)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("retry_recovers_transient_failure", undefined);
+      const progressFilePath = path.join(folderPath, "task-progress.json");
+      let readAttempts = 0;
+      const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const bridgedReadFile = target.readFile as (uri: vscode.Uri) => Promise<Uint8Array>;
+      target.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+        if (uri.fsPath === progressFilePath && readAttempts++ === 0) {
+          return Promise.reject(new Error("simulated transient read failure"));
+        }
+        return bridgedReadFile(uri);
+      };
+
+      const begun = await beginImplementationRecoveryV1(folderUri, {
+        trigger: "roundIncomplete",
+        reason: "the last implementation round ended without a complete report",
+        terminatedExternally: false,
+        filesChanged: ["src/a.ts"],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+      });
+
+      assert.ok(
+        readAttempts >= 2,
+        "the first read must have failed and a retry must have been attempted"
+      );
+      assert.ok(begun.persisted, "the retry must have persisted the transition");
+      const raw = readProgress(folderPath);
+      assert.equal(raw.implRecovery?.sourceAttemptId, begun.sourceAttemptId);
+      assert.equal(raw.implRecovery?.dispatch, "pending");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  // Part 4 / item 106 (Step 11): when the persist still fails after the Step
+  // 11 retry, `finishDispatch()` must not claim a continuation was scheduled
+  // — it stamps the honest outcome and dispatches nothing.
+  void it(
+    "finishDispatch() stamps honest text and schedules nothing when the persist fails even after a retry (item 106)",
+    async () => {
+      const fsBridge = installFsBridge();
+      const wsStub = installWorkspaceFoldersStub();
+      const warnings: string[] = [];
+      const fakeSurface: StatusSurface = {
+        addEntry: (message: string) => {
+          warnings.push(message);
+        },
+      } as unknown as StatusSurface;
+      initNotificationRouter(fakeSurface);
+      try {
+        const { folderUri, folderPath } = makeTaskFolder("persist_fails_twice", undefined);
+        const progressFilePath = path.join(folderPath, "task-progress.json");
+        const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+        target.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+          if (uri.fsPath === progressFilePath) {
+            return Promise.reject(new Error("simulated persistent read failure"));
+          }
+          return fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+        };
+
+        const begun = await beginImplementationRecoveryV1(folderUri, {
+          trigger: "roundIncomplete",
+          reason: "the last implementation round ended without a complete report",
+          terminatedExternally: false,
+          filesChanged: ["src/a.ts"],
+          filesChangedUnknown: false,
+          postRunReviewStage: "impl",
+        });
+
+        assert.equal(begun.persisted, undefined, "the record must never have been persisted");
+
+        await begun.finishDispatch();
+
+        assert.equal(warnings.length, 1, "exactly one honest-outcome warning must be shown");
+        assert.match(warnings[0] ?? "", /could not be recorded/);
+        assert.match(warnings[0] ?? "", /rerun the implementation manually/i);
+        assert.doesNotMatch(
+          warnings[0] ?? "",
+          /has been scheduled/,
+          "must never claim a continuation was scheduled when nothing was persisted"
+        );
+
+        // No implRecovery record exists anywhere to have been written.
+        const onDisk = fs.existsSync(progressFilePath)
+          ? (JSON.parse(fs.readFileSync(progressFilePath, "utf8")) as TaskProgress)
+          : undefined;
+        assert.ok(
+          !onDisk || !onDisk.implRecovery,
+          "no implRecovery record should exist"
+        );
+      } finally {
+        deactivateNotificationRouter();
+        wsStub.restore();
+        fsBridge.restore();
+      }
+    }
+  );
 });
 
 void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 / item 1)", () => {

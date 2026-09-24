@@ -486,6 +486,99 @@ async function runImplementationRounds(
   return { iteration, completedCleanly: false, cancelled: false, finalSummary: "" };
 }
 
+/**
+ * Ask the user whether to keep going or stop once the round limit is hit.
+ * Extracted from `runImplementationWithCopilot`'s loop (pre-1.0.0 fixes
+ * register, Part 3 Step 2 known-gap closure) so this "continue"/"cancel"
+ * decision — the loop `await`s it and branches on the result, so its
+ * classification can only be proven by observing what this function
+ * actually returns for each answer — is callable directly from a test
+ * without needing to drive the full model tool-call loop up to
+ * `maxIterations`.
+ *
+ * Migrated off `vscode.window.showWarningMessage` (task "Actionable
+ * Hand-offs", Part 11 notification audit, site #20): this caller `await`s
+ * the answer and branches on it, so it uses `awaitWorkflowDecisionAnswerV1`,
+ * not the fire-and-forget `postWorkflowDecisionV1` the two advisory
+ * `reviewActions.ts` dialogs use. Falls back to the original raw modal when
+ * there is no task to attribute the decision to (a caller with no
+ * `taskFolderUri`/`stage`, e.g. a non-task-scoped caller or a test) — the
+ * question must still be asked.
+ */
+export async function resolveRoundLimitDecisionV1(options: {
+  maxIterations: number;
+  workspaceUri: vscode.Uri;
+  token: vscode.CancellationToken;
+  onBusyDetail?: (detail: string | undefined) => void;
+  onWaitingForUser?: (waiting: boolean) => void;
+  taskFolderUri?: vscode.Uri;
+  stage?: TaskStage;
+}): Promise<"Continue" | "Cancel" | undefined> {
+  const { maxIterations, workspaceUri, token, onBusyDetail, onWaitingForUser, taskFolderUri, stage } = options;
+  onBusyDetail?.("waiting for your answer — round limit reached");
+  onWaitingForUser?.(true);
+  notifyDesktop("Ensemble — question", `The implementation reached its ${maxIterations}-round limit. Continue working?`);
+  // Genuinely blocking: the loop cannot resume without this choice, so it
+  // gets the "can't proceed" error rather than the softer "waiting for
+  // feedback" warning used for non-blocking questions.
+  NotificationRouter.showError(
+    `Can't proceed without your input — ${nodePath.basename(workspaceUri.fsPath)}: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
+  );
+  let choice: "Continue" | "Cancel" | undefined;
+  if (taskFolderUri && stage) {
+    const target: ChatTarget = {
+      canonicalId: taskFolderUri.fsPath,
+      taskFolderPath: taskFolderUri.fsPath,
+      stage,
+    };
+    const chosenOptionId = await awaitWorkflowDecisionAnswerV1(
+      {
+        decisionKey: "implementationRoundLimitReached",
+        taskCanonicalId: taskFolderUri.fsPath,
+        stage,
+        whatHappened: `The implementation reached its ${maxIterations}-round tool-call limit without finishing.`,
+        whyUserNeeded: "The loop cannot continue without your choice — it can either keep working with a raised limit, or stop here and report what it has so far.",
+        options: [
+          {
+            optionId: "continue",
+            label: "Continue",
+            resumeKind: "continue",
+            consequence: `Raises the round limit and keeps working from where it stopped, reusing the same conversation and file changes so far.`,
+            effect: { kind: "doNothing" },
+          },
+          {
+            optionId: "cancel",
+            label: "Cancel",
+            resumeKind: "unpause",
+            consequence: "Stops here and reports the round-limit failure. Any file changes already made are kept — nothing is reverted.",
+            effect: { kind: "doNothing" },
+          },
+        ],
+        recommendation: {
+          kind: "none",
+          reasoning: "Only you know whether this implementation is close to finishing (worth continuing) or looping without progress (worth stopping to inspect).",
+        },
+        gating: {
+          holdsTaskPaused: true,
+          unblocksProgress: true,
+          detail: "The round is paused on this exact choice; answering it either resumes the round with a higher limit or ends it.",
+        },
+      },
+      target,
+      token
+    );
+    choice = chosenOptionId === "continue" ? "Continue" : chosenOptionId === "cancel" ? "Cancel" : undefined;
+  } else {
+    choice = await vscode.window.showWarningMessage(
+      `The implementation reached its ${maxIterations}-round limit. Continue working?`,
+      "Continue", "Cancel"
+    );
+  }
+  onBusyDetail?.(undefined);
+  onWaitingForUser?.(false);
+  return choice;
+}
+
 export interface ImplementationRunResult {
   status: "completed" | "failed" | "cancelled";
   /** Workspace-relative paths written by the model */
@@ -743,73 +836,15 @@ export async function runImplementationWithCopilot(options: {
         errorMessage: `Reached the configured maximum of ${maxIterations} tool-call rounds without finishing. The implementation may be incomplete.`,
       });
     }
-    onBusyDetail?.("waiting for your answer — round limit reached");
-    onWaitingForUser?.(true);
-    notifyDesktop("Ensemble — question", `The implementation reached its ${maxIterations}-round limit. Continue working?`);
-    // Genuinely blocking: the loop cannot resume without this choice, so it
-    // gets the "can't proceed" error rather than the softer "waiting for
-    // feedback" warning used for non-blocking questions.
-    NotificationRouter.showError(
-      `Can't proceed without your input — ${nodePath.basename(workspaceUri.fsPath)}: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
-    );
-    // Migrated off `vscode.window.showWarningMessage` (task "Actionable
-    // Hand-offs", Part 11 notification audit, site #20): this loop `await`s
-    // the answer and branches on it (keep iterating vs. fail the round), so
-    // it uses `awaitWorkflowDecisionAnswerV1`, not the fire-and-forget
-    // `postWorkflowDecisionV1` the two advisory reviewActions.ts dialogs use.
-    // Falls back to the original raw modal when there is no task to attribute
-    // the decision to (a caller with no `taskFolderUri`/`stage`, e.g. a
-    // non-task-scoped caller or a test) — the question must still be asked.
-    let choice: "Continue" | "Cancel" | undefined;
-    if (taskFolderUri && stage) {
-      const target: ChatTarget = {
-        canonicalId: taskFolderUri.fsPath,
-        taskFolderPath: taskFolderUri.fsPath,
-        stage,
-      };
-      const chosenOptionId = await awaitWorkflowDecisionAnswerV1(
-        {
-          decisionKey: "implementationRoundLimitReached",
-          taskCanonicalId: taskFolderUri.fsPath,
-          stage,
-          whatHappened: `The implementation reached its ${maxIterations}-round tool-call limit without finishing.`,
-          whyUserNeeded: "The loop cannot continue without your choice — it can either keep working with a raised limit, or stop here and report what it has so far.",
-          options: [
-            {
-              optionId: "continue",
-              label: "Continue",
-              consequence: `Raises the round limit and keeps working from where it stopped, reusing the same conversation and file changes so far.`,
-              effect: { kind: "doNothing" },
-            },
-            {
-              optionId: "cancel",
-              label: "Cancel",
-              consequence: "Stops here and reports the round-limit failure. Any file changes already made are kept — nothing is reverted.",
-              effect: { kind: "doNothing" },
-            },
-          ],
-          recommendation: {
-            kind: "none",
-            reasoning: "Only you know whether this implementation is close to finishing (worth continuing) or looping without progress (worth stopping to inspect).",
-          },
-          gating: {
-            holdsTaskPaused: true,
-            unblocksProgress: true,
-            detail: "The round is paused on this exact choice; answering it either resumes the round with a higher limit or ends it.",
-          },
-        },
-        target,
-        token
-      );
-      choice = chosenOptionId === "continue" ? "Continue" : chosenOptionId === "cancel" ? "Cancel" : undefined;
-    } else {
-      choice = await vscode.window.showWarningMessage(
-        `The implementation reached its ${maxIterations}-round limit. Continue working?`,
-        "Continue", "Cancel"
-      );
-    }
-    onBusyDetail?.(undefined);
-    onWaitingForUser?.(false);
+    const choice = await resolveRoundLimitDecisionV1({
+      maxIterations,
+      workspaceUri,
+      token,
+      onBusyDetail,
+      onWaitingForUser,
+      taskFolderUri,
+      stage,
+    });
     if (choice !== "Continue") {
       return classifyFailure<ImplementationRunResult>({
         status: "failed",

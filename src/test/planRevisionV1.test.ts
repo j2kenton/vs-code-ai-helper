@@ -1054,10 +1054,37 @@ function makeStore(persistedId?: string): CurrentTaskStore {
   return store;
 }
 
+// 2026-09-2x review completion blocker (Part 3 Step 4): `revise` is
+// classified `continue` and its own consequence text says plan generation
+// dispatches again — `reviseChecklistChangeProposalConfirmedV1` now actually
+// dispatches `generatePlanWithAI` after its transition commits, so every
+// test below that exercises it must stub `executeCommand` (the vscode test
+// stub throws on an unstubbed command id, "so forgotten stubs are caught
+// immediately").
+function installExecuteCommandCaptureV1(): {
+  captured: Array<{ command: string; arg: unknown }>;
+  restore: () => void;
+} {
+  const captured: Array<{ command: string; arg: unknown }> = [];
+  const commandsRecord = vscode.commands as unknown as { _executeCommandOverride?: unknown };
+  const original = commandsRecord._executeCommandOverride;
+  commandsRecord._executeCommandOverride = (command: string, arg?: unknown): Promise<undefined> => {
+    captured.push({ command, arg });
+    return Promise.resolve(undefined);
+  };
+  return {
+    captured,
+    restore: (): void => {
+      commandsRecord._executeCommandOverride = original;
+    },
+  };
+}
+
 void describe("reviseChecklistChangeProposalConfirmedV1 / discardChecklistChangeProposalConfirmedV1", () => {
   void it("Revise moves the task to plan, truncates completedStages, and records planRevision", async () => {
     const fsBridge = installFsBridge();
     const ws = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandCaptureV1();
     const surface: StatusSurface = { addEntry: (): void => { /* no-op */ } };
     initNotificationRouter(surface);
     try {
@@ -1086,8 +1113,15 @@ void describe("reviseChecklistChangeProposalConfirmedV1 / discardChecklistChange
       // No plan-final.md was written for this fixture, so there is nothing
       // to journal — the field is simply absent, not an error.
       assert.equal(progress.planRevision?.journaledPlanRef, undefined);
+
+      // The whole point of the review fix: plan generation actually runs
+      // again, rather than leaving the user to click Generate Plan.
+      const dispatch = execCmd.captured.find((e) => e.command === "vs-code-ai-helper.generatePlanWithAI");
+      assert.ok(dispatch !== undefined, "must dispatch generatePlanWithAI after the plan-revision transition commits");
+      assert.deepEqual(dispatch.arg, { taskFolderPath: folderPath });
     } finally {
       deactivateNotificationRouter();
+      execCmd.restore();
       ws.restore();
       fsBridge.restore();
     }
@@ -1098,6 +1132,7 @@ void describe("reviseChecklistChangeProposalConfirmedV1 / discardChecklistChange
   void it("Revise snapshots the existing plan-final.md into the revision journal and records journaledPlanRef", async () => {
     const fsBridge = installFsBridge();
     const ws = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandCaptureV1();
     const surface: StatusSurface = { addEntry: (): void => { /* no-op */ } };
     initNotificationRouter(surface);
     try {
@@ -1128,6 +1163,44 @@ void describe("reviseChecklistChangeProposalConfirmedV1 / discardChecklistChange
       assert.equal(readPlanFinal(folderPath), PRE_REVISION_PLAN);
     } finally {
       deactivateNotificationRouter();
+      execCmd.restore();
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
+  // 2026-09-2x review completion blocker: a REFUSED transition (the
+  // proposal was already resolved) must dispatch nothing — Generate Plan
+  // firing against a task that never actually moved would be wrong.
+  void it("does not dispatch generatePlanWithAI when the transition is refused (proposal already resolved)", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandCaptureV1();
+    const surface: StatusSurface = { addEntry: (): void => { /* no-op */ } };
+    initNotificationRouter(surface);
+    try {
+      const { folderPath } = makeTaskFolder("revise-command-refused", {
+        currentStage: "impl-high-review",
+        checklistChangeProposals: [{ ...PENDING_PROPOSAL, status: "discarded" }],
+      });
+      const canonicalId = "canonical-revise-command-refused";
+      const { inventory } = makeInventory(canonicalId, folderPath, readProgress(folderPath));
+
+      await reviseChecklistChangeProposalConfirmedV1(inventory, makeStore(canonicalId), {
+        taskFolderPath: folderPath,
+        canonicalId,
+        proposalAt: PENDING_PROPOSAL.at,
+      });
+
+      assert.equal(readProgress(folderPath).currentStage, "impl-high-review", "the stage must not have moved");
+      assert.equal(
+        execCmd.captured.some((e) => e.command === "vs-code-ai-helper.generatePlanWithAI"),
+        false,
+        "a refused transition must dispatch nothing"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      execCmd.restore();
       ws.restore();
       fsBridge.restore();
     }

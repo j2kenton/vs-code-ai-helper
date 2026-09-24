@@ -194,8 +194,68 @@ void describe("resumeTask.v1 registry row", () => {
     });
   });
 
+  void it("refuses a Reopen to impl with no plan-final.md, instead of stranding the task (item 15)", async () => {
+    const folder = makeCompletedTaskFolder("ensemble-resume-row-noartifact-");
+    const before = fs.readFileSync(path.join(folder, "task-progress.json"), "utf8");
+    const outcome = await executeResumeTaskV1(
+      contextFor(folder, { selectedStage: "impl", expectedCompletedAt: COMPLETED_AT })
+    );
+    // Review fix (2026-09-22, completion blocker): this used to report
+    // `{ kind: "recoveryRequired", code: "taskProgressRecoveryRequired" }`,
+    // which misreports a missing implementation artifact as progress-file
+    // corruption. It is now a `failed` outcome naming the real cause.
+    assert.deepEqual(outcome, {
+      kind: "failed",
+      code: "resumeTask.noImplementationArtifact",
+      retryable: false,
+      detail: "this task has no plan-final.md to reopen at Implementation — its plan may need to be regenerated first",
+    });
+    // Refused before anything is written — the stage and status are untouched.
+    assert.equal(fs.readFileSync(path.join(folder, "task-progress.json"), "utf8"), before);
+    assert.equal(fs.existsSync(path.join(folder, "plan-final.md")), false);
+  });
+
+  void it("refuses a Reopen to impl with only a leftover plan.md (no plan-final.md), instead of regenerating it (2026-09-22 review fix)", async () => {
+    // The review's exact finding: `prepareStageEntryV1` used to delegate
+    // every "impl" entry to generic promotion, which would recreate
+    // plan-final.md from an available plan.md rather than refuse. A
+    // completed task's plan-final.md must already be canonical — Reopen must
+    // never regenerate it from a leftover plan.md.
+    const folder = makeCompletedTaskFolder("ensemble-resume-row-leftover-plan-");
+    fs.writeFileSync(
+      path.join(folder, "plan.md"),
+      "<!-- ensemble:implementation-checklist -->\n\n- [ ] Do the thing\n",
+      "utf8"
+    );
+    const outcome = await executeResumeTaskV1(
+      contextFor(folder, { selectedStage: "impl", expectedCompletedAt: COMPLETED_AT })
+    );
+    assert.deepEqual(outcome, {
+      kind: "failed",
+      code: "resumeTask.noImplementationArtifact",
+      retryable: false,
+      detail: "this task has no plan-final.md to reopen at Implementation — its plan may need to be regenerated first",
+    });
+    assert.equal(
+      fs.existsSync(path.join(folder, "plan-final.md")),
+      false,
+      "must not regenerate plan-final.md from the leftover plan.md"
+    );
+  });
+
   void it("honors skipTaskLock under a held covering meta-root lock (activation-seam regression)", async () => {
     const folder = makeCompletedTaskFolder("ensemble-resume-row-skiplock-");
+    // Part 1 review fix (2026-09-22): the row now routes through
+    // `enterStageV1`, whose `impl`-entry backstop refuses landing on "impl"
+    // with no implementation artifact at all — a completed task reopened at
+    // "impl" must find the artifact already canonical, same as any other
+    // production Reopen-to-impl. This test is about the skipTaskLock
+    // composition, not the artifact requirement, so the fixture must not
+    // omit it.
+    fs.writeFileSync(
+      path.join(folder, "plan-final.md"),
+      "<!-- ensemble:implementation-checklist -->\n\n- [x] Already done\n"
+    );
     const tasksRoot = path.dirname(folder);
     const outcome = await withMetaRootLock(tasksRoot, () =>
       executeResumeTaskV1(

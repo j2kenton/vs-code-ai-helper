@@ -20,6 +20,7 @@ import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1, isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
+import { withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -375,12 +376,15 @@ export class TaskStatusBar implements vscode.Disposable {
     store.recordOwedContinuation(taskId, owedSource).then(undefined, () => {
       // Best-effort self-heal only — never blocks or fails this render.
     });
-    const posture: SchedulingPostureV1 = deriveSchedulingPostureV1({
-      entries: store.listForTask(taskId),
-      owedContinuation: deriveOwedContinuationRecordV1(taskId, store.getOwedContinuation(taskId)),
-      hasCoverage: store.hasCoverage(taskId),
-      inFlight: taskOperations.hasRootOperationForTask(taskId),
-    });
+    const posture: SchedulingPostureV1 = withWaitingForHumanFallbackV1(
+      deriveSchedulingPostureV1({
+        entries: store.listForTask(taskId),
+        owedContinuation: deriveOwedContinuationRecordV1(taskId, store.getOwedContinuation(taskId)),
+        hasCoverage: store.hasCoverage(taskId),
+        inFlight: taskOperations.hasRootOperationForTask(taskId),
+      }),
+      task.progress
+    );
     const rendered = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture));
     return {
       shortLabel: describeSchedulingPostureShortLabelV1(posture),

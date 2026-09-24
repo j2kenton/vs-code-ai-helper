@@ -597,10 +597,15 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
       const warning = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
       assert.ok(warning, `expected an unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`);
       assert.match(warning.message, /Restore the last usable summary/);
+      // Run Implementation takes priority as the toast's one action button
+      // when both it and Restore apply (2026-09-24 review, narrowed
+      // completion blocker) — Restore stays reachable via the tree row and
+      // the "Restore Last Usable Summary" command; the message text above
+      // still names it.
       assert.deepEqual(warning.actionCommand, {
-        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-        title: "Restore Last Usable Summary",
-        args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+        command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+        title: "Run Implementation",
+        args: [{ taskFolderPath: folderPath }],
       });
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
@@ -644,10 +649,14 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
         assert.match(warning.message, /Restore the last usable summary/);
         assert.match(warning.message, /fully settled/);
         assert.doesNotMatch(warning.message, /run the implementation step again/i);
+        // Run Implementation still takes priority as the toast's one action
+        // button here: a fully-settled checklist is not a reason to withhold
+        // it (`shouldOfferRunImplementationForUnusableSummaryV1`'s doc
+        // comment) — only the message TEXT above changes for this case.
         assert.deepEqual(warning.actionCommand, {
-          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-          title: "Restore Last Usable Summary",
-          args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+          command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+          title: "Run Implementation",
+          args: [{ taskFolderPath: folderPath }],
         });
       } finally {
         for (const p of patches.reverse()) { p.restore(); }
@@ -719,10 +728,14 @@ void describe("fastForwardReviewWithAI — offers Restore Last Usable Summary wh
         `expected Fast Forward's own unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`
       );
       assert.match(warning.message, /Restore the last usable summary/);
+      // Run Implementation takes priority as the toast's one action button
+      // when both it and Restore apply (2026-09-24 review, narrowed
+      // completion blocker) — Restore stays reachable via the tree row and
+      // the "Restore Last Usable Summary" command.
       assert.deepEqual(warning.actionCommand, {
-        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-        title: "Restore Last Usable Summary",
-        args: [folderPath, "impl-high-review", "vs-code-ai-helper.fastForwardReviewWithAI"],
+        command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+        title: "Run Implementation",
+        args: [{ taskFolderPath: folderPath }],
       });
       assert.equal(
         fs.existsSync(path.join(folderPath, "impl-high-review.md")),

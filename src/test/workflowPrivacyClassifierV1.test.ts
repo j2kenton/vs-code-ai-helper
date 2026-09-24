@@ -28,6 +28,7 @@ import { REVERT_JOURNAL_SUFFIX } from "../utils/artifactRevertJournal";
 import { REDO_SIDECAR_SUFFIX } from "../utils/redoSidecar";
 import { TASK_MODEL_CONFIG_FILENAME } from "../utils/modelSelection";
 import { MIGRATION_JOURNAL_FILENAME } from "../utils/metaResourcesMigration";
+import { STAGE_ENTRY_JOURNAL_FILENAME } from "../utils/stageEntryJournalV1";
 import { formatAtomicTempBasename } from "../state/writeAtomic";
 
 /**
@@ -122,6 +123,15 @@ void describe("workflowPrivacyClassifierV1", () => {
     assert.equal(classifyWorkflowPathV1(`.ensemble/${MIGRATION_JOURNAL_FILENAME}`), "workflowControl");
     assert.equal(
       classifyWorkflowPathV1(`C:\\ws\\plans\\${MIGRATION_JOURNAL_FILENAME}`),
+      "workflowControl"
+    );
+  });
+
+  void it("classifies the stage-entry crash-recovery journal as workflow-control (pinned to its owner export, pre-1.0.0 fixes register Part 2)", () => {
+    assert.equal(classifyWorkflowPathV1(STAGE_ENTRY_JOURNAL_FILENAME), "workflowControl");
+    assert.equal(classifyWorkflowPathV1(`plans/t/${STAGE_ENTRY_JOURNAL_FILENAME}`), "workflowControl");
+    assert.equal(
+      classifyWorkflowPathV1(`C:\\ws\\plans\\t\\${STAGE_ENTRY_JOURNAL_FILENAME}`),
       "workflowControl"
     );
   });

@@ -41,8 +41,13 @@ import { deactivateNotificationRouter, initNotificationRouter } from "../utils/n
 import { TaskProgress } from "../types/taskProgress";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { markFastForwardRunActiveV1, clearFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
+import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { safeRemoveDir } from "./testFsUtils";
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const settingsModule = require("../config/settings") as Record<string, unknown>;
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -336,9 +341,9 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       assert.ok(decision.gating?.holdsTaskPaused, "the card must state that it holds the task paused");
       assert.equal(decision.recommendation.kind, "option");
       if (decision.recommendation.kind === "option") {
-        assert.equal(decision.recommendation.optionId, "keepIterating");
+        assert.equal(decision.recommendation.optionId, "switchStageModel");
       }
-      const switchModel = decision.options.find((option) => option.optionId === "keepIterating");
+      const switchModel = decision.options.find((option) => option.optionId === "switchStageModel");
       assert.equal(switchModel?.label, "Switch this stage's model");
       assert.deepEqual(switchModel?.effect, { kind: "command", command: "vs-code-ai-helper.openAiModels" });
       // Review blocker (2026-08-30): every escalation pauses the task, and
@@ -350,7 +355,14 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       assert.deepEqual(advance?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndSetTaskStage",
-        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-low-review" }],
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "impl-low-review",
+            resumeFastForward: false,
+            expectedSourceStage: "impl-high-review",
+          },
+        ],
       });
       // Item 13d / review blocker: "Leave it paused — I'll fix it" must
       // actually open plan-final.md rather than silently doing nothing —
@@ -438,7 +450,14 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       assert.deepEqual(advance?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndSetTaskStage",
-        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-high-review" }],
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "impl-high-review",
+            resumeFastForward: false,
+            expectedSourceStage: "impl",
+          },
+        ],
       });
       // Item 13d / review blocker: "Leave it paused — I'll fix it" must
       // actually open plan-final.md rather than silently doing nothing —
@@ -466,6 +485,87 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       __extensionContextV1TestOnly.reset();
     }
   });
+
+  // Pre-1.0.0 fixes register, item 14 / Part 3 Step 3, closing the
+  // remaining gap in the boundary-test line for this part: every existing
+  // "advance" assertion above builds its card with no Fast Forward run
+  // marked active, so it only ever proves the `resumeFastForward: false`
+  // ("ordinary consequence") branch of `buildAdvanceOptionV1`. Nothing
+  // before this test proved the OTHER branch — that a genuinely interrupted
+  // Fast Forward run (captured via `markFastForwardRunActiveV1`, the exact
+  // mechanism `fastForwardReviewWithAI` itself uses around its own
+  // `improveReviewScore` loop) is captured into the card at BUILD time, both
+  // as `resumeFastForward: true` in the dispatched args AND as the
+  // "Continues fast-forwarding" consequence text the plan's own boundary
+  // test explicitly asks for ("its consequence text names what runs"). The
+  // dispatch-side behavior (that `resumeAndSetTaskStageV1` actually
+  // continues Fast Forward once it receives `resumeFastForward: true`) is
+  // separately covered in commandArgNormalization.test.ts.
+  void it(
+    "captures a genuinely interrupted Fast Forward run into the Advance option at card-build time " +
+      "(resumeFastForward: true, and a consequence naming that it continues fast-forwarding)",
+    async () => {
+      const store = new Map<string, string>();
+      installMemStore(store);
+      const surface = new RecordingSurface();
+      initNotificationRouter(surface);
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      const folderUri = makeTaskFolderUri("plateau-decision-ff-active");
+      seedProgress(store, folderUri, baseProgress({ currentStage: "impl", reviewAttemptId: undefined }));
+
+      // Mark this task's Fast Forward run active BEFORE escalating — mirrors
+      // `fastForwardReviewWithAI`'s own try/finally, which marks the folder
+      // active for the whole of its multi-round `improveReviewScore` loop
+      // and would still hold it active at the moment a plateau escalation
+      // pauses the task from deep inside that same call stack.
+      markFastForwardRunActiveV1(folderUri.fsPath);
+      try {
+        const escalated = await escalateReviewToHuman(
+          folderUri,
+          "impl",
+          "plateau",
+          "3 consecutive implementation round(s) ended without a usable report",
+          undefined
+        );
+        assert.equal(escalated, true);
+
+        const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+          .listPending()
+          .find((candidate) => candidate.decisionKey === "reviewEscalation:plateau");
+        assert.ok(decision, "an escalation raised while Fast Forward is active must still post a durable decision");
+
+        const advance = decision.options.find((option) => option.optionId === "advance");
+        assert.ok(advance, "the Advance option must still be offered");
+        assert.equal(advance?.resumeKind, "continue");
+        assert.deepEqual(advance?.effect, {
+          kind: "command",
+          command: "vs-code-ai-helper.resumeAndSetTaskStage",
+          args: [
+            {
+              taskFolderPath: folderUri.fsPath,
+              stage: "impl-high-review",
+              // The fact under test: captured at build time from the
+              // genuinely-active Fast Forward run, not left at the
+              // `false` default every other test in this suite observes.
+              resumeFastForward: true,
+              expectedSourceStage: "impl",
+            },
+          ],
+        });
+        assert.match(
+          advance?.consequence ?? "",
+          /Continues fast-forwarding at High-Level Code Review\.$/,
+          "the consequence must name that choosing Advance continues fast-forwarding at the new stage, " +
+            "not merely that the task moves there"
+        );
+      } finally {
+        clearFastForwardRunActiveV1(folderUri.fsPath);
+        deactivateNotificationRouter();
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+  );
 
   void it("no-context fallback: posts a bound singleChoice interaction through askInteraction, never prose", async () => {
     // Part 10 items 13d/13e, review blocker (2026-08-30): reached only when
@@ -548,13 +648,13 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
       const optionIds = options.map((o) => o.optionId).sort();
       assert.deepEqual(
         optionIds,
-        ["advance", "handleMyself", "keepIterating", "reconsiderRequirement"].sort(),
+        ["advance", "handleMyself", "reconsiderRequirement", "switchStageModel"].sort(),
         "must reuse the exact same enumerated choices the decision card would have posted"
       );
-      const keepIterating = options.find((o) => o.optionId === "keepIterating");
-      assert.equal(keepIterating?.label, "Switch this stage's model");
+      const switchStageModel = options.find((o) => o.optionId === "switchStageModel");
+      assert.equal(switchStageModel?.label, "Switch this stage's model");
       assert.ok(
-        keepIterating?.description && keepIterating.description.length > 0,
+        switchStageModel?.description && switchStageModel.description.length > 0,
         "each option carries its consequence as a description, not folded into the question text"
       );
       // Review blocker (2026-08-30): the fallback used to drop the effect
@@ -566,7 +666,7 @@ void describe("escalateReviewToHuman — no-evidence escalations post a bound de
         assert.ok(optionEffects[optionId], `option "${optionId}" must carry a bound effect, not just a label`);
       }
       assert.deepEqual(
-        optionEffects.keepIterating,
+        optionEffects.switchStageModel,
         { kind: "command", command: "vs-code-ai-helper.openAiModels" },
         "the fallback's option effect must match the environmental decision card's own effect exactly"
       );
@@ -643,7 +743,14 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       assert.deepEqual(advance?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndSetTaskStage",
-        args: [{ taskFolderPath: folderUri.fsPath, stage: "impl-low-review" }],
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "impl-low-review",
+            resumeFastForward: false,
+            expectedSourceStage: "impl-high-review",
+          },
+        ],
       });
       assert.ok(decision.gating?.holdsTaskPaused, "a plateau decision genuinely holds the task paused");
 
@@ -1397,10 +1504,18 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
         ["acknowledgeAdvance", "handleMyself", "publishAnyway"],
         "must offer all three exits named in Part 4: advance anyway, fix it yourself, Publish Anyway"
       );
-      assert.deepEqual(
-        decision.options.find((o) => o.optionId === "acknowledgeAdvance")?.effect,
-        { kind: "doNothing" }
-      );
+      assert.deepEqual(decision.options.find((o) => o.optionId === "acknowledgeAdvance")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [
+          {
+            taskFolderPath: "/tmp/task1",
+            stage: "impl-low-review",
+            resumeFastForward: false,
+            expectedSourceStage: "impl-high-review",
+          },
+        ],
+      });
       assert.deepEqual(decision.options.find((o) => o.optionId === "handleMyself")?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.openPlanFinal",
@@ -1412,6 +1527,142 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
         args: [{ taskFolderPath: "/tmp/task1" }],
       });
     } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Review fix, 2026-09-2x: `acknowledgeAdvance` used to dispatch
+  // `resumeAndApplyCurrentStageAction` unconditionally — reproducing the
+  // CURRENT stage's action, not a genuine advance — because its doc comment
+  // wrongly assumed the transition had already happened synchronously
+  // before the card could be answered. It now performs the transition
+  // itself through the Step-3 advance path (`resumeAndSetTaskStage`), which
+  // requires a real next stage; at the last stage in `STAGE_ORDER` (publish)
+  // there is none, so the option correctly falls back to re-running the
+  // current stage's action instead of dispatching a stage move to nowhere.
+  void it("acknowledgeAdvance falls back to re-running the current stage's action when there is no next stage", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "publish-stage environmental failure" },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1("publish", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: "/tmp/task1",
+      });
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
+      assert.deepEqual(decision.options.find((o) => o.optionId === "acknowledgeAdvance")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        args: [{ taskFolderPath: "/tmp/task1" }],
+      });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Review fix, 2026-09-23 (narrowed blocker c2453680-fe42-461b-9652-1f87445cb9d3-0):
+  // `routeReviewOutcomeV1`'s own score/threshold check can — and, whenever
+  // auto-advance is on and this route was chosen, routinely does — actually
+  // perform the exact advance this card's "Continue — advance anyway" option
+  // offers, in the SAME round that posted the card (see the withdrawal added
+  // beside that auto-advance transition in reviewActions.ts). A stale card
+  // left behind after that real advance would let `resumeAndSetTaskStageV1`
+  // read the target stage already being current as "the move just
+  // succeeded" and dispatch that stage's action a second time — so once the
+  // real advance lands, this card must be gone before it can ever be
+  // clicked. This pins the withdrawal primitive reviewActions.ts now calls
+  // with the exact decisionKey/target shape used there.
+  void it("withdrawing by the same decisionKey/reason reviewActions.ts uses removes the card once the real advance lands", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "some environmental failure" },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: "/tmp/task1",
+      });
+      assert.strictEqual(posted, true);
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      assert.ok(
+        store.listPending().some((d) => d.decisionKey === "environmentalAdvanceNotice"),
+        "the card must exist before the withdrawal this test is about to perform"
+      );
+
+      // The exact call reviewActions.ts now makes once `transition?.persisted`
+      // is true in the auto-advance block, with the same target shape and
+      // decisionKey string.
+      await withdrawWorkflowDecisionsByKeyV1(
+        { taskFolderPath: "/tmp/task1", canonicalId: "c1" },
+        "environmentalAdvanceNotice",
+        "the task already advanced to Low-Level Code Review automatically, so this notice's own advance option would only repeat that stage's action"
+      );
+
+      assert.strictEqual(
+        store.listPending().some((d) => d.decisionKey === "environmentalAdvanceNotice"),
+        false,
+        "the stale card must be gone once the real advance has landed"
+      );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Review fix, 2026-09-23 (same blocker as above): the card's own text used
+  // to unconditionally claim the task "stays on <stage> until you choose",
+  // which is false whenever auto-advance is on — the task can move out from
+  // under the user before, or instead of, an answer ever being given. The
+  // text now only makes that claim when auto-advance genuinely cannot
+  // preempt it (auto-advance off, or no next stage to preempt into).
+  void it("only claims the task stays on its stage until you choose when auto-advance cannot preempt it", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "some environmental failure" },
+    ];
+    const original = settingsModule.isAutoAdvanceEnabled;
+    try {
+      settingsModule.isAutoAdvanceEnabled = (): boolean => true;
+      const postedWithAutoAdvance = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+        canonicalId: "c-auto",
+        taskFolderPath: "/tmp/task-auto",
+      });
+      assert.strictEqual(postedWithAutoAdvance, true);
+      const autoAdvanceDecision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "environmentalAdvanceNotice" && d.taskCanonicalId === "c-auto");
+      assert.ok(autoAdvanceDecision);
+      assert.doesNotMatch(
+        autoAdvanceDecision.whyUserNeeded,
+        /stays on .* until you choose/,
+        "with auto-advance on and a next stage available, the task may move on its own before an answer"
+      );
+      assert.match(autoAdvanceDecision.gating?.detail ?? "", /auto-advance may move/i);
+
+      settingsModule.isAutoAdvanceEnabled = (): boolean => false;
+      const postedWithoutAutoAdvance = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+        canonicalId: "c-manual",
+        taskFolderPath: "/tmp/task-manual",
+      });
+      assert.strictEqual(postedWithoutAutoAdvance, true);
+      const manualDecision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "environmentalAdvanceNotice" && d.taskCanonicalId === "c-manual");
+      assert.ok(manualDecision);
+      assert.match(
+        manualDecision.whyUserNeeded,
+        /stays on .* until you choose/,
+        "with auto-advance off, nothing can move the task out from under the user"
+      );
+    } finally {
+      settingsModule.isAutoAdvanceEnabled = original;
       __extensionContextV1TestOnly.reset();
     }
   });

@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
-import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { enterStageV1 } from "../utils/stageTransition";
 import { formatPlanRevisionProposalVariableV1, listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readNonEmptyText } from "../utils/fileUtils";
@@ -438,15 +438,28 @@ export async function generatePlanWithAI(
       resolvedForDisplay.progress.displayName ?? resolvedForDisplay.folderName,
       lockKey
     );
-    result = await runTrackedOperation(
+    // Completion blocker (2026-09-22 review, review-pass 18): the body used
+    // to return the full `GeneratePlanResult` object, which is truthy even
+    // when `succeeded: false` (an ineligible-source stage-entry refusal, a
+    // missing model, an unowned task, ...) — `runTrackedOperation` derives
+    // its terminal state from a normal return, so every one of those
+    // refusals was recorded as a completed operation on the Notifications
+    // row. `refusedWhenFalse` (the same mechanism Generate Implementation
+    // uses for its own `enterStageV1` refusal, `handleGenerateImplementationOutcomeV1`
+    // above) needs an actual `false` return to trigger, so the closure below
+    // captures the full result in the outer `result` variable and returns
+    // only its `succeeded` flag to `runTrackedOperation`.
+    const opStarted = await runTrackedOperation(
       lockKey,
-      { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true },
-      (op) =>
-        generatePlanWithAIForResolvedTask(
+      { label: "Generate Plan", stage: "plan", taskName, kind: "generate-plan", cancellable: true, refusedWhenFalse: true },
+      async (op) => {
+        result = await generatePlanWithAIForResolvedTask(
           context, inventory, chatViewProvider, taskFolderUri, op, effectiveReviewMode
-        )
+        );
+        return result.succeeded;
+      }
     );
-    if (!result) {
+    if (opStarted === undefined || !result) {
       // Refused (another operation holds this task's lock) — the busy warning
       // was already shown by runTrackedOperation.
       return;
@@ -556,13 +569,13 @@ async function resolveGeneratePlanCoordinatorV1(
 }
 
 /** Minimal task identity `handleGeneratePlanOutcomeV1` needs — never a raw filesystem path beyond the task's own folder. */
-interface GeneratePlanOutcomeTaskRefV1 {
+export interface GeneratePlanOutcomeTaskRefV1 {
   readonly taskFolderPath: string;
   readonly canonicalId: string;
   readonly taskName?: string;
 }
 
-interface GeneratePlanOutcomeContextV1 {
+export interface GeneratePlanOutcomeContextV1 {
   readonly taskRef: GeneratePlanOutcomeTaskRefV1;
   readonly chatViewProvider: ChatViewProvider;
   readonly orchestrator: ActionConversationOrchestratorV1;
@@ -579,7 +592,7 @@ interface GeneratePlanOutcomeContextV1 {
   readonly effectiveReviewMode: AutoTriggerMode;
 }
 
-interface GeneratePlanOutcomeResultV1 {
+export interface GeneratePlanOutcomeResultV1 {
   readonly succeeded: boolean;
   readonly triggerAutoReview: boolean;
   readonly runLogUri?: vscode.Uri;
@@ -595,7 +608,7 @@ interface GeneratePlanOutcomeResultV1 {
  * command invocation and by an explicit Chat Resume, so both paths behave
  * identically once the coordinator has produced an outcome.
  */
-async function handleGeneratePlanOutcomeV1(
+export async function handleGeneratePlanOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: GeneratePlanOutcomeContextV1
 ): Promise<GeneratePlanOutcomeResultV1> {
@@ -604,6 +617,12 @@ async function handleGeneratePlanOutcomeV1(
 
   let succeeded = false;
   let triggerAutoReview = false;
+  // Set only on the stage-entry refusal branch below, so the run log can
+  // record the actual reason instead of just the provider's own (successful)
+  // outcome text — a refusal here is a stage-transition fact, not something
+  // `describeTaskActionOutcomeForLogV1` (which only describes `outcome`,
+  // still "completed") can see.
+  let stageEntryRefusalReason: string | undefined;
 
   if (outcome.kind === "completed") {
     // Preserve unrelated fields (implReviewFiles, scheduled metadata, lint
@@ -611,28 +630,75 @@ async function handleGeneratePlanOutcomeV1(
     // persisted before its automatic follow-up operation begins, so the
     // tree/progress indicator and review eligibility stay aligned with what
     // actually runs next.
+    //
+    // Part 1 review fix: routed through `enterStageV1` (the one-door
+    // stage-entry primitive — see `stageTransition.ts`) with kind
+    // `generate-plan`, instead of a bare `patchTaskProgressStrictV1` call
+    // that silently left the stage untouched on an ineligible source. The
+    // source stage is read fresh here (outside the lock) only to seed
+    // `enterStageV1`'s compare-and-set; the `precondition` re-checks
+    // `ELIGIBLE_STAGES` against the freshly re-read progress INSIDE the
+    // lock, so a race between this read and the write is caught the same
+    // way as any other stale-source-stage transition.
     const destinationStage: TaskStage = ctx.effectiveReviewMode !== "off" ? "plan-high-review" : "plan";
-    // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker on the
-    // checked nextActor item): a review is about to be dispatched right
-    // after this write exactly when effectiveReviewMode !== "off" (see
-    // `triggerAutoReview` below) — "automation" then, "human" otherwise
-    // (landing on "plan" with nothing further arranged, matching every
-    // other stage-transition writer's nextActor: human default for a
-    // completed action that hands control back).
-    await patchTaskProgressStrictV1(taskFolderUri, (existing) => {
-      if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
-        return existing;
-      }
-      return updateTaskProgressStage(
-        existing,
-        destinationStage,
-        ctx.effectiveReviewMode !== "off" ? "automation" : "human"
+    const preflightProgress = await readTaskProgressStrictV1(taskFolderUri);
+    const sourceStage: TaskStage | undefined = preflightProgress.ok
+      ? preflightProgress.decoded.progress.currentStage
+      : undefined;
+    const entryResult = sourceStage === undefined
+      ? undefined
+      : await enterStageV1(
+          taskFolderUri,
+          sourceStage,
+          destinationStage,
+          /* isPaused */ false, // Inert: "generate-plan" is never AUTO_REVIEW_ELIGIBLE, so isPaused cannot affect shouldAutoReview here.
+          "generate-plan",
+          {
+            precondition: (current) =>
+              ELIGIBLE_STAGES.includes(current.currentStage)
+                ? true
+                : "the task is no longer at Description or Plan",
+            // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker
+            // on the checked nextActor item): a review is about to be
+            // dispatched right after this write exactly when
+            // effectiveReviewMode !== "off" (see `triggerAutoReview` below)
+            // — "automation" then, "human" otherwise (landing on "plan"
+            // with nothing further arranged, matching every other
+            // stage-transition writer's nextActor: human default for a
+            // completed action that hands control back).
+            transform: (current) =>
+              updateTaskProgressStage(
+                current,
+                destinationStage,
+                ctx.effectiveReviewMode !== "off" ? "automation" : "human"
+              ),
+          }
+        );
+    if (entryResult?.ready) {
+      succeeded = true;
+      triggerAutoReview = ctx.effectiveReviewMode !== "off";
+      await safeOpenTextDocument(planFileUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
+      NotificationRouter.showInformation(`${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} generated.`);
+    } else {
+      // Deliberate behavior change (Part 1 review fix): an ineligible source
+      // stage (or an unreadable progress file) used to report `succeeded:
+      // true` with the stage silently unmoved. That is now a reported
+      // refusal — the generated plan.md is kept either way, but `succeeded`
+      // is false (2026-09-22 review fix: this used to be reported `true`,
+      // which recorded a refused stage entry as a successful operation), the
+      // task's stage was not moved, and the user is told why instead of the
+      // discrepancy going unnoticed.
+      succeeded = false;
+      triggerAutoReview = false;
+      stageEntryRefusalReason =
+        entryResult?.ready === false
+          ? entryResult.reason
+          : "the task's current stage could not be read";
+      NotificationRouter.showWarning(
+        `${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} was generated, but the task is no longer at Description or ` +
+          `Plan, so its stage was not moved.`
       );
-    });
-    succeeded = true;
-    triggerAutoReview = ctx.effectiveReviewMode !== "off";
-    await safeOpenTextDocument(planFileUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
-    NotificationRouter.showInformation(`${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} generated.`);
+    }
   } else if (outcome.kind === "questions") {
     // Plan §6.1: questions surface in Chat With AI, never in plan.md. The
     // durable Chat interaction transaction is already persisted (the
@@ -693,7 +759,11 @@ async function handleGeneratePlanOutcomeV1(
       `# Prompt\n\n${ctx.prompt}\n\n` +
       "*(The coordinator appends its own AI-result envelope contract block " +
       "to this prompt before dispatch; that block is not reproduced here.)*\n\n" +
-      `# Result\n\n${describeTaskActionOutcomeForLogV1(outcome, "plan.md")}`
+      `# Result\n\n${describeTaskActionOutcomeForLogV1(outcome, "plan.md")}` +
+      (stageEntryRefusalReason
+        ? `\n\n${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} was generated, but the stage entry was refused: ` +
+          `${stageEntryRefusalReason}. The task's stage was not moved.`
+        : "")
   );
 
   return { succeeded, triggerAutoReview, runLogUri };

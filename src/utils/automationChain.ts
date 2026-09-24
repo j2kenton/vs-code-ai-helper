@@ -12,6 +12,7 @@ import {
   setPendingAutomationRoundIntentV1,
   terminalizeRoundV1,
 } from "./roundLedgerV1";
+import { writeRunLog } from "./runLog";
 
 /**
  * Lock-safe guarded dispatch for automation chains (auto-review,
@@ -339,9 +340,32 @@ function terminalizeGenericAutomationRoundBestEffortV1(
         : undefined;
   void terminalizeRoundV1(intentId, state, outcome, {
     taskFolderUri: vscode.Uri.file(taskKey),
-  }).catch(() => {
-    // Best-effort — never surfaces to the dispatch caller.
-  });
+  })
+    .then((result) => {
+      // pre-1.0.0 register item 16 / plan step 10: a dispatched round that
+      // never invoked a provider or changed anything was otherwise invisible
+      // in runs/ — the one place an operator looks for what happened held
+      // nothing. Write a short, honest run log for exactly this case
+      // (dropped with a reason, on a row this call actually terminalized —
+      // never on a row something else already closed), best-effort.
+      if (state === "dropped" && result.ok && !result.alreadyTerminal) {
+        const reason = typeof errorOrReason === "string" ? errorOrReason : "the dispatched command declined to run";
+        void writeRunLog(
+          vscode.Uri.file(taskKey),
+          "automation",
+          result.entry.stage,
+          `# Automation Round Not Started\n\n` +
+            `The scheduled \`${result.entry.mode}\` round for stage \`${result.entry.stage}\` ended ` +
+            `without invoking a provider or changing anything, and was not started.\n\n` +
+            `Reason: ${reason}\n`
+        ).catch(() => {
+          // Best-effort — never surfaces to the dispatch caller.
+        });
+      }
+    })
+    .catch(() => {
+      // Best-effort — never surfaces to the dispatch caller.
+    });
 }
 
 /**
@@ -473,11 +497,22 @@ export function scheduleAutomationChain(
       })
       .then(() => deps.execute(dispatch.command, dispatch.arg))
       .then(
-        () => {
+        (executed) => {
           release();
+          // Item 16 / plan step 10: a normal resolve is not automatically
+          // "completed" — a dispatched command that declines (returns
+          // `false`, e.g. an early guard clause before any round started)
+          // ended the same way a chain drop does: nothing ran, so the
+          // ledger records `"dropped"`, never a clean ending it never had.
+          const declined = executed === false;
           void intentIdPromise.then((id) => {
-            void recordTerminalIntentBestEffortV1(id, "completed");
-            terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+            void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
+            terminalizeGenericAutomationRoundBestEffortV1(
+              dispatch.taskKey,
+              id,
+              declined ? "dropped" : "completed",
+              declined ? "the dispatched command declined to run and no round was started" : undefined
+            );
           });
           return true;
         },
@@ -550,11 +585,19 @@ export function scheduleAutomationChain(
           })
           .then(() => {
             Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
-              () => {
+              (executed) => {
                 release();
+                // Same fix as the immediate-dispatch branch above: a
+                // declined (`false`) resolve is not a clean ending.
+                const declined = executed === false;
                 void intentIdPromise.then((id) => {
-                  void recordTerminalIntentBestEffortV1(id, "completed");
-                  terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+                  void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
+                  terminalizeGenericAutomationRoundBestEffortV1(
+                    dispatch.taskKey,
+                    id,
+                    declined ? "dropped" : "completed",
+                    declined ? "the dispatched command declined to run and no round was started" : undefined
+                  );
                 });
               },
               (error) => {

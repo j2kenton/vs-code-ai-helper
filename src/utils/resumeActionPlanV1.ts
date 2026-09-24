@@ -477,24 +477,46 @@ export function describeResumeOptionV1(plan: ResumeActionPlanV1 | undefined): {
   readonly label: string;
   readonly consequence: string;
 } {
+  // Pre-1.0.0 fixes register, item 22: name the action AND say whether it
+  // edits code — a shared generic label/consequence here is exactly what let
+  // "Resume and re-run this stage" dispatch an implementation round while
+  // reading as a review re-run. What decides the outcome (an apply-review vs
+  // a run-review) is whether a usable, fresh review already exists for this
+  // stage (see planResumeActionV1 above) — stated here rather than guessed at.
   if (plan === undefined) {
     return {
       label: "Resume and run this stage's next action",
       consequence:
         "Resumes the task and dispatches the action its current stage calls for, through the same " +
-        "admission-protected path a scheduled resume uses.",
+        "admission-protected path a scheduled resume uses. Which action that is, and whether it edits " +
+        "code, depends on whether a usable, fresh review already exists for this stage.",
     };
   }
   switch (plan.kind) {
     case "run-review":
+      return {
+        label: `${plan.label} — a review; it does not edit code`,
+        consequence:
+          "Resumes the task and immediately starts this review through the same admission-protected " +
+          "path a scheduled resume uses — the task will not go active again without genuine work " +
+          "arranged for it. A review reads the workspace and writes its own findings; it does not edit code.",
+      };
     case "apply-review":
+      return {
+        label: `${plan.label} — runs an implementation round that edits code`,
+        consequence:
+          "Resumes the task and immediately starts applying the review through the same " +
+          "admission-protected path a scheduled resume uses — the task will not go active again without " +
+          "genuine work arranged for it. This runs an implementation round that edits the workspace to " +
+          "address the review's findings.",
+      };
     case "stage-default":
       return {
         label: plan.label,
         consequence:
-          "Resumes the task and immediately starts exactly this action through the same " +
+          "Resumes the task and immediately starts this stage's own action through the same " +
           "admission-protected path a scheduled resume uses — the task will not go active again without " +
-          "genuine work arranged for it.",
+          "genuine work arranged for it. Whether that action edits code depends on the stage.",
       };
     case "resume-only":
       return {

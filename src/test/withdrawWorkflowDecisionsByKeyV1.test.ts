@@ -53,6 +53,7 @@ function decisionInput(decisionKey: string): CreateWorkflowDecisionInputV1 {
         optionId: "doNothing",
         label: "Do nothing",
         consequence: "Nothing happens.",
+        resumeKind: "unpause",
         effect: { kind: "doNothing" },
       },
     ],

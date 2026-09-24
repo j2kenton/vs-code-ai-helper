@@ -1241,9 +1241,15 @@ export async function attachCoordinatorIdentityToRoundV1(
         row.operationId !== options.operationId &&
         options.allowOperationTakeover !== true
       ) {
+        // Pre-1.0.0 fixes register, Part 4 Step 8: name both operation ids in
+        // the thrown message (not just the row id) so a run log line built
+        // from this error's `.message` lets a reader tell which operation
+        // already owned the row and which one arrived second and lost the
+        // race, without having to cross-reference the round ledger by hand.
         throw new AttachCoordinatorIdentityErrorV1(
           "wrongOwner",
-          `round ledger row ${options.roundId} belongs to another operation`
+          `round ledger row ${options.roundId} belongs to another operation ` +
+            `(existing operationId=${row.operationId}, this attempt's operationId=${options.operationId})`
         );
       }
       const attemptIds = row.attemptIds.includes(options.attemptId)

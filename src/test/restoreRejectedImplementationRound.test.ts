@@ -31,6 +31,8 @@ import {
   buildUnusableImplementationSummaryV1,
   getCanonicalImplementationUri,
   getImplementationSummaryUri,
+  hasOfferableRunImplementationForUnusableSummaryV1,
+  shouldOfferRunImplementationForUnusableSummaryV1,
 } from "../utils/implementationArtifactResolver";
 import { previousVersionUri } from "../utils/artifactBackups";
 
@@ -151,7 +153,7 @@ void describe("describeUnusableReviewBlockV1", () => {
       );
       activeStore = mem;
 
-      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+      const { warning, canRestorePreviousImplSummary, offerRunImplementation } = await describeUnusableReviewBlockV1(
         FOLDER,
         "impl-low-review"
       );
@@ -164,6 +166,51 @@ void describe("describeUnusableReviewBlockV1", () => {
       assert.doesNotMatch(warning, /Readiness: N\/10/);
       assert.doesNotMatch(warning, /run the review again/i);
       assert.equal(canRestorePreviousImplSummary, false);
+      // Part 4 Step 12 (item 16): nothing is restorable and no task-progress.json
+      // (hence no live implRecovery) exists here, so "Run Implementation" must be
+      // offered — this is the exact deadlock the register recorded.
+      assert.equal(offerRunImplementation, true);
+    }
+  );
+
+  void it(
+    "offers no 'Run Implementation' action when a continuation is already armed (implRecovery is live) — " +
+      "Part 4 Step 12, item 16",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1(
+        "the final response is missing Verification",
+        "run-log-2026-08-13.md"
+      );
+      const liveRecoveryProgress = JSON.stringify({
+        taskFolder: "2026-08-13_restore-rejected-round",
+        currentStage: "impl-low-review",
+        status: "active",
+        createdAt: "2026-08-13T00:00:00.000Z",
+        updatedAt: "2026-08-13T00:00:00.000Z",
+        implRecovery: {
+          trigger: "roundIncomplete",
+          reason: "the last implementation round ended without a complete report",
+          sourceAttemptId: "attempt-1",
+          dispatch: "pending",
+          mode: "unconstrained",
+          at: "2026-08-13T00:00:00.000Z",
+        },
+      });
+      const mem = installMemStore(
+        seed({
+          [getImplementationSummaryUri(FOLDER).toString()]: stamped,
+          [vscode.Uri.joinPath(FOLDER, "task-progress.json").toString()]: liveRecoveryProgress,
+        })
+      );
+      activeStore = mem;
+
+      const { canRestorePreviousImplSummary, offerRunImplementation } = await describeUnusableReviewBlockV1(
+        FOLDER,
+        "impl-low-review"
+      );
+
+      assert.equal(canRestorePreviousImplSummary, false);
+      assert.equal(offerRunImplementation, false);
     }
   );
 
@@ -188,7 +235,7 @@ void describe("describeUnusableReviewBlockV1", () => {
       );
       activeStore = mem;
 
-      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+      const { warning, canRestorePreviousImplSummary, offerRunImplementation } = await describeUnusableReviewBlockV1(
         FOLDER,
         "impl-low-review"
       );
@@ -196,6 +243,15 @@ void describe("describeUnusableReviewBlockV1", () => {
       assert.match(warning, /Restore the last usable summary/);
       assert.doesNotMatch(warning, /^Rerun the implementation/m);
       assert.equal(canRestorePreviousImplSummary, true);
+      // offerRunImplementation is independent of restorability (2026-09-24
+      // review, narrowed completion blocker: this field used to be ANDed
+      // with `!canRestorePreviousImplSummary`, suppressing it whenever a
+      // backup existed — narrower than the checked item's own applicability
+      // condition, which names only the live-implRecovery exclusion). The
+      // caller attaches Run Implementation as the toast's one action button
+      // when this is true, even though Restore is also available; the
+      // warning text above still names Restore.
+      assert.equal(offerRunImplementation, true);
     }
   );
 
@@ -223,7 +279,7 @@ void describe("describeUnusableReviewBlockV1", () => {
 
   void it(
     "never recommends rerunning implementation once the plan's checklist is fully settled, and " +
-      "points only at the restore action when one is available (v1 fixes 2, item 1 completion blocker)",
+      "and names the restore action in wording when one is available (v1 fixes 2, item 1 completion blocker)",
     async () => {
       const stamped = buildUnusableImplementationSummaryV1(
         "the final response is missing Verification",
@@ -291,8 +347,10 @@ void describe("describeUnusableReviewBlockV1", () => {
   );
 
   void it(
-    "names a human decision — never a rerun — when the checklist is fully settled and there is no " +
-      "usable _prev backup to restore (v1 fixes 2, item 1 completion blocker)",
+    "still offers Run Implementation when the checklist is fully settled and there is no usable _prev " +
+      "backup to restore — the plan's own applicability condition excludes only a LIVE implRecovery, " +
+      "never checklist state; a fully-settled checklist only changes the warning TEXT (Part 4 Step 12, " +
+      "item 16 completion blocker, 2026-09-24 review)",
     async () => {
       const stamped = buildUnusableImplementationSummaryV1(
         "the final response is missing Verification",
@@ -306,7 +364,7 @@ void describe("describeUnusableReviewBlockV1", () => {
       );
       activeStore = mem;
 
-      const { warning, canRestorePreviousImplSummary } = await describeUnusableReviewBlockV1(
+      const { warning, canRestorePreviousImplSummary, offerRunImplementation } = await describeUnusableReviewBlockV1(
         FOLDER,
         "impl-low-review"
       );
@@ -315,6 +373,10 @@ void describe("describeUnusableReviewBlockV1", () => {
       assert.match(warning, /fully settled/);
       assert.match(warning, /human decision/);
       assert.doesNotMatch(warning, /rerun the implementation/i);
+      // No live implRecovery is armed here, so the button IS offered even
+      // though the wording above warns that a rerun may find nothing to
+      // change — that judgment is left to the human, not hidden from them.
+      assert.equal(offerRunImplementation, true);
     }
   );
 
@@ -535,5 +597,136 @@ void describe("restoreRejectedImplementationRound command — rerun-on-success w
     );
 
     assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
+  });
+});
+
+/**
+ * Part 4 Step 12 (item 16) — the review-stage-ROW half: "Run Implementation"
+ * must be offerable straight from the task's context menu AND the review
+ * stage's own row, not only from a refusal toast the user has to trigger by
+ * pressing Review or Fast Forward first. `shouldOfferRunImplementationForUnusableSummaryV1`
+ * is the shared pure predicate both the refusal-toast callers (covered above
+ * via `describeUnusableReviewBlockV1`) and both row surfaces
+ * (`hasOfferableRunImplementationForUnusableSummaryV1`) resolve through —
+ * this pins the shared row gating, and that the function never throws.
+ *
+ * A 2026-09-24 review flagged an earlier round's task-row wrapper for
+ * suppressing the action whenever a restorable `_prev` backup existed
+ * ("Restore always takes priority"), which is narrower than the plan's own
+ * applicability condition (only a live `implRecovery` excludes it) — that
+ * suppression is removed here; Restore and Run Implementation may now be
+ * offered together.
+ */
+void describe("shouldOfferRunImplementationForUnusableSummaryV1", () => {
+  void it("is the plain negation of a live implRecovery — no other condition narrows it", () => {
+    assert.equal(shouldOfferRunImplementationForUnusableSummaryV1(false), true);
+    assert.equal(shouldOfferRunImplementationForUnusableSummaryV1(true), false);
+  });
+});
+
+void describe("hasOfferableRunImplementationForUnusableSummaryV1", () => {
+  void it(
+    "returns true even when a restorable round already exists — Restore and Run Implementation " +
+      "may be offered together (2026-09-24 review: the plan's applicability condition names only a " +
+      "live implRecovery, not restorability)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+      const mem = installMemStore(
+        seed({ [getImplementationSummaryUri(FOLDER).toString()]: stamped })
+      );
+      activeStore = mem;
+
+      const offered = await hasOfferableRunImplementationForUnusableSummaryV1(
+        FOLDER,
+        /* hasLiveImplRecovery */ false
+      );
+
+      assert.equal(offered, true);
+    }
+  );
+
+  void it("returns false when impl-summary.md does not exist", async () => {
+    const mem = installMemStore();
+    activeStore = mem;
+
+    const offered = await hasOfferableRunImplementationForUnusableSummaryV1(FOLDER, false);
+
+    assert.equal(offered, false);
+  });
+
+  void it("returns false when the current summary is not the rejection stamp", async () => {
+    const mem = installMemStore(
+      seed({ [getImplementationSummaryUri(FOLDER).toString()]: REAL_SUMMARY })
+    );
+    activeStore = mem;
+
+    const offered = await hasOfferableRunImplementationForUnusableSummaryV1(FOLDER, false);
+
+    assert.equal(offered, false);
+  });
+
+  void it(
+    "returns true for an unusable summary with nothing restorable and no live implRecovery — the " +
+      "deadlock case the register recorded",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+      const mem = installMemStore(
+        seed({ [getImplementationSummaryUri(FOLDER).toString()]: stamped })
+      );
+      activeStore = mem;
+
+      const offered = await hasOfferableRunImplementationForUnusableSummaryV1(FOLDER, false);
+
+      assert.equal(offered, true);
+    }
+  );
+
+  void it("returns false when a continuation is already live — it will fix the summary automatically", async () => {
+    const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+    const mem = installMemStore(
+      seed({ [getImplementationSummaryUri(FOLDER).toString()]: stamped })
+    );
+    activeStore = mem;
+
+    const offered = await hasOfferableRunImplementationForUnusableSummaryV1(
+      FOLDER,
+      /* hasLiveImplRecovery */ true
+    );
+
+    assert.equal(offered, false);
+  });
+
+  void it(
+    "still returns true when the checklist is fully settled — a fully-settled checklist is not, on " +
+      "its own, a reason to withhold the row action (only a live implRecovery narrows it)",
+    async () => {
+      const stamped = buildUnusableImplementationSummaryV1("bad shape", "run-log.md");
+      const mem = installMemStore(
+        seed({
+          [getImplementationSummaryUri(FOLDER).toString()]: stamped,
+          [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+        })
+      );
+      activeStore = mem;
+
+      const offered = await hasOfferableRunImplementationForUnusableSummaryV1(FOLDER, false);
+
+      assert.equal(offered, true);
+    }
+  );
+
+  void it("never throws on a read failure — a transient error renders as 'not offerable'", async () => {
+    const fsApi = vscode.workspace.fs as unknown as { readFile: (uri: vscode.Uri) => Promise<Uint8Array> };
+    const orig = fsApi.readFile;
+    fsApi.readFile = (): Promise<Uint8Array> => Promise.reject(new Error("EIO: simulated transient failure"));
+    activeStore = {
+      restore: (): void => {
+        fsApi.readFile = orig;
+      },
+    };
+
+    const offered = await hasOfferableRunImplementationForUnusableSummaryV1(FOLDER, false);
+
+    assert.equal(offered, false);
   });
 });

@@ -46,6 +46,7 @@
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vm from "node:vm";
 import * as vscode from "vscode";
@@ -59,6 +60,7 @@ import {
   notifyPendingWorkflowDecision,
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { makeOwnedTaskFolder, bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
 import { safeRemoveDir } from "./testFsUtils";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
@@ -219,6 +221,7 @@ function decisionInput(
         optionId: "doIt",
         label: "Do it",
         consequence: "Applies the change immediately.",
+        resumeKind: "unpause",
         effect: { kind: "command", command: "ensemble.doIt", args: ["arg1"] },
       },
     ],
@@ -557,6 +560,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
               optionId: "wait",
               label: "Wait",
               consequence: "Leaves the round as-is; nothing changes.",
+              resumeKind: "unpause",
               effect: { kind: "doNothing" },
             },
           ],
@@ -680,6 +684,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
             optionId: "doIt",
             label: "Do it",
             consequence: "Applies the change immediately.",
+            resumeKind: "unpause",
             effect: { kind: "command", command: "ensemble.doIt" },
           },
         ],
@@ -721,6 +726,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
             optionId: "doIt",
             label: "Do it",
             consequence: "Applies the change immediately.",
+            resumeKind: "unpause",
             effect: { kind: "command", command: "ensemble.doIt" },
           },
         ],
@@ -840,6 +846,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
               optionId: "wait",
               label: "Wait",
               consequence: "Leaves the round as-is; nothing changes.",
+              resumeKind: "unpause",
               effect: { kind: "doNothing" },
             },
           ],
@@ -920,12 +927,14 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
               optionId: "goToReviewAndApply",
               label: "Go to Review & Apply",
               consequence: "Moves the task to review and cancels the running round first.",
+              resumeKind: "continue",
               effect: { kind: "command", command: "vs-code-ai-helper.goToReviewAndApply", args: ["arg1"] },
             },
             {
               optionId: "letItRun",
               label: "Keep running Implementation",
               consequence: "Does nothing further.",
+              resumeKind: "continue",
               effect: { kind: "doNothing" },
             },
           ],
@@ -971,12 +980,14 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
               optionId: "goToReviewAndApply",
               label: "Go to Review & Apply",
               consequence: "Moves the task to review and cancels the running round first.",
+              resumeKind: "continue",
               effect: { kind: "command", command: "vs-code-ai-helper.goToReviewAndApply", args: ["arg1"] },
             },
             {
               optionId: "letItRun",
               label: "Keep running Implementation",
               consequence: "Does nothing further.",
+              resumeKind: "continue",
               effect: { kind: "doNothing" },
             },
           ],
@@ -2252,6 +2263,175 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
+  function writeIsWaitingForHumanFixtureProgress(folder: string, fields: Record<string, unknown>): void {
+    const ownership = fixtureOwnershipFor(folder);
+    fs.writeFileSync(
+      path.join(folder, TASK_PROGRESS_FILENAME),
+      JSON.stringify(
+        {
+          taskFolder: path.basename(folder),
+          currentStage: "impl",
+          createdAt: "2026-07-01T10:00:00.000Z",
+          updatedAt: "2026-07-02T11:30:00.000Z",
+          ownership,
+          ...fields,
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  void it("item 16: the view badge also lights up from isWaitingForHumanV1 when no live operation is running", async () => {
+    // Pre-1.0.0 fixes register item 16 ("a task whose nextActor is human
+    // shows that where the user looks") names the chat badge explicitly,
+    // alongside the tree row and status bar, as a surface that must consume
+    // `isWaitingForHumanV1` (`taskWatchdogV1.ts:99`). This is a narrower,
+    // independently-grounded fact read fresh from `TaskProgress` itself —
+    // not "any unresolved chat record" — so it does not reopen the AC3 leak
+    // the round-5/round-2-4 rework closed (see the two tests above): a
+    // persisted-only question/decision/interaction with no such task-level
+    // fact behind it still does not light the badge, and this fallback only
+    // ever fires from a fresh, successfully-read `TaskProgress`.
+    const folder = makeFolder();
+    // `status: "active"`, `nextActor: "human"`, nothing owed/scheduled and no
+    // open round-ledger row — exactly `isWaitingForHumanV1`'s contract.
+    writeIsWaitingForHumanFixtureProgress(folder, { status: "active", nextActor: "human" });
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    // The test stub's `workspace.fs.readFile` is unimplemented by default —
+    // this fallback is sourced from a real progress-file read, so it needs
+    // the real filesystem swapped in (see `installRealFs`'s own doc comment).
+    const realFs = installRealFs();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      assert.deepEqual(
+        (fake.view as unknown as { badge?: { value: number; tooltip: string } }).badge,
+        { value: 1, tooltip: "Waiting for you" },
+        "isWaitingForHumanV1 alone, with no live operation, must light the badge"
+      );
+      assert.equal(
+        lastState(fake)?.waitingForUser,
+        false,
+        "the fallback lights only the badge, not the AC3-governed waitingForUser banner"
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("item 16: a completed task's stale nextActor: human does not light the badge", async () => {
+    // `isWaitingForHumanV1` requires `status === "active"`; a completed task
+    // is not actually waiting on anyone, whatever its last-written
+    // `nextActor` says.
+    const folder = makeFolder();
+    writeIsWaitingForHumanFixtureProgress(folder, { status: "completed", nextActor: "human" });
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      assert.equal(
+        (fake.view as unknown as { badge?: unknown }).badge,
+        undefined,
+        "a completed task's stale nextActor must not light the badge"
+      );
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("item 16: a live waiting-for-user operation keeps its own badge tooltip even when isWaitingForHumanV1 also holds", async () => {
+    const folder = makeFolder();
+    writeIsWaitingForHumanFixtureProgress(folder, { status: "active", nextActor: "human" });
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    const op = taskOperations.begin(folder, { label: "Doing work" });
+    assert.ok(op, "expected the exclusive operation lock to be acquired");
+    try {
+      op.setWaitingForUser(true);
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForState(fake, (s) => s.waitingForUser === true);
+      assert.deepEqual(
+        (fake.view as unknown as { badge?: { value: number; tooltip: string } }).badge,
+        { value: 1, tooltip: "Waiting for your answer" },
+        "a live waiting-for-user operation keeps its own badge tooltip, not the fallback's"
+      );
+    } finally {
+      taskOperations.end(op);
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("item 16 (2026-09-24 review): a live, ordinarily-busy operation suppresses the isWaitingForHumanV1 badge fallback", async () => {
+    // Review-flagged: `busy` (a live, non-waiting operation) is derived
+    // independently from `targetOps`, and the fallback below previously
+    // guarded only on `!waitingForUser` — not on there being no live
+    // operation at all. A task mid-round can still carry a not-yet-updated
+    // `nextActor: "human"` in `TaskProgress` (the write that would flip it
+    // to "automation" lands with the round's own progress patch, which a
+    // still-running round has not reached yet), and this operation has not
+    // opened a round-ledger row yet either, so `isWaitingForHumanV1` alone
+    // would still read true. The busy banner and the "Waiting for you"
+    // badge must not both claim the task's state at once — mirror the tree
+    // row's own gate (`taskOperations.getTaskOperations(tKey).length === 0`)
+    // rather than `!waitingForUser` alone.
+    const folder = makeFolder();
+    writeIsWaitingForHumanFixtureProgress(folder, { status: "active", nextActor: "human" });
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    const op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
+    assert.ok(op, "expected the exclusive operation lock to be acquired");
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForState(fake, (s) => s.busy === true);
+      assert.equal(
+        (fake.view as unknown as { badge?: unknown }).badge,
+        undefined,
+        "a live, ordinarily-busy operation must suppress the isWaitingForHumanV1 badge fallback"
+      );
+    } finally {
+      taskOperations.end(op);
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
   void it("busy status names the live operation even before it reports incremental detail", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
@@ -2491,6 +2671,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
           optionId: "apply",
           label: "Apply 1 Reviewer-Verified Tick",
           consequence: "Ticks 1 item(s) in plan-final.md, sourced from impl-high-review.md:\n- Wire the completeness gate",
+          resumeKind: "continue",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
@@ -2501,6 +2682,7 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
           optionId: "skip",
           label: "Not yet",
           consequence: "Does nothing. The items stay unticked until you apply this or tick them yourself.",
+          resumeKind: "unpause",
           effect: { kind: "doNothing" },
         },
       ],
@@ -2676,11 +2858,12 @@ void describe("Chat With AI — a pending 'restoreRejectedImplementationRound' d
       decisionKey: "restoreRejectedImplementationRound",
       stage: "impl-high-review",
       options: [
-        { optionId: "keep", label: "Keep this round's changes", consequence: "Does nothing.", effect: { kind: "doNothing" } },
+        { optionId: "keep", label: "Keep this round's changes", consequence: "Does nothing.", resumeKind: "unpause", effect: { kind: "doNothing" } },
         {
           optionId: "restore",
           label: "Revert this round's changes",
           consequence: "Restores the prior round's files.",
+          resumeKind: "unpause",
           effect: { kind: "command", command: "vs-code-ai-helper.restoreRejectedImplementationRound", args: ["a", "b"] },
         },
       ],
@@ -2781,12 +2964,14 @@ void describe("Chat With AI — a pending 'checklistChangeProposed' decision is 
           optionId: "revise",
           label: "Revise the plan",
           consequence: "Starts a plan revision.",
+          resumeKind: "continue",
           effect: { kind: "command", command: "vs-code-ai-helper.reviseChecklistChangeProposalConfirmed", args: ["a"] },
         },
         {
           optionId: "discard",
           label: "Discard the proposal",
           consequence: "Leaves the plan untouched.",
+          resumeKind: "unpause",
           effect: { kind: "command", command: "vs-code-ai-helper.discardChecklistChangeProposalConfirmed", args: ["a"] },
         },
       ],
@@ -2903,13 +3088,14 @@ void describe("Chat With AI — a pending 'sterileRoundRouting' decision is re-c
           optionId: "goToReviewAndApply",
           label: "Go to Review & Apply",
           consequence: "Moves the task to review and opens Apply Review.",
+          resumeKind: "continue",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.goToReviewAndApply",
             args: [{ taskFolderPath: folder, reviewStage: "impl-high-review" }],
           },
         },
-        { optionId: "notNow", label: "Not now", consequence: "Does nothing.", effect: { kind: "doNothing" } },
+        { optionId: "notNow", label: "Not now", consequence: "Does nothing.", resumeKind: "unpause", effect: { kind: "doNothing" } },
       ],
       recommendation: { kind: "option", optionId: "goToReviewAndApply", reasoning: "Only Apply Review can fix this." },
     });

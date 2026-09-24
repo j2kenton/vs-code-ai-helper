@@ -89,7 +89,7 @@ import {
 import { NotificationRouter } from "../utils/notificationRouter";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import { scheduleAutomationChain } from "../utils/automationChain";
-import type { TaskOperationHandle } from "../utils/taskOperations";
+import type { TaskOperationHandle, TaskOperationState } from "../utils/taskOperations";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import type { ChatTarget } from "../views/chatView";
 import { syncOwedContinuationLedgerBestEffortV1, OwedContinuationSourceV1 } from "../state/schedulingIntentV1";
@@ -97,6 +97,7 @@ import {
   terminalizeRoundV1,
   peekPendingAutomationRoundIntentV1,
   RoundLedgerTerminalStateV1,
+  TerminalizeRoundResultV1,
 } from "../utils/roundLedgerV1";
 
 /**
@@ -511,7 +512,7 @@ export async function beginImplementationRecoveryV1(
   // passed when no hint exists (guaranteed not to resolve to any existing
   // row, so resolution falls through to the scan immediately) and as the
   // synthesized row's own id when nothing is live to reuse either.
-  const terminalization = await terminalizeRoundV1(input.sourceRoundIdHint ?? sourceAttemptId, sourceState, sourceOutcome, {
+  const runTerminalizeRoundV1 = (): Promise<TerminalizeRoundResultV1> => terminalizeRoundV1(input.sourceRoundIdHint ?? sourceAttemptId, sourceState, sourceOutcome, {
     taskFolderUri: folderUri,
     fallbackToAnyLiveRow: input.sourceRoundIdHint === undefined,
     synthesizeIfMissing: () => ({
@@ -582,6 +583,16 @@ export async function beginImplementationRecoveryV1(
       );
     },
   });
+  let terminalization = await runTerminalizeRoundV1();
+  if (!terminalization.ok) {
+    // Item 105 (Part 4 Step 11): one retry before accepting the persist
+    // genuinely failed — a transient write error or a CAS loss on the very
+    // first attempt must not silently turn into "no continuation was
+    // scheduled" without ever trying again. `extraPatch`/`postTerminalizePatch`
+    // re-read `current` fresh on each call, so a second attempt is safe to
+    // run unconditionally rather than only on a specific failure reason.
+    terminalization = await runTerminalizeRoundV1();
+  }
   const persisted = terminalization.ok ? terminalization.progress : undefined;
   // PART 6.5: push the just-committed fact into the scheduling-intent
   // ledger right after the CAS resolves (never from inside the callback,
@@ -594,6 +605,22 @@ export async function beginImplementationRecoveryV1(
   const capReached = continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1;
 
   const finishDispatch = async (): Promise<void> => {
+    if (!persisted) {
+      // Item 106 (Part 4 Step 11): the strict patch that would have written
+      // the `implRecovery` record failed even after the Step 11 retry above
+      // — there is no record here for `runImplementationWithAI` to claim,
+      // and no decision card or scheduled continuation can honestly
+      // reference one. Stamp the honest outcome instead of claiming a
+      // continuation is scheduled (item 16's "never claim work that did not
+      // happen" rule, applied to this failure mode too).
+      NotificationRouter.showWarning(
+        `⚠️ The implementation round did not finish its turn (${input.reason}), and the continuation could ` +
+          "not be recorded (the progress write failed, even after a retry). No continuation round could be " +
+          "scheduled — rerun the implementation manually. The unreported edits are preserved in " +
+          "pendingImplReviewFiles."
+      );
+      return;
+    }
     const lead =
       input.escalatedFromSummaryOnly === true
         ? "⚠️ The summary-only continuation edited files it was not permitted to edit, so its report was rejected. "
@@ -659,6 +686,7 @@ export async function beginImplementationRecoveryV1(
           options: [
             {
               optionId: "keep",
+              resumeKind: "unpause",
               // Item 13b: name the outcome, not the mechanism — "the
               // continuation" is an internal term the user has no reason to
               // know. Paired with "Revert this round's changes" below as an
@@ -674,6 +702,7 @@ export async function beginImplementationRecoveryV1(
             },
             {
               optionId: "restore",
+              resumeKind: "unpause",
               // Item 13b: "Revert this round's changes" — the opposed
               // outcome to "Keep this round's changes" above, in the user's
               // vocabulary rather than the internal "restore the _prev
@@ -1176,8 +1205,14 @@ export class ImplRecoveryOwedRefusalError extends Error {
   }
 }
 
-/** Human-readable description of why a round left `implRecovery` owed, for `describeOwedImplRecoveryRefusalV1`. */
-function describeImplRecoveryTriggerV1(trigger: ImplRecoveryTriggerV1): string {
+/**
+ * Human-readable description of why a round left `implRecovery` owed, for
+ * `describeOwedImplRecoveryRefusalV1` and for the no-op-continuation run-log
+ * entry `runImplementationWithAI` writes via `onSettled` (item 16, plan Part
+ * 4 Step 10) when a continuation round ends without ever invoking a
+ * provider.
+ */
+export function describeImplRecoveryTriggerV1(trigger: ImplRecoveryTriggerV1): string {
   switch (trigger) {
     case "roundDeferred":
       return "the last implementation round deferred its work to a follow-up turn that never ran";
@@ -1190,6 +1225,43 @@ function describeImplRecoveryTriggerV1(trigger: ImplRecoveryTriggerV1): string {
     case "providerFailedMidRound":
       return "the last implementation round's provider failed mid-round after making unverified edits";
   }
+}
+
+/**
+ * Whether `runImplementationWithAI`'s `onSettled` should write the
+ * "Continuation Round Ended Without Changes" run-log entry (item 16, plan
+ * Part 4 Step 10) — extracted as a pure function so the decision is directly
+ * testable without spinning up a whole tracked-operation dispatch.
+ *
+ * True only when ALL of: a continuation was owed when the round started; the
+ * round did not end `"succeeded"`; and nothing durable happened during it
+ * (`workDoneThisRound`, tracked explicitly by the caller at each of its own
+ * provider-call AND file-write sites — see that flag's declaration comment
+ * in `reviewActions.ts` for why the terminal `state` alone cannot answer
+ * this).
+ *
+ * Deliberately does NOT special-case `state === "cancelled"`: a cancellation
+ * reached before any provider call is still a genuine no-op and must be
+ * logged (the 2026-09-24 review's second finding — the old blanket
+ * `state === "cancelled"` exclusion silently dropped exactly this case); a
+ * non-"succeeded" state reached AFTER a provider call (the checklist
+ * generation call, or the main implementation dispatch) is excluded because
+ * `workDoneThisRound` is true by then, not because of `state` itself — that
+ * failure already has its own reporting from the provider call, and
+ * relabeling it here as "before invoking a provider" was the review's first
+ * finding. `workDoneThisRound` also covers a narrower case the same review
+ * flagged: `materializeCanonicalIfNeeded` can copy `implementation.md` to
+ * `plan-final.md` — a real, durable write — before any provider call, and a
+ * later guard clause can still decline the round; that write must count as
+ * "something changed" the same way a provider call does.
+ * @internal exported for testing
+ */
+export function shouldLogNoOpContinuationRoundV1(
+  continuationOwedAtEntry: boolean,
+  state: TaskOperationState,
+  workDoneThisRound: boolean
+): boolean {
+  return continuationOwedAtEntry && state !== "succeeded" && !workDoneThisRound;
 }
 
 /**

@@ -11,6 +11,7 @@ import {
   buildOwedContinuationDecisionV1,
   buildStalledTaskEscalationDecisionV1,
   QUOTA_RESUME_SCHEDULE_BUFFER_MS,
+  registerScheduleTaskResumeCommand,
   SchedulerClock,
   SchedulerProgressStore,
   scheduleQuotaResumeAtV1,
@@ -578,6 +579,50 @@ void test("scheduleQuotaResumeAtV1 arms a scheduledRun at resetAt plus the buffe
     // `dispose()` alone fires that same release as an un-awaited write,
     // which can still be in flight when `folder.cleanup()` deletes the
     // directory out from under it.
+    await scheduler.cancel(folder.taskFolderPath);
+    scheduler.dispose();
+    realFs.restore();
+    deactivateNotificationRouter();
+    folder.cleanup();
+  }
+});
+
+/**
+ * Pre-1.0.0 fixes register, Part 3 Step 2 inventory: `runnerRegistry.ts`'s
+ * `rerunAfterReset` option was a `known-gap` row in
+ * `decisionOptionResumeKindTableV1.test.ts`, citing only that
+ * `scheduleQuotaResumeAtV1` genuinely schedules (source-traced, not a
+ * runtime dispatch proof). This closes that gap: it drives the REAL
+ * registered `vs-code-ai-helper.scheduleQuotaResumeV1` command — through
+ * `registerScheduleTaskResumeCommand`, the same registration `extension.ts`
+ * performs — with the exact `{ taskFolderPath, resetAtIso }` args shape
+ * `runnerRegistry.ts`'s option literal supplies, and observes the actual
+ * persisted `scheduledRun`/`nextActor` effect, closing the gap between
+ * "the option's effect names this command" and "choosing the option
+ * genuinely arms a scheduled action."
+ */
+void test("the real 'vs-code-ai-helper.scheduleQuotaResumeV1' command (rerunAfterReset's effect) arms a scheduledRun", async () => {
+  const folder = createRealTaskFolderV1("impl");
+  const inventory = stubInventory(folder.taskFolderPath, "task-id", readPersistedProgress(folder.progressPath));
+  const surface: StatusSurface = { addEntry(): void {} };
+  initNotificationRouter(surface);
+  const realFs = installRealWorkspaceFsV1();
+  const fakeContext = { subscriptions: [] } as unknown as vscode.ExtensionContext;
+  const scheduler = registerScheduleTaskResumeCommand(fakeContext, inventory);
+
+  try {
+    const resetAtIso = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await vscode.commands.executeCommand("vs-code-ai-helper.scheduleQuotaResumeV1", {
+      canonicalId: "task-id",
+      taskFolderPath: folder.taskFolderPath,
+      resetAtIso,
+    });
+
+    const persisted = readPersistedProgress(folder.progressPath);
+    assert.ok(persisted.scheduledRun, "choosing rerunAfterReset must genuinely arm a scheduledRun, not merely name the command");
+    assert.equal(persisted.scheduledRun?.stage, "impl");
+    assert.equal(persisted.nextActor, "automation", "arming a schedule means automation acts next");
+  } finally {
     await scheduler.cancel(folder.taskFolderPath);
     scheduler.dispose();
     realFs.restore();
@@ -2576,7 +2621,7 @@ void test("takeOverStaleWorkAdmissionCommandV1 does nothing when no expectedMark
   }
 });
 
-void test("watchdog pause card for a blocked resume plan neither recommends nor promises an unblocking resume", () => {
+void test("watchdog pause card for a blocked resume plan never offers an inert resume, and restoreSummary tries again after restoring", () => {
   const target = {
     canonicalId: "task-id",
     taskFolderPath: "/tmp/task",
@@ -2588,7 +2633,12 @@ void test("watchdog pause card for a blocked resume plan neither recommends nor 
     precondition: "the implementation summary is unusable.",
     restoreSummary: true,
   });
-  assert.equal(restorable.gating?.unblocksProgress, false);
+  // restoreSummary is an Ensemble-performed adjustment (resumeKind: continue),
+  // so it both restores AND tries again — it dispatches
+  // resumeAndApplyCurrentStageAction, but only once
+  // restoreRejectedImplementationRound has confirmed the restore actually
+  // replaced something (see that command's own `rerunCommandId` guard).
+  assert.equal(restorable.gating?.unblocksProgress, true);
   assert.equal(restorable.recommendation.kind, "option");
   assert.equal(
     restorable.recommendation.kind === "option" ? restorable.recommendation.optionId : undefined,
@@ -2596,12 +2646,12 @@ void test("watchdog pause card for a blocked resume plan neither recommends nor 
   );
   assert.ok(!restorable.options.some((o) => o.optionId === "resumeAndRerun"), "no inert resume option");
   const restore = restorable.options.find((o) => o.optionId === "restoreSummary");
+  assert.equal(restore?.resumeKind, "continue");
   assert.deepEqual(restore?.effect, {
     kind: "command",
     command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-    args: ["/tmp/task", "impl-high-review"],
+    args: ["/tmp/task", "impl-high-review", "vs-code-ai-helper.resumeAndApplyCurrentStageAction"],
   });
-  assert.ok(!/immediately/.test(restorable.gating?.detail ?? ""));
 
   const unrestorable = buildStalledTaskEscalationDecisionV1(false, target, {
     kind: "blocked",
@@ -2617,7 +2667,12 @@ void test("watchdog pause card for a blocked resume plan neither recommends nor 
   });
   assert.equal(runnable.gating?.unblocksProgress, true);
   const resumeOption = runnable.options.find((o) => o.optionId === "resumeAndRerun");
-  assert.equal(resumeOption?.label, "Resume and run the review again (Copilot)");
+  // item 22: a run-review plan's label says it does not edit code, resolved
+  // at card-build time by describeResumeOptionV1 from the plan's own kind.
+  assert.equal(
+    resumeOption?.label,
+    "Resume and run the review again (Copilot) — a review; it does not edit code"
+  );
   assert.deepEqual(resumeOption?.effect, {
     kind: "command",
     command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",

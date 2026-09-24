@@ -13,6 +13,8 @@ import {
 } from "../actions/productionTaskActionRuntimeV1";
 import { RESUME_TASK_ACTION_KEY_V1 } from "../actions/rows/resumeTaskRowV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
+import { runStageEntryPostCommitV1, type StageEntryResultV1 } from "./stageTransition";
+import { recoverStageEntryJournalIfPresentV1 } from "./stageEntryJournalV1";
 import * as path from "path";
 
 export { StaleReopenError };
@@ -82,6 +84,36 @@ export async function reopenCompletedTask(
   // (recovery/failure) can surface its specific message after activateTask
   // returns false.
   let rejection: ReopenCompletedTaskResult | undefined;
+  // Part 1 review fix (item 15): `resumeTaskRowV1`'s `executeResumeTaskV1`
+  // cannot safely run `enterStageV1`'s own post-commit work (a deferred plan-
+  // revision adoption write) while `skipTaskLock` is set — that work acquires
+  // the per-task lock itself, and `activateTask` is still holding the
+  // covering meta-root lock at that point, so running it inline would
+  // self-deadlock. It hands the work back via `postCommitSink` instead;
+  // captured here and run once `activateTask` has returned, i.e. after that
+  // meta-root lock has released.
+  // Narrowed to the `ready: true` branch: `postCommitSink` below is only ever
+  // invoked by `resumeTaskRowV1.ts` after its own `!entryResult.ready` guard
+  // has already returned, so this is never actually the refusal shape —
+  // typed that way so it satisfies `runStageEntryPostCommitV1`'s
+  // `StageEntryPostCommitPayloadV1` parameter without a runtime check here.
+  let deferredPostCommit: Extract<StageEntryResultV1, { ready: true }> | undefined;
+
+  // Review fix (2026-09-23, architectural blocker): recover any stage-entry
+  // journal a prior crashed transition left behind BEFORE `activateTask`
+  // acquires its meta-root lock, rather than only skipping recovery once
+  // already inside that lock (the previous shape — `callerHoldsCoveringLock`
+  // below still exists to prevent this exact call path from self-deadlocking
+  // if it is ever reached from inside a covering lock, but it must never be
+  // this function's ONLY defense against a stale journal). Reconciling here,
+  // lock-free, means the covering-lock path below almost never encounters an
+  // un-recovered journal at all — and on the rare occasion a fresh one begins
+  // in the moment between this call and `activateTask` acquiring its lock,
+  // `enterStageV1`'s own runtime backstop still refuses rather than silently
+  // trusting an unproven artifact. `recoverStageEntryJournalIfPresentV1`
+  // starts with a cheap lock-free existence probe, so this costs nothing on
+  // the overwhelmingly common "no journal" path.
+  await recoverStageEntryJournalIfPresentV1(vscode.Uri.file(task.taskFolderPath));
 
   const writeTarget = async (): Promise<boolean> => {
     // Plan §3.9: the coordinator's task-binding identity is the digest
@@ -115,6 +147,9 @@ export async function reopenCompletedTask(
         ...(capturedCompletedAt !== undefined ? { expectedCompletedAt: capturedCompletedAt } : {}),
       },
       skipTaskLock: true,
+      postCommitSink: (result) => {
+        deferredPostCommit = result as Extract<StageEntryResultV1, { ready: true }>;
+      },
     });
     if (outcome.kind === "completed") {
       return true;
@@ -133,6 +168,15 @@ export async function reopenCompletedTask(
           "Could not reopen the task — its progress file needs recovery. " +
           "See the task's entry in the Tasks panel.",
       };
+      return false;
+    }
+    // Review fix (2026-09-22, completion blocker): `resumeTask.noImplementationArtifact`
+    // (item 15's Reopen-to-Implementation refusal) names the real cause in
+    // `outcome.detail` — surface it instead of the bare code, so this reads
+    // as "there is no plan to reopen at Implementation", not a generic
+    // unlabeled failure.
+    if (outcome.kind === "failed" && outcome.detail) {
+      rejection = { outcome: "failed", message: `Could not reopen the task: ${outcome.detail}` };
       return false;
     }
     const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
@@ -159,6 +203,17 @@ export async function reopenCompletedTask(
             "Could not reopen the task — its progress file could not be read. Please refresh the Tasks panel and try again.",
         }
       );
+    }
+    // `activateTask` has returned, so its meta-root lock has released — safe
+    // now to run the post-commit work `executeResumeTaskV1` could not run
+    // inline. Best-effort: a failure here must not turn an already-committed,
+    // already-reported reopen into a failure the caller re-attempts.
+    if (deferredPostCommit) {
+      try {
+        await runStageEntryPostCommitV1(vscode.Uri.file(task.taskFolderPath), deferredPostCommit);
+      } catch (error) {
+        console.error("reopenCompletedTask: deferred post-commit work failed after the reopen itself committed", error);
+      }
     }
     return { outcome: "reopened" };
   } catch (error) {

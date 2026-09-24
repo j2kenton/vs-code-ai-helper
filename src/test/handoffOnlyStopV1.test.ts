@@ -256,12 +256,16 @@ void describe("hand-off card lifecycle", () => {
     io: HandoffCommandIoV1;
     reposts: (readonly string[])[];
     lastRepostArg: () => HandoffChecksArgV1 | undefined;
+    /** Every call `HandoffCommandIoV1.dispatchStageAction` received — the "try again" dispatch. */
+    captured: HandoffChecksArgV1[];
   } {
     const reposts: (readonly string[])[] = [];
+    const captured: HandoffChecksArgV1[] = [];
     let lastArg: HandoffChecksArgV1 | undefined;
     return {
       reposts,
       lastRepostArg: () => lastArg,
+      captured,
       io: {
         askNote: () => Promise.resolve(note),
         refresh: () => Promise.resolve(),
@@ -270,13 +274,17 @@ void describe("hand-off card lifecycle", () => {
           reposts.push(remaining);
           return Promise.resolve();
         },
+        dispatchStageAction: (arg): Promise<void> => {
+          captured.push(arg);
+          return Promise.resolve();
+        },
       },
     };
   }
 
-  void it("re-posts the card with the checks still outstanding after one is ticked", async () => {
+  void it("re-posts the card with the checks still outstanding after one is ticked, and dispatches nothing yet", async () => {
     await withPlan(async (folder, planPath) => {
-      const { io, reposts, lastRepostArg } = makeIo("saw it work");
+      const { io, reposts, lastRepostArg, captured } = makeIo("saw it work");
       const ok = await tickHandoffCheckV1(
         { taskFolderPath: folder, itemText: "Click through the card in a live window", stage: "impl-high-review" },
         io
@@ -285,19 +293,25 @@ void describe("hand-off card lifecycle", () => {
       assert.ok(fs.readFileSync(planPath, "utf8").includes("— Checked: saw it work."));
       assert.deepEqual(reposts, [["Run check-types, lint and the full test suite"]]);
       assert.equal(lastRepostArg()?.stage, "impl-high-review");
+      assert.deepEqual(captured, [], "the stage action must not be dispatched while a check remains outstanding");
     });
   });
 
   void it("re-posts the card, ticking nothing, when the user chooses Not yet", async () => {
     await withPlan(async (folder, planPath) => {
       const before = fs.readFileSync(planPath, "utf8");
-      const { io, reposts, lastRepostArg } = makeIo("unused");
-      const ok = await keepHandoffChecksV1({ taskFolderPath: folder, stage: "impl-high-review" }, io);
+      const helper = makeIo("unused");
+      const ok = await keepHandoffChecksV1({ taskFolderPath: folder, stage: "impl-high-review" }, helper.io);
       assert.equal(ok, true);
       assert.equal(fs.readFileSync(planPath, "utf8"), before);
-      assert.equal(reposts.length, 1);
-      assert.equal(reposts[0]!.length, 2);
-      assert.equal(lastRepostArg()?.stage, "impl-high-review");
+      assert.equal(helper.reposts.length, 1);
+      assert.equal(helper.reposts[0]!.length, 2);
+      assert.equal(helper.lastRepostArg()?.stage, "impl-high-review");
+      // Pre-1.0.0 fixes register, Part 3 Step 2 inventory: "notYet" is
+      // classified `resumeKind: "unpause"` — it re-posts the same card and
+      // dispatches no further automation work (unlike "tick-${index}"/
+      // "acceptRest" above, which dispatch once nothing remains outstanding).
+      assert.equal(helper.captured.length, 0, "'Not yet' must never dispatch the stage's next action");
     });
   });
 
@@ -313,14 +327,59 @@ void describe("hand-off card lifecycle", () => {
     });
   });
 
-  void it("does not re-post once the last check is ticked", async () => {
-    await withPlan(async (folder) => {
-      const { io, reposts } = makeIo("ok");
-      await tickHandoffCheckV1({ taskFolderPath: folder, itemText: "Click through the card in a live window" }, io);
-      await tickHandoffCheckV1({ taskFolderPath: folder, itemText: "Run check-types, lint and the full test suite" }, io);
-      assert.equal(reposts.length, 1);
-    });
-  });
+  void it(
+    "does not re-post once the last check is ticked, and dispatches the stage's next action instead " +
+      "(pre-1.0.0 fixes register, Part 3 Step 2/5: 'continue' options dispatch or schedule work once the " +
+      "adjustment they perform succeeds)",
+    async () => {
+      // Covers optionId "tick-${index}" (handoffChecksV1.ts): it settles
+      // through settleAndRepostV1, which calls
+      // HandoffCommandIoV1.dispatchStageAction once nothing remains
+      // outstanding — the "try again" dispatch pre-1.0.0 fixes register
+      // Part 3 Step 5 requires for a 'continue' option once its adjustment
+      // succeeds.
+      await withPlan(async (folder) => {
+        const helper = makeIo("ok");
+        await tickHandoffCheckV1(
+          { taskFolderPath: folder, itemText: "Click through the card in a live window", stage: "impl-high-review" },
+          helper.io
+        );
+        await tickHandoffCheckV1(
+          { taskFolderPath: folder, itemText: "Run check-types, lint and the full test suite", stage: "impl-high-review" },
+          helper.io
+        );
+        assert.equal(helper.reposts.length, 1);
+        assert.equal(helper.captured.length, 1, "the stage action must be dispatched exactly once, when nothing remains");
+        assert.equal(helper.captured[0]?.taskFolderPath, folder);
+      });
+    }
+  );
+
+  void it(
+    "acceptHandoffChecksV1 also dispatches the stage's next action once accepting the rest leaves nothing outstanding",
+    async () => {
+      // Covers optionId "acceptRest" (handoffChecksV1.ts): it too settles
+      // through settleAndRepostV1, which calls
+      // HandoffCommandIoV1.dispatchStageAction once nothing remains
+      // outstanding, reaching the same dispatch as the tick option above
+      // when the LAST outstanding checks are settled via "Accept the rest"
+      // rather than one tick at a time.
+      await withPlan(async (folder) => {
+        const helper = makeIo("unused");
+        const ok = await acceptHandoffChecksV1(
+          {
+            taskFolderPath: folder,
+            itemTexts: ["Run check-types, lint and the full test suite", "Click through the card in a live window"],
+            stage: "impl-high-review",
+          },
+          helper.io
+        );
+        assert.equal(ok, true);
+        assert.equal(helper.captured.length, 1, "acceptRest must dispatch the stage's next action once nothing remains");
+        assert.equal(helper.captured[0]?.taskFolderPath, folder);
+      });
+    }
+  );
 
   void it("reaches a check beyond the option cap by ticking through successive cards", async () => {
     const folder = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-card-many-"));

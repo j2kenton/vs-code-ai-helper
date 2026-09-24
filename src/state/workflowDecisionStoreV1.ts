@@ -3,6 +3,7 @@ import { normalizePath } from "../utils/taskRoot";
 import {
   CreateWorkflowDecisionInputV1,
   createWorkflowDecisionV1,
+  normalizeWorkflowDecisionV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
@@ -206,7 +207,13 @@ export class WorkflowDecisionStoreV1 {
   }
 
   private all(): WorkflowDecisionV1[] {
-    return this.state.get<WorkflowDecisionV1[]>(STORAGE_KEY, []);
+    // Pre-1.0.0 fixes register, item 14/22 (Part 3): every reader goes
+    // through this method, so this is the one place a persisted record
+    // missing `resumeKind` (written before the field existed) is normalized
+    // to the safe `"unpause"` default, for both this window's own records
+    // and — when `state` is the mirrored memento — the runner's mirrored
+    // ones combined into the same read.
+    return this.state.get<WorkflowDecisionV1[]>(STORAGE_KEY, []).map(normalizeWorkflowDecisionV1);
   }
 
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {

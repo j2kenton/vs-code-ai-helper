@@ -200,9 +200,11 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
       options: [
         {
           optionId: "apply",
-          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}`,
+          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"} and try again`,
+          resumeKind: "continue",
           consequence:
-            `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}:\n` +
+            `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}, then ` +
+            "dispatches this stage's next action:\n" +
             applicable
               .map((item) => `- ${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}`)
               .join("\n"),
@@ -215,6 +217,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
         {
           optionId: "skip",
           label: "Not yet",
+          resumeKind: "unpause",
           consequence: "Does nothing. The items stay unticked until you apply this or tick them yourself.",
           effect: { kind: "doNothing" },
         },
@@ -228,11 +231,11 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
       },
       gating: {
         holdsTaskPaused: false,
-        unblocksProgress: false,
+        unblocksProgress: true,
         detail:
-          "This does not resume or unblock the task by itself. It only ticks items in plan-final.md; if the " +
-          "task is currently paused, that pause comes from something else and answering this alone will not " +
-          "resume it.",
+          "Applying ticks these items in plan-final.md and then dispatches this stage's next action, so it can " +
+          "move the task forward; if the task is currently paused for a reason unrelated to these ticks, that " +
+          "pause is not this decision's to clear.",
       },
     },
     target
@@ -396,6 +399,11 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   NotificationRouter.showInformation(
     `Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`
   );
+  // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
+  // it") — same note as reconcilePlanChecklist.ts's identical dispatch.
+  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+    taskFolderPath: folderUri.fsPath,
+  });
 }
 
 export function registerApplyReviewerVerifiedTicksCommands(

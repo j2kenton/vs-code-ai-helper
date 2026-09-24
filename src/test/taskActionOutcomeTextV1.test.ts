@@ -83,6 +83,34 @@ void describe("describeTaskActionOutcomeForLogV1", () => {
     );
   });
 
+  void it(
+    "records the failing attempt's actionKey/operationId for an attemptIdentityAttachmentFailed " +
+      "failure (pre-1.0.0 fixes register, Part 4 Step 8: a wrongOwner run log must name who arrived " +
+      "second, not just the bookkeeping row id)",
+    () => {
+      const wrongOwner: TaskActionOutcomeV1 = {
+        kind: "failed",
+        correlation: CORRELATION,
+        code: "attemptIdentityAttachmentFailed",
+        retryable: false,
+        detail:
+          "wrongOwner: round ledger row r-1 belongs to another operation " +
+          "(existing operationId=owning-op, this attempt's operationId=retry-op) — this stage can " +
+          "simply be re-run: re-running its action allocates a fresh round ledger row rather than " +
+          "reusing this one.",
+      };
+      const line = describeTaskActionOutcomeForLogV1(wrongOwner);
+      assert.match(line, /\[actionKey=review\.v1, operationId=a+\]/);
+      assert.match(line, /existing operationId=owning-op/);
+      assert.match(line, /this attempt's operationId=retry-op/);
+
+      // A different failed code must not gain the bracket — it is specific to
+      // this one code, not every failed outcome that happens to carry a
+      // correlation.
+      assert.doesNotMatch(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[3]!), /\[actionKey=/);
+    }
+  );
+
   void it("appends detail when the coordinator supplied one, for OUR OWN parser/schema diagnostics only", () => {
     const withDetail: TaskActionOutcomeV1 = {
       kind: "malformedResult",

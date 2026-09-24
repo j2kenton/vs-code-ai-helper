@@ -194,6 +194,14 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   deleteStageBackup: { kind: "notWatchdogSusceptible", reason: "deterministic backup removal; no provider dispatch" },
   renameTask: { kind: "notWatchdogSusceptible", reason: "src/commands/renameTask.ts — renameTask (the non-AI variant) is a plain deterministic rename" },
   renameTaskWithAI: { kind: "admissionWired", evidence: "src/commands/renameTask.ts — renameTaskWithAI (v1 fixes 2 gap, fixed this round)" },
+  resumeAndDispatchImplementation: {
+    kind: "admissionWired",
+    evidence:
+      "src/commands/resumeTask.ts — resumeAndDispatchImplementationV1 calls resumeThenDispatchV1, which holds " +
+      "admission continuously through the whole dispatch and forwards a single-use handoff token into the " +
+      "already-admissionWired runImplementationWithAI it calls (2026-09-24 review completion blocker: newly " +
+      "contributed command had no inventory entry, failing pnpm run verify)",
+  },
 };
 
 /** Commands transitively resolve through `delegatesTo` chains to one of

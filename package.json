@@ -149,6 +149,12 @@
         "icon": "$(discard)"
       },
       {
+        "command": "vs-code-ai-helper.resumeAndDispatchImplementation",
+        "title": "Run Implementation",
+        "category": "Ensemble",
+        "icon": "$(play)"
+      },
+      {
         "command": "vs-code-ai-helper.archiveTask",
         "title": "Archive Task",
         "category": "Ensemble",
@@ -911,6 +917,11 @@
           "group": "stage@1"
         },
         {
+          "command": "vs-code-ai-helper.resumeAndDispatchImplementation",
+          "when": "view == vs-code-ai-helper.tasksView && ((viewItem =~ /^stage-impl-high-review-current/ || viewItem =~ /^stage-impl-low-review-current/) && viewItem =~ /-runImplementationOfferable/)",
+          "group": "stage@2"
+        },
+        {
           "command": "vs-code-ai-helper.viewPendingTaskDecision",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-decisionPending/",
           "group": "inline@0"
@@ -939,6 +950,11 @@
           "command": "vs-code-ai-helper.restoreRejectedImplementationRound",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem =~ /^task-active/ || viewItem =~ /^task-paused/) && viewItem =~ /-restorableRound/",
           "group": "task@5"
+        },
+        {
+          "command": "vs-code-ai-helper.resumeAndDispatchImplementation",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem =~ /^task-active/ || viewItem =~ /^task-paused/) && viewItem =~ /-runImplementationOfferable/",
+          "group": "task@6"
         },
         {
           "command": "vs-code-ai-helper.reconcilePlanChecklist",

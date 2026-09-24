@@ -48,6 +48,7 @@ import {
   discardOwedImplRecoveryV1,
   isImplRecoveryDiscardOfferableV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
+  shouldLogNoOpContinuationRoundV1,
 } from "../commands/implementationRecoveryV1";
 import { IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1 } from "../utils/implementationArtifactResolver";
 import { registerReviewActionCommands } from "../commands/reviewActions";
@@ -1109,4 +1110,48 @@ void describe("describeOwedImplRecoveryRefusalV1 / isImplRecoveryDiscardOfferabl
     const message = describeOwedImplRecoveryRefusalV1(recovery, progressUnderCap, BASE_NOW);
     assert.ok(!message.includes("Discard this owed continuation"));
   });
+});
+
+// Part 4 Step 10 (item 16) completion blocker, 2026-09-24 review: the old
+// inline condition inferred "no provider was invoked" purely from the
+// terminal operation state, which is wrong in both directions — see
+// `shouldLogNoOpContinuationRoundV1`'s doc comment. These pin the corrected
+// decision directly, without needing to dispatch a real implementation round.
+void describe("shouldLogNoOpContinuationRoundV1 (Part 4 Step 10 / item 16)", () => {
+  void it("never logs without an owed continuation, whatever the state or provider flag", () => {
+    assert.equal(shouldLogNoOpContinuationRoundV1(false, "refused", false), false);
+    assert.equal(shouldLogNoOpContinuationRoundV1(false, "cancelled", false), false);
+  });
+
+  void it("never logs a succeeded round, whether or not a provider ran", () => {
+    assert.equal(shouldLogNoOpContinuationRoundV1(true, "succeeded", false), false);
+    assert.equal(shouldLogNoOpContinuationRoundV1(true, "succeeded", true), false);
+  });
+
+  void it("logs a refused/failed/interrupted round when no provider was ever invoked", () => {
+    assert.equal(shouldLogNoOpContinuationRoundV1(true, "refused", false), true);
+    assert.equal(shouldLogNoOpContinuationRoundV1(true, "failed", false), true);
+    assert.equal(shouldLogNoOpContinuationRoundV1(true, "interrupted", false), true);
+  });
+
+  void it(
+    "logs a CANCELLED round reached before any provider call — the review's second finding: the old " +
+      "blanket state === \"cancelled\" exclusion silently dropped exactly this pre-provider no-op",
+    () => {
+      assert.equal(shouldLogNoOpContinuationRoundV1(true, "cancelled", false), true);
+    }
+  );
+
+  void it(
+    "does NOT log once a provider has been invoked, even though the round did not succeed — the review's " +
+      "first finding: a checklist-generation or main-dispatch provider call that itself failed, was " +
+      "declined, or was cancelled mid-round is not a pre-provider no-op, and already has its own failure " +
+      "reporting from that provider call",
+    () => {
+      assert.equal(shouldLogNoOpContinuationRoundV1(true, "failed", true), false);
+      assert.equal(shouldLogNoOpContinuationRoundV1(true, "refused", true), false);
+      assert.equal(shouldLogNoOpContinuationRoundV1(true, "cancelled", true), false);
+      assert.equal(shouldLogNoOpContinuationRoundV1(true, "interrupted", true), false);
+    }
+  );
 });

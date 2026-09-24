@@ -1289,8 +1289,12 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
     assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
 
     // The recommendation.reasoning block, scoped to just before the
-    // `gating:` field that follows it.
-    const after = source.slice(index, index + 3200);
+    // `gating:` field that follows it. Sized with headroom past the
+    // options/recommendation/fallback text this decision carries today
+    // (including each option's `resumeKind` line) plus the 900-char
+    // fallback-block slice below, so a later text edit to this decision
+    // does not silently truncate the fallback-block check again.
+    const after = source.slice(index, index + 4600);
     const gatingOffset = after.indexOf("gating: {");
     assert.ok(gatingOffset >= 0, "expected a gating field after the recommendation block");
     const recommendationBlock = after.slice(0, gatingOffset);

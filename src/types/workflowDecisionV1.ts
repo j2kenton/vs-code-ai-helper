@@ -36,11 +36,25 @@ export type WorkflowDecisionOptionEffectV1 =
   /** A legitimate "do nothing" choice — resolves the decision without dispatching anything. */
   | { readonly kind: "doNothing" };
 
+/**
+ * Pre-1.0.0 fixes register, items 14 and 22: whether choosing this option
+ * merely unpauses the task (dispatches nothing) or continues whatever
+ * process was interrupted (a Fast Forward run, or the current stage's own
+ * action). Required so every builder states it next to the option's label
+ * and consequence, rather than the dispatcher inferring it from task state.
+ * A persisted or mirrored record from before this field existed is defaulted
+ * to `"unpause"` by `normalizeWorkflowDecisionV1` — the safe direction, since
+ * an old record then never dispatches more than it did before.
+ */
+export type WorkflowDecisionResumeKindV1 = "unpause" | "continue";
+
 export interface WorkflowDecisionOptionV1 {
   readonly optionId: string;
   readonly label: string;
   /** What choosing this option actually does — always shown to the user. */
   readonly consequence: string;
+  /** See `WorkflowDecisionResumeKindV1`. */
+  readonly resumeKind: WorkflowDecisionResumeKindV1;
   /** True when this option discards work or is otherwise hard to reverse. */
   readonly destructive?: boolean;
   readonly effect: WorkflowDecisionOptionEffectV1;
@@ -179,6 +193,27 @@ export interface CreateWorkflowDecisionInputV1 {
     readonly answeredOptionIds: readonly string[];
   };
   readonly createdAt: string;
+}
+
+/**
+ * Compatibility normalizer, applied at the store boundary
+ * (`WorkflowDecisionStoreV1.all()`) and by the host decision mirror, so every
+ * reader of a persisted or mirrored decision sees a fully classified option
+ * set even when the record predates `resumeKind`. Pure: returns the input
+ * unchanged when every option already carries a recognised value, so a
+ * record is only rewritten in storage the next time it is legitimately
+ * saved, not by merely being read.
+ */
+export function normalizeWorkflowDecisionV1(record: WorkflowDecisionV1): WorkflowDecisionV1 {
+  let changed = false;
+  const options = record.options.map((option) => {
+    if (option.resumeKind === "unpause" || option.resumeKind === "continue") {
+      return option;
+    }
+    changed = true;
+    return { ...option, resumeKind: "unpause" as const };
+  });
+  return changed ? { ...record, options } : record;
 }
 
 /** Identity of a decision: its condition fingerprint plus the answers it currently offers. */

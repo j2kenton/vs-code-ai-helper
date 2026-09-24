@@ -56,11 +56,17 @@ function setProgress(folder: string, patch: Record<string, unknown>): void {
   fs.writeFileSync(progressPath, JSON.stringify(raw, null, 2));
 }
 
-/** The test vscode stub does not implement workspace.fs.readFile; bridge it to real fs. */
+/**
+ * The test vscode stub does not implement several workspace.fs members;
+ * bridge them to real fs. Review fix (2026-09-22, architectural blocker):
+ * `executeNextStageV1` now performs the "impl" plan-final.md promotion
+ * itself (via `enterStageV1`), rather than leaving it entirely to the
+ * caller — so a test landing directly on "impl" now exercises real
+ * `writeFile`/`delete` calls this bridge previously never needed to cover.
+ */
 function installReadFileBridge(): { restore: () => void } {
   const target = vscode.workspace.fs as unknown as Record<string, unknown>;
-  const orig = target.readFile;
-  const origStat = target.stat;
+  const orig = { ...target };
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
   target.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
@@ -70,7 +76,21 @@ function installReadFileBridge(): { restore: () => void } {
       mtime: stat.mtimeMs,
       size: stat.size,
     }));
-  return { restore: (): void => { target.readFile = orig; target.stat = origStat; } };
+  target.writeFile = async (uri: vscode.Uri, content: Uint8Array): Promise<void> => {
+    await fs.promises.mkdir(path.dirname(uri.fsPath), { recursive: true });
+    await fs.promises.writeFile(uri.fsPath, content);
+  };
+  target.delete = (uri: vscode.Uri): Promise<void> =>
+    fs.promises.rm(uri.fsPath, { force: true, recursive: true });
+  target.createDirectory = (uri: vscode.Uri): Promise<void> =>
+    fs.promises.mkdir(uri.fsPath, { recursive: true }).then(() => undefined);
+  return {
+    restore: (): void => {
+      for (const key of ["readFile", "stat", "writeFile", "delete", "createDirectory"]) {
+        target[key] = orig[key];
+      }
+    },
+  };
 }
 
 void describe("nextStage.v1 registry row", () => {
@@ -329,6 +349,10 @@ void describe("nextStage.v1 registry row", () => {
       assert.equal(strict.decoded.progress.completedStages?.includes("plan-high-review"), false);
       assert.equal(strict.decoded.progress.completedStages?.includes("plan-low-review"), false);
     }
+    // Review fix (2026-09-22, architectural blocker): landing directly on
+    // "impl" through this row now promotes plan.md -> plan-final.md itself
+    // (via enterStageV1), atomically with the same CAS write.
+    assert.equal(fs.readFileSync(path.join(fixture.folder, "plan-final.md"), "utf8"), "# Plan");
   });
 
   void it("rejects a backward/equal targetStage with invalidTargetStage and never mutates", async () => {
