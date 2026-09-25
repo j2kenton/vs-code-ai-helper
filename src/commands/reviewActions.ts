@@ -6015,7 +6015,7 @@ export async function runReviewForFolder(
       taskStatus: "active",
       taskStage: currentStage,
       rawInput: validatedInput,
-      cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
+      cancellationToken: options.operation?.token || new vscode.CancellationTokenSource().token,
       // 2026-08-28 review, blocker "coordinator allocation sites still do not
       // synchronously attach durable round identities before pre-prompt
       // failures can return": an attempt that fails BEFORE reaching
@@ -7100,7 +7100,7 @@ export async function applyReviewWithAI(
       taskStatus: "active",
       taskStage: stage,
       rawInput: validatedInput,
-      cancellationToken: op.token ?? new vscode.CancellationTokenSource().token,
+      cancellationToken: op.token!,
     });
 
     if (outcome.kind === "completed") {
@@ -7111,7 +7111,7 @@ export async function applyReviewWithAI(
       // Re-review after applying (no confirmation, no stage change)
       await runTrackedOperation(
         lockKey,
-        { parent: op, label: stepNameV1("re-review"), stage, kind: "review" },
+        { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
         // See the impl-review branch above: anchor the deferred auto-advance
         // dispatch to the exclusive root (`op`), not this re-review's own
         // child handle, or the follow-up command fires while the root
@@ -9885,7 +9885,6 @@ export async function generateImplementationWithAI(
       }
 
       reportStageRunningV1(op, stageToken);
-      const cancellationToken = op?.token ?? new vscode.CancellationTokenSource().token;
       const { outcome, orchestrator } = await invokeGenerateImplementationActionV1({
         folderUri: resolved.folderUri,
         workspaceUri: workspaceRoot.uri,
@@ -9893,7 +9892,7 @@ export async function generateImplementationWithAI(
         prompt,
         targetUri: implementationUri,
         modelId: model.modelId,
-        cancellationToken,
+        cancellationToken: op.token!,
       });
 
       const handleRes = await handleGenerateImplementationOutcomeV1(outcome, {
@@ -13870,7 +13869,7 @@ export async function applyReviewEditWithAI(
     if (implementSucceeded) {
       await runTrackedOperation(
         lockKey,
-        { parent: op, label: stepNameV1("re-review"), stage, kind: "review" },
+        { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
         () =>
           runReviewForFolder(
             extensionUri,

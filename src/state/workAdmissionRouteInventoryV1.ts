@@ -193,6 +193,7 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   redoStageChanges: { kind: "notWatchdogSusceptible", reason: "deterministic backup restore; no provider dispatch" },
   deleteStageBackup: { kind: "notWatchdogSusceptible", reason: "deterministic backup removal; no provider dispatch" },
   renameTask: { kind: "notWatchdogSusceptible", reason: "src/commands/renameTask.ts — renameTask (the non-AI variant) is a plain deterministic rename" },
+  releaseStuckAdmissionMarkers: { kind: "notWatchdogSusceptible", reason: "src/commands/releaseStuckAdmissionMarkers.ts — scans and deletes stale admission markers on user confirmation; no provider dispatch" },
   renameTaskWithAI: { kind: "admissionWired", evidence: "src/commands/renameTask.ts — renameTaskWithAI (v1 fixes 2 gap, fixed this round)" },
   resumeAndDispatchImplementation: {
     kind: "admissionWired",

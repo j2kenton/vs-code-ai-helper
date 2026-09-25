@@ -324,6 +324,9 @@ export async function postWorkflowDecisionV1(
  * to close the gap. The activation-time sweep remains the backstop for
  * whatever the retry schedule doesn't catch before the process ends.
  */
+/** Timeout for awaiting a workflow decision before auto-dismissing (10 minutes). */
+const WORKFLOW_DECISION_AWAIT_TIMEOUT_MS = 10 * 60 * 1000;
+
 export async function awaitWorkflowDecisionAnswerV1(
   input: PostWorkflowDecisionInputV1,
   target: ChatTarget,
@@ -352,6 +355,7 @@ export async function awaitWorkflowDecisionAnswerV1(
     const cancelSubscription = token?.onCancellationRequested(() => {
       void handleCancellation();
     });
+    const timeoutHandle = setTimeout(() => void handleTimeout(), WORKFLOW_DECISION_AWAIT_TIMEOUT_MS);
 
     async function handleCancellation(): Promise<void> {
       try {
@@ -376,6 +380,19 @@ export async function awaitWorkflowDecisionAnswerV1(
       }
     }
 
+    async function handleTimeout(): Promise<void> {
+      console.warn(`Workflow decision "${decisionId}" (${input.decisionKey}) timed out after ${WORKFLOW_DECISION_AWAIT_TIMEOUT_MS}ms waiting for user answer`);
+      try {
+        await store.dismiss(decisionId);
+      } catch (err) {
+        console.error(`Failed to dismiss timed-out workflow decision "${decisionId}"`, err);
+        markWorkflowDecisionOrphanedV1(decisionId);
+        void retryOrphanDismissV1(store, decisionId);
+      } finally {
+        finish(undefined);
+      }
+    }
+
     function checkForResolution(): void {
       const current = store.get(decisionId);
       if (current && current.state !== "pending") {
@@ -388,6 +405,7 @@ export async function awaitWorkflowDecisionAnswerV1(
         return;
       }
       settled = true;
+      clearTimeout(timeoutHandle);
       changeSubscription.dispose();
       cancelSubscription?.dispose();
       resolve(value);

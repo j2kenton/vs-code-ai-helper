@@ -279,6 +279,12 @@
         "icon": "images/cancel-red.svg"
       },
       {
+        "command": "vs-code-ai-helper.releaseStuckAdmissionMarkers",
+        "title": "Release Stuck Admission Markers",
+        "category": "Ensemble",
+        "icon": "$(unlock)"
+      },
+      {
         "command": "vs-code-ai-helper.runNotificationAction",
         "title": "Run Notification Action",
         "category": "Ensemble",
