@@ -1584,7 +1584,7 @@
     "publish:patch": "vsce publish patch",
     "publish:minor": "vsce publish minor",
     "publish:major": "vsce publish major",
-    "install:local": "powershell -ExecutionPolicy Bypass -File scripts/install-local.ps1",
+    "install:local": "node scripts/install-local.mjs",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
     "ensemble:release": "npm run release"
   },

@@ -5062,6 +5062,8 @@ export async function runReviewForFolder(
      * defect).
      */
     operation?: TaskOperationHandle;
+    /** Optional child-operation token used by chained re-reviews while `operation` stays anchored to the exclusive root. */
+    operationCancellationToken?: vscode.CancellationToken;
     /** Routes `review.v1` structured questions into Chat With AI. */
     chatViewProvider?: ChatViewProvider;
     /**
@@ -6015,7 +6017,7 @@ export async function runReviewForFolder(
       taskStatus: "active",
       taskStage: currentStage,
       rawInput: validatedInput,
-      cancellationToken: options.operation?.token || new vscode.CancellationTokenSource().token,
+      cancellationToken: options.operationCancellationToken ?? options.operation?.token ?? new vscode.CancellationTokenSource().token,
       // 2026-08-28 review, blocker "coordinator allocation sites still do not
       // synchronously attach durable round identities before pre-prompt
       // failures can return": an attempt that fails BEFORE reaching
@@ -7117,7 +7119,7 @@ export async function applyReviewWithAI(
         // child handle, or the follow-up command fires while the root
         // (e.g. Fast Forward's loop) is still holding the lock and is
         // silently refused as busy.
-        () =>
+        (reReviewOp) =>
           runReviewForFolder(
             extensionUri,
             resolved.folderUri,
@@ -7127,6 +7129,7 @@ export async function applyReviewWithAI(
             {
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
+              operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
               // Chained continuation of the apply-review edit just above, not
               // a fresh human click. See runReviewForFolder's own doc comment
@@ -13870,7 +13873,7 @@ export async function applyReviewEditWithAI(
       await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
-        () =>
+        (reReviewOp) =>
           runReviewForFolder(
             extensionUri,
             resolved.folderUri,
@@ -13880,6 +13883,7 @@ export async function applyReviewEditWithAI(
             {
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
+              operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
               // This re-review is a chained continuation of the implementation
               // round just above, not a fresh human click — nobody is

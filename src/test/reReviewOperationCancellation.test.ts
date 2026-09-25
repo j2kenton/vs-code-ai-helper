@@ -8,6 +8,10 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { TaskOperationRegistry } from "../utils/taskOperations";
 
+function assertPresentV1<T>(value: T | null | undefined, message: string): asserts value is T {
+  assert.ok(value !== null && value !== undefined, message);
+}
+
 void describe("re-review operations cancellation propagation", () => {
   void it("creates cancellable child re-review operations under a parent root review", () => {
     const registry = new TaskOperationRegistry();
@@ -19,23 +23,23 @@ void describe("re-review operations cancellation propagation", () => {
       kind: "review",
       cancellable: true,
     });
+    assertPresentV1(rootOp, "root review operation should be created");
 
-    assert.ok(rootOp, "root review operation should be created");
-    assert.ok(rootOp!.token, "root review operation should have a live cancellation token");
+    assert.ok(rootOp.token, "root review operation should have a live cancellation token");
 
     // Create child re-review operation with cancellable: true (after fix)
     const reReviewOp = registry.begin(taskPath, {
-      parent: rootOp!,
+      parent: rootOp,
       label: "Re-review",
       kind: "review",
       cancellable: true, // This is the fix
     });
+    assertPresentV1(reReviewOp, "child re-review operation should be created");
 
-    assert.ok(reReviewOp, "child re-review operation should be created");
-    assert.ok(reReviewOp!.token, "child re-review operation should have a live cancellation token");
+    assert.ok(reReviewOp.token, "child re-review operation should have a live cancellation token");
     assert.notEqual(
-      rootOp!.token,
-      reReviewOp!.token,
+      rootOp.token,
+      reReviewOp.token,
       "child should have its own distinct token (not the same object)"
     );
   });
@@ -49,22 +53,24 @@ void describe("re-review operations cancellation propagation", () => {
       kind: "review",
       cancellable: true,
     });
+    assertPresentV1(rootOp, "root operation should be created");
 
     const childOp = registry.begin(taskPath, {
-      parent: rootOp!,
+      parent: rootOp,
       label: "Child",
       kind: "review",
       cancellable: true,
     });
-
-    assert.ok(rootOp && childOp, "both operations should be created");
+    assertPresentV1(childOp, "child operation should be created");
+    assertPresentV1(childOp.token, "child operation should have a cancellation token");
+    const childToken = childOp.token;
 
     const childTokenCancelled = new Promise<void>((resolve) => {
-      childOp!.token!.onCancellationRequested(() => resolve());
+      childToken.onCancellationRequested(() => resolve());
     });
 
     // Cancel the root operation
-    const cancelResult = registry.cancelOperation(rootOp!.id);
+    const cancelResult = registry.cancelOperation(rootOp.id);
     assert.ok(cancelResult, "cancel should succeed on the parent");
 
     // Child token should fire (cancellation cascades)
@@ -86,21 +92,22 @@ void describe("re-review operations cancellation propagation", () => {
       kind: "review",
       cancellable: true,
     });
+    assertPresentV1(op, "operation should be created");
+    assertPresentV1(op.token, "operation should have a token");
+    const token = op.token;
 
-    assert.ok(op, "operation should be created");
-    assert.ok(op!.token, "operation should have a token");
     assert.equal(
-      op!.token!.isCancellationRequested,
+      token.isCancellationRequested,
       false,
       "token should not be pre-cancelled"
     );
 
     // The token should be cancellable via registry.cancelOperation
     const cancelled = new Promise<void>((resolve) => {
-      op!.token!.onCancellationRequested(() => resolve());
+      token.onCancellationRequested(() => resolve());
     });
 
-    registry.cancelOperation(op!.id);
+    registry.cancelOperation(op.id);
 
     return Promise.race([
       cancelled,
@@ -120,20 +127,21 @@ void describe("re-review operations cancellation propagation", () => {
       kind: "review",
       cancellable: true,
     });
+    assertPresentV1(rootOp, "root operation should be created");
 
     // Child without cancellable flag (old pattern) should still be created
     // but this is now the LEGACY case after the fix.
     const childOp = registry.begin(taskPath, {
-      parent: rootOp!,
+      parent: rootOp,
       label: "Child",
       kind: "review",
       // No cancellable: true — old pattern
     });
+    assertPresentV1(childOp, "legacy child operation should be created");
 
     // Child without explicit cancellable will have undefined token
     // The fix makes sure all re-review ops have cancellable: true instead
     // So this test documents the old (now-fixed) pattern.
-    assert.ok(childOp, "legacy child operation should still be created");
-    assert.equal(childOp!.token, undefined, "legacy child without cancellable: true has no token");
+    assert.equal(childOp.token, undefined, "legacy child without cancellable: true has no token");
   });
 });
