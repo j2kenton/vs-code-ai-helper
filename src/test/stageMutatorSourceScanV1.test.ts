@@ -18,16 +18,19 @@ import * as path from "node:path";
  * `operationCoverage.test.ts`'s identical rationale (it runs from
  * `out/test/`, so the repo root is two levels up).
  *
- * Line-exact, not file-level: a prior revision of this scan allowlisted
+ * Site-exact, not file-level: a prior revision of this scan allowlisted
  * whole FILES, which meant a brand-new bare `currentStage:` write or a new
  * standalone transform call landing anywhere in an already-allowlisted file
  * (for example a second, unreviewed write added to `reviewActions.ts`) was
- * invisible to it. Every entry below instead names the one line it covers,
- * the same drift-prone-but-explicit convention `scripts/toastAllowlistV1.json`
- * already uses for toast call sites: a legitimate refactor that shifts an
- * allowlisted line is expected to surface as a mismatch here on the next
- * run — update the line number, do not delete or broaden the entry, unless
- * the write/call itself was removed. A match at any OTHER line — allowlisted
+ * invisible to it. Every entry below instead names a stable SNIPPET of the
+ * write/call's own source text (1.0 plan item 14 — not a line number, unlike
+ * a prior revision of this file and unlike `scripts/toastAllowlistV1.json`,
+ * which has since been migrated to the same convention): an unrelated edit
+ * elsewhere in the file never requires touching any entry below it, and a
+ * legitimate refactor that changes the write/call's own text is expected to
+ * surface as a mismatch here on the next run — update the entry's snippet,
+ * do not delete or broaden the entry, unless the write/call itself was
+ * removed. A write/call whose text is not claimed by any entry — allowlisted
  * file or not — is a violation. The runtime backstop in `advanceStageLocked`
  * (a transition landing on "impl" with no entry work and no existing
  * artifact is refused) and the human-hand-off checks recorded in
@@ -276,6 +279,47 @@ function hasRawCurrentStageWrite(content: string): boolean {
   return findRawCurrentStageWriteLines(content).length > 0;
 }
 
+/** See {@link AllowlistEntry.snippet}'s doc comment. */
+const SNIPPET_MAX_CHARS = 150;
+
+/** Every raw `currentStage:` write SITE (line plus a stable snippet — see
+ * {@link findRawCurrentStageWriteLines}, which this mirrors for allowlist
+ * matching instead of the self-test above). */
+function findRawCurrentStageWriteSites(content: string): Array<{ line: number; snippet: string }> {
+  const stripped = stripCommentsPreservingLines(content);
+  const lineStartOffsets = buildLineStartOffsets(stripped);
+  const byLine = new Map<number, string>();
+  for (const pattern of RAW_WRITE_PATTERNS) {
+    for (const match of stripped.matchAll(pattern)) {
+      const token = match[1]!;
+      if (isNonValueToken(token)) {
+        continue;
+      }
+      const line = lineForOffset(lineStartOffsets, match.index);
+      if (byLine.has(line)) {
+        continue;
+      }
+      const snippet = content.slice(match.index, match.index + SNIPPET_MAX_CHARS).replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX_CHARS);
+      byLine.set(line, snippet);
+    }
+  }
+  return Array.from(byLine, ([line, snippet]) => ({ line, snippet })).sort((a, b) => a.line - b.line);
+}
+
+/** Every stage-transform call SITE (line plus a stable snippet — mirrors
+ * {@link findStageTransformCallLines} for allowlist matching). */
+function findStageTransformCallSites(content: string): Array<{ line: number; snippet: string }> {
+  const stripped = stripCommentsPreservingLines(content);
+  const lineStartOffsets = buildLineStartOffsets(stripped);
+  const sites: Array<{ line: number; snippet: string }> = [];
+  for (const match of stripped.matchAll(STAGE_TRANSFORM_CALL_GLOBAL)) {
+    const line = lineForOffset(lineStartOffsets, match.index);
+    const snippet = content.slice(match.index, match.index + SNIPPET_MAX_CHARS).replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX_CHARS);
+    sites.push({ line, snippet });
+  }
+  return sites;
+}
+
 /** Calls to the four functions that may assign `currentStage` (non-global, for the self-test's `.test()` use). */
 const STAGE_TRANSFORM_CALL =
   /\b(updateTaskProgressStage|applyNextStagePolicyV1|applyReopenPolicyV1|applyPlanRevisionPolicyV1)\s*\(/;
@@ -296,7 +340,15 @@ function findStageTransformCallLines(content: string): number[] {
 }
 
 interface AllowlistEntry {
-  readonly line: number;
+  /**
+   * A normalized (whitespace-collapsed) prefix of the source text AT the
+   * match (the `currentStage`/transform-call token through up to
+   * SNIPPET_MAX_CHARS further characters) — NOT a line number (1.0 plan item
+   * 14): an unrelated edit elsewhere in the file no longer requires updating
+   * every entry below it. An entry only goes stale when the matched text
+   * itself changes or is removed.
+   */
+  readonly snippet: string;
   readonly reason: string;
 }
 
@@ -308,41 +360,56 @@ interface AllowlistEntry {
 const RAW_WRITE_ALLOWLIST: ReadonlyMap<string, readonly AllowlistEntry[]> = new Map([
   [
     "utils/taskProgressTransforms.ts",
-    [{ line: 117, reason: "updateTaskProgressStage's own write — the default enterStageV1 transform" }],
+    [{
+      snippet: "currentStage: newStage, nextActor, ...(completedStages !== undefined ? { completedStages } : {}), fallbackActive: Object.keys(fallbackActi",
+      reason: "updateTaskProgressStage's own write — the default enterStageV1 transform",
+    }],
   ],
   [
     "services/taskProgressFieldPolicyV1.ts",
     [
-      { line: 525, reason: "applyNextStagePolicyV1's target-stage write" },
       {
-        line: 619,
+        snippet: "currentStage: nextStage, createdAt: progress.createdAt, updatedAt: input.now, progressVersion: progress.progressVersion, displayName:",
+        reason: "applyNextStagePolicyV1's target-stage write",
+      },
+      {
+        snippet: "currentStage: progress.currentStage, createdAt: progress.createdAt, updatedAt: input.now, progressVersion: progress.progressVersion, d",
         reason:
           "applyMarkTaskDonePolicyV1 — stage-preserving, carries currentStage forward unchanged " +
           "(registered as stage-preserving, not stage-mutating)",
       },
-      { line: 741, reason: "applyReopenPolicyV1's target-stage write" },
-      { line: 863, reason: "applyPlanRevisionPolicyV1's target-stage write (back to 'plan')" },
+      {
+        snippet: "currentStage: input.selectedStage, createdAt: progress.createdAt, updatedAt: input.now, progressVersion: progress.progressVersion, dis",
+        reason: "applyReopenPolicyV1's target-stage write",
+      },
+      {
+        snippet: "currentStage: \"plan\", createdAt: progress.createdAt, updatedAt: input.now, progressVersion: progress.progressVersion, displayName: pro",
+        reason: "applyPlanRevisionPolicyV1's target-stage write (back to 'plan')",
+      },
     ],
   ],
   [
     "services/taskProgressWriterV1.ts",
-    [{ line: 328, reason: "createTaskProgressV1 — task birth, the one legitimate raw seed" }],
+    [{
+      snippet: "currentStage: stage, status: \"creating\", createdAt: now, updatedAt: now, }; }",
+      reason: "createTaskProgressV1 — task birth, the one legitimate raw seed",
+    }],
   ],
   [
     "services/taskProgressDecoderV1.ts",
     [
       {
-        line: 2115,
+        snippet: ".currentStage = \"publish\"; break; } const stage = resolveStage(value, family); if (stage === undefined) {",
         reason:
           "the strict decoder's in-memory draft reconstruction while deserializing a persisted " +
           "workspace-legacy-v0 'completed' stage into 'publish' — a read-path decode of bytes " +
           "already on disk, never a live stage transition",
       },
       {
-        line: 2125,
+        snippet: ".currentStage = stage; break; } case \"status\": { if (typeof value !== \"string\") { return recovery(\"invalidFieldV",
         reason:
           "the strict decoder's in-memory draft reconstruction assigning the resolved stage while " +
-          "deserializing persisted progress — same read-path decode as line 2115, not a transition",
+          "deserializing persisted progress — same read-path decode as the entry above, not a transition",
       },
     ],
   ],
@@ -350,7 +417,7 @@ const RAW_WRITE_ALLOWLIST: ReadonlyMap<string, readonly AllowlistEntry[]> = new 
     "commands/commitAndPushTask.ts",
     [
       {
-        line: 3354,
+        snippet: "currentStage: \"publish\", // Since it was just advanced }, canonicalId: resolvedTask.canonicalId, }; await invokeCommitPush",
         reason:
           "an in-memory IncompleteTask display/dispatch-argument literal ('Since it was just " +
           "advanced') — not a task-progress.json write; the real advance already happened",
@@ -361,13 +428,13 @@ const RAW_WRITE_ALLOWLIST: ReadonlyMap<string, readonly AllowlistEntry[]> = new 
     "commands/reviewActions.ts",
     [
       {
-        line: 1232,
+        snippet: "currentStage: \"desc\" as TaskStage, status: \"active\", createdAt: \"\", updatedAt: \"\", }, }, }; } retu",
         reason:
           "normalizeReviewArg's minimal IncompleteTask reconstruction — progress is always " +
           "re-read from disk by resolveTask, never trusted from this literal",
       },
       {
-        line: 9490,
+        snippet: "currentStage: next }, }, }, taskKey: resolved.folderUri.fsPath, chainId: \"auto-review\", stillEnabled: () => completeAn",
         reason:
           "the auto-review dispatch after Complete & Move On — an automation-chain dispatch " +
           "arg's routing hint that resolveTask never trusts for anything but that hint",
@@ -386,35 +453,68 @@ const RAW_WRITE_ALLOWLIST: ReadonlyMap<string, readonly AllowlistEntry[]> = new 
 const TRANSFORM_CALL_ALLOWLIST: ReadonlyMap<string, readonly AllowlistEntry[]> = new Map([
   [
     "utils/stageTransition.ts",
-    [{ line: 386, reason: "advanceStageLocked's own default-transform call inside enterStageV1's machinery" }],
+    [{
+      snippet: "updateTaskProgressStage( current, newStage, // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker): // \"no",
+      reason: "advanceStageLocked's own default-transform call inside enterStageV1's machinery",
+    }],
   ],
-  ["utils/taskProgressTransforms.ts", [{ line: 43, reason: "updateTaskProgressStage's own definition" }]],
+  [
+    "utils/taskProgressTransforms.ts",
+    [{
+      snippet: "updateTaskProgressStage( progress: TaskProgress, newStage: TaskStage, /** * v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): `nextActor`",
+      reason: "updateTaskProgressStage's own definition",
+    }],
+  ],
   [
     "services/taskProgressFieldPolicyV1.ts",
     [
-      { line: 469, reason: "applyNextStagePolicyV1's own definition" },
-      { line: 685, reason: "applyReopenPolicyV1's own definition" },
-      { line: 814, reason: "applyPlanRevisionPolicyV1's own definition" },
+      {
+        snippet: "applyNextStagePolicyV1( progress: PersistedTaskProgressV1, input: NextStagePolicyInputV1 ): TaskProgressPolicyResultV1 { if (!isCoordinatorTimes",
+        reason: "applyNextStagePolicyV1's own definition",
+      },
+      {
+        snippet: "applyReopenPolicyV1( progress: PersistedTaskProgressV1, input: ReopenPolicyInputV1 ): TaskProgressPolicyResultV1 { if (!isCoordinatorTimestamp(i",
+        reason: "applyReopenPolicyV1's own definition",
+      },
+      {
+        snippet: "applyPlanRevisionPolicyV1( progress: PersistedTaskProgressV1, input: PlanRevisionPolicyInputV1 ): TaskProgressPolicyResultV1 { if (!isCoordinato",
+        reason: "applyPlanRevisionPolicyV1's own definition",
+      },
     ],
   ],
   [
     "actions/rows/nextStageRowV1.ts",
     [
-      { line: 233, reason: "builds applyNextStagePolicyV1 as enterStageV1's transform (baseResult pass)" },
-      { line: 241, reason: "builds applyNextStagePolicyV1 as enterStageV1's transform (finalResult pass)" },
+      {
+        snippet: "applyNextStagePolicyV1(current, { now, targetStage: input.targetStage, completionArtifactsPresent: true, });",
+        reason: "builds applyNextStagePolicyV1 as enterStageV1's transform (baseResult pass)",
+      },
+      {
+        snippet: "applyNextStagePolicyV1(current, { now, targetStage: input.targetStage, completionArtifactsPresent: missingArtifacts.leng",
+        reason: "builds applyNextStagePolicyV1 as enterStageV1's transform (finalResult pass)",
+      },
     ],
   ],
   [
     "actions/rows/resumeTaskRowV1.ts",
-    [{ line: 191, reason: "builds applyReopenPolicyV1 as enterStageV1's transform for kind reopen" }],
+    [{
+      snippet: "applyReopenPolicyV1(current, { now: new Date().toISOString(), selectedStage: input.selectedStage, }); if (!result.",
+      reason: "builds applyReopenPolicyV1 as enterStageV1's transform for kind reopen",
+    }],
   ],
   [
     "commands/planRevisionV1.ts",
-    [{ line: 238, reason: "builds applyPlanRevisionPolicyV1 as enterStageV1's transform for kind plan-revision" }],
+    [{
+      snippet: "applyPlanRevisionPolicyV1(current, { now: new Date().toISOString(), proposalAt, reason: \"A round's edit to p",
+      reason: "builds applyPlanRevisionPolicyV1 as enterStageV1's transform for kind plan-revision",
+    }],
   ],
   [
     "commands/generatePlanWithAI.ts",
-    [{ line: 670, reason: "builds updateTaskProgressStage as enterStageV1's transform for kind generate-plan" }],
+    [{
+      snippet: "updateTaskProgressStage( current, destinationStage, ctx.effectiveReviewMode !== \"off\" ? \"automation\" :",
+      reason: "builds updateTaskProgressStage as enterStageV1's transform for kind generate-plan",
+    }],
   ],
 ]);
 
@@ -497,14 +597,16 @@ function collectSourceFiles(dir: string, fileList: string[] = []): string[] {
 }
 
 /**
- * Compares the actual (file, line) hits a finder produces against an
- * exact-line allowlist, in both directions: a hit at an unlisted line is a
- * violation ("new/moved write"), and a listed line with no matching hit is
- * also a violation ("stale entry — the allowlist itself has drifted and must
- * be updated, per this file's header comment").
+ * Compares the actual (file, site) hits a finder produces against a
+ * snippet-keyed allowlist (1.0 plan item 14 — NOT by line number), in both
+ * directions: a hit whose snippet is not claimed by any entry is a violation
+ * ("new/changed write/call"), and an entry that claims no hit is also a
+ * violation ("stale entry — the write/call itself changed or was removed").
+ * Matching is by SET membership (each entry claims at most one site), not a
+ * 1:1 site-to-entry pairing — see {@link AllowlistEntry}'s doc comment.
  */
-function diffAgainstLineAllowlist(
-  finder: (content: string) => number[],
+function diffAgainstAllowlist(
+  finder: (content: string) => Array<{ line: number; snippet: string }>,
   allowlist: ReadonlyMap<string, readonly AllowlistEntry[]>
 ): { newOrMoved: string[]; stale: string[] } {
   const newOrMoved: string[] = [];
@@ -514,20 +616,23 @@ function diffAgainstLineAllowlist(
     // Forward slashes always, so the map keys above are platform-independent.
     const srcRelativeKey = path.relative(SRC_DIR, file).split(path.sep).join("/");
     const content = fs.readFileSync(file, "utf8");
-    const actualLines = new Set(finder(content));
+    const sites = finder(content);
     const allowed = allowlist.get(srcRelativeKey) ?? [];
     if (allowlist.has(srcRelativeKey)) {
       seenAllowlistKeys.add(srcRelativeKey);
     }
-    const allowedLines = new Set(allowed.map((entry) => entry.line));
-    for (const line of actualLines) {
-      if (!allowedLines.has(line)) {
-        newOrMoved.push(`${path.relative(REPO_ROOT, file)}:${line}`);
+    const claimedEntries = new Set<AllowlistEntry>();
+    for (const site of sites) {
+      const match = allowed.find((entry) => !claimedEntries.has(entry) && site.snippet.includes(entry.snippet));
+      if (match) {
+        claimedEntries.add(match);
+      } else {
+        newOrMoved.push(`${path.relative(REPO_ROOT, file)}:${site.line} :: ${site.snippet}`);
       }
     }
     for (const entry of allowed) {
-      if (!actualLines.has(entry.line)) {
-        stale.push(`${path.relative(REPO_ROOT, file)}:${entry.line} ("${entry.reason}")`);
+      if (!claimedEntries.has(entry)) {
+        stale.push(`${srcRelativeKey} ("${entry.reason}") snippet: ${entry.snippet}`);
       }
     }
   }
@@ -655,13 +760,13 @@ void describe("stage-mutator source scan (Part 1, item 15 — the one-door proof
     assert.deepStrictEqual(findRawCurrentStageWriteLines(quotedWriteAfterUrlInString), [1]);
   });
 
-  void it("every raw currentStage: write sits at an allowlisted exact line", () => {
-    const { newOrMoved, stale } = diffAgainstLineAllowlist(findRawCurrentStageWriteLines, RAW_WRITE_ALLOWLIST);
+  void it("every raw currentStage: write sits at an allowlisted call site", () => {
+    const { newOrMoved, stale } = diffAgainstAllowlist(findRawCurrentStageWriteSites, RAW_WRITE_ALLOWLIST);
 
     assert.deepStrictEqual(
       newOrMoved,
       [],
-      "These currentStage writes are not on the exact-line allowlist (new, moved, or an " +
+      "These currentStage writes are not on the allowlist (new, changed, or an " +
         "unreviewed second write in an already-allowlisted file) — route through enterStageV1 " +
         "or add a reviewed entry: " +
         newOrMoved.join(", ")
@@ -669,11 +774,38 @@ void describe("stage-mutator source scan (Part 1, item 15 — the one-door proof
     assert.deepStrictEqual(
       stale,
       [],
-      "These RAW_WRITE_ALLOWLIST entries no longer match anything at their recorded line — the " +
-        "write moved or was removed; update the line number (do not delete the entry unless the " +
-        "write itself is gone): " +
+      "These RAW_WRITE_ALLOWLIST entries no longer match any write — the write's own text " +
+        "changed or it was removed; update the entry's snippet (do not delete the entry unless " +
+        "the write itself is gone): " +
         stale.join(", ")
     );
+  });
+
+  void it("stable-key robustness: inserting unrelated lines elsewhere in a file does not break the write/call allowlist scans (1.0 plan item 14)", () => {
+    const original =
+      'import { unrelated } from "./x";\n\nfunction build() {\n  return { currentStage: next };\n}\n';
+    const withInsertedLines =
+      'import { unrelated } from "./x";\n' +
+      "// a completely unrelated comment inserted above the write\n".repeat(20) +
+      '\nfunction build() {\n  return { currentStage: next };\n}\n';
+
+    const originalWriteSites = findRawCurrentStageWriteSites(original);
+    const shiftedWriteSites = findRawCurrentStageWriteSites(withInsertedLines);
+    assert.equal(originalWriteSites.length, 1);
+    assert.equal(shiftedWriteSites.length, 1);
+    assert.notEqual(originalWriteSites[0]!.line, shiftedWriteSites[0]!.line);
+    assert.equal(originalWriteSites[0]!.snippet, shiftedWriteSites[0]!.snippet);
+
+    const originalCall = "const a = applyReopenPolicyV1(current, opts);\n";
+    const shiftedCall =
+      "// a completely unrelated comment inserted above the call\n".repeat(20) +
+      "const a = applyReopenPolicyV1(current, opts);\n";
+    const originalCallSites = findStageTransformCallSites(originalCall);
+    const shiftedCallSites = findStageTransformCallSites(shiftedCall);
+    assert.equal(originalCallSites.length, 1);
+    assert.equal(shiftedCallSites.length, 1);
+    assert.notEqual(originalCallSites[0]!.line, shiftedCallSites[0]!.line);
+    assert.equal(originalCallSites[0]!.snippet, shiftedCallSites[0]!.snippet);
   });
 
   void it(
@@ -722,13 +854,13 @@ void describe("stage-mutator source scan (Part 1, item 15 — the one-door proof
     }
   );
 
-  void it("every call to a stage-mutating transform sits at an allowlisted exact line", () => {
-    const { newOrMoved, stale } = diffAgainstLineAllowlist(findStageTransformCallLines, TRANSFORM_CALL_ALLOWLIST);
+  void it("every call to a stage-mutating transform sits at an allowlisted call site", () => {
+    const { newOrMoved, stale } = diffAgainstAllowlist(findStageTransformCallSites, TRANSFORM_CALL_ALLOWLIST);
 
     assert.deepStrictEqual(
       newOrMoved,
       [],
-      "These stage-transform calls are not on the exact-line allowlist (new, moved, or an " +
+      "These stage-transform calls are not on the allowlist (new, changed, or an " +
         "unreviewed second call in an already-allowlisted file) — route through enterStageV1's " +
         "own transform-closure pattern or add a reviewed entry: " +
         newOrMoved.join(", ")
@@ -736,8 +868,8 @@ void describe("stage-mutator source scan (Part 1, item 15 — the one-door proof
     assert.deepStrictEqual(
       stale,
       [],
-      "These TRANSFORM_CALL_ALLOWLIST entries no longer match anything at their recorded line — " +
-        "the call moved or was removed; update the line number (do not delete the entry unless " +
+      "These TRANSFORM_CALL_ALLOWLIST entries no longer match any call — the call's own text " +
+        "changed or it was removed; update the entry's snippet (do not delete the entry unless " +
         "the call itself is gone): " +
         stale.join(", ")
     );

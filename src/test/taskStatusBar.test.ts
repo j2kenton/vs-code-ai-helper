@@ -56,14 +56,20 @@ function installReadFileStub(files: Map<string, string>): () => void {
 
 function makeTask(folderPath: string, currentStage: TaskStage): IncompleteTask {
   const folderUri = vscode.Uri.file(folderPath);
+  // Derived from `folderPath` (this fixture's own POSIX literal), never from
+  // `folderUri.fsPath` (a native path — `\`-separated on Windows, where
+  // splitting it on "/" finds no separator and returns the whole string).
+  // 1.0 plan item 15: a POSIX path literal must never be compared against, or
+  // derived from, an `fsPath`-derived value.
+  const leafName = folderPath.split("/").pop() ?? folderPath;
   return {
     folderUri,
-    folderName: folderPath.split("/").pop() ?? folderPath,
+    folderName: leafName,
     canonicalId: folderUri.fsPath,
     progress: {
       currentStage,
       status: "active",
-      taskFolder: folderUri.fsPath.split("/").pop() ?? folderPath,
+      taskFolder: leafName,
       createdAt: "2026-09-06T00:00:00.000Z",
       updatedAt: "2026-09-06T00:00:00.000Z",
     },

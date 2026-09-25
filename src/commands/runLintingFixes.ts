@@ -607,6 +607,7 @@ export async function runLintingFixes(
                       stage: "publish",
                       taskStage: "publish",
                       taskFolderUri: taskFolderUri,
+                      roundProcessClaimId: handle?.claimId,
                       onProgress: (message) => aiProgress.report({ message }),
                       // Mirror structured preflight questions into task-local
                       // Chat so Answer/Resume work (plan §5.5).

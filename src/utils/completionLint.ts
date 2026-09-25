@@ -253,6 +253,16 @@ export interface CompletionLintResult {
     passed: boolean;
     retryCount?: number;
   }>;
+  /**
+   * The check set this run actually used — see
+   * {@link CollectCompletionLintOptions.checkSet}. Carried on the result so
+   * `buildVerifiedChecksSection` can state plainly which checks ran without
+   * a separate parameter that could drift from what `collectCompletionLint`
+   * actually did. Optional for the same reason as `commandsRun` above:
+   * callers that construct a result without running the real check aren't
+   * forced to populate it. Treat absent as `"full"`.
+   */
+  checkSet?: "fast" | "full";
 }
 
 /** True when the path exists on disk and is a directory. */
@@ -1184,9 +1194,20 @@ export interface CollectCompletionLintOptions {
    * Explicitly configured verification command lines. When non-empty these
    * take precedence over the conventional package.json `lint`/`test`/
    * `check-types` script detection: exactly these commands run, and the
-   * missing-script (inconclusive) reporting does not apply.
+   * missing-script (inconclusive) reporting does not apply. Ignored when
+   * `checkSet` is `"fast"` — a fast pass always runs the conventional
+   * `lint`/`check-types` scripts, since an explicit command line cannot be
+   * inspected to confirm it excludes `verify`/`test`/`build`.
    */
   explicitCommands?: readonly string[];
+  /**
+   * `"fast"` (implementation review rounds, item 4 of the 1.0 plan) runs
+   * only `lint` and `check-types` — never `verify`, `test`, or `build`,
+   * including for monorepo member packages — so a review round finishes in
+   * seconds rather than minutes. `"full"` (the default; Publish and any
+   * other caller) runs the complete check set as before.
+   */
+  checkSet?: "fast" | "full";
   /**
    * Cancellation token linked to the enclosing operation (a review round,
    * Fast Forward, a Publish attempt). When cancelled, every still-running
@@ -1255,10 +1276,13 @@ export async function collectCompletionLint(
   options?: CollectCompletionLintOptions
 ): Promise<CompletionLintResult> {
   const manager = packageManager(folder);
+  const checkSet = options?.checkSet ?? "full";
   const missingScripts: string[] = [];
-  const explicitCommands = (options?.explicitCommands ?? [])
-    .map((command) => command.trim())
-    .filter((command) => command.length > 0);
+  const explicitCommands = checkSet === "fast"
+    ? []
+    : (options?.explicitCommands ?? [])
+        .map((command) => command.trim())
+        .filter((command) => command.length > 0);
   const guard: { token?: vscode.CancellationToken; timeoutMs?: number } = {
     token: options?.token,
     timeoutMs: options?.timeoutMs ?? getCompletionCheckTimeoutMs(),
@@ -1280,7 +1304,9 @@ export async function collectCompletionLint(
   monorepoDetected = isMonorepoWorkspace(folder);
   if (monorepoDetected && explicitCommands.length === 0) {
     const memberFolders = discoverWorkspaceMemberFolders(folder);
-    const scriptNames = ["lint", "check-types", "test", "build"] as const;
+    const scriptNames = checkSet === "fast"
+      ? (["lint", "check-types"] as const)
+      : (["lint", "check-types", "test", "build"] as const);
     for (const memberFolder of memberFolders) {
       const memberScripts = readPackageScripts(memberFolder);
       if (!memberScripts) { continue; }
@@ -1309,15 +1335,22 @@ export async function collectCompletionLint(
     const scripts = readPackageScripts(folder);
     // 1b: a repo's own aggregate `verify` script, when safe, replaces the
     // conventional candidate list outright (see selectVerifyScriptCandidate).
-    const verifyCandidate = selectVerifyScriptCandidate(scripts, manager);
+    // Never considered for a fast pass: `verify` commonly runs the full
+    // suite/build, exactly what `checkSet: "fast"` promises never to run.
+    const verifyCandidate = checkSet === "fast" ? undefined : selectVerifyScriptCandidate(scripts, manager);
     const candidateChecks: Array<readonly [string, string[]]> = verifyCandidate
       ? [verifyCandidate]
-      : [
-          [`${manager} run lint`, [manager, "run", "lint"]],
-          [`${manager} run check-types`, [manager, "run", "check-types"]],
-          [`${manager} run test`, [manager, "run", "test"]],
-          [`${manager} run build`, [manager, "run", "build"]],
-        ];
+      : checkSet === "fast"
+        ? [
+            [`${manager} run lint`, [manager, "run", "lint"]],
+            [`${manager} run check-types`, [manager, "run", "check-types"]],
+          ]
+        : [
+            [`${manager} run lint`, [manager, "run", "lint"]],
+            [`${manager} run check-types`, [manager, "run", "check-types"]],
+            [`${manager} run test`, [manager, "run", "test"]],
+            [`${manager} run build`, [manager, "run", "build"]],
+          ];
 
     // The conventional `lint`/`test`/`build` scripts (publish pre-check
     // contract, extended by 1b to include `build`) are skipped rather than
@@ -1531,6 +1564,7 @@ export async function collectCompletionLint(
     commandsRun: checks.map((check) => check.command),
     monorepoDetected,
     ...(monorepoDetected ? { monorepoChecks } : {}),
+    checkSet,
   };
 }
 
@@ -1931,12 +1965,20 @@ export function buildVerifiedChecksSection(
   const lines: string[] = [
     "## Verified Checks (ground truth)",
     "",
+  ];
+  if (result.checkSet === "fast") {
+    lines.push(
+      "Fast checks: lint, type-check — the test suite and build were NOT run for this review.",
+      ""
+    );
+  }
+  lines.push(
     "These results were produced by the extension host actually running the project's " +
       "lint/type-check/test commands — they are not generated, claimed, or verifiable-only-by-you. " +
       "Treat them as ground truth. Do not lower the score, and do not raise a review-confidence " +
       "blocker, merely because you cannot independently reproduce a test run yourself.",
-    "",
-  ];
+    ""
+  );
   const knownFlakeFailures = result.knownFlakeFailures ?? [];
   // Deliberately derived only from what this function actually lists below
   // (failedChecks / knownFlakeFailures / missingScripts) — NOT from
@@ -2250,6 +2292,8 @@ export async function collectCompletionLintPreview(
     timeoutMs?: number;
     /** See CollectCompletionLintOptions.onCheckEvent — forwarded unchanged. */
     onCheckEvent?: CollectCompletionLintOptions["onCheckEvent"];
+    /** See CollectCompletionLintOptions.checkSet. Defaults to `"full"`. */
+    checkSet?: CollectCompletionLintOptions["checkSet"];
   }
 ): Promise<CompletionLintResult> {
   const allowScopePrompt = options?.allowScopePrompt ?? true;
@@ -2298,6 +2342,7 @@ export async function collectCompletionLintPreview(
     token: options?.token,
     timeoutMs: options?.timeoutMs,
     onCheckEvent: options?.onCheckEvent,
+    checkSet: options?.checkSet,
   });
   result.verifiedFolder = scopeFolder;
   if (includeAiPlanVerification) {

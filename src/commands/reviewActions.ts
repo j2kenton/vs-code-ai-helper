@@ -993,6 +993,12 @@ interface ExecuteImplementationRunOptions {
    * auditable against what the reviewer actually reported.
    */
   dispatchedBlockerIds?: readonly ReviewBlockerIdentity[];
+  /** This round's admission lock claim id (`WorkAdmissionHandleV1.claimId`),
+   * when the caller currently holds one — forwarded to the CLI edit path so
+   * its provider process is recorded next to the lock (1.0 RC1 Part B item
+   * 2, `roundProcessRecordV1.ts`). Absent for a caller with no lock in
+   * scope; recording is then simply skipped, unchanged from today. */
+  roundProcessClaimId?: string;
 }
 
 /**
@@ -2509,6 +2515,11 @@ async function buildVerifiedChecksVariable(
       includeAiPlanVerification: includePlanItemVerification,
       token,
       onCheckEvent: checkActivity.onCheckEvent,
+      // Item 1 of the 1.0 plan (f3 Part 5): implementation review rounds run
+      // only lint/type-check, never the full test suite or build — the full
+      // suite still runs once at Publish. Every other caller (Publish itself,
+      // and callers with no targetStage) keeps the full check set.
+      checkSet: targetStage && IMPL_REVIEW_STAGES_V1.includes(targetStage) ? "fast" : "full",
     });
     if (targetStage === "publish") {
       // Narrow, explicit carve-out from this function's normal
@@ -10366,6 +10377,7 @@ async function executeImplementationRun(
         // so its coordinator attempts attach to it at allocation time, the
         // same as a review round — see `RunSealedImplementationOptionsV1.roundId`.
         roundId: implRoundId,
+        roundProcessClaimId: options.roundProcessClaimId,
         // Structured preflight questions get their full Chat lifecycle
         // (mirror → Answer → Resume via extension.ts's dispatcher).
         onQuestions: async (questionsOutcome) => {
@@ -13452,6 +13464,7 @@ export async function runImplementationWithAI(
         stageToken,
         followUpReviewMode,
         chatViewProvider,
+        roundProcessClaimId: handle?.claimId,
         templateName: dispatchedTemplateName,
         templateVariables: dispatchedTemplateVariables,
         ...(sourceReviewStageForRun ? { editActionKey: "applyReviewEdit.v1" } : {}),
@@ -13850,6 +13863,7 @@ export async function applyReviewEditWithAI(
             // mirror (plan §7.5/AC-PREFLIGHT-04) — see this file's
             // ExecuteImplementationRunOptions.chatViewProvider doc comment.
             chatViewProvider: options.chatViewProvider,
+            roundProcessClaimId: handle?.claimId,
           }
         )
     );

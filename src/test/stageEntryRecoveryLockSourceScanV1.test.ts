@@ -42,10 +42,14 @@ import * as path from "node:path";
  * hold for that task — and a NEW call site added later must be forced to
  * re-earn that proof rather than silently inheriting it. This scan is that
  * proof, kept honest the same way `stageMutatorSourceScanV1.test.ts` keeps
- * its own one-door proof honest: an exact-line allowlist, each entry with a
- * reason, that fails on a hit at any OTHER line (new, moved, or an
- * unreviewed second call in an already-allowlisted file) and on a listed
- * line that no longer matches anything (a stale entry).
+ * its own one-door proof honest: an allowlist keyed by file plus a stable
+ * snippet of the call's own source text (1.0 plan item 14 — NOT a line
+ * number, so an unrelated edit elsewhere in the file never requires
+ * updating every entry below it), each entry with a reason, that fails on a
+ * call whose text is not on the allowlist (new, changed, or an unreviewed
+ * second call in an already-allowlisted file) and on a listed entry that no
+ * longer matches any call (a stale entry — the call itself changed or was
+ * removed).
  *
  * Six functions are tracked. The first four are the direct lock-acquirers
  * (or a one-hop wrapper around one); the last two were added after the
@@ -221,18 +225,78 @@ function findCallLines(content: string, name: string): number[] {
   return Array.from(lines).sort((a, b) => a - b);
 }
 
+/** See {@link AllowlistEntry.snippet}'s doc comment. */
+const SNIPPET_MAX_CHARS = 160;
+
+/** The character offset, within `text`, of the `(` at `openIndex`'s balanced close. -1 if unbalanced. */
+function findMatchingParen(text: string, openIndex: number): number {
+  let depth = 0;
+  for (let i = openIndex; i < text.length; i++) {
+    if (text[i] === "(") {
+      depth++;
+    } else if (text[i] === ")") {
+      depth--;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Every call SITE to `name` (line plus a stable {@link AllowlistEntry.snippet}
+ * — the call's own source text, `name` through its balanced closing paren,
+ * normalized and capped), one per distinct line (mirrors {@link findCallLines}'s
+ * dedupe-by-line behavior).
+ */
+function findCallSites(content: string, name: string): Array<{ line: number; snippet: string }> {
+  const stripped = stripCommentsPreservingLines(content);
+  const lineStartOffsets = buildLineStartOffsets(stripped);
+  const pattern = new RegExp(`\\b${name}\\s*\\(`, "g");
+  const sites: Array<{ line: number; snippet: string }> = [];
+  const seenLines = new Set<number>();
+  for (const match of stripped.matchAll(pattern)) {
+    const line = lineForOffset(lineStartOffsets, match.index);
+    if (seenLines.has(line)) {
+      continue;
+    }
+    seenLines.add(line);
+    const openParen = match.index + match[0].length - 1;
+    const close = findMatchingParen(stripped, openParen);
+    const end = close === -1 ? Math.min(content.length, openParen + 200) : close + 1;
+    const snippet = content.slice(match.index, end).replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX_CHARS);
+    sites.push({ line, snippet });
+  }
+  return sites;
+}
+
 interface AllowlistEntry {
-  readonly line: number;
+  /**
+   * A normalized (whitespace-collapsed) prefix of the call's own source text
+   * — from the tracked function's name through its balanced closing paren,
+   * capped at SNIPPET_MAX_CHARS — NOT a line number (1.0 plan item 14): an
+   * unrelated edit elsewhere in the file no longer requires updating every
+   * entry below it. An entry only goes stale when the call's own text
+   * changes or is removed. When two distinct call sites in the same file
+   * happen to share identical short text (e.g. two bare
+   * `recoverStageEntryJournalV1(taskFolderUri)` calls), their entries
+   * legitimately carry the same snippet — matching is by SET membership (N
+   * occurrences require N matching entries), not a 1:1 site-to-entry
+   * pairing, so this is still exact: a THIRD unreviewed occurrence of the
+   * same text would still be caught as unallowlisted.
+   */
+  readonly snippet: string;
   readonly reason: string;
 }
 
 /**
- * Every allowlisted call-site line for each tracked function, keyed first by
+ * Every allowlisted call-site for each tracked function, keyed first by
  * function name and then by path relative to `src/` (forward slashes). A
- * function's OWN declaration line is included here too (with a reason
- * explaining it is the definition, not a call this scan cares about) so the
- * declaration itself does not need a separate exclusion mechanism — it is
- * just another allowlisted line.
+ * function's OWN declaration is included here too (with a reason explaining
+ * it is the definition, not a call this scan cares about) so the declaration
+ * itself does not need a separate exclusion mechanism — it is just another
+ * allowlisted entry.
  */
 const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry[]>> = new Map([
   [
@@ -241,9 +305,9 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
       [
         "utils/stageEntryJournalV1.ts",
         [
-          { line: 561, reason: "the function's own declaration" },
+          { snippet: "recoverStageEntryJournalV1( taskFolderUri: vscode.Uri )", reason: "the function's own declaration" },
           {
-            line: 593,
+            snippet: "recoverStageEntryJournalV1(taskFolderUri)",
             reason:
               "recoverStageEntryJournalIfPresentV1's delegation, after its own cheap lock-free existence " +
               "probe found a journal present — no lock is held at this point",
@@ -254,18 +318,21 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "utils/stageTransition.ts",
         [
           {
-            line: 811,
+            snippet: "recoverStageEntryJournalV1(taskFolderUri)",
             reason:
               "enterStageV1's own recover-and-retry-once path, reached only after enterStageOnceV1 has " +
               "already returned — its patchTaskProgressStrictV1/withTaskLock hold has released by the " +
               "time a rejection can propagate here",
           },
           {
-            line: 1094,
+            snippet: "recoverStageEntryJournalV1(taskFolderUri)",
             reason:
               "onCommitFailure, reached only after advanceStage's own patchTaskProgressStrictV1 call has " +
               "rejected — its withTaskLock hold releases before the rejection propagates to this catch " +
-              "(see this call's own doc comment in stageTransition.ts)",
+              "(see this call's own doc comment in stageTransition.ts). NOTE: this file has TWO calls " +
+              "with this identical short text (this one and the recover-and-retry-once path above); " +
+              "matching is by set membership (2 entries, 2 occurrences), not a 1:1 pairing — see " +
+              "AllowlistEntry's doc comment.",
           },
         ],
       ],
@@ -276,13 +343,13 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
     new Map([
       [
         "utils/stageEntryJournalV1.ts",
-        [{ line: 586, reason: "the function's own declaration" }],
+        [{ snippet: "recoverStageEntryJournalIfPresentV1( taskFolderUri: vscode.Uri )", reason: "the function's own declaration" }],
       ],
       [
         "utils/stageTransition.ts",
         [
           {
-            line: 562,
+            snippet: "recoverStageEntryJournalIfPresentV1(taskFolderUri)",
             reason:
               "prepareStageEntryV1's own proactive-recovery call, at the very head of enterStageOnceV1 " +
               "(before advanceStage/patchTaskProgressStrictV1 ever acquires withTaskLock for this " +
@@ -294,7 +361,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "utils/reopenTask.ts",
         [
           {
-            line: 116,
+            snippet: "recoverStageEntryJournalIfPresentV1(vscode.Uri.file(task.taskFolderPath))",
             reason:
               "reopenCompletedTask's own proactive recovery, run BEFORE activateTask ever acquires its " +
               "meta-root lock — see this call's own doc comment (review fix, 2026-09-23)",
@@ -305,12 +372,10 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "utils/implementationArtifactResolver.ts",
         [
           {
-            line: 1170,
+            snippet: "recoverStageEntryJournalIfPresentV1(taskFolderUri)",
             reason:
               "materializeCanonicalIfNeeded's own proactive recovery — its doc comment records that " +
-              "neither production caller of this function holds withTaskLock. (Line moved 1102 -> 1170: " +
-              "this round's fix for the no-op continuation (item 16 / Part 4 step 10) shifted the whole " +
-              "function, net +68 lines.)",
+              "neither production caller of this function holds withTaskLock.",
           },
         ],
       ],
@@ -318,7 +383,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/scheduleTaskResume.ts",
         [
           {
-            line: 1022,
+            snippet: "recoverStageEntryJournalIfPresentV1(vscode.Uri.file(task.taskFolderPath))",
             reason:
               "the activation sweep's per-task proactive recovery (armAll's recoverStageEntryJournalsV1) " +
               "— a best-effort loop over the inventory with no covering lock held around it",
@@ -332,13 +397,14 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
     new Map([
       [
         "utils/stageTransition.ts",
-        [{ line: 1210, reason: "the function's own declaration" }],
+        [{ snippet: "runStageEntryPostCommitV1( taskFolderUri: vscode.Uri, result: StageEntryPostCommitPayloadV1 )", reason: "the function's own declaration" }],
       ],
       [
         "utils/stageEntryJournalV1.ts",
         [
           {
-            line: 540,
+            snippet:
+              "runStageEntryPostCommitV1(taskFolderUri, { deferredPlanRevisionAdoption: deferredAdoption, journalTransitionId: transitionId, })",
             reason:
               "recoverAndReplayCommittedJournalV1's Phase B/C delegation, reached only after Phase A's " +
               "own withTaskLock hold (recoverStageEntryJournalPhaseAV1) has already returned",
@@ -349,7 +415,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "utils/reopenTask.ts",
         [
           {
-            line: 213,
+            snippet: "runStageEntryPostCommitV1(vscode.Uri.file(task.taskFolderPath), deferredPostCommit)",
             reason:
               "reopenCompletedTask's deferred post-commit work, run only after activateTask has returned " +
               "— its meta-root lock has released by this point",
@@ -360,7 +426,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "actions/rows/nextStageRowV1.ts",
         [
           {
-            line: 291,
+            snippet: "runStageEntryPostCommitV1(taskFolderUri, result)",
             reason:
               "executeNextStageV1, run only after enterStageV1's own patchTaskProgressStrictV1 call has " +
               "already returned",
@@ -371,7 +437,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "actions/rows/resumeTaskRowV1.ts",
         [
           {
-            line: 261,
+            snippet: "runStageEntryPostCommitV1(taskFolderUri, entryResult)",
             reason:
               "executeResumeTaskV1, guarded by `!context.skipTaskLock` — the one caller that sets " +
               "skipTaskLock (taskActivationCoordinator, via resumeTaskRowV1's own postCommitSink) hands " +
@@ -383,38 +449,13 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/setTaskStage.ts",
         [
           {
-            line: 493,
+            snippet: "runStageEntryPostCommitV1(taskFolderUri, entryResult)",
             reason:
               "setTaskStage's own command body, run only after its enterStageV1 call has returned. " +
-              "(Line moved 297 -> 371 -> 405 -> 401 -> 416 -> 455 -> 491 -> 495 -> 493: this round's fix for the narrowed stale-" +
-              "Advance-card blocker c2453680-fe42-461b-9652-1f87445cb9d3-0 — the CAS sourceStage fed to " +
-              "enterStageV1 is now the caller's expectedSourceStage when supplied, and the !entryResult.ready " +
-              "branch grew the CAS-mismatch/already-there disambiguation this fix required — added doc " +
-              "comment and branching above the enterStageV1 call, net; then a further-narrowing round " +
-              "inserted a fresh pre-cancel re-read and its own CAS-mismatch/already-there branching above " +
-              "the cancelRunningOperationsForTask call, above the enterStageV1 call, net; then a round " +
-              "closed the remaining cancel-before-CAS race structurally instead of narrowing it again — " +
-              "removing that pre-cancel re-read entirely and moving cancelRunningOperationsForTask to run " +
-              "only after enterStageV1 has committed the transition, net -4 lines; then a round closed the " +
-              "reviewer's completion blocker on THAT reordering (dispatching brand-new automated work for " +
-              "the destination stage while the outgoing stage's operation was not confirmed to have actually " +
-              "stopped) by adding an explanatory comment block above the cancelRunningOperationsForTask call " +
-              "and gating the shouldAutoReview dispatch below on cancelResult.ok, net +15 lines; then this " +
-              "round closed the reviewer's next completion blocker on THAT gate (a second, independent " +
-              "cancelRunningOperationsForTask call made by resumeAndSetTaskStageV1 after this one could not " +
-              "observe a forced end this call had already recorded, since the operation row is gone by the " +
-              "time a second call could see it) by depositing this call's own cancelResult into an " +
-              "optional caller-supplied box (`cancelResultOutV1`) instead of leaving the caller to guess — " +
-              "added the deposit plus its doc comment above and beside this call site, net +24 lines; then " +
-              "a round's fix for the narrowed completion blocker 906d1f21-e807-48d3-9468-62856cdc7e7a-0 " +
-              "added an `additionalBeforeWrite` option (requesting cancellation from inside the locked " +
-              "write, before the new stage's bytes landed) plus its doc comment above the enterStageV1 " +
-              "call, net +24 lines; then this round reverted that option as architecturally unsafe (a " +
-              "failed write could leave a genuinely unrelated operation cancelled for a transition that " +
-              "never committed) — cancellation is requested only via the post-commit " +
+              "The CAS sourceStage fed to enterStageV1 is the caller's expectedSourceStage when supplied; " +
+              "cancellation of the outgoing stage's operation is requested only via the post-commit " +
               "cancelRunningOperationsForTask call below, once enterStageV1 has already confirmed the " +
-              "write landed — replacing both comment blocks and removing the additionalBeforeWrite option, " +
-              "net -2 lines.)",
+              "write landed.",
           },
         ],
       ],
@@ -422,7 +463,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/planRevisionV1.ts",
         [
           {
-            line: 283,
+            snippet: "runStageEntryPostCommitV1(folderUri, entryResult)",
             reason:
               "reviseChecklistChangeProposalConfirmed, run only after its enterStageV1 call has returned",
           },
@@ -432,17 +473,14 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/reviewActions.ts",
         [
           {
-            line: 9573,
+            snippet: "runStageEntryPostCommitV1(ctx.folderUri, entryResult)",
             reason:
-              "handleGenerateImplementationOutcomeV1, run only after its enterStageV1 call has returned. " +
-              "(Line moved 9518 -> 9519 -> 9573: this round's fix for the no-op continuation (item 16 / " +
-              "Part 4 step 10) added a writeRunLog call earlier in the file, shifting this line by 54.)",
+              "handleGenerateImplementationOutcomeV1, run only after its enterStageV1 call has returned.",
           },
           {
-            line: 11913,
+            snippet: "runStageEntryPostCommitV1(folderUri, implEntry)",
             reason:
-              "executeImplementationRun, run only after its enterStageV1 call has returned. " +
-              "(Line moved 11858 -> 11859 -> 11913: same shift as above.)",
+              "executeImplementationRun, run only after its enterStageV1 call has returned.",
           },
         ],
       ],
@@ -454,9 +492,14 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
       [
         "utils/stageTransition.ts",
         [
-          { line: 506, reason: "the function's own declaration" },
           {
-            line: 849,
+            snippet:
+              "prepareStageEntryV1( taskFolderUri: vscode.Uri, destinationStage: TaskStage, options?: { requireExistingArtifact?: boolean; /** * Set only by `enterStageOnceV1`",
+            reason: "the function's own declaration",
+          },
+          {
+            snippet:
+              "prepareStageEntryV1(taskFolderUri, destinationStage, { requireExistingArtifact: kind === \"reopen\", skipProactiveRecovery: options.callerHoldsCoveringLock, })",
             reason:
               "enterStageOnceV1's own call, at the very head of the function, before advanceStage/ " +
               "patchTaskProgressStrictV1 ever acquires withTaskLock for this transition",
@@ -467,19 +510,17 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/reviewActions.ts",
         [
           {
-            line: 4367,
+            snippet: "prepareStageEntryV1(folderUri, next)",
             reason:
               "the score-based auto-advance's own 'friendly pre-check' (a real race is still caught by " +
               "enterStageV1's own CAS, per this call's own comment) — plain command-handler code, no " +
-              "covering lock held. (Line moved 4363 -> 4364 -> 4367: this round's fix for the no-op " +
-              "continuation (item 16 / Part 4 step 10) shifted this line by 3.)",
+              "covering lock held.",
           },
           {
-            line: 9195,
+            snippet: "prepareStageEntryV1(resolved.folderUri, next)",
             reason:
-              "manual Next Stage's own 'friendly pre-check', same shape as line 4367 — plain " +
-              "command-handler code, no covering lock held. (Line moved 9140 -> 9141 -> 9195: same shift " +
-              "as above, plus this round's writeRunLog addition.)",
+              "manual Next Stage's own 'friendly pre-check', same shape as the entry above — plain " +
+              "command-handler code, no covering lock held.",
           },
         ],
       ],
@@ -492,10 +533,8 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "utils/implementationArtifactResolver.ts",
         [
           {
-            line: 1160,
-            reason:
-              "the function's own declaration. (Line moved 1092 -> 1160: this round's fix for the no-op " +
-              "continuation (item 16 / Part 4 step 10) shifted the whole function, net +68 lines.)",
+            snippet: "materializeCanonicalIfNeeded( taskFolderUri: vscode.Uri )",
+            reason: "the function's own declaration.",
           },
         ],
       ],
@@ -503,23 +542,19 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/reviewActions.ts",
         [
           {
-            line: 8442,
+            snippet: "materializeCanonicalIfNeeded(folderUri)",
             reason:
               "buildApplyReviewPromptPartsV1, called only from applyImplementationReviewWithAI (its " +
               "own shrink loop) and from executeImplementationRun's source-review reconstruction branch " +
               "— both plain command-handler/helper code with no withTaskLock acquired anywhere earlier " +
-              "in either call path. (Line moved 8387 -> 8388 -> 8442: this round's fix for the no-op " +
-              "continuation (item 16 / Part 4 step 10) shifted this line by 54.)",
+              "in either call path.",
           },
           {
-            line: 12884,
+            snippet: "materializeCanonicalIfNeeded(resolved.folderUri)",
             reason:
               "runImplementationWithAI's runTrackedOperation callback — runTrackedOperation " +
               "(taskOperations.ts) never acquires withTaskLock itself, and nothing earlier in this " +
-              "callback does either. (Line moved 12720 -> 12740 -> 12774 -> 12884: this round's own fix " +
-              "for the no-op-continuation completion blocker (2026-09-24 review, narrowed) added a " +
-              "canonicalExistedBeforeMaterialize existence check, with an explanatory comment, above this " +
-              "call, net +110.)",
+              "callback does either.",
           },
         ],
       ],
@@ -531,12 +566,16 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
       [
         "utils/stageTransition.ts",
         [
-          { line: 775, reason: "the function's own declaration" },
           {
-            line: 812,
+            snippet:
+              "enterStageV1( taskFolderUri: vscode.Uri, sourceStage: TaskStage, destinationStage: TaskStage, isPaused: boolean, kind: TransitionKind, options: { optIn?: boolea",
+            reason: "the function's own declaration",
+          },
+          {
+            snippet: "enterStageV1(taskFolderUri, sourceStage, destinationStage, isPaused, kind, options, true)",
             reason:
               "the function's own single-retry recursion, reached only after recoverStageEntryJournalV1 " +
-              "(line 811, already allowlisted above) has itself returned — its withTaskLock hold has " +
+              "(already allowlisted above) has itself returned — its withTaskLock hold has " +
               "released by the time this recursive call runs, and `retrying=true` on the recursive call " +
               "prevents a second recovery/retry cycle",
           },
@@ -546,7 +585,8 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "actions/rows/nextStageRowV1.ts",
         [
           {
-            line: 215,
+            snippet:
+              "enterStageV1( taskFolderUri, input.expectedSourceStage, destinationStage, /* isPaused */ false, // Inert here: the transform below always overrides advanceStage",
             reason:
               "executeNextStageV1's own command body — plain row-execution code, no covering lock held; " +
               "callerHoldsCoveringLock is not needed here because this row is never invoked from inside " +
@@ -558,7 +598,8 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "actions/rows/resumeTaskRowV1.ts",
         [
           {
-            line: 149,
+            snippet:
+              "enterStageV1( taskFolderUri, sourceStage, input.selectedStage, /* isPaused */ false, // Inert: \"reopen\" is never AUTO_REVIEW_ELIGIBLE. \"reopen\", { deps: { patch",
             reason:
               "executeResumeTaskV1 — the one call site that CAN run from inside " +
               "activateTaskLocked's held meta-root lock (when context.skipTaskLock is set by " +
@@ -575,16 +616,11 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/setTaskStage.ts",
         [
           {
-            line: 370,
+            snippet:
+              "enterStageV1( taskFolderUri, expectedSourceStage ?? task.progress.currentStage, newStage, false, kind, { optIn: AUTO_REVIEW_ELIGIBLE_KINDS.has(kind), } )",
             reason:
               "setTaskStage's own command body — plain command-handler code, no covering lock held. " +
-              "(Line moved 267 -> 313 -> 347 -> 312 -> 341 -> 365 -> 370: a round's fix for the narrowed " +
-              "completion blocker 906d1f21-e807-48d3-9468-62856cdc7e7a-0 added an `additionalBeforeWrite` " +
-              "option (requesting cancellation of the outgoing stage's operation atomically inside the " +
-              "locked commit, before the new stage's bytes land) plus its doc comment above this call, " +
-              "net +24 lines; then this round reverted that option as architecturally unsafe and replaced " +
-              "the doc comment explaining why cancellation is requested post-commit instead, net +5 lines; " +
-              "see the runStageEntryPostCommitV1 entry above for the same file.)",
+              "See the runStageEntryPostCommitV1 entry above for the same file.",
           },
         ],
       ],
@@ -592,7 +628,8 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/generatePlanWithAI.ts",
         [
           {
-            line: 650,
+            snippet:
+              "enterStageV1( taskFolderUri, sourceStage, destinationStage, /* isPaused */ false, // Inert: \"generate-plan\" is never AUTO_REVIEW_ELIGIBLE, so isPaused cannot af",
             reason:
               "handleGeneratePlanOutcomeV1's own outcome-handling body — plain command-handler code, " +
               "no covering lock held anywhere earlier in the function",
@@ -603,7 +640,8 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/planRevisionV1.ts",
         [
           {
-            line: 226,
+            snippet:
+              "enterStageV1( folderUri, sourceStage, \"plan\", /* isPaused */ false, // Inert: \"plan-revision\" is never AUTO_REVIEW_ELIGIBLE. \"plan-revision\", { transform: (curr",
             reason:
               "reviseChecklistChangeProposalConfirmed's own command body — plain command-handler code, " +
               "no covering lock held",
@@ -614,22 +652,19 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         "commands/reviewActions.ts",
         [
           {
-            line: 9554,
+            snippet: "enterStageV1( ctx.folderUri, \"impl\", \"impl\", false, \"generate-implementation\" )",
             reason:
               "handleGenerateImplementationOutcomeV1's own outcome-handling body (same function tracked " +
-              "for runStageEntryPostCommitV1 at line 9573 above) — plain command-handler code, no " +
-              "covering lock held anywhere earlier in the function. (Line moved 9499 -> 9500 -> 9554: " +
-              "this round's fix for the no-op continuation (item 16 / Part 4 step 10) shifted this line " +
-              "by 54.)",
+              "for runStageEntryPostCommitV1 above) — plain command-handler code, no " +
+              "covering lock held anywhere earlier in the function.",
           },
           {
-            line: 11900,
+            snippet:
+              "enterStageV1( folderUri, sourceStageBeforeImplEntry, \"impl\", /* isPaused */ false, // Inert: \"implementation-run\" is never AUTO_REVIEW_ELIGIBLE. \"implementation",
             reason:
               "executeImplementationRun's stage-entry branch (same function tracked for " +
-              "runStageEntryPostCommitV1 at line 11913 above) — plain command-handler code, no " +
-              "covering lock held anywhere earlier in the function. (Line moved 11845 -> 11846 -> 11900: " +
-              "this round's own fix for the no-op-continuation completion blocker (2026-09-24 review, " +
-              "narrowed) shifted this line by 54.)",
+              "runStageEntryPostCommitV1 above) — plain command-handler code, no " +
+              "covering lock held anywhere earlier in the function.",
           },
         ],
       ],
@@ -689,7 +724,7 @@ void describe("stage-entry recovery lock source scan (Part 2, item 15 hardening)
   });
 
   for (const fn of TRACKED_FUNCTIONS) {
-    void it(`every call to ${fn} sits at an allowlisted exact line`, () => {
+    void it(`every call to ${fn} sits at an allowlisted call site`, () => {
       const allowlist = ALLOWLIST.get(fn);
       assert.ok(allowlist, `No allowlist registered for tracked function ${fn}`);
 
@@ -700,20 +735,29 @@ void describe("stage-entry recovery lock source scan (Part 2, item 15 hardening)
       for (const file of collectSourceFiles(SRC_DIR)) {
         const srcRelativeKey = path.relative(SRC_DIR, file).split(path.sep).join("/");
         const content = fs.readFileSync(file, "utf8");
-        const actualLines = new Set(findCallLines(content, fn));
+        const sites = findCallSites(content, fn);
         const allowed = allowlist.get(srcRelativeKey) ?? [];
         if (allowlist.has(srcRelativeKey)) {
           seenAllowlistKeys.add(srcRelativeKey);
         }
-        const allowedLines = new Set(allowed.map((entry) => entry.line));
-        for (const line of actualLines) {
-          if (!allowedLines.has(line)) {
-            newOrMoved.push(`${path.relative(REPO_ROOT, file)}:${line}`);
+        // Set-membership matching by snippet (not a 1:1 site<->entry
+        // pairing, and never by line — see AllowlistEntry's doc comment):
+        // each entry may satisfy at most one site, so N identically-texted
+        // sites still require N entries.
+        const claimedEntries = new Set<AllowlistEntry>();
+        for (const site of sites) {
+          const match = allowed.find(
+            (entry) => !claimedEntries.has(entry) && site.snippet.includes(entry.snippet)
+          );
+          if (match) {
+            claimedEntries.add(match);
+          } else {
+            newOrMoved.push(`${path.relative(REPO_ROOT, file)}:${site.line} :: ${site.snippet}`);
           }
         }
         for (const entry of allowed) {
-          if (!actualLines.has(entry.line)) {
-            stale.push(`${path.relative(REPO_ROOT, file)}:${entry.line} ("${entry.reason}")`);
+          if (!claimedEntries.has(entry)) {
+            stale.push(`${srcRelativeKey} ("${entry.reason}") snippet: ${entry.snippet}`);
           }
         }
       }
@@ -726,7 +770,7 @@ void describe("stage-entry recovery lock source scan (Part 2, item 15 hardening)
       assert.deepStrictEqual(
         newOrMoved,
         [],
-        `These calls to ${fn} are not on the exact-line allowlist (new, moved, or an unreviewed second ` +
+        `These calls to ${fn} are not on the allowlist (new, moved, or an unreviewed second ` +
           "call in an already-allowlisted file) — prove this call site runs outside any covering " +
           `withTaskLock/withMetaRootLock hold and add a reviewed entry, or remove the call: ` +
           newOrMoved.join(", ")
@@ -734,11 +778,30 @@ void describe("stage-entry recovery lock source scan (Part 2, item 15 hardening)
       assert.deepStrictEqual(
         stale,
         [],
-        `These ALLOWLIST entries for ${fn} no longer match anything at their recorded line — the call ` +
-          "moved or was removed; update the line number (do not delete the entry unless the call itself " +
-          "is gone): " +
+        `These ALLOWLIST entries for ${fn} no longer match any call site — the call's own text ` +
+          "changed or the call was removed; update the entry's snippet (do not delete the entry " +
+          "unless the call itself is gone): " +
           stale.join(", ")
       );
     });
   }
+
+  void it("stable-key robustness: inserting unrelated lines elsewhere in a file does not break the allowlist scan (1.0 plan item 14)", () => {
+    const original =
+      'import { unrelated } from "./x";\n\nasync function caller(taskFolderUri: vscode.Uri) {\n  await runStageEntryPostCommitV1(taskFolderUri, entryResult);\n}\n';
+    const withInsertedLines =
+      'import { unrelated } from "./x";\n' +
+      "// a completely unrelated comment inserted above the call\n".repeat(20) +
+      '\nasync function caller(taskFolderUri: vscode.Uri) {\n  await runStageEntryPostCommitV1(taskFolderUri, entryResult);\n}\n';
+
+    const originalSites = findCallSites(original, "runStageEntryPostCommitV1");
+    const shiftedSites = findCallSites(withInsertedLines, "runStageEntryPostCommitV1");
+
+    assert.equal(originalSites.length, 1);
+    assert.equal(shiftedSites.length, 1);
+    // The line moved (20 unrelated lines were inserted above the call)...
+    assert.notEqual(originalSites[0]!.line, shiftedSites[0]!.line);
+    // ...but the snippet — the actual matching key — did not.
+    assert.equal(originalSites[0]!.snippet, shiftedSites[0]!.snippet);
+  });
 });
