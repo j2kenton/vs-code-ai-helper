@@ -55,6 +55,7 @@ function endAllOperations(): void {
       setWaitingForUser: () => {},
       setResultTargetUri: () => {},
       reportActivity: () => undefined,
+      settleAs: () => {},
     };
     taskOperations.end(handle);
   }

@@ -128,6 +128,15 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 
+// `import * as` produces a read-only namespace binding TypeScript refuses to
+// reassign; `require` (matching nextStageBlockerGateV1.test.ts's own stubbing
+// pattern for this exact module) gives back the same live module object
+// `setTaskStage.ts`'s own named import reads its property from at call time,
+// so overwriting the property here is what the stub in the tests below needs.
+/* eslint-disable @typescript-eslint/no-var-requires */
+const taskOperationsModule = require("../utils/taskOperations") as Record<string, unknown>;
+/* eslint-enable @typescript-eslint/no-var-requires */
+
 // Initialize notification router to forward to vscode stubs so tests can intercept them
 initNotificationRouter({
   addEntry(message, level) {
@@ -856,7 +865,7 @@ import {
 } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
-import type { TaskProgress } from "../types/taskProgress";
+import type { TaskProgress, TaskStage } from "../types/taskProgress";
 import { IMPLEMENTATION_SUMMARY_FILENAME } from "../types/taskProgress";
 import {
   ADMISSION_DIRNAME_V1,
@@ -2790,16 +2799,22 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
 
 // ---------------------------------------------------------------------------
 // resumeAndSetTaskStageV1 — v1 fixes 2, Wave I chokepoint (per-target
-// resumeAndXxxV1 dispatch): unlike its four siblings, this dispatches a bare
-// stage MOVE (setTaskStage), not a round-starting command, so it must leave
-// `nextActor` untouched rather than assert "automation" — the correct value
-// depends on whether the destination stage's default action auto-dispatches,
-// which is the still-open stage-transition chokepoint's job to answer, not
-// this call site's to guess.
+// resumeAndXxxV1 dispatch), updated for the pre-1.0.0 fixes register, item 14
+// / Part 3 Step 3: choosing "Advance" while a Fast Forward run is
+// interrupted must CONTINUE that run at the new stage — this now dispatches
+// setTaskStage AND, when `resumeFastForward` is true, fastForwardReviewWithAI
+// at the destination stage, in the same resumeThenDispatchV1 admission hold.
 // ---------------------------------------------------------------------------
 
 void describe("resumeAndSetTaskStageV1 (production code)", () => {
-  function installExecuteCommandStub(): {
+  function installExecuteCommandStub(
+    store: Map<string, string>,
+    // Review fix (2026-09-23, completion blocker: "the second cancellation
+    // check forgets the unsafe result"): lets a test simulate setTaskStage
+    // depositing an UNSAFE cancelResult (e.g. a forced end) into the box,
+    // instead of every test being stuck with the happy-path default.
+    cancelResult: { ok: boolean; reason?: string; forcedEnd?: boolean } = { ok: true }
+  ): {
     captured: Array<{ command: string; arg: unknown }>;
     restore: () => void;
   } {
@@ -2811,8 +2826,41 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
     (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
       command: string,
       arg?: unknown
-    ): Promise<undefined> => {
+    ): Promise<unknown> => {
       captured.push({ command, arg });
+      // setTaskStage's real implementation is not under test here (it has
+      // its own dedicated coverage) — this stub simulates its one
+      // observable effect this test cares about, so resumeAndSetTaskStageV1's
+      // own re-read of the (now-moved) stage sees a genuine move, exactly as
+      // it would against the real command.
+      if (command === "vs-code-ai-helper.setTaskStage") {
+        const { taskFolderPath, stage, cancelResultOutV1 } = arg as {
+          taskFolderPath: string;
+          stage: TaskStage;
+          cancelResultOutV1?: { current?: { ok: boolean; reason?: string; forcedEnd?: boolean } };
+        };
+        const folderUri = vscode.Uri.file(taskFolderPath);
+        const current = await readStoredProgress(store, folderUri);
+        if (current) {
+          // Mirror the real command's contract: `true` only when THIS call
+          // actually moved the stage (it wasn't already there) — see
+          // setTaskStage's own `@returns` doc.
+          if (current.currentStage === stage) {
+            return false;
+          }
+          await seedProgress(store, folderUri, { ...current, currentStage: stage });
+        }
+        // Mirror the real command's other observable effect (2026-09-23, new
+        // completion blocker fix): it deposits its own `cancelResult` into
+        // the box the caller supplied, rather than leaving the caller to
+        // guess by calling `cancelRunningOperationsForTask` a second time.
+        // Defaults to the happy path; a test passes `cancelResult` to
+        // simulate an unsafe outcome (e.g. a forced end) instead.
+        if (cancelResultOutV1) {
+          cancelResultOutV1.current = cancelResult;
+        }
+        return true;
+      }
       return Promise.resolve(undefined);
     };
     return {
@@ -2823,17 +2871,245 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
     };
   }
 
-  void it("resumes and dispatches setTaskStage, but does not assert nextActor: automation for a bare stage move", async () => {
+  void it("resumes, dispatches setTaskStage, and continues Fast Forward at the new stage when resumeFastForward is true", async () => {
     const store = new Map<string, string>();
     const fs = installMemStore(store);
     const msgs = installMessageCapture();
     const wsFolders = installWorkspaceFoldersStub();
-    const execCmd = installExecuteCommandStub();
+    const execCmd = installExecuteCommandStub(store);
     try {
-      const folderUri = makeTaskFolderUri("resume-and-set-stage");
+      const folderUri = makeTaskFolderUri("resume-and-set-stage-ff");
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
-        taskFolder: "resume-and-set-stage",
+        taskFolder: "resume-and-set-stage-ff",
+        currentStage: "impl-high-review",
+        status: "paused",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStub(folderPath, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      await resumeAndSetTaskStageV1(inv, currentStore, {
+        taskFolderPath: folderPath,
+        stage: "impl-low-review",
+        resumeFastForward: true,
+      });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.status, "active", "the task must actually be resumed");
+      assert.strictEqual(stored!.currentStage, "impl-low-review", "the stage must actually have moved");
+
+      const stageDispatch = execCmd.captured.find((e) => e.command === "vs-code-ai-helper.setTaskStage");
+      assert.ok(stageDispatch !== undefined, "must dispatch setTaskStage after resuming");
+      assert.deepEqual(stageDispatch.arg, {
+        taskFolderPath: folderPath,
+        stage: "impl-low-review",
+        // Deposited by the stub above, mirroring the real setTaskStage
+        // command's own `cancelResultOutV1` deposit (2026-09-23 fix).
+        cancelResultOutV1: { current: { ok: true } },
+      });
+
+      // The whole point of item 14 / Part 3 Step 3: an interrupted Fast
+      // Forward run is continued at the new stage, not merely moved onto it
+      // with nothing running.
+      const ffDispatch = execCmd.captured.find((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI");
+      assert.ok(ffDispatch !== undefined, "must continue Fast Forward at the new stage");
+      assert.strictEqual((ffDispatch.arg as { taskFolderPath?: string }).taskFolderPath, folderPath);
+
+      assert.strictEqual(
+        stored!.nextActor,
+        "automation",
+        "a genuinely-dispatched follow-up action (Fast Forward) must assert nextActor: automation"
+      );
+    } finally {
+      execCmd.restore();
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
+    }
+  });
+
+  // Review fix, 2026-09-23 (narrowed blocker
+  // c2453680-fe42-461b-9652-1f87445cb9d3-0): an automatic advance can reach
+  // the destination stage before this option is chosen (its own withdrawal of
+  // the now-stale card is best-effort and can race, or simply fail, with a
+  // resolve() that still runs) — so setTaskStage's own compare against the
+  // ALREADY-current stage reports "not moved by this call" here. Previously
+  // this closure re-read progress, saw `currentStage === stage`, and treated
+  // that as "the move just succeeded", dispatching the destination stage's
+  // action a SECOND time on top of whatever the automatic advance had already
+  // started. It must instead recognise "already there, not moved by me" and
+  // stop, without dispatching anything further and without re-pausing the
+  // task as a refusal.
+  void it(
+    "does not dispatch the destination stage's action a second time when the task is already there " +
+      "before this call runs (an automatic advance won the race)",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub(store);
+      try {
+        const folderUri = makeTaskFolderUri("resume-and-set-stage-already-there");
+        const folderPath = folderUri.fsPath;
+        const progress: TaskProgress = {
+          taskFolder: "resume-and-set-stage-already-there",
+          // The task is ALREADY on the destination stage the option targets —
+          // simulating an automatic advance that beat this stale click there.
+          currentStage: "impl-low-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl-low-review",
+          // Present and set to the stage this (simulated) card was raised
+          // against, to exercise the new staleness guard's "already reached
+          // the destination" branch — it must not treat this as stale.
+          expectedSourceStage: "impl-high-review",
+          resumeFastForward: true,
+        });
+
+        assert.strictEqual(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "must not re-dispatch the destination stage's action when the task was already there"
+        );
+        assert.strictEqual(
+          execCmd.captured.some(
+            (e) => e.command === "vs-code-ai-helper.runReviewWithAI" || e.command === "vs-code-ai-helper.applyCurrentStageAction"
+          ),
+          false,
+          "must not fall through to the current-stage-action dispatch either"
+        );
+
+        const stored = await readStoredProgress(store, folderUri);
+        assert.strictEqual(
+          stored!.status,
+          "active",
+          "already being at the destination stage is not a refusal — the task must not be re-paused"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // Review fix, 2026-09-23 (further narrowing of
+  // c2453680-fe42-461b-9652-1f87445cb9d3-0, the "outliving" case the previous
+  // round's fix left open): the card carries only the stage it was raised
+  // against (`expectedSourceStage`) and the stage it targets. If the task has
+  // since been carried past BOTH — not merely reached the destination, but
+  // gone further still — a stale click must not be treated as a fresh,
+  // legitimate jump: without a source guard, setTaskStage's own
+  // compare-and-set would see "current stage differs from destination" and
+  // happily move the task BACKWARD to the card's stale destination.
+  void it(
+    "refuses a stale click whose card has outlived a further transition, instead of moving the task backward",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub(store);
+      try {
+        const folderUri = makeTaskFolderUri("resume-and-set-stage-outlived");
+        const folderPath = folderUri.fsPath;
+        const progress: TaskProgress = {
+          taskFolder: "resume-and-set-stage-outlived",
+          // Neither the card's expected source (impl-high-review) nor its
+          // destination (impl-low-review) — the task was carried all the way
+          // to "publish" by other automation while this card sat unanswered
+          // and its best-effort withdrawal failed.
+          currentStage: "publish",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl-low-review",
+          expectedSourceStage: "impl-high-review",
+          resumeFastForward: true,
+        });
+
+        assert.strictEqual(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.setTaskStage"),
+          false,
+          "a stale card that has outlived a further transition must not even attempt the stage move"
+        );
+        assert.strictEqual(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "must not continue Fast Forward at the card's stale destination either"
+        );
+
+        const stored = await readStoredProgress(store, folderUri);
+        assert.strictEqual(
+          stored!.currentStage,
+          "publish",
+          "the task must not be moved backward to the card's stale destination"
+        );
+        // Review fix (2026-09-23, completion blocker
+        // c2453680-fe42-461b-9652-1f87445cb9d3-0): this fast path refuses
+        // without dispatching anything, so it must report that refusal as
+        // `false` (the boolean-refusal contract every dispatch closure in
+        // resumeThenDispatchV1 uses) so the "a refused dispatch puts the
+        // task back to paused" handling fires — leaving the task active with
+        // nothing arranged is exactly the state item 14 exists to prevent.
+        assert.strictEqual(
+          stored!.status,
+          "paused",
+          "a stale click that dispatches nothing further must leave the task paused, not active with nothing arranged"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  void it("dispatches nothing further when the stage move itself is refused, and does not claim the task was advanced", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    // Stub setTaskStage as a genuine no-op (simulating a refused transition,
+    // e.g. a lost compare-and-set or an unmet stage-entry requirement) —
+    // the re-read then still shows the OLD stage.
+    const execCmd = installExecuteCommandStub(store);
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<unknown> => {
+      execCmd.captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    try {
+      const folderUri = makeTaskFolderUri("resume-and-set-stage-refused");
+      const folderPath = folderUri.fsPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-and-set-stage-refused",
         currentStage: "impl",
         status: "paused",
         createdAt: "2026-08-24T00:00:00.000Z",
@@ -2847,18 +3123,20 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
       await resumeAndSetTaskStageV1(inv, currentStore, {
         taskFolderPath: folderPath,
         stage: "plan",
+        resumeFastForward: true,
       });
 
-      const stored = await readStoredProgress(store, folderUri);
-      assert.strictEqual(stored!.status, "active", "the task must actually be resumed");
-
-      const dispatch = execCmd.captured.find((e) => e.command === "vs-code-ai-helper.setTaskStage");
-      assert.ok(dispatch !== undefined, "must dispatch setTaskStage after resuming");
-
       assert.strictEqual(
-        stored!.nextActor,
-        undefined,
-        "a bare stage move must not assert nextActor: automation — that would be a guess this call site cannot verify"
+        execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+        false,
+        "a refused stage move must never continue Fast Forward at a stage the task never reached"
+      );
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.notStrictEqual(
+        stored!.currentStage,
+        "plan",
+        "precondition: the stub must not have actually moved the stage"
       );
     } finally {
       execCmd.restore();
@@ -2867,6 +3145,162 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
       wsFolders.restore();
     }
   });
+
+  // 2026-09-2x review completion blocker: `resumeThenDispatchV1` stamps
+  // `nextActor: "automation"` before this function's dispatch closure runs,
+  // on the assumption dispatch() is about to start a round. When the newly
+  // entered stage's planner instead resolves "blocked" or "resume-only" —
+  // nothing further to arrange automatically — that stamp is false and must
+  // be corrected to "human" rather than left standing, and the task must
+  // stay active (never re-paused: this is not a refusal of Advance itself).
+  void it(
+    "corrects nextActor to human, and leaves the task active, when the new stage's next step has nothing to " +
+      "arrange automatically",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub(store);
+      try {
+        const folderUri = makeTaskFolderUri("resume-and-set-stage-blocked");
+        const folderPath = folderUri.fsPath;
+        const progress: TaskProgress = {
+          taskFolder: "resume-and-set-stage-blocked",
+          currentStage: "plan-high-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+        // No plan-final.md is seeded, so entering "impl" leaves
+        // loadResumeActionPlanV1's runImplementation prerequisite unmet —
+        // a real, reachable "blocked" outcome (item 15's own scenario),
+        // independent of `nextActor`.
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl",
+          resumeFastForward: false,
+        });
+
+        const stored = await readStoredProgress(store, folderUri);
+        assert.strictEqual(stored!.currentStage, "impl", "precondition: the stub must have moved the stage");
+        assert.strictEqual(stored!.status, "active", "a legitimate human-next wait must not re-pause the task");
+        assert.strictEqual(
+          stored!.nextActor,
+          "human",
+          "the provisional 'automation' stamp must be corrected once nothing was actually arranged"
+        );
+
+        assert.strictEqual(
+          execCmd.captured.some(
+            (e) =>
+              e.command === "vs-code-ai-helper.runReviewWithAI" ||
+              e.command === "vs-code-ai-helper.applyCurrentStageAction" ||
+              e.command === "vs-code-ai-helper.fastForwardReviewWithAI"
+          ),
+          false,
+          "nothing may be dispatched at a stage whose next step is the human's"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // Review fix, 2026-09-23 (new completion blocker: "the second cancellation
+  // check forgets the unsafe result"). `setTaskStage` (dispatched below)
+  // already tried to stop whatever was running for the OUTGOING stage as
+  // part of committing this transition, and deposited its own, single
+  // `cancelResult` into `cancelResultOutV1` — including the case where the
+  // prior operation was only force-removed, not provably stopped
+  // (`forcedEnd: true`, folded into `ok: false`). This closure must read
+  // THAT result rather than re-deriving it, and must refuse to arrange any
+  // brand-new automated work on top of a stage move whose outgoing operation
+  // may still be writing underneath.
+  void it(
+    "does not dispatch further automated work when the deposited cancelResult reports an unsafe " +
+      "(forced-end) outcome, and corrects nextActor back to human",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub(store, {
+        ok: false,
+        forcedEnd: true,
+        reason:
+          "a previous Stop request was ignored for over a minute, so its row was force-removed — the work " +
+          "itself may still be running underneath. Confirm it has actually finished, then try again.",
+      });
+      try {
+        const folderUri = makeTaskFolderUri("resume-and-set-stage-forced-end");
+        const folderPath = folderUri.fsPath;
+        const progress: TaskProgress = {
+          taskFolder: "resume-and-set-stage-forced-end",
+          currentStage: "impl-high-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl-low-review",
+          resumeFastForward: true,
+        });
+
+        const stored = await readStoredProgress(store, folderUri);
+        assert.strictEqual(stored!.currentStage, "impl-low-review", "the stage move itself must still commit");
+        assert.strictEqual(
+          stored!.status,
+          "active",
+          "an unsafe cancellation result is not a refusal of the move itself — the task stays active"
+        );
+        assert.strictEqual(
+          stored!.nextActor,
+          "human",
+          "the provisional 'automation' stamp must be corrected back once no follow-up could safely be arranged"
+        );
+
+        assert.strictEqual(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "must not continue Fast Forward on top of a possibly still-running outgoing operation"
+        );
+        assert.strictEqual(
+          execCmd.captured.some(
+            (e) =>
+              e.command === "vs-code-ai-helper.runReviewWithAI" ||
+              e.command === "vs-code-ai-helper.applyCurrentStageAction"
+          ),
+          false,
+          "must not fall through to any other stage-default dispatch either"
+        );
+
+        assert.ok(
+          msgs.captured.some((m) => /could not be stopped/.test(m.message) && /No automatic follow-up was started/.test(m.message)),
+          "the unsafe cancellation outcome must be reported where the user is looking, not silently swallowed"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -3590,6 +4024,277 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
       "normalizeReviewArg: resolved task folderUri matches the supplied path"
     );
   });
+
+  // Review fix, 2026-09-23 (further narrowing of c2453680-fe42-461b-9652-1f87445cb9d3-0):
+  // the previous round's guard compared `expectedSourceStage` against a
+  // stage read by the CALLER (`resumeAndSetTaskStageV1`'s own non-atomic
+  // pre-check), then let `setTaskStage` go on to feed its OWN freshly-read
+  // `task.progress.currentStage` — not `expectedSourceStage` — as the CAS
+  // `sourceStage` to `enterStageV1`/`advanceStage`. That CAS then trivially
+  // "matched itself" (whatever `setTaskStage` had just read, compared to
+  // whatever `advanceStageLocked` re-reads a moment later under its lock,
+  // are the same value absent a true concurrent writer), so a card that had
+  // outlived a further transition — one neither the caller's pre-check nor
+  // this earlier fix's simulated tests ever exercised, because both only
+  // ever drove `setTaskStage` through a stub — could still be accepted as a
+  // fresh, legitimate jump FROM wherever the task had since moved TO the
+  // card's stale destination. This test calls PRODUCTION `setTaskStage`
+  // directly (no stub in front of it) with an `expectedSourceStage` that
+  // does NOT match the task's actual on-disk stage, proving the fix without
+  // needing a real concurrent writer: it demonstrates that `setTaskStage`'s
+  // own CAS is keyed on `expectedSourceStage`, not on whatever it happens to
+  // read moments before its lock — exactly the property that makes the CAS
+  // atomic against an interleaving transition, real or simulated.
+  void it(
+    "production setTaskStage refuses (and does not move the stage) when expectedSourceStage does not match " +
+      "the task's actual current stage, even though the requested destination differs from both",
+    async () => {
+      const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "set-stage-stale-expected-source");
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      try {
+        // The task is actually at "impl-low-review" — further along than
+        // both the stale card's remembered source ("impl") AND its
+        // destination ("impl-high-review"). A card built against "impl"
+        // asking to move to "impl-high-review" has outlived this.
+        const progress: TaskProgress = {
+          taskFolder: "set-stage-stale-expected-source",
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "impl-low-review",
+          "active"
+        );
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        const moved = await setTaskStage(
+          inv,
+          currentStore,
+          {
+            taskFolderPath: FOLDER_PATH,
+            stage: "impl-high-review",
+            expectedSourceStage: "impl",
+          },
+          "jump"
+        );
+
+        assert.strictEqual(
+          moved,
+          false,
+          "a stale expectedSourceStage must be refused, not treated as a fresh legitimate jump"
+        );
+
+        const persisted = JSON.parse(
+          nodeFs.readFileSync(nodePath.join(FOLDER_PATH, "task-progress.json"), "utf8")
+        ) as TaskProgress;
+        assert.strictEqual(
+          persisted.currentStage,
+          "impl-low-review",
+          "the task's actual current stage must be left untouched — moving it to impl-high-review here " +
+            "would be exactly the backward/sideways jump this fix exists to prevent"
+        );
+
+        assert.strictEqual(
+          execCmd.captured.length,
+          0,
+          "a refused transition must not dispatch any follow-up command (e.g. auto-review)"
+        );
+      } finally {
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
+
+  // Review fix (2026-09-23, closing the remaining half of completion blocker
+  // c2453680-fe42-461b-9652-1f87445cb9d3-0): the prior round's fix still did
+  // a fresh read, THEN cancelled, THEN attempted the CAS-protected write —
+  // three separate steps sharing no lock, so a stale command could still
+  // cancel a legitimate, unrelated operation before learning its own write
+  // would be refused. `cancelRunningOperationsForTask` is now called only
+  // after `enterStageV1` has already confirmed the transition committed, so
+  // a refused transition must never reach it at all. This test proves that
+  // directly against PRODUCTION `setTaskStage`, using the exact same stale
+  // `expectedSourceStage` fixture as the test above (whose own CAS is
+  // refused), by stubbing `cancelRunningOperationsForTask` and asserting it
+  // is never invoked.
+  void it(
+    "production setTaskStage never calls cancelRunningOperationsForTask when its own CAS is refused " +
+      "(closes the remaining cancel-before-CAS race, blocker c2453680-fe42-461b-9652-1f87445cb9d3-0)",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "set-stage-stale-no-cancel"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      const origCancel = taskOperationsModule.cancelRunningOperationsForTask;
+      let cancelCallCount = 0;
+      taskOperationsModule.cancelRunningOperationsForTask = (): Promise<{
+        ok: boolean;
+        reason?: string;
+      }> => {
+        cancelCallCount++;
+        return Promise.resolve({ ok: true });
+      };
+
+      try {
+        // Same stale-card shape as the test above: the task is actually at
+        // "impl-low-review", further along than the stale card's remembered
+        // source ("impl"), so enterStageV1's CAS is refused.
+        const progress: TaskProgress = {
+          taskFolder: "set-stage-stale-no-cancel",
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "impl-low-review",
+          "active"
+        );
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        const moved = await setTaskStage(
+          inv,
+          currentStore,
+          {
+            taskFolderPath: FOLDER_PATH,
+            stage: "impl-high-review",
+            expectedSourceStage: "impl",
+          },
+          "jump"
+        );
+
+        assert.strictEqual(moved, false, "the refused transition must not report success");
+        assert.strictEqual(
+          cancelCallCount,
+          0,
+          "cancelRunningOperationsForTask must never run when enterStageV1's CAS refuses the write — " +
+            "there is no longer a read-then-cancel window that could reach it for a stale command"
+        );
+      } finally {
+        taskOperationsModule.cancelRunningOperationsForTask = origCancel;
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
+
+  // Companion to the test above: proves the OTHER half of the reordering —
+  // when the transition genuinely commits, cancellation still runs (nothing
+  // was lost by moving it), and it runs strictly AFTER the new stage is
+  // already durably persisted, never before. The stub reads the real
+  // on-disk stage at the moment it is invoked to prove the ordering, rather
+  // than merely asserting call counts.
+  void it(
+    "production setTaskStage calls cancelRunningOperationsForTask only after its own transition has " +
+      "already committed the new stage to disk",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "set-stage-commit-then-cancel"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+      const progressFilePath = nodePath.join(FOLDER_PATH, "task-progress.json");
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      const origCancel = taskOperationsModule.cancelRunningOperationsForTask;
+      let stageOnDiskWhenCancelRan: string | undefined;
+      let cancelCallCount = 0;
+      taskOperationsModule.cancelRunningOperationsForTask = (): Promise<{
+        ok: boolean;
+        reason?: string;
+      }> => {
+        cancelCallCount++;
+        const onDisk = JSON.parse(nodeFs.readFileSync(progressFilePath, "utf8")) as TaskProgress;
+        stageOnDiskWhenCancelRan = onDisk.currentStage;
+        return Promise.resolve({ ok: true });
+      };
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "set-stage-commit-then-cancel",
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "impl-low-review",
+          "active"
+        );
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        const moved = await setTaskStage(
+          inv,
+          currentStore,
+          {
+            taskFolderPath: FOLDER_PATH,
+            stage: "impl-high-review",
+            expectedSourceStage: "impl-low-review",
+          },
+          "jump"
+        );
+
+        assert.strictEqual(moved, true, "a matching expectedSourceStage must commit the transition");
+        assert.strictEqual(cancelCallCount, 1, "cancellation must still run for a genuine transition");
+        assert.strictEqual(
+          stageOnDiskWhenCancelRan,
+          "impl-high-review",
+          "cancelRunningOperationsForTask must observe the NEW stage already durably persisted — " +
+            "proving it ran after enterStageV1 committed, not before or racing it"
+        );
+      } finally {
+        taskOperationsModule.cancelRunningOperationsForTask = origCancel;
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------

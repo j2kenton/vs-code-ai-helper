@@ -19,7 +19,7 @@ import {
 import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
-import { runTrackedOperation } from "../utils/taskOperations";
+import { CancelRunningOperationsResultV1, runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
@@ -605,12 +605,13 @@ export async function resumePausedTask(
  * implementation round (or an admission-wired stage action) the task did not
  * have running a moment ago — the same fact the generic resume's own
  * `scheduledRun` arming and `scheduleTaskResume`/`scheduleQuotaResumeAtV1`
- * already record at their own arming sites. `resumeAndSetTaskStageV1` passes
- * `false`: its `dispatch` only moves `currentStage` (`setTaskStage`), which
- * does not itself start a round — asserting `"automation"` there would be a
- * guess this function cannot verify (the correct value depends on whether the
- * entered stage's default action auto-dispatches, which is `advanceStage`'s
- * own still-open stage-transition chokepoint, not this one's to pre-empt).
+ * already record at their own arming sites. `resumeAndSetTaskStageV1` used to
+ * pass `false` here on the grounds that its `dispatch` only moved
+ * `currentStage` (`setTaskStage`), which did not itself start a round; it now
+ * uses the default `true` (pre-1.0.0 fixes register, Part 3 Step 3 — "advance"
+ * is a `continue` option, so its `dispatch` closure arranges the destination
+ * stage's follow-up action itself, below, rather than being a bare stage
+ * move), and the stamp is still only provisional — see the paragraph below.
  *
  * The `"automation"` stamp above is provisional, not final (2026-09-17 review
  * completion blocker): once `dispatch()` resolves, a `false` result — the
@@ -1123,11 +1124,30 @@ export async function resumeAndApplyCurrentStageActionV1(
  * actually reached "active", so a failed/declined resume does not also throw
  * a confusing "task is paused" message on top of whatever `resumePausedTask`
  * already told the user.
+ *
+ * Pre-1.0.0 fixes register, item 14 / Part 3 Step 3: "Advance", chosen while
+ * a Fast Forward run is interrupted, must CONTINUE that run at the new
+ * stage, not merely move a field and leave nothing running (the reported
+ * defect — the task sat idle at the new stage until the watchdog paused it
+ * again). `explicitArg.resumeFastForward` is baked into the option's own
+ * args at card-build time (`buildAdvanceOptionV1`), from whether Fast
+ * Forward was genuinely mid-run for this task when the card was posted — see
+ * `activeFastForwardRunsV1.ts`'s doc comment for why that has to be captured
+ * then, not re-derived now. When it was, this dispatches
+ * `fastForwardReviewWithAI` at the new stage; otherwise it dispatches the
+ * new stage's own default action, resolved by `loadResumeActionPlanV1` —
+ * the same resolution `resumeAndApplyCurrentStageActionV1` above uses.
  */
 export async function resumeAndSetTaskStageV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
-  explicitArg: (ResumeTaskArg & { stage?: TaskStage }) | undefined
+  explicitArg:
+    | (ResumeTaskArg & {
+        stage?: TaskStage;
+        resumeFastForward?: boolean;
+        expectedSourceStage?: TaskStage;
+      })
+    | undefined
 ): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
   const target = await resolveTaskContext(
@@ -1140,6 +1160,8 @@ export async function resumeAndSetTaskStageV1(
     return;
   }
   const stage = explicitArg.stage;
+  const resumeFastForward = explicitArg.resumeFastForward === true;
+  const expectedSourceStage = explicitArg.expectedSourceStage;
   // arrangeStageDispatch: false — this function dispatches setTaskStage
   // itself, below, which is a stage MOVE, not a rerun of the current stage's
   // action; a durably arranged current-stage action would be actively wrong
@@ -1149,22 +1171,204 @@ export async function resumeAndSetTaskStageV1(
   // admission-wired on its own (separate, still-open plan item), but that is
   // not a conflict here — it never calls acquireOrAdoptWorkAdmissionV1, so
   // holding through its dispatch can only add protection, not refuse it.
-  // dispatchesAutomationWork: false (v1 fixes 2, Wave I chokepoint) — a bare
-  // stage MOVE does not itself start a round; whether the destination
-  // stage's default action then auto-dispatches is `advanceStage`'s own
-  // still-unwired stage-transition chokepoint to answer, not a guess this
-  // call site should make.
+  // dispatchesAutomationWork now defaults to true (Part 3 Step 3 — this used
+  // to pass `false` here, on the grounds that a bare stage MOVE does not
+  // itself start a round; it no longer is bare, since this dispatch closure
+  // now arranges the follow-up action itself, below).
   await resumeThenDispatchV1(
     inventory,
     currentTaskStore,
     explicitArg,
     target.taskFolderPath,
-    () =>
-      vscode.commands.executeCommand("vs-code-ai-helper.setTaskStage", {
-        taskFolderPath: target.taskFolderPath,
-        stage,
-      }),
-    { dispatchesAutomationWork: false }
+    async (admissionHandoffToken) => {
+      // Review blocker (2026-09-23, narrowed c2453680-fe42-461b-9652-1f87445cb9d3-0,
+      // now closed): a stale click can only be legitimate while the task is
+      // still at `expectedSourceStage` (the stage this card was raised
+      // against) OR has already been carried to `stage` by an independent
+      // automatic advance (the ordinary race the earlier fix handles) — a
+      // task that has moved to any THIRD stage means the card has outlived a
+      // further transition and must be refused, not acted on.
+      //
+      // The read below is a best-effort FAST PATH only — it can save a round
+      // trip through `setTaskStage` for the common "obviously stale" case,
+      // but it is NOT where this is actually enforced: there is still a
+      // window between this read and `setTaskStage`'s own read in which an
+      // independent transition could carry the task to that third stage
+      // unnoticed by both. The real enforcement is atomic and lives one
+      // level down — `expectedSourceStage` is passed straight through as the
+      // `sourceStage` CAS `setTaskStage` feeds to `enterStageV1`/
+      // `advanceStage`, so the ONLY read that matters is the one performed
+      // under `advanceStageLocked`'s own lock hold (`stageTransition.ts`),
+      // compared against the stage this card actually knows about — see
+      // `setTaskStage`'s `enterStageV1` call site for the full comment.
+      // Older persisted decisions from before this field existed carry no
+      // `expectedSourceStage`; those are read as "no guard" (unchanged prior
+      // behaviour) rather than refused outright, since there is nothing
+      // stale to compare against.
+      if (expectedSourceStage !== undefined) {
+        const preCheck = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+        if (
+          preCheck.ok &&
+          preCheck.decoded.progress.currentStage !== expectedSourceStage &&
+          preCheck.decoded.progress.currentStage !== stage
+        ) {
+          const staleTaskName = preCheck.decoded.progress.displayName ?? target.folderName;
+          NotificationRouter.showWarning(
+            `"Advance to ${STAGE_DISPLAY_NAMES[stage]}" no longer applies — ${staleTaskName} has since moved on ` +
+              `to ${STAGE_DISPLAY_NAMES[preCheck.decoded.progress.currentStage]}. No stage change was made.`
+          );
+          // Review fix (2026-09-23, completion blocker
+          // c2453680-fe42-461b-9652-1f87445cb9d3-0): this fast path refused
+          // without dispatching anything — it must report that refusal as
+          // `false`, the same boolean-refusal contract `applyCurrentStageAction`
+          // and `goToReviewAndApplyV1` use, so `resumeThenDispatchV1`'s own
+          // "a refused dispatch puts the task back to paused" handling
+          // (just below the `dispatch()` call in that function) fires.
+          // Reporting `true` here left `resumeThenDispatchV1` treat this as
+          // success — the task was already resumed to active by the time
+          // this closure ran, so a stale click would leave it active with
+          // `nextActor: automation` stamped and nothing running: exactly the
+          // "active with nothing arranged" state item 14 exists to prevent.
+          return false;
+        }
+      }
+      // Review fix (2026-09-23, new completion blocker: "the second
+      // cancellation check forgets the unsafe result"). `setTaskStage`
+      // (below) already calls `cancelRunningOperationsForTask` once, as part
+      // of committing the transition. This box is how THIS caller learns
+      // that call's result, rather than calling `cancelRunningOperationsForTask`
+      // a second time — a second call is blind to a forced end: the moment
+      // `forceEndSubtreeV1` fires (inside the FIRST call), it removes the
+      // operation row, so a second call would find an empty registry and
+      // report `{ ok: true }`, silently discarding the "the work may still be
+      // running underneath" signal the first call already observed. See
+      // `SetTaskStageArg.cancelResultOutV1`'s doc comment in setTaskStage.ts.
+      const cancelResultBox: { current?: CancelRunningOperationsResultV1 } = {};
+      const movedByThisCall = await vscode.commands.executeCommand<boolean>(
+        "vs-code-ai-helper.setTaskStage",
+        {
+          taskFolderPath: target.taskFolderPath,
+          stage,
+          // Omitted entirely (not just `undefined`-valued) when this card
+          // carries none, so an older-shaped decision's dispatch keeps the
+          // exact same argument shape as before this fix.
+          ...(expectedSourceStage !== undefined ? { expectedSourceStage } : {}),
+          cancelResultOutV1: cancelResultBox,
+        }
+      );
+      // Re-read to learn the outcome: setTaskStage's own refusal paths (a
+      // lost compare-and-set, an unmet stage-entry requirement such as a
+      // missing plan-final.md, or a read/write failure) already notified the
+      // user directly — this only needs to know whether the stage genuinely
+      // ended up at the destination before arranging anything further.
+      const reread = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+      if (!reread.ok || reread.decoded.progress.currentStage !== stage) {
+        return false;
+      }
+      // Race-safety fix (review finding, narrowed blocker
+      // c2453680-fe42-461b-9652-1f87445cb9d3-0): the task can be sitting at
+      // `stage` here for two different reasons — THIS call moved it there, or
+      // an automatic advance (the same score/threshold check this option's
+      // card derives from) got there first, independently, and this option
+      // arrived after — whether because the card's best-effort withdrawal
+      // lost the race to the click, or the withdrawal itself failed. Trusting
+      // "the destination stage is current" alone (the old check, above) could
+      // not tell those apart, so a stale click re-dispatched the destination
+      // stage's action A SECOND TIME on top of whatever the automatic advance
+      // had already started. `setTaskStage`'s own boolean return is
+      // authoritative about which case this is — it reports `false` exactly
+      // when the task was already on the requested stage before this call —
+      // so when it did NOT move anything, there is nothing further to
+      // arrange: stop here and report success (nothing was refused; the
+      // destination was simply already reached), not a fresh dispatch.
+      if (movedByThisCall !== true) {
+        return true;
+      }
+      // Review fix (2026-09-23, completion blocker on the commit-then-cancel
+      // ordering `setTaskStage`'s own `enterStageV1` call site uses): that
+      // call already tried to stop whatever was running for the OUTGOING
+      // stage, and this caller is about to arrange its own brand-new
+      // automated work (Fast Forward, or the destination stage's default
+      // action) on top of the same, already-moved task, so it must gate that
+      // dispatch on whether cancellation actually succeeded — mirroring the
+      // "commit stands, follow-up dispatch requires a confirmed stop" rule
+      // `nextStage` (the other stage-advancing writer) already applies.
+      //
+      // This reads `cancelResultBox` — the result `setTaskStage` itself
+      // deposited while performing that cancellation — rather than calling
+      // `cancelRunningOperationsForTask` a second time (fixed 2026-09-23,
+      // narrowed completion blocker c2453680-fe42-461b-9652-1f87445cb9d3-0):
+      // a second call cannot observe a forced end that already fired during
+      // the FIRST call, because `forceEndSubtreeV1` removes the operation row
+      // the moment it fires — a second call on the now-empty registry read
+      // `{ ok: true }`, silently discarding exactly the "the work may still
+      // be running underneath" signal this gate exists to catch. The box is
+      // guaranteed to be populated whenever `movedByThisCall === true` (every
+      // return-true path in `setTaskStage` runs after the deposit); the
+      // fallback below only guards against that invariant being broken by a
+      // future refactor, and fails closed (no dispatch) rather than assuming
+      // success.
+      const advanceCancelResult: CancelRunningOperationsResultV1 = cancelResultBox.current ?? {
+        ok: false,
+        reason: "the stage-transition command did not report a cancellation result.",
+      };
+      if (!advanceCancelResult.ok) {
+        await patchTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath), (p) =>
+          setNextActorV1(p, "human")
+        );
+        NotificationRouter.showWarning(
+          `Moved to ${STAGE_DISPLAY_NAMES[stage]}, but a previously running operation for the prior stage could ` +
+            `not be stopped: ${advanceCancelResult.reason} No automatic follow-up was started — stop the stale ` +
+            `operation from its Notifications row (or wait for it to actually finish), then use the stage's own ` +
+            `action to continue.`
+        );
+        return true;
+      }
+      if (resumeFastForward) {
+        await vscode.commands.executeCommand("vs-code-ai-helper.fastForwardReviewWithAI", {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+        });
+        return true;
+      }
+      const plan = await loadResumeActionPlanV1(target.taskFolderPath, reread.decoded.progress);
+      if (plan.kind === "blocked" || plan.kind === "resume-only") {
+        // The stage move itself succeeded; there is simply nothing further
+        // to arrange automatically at the new stage (e.g. its next step is
+        // the human's) — not a refusal of the Advance option itself, so this
+        // says so directly rather than through resumeThenDispatchV1's
+        // generic "the action it arranged could not start" refusal text.
+        //
+        // 2026-09-2x review completion blocker: `resumeThenDispatchV1`
+        // already stamped `nextActor: "automation"` before this closure ran
+        // (`dispatchesAutomationWork` defaults to `true`), on the assumption
+        // that `dispatch()` was about to start a round. Here it was not —
+        // the new stage's next step is the human's — so that stamp is now
+        // false and must be corrected directly, to "human", rather than left
+        // standing. Returning `true` (this is not a refusal) means
+        // `resumeThenDispatchV1`'s own `false`-only clearing branch never
+        // runs and would be wrong here anyway: it also re-pauses the task,
+        // which this state must not do (item 6/16/25: a legitimate
+        // human-next wait is `status: active`, not paused).
+        await patchTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath), (p) =>
+          setNextActorV1(p, "human")
+        );
+        NotificationRouter.showInformation(
+          `Moved to ${STAGE_DISPLAY_NAMES[stage]}. ${plan.kind === "blocked" ? plan.precondition : plan.reason}`
+        );
+        return true;
+      }
+      const result = await vscode.commands.executeCommand(
+        plan.kind === "run-review"
+          ? "vs-code-ai-helper.runReviewWithAI"
+          : "vs-code-ai-helper.applyCurrentStageAction",
+        {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+        }
+      );
+      return plan.kind === "run-review" ? result === true : result !== false;
+    }
   );
 }
 
@@ -1281,7 +1485,7 @@ export function registerResumeTaskCommand(
 
   const resumeAndSetTaskStage = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndSetTaskStage",
-    (arg?: ResumeTaskArg & { stage?: TaskStage }) =>
+    (arg?: ResumeTaskArg & { stage?: TaskStage; resumeFastForward?: boolean }) =>
       resumeAndSetTaskStageV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndSetTaskStage);

@@ -1265,10 +1265,14 @@ void describe("nextStage (Complete Stage & Move On) — offers Restore Last Usab
         `expected an unusable-summary warning on the Notifications surface; got: ${JSON.stringify(entries)}`
       );
       assert.match(warning.message, /Restore the last usable summary/);
+      // Run Implementation takes priority as the toast's one action button
+      // when both it and Restore apply (2026-09-24 review, narrowed
+      // completion blocker) — Restore stays reachable via the tree row and
+      // the "Restore Last Usable Summary" command.
       assert.deepEqual(warning.actionCommand, {
-        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-        title: "Restore Last Usable Summary",
-        args: [folderPath, "impl-high-review", "vs-code-ai-helper.runReviewWithAI"],
+        command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+        title: "Run Implementation",
+        args: [{ taskFolderPath: folderPath }],
       });
 
       assert.equal(

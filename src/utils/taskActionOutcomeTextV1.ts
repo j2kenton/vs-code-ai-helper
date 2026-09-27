@@ -75,9 +75,21 @@ export function describeTaskActionOutcomeForLogV1(
     case "cancelled":
       return `Status: cancelled (${outcome.code})${providerLogSuffix(outcome.provider)}`;
     case "failed":
+      // Pre-1.0.0 fixes register, Part 4 Step 8: an `attemptIdentityAttachmentFailed`
+      // failure's `.detail` (see `formatIdentityAttachmentFailureDetailV1`,
+      // taskActionCoordinatorV1.ts, and the `wrongOwner` message built in
+      // `attachCoordinatorIdentityToRoundV1`, roundLedgerV1.ts) already names
+      // both operation ids for a `wrongOwner` failure; append this failing
+      // (second) attempt's own `actionKey`/`operationId` from `correlation`
+      // here so a run log line records that too, without requiring a reader
+      // to cross-reference the round ledger by hand.
       return `Status: failed (code=${outcome.code}${
         outcome.detail ? `: ${outcome.detail}` : ""
-      }, retryable=${outcome.retryable})${providerLogSuffix(outcome.provider)}`;
+      }, retryable=${outcome.retryable})${
+        outcome.code === "attemptIdentityAttachmentFailed" && outcome.correlation
+          ? ` [actionKey=${outcome.correlation.actionKey}, operationId=${outcome.correlation.operationId}]`
+          : ""
+      }${providerLogSuffix(outcome.provider)}`;
     case "malformedResult":
       return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":

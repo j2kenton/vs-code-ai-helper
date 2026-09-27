@@ -1846,6 +1846,40 @@ void describe("taskActionCoordinatorV1", () => {
   );
 
   void it(
+    "a wrongOwner identity-attachment failure's detail tells the user the stage can simply be " +
+      "re-run, not only the round-ledger row id (pre-1.0.0 fixes register, Part 4 Step 8)",
+    async () => {
+      const harness = makeHarness([]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onAttemptAllocated: () =>
+          Promise.reject(
+            new AttachCoordinatorIdentityErrorV1("wrongOwner", "round ledger row r-1 belongs to another operation")
+          ),
+      });
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "attemptIdentityAttachmentFailed");
+        assert.equal(outcome.retryable, false);
+        // The original bookkeeping classification/detail is kept verbatim as
+        // a prefix (other tooling may still key on it), with user-facing
+        // guidance appended — not replaced.
+        const detail = outcome.detail ?? "";
+        assert.ok(
+          detail.startsWith("wrongOwner: round ledger row r-1 belongs to another operation"),
+          `expected the original wrongOwner detail to be kept verbatim as a prefix, got: ${detail}`
+        );
+        assert.match(
+          detail,
+          /this stage can simply be re-run/,
+          "a wrongOwner failure must tell the user re-running the stage's action resolves it"
+        );
+      }
+      assert.equal(harness.selection.reserved, 0, "a genuine ownership violation must prevent provider reservation");
+    }
+  );
+
+  void it(
     "proceeds to invoke the provider (degraded provenance, not a failed round) when the " +
       "attach hook reports only a transient writerRetriesExhausted — 2026-09-15 post-freeze " +
       "findings, item 2: \"an admission gate should guard correctness, not bookkeeping\"",

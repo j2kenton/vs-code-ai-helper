@@ -4,7 +4,7 @@ import { isViewerHostV1 } from "../state/hostRoleV1";
 import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { normalizePath } from "../utils/taskRoot";
-import { isReviewStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { isReviewStage, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
@@ -56,6 +56,7 @@ import {
 } from "../utils/effectiveReviewProgress";
 import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
+import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
 import {
   deriveOwedContinuationRecordV1,
   deriveSchedulingPostureV1,
@@ -2735,6 +2736,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // required "unknown" statement, exactly the "absence is never positive
     // evidence" defect this contract exists to prevent).
     let schedulingPostureLine: string | undefined;
+    // Hoisted out of the try block below so the badge (further down, after
+    // this block) can apply the same item-16 `isWaitingForHumanV1` fallback
+    // the footer line applies — `progress` itself stays block-scoped to the
+    // read that produced it. Left `undefined` for the global assistant, and
+    // for any render whose progress read failed or never ran, so the badge
+    // fallback only ever fires from a real, freshly read `TaskProgress`.
+    let progressForBadgeFallback: TaskProgress | undefined;
     if (target && target.kind !== "global") {
       try {
         const progressResult = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
@@ -2747,6 +2755,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // explicit `unknown` fallback instead whenever the read did not
         // succeed.
         const progress = progressResult.ok ? progressResult.decoded.progress : undefined;
+        progressForBadgeFallback = progress;
         const owedSource = progress?.implRecovery
           ? {
               reason: progress.implRecovery.reason,
@@ -2780,13 +2789,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // still positive evidence and is preferred over forcing `unknown`;
         // only a ledger that has NEVER recorded anything for this task
         // degrades to `unknown` via `owedContinuationUnknown` below.
-        const posture = deriveSchedulingPostureV1({
-          entries: this.schedulingIntentStore.listForTask(target.canonicalId),
-          owedContinuation: deriveOwedContinuationRecordV1(target.canonicalId, ledgerOwedSource),
-          hasCoverage: this.schedulingIntentStore.hasCoverage(target.canonicalId),
-          inFlight: taskOperations.hasRootOperationForTask(target.canonicalId),
-          owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
-        });
+        const posture = withWaitingForHumanFallbackV1(
+          deriveSchedulingPostureV1({
+            entries: this.schedulingIntentStore.listForTask(target.canonicalId),
+            owedContinuation: deriveOwedContinuationRecordV1(target.canonicalId, ledgerOwedSource),
+            hasCoverage: this.schedulingIntentStore.hasCoverage(target.canonicalId),
+            inFlight: taskOperations.hasRootOperationForTask(target.canonicalId),
+            owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
+          }),
+          progress
+        );
         schedulingPostureLine = formatChatSchedulingPostureLineV1(posture, progress?.implRecovery?.leaseUntil);
       } catch {
         // A failure deriving the posture is exactly the "cannot establish
@@ -2805,13 +2817,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // views badge unread/actionable counts. It asserts the exact same claim
     // as the `waitingForUser` banner ("something needs you right now"), just
     // on a different widget, so it is held to the identical AC3 rule: only a
-    // live `taskOperations` entry may justify it. A pending question, open
-    // interaction, or pending decision with no live operation behind it
-    // (e.g. after a window reload) is real and still renders in the panel
-    // body either way — it just no longer lights this badge, since nothing
-    // live is actually happening right now.
+    // live `taskOperations` entry, OR item 16's `isWaitingForHumanV1` (the
+    // register's "a task whose nextActor is human shows that where the user
+    // looks", implemented via `withWaitingForHumanFallbackV1` for the tree
+    // row/status bar/footer line above), may justify it. The latter is not
+    // the leak AC3's rework removed: it is not "any unresolved chat record",
+    // it is a narrower, independently-grounded fact read fresh from
+    // `TaskProgress` itself — `status === "active"`, `nextActor === "human"`,
+    // and nothing owed, scheduled or already running — so a pending
+    // question, open interaction, or pending decision with no live operation
+    // and no such task-level fact behind it still does not light this badge.
+    //
+    // 2026-09-24 review: `busy` (a live, non-waiting operation) is derived
+    // independently from `targetOps` above and was not excluded here — only
+    // `!waitingForUser` was checked — so a task with a live, ordinarily busy
+    // operation (one that has not yet, or never will, open a round-ledger
+    // row, which is what `isWaitingForHumanV1` itself checks) could still
+    // read `nextActor: human` from a not-yet-updated `TaskProgress` and light
+    // "Waiting for you" while the busy banner was also showing. The tree
+    // row's own use of this same fact (`taskTreeProvider.ts`, `StageNode`)
+    // gates it on there being no live operation for the task at all
+    // (`taskOperations.getTaskOperations(tKey).length === 0`); mirror that
+    // here via `targetOps`, the chat panel's equivalent list, rather than
+    // `!waitingForUser` alone.
     if (this.view) {
-      this.view.badge = waitingForUser ? { value: 1, tooltip: "Waiting for your answer" } : undefined;
+      const waitingForYouFallback =
+        targetOps.length === 0 &&
+        progressForBadgeFallback !== undefined &&
+        isWaitingForHumanV1(progressForBadgeFallback);
+      this.view.badge = waitingForUser
+        ? { value: 1, tooltip: "Waiting for your answer" }
+        : waitingForYouFallback
+          ? { value: 1, tooltip: "Waiting for you" }
+          : undefined;
     }
     await this.view?.webview.postMessage({
       type: "state",

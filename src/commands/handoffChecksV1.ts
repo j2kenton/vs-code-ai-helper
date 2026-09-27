@@ -87,6 +87,7 @@ export function buildHandoffChecksDecisionInputV1(input: {
     options: [
       ...listed.map((check, index) => ({
         optionId: `tick-${index}`,
+        resumeKind: "continue" as const,
         label: `Ticked: ${truncateChecklistItemTextV1(check, 80)}`,
         consequence:
           "Asks for a short note of what you saw, then ticks this check in plan-final.md with that note beside it. " +
@@ -99,6 +100,7 @@ export function buildHandoffChecksDecisionInputV1(input: {
       })),
       {
         optionId: "acceptRest",
+        resumeKind: "continue",
         label: `Accept the ${n === 1 ? "remaining check" : `remaining ${n} checks`}`,
         consequence:
           `Ticks ${n === 1 ? "it" : `all ${n}`} in plan-final.md, noting that you accepted ${n === 1 ? "it" : "them"} ` +
@@ -111,6 +113,7 @@ export function buildHandoffChecksDecisionInputV1(input: {
       },
       {
         optionId: "notYet",
+        resumeKind: "unpause",
         label: "Not yet — I'll do the checks first",
         consequence: "Ticks nothing. The checks stay listed — this card comes straight back — and the task keeps waiting for you.",
         // A command, not `doNothing`: a decision resolves the moment an option
@@ -202,6 +205,17 @@ export interface HandoffCommandIoV1 {
   refresh(): Promise<void>;
   /** Posts the successor card listing what is still outstanding. */
   repost(arg: HandoffChecksArgV1, remaining: readonly string[]): Promise<void>;
+  /**
+   * "Try again" for a `continue` option once nothing remains outstanding
+   * (pre-1.0.0 fixes register, Part 3 Step 2's inventory note for this file:
+   * "Ensemble performs the adjustment, so continue under Step 5's rule" —
+   * Step 5's rule is "after the adjustment succeeds, dispatch the current
+   * stage's next action"). Ticking is itself real dispatched work (it writes
+   * plan-final.md) whether or not this fires; this is what closes the loop
+   * once the LAST hand-off check is settled, instead of leaving the task
+   * sitting on a now-cleared gate with nothing running.
+   */
+  dispatchStageAction(arg: HandoffChecksArgV1): Promise<void>;
 }
 
 async function readRemainingV1(taskFolderPath: string): Promise<readonly string[]> {
@@ -243,7 +257,8 @@ async function settleAndRepostV1(
   if (remaining.length > 0) {
     await io.repost(arg, remaining);
   } else if (result.kind === "ticked") {
-    NotificationRouter.showInformation("Every hand-off check is settled — plan-final.md has nothing left for you to tick.");
+    NotificationRouter.showInformation("Every hand-off check is settled — plan-final.md has nothing left for you to tick. Trying the stage's next action now.");
+    await io.dispatchStageAction(arg);
   }
   return result.kind === "ticked";
 }
@@ -318,6 +333,11 @@ export function registerHandoffChecksCommandsV1(context: vscode.ExtensionContext
         reason: `${remaining.length} hand-off check${plural ? "" : "s"} still need${plural ? "s" : ""} you.`,
         checks: remaining,
       }).catch(() => false);
+    },
+    dispatchStageAction: async (arg) => {
+      await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+        taskFolderPath: arg.taskFolderPath,
+      });
     },
   };
   context.subscriptions.push(

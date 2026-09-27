@@ -39,6 +39,23 @@ function indexOfAll(needle: string): number[] {
   return indices;
 }
 
+/**
+ * Finds `needle` after `fromIdx` regardless of how the source wraps
+ * whitespace between its tokens (`\s+` tolerates both a single space and a
+ * multi-line indented break) — a plain `String.indexOf` on a literal
+ * snippet breaks the moment reformatting (or an inserted comment/field)
+ * pushes tokens that used to sit on one line onto separate lines.
+ */
+function indexOfFlexible(needle: string, fromIdx = 0): number {
+  const pattern = needle
+    .split(/\s+/)
+    .filter((token) => token.length > 0)
+    .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("\\s+");
+  const match = new RegExp(pattern).exec(source.slice(fromIdx));
+  return match ? fromIdx + match.index : -1;
+}
+
 void describe("reviewActions.ts stage-activity instrumentation", () => {
   void it("defines reportStageStartingV1 and reportStageRunningV1 as thin reportActivity wrappers, shared from taskOperations.ts", () => {
     // Moved out of reviewActions.ts into taskOperations.ts so
@@ -103,7 +120,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   });
 
   void it("reports 'starting' at the top of the Run Implementation operation, and 'running' right before executeImplementationRun", () => {
-    const runImplLabel = source.indexOf('{ label: stepNameV1("implementation"), stage: "impl"');
+    const runImplLabel = indexOfFlexible('{ label: stepNameV1("implementation"), stage: "impl"');
     assert.ok(runImplLabel >= 0, "expected the Run Implementation runTrackedOperation call");
 
     const startingIdx = source.indexOf("reportStageStartingV1(op, model.modelId);", runImplLabel);
@@ -323,23 +340,6 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
     });
 
-    /**
-     * Finds `needle` after `fromIdx` regardless of the file's line-ending
-     * style (`\s+` tolerates both `\n` and `\r\n` between tokens) — plain
-     * `String.indexOf` on a literal multi-line string is brittle against
-     * that, and IS the line-ending mismatch that broke this test's first
-     * draft.
-     */
-    function indexOfFlexible(needle: string, fromIdx = 0): number {
-      const pattern = needle
-        .split(/\s+/)
-        .filter((token) => token.length > 0)
-        .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("\\s+");
-      const match = new RegExp(pattern).exec(source.slice(fromIdx));
-      return match ? fromIdx + match.index : -1;
-    }
-
     void it("Apply Review Edit / apply-review-code dispatch reports it right after its context pack resolves", () => {
       const contextIdx = source.indexOf(
         "const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);"
@@ -452,7 +452,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       // the identical `generateContextPack(resolved.folderUri,
       // workspaceRoot.uri)` call shape but lives earlier in the file, so an
       // unanchored search would match that occurrence instead of this one.
-      const runImplLabel = source.indexOf('{ label: stepNameV1("implementation"), stage: "impl"');
+      const runImplLabel = indexOfFlexible('{ label: stepNameV1("implementation"), stage: "impl"');
       assert.ok(runImplLabel >= 0, "expected the Run Implementation runTrackedOperation call");
       const contextIdx = indexOfFlexible(
         "const contextPackContent = await generateContextPack( resolved.folderUri, workspaceRoot.uri );",

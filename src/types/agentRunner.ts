@@ -35,6 +35,16 @@ export interface AgentRunRequest {
   prompt: string;
   outputFile: vscode.Uri;
   modelId?: string;
+  /**
+   * The admission lock's own claim id (`WorkAdmissionHandleV1.claimId`),
+   * when the caller currently holds one for this task. Lets a CLI-backed
+   * runner record the provider processes it spawns next to that lock
+   * (`roundProcessRecordV1.ts`, 1.0 RC1 Part B item 2), so a dead-owner
+   * cleanup can later confirm those processes are gone before releasing it.
+   * Undefined when no lock is held by the caller — recording is then
+   * skipped, matching today's behavior.
+   */
+  roundProcessClaimId?: string;
 }
 
 /**

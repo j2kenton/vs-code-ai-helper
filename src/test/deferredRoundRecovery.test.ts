@@ -44,6 +44,7 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { StatusTreeProvider } from "../views/statusView";
+import { enterStageV1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
@@ -69,6 +70,16 @@ import {
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+
+// Part 3, Step 5: `applyReviewerVerifiedTicksConfirmedV1` (invoked directly
+// below, as the "Apply" decision option would) now dispatches
+// "vs-code-ai-helper.resumeAndApplyCurrentStageAction" on success. The vscode
+// test stub throws for an unregistered command id, so — mirroring
+// applyReviewerVerifiedTicksCommand.test.ts's identical module-scope stub —
+// register a no-op handler here too, or this file's own call into that
+// confirmed path would fail closed on ground truth for a reason unrelated to
+// what this suite actually covers.
+vscode.commands.registerCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", () => undefined);
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
@@ -1318,6 +1329,93 @@ void describe("round file attribution (end to end)", () => {
     assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"]);
     const logs = readRunLogs(folderPath);
     assert.doesNotMatch(logs[0]!, /## Unattributed workspace changes/);
+  });
+});
+
+/**
+ * Pre-1.0.0 fixes register, Part 1 (item 15): the move onto "impl" that used
+ * to be a bare `currentStage` field assignment folded into the giant
+ * post-run patch is now a SEPARATE transition through `enterStageV1` (kind
+ * "implementation-run"), run BEFORE that patch. `makeTaskFolder` always
+ * seeds `plan-final.md`, so this exercises the "already canonical" path the
+ * plan's own text describes for this kind — the entry writes no journal, it
+ * only performs the stage's compare-and-set.
+ *
+ * Both current production callers of `executeImplementationRun`
+ * (`runImplementationWithAI`, gated to `IMPLEMENTATION_ELIGIBLE_STAGES` —
+ * impl/impl-high-review/impl-low-review — and `applyImplementationReviewWithAI`,
+ * always dispatched at an impl review stage) only ever reach the "not already
+ * at or past implementation" branch with a source stage that guard already
+ * excludes (verified directly: `runImplementationWithAI` refuses before
+ * dispatch for a task at "plan", so `executeImplementationRun` is never even
+ * entered). The "moves onto impl" half of the branch is therefore exercised
+ * directly against the `enterStageV1` primitive it now goes through — the
+ * same primitive `enterStageV1.test.ts` already covers exhaustively — rather
+ * than end to end, since no exported entry point can reach it today.
+ */
+void describe("implementation-run stage entry via enterStageV1 (Part 1, item 15 reroute)", () => {
+  void it("enterStageV1 with kind \"implementation-run\" moves a pre-implementation, non-review stage onto impl", async () => {
+    const { folderPath } = makeTaskFolder("stage_entry_from_plan", { currentStage: "plan" });
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const entry = await enterStageV1(
+        vscode.Uri.file(folderPath),
+        "plan",
+        "impl",
+        false,
+        "implementation-run"
+      );
+      assert.equal(entry.ready, true, entry.ready ? "" : (entry as { reason: string }).reason);
+      if (entry.ready) {
+        await runStageEntryPostCommitV1(vscode.Uri.file(folderPath), entry);
+      }
+      assert.equal(readProgress(folderPath).currentStage, "impl");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("runImplementationWithAI refuses before dispatch for a task at a pre-implementation stage, so executeImplementationRun's stage-entry branch never fires there", async () => {
+    const { folderPath, progress } = makeTaskFolder("stage_entry_ineligible_source", {
+      currentStage: "plan",
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // No round ever dispatched — resolveTask's eligibility gate refused
+    // before executeImplementationRun could be entered — so the stage and
+    // every other field are exactly as seeded.
+    assert.equal(run.prompts.length, 0);
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.currentStage, "plan");
+    assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"]);
+  });
+
+  void it("a round started at an already-past-implementation review stage does not move the stage", async () => {
+    const { folderPath, progress } = makeTaskFolder("stage_entry_from_review", {
+      currentStage: "impl-high-review",
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.currentStage, "impl-high-review");
   });
 });
 

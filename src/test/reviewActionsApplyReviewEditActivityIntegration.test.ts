@@ -431,4 +431,108 @@ void describe("applyReviewEditWithAI — real in-flight activity through the pro
       deactivateNotificationRouter();
     }
   });
+
+  void it("ends the standalone root operation as refused, never succeeded, when the dispatched implementation round declines without throwing (pre-1.0.0 fixes register item 8 / Part 4 review fix)", async () => {
+    // Review blocker (2026-09-24): applyImplementationReviewWithAI warns and
+    // returns false on its own guard-clause declines (host gate closed,
+    // provider unavailable) rather than throwing. Its own CHILD operation
+    // ("Applying implementation review") already settles "refused" via
+    // `refusedWhenFalse` — but children never render their own Notifications
+    // row (operationNotificationBridge.ts), and `runApply` unconditionally
+    // returned `true` once the dispatch was reached (that `true` reports
+    // "dispatch occurred" to composite callers like Fast Forward, and must
+    // stay `true` here too — see runApply's own comment). Before this
+    // round's fix, that meant the standalone root (this function's own
+    // non-composite runTrackedOperation, `refusedWhenFalse: true`) never saw
+    // anything but a normal `true` return and settled "succeeded" for a
+    // round that changed nothing. This test drives the decline through the
+    // real `applyImplementationReviewWithAI` re-check
+    // (`checkImplementationAvailabilityForModel` returning unavailable) and
+    // pins the standalone root's real terminal state.
+    const { folderPath } = makeImplReviewTaskFolder(
+      `applyrevedit-activity-declined-${Math.floor(Math.random() * 1e9)}`
+    );
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    let providerInvoked = false;
+    let availabilityCallCount = 0;
+    const patches = [
+      ...installApplyReviewEditPatches(),
+      // Overrides installApplyReviewEditPatches's own "always available"
+      // stub. Two calls happen BEFORE runApply's child dispatch is even
+      // reached — checkEditActionProviderPathGateV1's own internal check
+      // (applyReviewEditWithAI's task-independent early gate) and
+      // checkEditActionAvailabilityV1's own internal check (its top-level
+      // per-task gate, runEditActionV1.ts) — both of which must stay
+      // available, or the dispatch never reaches runApply at all and this
+      // test would exercise the already-covered `refusedWhenFalse` root
+      // path instead of the bug it pins. The THIRD call is
+      // applyImplementationReviewWithAI's own re-check (reviewActions.ts,
+      // inside the function it dispatches as a child), which this test
+      // makes decline without throwing, exactly as that call site's own
+      // comment describes ("host gate closed, provider unavailable").
+      patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () => {
+        availabilityCallCount += 1;
+        if (availabilityCallCount <= 2) {
+          return Promise.resolve({
+            availability: { available: true },
+            providerLabel: "Claude Code",
+            provider: "claude-cli",
+            modelId: "claude-cli:sonnet@high",
+            nativeModelId: "sonnet",
+          });
+        }
+        return Promise.resolve({
+          availability: { available: false, reason: "simulated provider outage" },
+          providerLabel: "Claude Code",
+          provider: "claude-cli",
+          modelId: "claude-cli:sonnet@high",
+          nativeModelId: "sonnet",
+        });
+      }),
+      patch(runnerRegistryModule, "runImplementationForModel", () => {
+        providerInvoked = true;
+        return Promise.reject(new Error("must not be invoked — the availability re-check declined"));
+      }),
+    ];
+
+    const ended: { state: string }[] = [];
+    const endSub = taskOperations.onDidEnd((snap) => {
+      if (snap.key.includes("applyrevedit-activity-declined")) { ended.push({ state: snap.state }); }
+    });
+
+    try {
+      const context = makeExtensionContext();
+      const result = await applyReviewEditWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+
+      assert.equal(result, true, "runApply's own dispatched-vs-not contract is unchanged: the round genuinely dispatched, even though it then declined");
+      assert.equal(providerInvoked, false, "the real provider must never be invoked once the availability re-check declined");
+      assert.deepEqual(
+        taskOperations.getTaskOperations(folderPath),
+        [],
+        "the live row must be gone once the declined dispatch resolves"
+      );
+      assert.ok(ended.length > 0, "at least the root operation must have ended");
+      assert.ok(
+        ended.every((e) => e.state === "refused"),
+        `every ended operation must end as refused, never succeeded, got: ${JSON.stringify(ended)}`
+      );
+    } finally {
+      endSub.dispose();
+      for (const p of patches.reverse()) { p.restore(); }
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
 });

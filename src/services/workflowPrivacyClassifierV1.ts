@@ -85,9 +85,11 @@ export const CREATION_SENTINEL_FILENAME_V1 = ".ensemble-creation-sentinel-v1.jso
  * (state/taskActivationCheckpoint.ts), task-models.json
  * (utils/modelSelection.ts), .ensemble-migration.json
  * — the crash-surviving meta-root move provenance journal
- * (utils/metaResourcesMigration.ts MIGRATION_JOURNAL_FILENAME). The classifier
- * unit test pins each literal against its owning module's export where one
- * exists, so the two cannot drift silently.
+ * (utils/metaResourcesMigration.ts MIGRATION_JOURNAL_FILENAME),
+ * stage-entry-journal.json — the stage-entry crash-recovery journal
+ * (utils/stageEntryJournalV1.ts STAGE_ENTRY_JOURNAL_FILENAME; pre-1.0.0 fixes
+ * register, Part 2). The classifier unit test pins each literal against its
+ * owning module's export where one exists, so the two cannot drift silently.
  */
 const WORKFLOW_CONTROL_BASENAMES = new Set<string>([
   TASK_PROGRESS_FILENAME.toLowerCase(),
@@ -96,6 +98,7 @@ const WORKFLOW_CONTROL_BASENAMES = new Set<string>([
   "task-models.json",
   ".ensemble-migration.json",
   CREATION_SENTINEL_FILENAME_V1.toLowerCase(),
+  "stage-entry-journal.json",
 ]);
 
 /**

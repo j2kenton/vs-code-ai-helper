@@ -45,6 +45,7 @@ function decision(overrides: Partial<WorkflowDecisionV1> = {}): WorkflowDecision
         optionId: "advance",
         label: "Advance to Publish",
         consequence: "The task moves on with the blockers recorded.",
+        resumeKind: "unpause",
         effect: { kind: "command", command: "vs-code-ai-helper.resumeAndSetTaskStage", args: [{ stage: "publish" }] },
       },
     ],
@@ -134,7 +135,7 @@ void describe("hostDecisionMirrorV1", () => {
     }
     assert.equal(decodeMirroredDecisionV1(undefined), undefined);
     assert.equal(decodeMirroredDecisionV1({ ...decision(), options: [] }), undefined);
-    assert.ok(decodeMirroredDecisionV1(decision({ options: [{ optionId: "o", label: "L", consequence: "", effect: { kind: "doNothing" } }] })));
+    assert.ok(decodeMirroredDecisionV1(decision({ options: [{ optionId: "o", label: "L", consequence: "", resumeKind: "unpause", effect: { kind: "doNothing" } }] })));
   });
 
   void it("rejects a record the webview would throw on: no recommendation, junk evidence, a fabricated stage, a settled state", () => {
@@ -192,5 +193,60 @@ void describe("hostDecisionMirrorV1", () => {
     assert.deepEqual(persisted.map((d) => d.decisionId), ["viewer-local"]);
     assert.equal(persisted[0]!.state, "resolved");
     assert.deepEqual(store.listPending().map((d) => d.decisionId), ["d-1"]);
+  });
+
+  /**
+   * Pre-1.0.0 fixes register, items 14/22 (Part 3, Step 2): "decodeOption
+   * accepts a missing resumeKind and the mirror applies the same
+   * normalizer." A runner still running an older build mirrors a record
+   * whose options never had the field at all — that must decode, not be
+   * dropped as `undecodable` (which would silently hide the whole card from
+   * every viewer). A PRESENT value that is neither literal is a genuinely
+   * malformed record and is rejected like any other structural violation.
+   */
+  void it("decodes a mirrored option missing resumeKind entirely, normalizing it to 'unpause'", () => {
+    const legacyOption = { optionId: "advance", label: "Advance", consequence: "Moves on.", effect: { kind: "doNothing" } };
+    const decoded = decodeMirroredDecisionV1({
+      ...decision(),
+      options: [legacyOption],
+      recommendation: { kind: "option", optionId: "advance", reasoning: "x" },
+    });
+    assert.ok(decoded);
+    assert.equal(decoded.options[0]!.resumeKind, "unpause");
+  });
+
+  void it("rejects a mirrored option whose resumeKind is present but not a recognised literal", () => {
+    const badOption = {
+      optionId: "advance",
+      label: "Advance",
+      consequence: "Moves on.",
+      resumeKind: "sideways",
+      effect: { kind: "doNothing" },
+    };
+    assert.equal(
+      decodeMirroredDecisionV1({
+        ...decision(),
+        options: [badOption],
+        recommendation: { kind: "option", optionId: "advance", reasoning: "x" },
+      }),
+      undefined
+    );
+  });
+
+  void it("passes through an already-valid mirrored resumeKind unchanged", () => {
+    const goodOption = {
+      optionId: "advance",
+      label: "Advance",
+      consequence: "Moves on.",
+      resumeKind: "continue",
+      effect: { kind: "doNothing" },
+    };
+    const decoded = decodeMirroredDecisionV1({
+      ...decision(),
+      options: [goodOption],
+      recommendation: { kind: "option", optionId: "advance", reasoning: "x" },
+    });
+    assert.ok(decoded);
+    assert.equal(decoded.options[0]!.resumeKind, "continue");
   });
 });

@@ -527,6 +527,8 @@ export async function invokeLifecycleRowV1(options: {
   readonly skipTaskLock?: boolean;
   /** Forwarded to `TaskActionRequestV1.lifecycleServices` — see its header. */
   readonly services?: unknown;
+  /** Forwarded to `TaskActionRequestV1.lifecyclePostCommitSink` — see its header. */
+  readonly postCommitSink?: (result: unknown) => void;
 }): Promise<TaskActionOutcomeV1> {
   let chatDocumentId: string;
   try {
@@ -564,6 +566,7 @@ export async function invokeLifecycleRowV1(options: {
       lifecycleBeforeWrite: options.beforeWrite,
       lifecycleSkipTaskLock: options.skipTaskLock,
       lifecycleServices: options.services,
+      lifecyclePostCommitSink: options.postCommitSink,
     });
   } finally {
     cancellation.dispose();

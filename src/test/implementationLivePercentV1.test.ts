@@ -275,6 +275,17 @@ void describe("TaskStatusBar.isShowingTaskFolder", () => {
 });
 
 void describe("handleImplementationChecklistChangeV1", () => {
+  const plan = (folder: string): vscode.Uri => vscode.Uri.file(path.join(folder, "plan-final.md"));
+  // The production code (implementationChecklistRefreshV1.ts) derives its
+  // lookup key as `path.dirname(file.fsPath)`, where `file` came from the
+  // SAME `vscode.Uri.file(path.join(...))` round trip `plan()` above uses —
+  // so this fixture must derive its keys the identical way rather than
+  // writing a POSIX literal on one side (`"/t/a"`) and letting the native
+  // form (`\t\a` on Windows) arrive on the other. Sweep note (1.0 plan item
+  // 15): this was one of two Windows-only test fixture defects found in the
+  // suite — a POSIX path literal compared against an `fsPath`-derived value.
+  const folderFsPath = (folder: string): string => path.dirname(plan(folder).fsPath);
+
   function harness(stages: Record<string, TaskStage>, showing: string[] = []) {
     const calls: string[] = [];
     const deps = {
@@ -289,35 +300,38 @@ void describe("handleImplementationChecklistChangeV1", () => {
     };
     return { calls, deps };
   }
-  const plan = (folder: string): vscode.Uri => vscode.Uri.file(path.join(folder, "plan-final.md"));
 
   void it("ignores files that are not a known task's plan, and tasks not at the implementation stage", async () => {
-    const { calls, deps } = harness({ "/t/planning": "plan" });
+    const { calls, deps } = harness({ [folderFsPath("/t/planning")]: "plan" });
     await handleImplementationChecklistChangeV1([plan("/elsewhere/project"), plan("/t/planning")], deps);
     assert.deepEqual(calls, []);
   });
 
   void it("refreshes the tree, and the status bar only when it shows a changed folder", async () => {
-    const notShowing = harness({ "/t/a": "impl" });
+    const notShowing = harness({ [folderFsPath("/t/a")]: "impl" });
     await handleImplementationChecklistChangeV1([plan("/t/a")], notShowing.deps);
-    assert.deepEqual(notShowing.calls, ["tree", "chat:/t/a"]);
+    assert.deepEqual(notShowing.calls, ["tree", `chat:${folderFsPath("/t/a")}`]);
 
-    const showing = harness({ "/t/a": "impl" }, ["/t/a"]);
+    const showing = harness({ [folderFsPath("/t/a")]: "impl" }, [folderFsPath("/t/a")]);
     await handleImplementationChecklistChangeV1([plan("/t/a")], showing.deps);
-    assert.deepEqual(showing.calls, ["tree", "statusBar", "chat:/t/a"]);
+    assert.deepEqual(showing.calls, ["tree", "statusBar", `chat:${folderFsPath("/t/a")}`]);
   });
 
   void it("delegates the chat refresh once per surviving folder", async () => {
-    const { calls, deps } = harness({ "/t/a": "impl", "/t/b": "impl", "/t/c": "plan" });
+    const { calls, deps } = harness({
+      [folderFsPath("/t/a")]: "impl",
+      [folderFsPath("/t/b")]: "impl",
+      [folderFsPath("/t/c")]: "plan",
+    });
     await handleImplementationChecklistChangeV1(
       [plan("/t/a"), plan("/t/a"), plan("/t/b"), plan("/t/c")],
       deps
     );
-    assert.deepEqual(calls, ["tree", "chat:/t/a", "chat:/t/b"]);
+    assert.deepEqual(calls, ["tree", `chat:${folderFsPath("/t/a")}`, `chat:${folderFsPath("/t/b")}`]);
   });
 
   void it("survives a chat refresh that rejects", async () => {
-    const { deps } = harness({ "/t/a": "impl" });
+    const { deps } = harness({ [folderFsPath("/t/a")]: "impl" });
     deps.refreshChatImplementationProgress = (): Promise<boolean> => Promise.reject(new Error("boom"));
     await handleImplementationChecklistChangeV1([plan("/t/a")], deps);
   });

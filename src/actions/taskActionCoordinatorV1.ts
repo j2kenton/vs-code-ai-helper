@@ -420,6 +420,17 @@ export interface TaskActionRequestV1 {
    */
   readonly lifecycleServices?: unknown;
   /**
+   * Lifecycle-row-only side channel like `lifecycleBeforeWrite`: forwarded
+   * verbatim into `LifecycleExecutionContextV1.postCommitSink` for a
+   * `"lifecycle"` row and otherwise ignored. Pre-1.0.0 fixes register, Part 1
+   * (item 15): a row invoked with `lifecycleSkipTaskLock: true` cannot safely
+   * run `enterStageV1`'s own post-commit work inline (it would re-acquire a
+   * lock the caller already holds) — this is how such a row hands that work
+   * BACK to its caller instead of dropping it. `resumeTaskRowV1.ts`'s
+   * `executeResumeTaskV1` is the only row that currently uses it.
+   */
+  readonly lifecyclePostCommitSink?: (result: unknown) => void;
+  /**
    * Set ONLY by a lifecycle row's own `execute` when it drives a nested
    * provider-row invocation against the SAME task binding while its own
    * coordinator lease is still held — e.g. `commitPush.v1` invoking
@@ -1418,6 +1429,29 @@ function classifyAttemptAllocationFailureV1(
   };
 }
 
+/**
+ * Pre-1.0.0 fixes register, Part 4 Step 8: a `wrongOwner` identity-attachment
+ * failure previously surfaced to the user as nothing but a bookkeeping row
+ * id ("round ledger row X belongs to another operation"), with no statement
+ * of what to actually do. It is not a corruption: it means a second
+ * operation reached this round-ledger row after an earlier one already
+ * claimed it, and re-dispatching the stage's action allocates a fresh row,
+ * which proceeds normally. Say that in the user's own terms, in addition to
+ * the existing `${failureKind}: ${detail}` shape every caller and test
+ * already keys on (kept verbatim for `rowNotLive` and any other kind, whose
+ * exact text other call sites/tests still pin).
+ */
+function formatIdentityAttachmentFailureDetailV1(failureKind: string, detail: string): string {
+  const base = `${failureKind}: ${detail}`;
+  if (failureKind !== "wrongOwner") {
+    return base;
+  }
+  return (
+    `${base} — this stage can simply be re-run: re-running its action allocates a fresh round ` +
+    "ledger row rather than reusing this one."
+  );
+}
+
 export function createTaskActionCoordinatorV1(
   deps: TaskActionCoordinatorDepsV1
 ): TaskActionCoordinatorV1 {
@@ -1653,7 +1687,7 @@ export function createTaskActionCoordinatorV1(
       // (see `reportAttemptAllocatedV1` below), so clearing this requires a
       // human/task-level retry, not an automatic one.
       retryable: false,
-      detail: `${failureKind}: ${detail}`,
+      detail: formatIdentityAttachmentFailureDetailV1(failureKind, detail),
     });
     /** See `classifyAttemptAllocationFailureV1`'s own doc comment for the
      * fail-open/fail-closed split this applies. */
@@ -2661,6 +2695,7 @@ export function createTaskActionCoordinatorV1(
           beforeWrite: request.lifecycleBeforeWrite,
           skipTaskLock: request.lifecycleSkipTaskLock,
           services: request.lifecycleServices,
+          postCommitSink: request.lifecyclePostCommitSink,
         });
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, outcome, metrics) };
       } finally {
@@ -2750,7 +2785,7 @@ export function createTaskActionCoordinatorV1(
               // this settlement, and only a genuine ownership violation (or
               // an unrecognized error) reaches this path now.
               retryable: false,
-              detail: `${identityFailureKind}: ${identityFailureDetail}`,
+              detail: formatIdentityAttachmentFailureDetailV1(identityFailureKind, identityFailureDetail),
             },
             metrics
           ),

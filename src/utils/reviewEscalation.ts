@@ -14,7 +14,9 @@ import {
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
+import { isAutoAdvanceEnabled } from "../config/settings";
 import { normalizePath } from "./taskRoot";
+import { isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
@@ -246,16 +248,57 @@ export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
 function buildAdvanceOptionV1(
   nextStage: TaskStage,
   taskFolderPath: string,
-  consequence: string
+  consequence: string,
+  expectedSourceStage: TaskStage
 ): WorkflowDecisionOptionV1 {
+  // Item 14 / Part 3 Step 3: captured NOW, at card-build time, not re-derived
+  // when the option is later chosen — by then the Fast Forward call stack
+  // that may have raised this very card is long gone (see
+  // activeFastForwardRunsV1.ts's doc comment). Baked into the option's own
+  // args so `resumeAndSetTaskStageV1` knows, without guessing, whether
+  // choosing "Advance" should continue fast-forwarding at the new stage or
+  // just dispatch that stage's own default action.
+  const resumeFastForward = isFastForwardRunActiveV1(taskFolderPath);
+  const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
+  // 2026-09-2x review completion blocker: the ordinary (no Fast Forward to
+  // continue) branch used to stop at the caller's stage-move-only prose,
+  // naming no follow-up at all — the exact "moves the task to X" shape the
+  // plan's own requirement forbids ("names what will run", not merely where
+  // the task lands). `resumeAndSetTaskStageV1` dispatches
+  // `loadResumeActionPlanV1`'s resolved action once the move lands, and — on
+  // a `blocked`/`resume-only` result — dispatches nothing and hands the task
+  // to the human instead (its own fix, same round). This sentence has to
+  // stay true for BOTH outcomes without knowing which one will apply — the
+  // resolution itself needs a fresh read of the destination stage's state,
+  // which this synchronous builder has no access to (Part 3 Step 6's own,
+  // still-open job) — so it names what decides the outcome instead of
+  // guessing one, per the plan's own fallback ("or state what determines
+  // it, rather than describing the dispatch mechanism").
+  const ordinaryConsequence =
+    `${consequence} Then dispatches ${nextStageName}'s own next action automatically — starting its review, or ` +
+    "applying an existing review's findings — unless that stage's next step is yours, in which case nothing is " +
+    "dispatched and it simply waits there for you.";
   return {
     optionId: "advance",
-    label: `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`,
-    consequence,
+    label: `Advance to ${nextStageName}`,
+    consequence: resumeFastForward
+      ? `${consequence} Continues fast-forwarding at ${nextStageName}.`
+      : ordinaryConsequence,
+    // Item 14: chosen during an interrupted Fast Forward run, this continues
+    // fast-forwarding at the new stage rather than merely moving the field.
+    resumeKind: "continue",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.resumeAndSetTaskStage",
-      args: [{ taskFolderPath, stage: nextStage }],
+      // Review blocker (2026-09-23, narrowed
+      // c2453680-fe42-461b-9652-1f87445cb9d3-0): `expectedSourceStage` is the
+      // stage this card was raised against (captured NOW, for the same
+      // "don't re-derive it later" reason as `resumeFastForward` above). A
+      // card answered after the task has since moved past ITS OWN
+      // destination (not merely reached it) must not be treated as a fresh,
+      // legitimate jump — `resumeAndSetTaskStageV1` uses this to refuse a
+      // stale click rather than moving the task backward to `nextStage`.
+      args: [{ taskFolderPath, stage: nextStage, resumeFastForward, expectedSourceStage }],
     },
   };
 }
@@ -276,6 +319,8 @@ function buildReconsiderRequirementOptionV1(
     optionId: "reconsiderRequirement",
     label: "Change the plan instead",
     consequence,
+    // The user edits Accepted Non-Goals themselves; Ensemble dispatches nothing.
+    resumeKind: "unpause",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.openPlanNonGoals",
@@ -372,12 +417,15 @@ function buildEscalationDecisionV1(
                 ? `Moves the task to ${nextStageName}, which has already run once for this task — this accepts the ` +
                   "current state as good enough to proceed rather than re-reviewing it here."
                 : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
-                  `not necessarily re-find this same blocker the way another ${stageName} round would.`
+                  `not necessarily re-find this same blocker the way another ${stageName} round would.`,
+              stage
             ),
           ]
         : []),
       {
         optionId: "keepIterating",
+        // Resumes and dispatches Apply Review: continues the process.
+        resumeKind: "continue",
         // v1 fixes 2, item 25: name the action, not just "Keep iterating".
         label:
           taskFixableCount > 0
@@ -409,6 +457,7 @@ function buildEscalationDecisionV1(
       {
         optionId: "handleMyself",
         label: "Leave it paused — I'll fix it",
+        resumeKind: "unpause",
         consequence:
           "Leaves the task paused, exactly like \"Change the plan instead\" below — nothing is dispatched. " +
           "Choose this if you disagree the blocker is outside automation's control, or want to make a fix (or a " +
@@ -421,11 +470,12 @@ function buildEscalationDecisionV1(
           ? "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
             "dispatched. At least one remaining blocker here is classified spec-defect — check the plan's " +
             "non-goals and prior decisions; it may be asking for something no implementation can satisfy as " +
-            "written."
+            "written. Once you've updated the plan, resume the task (or choose Keep Iterating) to continue."
           : "Leaves the task paused and opens plan-final.md's Accepted Non-Goals section — nothing else is " +
             "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
             "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
-            "believe otherwise despite that."
+            "believe otherwise despite that. Once you've updated the plan, resume the task (or choose Keep " +
+            "Iterating) to continue."
       ),
       // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
       // paused `escalate` route previously omitted the "publish over it"
@@ -511,14 +561,29 @@ function buildEscalationDecisionV1(
   const environmental = kind === "environmental";
   const keepIterating: WorkflowDecisionOptionV1 = environmental
     ? {
-        optionId: "keepIterating",
+        // Pre-1.0.0 fixes register, item 14 / Part 3: this variant only opens
+        // AI Models for the user to pick a model — the user performs the
+        // adjustment, and nothing resumes or dispatches automatically. That
+        // is the "unpause" shape, not "continue" (which must resume the
+        // interrupted process). Review finding, 2026-09-23: this used to
+        // reuse the `keepIterating` optionId, but the plan's Step 2 inventory
+        // classifies EVERY `keepIterating` literal in this file as
+        // "continue" with no carve-out, so an "unpause" option under that
+        // same id contradicted the plan of record even though the behaviour
+        // itself is correct (this branch's semantics are the same as
+        // `adjustSettings`/`switch`, both "unpause"). Given its own distinct
+        // id instead, so it is no longer covered by that inventory line.
+        optionId: "switchStageModel",
         label: "Switch this stage's model",
+        resumeKind: "unpause",
         consequence:
-          "Opens AI Models so you can select a working model for this stage. The task stays paused until you resume it.",
+          "Opens AI Models so you can select a working model for this stage. Nothing resumes automatically — " +
+          "once you've switched, resume this task (or press this again) to try it.",
         effect: { kind: "command", command: "vs-code-ai-helper.openAiModels" },
       }
     : {
         optionId: "keepIterating",
+        resumeKind: "continue",
         // v1 fixes 2, item 25: the button names the action it dispatches
         // rather than a bare "Keep iterating".
         label: IMPL_REVIEW_STAGES.includes(stage)
@@ -556,7 +621,8 @@ function buildEscalationDecisionV1(
           buildAdvanceOptionV1(
             nextStage,
             target.taskFolderPath,
-            `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`
+            `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`,
+            stage
           ),
         ]
       : []),
@@ -564,6 +630,7 @@ function buildEscalationDecisionV1(
     {
       optionId: "handleMyself",
       label: "Leave it paused — I'll fix it",
+      resumeKind: "unpause",
       consequence: "Leaves the task paused and opens plan-final.md so you can review the plan and make the needed change yourself.",
       effect: {
         kind: "command",
@@ -573,13 +640,14 @@ function buildEscalationDecisionV1(
     },
     buildReconsiderRequirementOptionV1(
       target.taskFolderPath,
-      "Opens plan-final.md's Accepted Non-Goals section. The task stays paused while you review it."
+      "Opens plan-final.md's Accepted Non-Goals section. The task stays paused while you review it — " +
+        "resume it (or choose Keep Iterating) once you've made the change."
     ),
   ];
   const recommendation: WorkflowDecisionRecommendationV1 = environmental
     ? {
         kind: "option",
-        optionId: "keepIterating",
+        optionId: "switchStageModel",
         reasoning: "This is an environmental failure, so changing this stage's model is the action available in Ensemble.",
       }
     : kind === "spec-defect"
@@ -627,21 +695,34 @@ function buildEscalationDecisionV1(
  * blocker's own description, exactly as the reviewer or mechanical check
  * wrote it — never just its category), the consequence (it will block
  * Publish until it clears or is overridden there), and all three exits named
- * in Part 4: advance anyway (already happening — this option just
- * acknowledges it), fix it yourself (opens plan-final.md), and "I'll publish
- * over it" (runs Publish Checks now if the task has reached Publish, so the
- * existing audited override is one click away instead of a surprise later;
- * gracefully tells the user it isn't available yet otherwise, via
- * `runPublishChecks`'s own stage guard).
+ * in Part 4: advance anyway (fix, 2026-09-2x review: an earlier revision's
+ * doc comment claimed the stage transition had already happened
+ * synchronously before this card could be answered — it had not.
+ * `handleReviewRoutingOutcome`'s `advance-with-note` branch, which is the
+ * only caller, returns immediately after posting this notice, well before
+ * the later `isAutoAdvanceEnabled() && meetsThreshold` block in the same
+ * function that performs the real transition — so with auto-advance off, or
+ * that later transition refused, the task never moved and choosing this
+ * option ran only the CURRENT stage's action forever. This option now
+ * performs the transition itself, through the same Step-3 advance path
+ * `buildAdvanceOptionV1` uses — `resumeAndSetTaskStage`, which runs
+ * `enterStageV1` and then dispatches the destination stage's next action —
+ * so "advance anyway" always genuinely advances; see the pre-1.0.0 fixes
+ * register, item 14 / Part 3 Step 4), fix it yourself (opens plan-final.md),
+ * and "I'll publish over it" (runs Publish Checks now if the task has reached
+ * Publish, so the existing audited override is one click away instead of a
+ * surprise later; gracefully tells the user it isn't available yet otherwise,
+ * via `runPublishChecks`'s own stage guard).
  *
- * Deliberately non-blocking (`holdsTaskPaused: false`): the stage is already
- * advancing on its own merits, so this notice must never read as something
- * that needs answering before progress continues — only as advance warning
- * of what to expect later. Returns whether the decision was actually posted
- * (no extension context available is the one expected failure mode, as with
- * every other `postWorkflowDecisionV1` call site); the caller falls back to
- * a plain informational toast when this returns false, so the notice is
- * never silently dropped.
+ * Deliberately non-blocking (`holdsTaskPaused: false`): this notice does not
+ * pause the task — the review round that raised it already left the task
+ * active — so it must never read as something that needs answering before
+ * progress continues, only as advance warning of what to expect at Publish
+ * if the blocker is not cleared first. Returns whether the decision was
+ * actually posted (no extension context available is the one expected
+ * failure mode, as with every other `postWorkflowDecisionV1` call site); the
+ * caller falls back to a plain informational toast when this returns false,
+ * so the notice is never silently dropped.
  */
 /**
  * B4's third exit ("Publish over it with an audit trail"), shared by every
@@ -669,6 +750,7 @@ function buildPublishAnywayOptionV1(taskFolderPath: string): WorkflowDecisionOpt
   return {
     optionId: "publishAnyway",
     label: "I'll publish over it",
+    resumeKind: "continue",
     consequence:
       "Opens Commit and Push for this task. If it's ready to publish and this same issue fails its checks " +
       "there, choose \"Publish Anyway\" to record the override in publish-review.md with an audit trail. If " +
@@ -702,18 +784,52 @@ export async function postEnvironmentalAdvanceNoticeV1(
   // evidence a reader needs to act on it.
   const quotedBlockers = nonFixable.map((b) => `"${b.description}"`).join("\n\n");
 
+  // Item 14 / Part 3 Step 3–4 (review fix, 2026-09-2x): this notice fires
+  // BEFORE any transition — see the doc comment above — so "advance anyway"
+  // has to perform the move itself. `resumeFastForward` is captured now, at
+  // card-build time, for the same reason `buildAdvanceOptionV1` captures it
+  // then rather than re-deriving it when the option is chosen (see that
+  // function's own comment). Only meaningful when there is a next stage to
+  // advance into.
+  const resumeFastForward = nextStage ? isFastForwardRunActiveV1(target.taskFolderPath) : false;
+
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "acknowledgeAdvance",
       label: "Continue — advance anyway",
-      consequence:
-        `${stageName} already met its score threshold, so it advances to ` +
-        `${nextStageName ?? "the next stage"} regardless of this notice — choosing this just closes it.`,
-      effect: { kind: "doNothing" },
+      resumeKind: "continue",
+      consequence: nextStage
+        ? `${stageName} met its score threshold. Choosing this closes the notice, advances the task to ` +
+          `${nextStageName}, and then tries to keep it moving by running ${nextStageName}'s own next action.`
+        : `${stageName} met its score threshold, but there is no later stage to advance to. Choosing this ` +
+          `closes the notice and tries to keep the task moving by running ${stageName}'s own next action now.`,
+      effect: nextStage
+        ? {
+            kind: "command",
+            command: "vs-code-ai-helper.resumeAndSetTaskStage",
+            // See buildAdvanceOptionV1's matching comment: `expectedSourceStage`
+            // is `stage` here — the stage whose score threshold this notice
+            // fired against — so a stale click that outlived a further
+            // transition cannot move the task backward to `nextStage`.
+            args: [
+              {
+                taskFolderPath: target.taskFolderPath,
+                stage: nextStage,
+                resumeFastForward,
+                expectedSourceStage: stage,
+              },
+            ],
+          }
+        : {
+            kind: "command",
+            command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+            args: [{ taskFolderPath: target.taskFolderPath }],
+          },
     },
     {
       optionId: "handleMyself",
       label: "Fix it yourself first",
+      resumeKind: "unpause",
       consequence: "Opens plan-final.md so you can address the blocker before it reaches Publish.",
       effect: {
         kind: "command",
@@ -724,6 +840,18 @@ export async function postEnvironmentalAdvanceNoticeV1(
     buildPublishAnywayOptionV1(target.taskFolderPath),
   ];
 
+  // Review fix (2026-09-23, narrowed blocker c2453680-fe42-461b-9652-1f87445cb9d3-0):
+  // this card is posted from the SAME score/threshold this stage's own
+  // auto-advance check (`isAutoAdvanceEnabled() && meetsThreshold` in
+  // `routeReviewOutcomeV1`, reviewActions.ts) re-derives independently a few
+  // lines later in the very same round — so with auto-advance on, the task
+  // can (and often does) advance out of `stageName` on its own before, or
+  // moments after, this notice is even read. An unconditional "stays until
+  // you choose" is then false. The caller withdraws this card the instant
+  // that happens (see the withdrawal beside the auto-advance transition in
+  // reviewActions.ts), so the two texts below only need to be honest about
+  // the possibility, not track the outcome themselves.
+  const autoAdvanceMayPreempt = isAutoAdvanceEnabled() && nextStage !== undefined;
   const decisionInput: PostWorkflowDecisionInputV1 = {
     decisionKey: "environmentalAdvanceNotice",
     taskCanonicalId: target.canonicalId,
@@ -731,19 +859,31 @@ export async function postEnvironmentalAdvanceNoticeV1(
     whatHappened:
       `${stageName} met its score threshold, but ${nonFixable.length === 1 ? "a blocker remains" : `${nonFixable.length} blockers remain`} ` +
       `that no further automated round can fix — here ${nonFixable.length === 1 ? "it is" : "they are"}, verbatim:\n\n${quotedBlockers}`,
-    whyUserNeeded:
-      "This will not stop the stage from advancing now, but the same issue will block Publish later, until it " +
-      "clears or you override it there — this is the moment to see the exits, not a surprise at publish time.",
+    whyUserNeeded: autoAdvanceMayPreempt
+      ? `Auto-advance is on, so the task may move off ${stageName} on its own before you answer — if it does, this ` +
+        "notice is withdrawn automatically and needs no answer. Until then, advancing yourself moves it forward " +
+        "with this blocker still outstanding, which will block Publish later, until it clears or you override it " +
+        "there — this is the moment to see the exits, not a surprise at publish time."
+      : `The task stays on ${stageName} until you choose. Advancing moves it forward with this blocker still ` +
+        "outstanding, which will block Publish later, until it clears or you override it there — this is the " +
+        "moment to see the exits, not a surprise at publish time.",
     options,
     recommendation: {
       kind: "option",
       optionId: "acknowledgeAdvance",
-      reasoning: "The stage is already advancing on its own; this notice only tells you what to expect at Publish.",
+      reasoning:
+        `${stageName} already met its score threshold; the remaining blocker(s) are outside automation's ` +
+        "control, so advancing now and dealing with Publish's own audited override later is the same choice " +
+        "you would otherwise face at that gate.",
     },
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: false,
-      detail: "This does not pause the task — it is already advancing. Nothing here is required before proceeding.",
+      detail: autoAdvanceMayPreempt
+        ? "This does not pause the task, and nothing here is required before proceeding — auto-advance may move " +
+          `${stageName} on its own, in which case this notice is withdrawn automatically.`
+        : "This does not pause the task, and nothing here is required before proceeding — the task simply " +
+          `stays on ${stageName} until you pick an option.`,
     },
   };
   const posted = await postWorkflowDecisionV1(decisionInput, {

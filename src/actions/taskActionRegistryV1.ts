@@ -137,6 +137,19 @@ export interface LifecycleExecutionContextV1 {
    * like `validatedInput`. Threaded from `TaskActionRequestV1.lifecycleServices`.
    */
   readonly services?: unknown;
+  /**
+   * Lifecycle-only side channel like `beforeWrite`/`skipTaskLock`: a sink a
+   * row calls (never awaited) to hand its caller a piece of lock-released
+   * follow-up work it could not safely run itself because `skipTaskLock` was
+   * set — the caller already holds a covering lock, and running the work
+   * inline would re-acquire a lock it holds (see `skipTaskLock`'s own header).
+   * Pre-1.0.0 fixes register, Part 1 (item 15): `resumeTaskRowV1.ts` casts the
+   * value it passes to its own `StageEntryResultV1`, and
+   * `taskActivationCoordinator`'s reopen caller (`reopenTask.ts`) casts it
+   * back the same way once `activateTask` returns and its meta-root lock has
+   * released. Threaded from `TaskActionRequestV1.lifecyclePostCommitSink`.
+   */
+  readonly postCommitSink?: (result: unknown) => void;
 }
 
 export type TaskActionPromotionCodeV1 = "completed" | "noChanges";

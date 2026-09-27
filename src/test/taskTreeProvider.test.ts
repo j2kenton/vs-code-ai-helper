@@ -963,6 +963,107 @@ void describe("Context Tokens Emission", () => {
     }
   });
 
+  void it(
+    "buildTaskContextValue emits the runImplementationOfferable token only when Run Implementation is offerable",
+    () => {
+      assert.strictEqual(
+        buildTaskContextValue({ status: "active", currentStage: "impl", offerRunImplementationForUnusableSummary: true }),
+        "task-active-runImplementationOfferable"
+      );
+      assert.strictEqual(
+        buildTaskContextValue({ status: "active", currentStage: "impl", offerRunImplementationForUnusableSummary: false }),
+        "task-active"
+      );
+      assert.strictEqual(
+        buildTaskContextValue({ status: "active", currentStage: "impl" }),
+        "task-active",
+        "absent offerRunImplementationForUnusableSummary must not emit the token"
+      );
+      assert.strictEqual(
+        buildTaskContextValue({
+          status: "paused",
+          currentStage: "impl",
+          offerRunImplementationForUnusableSummary: true,
+          isPinned: true,
+        }),
+        "task-paused-runImplementationOfferable-pinned",
+        "runImplementationOfferable must sit before the trailing pinned token"
+      );
+    }
+  );
+
+  // Part 4 Step 12 (item 16), 2026-09-24 review completion blocker: "Run
+  // Implementation" must be offerable straight from the task row's context
+  // menu, not only from a refusal toast — pinned the same way the Discard
+  // Last Round menu entry is pinned above.
+  void it("gates the Run Implementation menu entry on the runImplementationOfferable token", () => {
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8")
+    ) as {
+      contributes?: {
+        commands?: Array<{ command: string; title?: string }>;
+        menus?: Record<string, Array<{ command: string; when?: string }>>;
+      };
+    };
+    const commandDecl = (packageJson.contributes?.commands ?? []).find(
+      (entry) => entry.command === "vs-code-ai-helper.resumeAndDispatchImplementation"
+    );
+    assert.ok(commandDecl, "Expected vs-code-ai-helper.resumeAndDispatchImplementation to be declared");
+    const contextMenus = packageJson.contributes?.menus?.["view/item/context"] ?? [];
+    const entries = contextMenus.filter(
+      (entry) => entry.command === "vs-code-ai-helper.resumeAndDispatchImplementation"
+    );
+    assert.ok(entries.length > 0, "Expected menu entries for resumeAndDispatchImplementation");
+    for (const entry of entries) {
+      assert.ok(
+        (entry.when ?? "").includes("viewItem =~ /-runImplementationOfferable/"),
+        `Run Implementation menu entry must be gated on the runImplementationOfferable token: ${entry.when}`
+      );
+    }
+    // 2026-09-24 review completion blocker: the plan requires the action on
+    // the REVIEW STAGE'S OWN row, not only the task row — pin both surfaces
+    // exist so this cannot silently regress back to task-row-only.
+    assert.ok(
+      entries.some((entry) => (entry.when ?? "").includes("^task-active")),
+      "Expected a task-row menu entry for resumeAndDispatchImplementation"
+    );
+    assert.ok(
+      entries.some(
+        (entry) =>
+          (entry.when ?? "").includes("stage-impl-high-review-current") &&
+          (entry.when ?? "").includes("stage-impl-low-review-current")
+      ),
+      "Expected a review-stage-row menu entry for resumeAndDispatchImplementation"
+    );
+  });
+
+  void it(
+    "buildStageContextValue emits the runImplementationOfferable token only when set, on the review stage row",
+    () => {
+      assert.strictEqual(
+        buildStageContextValue({
+          stage: "impl-high-review",
+          status: "current",
+          offerRunImplementationForUnusableSummary: true,
+        }),
+        "stage-impl-high-review-current-runImplementationOfferable-modelable"
+      );
+      assert.strictEqual(
+        buildStageContextValue({
+          stage: "impl-high-review",
+          status: "current",
+          offerRunImplementationForUnusableSummary: false,
+        }),
+        "stage-impl-high-review-current-modelable"
+      );
+      assert.strictEqual(
+        buildStageContextValue({ stage: "impl-high-review", status: "current" }),
+        "stage-impl-high-review-current-modelable",
+        "absent offerRunImplementationForUnusableSummary must not emit the token"
+      );
+    }
+  );
+
   void it("gates the reconcilePlanChecklist menu entry on the checklistUnreliable token", () => {
     // Same package.json-reading contract pattern as stage3ActionMatrix /
     // stageRevertContract: the menu contribution is the whole point of the
@@ -1795,6 +1896,7 @@ void describe("TaskTreeProvider — pending workflow decisions (task: hidden-but
       label: "Restore Prior Round",
       consequence: "Overwrites the current summary/review with the previous round's backup, discarding the completed round.",
       destructive: true,
+      resumeKind: "unpause",
       effect: { kind: "command", command: "vs-code-ai-helper.restoreRejectedImplementationRound" },
       ...overrides,
     };

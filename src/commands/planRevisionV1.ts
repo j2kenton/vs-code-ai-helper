@@ -4,11 +4,13 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { TaskStage, TaskProgress } from "../types/taskProgress";
+import { TaskStage } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { applyPlanRevisionPolicyV1 } from "../services/taskProgressFieldPolicyV1";
 import { markChecklistChangeProposalDiscardedV1 } from "../utils/taskProgressTransforms";
 import { snapshotPlanForRevisionV1 } from "../utils/implementationArtifactResolver";
+import { enterStageV1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 
@@ -92,6 +94,10 @@ export async function postChecklistChangeProposedDecisionV1(
         {
           optionId: "revise",
           label: "Revise the plan",
+          // Ensemble performs the revision (moves the stage and, per items
+          // 14/22 Step 4, dispatches Generate Plan), so this continues the
+          // process rather than merely unpausing.
+          resumeKind: "continue",
           consequence:
             "Moves the task back to Plan carrying this proposal — plan generation and both plan reviews run " +
             "again before Implementation resumes. Existing ticks are preserved; nothing already done is lost.",
@@ -104,6 +110,7 @@ export async function postChecklistChangeProposedDecisionV1(
         {
           optionId: "discard",
           label: "Discard the proposal",
+          resumeKind: "unpause",
           consequence: "Leaves plan-final.md exactly as it reads now. The proposal is dropped and nothing changes.",
           effect: {
             kind: "command",
@@ -202,55 +209,93 @@ export async function reviseChecklistChangeProposalConfirmedV1(
     return;
   }
 
-  let patched: TaskProgress | undefined;
-  try {
-    patched = await patchTaskProgressStrictV1(folderUri, (current) => {
-      const result = applyPlanRevisionPolicyV1(current, {
-        now: new Date().toISOString(),
-        proposalAt,
-        reason:
-          "A round's edit to plan-final.md tried to change the checklist item set. The discovered change was " +
-          "reverted and now needs a deliberate plan revision to incorporate.",
-        ...(journaledPlanRef !== undefined ? { journaledPlanRef } : {}),
-      });
-      if (!result.ok) {
-        throw new PlanRevisionPolicyFailureError(result.code, result.reason);
-      }
-      return result.progress;
-    });
-  } catch (error) {
-    if (error instanceof PlanRevisionPolicyFailureError) {
-      NotificationRouter.showWarning(
-        error.code === "checklistChangeProposalNotPending"
-          ? "This proposal was already resolved — nothing to revise."
-          : `Revise the plan could not run: ${error.message}`
-      );
-      return;
-    }
-    NotificationRouter.showError(
-      `Revise the plan failed: ${error instanceof Error ? error.message : String(error)}`
-    );
-    return;
-  }
-  if (!patched) {
+  // Part 1 review fix: routed through `enterStageV1` (kind `plan-revision`)
+  // instead of a bare `patchTaskProgressStrictV1` call, so this joins every
+  // other stage-mutating writer behind the one-door primitive. The source
+  // stage is read fresh here (outside the lock) only to seed `enterStageV1`'s
+  // compare-and-set — `applyPlanRevisionPolicyV1` itself has no source-stage
+  // restriction of its own (it lands on "plan" from any active stage), so no
+  // extra `precondition` is needed beyond the built-in stale-source-stage CAS.
+  const preflightProgress = await readTaskProgressStrictV1(folderUri);
+  if (!preflightProgress.ok) {
     NotificationRouter.showError("Revise the plan failed: task-progress.json could not be read.");
     return;
   }
+  const sourceStage = preflightProgress.decoded.progress.currentStage;
 
+  const entryResult = await enterStageV1(
+    folderUri,
+    sourceStage,
+    "plan",
+    /* isPaused */ false, // Inert: "plan-revision" is never AUTO_REVIEW_ELIGIBLE.
+    "plan-revision",
+    {
+      transform: (current) => {
+        // Computed fresh on every invocation (matching the pre-reroute
+        // behavior) rather than once outside the lock — `patchTaskProgress`
+        // may re-run this callback on an internal retry, and a stale
+        // captured timestamp would then land as `updatedAt`.
+        const result = applyPlanRevisionPolicyV1(current, {
+          now: new Date().toISOString(),
+          proposalAt,
+          reason:
+            "A round's edit to plan-final.md tried to change the checklist item set. The discovered change was " +
+            "reverted and now needs a deliberate plan revision to incorporate.",
+          ...(journaledPlanRef !== undefined ? { journaledPlanRef } : {}),
+        });
+        if (!result.ok) {
+          throw new PlanRevisionPolicyFailureError(result.code, result.reason);
+        }
+        return result.progress;
+      },
+      // Moved here from immediately after the write (Part 1 review fix): the
+      // proposal-card withdrawal now runs as this transition's own
+      // lock-released post-commit work, via `runStageEntryPostCommitV1` below
+      // — the same mechanism a deferred plan-revision adoption write uses.
+      postCommit: async () => {
+        // Event-driven half of Part 11 item 13c: the proposal just left
+        // "pending" (moved to "revising"), so the card offering it is stale
+        // the instant this transition commits — withdraw it now rather than
+        // leaving `hasPendingDecision` true until the chat panel's own
+        // render-time safety net happens to run.
+        await withdrawWorkflowDecisionsByKeyV1(
+          { taskFolderPath: resolved.taskFolderPath, canonicalId: resolved.canonicalId },
+          "checklistChangeProposed",
+          "this checklist-change proposal has already been revised or discarded"
+        );
+      },
+    }
+  );
+
+  if (!entryResult.ready) {
+    if (entryResult.cause instanceof PlanRevisionPolicyFailureError) {
+      NotificationRouter.showWarning(
+        entryResult.cause.code === "checklistChangeProposalNotPending"
+          ? "This proposal was already resolved — nothing to revise."
+          : `Revise the plan could not run: ${entryResult.cause.message}`
+      );
+      return;
+    }
+    NotificationRouter.showError(`Revise the plan failed: ${entryResult.reason}`);
+    return;
+  }
+
+  await runStageEntryPostCommitV1(folderUri, entryResult);
   await inventory.refresh();
-  // Event-driven half of Part 11 item 13c: the proposal just left "pending"
-  // (moved to "revising"), so the card offering it is stale the instant this
-  // patch lands — withdraw it now rather than leaving `hasPendingDecision`
-  // true until the chat panel's own render-time safety net happens to run.
-  await withdrawWorkflowDecisionsByKeyV1(
-    { taskFolderPath: resolved.taskFolderPath, canonicalId: resolved.canonicalId },
-    "checklistChangeProposed",
-    "this checklist-change proposal has already been revised or discarded"
-  );
+  // Part 3 Step 4 review fix (2026-09-2x): `revise` is classified `continue`
+  // (Ensemble performs the adjustment, per Step 5's rule) and its own
+  // consequence text says plan generation and both plan reviews run again —
+  // dispatch that now, rather than leaving the user to click Generate Plan
+  // themselves. `generatePlanWithAI` resolves its own admission and re-reads
+  // task-progress.json fresh, so it needs nothing carried over from this
+  // transition beyond the folder path.
   NotificationRouter.showInformation(
-    "Moved to Plan for revision. Generate the plan again to incorporate the discovered change — Implementation " +
-      "and later reviews will re-run once the revised plan is finalized."
+    "Moved to Plan for revision. Generating the plan again to incorporate the discovered change — " +
+      "Implementation and later reviews will re-run once the revised plan is finalized."
   );
+  await vscode.commands.executeCommand("vs-code-ai-helper.generatePlanWithAI", {
+    taskFolderPath: resolved.taskFolderPath,
+  });
 }
 
 /**

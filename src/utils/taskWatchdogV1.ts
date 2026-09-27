@@ -25,7 +25,7 @@ import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   TaskProgress,
 } from "../types/taskProgress";
-import { hasLiveSchedulingIntentBestEffortV1 } from "../state/schedulingIntentV1";
+import { hasLiveSchedulingIntentBestEffortV1, SchedulingPostureV1 } from "../state/schedulingIntentV1";
 import { hasLiveWorkAdmissionBestEffortV1, hasLiveWorkAdmissionExcludingOwnerV1 } from "../state/workAdmissionV1";
 
 /** True when this task's own persisted round ledger still has an open row. */
@@ -105,6 +105,34 @@ export function isWaitingForHumanV1(progress: TaskProgress): boolean {
     progress.scheduledResumeTime === undefined &&
     !hasOpenRoundLedgerRowV1(progress)
   );
+}
+
+/**
+ * Pre-1.0.0 fixes register item 16 ("a task whose nextActor is human shows
+ * that where the user looks"): the status bar and chat panel derive their
+ * "waiting for you" text from `SchedulingPostureV1`
+ * (`schedulingIntentV1.ts`), which reports `unknown` whenever the
+ * scheduling-intent ledger has never recorded coverage for this task —
+ * correctly, since ledger absence alone is never positive evidence (that
+ * module's own documented contract). But `isWaitingForHumanV1` above is
+ * independently sourced, direct evidence from `TaskProgress` itself, already
+ * requiring nothing owed/scheduled/running before it asserts anything. This
+ * only fills the `unknown` bucket — every stronger posture (`running`,
+ * `scheduled`, `owedWillNotRetry`) still comes from the ledger, and a
+ * `progress` the caller does not actually hold (an unreadable read) must
+ * pass `undefined` rather than force this fallback. Callers: the tree row's
+ * own tooltip posture, the status bar, and the chat panel's footer line —
+ * the same three surfaces the task tree's row `description` already covers
+ * directly via `isWaitingForHumanV1` (see `taskTreeProvider.ts`'s StageNode).
+ */
+export function withWaitingForHumanFallbackV1(
+  posture: SchedulingPostureV1,
+  progress: TaskProgress | undefined
+): SchedulingPostureV1 {
+  if (posture.kind === "unknown" && progress !== undefined && isWaitingForHumanV1(progress)) {
+    return { kind: "waitingForYou" };
+  }
+  return posture;
 }
 
 /**

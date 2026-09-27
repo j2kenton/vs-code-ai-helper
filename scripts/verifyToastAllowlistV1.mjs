@@ -130,6 +130,17 @@ function collectTsFiles(dir, out = []) {
   return out;
 }
 
+/** Whitespace-collapsed prefix of a call's own source text — see the
+ * `note`/`directActionEntriesNote` fields in toastAllowlistV1.json for why
+ * this, not the line number, is the allowlist's matching key (1.0 plan item
+ * 14: an unrelated edit elsewhere in the file must never require touching
+ * every entry below it). Matches SNIPPET_MAX_CHARS in the migration helper
+ * this file's entries were generated from. */
+const SNIPPET_MAX_CHARS = 160;
+function callSnippet(text, callStart, argsEndIndex) {
+  return text.slice(callStart, argsEndIndex).replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX_CHARS);
+}
+
 function findMultiButtonCalls(filePath) {
   const text = readFileSync(filePath, "utf8");
   const findings = [];
@@ -143,7 +154,7 @@ function findMultiButtonCalls(filePath) {
     if (isCommentContext(lineText)) continue;
 
     const argsStart = callStart + match[0].length;
-    const { args } = splitTopLevelArgs(text.slice(argsStart));
+    const { args, endIndex } = splitTopLevelArgs(text.slice(argsStart));
     if (args.length <= 1) continue; // just the message, no buttons at all
 
     const secondArgIsOptions = args[1].trim().startsWith("{");
@@ -153,29 +164,52 @@ function findMultiButtonCalls(filePath) {
         line: lineNumberAt(text, callStart),
         buttonCount,
         method: `show${match[1]}Message`,
+        snippet: callSnippet(text, callStart, argsStart + endIndex + 1),
       });
     }
   }
   return findings;
 }
 
+/** Groups entries by `file` — the allowlist's matching key is (file, snippet),
+ * never a line number (1.0 plan item 14). */
+function groupByFile(entries, label) {
+  const byFile = new Map();
+  for (const entry of entries) {
+    if (!entry.file || !entry.snippet || !entry.reason) {
+      throw new Error(`toastAllowlistV1.json ${label} entry missing file/snippet/reason: ${JSON.stringify(entry)}`);
+    }
+    const list = byFile.get(entry.file) ?? [];
+    list.push(entry);
+    byFile.set(entry.file, list);
+  }
+  return byFile;
+}
+
 function loadAllowlist() {
   const raw = JSON.parse(readFileSync(allowlistPath, "utf8"));
-  const byKey = new Map();
-  for (const entry of raw.entries) {
-    if (!entry.file || !entry.line || !entry.reason) {
-      throw new Error(`toastAllowlistV1.json entry missing file/line/reason: ${JSON.stringify(entry)}`);
+  return {
+    raw,
+    byFile: groupByFile(raw.entries, "entries"),
+    directActionByFile: groupByFile(raw.directActionEntries ?? [], "directActionEntries"),
+  };
+}
+
+/** Finds the first not-yet-used entry for `finding.file` whose `snippet` is a
+ * substring of the finding's own (already-normalized) snippet — i.e. the
+ * finding's snippet, captured from the CURRENT source, still contains the
+ * text the allowlist entry was generated from. Line-independent by
+ * construction: an unrelated insertion elsewhere in the file changes no
+ * entry's snippet and no finding's snippet. */
+function matchEntry(byFile, finding, relPath, usedEntries) {
+  for (const entry of byFile.get(relPath) ?? []) {
+    if (usedEntries.has(entry)) continue;
+    if (finding.snippet.includes(entry.snippet)) {
+      usedEntries.add(entry);
+      return entry;
     }
-    byKey.set(`${entry.file}:${entry.line}`, entry);
   }
-  const directActionByKey = new Map();
-  for (const entry of raw.directActionEntries ?? []) {
-    if (!entry.file || !entry.line || !entry.reason) {
-      throw new Error(`toastAllowlistV1.json directActionEntries entry missing file/line/reason: ${JSON.stringify(entry)}`);
-    }
-    directActionByKey.set(`${entry.file}:${entry.line}`, entry);
-  }
-  return { raw, byKey, directActionByKey };
+  return undefined;
 }
 
 /**
@@ -218,7 +252,7 @@ function findDirectActionCommandCalls(filePath) {
     if (isCommentContext(lineText)) continue;
 
     const argsStart = callStart + match[0].length;
-    const { args } = splitTopLevelArgs(text.slice(argsStart));
+    const { args, endIndex } = splitTopLevelArgs(text.slice(argsStart));
     if (args.length < 5) continue; // no actionCommand argument at all
     const actionArg = args[4].trim();
     if (actionArg === "" || actionArg === "undefined") continue;
@@ -230,41 +264,38 @@ function findDirectActionCommandCalls(filePath) {
       line: lineNumberAt(text, callStart),
       method: `show${match[1]}`,
       command,
+      snippet: callSnippet(text, callStart, argsStart + endIndex + 1),
     });
   }
   return findings;
 }
 
 function main() {
-  const { raw, byKey, directActionByKey } = loadAllowlist();
+  const { raw, byFile, directActionByFile } = loadAllowlist();
   const files = collectTsFiles(srcRoot);
   const violations = [];
-  const usedKeys = new Set();
+  const usedEntries = new Set();
   const directActionViolations = [];
-  const usedDirectActionKeys = new Set();
+  const usedDirectActionEntries = new Set();
 
   for (const file of files) {
     const relPath = path.relative(repoRoot, file).split(path.sep).join("/");
     for (const finding of findMultiButtonCalls(file)) {
-      const key = `${relPath}:${finding.line}`;
-      if (byKey.has(key)) {
-        usedKeys.add(key);
-        continue;
-      }
+      if (matchEntry(byFile, finding, relPath, usedEntries)) continue;
       violations.push({ ...finding, file: relPath });
     }
     for (const finding of findDirectActionCommandCalls(file)) {
-      const key = `${relPath}:${finding.line}`;
-      if (directActionByKey.has(key)) {
-        usedDirectActionKeys.add(key);
-        continue;
-      }
+      if (matchEntry(directActionByFile, finding, relPath, usedDirectActionEntries)) continue;
       directActionViolations.push({ ...finding, file: relPath });
     }
   }
 
-  const staleEntries = [...byKey.keys()].filter((k) => !usedKeys.has(k));
-  const staleDirectActionEntries = [...directActionByKey.keys()].filter((k) => !usedDirectActionKeys.has(k));
+  const staleEntries = raw.entries
+    .filter((e) => !usedEntries.has(e))
+    .map((e) => `${e.file} :: ${e.snippet.slice(0, 60)}`);
+  const staleDirectActionEntries = raw.directActionEntries
+    .filter((e) => !usedDirectActionEntries.has(e))
+    .map((e) => `${e.file} :: ${e.snippet.slice(0, 60)}`);
 
   if (violations.length > 0) {
     console.warn(`toastAllowlistV1: ${violations.length} multi-button toast call(s) are not in the allow-list:`);
@@ -278,7 +309,7 @@ function main() {
     );
   }
   if (staleEntries.length > 0) {
-    console.warn(`toastAllowlistV1: ${staleEntries.length} allow-list entr${staleEntries.length === 1 ? "y is" : "ies are"} stale (no longer matches a multi-button call — the site moved, was fixed, or the line drifted):`);
+    console.warn(`toastAllowlistV1: ${staleEntries.length} allow-list entr${staleEntries.length === 1 ? "y is" : "ies are"} stale (no longer matches any multi-button call — the site's own text changed or was removed):`);
     for (const key of staleEntries) {
       console.warn(`  ${key}`);
     }
@@ -295,7 +326,7 @@ function main() {
     );
   }
   if (staleDirectActionEntries.length > 0) {
-    console.warn(`toastAllowlistV1: ${staleDirectActionEntries.length} directActionEntries entr${staleDirectActionEntries.length === 1 ? "y is" : "ies are"} stale (no longer matches a direct-action call — the site moved, was fixed, or the line drifted):`);
+    console.warn(`toastAllowlistV1: ${staleDirectActionEntries.length} directActionEntries entr${staleDirectActionEntries.length === 1 ? "y is" : "ies are"} stale (no longer matches any direct-action call — the site's own text changed or was removed):`);
     for (const key of staleDirectActionEntries) {
       console.warn(`  ${key}`);
     }
@@ -314,7 +345,7 @@ function main() {
     console.warn(`toastAllowlistV1: warn-only mode — not failing the build. Set "mode": "enforcing" in scripts/toastAllowlistV1.json once triage is complete.`);
     process.exit(0);
   }
-  console.log(`toastAllowlistV1: no un-triaged multi-button or direct-action toasts found (${usedKeys.size} multi-button, ${usedDirectActionKeys.size} direct-action allow-listed).`);
+  console.log(`toastAllowlistV1: no un-triaged multi-button or direct-action toasts found (${usedEntries.size} multi-button, ${usedDirectActionEntries.size} direct-action allow-listed).`);
   process.exit(0);
 }
 

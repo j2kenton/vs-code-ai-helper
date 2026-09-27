@@ -61,6 +61,7 @@ const runnerRegistryModule = require("../runners/runnerRegistry") as Record<stri
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
+const promptSizeGuardModule = require("../utils/promptSizeGuard") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-activity-"));
@@ -836,6 +837,73 @@ void describe("runImplementationWithAI — real in-flight activity through the p
     } finally {
       (taskOperations as unknown as Record<string, unknown>).setModel = origSetModel;
       activitySpy.restore();
+      endSub.dispose();
+      for (const p of patches.reverse()) { p.restore(); }
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("ends the root operation as refused, never succeeded, when the user declines the implementation prompt-size confirmation (pre-1.0.0 fixes register item 8 / Part 4 review fix)", async () => {
+    // Review blocker (2026-09-24, this file's own `runImplementationWithAI`
+    // family): `checkAndConfirmPromptSize` returning "declined" is one of
+    // several guard-clause `return false` sites inside this dispatch's body
+    // that carried no explicit `op.settleAs(...)` call — before this round's
+    // fix, `runTrackedOperation`'s normal-return default settled the root
+    // "succeeded" for a round that never actually ran the provider. The root
+    // spec now carries `refusedWhenFalse: true`, which is the general fix;
+    // this test pins the user-declined-prompt-size path specifically, since
+    // it needs no coordinator/transport machinery to construct.
+    const { folderPath } = makeImplTaskFolder(`impl-activity-declined-size-${Math.floor(Math.random() * 1e9)}`);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    let providerInvoked = false;
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", () => {
+        providerInvoked = true;
+        return Promise.reject(new Error("must not be invoked — the size confirmation was declined"));
+      }),
+      patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("declined")),
+    ];
+
+    const ended: { state: string }[] = [];
+    const endSub = taskOperations.onDidEnd((snap) => {
+      if (snap.key.includes("impl-activity-declined-size")) { ended.push({ state: snap.state }); }
+    });
+
+    try {
+      const context = makeExtensionContext();
+      const result = await runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+
+      assert.equal(result, false, "a declined prompt-size confirmation must not report a dispatched round");
+      assert.equal(
+        providerInvoked,
+        false,
+        "the real provider must never be invoked once the size confirmation was declined"
+      );
+      assert.deepEqual(
+        taskOperations.getTaskOperations(folderPath),
+        [],
+        "the live row must be gone once the declined dispatch resolves"
+      );
+      assert.deepEqual(
+        ended.map((e) => e.state),
+        ["refused"],
+        "a declined prompt-size confirmation must end the root operation as refused, never succeeded"
+      );
+    } finally {
       endSub.dispose();
       for (const p of patches.reverse()) { p.restore(); }
       warnStub.restore();

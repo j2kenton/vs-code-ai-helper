@@ -3,6 +3,7 @@ import * as path from "path";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
 import { consumeSendAcceptedV1 } from "./commands/chatWithStage";
+import { releaseStuckAdmissionMarkers } from "./commands/releaseStuckAdmissionMarkers";
 import {
   configureViewerCommandForwarderV1,
   decodeRelayedCommandArgV1,
@@ -1377,6 +1378,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
       }
     }
+  ));
+  // Release stale work-admission markers that block task operations after a
+  // crash or hung fast-forward loop. Scans for markers last renewed >20 min ago.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.releaseStuckAdmissionMarkers",
+    () => releaseStuckAdmissionMarkers()
   ));
   // Inline "act on this" button on notification rows that carry a concrete
   // follow-up (e.g. "Publish Anyway" after auto-publish was skipped). Kept

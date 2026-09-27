@@ -19,6 +19,7 @@ import {
   isReconstructableImplRecoveryV1,
   isStaleDispatchedImplRecoveryV1,
   isUnrecoverableImplRecoveryV1,
+  withWaitingForHumanFallbackV1,
 } from "../utils/taskWatchdogV1";
 import {
   ImplRecoveryV1,
@@ -537,5 +538,49 @@ void describe("isWaitingForHumanV1 (v1 fixes 2, item 8) — the row/card read ag
     const waiting = baseProgress({ nextActor: "human" });
     assert.equal(isWaitingForHumanV1(waiting), true);
     assert.equal(isImpossibleActiveStateV1({ progress: waiting, taskCanonicalId: "task-a" }), false);
+  });
+});
+
+void describe("withWaitingForHumanFallbackV1 (pre-1.0.0 fixes register item 16) — the status bar/chat/tree tooltip's fallback for an uncovered ledger", () => {
+  void it("upgrades an unknown posture to waitingForYou when nextActor is explicitly human", () => {
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "unknown" }, baseProgress({ nextActor: "human" })),
+      { kind: "waitingForYou" }
+    );
+  });
+
+  void it("leaves unknown alone when progress is unavailable (an unreadable read, not positive evidence)", () => {
+    assert.deepEqual(withWaitingForHumanFallbackV1({ kind: "unknown" }, undefined), { kind: "unknown" });
+  });
+
+  void it("leaves unknown alone when nextActor is not explicitly human, or something is owed/scheduled/running", () => {
+    assert.deepEqual(withWaitingForHumanFallbackV1({ kind: "unknown" }, baseProgress()), { kind: "unknown" });
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "unknown" }, baseProgress({ nextActor: "human", status: "paused" })),
+      { kind: "unknown" }
+    );
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1(
+        { kind: "unknown" },
+        baseProgress({ nextActor: "human", roundLedger: [openRow("open")] })
+      ),
+      { kind: "unknown" }
+    );
+  });
+
+  void it("never overrides a stronger, ledger-derived posture — running/scheduled/owed still win", () => {
+    const humanWaiting = baseProgress({ nextActor: "human" });
+    assert.deepEqual(withWaitingForHumanFallbackV1({ kind: "running" }, humanWaiting), { kind: "running" });
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "scheduled", trigger: "x" }, humanWaiting),
+      { kind: "scheduled", trigger: "x" }
+    );
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1(
+        { kind: "owedWillNotRetry", blocker: "x", surfacedAt: "2026-01-01T00:00:00.000Z", quarantinedFiles: [], willRetry: false },
+        humanWaiting
+      ),
+      { kind: "owedWillNotRetry", blocker: "x", surfacedAt: "2026-01-01T00:00:00.000Z", quarantinedFiles: [], willRetry: false }
+    );
   });
 });

@@ -896,6 +896,9 @@ export interface RunSealedImplementationOptionsV1 {
    * gets its full Answer/Resume lifecycle (AC-PREFLIGHT-04, AC-QUESTION-02).
    */
   readonly onQuestions?: (outcome: TaskActionOutcomeV1 & { kind: "questions" }) => Promise<void>;
+  /** See execCliAgent's own doc (`cliAgentRunner.ts`) — forwarded to the CLI
+   * edit path so this round's process is recorded next to its lock. */
+  readonly roundProcessClaimId?: string;
 }
 
 /**
@@ -1441,6 +1444,7 @@ export async function runImplementationOrSealedV1(
       taskFolderUri: options.taskFolderUri,
       requireFileChange: options.requireFileChange,
       correlation: { actionKey: options.editActionKey },
+      roundProcessClaimId: options.roundProcessClaimId,
       // A CLI candidate must never fail over to a Copilot backup INSIDE
       // runImplementationForModel's own cascade — that backup would run
       // through the older, unsealed Copilot runner, bypassing

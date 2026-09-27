@@ -4,6 +4,7 @@
  * Legacy implementation.md is only used as a read/materialization fallback.
  */
 import * as vscode from "vscode";
+import { createHash } from "crypto";
 import {
   ChecklistChangeProposalV1,
   IMPLEMENTATION_FILENAME,
@@ -48,6 +49,15 @@ import { markChecklistChangeProposalAdoptedV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
 import { withdrawWorkflowDecisionsByKeyV1 } from "./workflowDecisionDispatchV1";
 import { normalizePath } from "./taskRoot";
+import { writeAtomic } from "../state/writeAtomic";
+// Deliberately circular with `stageEntryJournalV1.ts` (which imports several
+// artifact-resolution helpers from this module) — safe for the same reason
+// `stageTransition.ts`'s own circular import with that module is safe (see
+// that file's header comment): both sides only call into the other from
+// inside function bodies, never at module top level, so Node16/commonjs's
+// lazy property access on the whole module object resolves correctly by the
+// time either function actually runs.
+import { recoverStageEntryJournalIfPresentV1 } from "./stageEntryJournalV1";
 
 export interface ResolvedImplementationArtifact {
   /** The URI to use for reading/opening */
@@ -959,6 +969,33 @@ export function describeUnusableSummaryRemedyV1(
 }
 
 /**
+ * Whether an unusable-summary refusal should offer "Run Implementation"
+ * (`vs-code-ai-helper.resumeAndDispatchImplementation`) instead of, or in
+ * addition to considering, "Restore Last Usable Summary" (Part 4 Step 12,
+ * item 16). Before this, a refusal with nothing restorable and no live
+ * `implRecovery` armed to fix the summary automatically told the user to
+ * "run the implementation step again" with no button to do it from — the
+ * exact three-refusals-and-no-way-forward deadlock the register recorded
+ * (task-progress.json held no live `implRecovery` and nothing was
+ * scheduled). Callers build the literal `{ command, title, args }` at their
+ * own call site — not returned from here — so the workflow-safety
+ * verifier's static `command:\s*["']...["']` scan can see the dispatched
+ * command directly in each `NotificationRouter.showWarning` call, matching
+ * `describeUnusableReviewBlockV1`'s own established pattern. The plan's own
+ * applicability condition names only the live-`implRecovery` exclusion — a
+ * fully-settled checklist is NOT a reason to withhold the button, since a
+ * human may still want to rerun implementation (for example to have it
+ * discover the checklist is stale, or to produce fresh notes for a manual
+ * change); that case is left to the caller's remedy TEXT ("needs a human
+ * decision to proceed"), not to hiding the action itself.
+ */
+export function shouldOfferRunImplementationForUnusableSummaryV1(
+  hasLiveImplRecovery: boolean
+): boolean {
+  return !hasLiveImplRecovery;
+}
+
+/**
  * The EXACT restorability condition `restoreRejectedImplementationRoundV1`
  * (reviewActions.ts) itself checks before it will do anything — current
  * impl-summary.md is the rejection stamp AND at least one of its own or its
@@ -990,6 +1027,47 @@ export async function hasRestorableImplRoundV1(
       }
     }
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a tree ROW (not just a refusal notification) should offer "Run
+ * Implementation" (`vs-code-ai-helper.resumeAndDispatchImplementation`) —
+ * Part 4 Step 12 (item 16). Before this, "Run Implementation" existed only as
+ * an action button on a refusal toast the user had to trigger by pressing
+ * Review or Fast Forward first; a task stuck in this state had no
+ * always-visible way forward from the Tasks panel itself.
+ *
+ * Shared by both offer sites the plan names — the task row's context menu
+ * AND the review stage's own row (`impl-high-review`/`impl-low-review` when
+ * current) — since the applicability condition is identical for both: the
+ * item's own text is "`impl-summary.md` is the Unusable stamp and no live
+ * `implRecovery` exists", nothing else. It deliberately does NOT take
+ * `hasRestorableImplRound` as an exclusion: an earlier round added "Restore
+ * always takes priority — only one of the two actions is ever shown", which
+ * a 2026-09-24 review flagged as narrower than the plan's own applicability
+ * condition (which names only the live-`implRecovery` exclusion) — a human
+ * may still want to rerun implementation with a restorable backup present
+ * (for example to have it discover the checklist is stale, or to produce
+ * fresh notes for a manual change), so both actions may show together.
+ * `hasLiveImplRecovery` is passed in by the caller, which can read it
+ * directly off the in-memory `TaskProgress` it already holds — no second
+ * progress read here. Read-only and never throws, matching
+ * `hasRestorableImplRoundV1`'s own "not offerable" fallback on a transient
+ * read failure.
+ */
+export async function hasOfferableRunImplementationForUnusableSummaryV1(
+  taskFolderUri: vscode.Uri,
+  hasLiveImplRecovery: boolean
+): Promise<boolean> {
+  try {
+    const summary = await readTextIfExists(getImplementationSummaryUri(taskFolderUri));
+    if (summary === undefined || !isUnusableImplementationSummaryV1(summary)) {
+      return false;
+    }
+    return shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery);
   } catch {
     return false;
   }
@@ -1082,6 +1160,14 @@ export async function resolveImplementationArtifact(
 export async function materializeCanonicalIfNeeded(
   taskFolderUri: vscode.Uri
 ): Promise<vscode.Uri> {
+  // Part 2 (item 15 hardening) — proactive recovery: this function's whole
+  // job is deciding what `plan-final.md` currently holds (already canonical,
+  // or needs materializing from legacy `implementation.md`), so a stale
+  // journal left by a crashed "impl" transition must be reconciled first —
+  // otherwise an orphaned first-seed file left by that crash reads as
+  // already-canonical here and is trusted. Neither production caller of this
+  // function holds `withTaskLock`, so this is never reentrant.
+  await recoverStageEntryJournalIfPresentV1(taskFolderUri);
   const canonicalUri = getCanonicalImplementationUri(taskFolderUri);
   const legacyUri = vscode.Uri.joinPath(
     taskFolderUri,
@@ -1200,6 +1286,68 @@ export type PlanPromotion =
       ready: true;
       publish?: (options?: {
         deferAdoptionWrite?: boolean;
+        /**
+         * Review fix (2026-09-22, completion blocker, second narrowing):
+         * called synchronously from INSIDE this function's own per-uri
+         * `withPlanFileWriteLockV1` hold, immediately before the write this
+         * call is about to perform — with the EXACT RAW BYTES of
+         * `canonicalUri` this write is about to replace (`undefined` for a
+         * first seed; never called at all when there is nothing to write,
+         * i.e. the ordinary "already canonical, not a revision" no-op
+         * branch). Deliberately the raw file bytes, freshly re-read here, and
+         * NOT `readNonEmptyText`'s trimmed string — a caller restoring these
+         * bytes on rollback needs the file back exactly as it was, trailing
+         * newline and all, not a normalized copy.
+         *
+         * A caller that needs a race-free snapshot for its own failure
+         * recovery MUST capture it here rather than reading the file itself
+         * before calling `publish` — reading beforehand can race a
+         * concurrent writer that lands new bytes between that read and this
+         * lock actually being acquired, capturing the wrong "prior" state to
+         * restore on a later rollback.
+         *
+         * `nextBytes` is the EXACT bytes this write is about to land — review
+         * fix (2026-09-22, completion blocker, third narrowing): a rollback
+         * that races a THIRD writer (a checklist merge, a human edit) which
+         * acquires this same per-uri lock between this write completing and a
+         * later rollback re-acquiring it must not blindly clobber that
+         * writer's newer content. A caller's rollback should only restore
+         * `priorBytes` when the file on disk still holds exactly `nextBytes`
+         * — proof that nothing else has touched it since this write.
+         *
+         * Part 2 (item 15 hardening): `enterStageV1`'s own `onCommitFailure`
+         * (`stageTransition.ts`) does not restore from `priorBytes` directly —
+         * it recovers through `recoverStageEntryJournalV1`'s Phase A instead,
+         * which re-proves the "did anyone else write since?" check from disk
+         * via the journal's `expectedSha256`/`priorArtifact` rather than
+         * trusting an in-memory byte buffer across the failure. It DOES use
+         * `priorBytes` for one thing, synchronously in this same callback:
+         * hashing it into the journal's `priorArtifact` (review fix,
+         * 2026-09-23, completion blocker, third narrowing — this used to be
+         * hashed by reading `canonicalUri` directly BEFORE `publish()` was
+         * even called, which is exactly the race this paragraph's own doc
+         * warns against: a concurrent writer landing between that early read
+         * and this lock being acquired left the journal holding proof against
+         * bytes that were never actually on disk when this write replaced
+         * them). `nextBytes` remains unused by `stageTransition.ts` — only the
+         * hash computed in `onBeforeArtifactWrite`, below, matters for that
+         * purpose.
+         */
+        onBeforeWrite?: (priorBytes: Uint8Array | undefined, nextBytes: Uint8Array) => void;
+        /**
+         * Part 2 (item 15 hardening): called synchronously, from the SAME
+         * per-uri `withPlanFileWriteLockV1` hold as {@link onBeforeWrite},
+         * immediately before the atomic artifact write, with the sha256 hash
+         * of the exact bytes about to be written. A caller journaling this
+         * transition (`enterStageV1`'s stage-entry journal) uses this to
+         * advance the journal to `phase: "publishing"` with `expectedSha256`
+         * set BEFORE the write lands, so a crash between this call and the
+         * write completing still leaves a journal that can prove, by hash,
+         * whether the write landed. Never called when there is nothing to
+         * write (the ordinary "already canonical, not a revision" no-op
+         * branch) — same as {@link onBeforeWrite}.
+         */
+        onBeforeArtifactWrite?: (sha256: string) => Promise<void> | void;
       }) => Promise<PlanRevisionAdoptionV1 | undefined>;
     }
   | { ready: false };
@@ -1208,11 +1356,16 @@ export type PlanPromotion =
  * Prepare (but do not perform) seeding plan-final.md from the current
  * plan.md the first time a task enters the Implementation stage.
  *
- * This is the single source of truth for that promotion: every path that can
- * transition a task's stage to "impl" (manual Next Stage, and score-based
- * review auto-advance) must use it, or the task lands on "impl" with no
- * implementation artifact and Generate Checklist/Implement immediately
- * hard-fail via `materializeCanonicalIfNeeded`.
+ * This is the single source of truth for that promotion. Pre-1.0.0 fixes
+ * register, Part 1 (item 15): its only production caller is
+ * `enterStageV1`/`prepareStageEntryV1` (`stageTransition.ts`) — every path
+ * that can transition a task's stage now goes through that one primitive
+ * instead of calling this function (or writing `currentStage` directly)
+ * itself, or the task lands on "impl" with no implementation artifact and
+ * Generate Checklist/Implement immediately hard-fail via
+ * `materializeCanonicalIfNeeded`. Do not call this directly from a new
+ * writer — route it through `enterStageV1` so the promotion commits
+ * atomically with the stage move.
  *
  * Returns `{ ready: false }` when there is no plan content to promote —
  * callers should abort the transition. Returns `{ ready: true }` with no
@@ -1240,7 +1393,15 @@ export type PlanPromotion =
  */
 export const PLAN_REVISION_JOURNAL_FILENAME = "plan-final.revision-journal.md";
 
-function getPlanRevisionJournalUri(taskFolderUri: vscode.Uri): vscode.Uri {
+/**
+ * Exported (Part 2, item 15 hardening) so {@link recoverStageEntryJournalV1}
+ * (`stageEntryJournalV1.ts`) can locate the SAME frozen pre-revision snapshot
+ * this module writes via {@link snapshotPlanForRevisionV1} — crash recovery's
+ * preferred restore source for a revision re-finalization, ahead of the
+ * mutable `_prev` backup slot. No behavior change; this was a private helper
+ * with the identical body.
+ */
+export function getPlanRevisionJournalUri(taskFolderUri: vscode.Uri): vscode.Uri {
   return vscode.Uri.joinPath(taskFolderUri, PLAN_REVISION_JOURNAL_FILENAME);
 }
 
@@ -1559,29 +1720,57 @@ export async function preparePlanPromotion(
         // keep their checked state (item 7's explicit requirement).
         const merged = priorContent !== undefined ? mergeChecklistProgressV1(planContent, priorContent) : undefined;
         const finalContent = merged?.kind === "merged" ? merged.content : planContent;
+        const nextBytes = new TextEncoder().encode(finalContent);
+        // Report the exact raw bytes this write is about to replace, from
+        // INSIDE this lock hold — the only point at which "what's on disk
+        // right now" and "what we're about to overwrite" are guaranteed to
+        // be the same thing. Re-read fresh (not `canonicalContent`, which is
+        // `readNonEmptyText`'s trimmed string) so a caller restoring these
+        // bytes on rollback gets the file back byte-for-byte. See
+        // `onBeforeWrite`'s own doc comment.
+        if (options?.onBeforeWrite) {
+          const rawPriorBytes = (await statIfExists(canonicalUri)) !== undefined
+            ? await vscode.workspace.fs.readFile(canonicalUri)
+            : undefined;
+          options.onBeforeWrite(rawPriorBytes, nextBytes);
+        }
+        if (options?.onBeforeArtifactWrite) {
+          await options.onBeforeArtifactWrite(createHash("sha256").update(nextBytes).digest("hex"));
+        }
         await backupArtifactBeforeWrite(canonicalUri);
-        await vscode.workspace.fs.writeFile(
-          canonicalUri,
-          new TextEncoder().encode(finalContent)
-        );
+        // Part 2 (item 15 hardening): atomic (temp file + rename) rather than
+        // a direct `writeFile`, so a crash mid-write can never leave
+        // plan-final.md half-written — a reader (or a stage-entry journal
+        // rollback comparing hashes) always sees either the complete prior
+        // content or the complete new content, never a partial file.
+        // `writeAtomic` takes the string content directly (not `nextBytes`,
+        // its UTF-8 encoding) since it re-encodes and validates the readback
+        // itself; the two are byte-identical for this artifact, which is
+        // always plain UTF-8 text (no BOM), unlike a stage-entry-journal
+        // rollback restore, which must write pre-verified raw bytes exactly.
+        await writeAtomic(canonicalUri, finalContent);
         if (planRevision !== undefined) {
-          // Review blocker (2026-08-30, Part 11 item 13c): this re-finalization
-          // just replaced plan-final.md's checklist item set/ticks wholesale
-          // (the revision's whole point) — the exact same "plan-final.md's
-          // checklist ticks changed" condition that withdraws a pending
-          // `applyReviewerVerifiedTicks` card at every other in-process writer
-          // of that state (reviewActions.ts, applyReviewerVerifiedTicks.ts,
-          // reconcilePlanChecklist.ts). This was the one remaining writer
-          // without the call, so a card claiming ticks against the
-          // pre-revision plan could survive a revision that invalidated it.
-          await withdrawWorkflowDecisionsByKeyV1(
-            { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
-            "applyReviewerVerifiedTicks",
-            "the plan was revised, replacing plan-final.md's checklist item set and ticks"
-          );
           const oldTotal = priorContent !== undefined ? countChecklistProgressV1(priorContent)?.total : undefined;
           const newTotal = countChecklistProgressV1(finalContent)?.total;
           if (deferAdoptionWrite) {
+            // Review fix (2026-09-22, completion blocker): the
+            // `applyReviewerVerifiedTicks` card withdrawal below used to run
+            // HERE, unconditionally and synchronously with the file write —
+            // before the caller's own stage-transition progress commit (the
+            // SAME `patchTaskProgressStrictV1` call this `publish` runs
+            // inside, as `beforeWrite`) had actually landed. If that commit
+            // then failed, a file-only rollback (`enterStageV1`'s
+            // `onCommitFailure`, now via `recoverStageEntryJournalV1`)
+            // could restore plan-final.md's prior bytes but had no way to
+            // "un-withdraw" the decision it had already withdrawn — a real
+            // side effect surviving a transition that never committed. Now
+            // deferred alongside the adoption write itself: both only ever
+            // run from `applyDeferredPlanRevisionAdoptionV1`
+            // (`runStageEntryPostCommitV1`), which every production caller
+            // invokes ONLY after its own stage-transition commit has already
+            // succeeded — so a failed commit leaves neither the withdrawal
+            // nor the adoption write performed, and a file rollback alone is
+            // then sufficient to undo everything this `publish` call did.
             // Never write task-progress.json here — see
             // finalizePlanRevisionBestEffortV1's doc comment. The journal is
             // deliberately left in place too: it is deleted only once the
@@ -1589,6 +1778,14 @@ export async function preparePlanPromotion(
             // failed deferred write still has its frozen pre-revision source.
             deferredAdoption = { proposalAt: planRevision.proposalAt, stage: revisionStage, oldTotal, newTotal };
           } else {
+            // Non-deferred path: there is no outer commit this write is
+            // waiting on, so the withdrawal is safe immediately — mirrors
+            // the deferred path's withdrawal, just not postponed.
+            await withdrawWorkflowDecisionsByKeyV1(
+              { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
+              "applyReviewerVerifiedTicks",
+              "the plan was revised, replacing plan-final.md's checklist item set and ticks"
+            );
             await finalizePlanRevisionBestEffortV1(taskFolderUri, planRevision, revisionStage, oldTotal, newTotal);
           }
         }
@@ -1608,6 +1805,17 @@ export async function preparePlanPromotion(
  * when the SAME proposal is still the one in flight — a defensive check
  * against the (expected-rare) case where something else has already
  * resolved or superseded it between `publish()` returning and this running.
+ *
+ * Also performs the `applyReviewerVerifiedTicks` card withdrawal that
+ * `publish`'s deferred path deliberately does NOT perform itself (review fix,
+ * 2026-09-22, completion blocker — see the withdrawal's own doc comment at
+ * its call site in `preparePlanPromotion`'s `publish` closure for why): this
+ * function only ever runs after the caller's own stage-transition commit has
+ * already succeeded, so withdrawing here can never survive a transition that
+ * never landed. Idempotent — `withdrawWorkflowDecisionsByKeyV1` is a no-op
+ * once the card is already gone, so a caller that runs this twice for the
+ * same proposal (e.g. this function followed by `retryStuckPlanRevisionAdoptionV1`)
+ * is safe.
  */
 export async function applyDeferredPlanRevisionAdoptionV1(
   taskFolderUri: vscode.Uri,
@@ -1621,6 +1829,11 @@ export async function applyDeferredPlanRevisionAdoptionV1(
   if (!planRevision || planRevision.proposalAt !== adoption.proposalAt) {
     return;
   }
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
+    "applyReviewerVerifiedTicks",
+    "the plan was revised, replacing plan-final.md's checklist item set and ticks"
+  );
   await finalizePlanRevisionBestEffortV1(
     taskFolderUri,
     planRevision,
@@ -1678,5 +1891,16 @@ export async function retryStuckPlanRevisionAdoptionV1(taskFolderUri: vscode.Uri
     const journaled = await readNonEmptyText(getPlanRevisionJournalUri(taskFolderUri));
     oldTotal = journaled !== undefined ? countChecklistProgressV1(journaled)?.total : undefined;
   }
+  // Same withdrawal `applyDeferredPlanRevisionAdoptionV1` performs — this is
+  // the guaranteed re-entry for the case where that call never ran at all
+  // (e.g. the extension host died between the transition committing and its
+  // post-commit work running), so the withdrawal must not depend on that
+  // first attempt having happened. Idempotent; see that function's doc
+  // comment.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
+    "applyReviewerVerifiedTicks",
+    "the plan was revised, replacing plan-final.md's checklist item set and ticks"
+  );
   await finalizePlanRevisionBestEffortV1(taskFolderUri, planRevision, progress.currentStage, oldTotal, newTotal);
 }

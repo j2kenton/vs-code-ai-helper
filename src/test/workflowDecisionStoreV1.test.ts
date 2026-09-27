@@ -37,6 +37,7 @@ function option(overrides: Partial<WorkflowDecisionOptionV1> = {}): WorkflowDeci
     optionId: "doIt",
     label: "Do it",
     consequence: "Applies the change immediately.",
+    resumeKind: "unpause",
     effect: { kind: "command", command: "ensemble.doIt" },
     ...overrides,
   };
@@ -365,5 +366,72 @@ void describe("WorkflowDecisionStoreV1 — answered decisions are not re-posted 
     const again = await store.post(decisionInput());
     assert.ok(again.ok && !again.suppressed);
     assert.equal(store.listPending().length, 1);
+  });
+});
+
+/**
+ * Pre-1.0.0 fixes register, items 14/22 (Part 3, Step 2): `resumeKind` is
+ * REQUIRED on `WorkflowDecisionOptionV1`, but a record written by an older
+ * build predates the field entirely. `all()` (private, exercised through
+ * every public reader) must default a missing or unrecognised value to
+ * `"unpause"` — the safe direction, since an old record then never dispatches
+ * more than it did before this field existed. Writes directly to the
+ * underlying `Memento`, bypassing `post()`'s own typed/validated path, since
+ * that is exactly how a genuinely pre-existing on-disk record would be seen.
+ */
+void describe("WorkflowDecisionStoreV1 — resumeKind compatibility normalizer (pre-1.0.0 fixes register, items 14/22)", () => {
+  void it("defaults a missing resumeKind to 'unpause' on read, without touching the value once it is set", async () => {
+    const memento = new FakeMemento();
+    const raw = {
+      decisionId: "pre-existing-1",
+      decisionKey: "legacyDecision",
+      taskCanonicalId: "/tmp/tasks/task-1",
+      stage: "impl",
+      whatHappened: "An older build posted this before resumeKind existed.",
+      whyUserNeeded: "Needs a human call.",
+      options: [
+        // No resumeKind at all — the pre-field shape.
+        { optionId: "doIt", label: "Do it", consequence: "Applies it.", effect: { kind: "doNothing" } },
+        // Already carries a valid value — must pass through unchanged.
+        { optionId: "wait", label: "Wait", consequence: "Waits.", resumeKind: "continue", effect: { kind: "doNothing" } },
+      ],
+      recommendation: { kind: "none", reasoning: "No basis." },
+      createdAt: new Date().toISOString(),
+      state: "pending",
+    };
+    await memento.update("workflowDecisions", [raw]);
+    const store = new WorkflowDecisionStoreV1(memento as unknown as import("vscode").Memento);
+
+    const pending = store.listPending();
+    assert.equal(pending.length, 1);
+    const [decoded] = pending;
+    assert.equal(decoded!.options[0]!.optionId, "doIt");
+    assert.equal(decoded!.options[0]!.resumeKind, "unpause", "missing resumeKind must default to unpause");
+    assert.equal(decoded!.options[1]!.resumeKind, "continue", "an already-set value must not be overwritten");
+
+    const fetched = store.get("pre-existing-1");
+    assert.equal(fetched?.options[0]?.resumeKind, "unpause");
+  });
+
+  void it("normalizes a record carrying an unrecognised resumeKind value to 'unpause', not to the unrecognised value", async () => {
+    const memento = new FakeMemento();
+    const raw = {
+      decisionId: "pre-existing-2",
+      decisionKey: "legacyDecision",
+      taskCanonicalId: "/tmp/tasks/task-1",
+      stage: "impl",
+      whatHappened: "Corrupted or forward-incompatible resumeKind value.",
+      whyUserNeeded: "Needs a human call.",
+      options: [
+        { optionId: "doIt", label: "Do it", consequence: "Applies it.", resumeKind: "not-a-real-kind", effect: { kind: "doNothing" } },
+      ],
+      recommendation: { kind: "none", reasoning: "No basis." },
+      createdAt: new Date().toISOString(),
+      state: "pending",
+    };
+    await memento.update("workflowDecisions", [raw]);
+    const store = new WorkflowDecisionStoreV1(memento as unknown as import("vscode").Memento);
+
+    assert.equal(store.get("pre-existing-2")?.options[0]?.resumeKind, "unpause");
   });
 });

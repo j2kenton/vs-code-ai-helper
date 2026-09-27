@@ -389,8 +389,8 @@ void describe("generateImplementationWithAI — real in-flight activity through 
       );
       assert.deepEqual(
         ended.map((e) => e.state),
-        ["succeeded"],
-        "the coordinator classifies the transport failure into a normal 'failed' outcome, which generateImplementationWithAI handles internally and returns from — the wrapping operation therefore still ends through the ordinary success path, never leaving a stale live row"
+        ["failed"],
+        "the coordinator classifies the transport failure into a genuine 'failed' outcome — GenerateImplementationOutcomeFailureV1 routes it through runTrackedOperation's catch clause, so the operation must settle as failed, never succeeded"
       );
     } finally {
       endSub.dispose();

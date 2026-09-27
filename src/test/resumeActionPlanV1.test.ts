@@ -264,9 +264,40 @@ void describe("describeResumeOptionV1", () => {
     }
   });
 
-  void it("carries the planned action's label verbatim", () => {
+  // Pre-1.0.0 fixes register, item 22: the label must say whether the
+  // action edits code, resolved at card-build time from the plan's own
+  // kind — not a bare pass-through of the planned action's label, which is
+  // what let "Resume and re-run this stage" dispatch an implementation
+  // round while reading as a review re-run.
+  void it("apply-review's label names the planned action and says it edits code", () => {
     const plan = planResumeActionV1(facts("impl-high-review", { reviewContent: review(HEAD, 3) }));
-    assert.equal(describeResumeOptionV1(plan).label, "Resume and fix the review's 3 blockers (Claude Code)");
+    assert.equal(plan.kind, "apply-review");
+    assert.equal(
+      describeResumeOptionV1(plan).label,
+      "Resume and fix the review's 3 blockers (Claude Code) — runs an implementation round that edits code"
+    );
+    assert.match(describeResumeOptionV1(plan).consequence, /implementation round that edits the workspace/);
+  });
+
+  void it("run-review's label names the planned action and says it does not edit code", () => {
+    const plan = planResumeActionV1(facts("impl-high-review", { reviewContent: review(OLD, 3) }));
+    assert.equal(plan.kind, "run-review");
+    const option = describeResumeOptionV1(plan);
+    assert.match(option.label, /— a review; it does not edit code$/);
+    assert.match(option.consequence, /does not edit code/);
+  });
+
+  void it("says what decides the outcome for stage-default and the unresolvable (undefined) plan, instead of guessing", () => {
+    const stageDefaultPlan = planResumeActionV1(facts("impl", { nextActor: "automation" }));
+    assert.equal(stageDefaultPlan.kind, "stage-default");
+    assert.match(
+      describeResumeOptionV1(stageDefaultPlan).consequence,
+      /whether that action edits code depends on the stage/i
+    );
+    assert.match(
+      describeResumeOptionV1(undefined).consequence,
+      /whether it edits code, depends on whether a usable, fresh review already exists/i
+    );
   });
 });
 

@@ -36,6 +36,7 @@ import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 import { runTrackedOperation } from "../utils/taskOperations";
+import { sha256HexV1 } from "../utils/stageEntryJournalV1";
 
 // Route NotificationRouter to the vscode stub's window methods, mirroring
 // commandArgNormalization.test.ts, so command-level assertions can inspect
@@ -126,6 +127,37 @@ function installReadFileBridge(): { restore: () => void } {
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
   return { restore: (): void => { target.readFile = orig; } };
+}
+
+/**
+ * Extends `installReadFileBridge` with `stat`/`delete` bridged to the real
+ * filesystem too — the stage-entry-journal recovery path
+ * (`recoverStageEntryJournalIfPresentV1`) needs `statIfExists` to see a
+ * planted journal file for real (an un-bridged stub would report it absent
+ * regardless of what is actually on disk, making a recovery test pass
+ * vacuously) and `deleteStageEntryJournalV1` to actually remove it.
+ * `writeStageEntryJournalV1`/`beginStageEntryJournalV1` go through
+ * `writeAtomic`, which already uses real `fs.promises` directly (see
+ * `state/writeAtomic.ts`), so no `writeFile`/`rename` bridging is needed here.
+ */
+function installReadStatDeleteFileBridge(): { restore: () => void } {
+  const rf = installReadFileBridge();
+  const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const origStat = target.stat;
+  const origDelete = target.delete;
+  target.stat = async (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
+    const stat = await fs.promises.stat(uri.fsPath);
+    return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs };
+  };
+  target.delete = (uri: vscode.Uri): Promise<void> =>
+    fs.promises.rm(uri.fsPath, { force: true, recursive: true });
+  return {
+    restore: (): void => {
+      target.stat = origStat;
+      target.delete = origDelete;
+      rf.restore();
+    },
+  };
 }
 
 /**
@@ -314,6 +346,91 @@ void describe("resumePausedTask on a completed task", () => {
       rf.restore();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. reopenCompletedTask proactive stage-entry-journal recovery (Part 2,
+//     item 15 hardening — review fix, 2026-09-23, architectural blocker)
+// ---------------------------------------------------------------------------
+
+void describe("reopenCompletedTask proactive recovery (Part 2, item 15 hardening)", () => {
+  void it(
+    "recovers a stale stage-entry journal BEFORE activateTask acquires its meta-root lock, rather than " +
+      "only suppressing recovery once already inside it",
+    async () => {
+      const folderPath = makeTaskFolder("resume-completed-stale-journal");
+      const canonicalId = folderPath;
+      // currentStage deliberately matches the stale journal's own `to` below
+      // (see that comment): a real crash leaves this completed task's
+      // progress exactly where its last-committed transition left it, and
+      // Phase A's committed-check (`currentStage === journal.to`) needs that
+      // match to correctly recognize the transition as committed rather than
+      // roll it back.
+      const progress = baseProgress({ taskFolder: path.basename(folderPath), currentStage: "impl" });
+      await writeProgress(folderPath, progress);
+
+      // Simulate a crash: a prior "impl" entry's progress write committed
+      // (currentStage above is "impl") but the process died before Phase C
+      // deleted the journal, leaving a stale "published" journal on disk that
+      // nothing has recovered since — until this task was later marked
+      // completed (from "impl") without anything ever passing back through
+      // prepareStageEntryV1/materializeCanonicalIfNeeded/the activation sweep
+      // in between.
+      const canonicalBytes = "committed plan-final.md content\n";
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), canonicalBytes, "utf8");
+      const journalPath = path.join(folderPath, "stage-entry-journal.json");
+      fs.writeFileSync(
+        journalPath,
+        JSON.stringify({
+          transitionId: "stale-committed-transition",
+          from: "plan-low-review",
+          to: "impl",
+          startedAt: "2020-01-01T00:00:00.000Z",
+          artifact: "plan-final.md",
+          priorArtifact: "absent",
+          phase: "published",
+          expectedSha256: sha256HexV1(new TextEncoder().encode(canonicalBytes)),
+        }),
+        "utf8"
+      );
+
+      const inv = makeInventory([{ canonicalId, taskFolderPath: folderPath, progress }]);
+      const { store } = makeCurrentTaskStoreStub();
+      const ws = installWorkspaceFoldersStub();
+      const rf = installReadStatDeleteFileBridge();
+      const msgs = installMessageCapture();
+      const bridge = installOperationNotificationBridge();
+
+      (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
+        items: Array<{ label: string; stage: string }>
+      ): Promise<{ label: string; stage: string } | undefined> => Promise.resolve(items[0]);
+
+      try {
+        await resumePausedTask(inv, store, { canonicalId });
+
+        const stored = await readTaskProgress(vscode.Uri.file(folderPath));
+        assert.equal(stored?.status, "active", "the reopen itself must still have succeeded");
+
+        assert.equal(
+          fs.existsSync(journalPath),
+          false,
+          "the stale journal must be recovered even though the Reopen row runs with skipTaskLock " +
+            "(callerHoldsCoveringLock) — recovery must happen at reopenCompletedTask's own call site, " +
+            "before activateTask's meta-root lock, not be skipped entirely"
+        );
+        assert.equal(
+          fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8"),
+          canonicalBytes,
+          "a journal Phase A finds already committed must leave the canonical artifact untouched"
+        );
+      } finally {
+        bridge.dispose();
+        msgs.restore();
+        ws.restore();
+        rf.restore();
+      }
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------

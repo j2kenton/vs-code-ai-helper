@@ -60,7 +60,7 @@ void describe("WorkflowDecisionV1 creation-site inventory — gating field", () 
     const slice = sliceAroundDecisionKey(source, "applyReviewerVerifiedTicks");
     assert.match(slice, /gating:\s*\{/, "the applyReviewerVerifiedTicks decision must supply gating");
     assert.match(slice, /holdsTaskPaused:\s*false/);
-    assert.match(slice, /unblocksProgress:\s*false/);
+    assert.match(slice, /unblocksProgress:\s*true/);
   });
 
   void it("implementationRecoveryV1.ts supplies gating for its decision", async () => {
@@ -75,7 +75,7 @@ void describe("WorkflowDecisionV1 creation-site inventory — gating field", () 
     const slice = sliceAroundDecisionKey(source, "reconcilePlanChecklist");
     assert.match(slice, /gating:\s*\{/, "the reconcilePlanChecklist decision must supply gating");
     assert.match(slice, /holdsTaskPaused:\s*false/);
-    assert.match(slice, /unblocksProgress:\s*false/);
+    assert.match(slice, /unblocksProgress:\s*true/);
   });
 
   // Previously the tracked, deliberate exception while reviewActions.ts was a

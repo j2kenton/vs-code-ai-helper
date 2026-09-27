@@ -20,6 +20,7 @@ function option(overrides: Partial<WorkflowDecisionOptionV1> = {}): WorkflowDeci
     optionId: "doIt",
     label: "Do it",
     consequence: "Applies the change immediately.",
+    resumeKind: "unpause",
     effect: { kind: "command", command: "ensemble.doIt" },
     ...overrides,
   };

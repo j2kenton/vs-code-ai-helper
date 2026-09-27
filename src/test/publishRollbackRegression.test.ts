@@ -86,6 +86,18 @@ void describe("Publish rollback — written progress JSON (repro for the stage-d
       status: "active",
       completedStages: ALL_BEFORE_PUBLISH,
     });
+    // A task that genuinely reached Publish already passed through impl and
+    // has an implementation artifact — write one so this fixture matches
+    // real state. Review fix (2026-09-22, completion blocker): the
+    // backward-into-impl backstop now applies regardless of direction (see
+    // stageTransition.ts's "Runtime backstop" comment), so a jump back to
+    // impl with no artifact at all is correctly refused; that is not what
+    // this test is about (it pins completedStages retraction), so the
+    // fixture must not omit the artifact.
+    fs.writeFileSync(
+      path.join(fixture.folder, "plan-final.md"),
+      "<!-- ensemble:implementation-checklist -->\n\n- [x] Already done\n"
+    );
 
     const result = await advanceStage(
       vscode.Uri.file(fixture.folder),
@@ -115,6 +127,18 @@ void describe("Publish rollback — written progress JSON (repro for the stage-d
       completedAt,
       completedStages: [...STAGE_ORDER],
     });
+    // A task that genuinely reached Publish already passed through impl and
+    // has an implementation artifact — write one so this fixture matches
+    // real state. Part 1 review fix (2026-09-22): the Reopen row now routes
+    // through `enterStageV1`, whose `impl`-entry backstop refuses a Reopen to
+    // "impl" with no artifact at all rather than stranding the task; that is
+    // not what this test is about (it pins completedStages retraction), so
+    // the fixture must not omit the artifact — same rationale as the ACTIVE
+    // case above.
+    fs.writeFileSync(
+      path.join(fixture.folder, "plan-final.md"),
+      "<!-- ensemble:implementation-checklist -->\n\n- [x] Already done\n"
+    );
 
     const context: LifecycleExecutionContextV1 = {
       actionKey: RESUME_TASK_ACTION_KEY_V1,

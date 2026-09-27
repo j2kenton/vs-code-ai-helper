@@ -82,6 +82,20 @@ export interface TaskOperationSpec {
    * Cancelling the parent cascades to its running children.
    */
   parent?: TaskOperationHandle;
+  /**
+   * Best-effort observer, called with this operation's final terminal state
+   * (already resolved from an explicit `settleAs`, `refusedWhenFalse`, or the
+   * normal-return default — the same value `end()` is about to record) right
+   * before the row is removed from the registry. Lets a caller whose body has
+   * many early-return guard clauses (e.g. `runImplementationWithAI`) react to
+   * "this run achieved nothing" in ONE place — for example, writing a run log
+   * naming why a continuation round could not proceed (item 16) — without
+   * threading a run-log write through every guard clause individually. Never
+   * throws into `runTrackedOperation`; errors are swallowed with a console
+   * warning, since a logging side-effect must never turn a real outcome into
+   * a thrown error.
+   */
+  onSettled?: (state: TaskOperationState, reason?: string) => void;
 }
 
 export interface TaskOperationHandle {
@@ -161,6 +175,17 @@ export interface TaskOperationHandle {
     activity: string | undefined,
     options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
   ): number | undefined;
+  /**
+   * Explicitly settles this operation as `refused` or `failed` once the
+   * operation's body returns, instead of `runTrackedOperation`'s default of
+   * inferring `succeeded` from a normal return (or `refused` only via
+   * `TaskOperationSpec.refusedWhenFalse`). Takes precedence over both: a body
+   * that shows a refusal or failure warning and then `return`s — rather than
+   * throwing — records that outcome directly instead of letting the normal
+   * return be read as "completed" (pre-1.0.0 fixes register item 8). Calling
+   * this more than once keeps the LAST call's state and reason.
+   */
+  settleAs(state: "refused" | "failed", reason?: string): void;
 }
 
 /**
@@ -277,6 +302,8 @@ interface MutableOperation {
   cancelRequestedAt?: number;
   /** See TaskOperationSnapshot.forcedEndV1. */
   forcedEndV1?: boolean;
+  /** Set via TaskOperationHandle.settleAs; read back by runTrackedOperation before end() removes this row. */
+  explicitOutcome?: { readonly state: "refused" | "failed"; readonly reason?: string };
 }
 
 /**
@@ -623,6 +650,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
         activity: string | undefined,
         options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
       ) => this.reportActivity(id, activity, options),
+      settleAs: (state: "refused" | "failed", reason?: string) => {
+        operation.explicitOutcome = { state, reason };
+      },
     };
 
     this.triggerChange(true);
@@ -957,6 +987,17 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return requested;
   }
 
+  /**
+   * Reads back an outcome set via TaskOperationHandle.settleAs, before end()
+   * removes this row. Returns undefined when the body never called it.
+   */
+  getExplicitOutcome(
+    handle: TaskOperationHandle | null | undefined
+  ): { readonly state: "refused" | "failed"; readonly reason?: string } | undefined {
+    if (!handle) {return undefined;}
+    return this.operations.get(handle.key)?.get(handle.id)?.explicitOutcome;
+  }
+
   end(
     handle: TaskOperationHandle | null | undefined,
     state?: Exclude<TaskOperationState, "running" | "interrupted">
@@ -1223,17 +1264,43 @@ export async function runTrackedOperation<T>(
   return runWithNotificationTaskContextV1(spec.taskName, taskPath, async () => {
     try {
       const result = await fn(handle);
-      if (spec.refusedWhenFalse === true && result === false && handle.token?.isCancellationRequested !== true) {
-        taskOperations.end(handle, "refused");
+      const explicit = taskOperations.getExplicitOutcome(handle);
+      let finalState: Exclude<TaskOperationState, "running" | "interrupted">;
+      let finalReason: string | undefined;
+      if (explicit) {
+        // Takes precedence over refusedWhenFalse and the normal-return
+        // default alike (item 8): the body itself said what happened.
+        finalState = explicit.state;
+        finalReason = explicit.reason;
+      } else if (spec.refusedWhenFalse === true && result === false && handle.token?.isCancellationRequested !== true) {
+        finalState = "refused";
       } else {
-        taskOperations.end(handle); // derives cancelled vs succeeded from the token
+        // Mirrors end()'s own no-explicit-state derivation, so onSettled sees
+        // the exact same value end() is about to record.
+        finalState = handle.token?.isCancellationRequested ? "cancelled" : "succeeded";
       }
+      if (spec.onSettled) {
+        try {
+          spec.onSettled(finalState, finalReason);
+        } catch (observerError) {
+          console.warn("[taskOperations] onSettled observer threw", observerError);
+        }
+      }
+      taskOperations.end(handle, finalState);
       return result;
     } catch (error) {
       const cancelled =
         error instanceof vscode.CancellationError ||
         handle.token?.isCancellationRequested === true;
-      taskOperations.end(handle, cancelled ? "cancelled" : "failed");
+      const finalState = cancelled ? "cancelled" : "failed";
+      if (spec.onSettled) {
+        try {
+          spec.onSettled(finalState);
+        } catch (observerError) {
+          console.warn("[taskOperations] onSettled observer threw", observerError);
+        }
+      }
+      taskOperations.end(handle, finalState);
       throw error;
     }
   }, spec.stage);
@@ -1247,11 +1314,29 @@ export async function runTrackedOperation<T>(
  * Current Stage", "Complete Stage & Move On") that must abort whatever the
  * previous stage was still doing before touching progress state or (for
  * "Complete Stage & Move On") dispatching the next stage's own automation.
+ *
+ * Review fix (2026-09-23, completion blocker on `setTaskStage`'s
+ * commit-then-cancel ordering): `ok: true` used to mean only "the operation
+ * registry emptied", which is also true of a FORCED end — `cancelOperation`
+ * removes a row whose owner ignored cancellation for over a minute, but its
+ * own comment says plainly "the work itself may still be finishing"
+ * (`forceEndSubtreeV1` above). A caller relying on `ok` to mean "provably
+ * stopped" (this function's own doc comment) was silently getting a
+ * registry-empty signal instead. `forcedEnd: true` now folds into `ok:
+ * false`, with its own reason, so every existing `!cancelResult.ok` caller
+ * gets the correction for free — nothing here newly runs alongside work that
+ * only APPEARS to have stopped.
  */
+export interface CancelRunningOperationsResultV1 {
+  ok: boolean;
+  reason?: string;
+  forcedEnd?: boolean;
+}
+
 export async function cancelRunningOperationsForTask(
   taskFolderPath: string,
   timeoutMs = 15_000
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<CancelRunningOperationsResultV1> {
   // Another window's work is not ours to cancel as a side effect of a local
   // action (review, 2026-09-17): archiving or moving a stage in a viewer used
   // to relay a cancel that killed the runner's round with no warning, then
@@ -1273,24 +1358,50 @@ export async function cancelRunningOperationsForTask(
 
   const roots = ops.filter((op) => op.parentId === undefined);
   const uncancellable = roots.filter((op) => !op.cancellable);
-  for (const op of roots) {
-    taskOperations.cancelOperation(op.id);
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (taskOperations.getLocalTaskOperations(taskFolderPath).length === 0) {
-      return { ok: true };
+  const key = taskKey(taskFolderPath);
+  // A forced end can fire the moment `cancelOperation` below is called (not
+  // only after this function's own poll ages past the force-end threshold):
+  // an op whose cancellation was already requested and ignored by an EARLIER,
+  // unrelated Stop click more than a minute ago force-ends on its very next
+  // `cancelOperation` call, which is exactly the one this function is about
+  // to make. Listening for the whole call keeps that covered.
+  let forcedEnd = false;
+  const forcedEndSub = taskOperations.onDidEnd((op) => {
+    if (op.key === key && op.forcedEndV1 === true) {
+      forcedEnd = true;
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
+  });
+  try {
+    for (const op of roots) {
+      taskOperations.cancelOperation(op.id);
+    }
 
-  return {
-    ok: false,
-    reason: uncancellable.length > 0
-      ? `"${uncancellable[0]?.label}" cannot be cancelled — wait for it to finish, then try again.`
-      : "The running operation did not stop in time. Try again once it has finished.",
-  };
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (taskOperations.getLocalTaskOperations(taskFolderPath).length === 0) {
+        if (forcedEnd) {
+          return {
+            ok: false,
+            forcedEnd: true,
+            reason:
+              "a previous Stop request was ignored for over a minute, so its row was force-removed — the work " +
+              "itself may still be running underneath. Confirm it has actually finished, then try again.",
+          };
+        }
+        return { ok: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    return {
+      ok: false,
+      reason: uncancellable.length > 0
+        ? `"${uncancellable[0]?.label}" cannot be cancelled — wait for it to finish, then try again.`
+        : "The running operation did not stop in time. Try again once it has finished.",
+    };
+  } finally {
+    forcedEndSub.dispose();
+  }
 }
 
 /**

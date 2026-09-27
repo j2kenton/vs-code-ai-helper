@@ -464,6 +464,15 @@ const CODEX_EFFORT_LOW_TO_XHIGH = [
 export const CODEX_MODEL_CAPABILITIES: Readonly<
   Record<string, CodexModelCapability>
 > = {
+  "gpt-6-astra": {
+    label: "GPT-6-Astra",
+    efforts: [
+      ...CODEX_EFFORT_LOW_TO_XHIGH,
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ],
+    supportsFast: true,
+  },
   "gpt-5.5": {
     label: "GPT-5.5",
     efforts: CODEX_EFFORT_LOW_TO_XHIGH,
@@ -563,9 +572,6 @@ export function parseCodexModelSelection(
   }
 
   const [reasoningEffort, speedTier] = split.suffix.split("+", 2);
-  if (!reasoningEffort || !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
-    return { model, reasoningEffort: undefined, serviceTier: undefined };
-  }
 
   // A base id in the capability table is held to that model's own ladder and
   // fast support. Base ids outside the table (live or hand-typed) keep the
@@ -576,10 +582,23 @@ export function parseCodexModelSelection(
   )
     ? CODEX_MODEL_CAPABILITIES[split.model]
     : undefined;
-  if (
-    capability &&
-    !capability.efforts.some(([effort]) => effort === reasoningEffort)
-  ) {
+
+  const isValidEffort = capability
+    ? capability.efforts.some(([effort]) => effort === reasoningEffort)
+    : reasoningEffort !== undefined && CODEX_REASONING_EFFORTS.has(reasoningEffort);
+
+  if (!reasoningEffort || !isValidEffort) {
+    if (capability) {
+      // Reject closed: a known capability-table base id with an
+      // out-of-ladder effort must never reach the CLI at all — neither as
+      // a bogus literal "id@badeffort" string, nor by silently dropping the
+      // override so the CLI's own default model runs instead (that would
+      // itself be an unnoticed downgrade). Throw so the caller sees an
+      // explicit, actionable error instead of a silent fallback.
+      throw new Error(
+        `Unsupported reasoning effort "${reasoningEffort}" for Codex model "${split.model}".`
+      );
+    }
     return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
@@ -647,7 +666,16 @@ function parseClaudeCliModelSelection(
   const maxThinkingTokens =
     CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS.get(split.suffix);
   if (maxThinkingTokens === undefined) {
-    return { model, maxThinkingTokens: undefined };
+    // Reject closed, mirroring parseCodexModelSelection's contract: an
+    // unrecognized suffix must never reach the CLI as a literal
+    // "id@badsuffix" string passed to --model, and must never silently drop
+    // the requested reasoning level either (that would be an unnoticed
+    // downgrade to the base model's own default thinking budget). Throw so
+    // the caller sees an explicit, actionable error instead of either
+    // silent behaviour.
+    throw new Error(
+      `Unsupported reasoning effort "${split.suffix}" for Claude model "${split.model}".`
+    );
   }
 
   return {
@@ -752,20 +780,38 @@ export interface ParsedOpencodeModelSelection {
 }
 
 /**
+ * Variant ladders for the OpenCode Zen entries added for Opus 5.5 and GPT-6,
+ * copied from `opencode models --verbose` (opencode 1.18.31, 2026-09-27; see
+ * audit-2026-09.json). A test pins this table to the seeded catalog so the two
+ * cannot drift. Ids outside the table keep the pass-through behaviour below.
+ */
+export const OPENCODE_MODEL_VARIANTS: Readonly<Record<string, readonly string[]>> = {
+  "opencode/claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+  "opencode/gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+  "opencode/gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+  "opencode/gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+};
+
+/**
  * Splits a stored opencode model ID into its base "<provider>/<model>" form
  * plus an optional "@<variant>" reasoning-effort suffix. Unlike Codex/Claude,
  * opencode has no single fixed set of valid variant names to validate
  * against — each model declares its own (verified live via `opencode models
  * --verbose`: e.g. "deepseek-v4-flash" has "high"/"max", "north-mini-code-
  * free" has "none"/"high", "gpt-5" has "minimal"/"low"/"medium"/"high"), so
- * whatever follows the last "@" is passed through verbatim as --variant
- * rather than checked against an allowlist. This is safe only because the
- * only source of `@variant`-suffixed IDs is parseOpencodeModelsOutput
- * (cliModelDiscovery.ts), which derives them from that same model's real
- * variants object — an unrecognized --variant value is silently ignored by
- * the CLI rather than rejected (verified live), so a hand-typed bad variant
- * would fail open (silently run without it) rather than error, which is why
- * this must never be reachable from free-text user input.
+ * for most ids whatever follows the last "@" is passed through verbatim as
+ * --variant rather than checked against an allowlist. This is safe only
+ * because the only source of `@variant`-suffixed IDs is
+ * parseOpencodeModelsOutput (cliModelDiscovery.ts), which derives them from
+ * that same model's real variants object — an unrecognized --variant value is
+ * silently ignored by the CLI rather than rejected (verified live), so a
+ * hand-typed bad variant would fail open (silently run without it) rather
+ * than error, which is why this must never be reachable from free-text user
+ * input.
+ *
+ * The exception is a base id in OPENCODE_MODEL_VARIANTS: its ladder is known,
+ * so an out-of-ladder variant throws, mirroring parseCodexModelSelection. A
+ * requested reasoning level must never be silently dropped by the CLI.
  */
 export function parseOpencodeModelSelection(
   model: string | undefined
@@ -774,7 +820,14 @@ export function parseOpencodeModelSelection(
     return { model: undefined, variant: undefined };
   }
   const split = splitModelAtLastAt(model);
-  return { model: split.model, variant: split.suffix || undefined };
+  const variant = split.suffix || undefined;
+  const ladder = Object.prototype.hasOwnProperty.call(OPENCODE_MODEL_VARIANTS, split.model)
+    ? OPENCODE_MODEL_VARIANTS[split.model]
+    : undefined;
+  if (ladder && variant !== undefined && !ladder.includes(variant)) {
+    throw new Error(`Unsupported variant "${variant}" for OpenCode model "${split.model}".`);
+  }
+  return { model: split.model, variant };
 }
 
 /**

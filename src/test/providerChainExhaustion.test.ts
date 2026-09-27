@@ -392,6 +392,20 @@ void describe("provider chain exhaustion (stage owner)", () => {
         "none",
         "no quota/entitlement signal means the system has no basis to recommend one option over another"
       );
+      // Pre-1.0.0 fixes register, Part 3 Step 2 inventory: "adjustSettings"
+      // is classified `resumeKind: "unpause"` because opening Settings does
+      // not itself resume or continue the task's automation — the option's
+      // own consequence text says so ("choose \"Retry now\" ... to try
+      // again"). Assert its effect directly: it dispatches
+      // setStageBackupModel (opens Settings), never a task-resuming command.
+      const adjustSettings = decision.options.find((o) => o.optionId === "adjustSettings");
+      assert.ok(adjustSettings, "expected an adjustSettings option");
+      assert.equal(adjustSettings?.resumeKind, "unpause");
+      assert.deepEqual(adjustSettings?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.setStageBackupModel",
+        args: [{ stage: "impl-high-review" }],
+      });
     } finally {
       __extensionContextV1TestOnly.reset();
     }
@@ -420,6 +434,20 @@ void describe("provider chain exhaustion (stage owner)", () => {
       if (decision.recommendation.kind === "option") {
         assert.equal(decision.recommendation.optionId, "wait");
         assert.ok(decision.recommendation.reasoning.length > 0);
+      }
+      // Pre-1.0.0 fixes register, Part 3 Step 2 inventory: "wait" is
+      // classified `resumeKind: "unpause"` because the option's own
+      // consequence text says the task "stays paused until then" even
+      // though it DOES dispatch a command (scheduling the automatic rerun) —
+      // it does not itself resume/continue the task. Assert the actual
+      // effect directly, so a future change that made it resume the task
+      // would break this test rather than pass silently.
+      const wait = decision.options.find((o) => o.optionId === "wait");
+      assert.ok(wait, "expected a wait option when a near-term reset is known");
+      assert.equal(wait?.resumeKind, "unpause");
+      assert.equal(wait?.effect.kind, "command");
+      if (wait?.effect.kind === "command") {
+        assert.equal(wait.effect.command, "vs-code-ai-helper.scheduleQuotaResumeV1");
       }
     } finally {
       __extensionContextV1TestOnly.reset();

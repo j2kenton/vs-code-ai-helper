@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as vscode from "vscode";
-import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { normalizeWorkflowDecisionV1, type WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { writeMirrorSnapshotV1 } from "./hostMirrorWriteV1";
 
 /**
@@ -74,6 +74,14 @@ function decodeOption(value: unknown): value is WorkflowDecisionV1["options"][nu
   }
   const option = value as Record<string, unknown>;
   if (!isNonEmptyString(option.optionId) || !isNonEmptyString(option.label) || typeof option.consequence !== "string") {
+    return false;
+  }
+  // Pre-1.0.0 fixes register, item 14/22 (Part 3): a record written before
+  // `resumeKind` existed omits it entirely — accepted, and defaulted to
+  // `"unpause"` by `normalizeWorkflowDecisionV1` below. A PRESENT value that
+  // is neither literal is a malformed record and is rejected like any other
+  // structural violation.
+  if (option.resumeKind !== undefined && option.resumeKind !== "unpause" && option.resumeKind !== "continue") {
     return false;
   }
   const effect = option.effect;
@@ -158,7 +166,12 @@ export function decodeMirroredDecisionV1(
     decodeRecommendation(decision.recommendation, optionIds) &&
     (decision.evidence === undefined || decodeEvidence(decision.evidence)) &&
     (decision.gating === undefined || (typeof decision.gating === "object" && decision.gating !== null));
-  return ok ? (decision as unknown as WorkflowDecisionV1) : undefined;
+  // The mirror applies the same normalizer the local store's `all()` does
+  // (pre-1.0.0 fixes register, item 14/22), so a decision mirrored from a
+  // runner still running an older build — its options missing `resumeKind`
+  // entirely — reads as `"unpause"` here, not merely once it later flows
+  // through a local store's `all()`.
+  return ok ? normalizeWorkflowDecisionV1(decision as unknown as WorkflowDecisionV1) : undefined;
 }
 
 /**

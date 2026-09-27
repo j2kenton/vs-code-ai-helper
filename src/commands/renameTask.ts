@@ -608,6 +608,7 @@ export async function renameTaskWithAI(
       try {
         const first = await requestAiNameV1(context, task, sourceText, "", token);
         if (first.kind === "no-model") {
+          op.settleAs("refused", "no Description-stage model configured");
           NotificationRouter.showWarning(
             "No Description-stage model is configured, so Rename Task with AI could not run. Configure a model in AI Models, or rename manually."
           );
@@ -659,6 +660,10 @@ export async function renameTaskWithAI(
           // direction entirely (observed 2026-08-20, where the model had
           // answered correctly twice and promotion failed on a missing
           // runs/ directory).
+          op.settleAs(
+            "failed",
+            rejectedReplies.length > 0 ? "no valid task summary produced" : lastFailureDetail ?? "the provider call failed"
+          );
           NotificationRouter.showWarning(
             rejectedReplies.length > 0
               ? "The AI did not produce a valid task summary, so the name was not changed. Configure a Description-stage model in AI Models, or rename manually."

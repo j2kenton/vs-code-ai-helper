@@ -584,13 +584,18 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
         {
           optionId: "resume",
           label: "Resume when credits restore",
+          resumeKind: "continue",
           consequence: "Waits and retries this same request once credits are available again; nothing runs until then.",
           effect: { kind: "doNothing" },
         },
         {
           optionId: "switch",
           label: "Switch model",
-          consequence: "Opens model selection so a different model (with its own credit pool) can be used instead of retrying this one.",
+          resumeKind: "unpause",
+          consequence:
+            "Opens model selection so a different model (with its own credit pool) can be used instead of " +
+            "retrying this one. Nothing retries automatically — once you've chosen a model there, resume this " +
+            "task (or choose Retry) to try again with it.",
           effect: { kind: "doNothing" },
         },
       ],

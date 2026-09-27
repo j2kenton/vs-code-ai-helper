@@ -938,6 +938,10 @@ export async function runImplementationForModel(options: {
    * this cascade, so the exclusion stays reversible without an API change.
    */
   runCrossProviderBackup?: (modelId: string) => Promise<ImplementationRunResult & { runnerId: string }>;
+  /** See execCliAgent's own doc (`cliAgentRunner.ts`) — forwarded to the CLI
+   * edit path so this round's process is recorded next to its lock. Has no
+   * effect on the Copilot path, which has no OS-level provider process. */
+  roundProcessClaimId?: string;
   /**
    * The stage's TRUE globally-configured primary, when `modelId` above is
    * actually a pre-resolved WINNING candidate rather than that primary
@@ -1011,6 +1015,7 @@ export async function runImplementationForModel(options: {
         requireFileChange: options.requireFileChange,
         taskFolderUri: options.taskFolderUri,
         stage: options.stage,
+        roundProcessClaimId: options.roundProcessClaimId,
       });
       return { ...result, runnerId: selected.def.id };
     }
@@ -1528,6 +1533,7 @@ export async function runImplementationForModel(options: {
                 {
                   optionId: "rerunAfterReset",
                   label: "Rerun after reset",
+                  resumeKind: "continue",
                   consequence: `Schedules an automatic rerun of this stage at ${knownResetAt}.`,
                   effect: {
                     kind: "command",
@@ -1538,6 +1544,7 @@ export async function runImplementationForModel(options: {
                 {
                   optionId: "notNow",
                   label: "Not now",
+                  resumeKind: "unpause",
                   consequence: "Does nothing. No rerun is scheduled.",
                   effect: { kind: "doNothing" },
                 },

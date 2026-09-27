@@ -20,6 +20,7 @@ import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
 import {
   firstUnmetStagePrerequisiteV1,
+  hasOfferableRunImplementationForUnusableSummaryV1,
   hasRestorableImplRoundV1,
   resolveImplementationArtifact,
 } from "../utils/implementationArtifactResolver";
@@ -34,7 +35,7 @@ import {
 } from "../utils/reviewReadiness";
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
-import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
+import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -491,7 +492,17 @@ export class TaskNode extends vscode.TreeItem {
      * `contextTokens.ts`'s `TaskContextInput.hasRestorableImplRound` doc
      * comment.
      */
-    hasRestorableImplRound: boolean = false
+    hasRestorableImplRound: boolean = false,
+    /**
+     * Whether "Run Implementation" is offerable as a task-row action
+     * (Part 4 Step 12, item 16), resolved by the caller via
+     * `hasOfferableRunImplementationForUnusableSummaryV1` — this
+     * constructor itself must stay synchronous. See `contextTokens.ts`'s
+     * `TaskContextInput.offerRunImplementationForUnusableSummary` doc
+     * comment. The review stage's own row offers the same action through
+     * `StageNode`'s identically-named parameter below, not this one.
+     */
+    offerRunImplementationForUnusableSummary: boolean = false
   ) {
     // An interrupted creation (plan §4.7 recovery row) has no stages to show
     // — getStageNodes() is never called for it (see getChildren) — so it
@@ -663,6 +674,7 @@ export class TaskNode extends vscode.TreeItem {
       // The exact `_prev`-pair condition, resolved by the caller and passed
       // in — see contextTokens.ts's TaskContextInput doc comment.
       hasRestorableImplRound,
+      offerRunImplementationForUnusableSummary,
       creationFootprint
     });
   }
@@ -720,7 +732,19 @@ export class StageNode extends vscode.TreeItem {
      * SECOND surface (the user reaches for them to resume a stopped task),
      * but they render only on hover, so they cannot be the first signal.
      */
-    pendingDecisionCount: number = 0
+    pendingDecisionCount: number = 0,
+    /**
+     * Whether "Run Implementation" is offerable as an action on THIS stage's
+     * own row — the review-stage-row half of Part 4 Step 12 (item 16),
+     * resolved by the caller via
+     * `hasOfferableRunImplementationForUnusableSummaryV1` only for the
+     * `impl-high-review`/`impl-low-review` stage that is currently active
+     * (the stage whose round actually produced the unusable
+     * `impl-summary.md`). See `contextTokens.ts`'s
+     * `StageContextInput.offerRunImplementationForUnusableSummary` doc
+     * comment.
+     */
+    offerRunImplementationForUnusableSummary: boolean = false
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -1093,7 +1117,8 @@ export class StageNode extends vscode.TreeItem {
       isMetaManaged,
       hasBackup,
       redoAvailable,
-      pendingDecisionCount > 0
+      pendingDecisionCount > 0,
+      offerRunImplementationForUnusableSummary
     );
   }
 
@@ -1117,7 +1142,8 @@ export function getStageNodeContextValue(
   isMetaManaged: boolean = false,
   hasBackup: boolean = false,
   redoAvailable: boolean = false,
-  hasPendingDecision: boolean = false
+  hasPendingDecision: boolean = false,
+  offerRunImplementationForUnusableSummary: boolean = false
 ): string {
   return buildStageContextValue({
     stage,
@@ -1130,6 +1156,7 @@ export function getStageNodeContextValue(
     hasBackup,
     redoAvailable,
     hasPendingDecision,
+    offerRunImplementationForUnusableSummary,
   });
 }
 
@@ -1467,12 +1494,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // reflects this render's push rather than a stale prior value.
     await this.schedulingIntentStore.recordOwedContinuation(taskId, owedSource);
     const ledgerOwedSource = this.schedulingIntentStore.getOwedContinuation(taskId);
-    return deriveSchedulingPostureV1({
-      entries: this.schedulingIntentStore.listForTask(taskId),
-      owedContinuation: deriveOwedContinuationRecordV1(taskId, ledgerOwedSource),
-      hasCoverage: this.schedulingIntentStore.hasCoverage(taskId),
-      inFlight: taskOperations.hasRootOperationForTask(task.canonicalId ?? task.folderUri.fsPath),
-    });
+    return withWaitingForHumanFallbackV1(
+      deriveSchedulingPostureV1({
+        entries: this.schedulingIntentStore.listForTask(taskId),
+        owedContinuation: deriveOwedContinuationRecordV1(taskId, ledgerOwedSource),
+        hasCoverage: this.schedulingIntentStore.hasCoverage(taskId),
+        inFlight: taskOperations.hasRootOperationForTask(task.canonicalId ?? task.folderUri.fsPath),
+      }),
+      task.progress
+    );
   }
 
   /**
@@ -1820,6 +1850,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           task.folderUri,
           task.progress.currentStage
         );
+        const offerRunImplementationForUnusableSummary =
+          await hasOfferableRunImplementationForUnusableSummaryV1(
+            task.folderUri,
+            task.progress.implRecovery !== undefined
+          );
         return new TaskNode(
           task,
           shouldExpand(task),
@@ -1830,7 +1865,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           creationFootprint,
           pendingDecisions,
           schedulingPosture,
-          hasRestorableImplRound
+          hasRestorableImplRound,
+          offerRunImplementationForUnusableSummary
         );
       }
     ));
@@ -1987,6 +2023,18 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         revertArtifact !== undefined &&
         isRedoAvailableFromRecord(await readRedoSidecar(revertArtifact));
 
+      // "Run Implementation" on the review stage's own row (Part 4 Step 12,
+      // item 16) — only computed for the CURRENT impl-high-review/
+      // impl-low-review row, the stage whose round is what could have
+      // produced the unusable impl-summary.md this button recovers from.
+      const offerRunImplementationOnThisStageRow =
+        status === "current" && (stage === "impl-high-review" || stage === "impl-low-review")
+          ? await hasOfferableRunImplementationForUnusableSummaryV1(
+              task.folderUri,
+              task.progress.implRecovery !== undefined
+            )
+          : false;
+
       nodes.push(
         new StageNode(
           task,
@@ -2000,7 +2048,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           redoAvailable,
           missingPrerequisite,
           implementationProgress,
-          pendingDecisions.filter((decision) => decision.stage === stage).length
+          pendingDecisions.filter((decision) => decision.stage === stage).length,
+          offerRunImplementationOnThisStageRow
         )
       );
     }

@@ -361,13 +361,14 @@ void describe("runReviewForFolder (impl-high-review) — real completion-check a
       );
 
       // The final completion-check label must report the true grand total
-      // (3: lint, check-types, test — no monorepo members, no explicit
+      // (2: lint, check-types — impl-high-review runs `checkSet: "fast"`,
+      // which never runs `test`/`build`; no monorepo members, no explicit
       // commands) fully settled, before the review's own dispatch begins.
       const lastCheckLabel = deduped[checkLabelIndices[checkLabelIndices.length - 1]!.index];
       assert.match(
         lastCheckLabel!,
-        /3\/3 complete/,
-        `expected the final completion-check label to report the true grand total 3/3, got: ${lastCheckLabel}`
+        /2\/2 complete/,
+        `expected the final completion-check label to report the true grand total 2/2, got: ${lastCheckLabel}`
       );
 
       // Once buildVerifiedChecksVariable returns (accumulator closed), the

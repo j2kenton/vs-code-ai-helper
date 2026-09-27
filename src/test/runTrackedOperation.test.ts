@@ -583,6 +583,81 @@ void describe("runTrackedOperation", () => {
     });
   });
 
+  void describe("settleAs (pre-1.0.0 fixes register item 8: a body that warns and returns is not recorded as completed)", () => {
+    void it("a body that calls settleAs('refused', reason) and then returns normally ends refused, not succeeded", async () => {
+      const taskPath = `/tmp/rto-settleas-refused-${Math.random()}`;
+      const ended: TaskOperationSnapshot[] = [];
+      const sub = taskOperations.onDidEnd((snap) => {
+        if (snap.key.includes("rto-settleas-refused")) {ended.push(snap);}
+      });
+      try {
+        const result = await runTrackedOperation(taskPath, { label: "Refusable Op" }, (op) => {
+          op.settleAs("refused", "no model configured");
+          return Promise.resolve("normal return value");
+        });
+        assert.equal(result, "normal return value", "the body's return value is still passed through");
+        assert.equal(ended.length, 1);
+        assert.equal(ended[0]?.state, "refused", "settleAs must override the normal-return default of succeeded");
+      } finally {
+        sub.dispose();
+      }
+    });
+
+    void it("a body that calls settleAs('failed', reason) and then returns normally ends failed, not succeeded", async () => {
+      const taskPath = `/tmp/rto-settleas-failed-${Math.random()}`;
+      const ended: TaskOperationSnapshot[] = [];
+      const sub = taskOperations.onDidEnd((snap) => {
+        if (snap.key.includes("rto-settleas-failed")) {ended.push(snap);}
+      });
+      try {
+        await runTrackedOperation(taskPath, { label: "Failable Op" }, (op) => {
+          op.settleAs("failed", "the provider call failed");
+          return Promise.resolve();
+        });
+        assert.equal(ended.length, 1);
+        assert.equal(ended[0]?.state, "failed");
+      } finally {
+        sub.dispose();
+      }
+    });
+
+    void it("settleAs takes precedence over refusedWhenFalse", async () => {
+      const taskPath = `/tmp/rto-settleas-precedence-${Math.random()}`;
+      const ended: TaskOperationSnapshot[] = [];
+      const sub = taskOperations.onDidEnd((snap) => {
+        if (snap.key.includes("rto-settleas-precedence")) {ended.push(snap);}
+      });
+      try {
+        // refusedWhenFalse would normally end this "refused" from a `false`
+        // return, but the body explicitly settles it "failed" instead — that
+        // more specific signal must win.
+        await runTrackedOperation(taskPath, { label: "Both", refusedWhenFalse: true }, (op) => {
+          op.settleAs("failed", "a genuine failure, not just a declined start");
+          return Promise.resolve(false);
+        });
+        assert.equal(ended.length, 1);
+        assert.equal(ended[0]?.state, "failed", "an explicit settleAs must win over the refusedWhenFalse inference");
+      } finally {
+        sub.dispose();
+      }
+    });
+
+    void it("with no settleAs call, a normal return still ends succeeded (no regression)", async () => {
+      const taskPath = `/tmp/rto-settleas-unused-${Math.random()}`;
+      const ended: TaskOperationSnapshot[] = [];
+      const sub = taskOperations.onDidEnd((snap) => {
+        if (snap.key.includes("rto-settleas-unused")) {ended.push(snap);}
+      });
+      try {
+        await runTrackedOperation(taskPath, { label: "Plain Op" }, () => Promise.resolve("ok"));
+        assert.equal(ended.length, 1);
+        assert.equal(ended[0]?.state, "succeeded");
+      } finally {
+        sub.dispose();
+      }
+    });
+  });
+
   void describe("onDidChange persistenceRelevant flagging", () => {
     void it("flags begin/end/report/setModel/setWaitingForUser as persistence-relevant, and reportActivity as not", async () => {
       const taskPath = `/tmp/rto-flag-${Math.random()}`;

@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it, beforeEach } from "node:test";
 import * as vscode from "vscode";
-import { taskKey, TaskOperationRegistry } from "../utils/taskOperations";
+import { taskKey, TaskOperationRegistry, runTrackedOperation } from "../utils/taskOperations";
 
 void describe("taskOperations", () => {
   let registry: TaskOperationRegistry;
@@ -216,6 +216,86 @@ void describe("taskOperations", () => {
 
     void it("returns undefined for a task with no live operation at all", () => {
       assert.equal(registry.rootOperationIdFor("/dev/never_started"), undefined);
+    });
+  });
+
+  // Part 4 / item 16 (Step 10): a best-effort observer, given the operation's
+  // FINAL terminal state before end() removes the row, so a caller with many
+  // early-return guard clauses (e.g. `runImplementationWithAI`) can react to
+  // "this run achieved nothing" in one place without threading a run-log
+  // write through every guard clause individually. Uses the module-level
+  // `runTrackedOperation` (the global singleton registry), not the local
+  // `registry` instance the rest of this file exercises directly.
+  void describe("runTrackedOperation onSettled observer (item 16, Part 4 Step 10)", () => {
+    void it("reports the explicit settleAs state and reason before end() removes the row", async () => {
+      const seen: { state?: string; reason?: string } = {};
+      const result = await runTrackedOperation(
+        "/dev/onSettled_explicit",
+        {
+          label: "Test Op",
+          refusedWhenFalse: true,
+          onSettled: (state, reason) => {
+            seen.state = state;
+            seen.reason = reason;
+          },
+        },
+        (op) => {
+          op.settleAs("refused", "no plan-final.md to implement from");
+          return Promise.resolve(false);
+        }
+      );
+      assert.equal(result, false);
+      assert.equal(seen.state, "refused");
+      assert.equal(seen.reason, "no plan-final.md to implement from");
+    });
+
+    void it("reports 'refused' when refusedWhenFalse derives the outcome (no explicit settleAs)", async () => {
+      const seen: { state?: string } = {};
+      const result = await runTrackedOperation(
+        "/dev/onSettled_refusedWhenFalse",
+        { label: "Test Op", refusedWhenFalse: true, onSettled: (state) => { seen.state = state; } },
+        () => Promise.resolve(false)
+      );
+      assert.equal(result, false);
+      assert.equal(seen.state, "refused");
+    });
+
+    void it("reports 'succeeded' on a normal successful return", async () => {
+      const seen: { state?: string } = {};
+      const result = await runTrackedOperation(
+        "/dev/onSettled_succeeded",
+        { label: "Test Op", onSettled: (state) => { seen.state = state; } },
+        () => Promise.resolve(true)
+      );
+      assert.equal(result, true);
+      assert.equal(seen.state, "succeeded");
+    });
+
+    void it("reports 'failed' when the body throws, and the error still propagates", async () => {
+      const seen: { state?: string } = {};
+      await assert.rejects(
+        runTrackedOperation(
+          "/dev/onSettled_thrown",
+          { label: "Test Op", onSettled: (state) => { seen.state = state; } },
+          () => Promise.reject(new Error("boom"))
+        ),
+        /boom/
+      );
+      assert.equal(seen.state, "failed");
+    });
+
+    void it("swallows an observer that itself throws, without breaking the operation's own settlement", async () => {
+      const result = await runTrackedOperation(
+        "/dev/onSettled_observerThrows",
+        {
+          label: "Test Op",
+          onSettled: () => {
+            throw new Error("observer boom");
+          },
+        },
+        () => Promise.resolve(true)
+      );
+      assert.equal(result, true);
     });
   });
 });

@@ -40,6 +40,8 @@ import {
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
 import { readPackageScripts } from "../utils/completionLint";
+import { beginRoundProcessRecordingV1, recordRoundProcessV1 } from "../state/roundProcessRecordV1";
+import { readOtherProcessStartEpochMsV1 } from "../state/processStartTimeProbeV1";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -2971,6 +2973,68 @@ export function checkArgvPromptSizeLimitV1(
 }
 
 /**
+ * Records one just-spawned provider CLI process next to its round's
+ * admission lock (`roundProcessRecordV1.ts`). Reads the process's OWN start
+ * time from the OS (never trusts `Date.now()` as a stand-in) so a later
+ * classification can tell "same process, still running" apart from "pid
+ * reused by something else" — see `processLivenessClassifierV1.ts`. When
+ * that read is itself unreadable (permissions, an unsupported platform, a
+ * process that has already exited by the time this runs), records
+ * `Number.NaN`: the classifier already treats a non-finite recorded start
+ * time as "inconclusive" (fail open — never signalled, never counted as
+ * gone), which is exactly the right answer for a start time this module
+ * could not confirm.
+ */
+async function recordSpawnedCliProcessV1(
+  taskFolderPath: string,
+  claimId: string,
+  def: CliProviderDefinition,
+  pid: number,
+  command: string
+): Promise<boolean> {
+  const now = Date.now();
+  const processStartTime = await readOtherProcessStartEpochMsV1(pid, now);
+  return recordRoundProcessV1(taskFolderPath, claimId, {
+    pid,
+    processStartTime: processStartTime ?? Number.NaN,
+    providerId: def.id,
+    providerLabel: def.label,
+    command,
+    recordedAt: now,
+  });
+}
+
+/**
+ * Poll until `pid` no longer exists (ESRCH), or `timeoutMs` elapses. Used
+ * only to confirm a just-signalled process has actually exited before
+ * resolving execCliAgent's promise — the caller's admission lock is
+ * released in an unconditional `finally` keyed off that resolution (see
+ * reviewActions.ts), so resolving the instant a kill signal is SENT rather
+ * than CONFIRMED would let the next action start while this pid may still
+ * be running and editing the workspace unrecorded — exactly the
+ * architectural gap a review flagged in the post-spawn record-failure path.
+ * Any errno other than ESRCH (e.g. EPERM) still means the pid exists, so it
+ * is never treated as exited.
+ */
+async function waitForPidToExitV1(pid: number, timeoutMs = 5000, intervalMs = 100): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return true;
+      }
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+
+/**
  * Run a provider CLI once: prompt in via stdin, answer out via stdout.
  * Cancellation kills the process tree.
  */
@@ -2986,6 +3050,17 @@ export async function execCliAgent(options: {
   resumePreviousConversation?: boolean;
   /** The exact session to continue — see CliBuildArgsContext.resumeSessionId. */
   resumeSessionId?: string;
+  /**
+   * The task folder this round's admission lock is held for, and the lock's
+   * own claim id (`WorkAdmissionHandleV1.claimId`). When both are given, the
+   * spawned process is recorded next to that lock via
+   * `roundProcessRecordV1.ts` (1.0 RC1 Part B item 2), so a later dead-owner
+   * cleanup or Cancel can confirm it is gone before releasing the lock.
+   * Either omitted (no lock held by the caller) skips recording entirely —
+   * matching today's behavior.
+   */
+  taskFolderPath?: string;
+  roundProcessClaimId?: string;
 }): Promise<CliExecResult> {
   const {
     def,
@@ -2997,6 +3072,8 @@ export async function execCliAgent(options: {
     onProgress,
     resumePreviousConversation,
     resumeSessionId,
+    taskFolderPath,
+    roundProcessClaimId,
   } = options;
 
   const promptTransport = def.promptTransport ?? "stdin";
@@ -3088,6 +3165,18 @@ export async function execCliAgent(options: {
     args.push(prompt);
   }
 
+  // A display-only rendering of this run's argv, for the process record
+  // below (`roundProcessRecordV1.ts`) — shown to the user if this process
+  // later needs to be identified in a blocked-lock recovery message. The
+  // argv transport just pushed the FULL prompt (arbitrary task/context-pack
+  // text, up to its own size ceiling) onto `args`; recording that verbatim
+  // into a disk-persisted `workspaceState` entry would both bloat the
+  // record and needlessly persist prompt content outside the task folder,
+  // so it is redacted here before anything is captured, never inside `args`
+  // itself (which still carries the real prompt through to spawn below).
+  const argsForRoundProcessRecordV1 =
+    promptTransport === "argv" ? [...args.slice(0, -1), "<prompt omitted>"] : [...args];
+
   const resolvedCommand = await resolveCliCommand(
     def.command,
     def.commandAliases
@@ -3102,9 +3191,85 @@ export async function execCliAgent(options: {
     });
   }
 
+  // Mark this claim as recording processes before the first one is spawned
+  // below — see roundProcessRecordV1.ts's "NO-RECORD AMBIGUITY" doc comment
+  // for why this ordering matters. Idempotent for the same claimId (a retry
+  // attempt calling execCliAgent again is a no-op here). A caller with no
+  // lock context (either field undefined) skips this entirely, unchanged
+  // from today's behavior. Unlike the rest of roundProcessRecordV1.ts's own
+  // "best-effort" writes, THIS particular write is a hard pre-spawn
+  // condition: the plan's safety rule ("a lock is never released while a
+  // provider CLI recorded against it may still be running") can only hold if
+  // every CLI this function goes on to spawn is at least representable in
+  // the record first. If this write cannot be confirmed durable, refuse to
+  // spawn at all rather than launch a process that could never be proven
+  // gone later — a caller holding a lock context always has an admission
+  // lock to retry against, so failing this run is safe and recoverable.
+  if (taskFolderPath !== undefined && roundProcessClaimId !== undefined) {
+    const recording = await beginRoundProcessRecordingV1(taskFolderPath, roundProcessClaimId);
+    if (!recording) {
+      cleanupPromptFile();
+      return classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage:
+          `Could not record this round's process bookkeeping before starting the ${cliDisplayLabel(def)} CLI, ` +
+          "so it was not started. Retrying should succeed once the workspace state store is writable again.",
+      });
+    }
+  }
+
   return new Promise<CliExecResult>((resolve) => {
     let settled = false;
     let cancelled = false;
+    // Set true the instant the post-spawn record-failure recovery path
+    // begins killing the child, BEFORE killProcessTree is called, so the
+    // ordinary child.on("close") listener below defers to recovery's own
+    // finish() call instead of racing it to settle first with a generic
+    // provider error — recovery must own settlement once it starts, or the
+    // caller's admission lock can be released without the record-failure
+    // outcome ever being reported.
+    let recordFailureRecovering = false;
+    // Set by cancellation before it begins killing the child and waiting
+    // for confirmed exit: this blocks the ordinary child.on("close")/
+    // child.on("error") listeners and emitTimeout from racing it to settle
+    // with the wrong result while that wait is in progress. Deliberately a
+    // SEPARATE flag from recordFailureRecovering -- that flag is also
+    // checked inside finishAfterRecordingSettles's own callback (to detect
+    // whether record-write-failure recovery took over instead), so reusing
+    // it here made cancellation's own call to finishAfterRecordingSettles
+    // suppress itself and never settle -- the regression a review flagged.
+    let terminationInProgress = false;
+    // Set true the instant this run's actual child process reports its own
+    // exit via Node's close event (not by polling a pid, which can be
+    // reused) -- the wait loops below check this flag first so they no
+    // longer depend solely on process.kill(pid, 0) polling, which a review
+    // flagged as capable of hanging indefinitely if the recorded pid is
+    // reused by an unrelated process before termination is confirmed.
+    let childExited = false;
+    // Resolved the instant the child's own "close" event fires, so the wait
+    // loops below can react to confirmed exit immediately instead of only
+    // finding out on their next poll tick (up to waitForPidToExitV1's own
+    // interval/timeout later) -- closing the residual delay a review flagged
+    // between confirmed close and settlement.
+    let resolveChildExitedV1: (() => void) | undefined;
+    const childExitedPromiseV1: Promise<void> = new Promise((resolve) => {
+      resolveChildExitedV1 = resolve;
+    });
+    // Set once the post-spawn process-record write begins, so the
+    // cancellation/watchdog/error settlement paths below can wait for it
+    // to settle before finishing. Without this, one of them could settle
+    // first during the write's pending window -- before recordFailureRecovering
+    // has had a chance to become true -- reopening the exact admission race
+    // recovery exists to close.
+    // Typed as unknown-resolution: the .then(async ...) callback below
+    // never returns a value on any path (all branches end in a bare
+    // `return;` or fall through), so its resolution type is really
+    // Promise<void> -- not Promise<boolean>. Declaring it that way was a
+    // type error (TS2322) that broke check-types; this promise's resolved
+    // value is never read, only its settlement is awaited, so `unknown` is
+    // the correct and sufficient type here.
+    let recordingPromise: Promise<unknown> | undefined;
     let stdout = "";
     let stderr = "";
     // Part 7: last time ANY stdout/stderr byte arrived, used by the
@@ -3172,6 +3337,75 @@ export async function execCliAgent(options: {
       return;
     }
 
+    // Record this process next to the round's lock as soon as its pid is
+    // known, so a later dead-owner cleanup or Cancel can find and classify
+    // it. NOT fire-and-forget on failure: the write's outcome is awaited
+    // below (without blocking this run's own stdin/stdout handling, wired up
+    // synchronously beneath this block) and, if it could not be durably
+    // persisted, this process is killed and the run fails rather than left
+    // running invisibly to a later dead-owner cleanup or Cancel — the same
+    // safety rule the pre-spawn gate above enforces, applied to the process
+    // that has now actually been spawned. Kill-then-finish immediately,
+    // without waiting to confirm the kill landed: the same convention
+    // emitTimeout (below) already uses for a wedged/overrunning process, and
+    // avoids racing this handler against the ordinary child.on("close")
+    // listener over which side gets to call finish() first.
+    if (taskFolderPath !== undefined && roundProcessClaimId !== undefined && child.pid !== undefined) {
+      const recordedPid = child.pid;
+      recordingPromise = recordSpawnedCliProcessV1(
+        taskFolderPath,
+        roundProcessClaimId,
+        def,
+        recordedPid,
+        [resolvedCommand, ...argsForRoundProcessRecordV1].join(" ")
+      ).then(async (recorded) => {
+        if (recorded || settled) {
+          return;
+        }
+        // Own settlement from this point on: the ordinary child.on("close")
+        // listener checks this flag and defers to us, so it can never win
+        // the race to finish() with a generic provider error while this
+        // recovery is still confirming termination.
+        recordFailureRecovering = true;
+        killProcessTree(child);
+        // Do NOT resolve the instant the kill signal is sent: the caller's
+        // admission lock is released in an unconditional `finally` keyed
+        // off this run's promise settling (reviewActions.ts), so settling
+        // here before termination is confirmed would let the next action
+        // start while this pid may still be alive and editing the
+        // workspace unrecorded — the exact gap a review flagged. Keep
+        // polling (never settling `failed` on an unconfirmed pid) until
+        // termination is actually confirmed, surfacing each retry through
+        // onProgress so a long wait is never silent.
+        let exited = childExited;
+        while (!exited && !settled) {
+          onProgress?.(
+            `Waiting for pid ${recordedPid} to stop after a process-record failure...`.substring(0, 80)
+          );
+          // Race the authoritative close-event promise against the pid poll:
+          // whichever confirms exit first wins, so a close that fires between
+          // poll ticks is acted on immediately rather than after the poll's
+          // own interval/timeout elapses.
+          exited = childExited || await Promise.race([
+            childExitedPromiseV1.then(() => true),
+            waitForPidToExitV1(recordedPid),
+          ]);
+        }
+        if (settled) {
+          return;
+        }
+        finish(
+          classifyCliFailure({
+            status: "failed",
+            output: stdout,
+            errorMessage:
+              `Could not record the ${cliDisplayLabel(def)} CLI process (pid ${recordedPid}) next to this round's lock, ` +
+              "so it was stopped before it could keep editing the workspace unrecorded.",
+          })
+        );
+      });
+    }
+
     const finish = (result: CliExecResult): void => {
       if (settled) {
         return;
@@ -3184,6 +3418,25 @@ export async function execCliAgent(options: {
       cancellationListener.dispose();
       cleanupPromptFile();
       resolve(result);
+    };
+
+    // Cancellation, the watchdogs, and the child 'error' handler all call
+    // this instead of finish() directly: if the post-spawn process-record
+    // write is still pending, admission must not be released until it
+    // settles and recordFailureRecovering has had its chance to become
+    // true -- otherwise this path could win the race to settle before
+    // recovery ever gets to confirm the recorded process's termination.
+    const finishAfterRecordingSettles = (result: CliExecResult): void => {
+      if (recordingPromise) {
+        void recordingPromise.then(() => {
+          if (recordFailureRecovering || settled) {
+            return;
+          }
+          finish(result);
+        });
+        return;
+      }
+      finish(result);
     };
 
     // Shared by both watchdogs below (Part 7): the flat wall-clock cap and
@@ -3199,6 +3452,23 @@ export async function execCliAgent(options: {
       def.structuredEventStream === "opencode" ? extractOpencodeSessionIdV1(stdout) : undefined;
 
     const emitTimeout = (baseMessage: string, timeoutReason: "wall-clock" | "inactivity"): void => {
+      // Once post-spawn record-failure recovery, or cancellation, has taken
+      // over settlement, a watchdog must not settle first (or kill/settle
+      // at all): whichever path owns settlement needs to confirm
+      // termination itself before finish() is called, or the caller's
+      // admission lock could be released while the recorded process's
+      // termination is still unconfirmed.
+      if (recordFailureRecovering || terminationInProgress) {
+        return;
+      }
+      // Own settlement from here, exactly like cancellation does above: a
+      // watchdog must confirm the killed process is actually gone before
+      // finishing, or the caller's admission lock (released in an
+      // unconditional `finally` keyed off this promise settling) could
+      // reopen while the provider may still be alive and editing the
+      // workspace unrecorded -- the same gap a review flagged for
+      // cancellation, which applies equally here.
+      terminationInProgress = true;
       killProcessTree(child);
       const message = `${baseMessage} ${describeCliSessionProgressV1(stdout)}`;
       // Edit-mode timeouts are always promoted: edit mode has its OWN
@@ -3214,47 +3484,64 @@ export async function execCliAgent(options: {
       const resumeConversation = def.conversationResume !== undefined;
       const promoteForRetry =
         mode === "edit" || isTextModeGuaranteedReadOnly(def) || resumeConversation;
-      finish({
-        ...classifyCliFailure({
-          status: "failed",
-          output: stdout,
-          errorMessage: message,
-        }),
-        // Override classifyCliFailure's marker-matched result: the fixed
-        // timeout message never contains "quota"/"rate limit"/etc, so it
-        // would otherwise fall through to "generic" — which the fallback
-        // cascade in runnerRegistry.ts treats as terminal (never tries the
-        // next backup model). A provider that is silently unresponsive for
-        // the full timeout window (verified live: opencode hangs producing
-        // zero stdout, rather than erroring, when its model is over quota)
-        // is exactly the "temporarily unavailable" case that cascade exists
-        // to handle, so it must be classified that way rather than generic
-        // — but only when promoteForRetry allows it; otherwise this stays
-        // "generic" (cascade-terminal, not retried), which is what
-        // classifyCliFailure already produced above.
-        ...(promoteForRetry
-          ? {
-              // A same-conversation continuation keeps this generic so the
-              // backup cascade cannot consume a partially edited tree.
-              failureKind: resumeConversation
-                ? "generic" as const
-                : "temporarily-unavailable" as const,
-              // A timeout is the one failure shape that is transport-transient
-              // and therefore retry-eligible (read-only runs always, subject
-              // to promoteForRetry above; edit runs only under the
-              // per-provider flush guarantee — see runImplementationWithCli).
-              transient: true,
-              ...(resumeConversation ? { resumeConversation: true } : {}),
-            }
-          : {}),
-        // What the event stream showed up to the kill — the primary
-        // retry-evidence input for edit-capable runs.
-        editEvidence: analyzeCliEventStream(stdout),
-        timeoutReason,
-        // Pin the session this run created, so a resume continues THIS
-        // conversation rather than whatever ran last in the directory.
-        ...(sessionIdOfRun() !== undefined ? { sessionId: sessionIdOfRun() } : {}),
-      });
+      void (async () => {
+        if (child.pid !== undefined) {
+          let exited = childExited;
+          while (!exited && !settled) {
+            onProgress?.(
+              `Waiting for pid ${child.pid} to stop after a timeout...`.substring(0, 80)
+            );
+            // See the matching comment on the record-failure recovery path:
+            // race the close-event promise against the poll so confirmed
+            // exit is acted on immediately, not on the poll's own cadence.
+            exited = childExited || await Promise.race([
+              childExitedPromiseV1.then(() => true),
+              waitForPidToExitV1(child.pid),
+            ]);
+          }
+        }
+        finishAfterRecordingSettles({
+          ...classifyCliFailure({
+            status: "failed",
+            output: stdout,
+            errorMessage: message,
+          }),
+          // Override classifyCliFailure's marker-matched result: the fixed
+          // timeout message never contains "quota"/"rate limit"/etc, so it
+          // would otherwise fall through to "generic" — which the fallback
+          // cascade in runnerRegistry.ts treats as terminal (never tries the
+          // next backup model). A provider that is silently unresponsive for
+          // the full timeout window (verified live: opencode hangs producing
+          // zero stdout, rather than erroring, when its model is over quota)
+          // is exactly the "temporarily unavailable" case that cascade exists
+          // to handle, so it must be classified that way rather than generic
+          // — but only when promoteForRetry allows it; otherwise this stays
+          // "generic" (cascade-terminal, not retried), which is what
+          // classifyCliFailure already produced above.
+          ...(promoteForRetry
+            ? {
+                // A same-conversation continuation keeps this generic so the
+                // backup cascade cannot consume a partially edited tree.
+                failureKind: resumeConversation
+                  ? "generic" as const
+                  : "temporarily-unavailable" as const,
+                // A timeout is the one failure shape that is transport-transient
+                // and therefore retry-eligible (read-only runs always, subject
+                // to promoteForRetry above; edit runs only under the
+                // per-provider flush guarantee — see runImplementationWithCli).
+                transient: true,
+                ...(resumeConversation ? { resumeConversation: true } : {}),
+              }
+            : {}),
+          // What the event stream showed up to the kill — the primary
+          // retry-evidence input for edit-capable runs.
+          editEvidence: analyzeCliEventStream(stdout),
+          timeoutReason,
+          // Pin the session this run created, so a resume continues THIS
+          // conversation rather than whatever ran last in the directory.
+          ...(sessionIdOfRun() !== undefined ? { sessionId: sessionIdOfRun() } : {}),
+        });
+      })();
     };
 
     const timeoutHandle = setTimeout(() => {
@@ -3289,13 +3576,54 @@ export async function execCliAgent(options: {
         : undefined;
 
     const cancellationListener = token.onCancellationRequested(() => {
+      // See the matching guard in emitTimeout above: once recovery owns
+      // settlement, cancellation must not settle (or kill) ahead of it —
+      // recovery's own bounded wait is what proves the recorded process is
+      // actually gone before the caller's admission lock can be released.
+      if (recordFailureRecovering || terminationInProgress) {
+        return;
+      }
       cancelled = true;
+      // Own settlement from here, exactly like post-spawn record-failure
+      // recovery does above: block the ordinary child.on("close") listener,
+      // emitTimeout, and child.on("error") from racing this to finish()
+      // first. Without this, finishAfterRecordingSettles below could
+      // resolve — and the caller's admission lock could release in its
+      // unconditional `finally` — the instant the kill signal is SENT,
+      // before the process is actually confirmed gone. That gap (settling
+      // on send rather than confirmed exit) is exactly what a review
+      // flagged for this path. Uses terminationInProgress, NOT
+      // recordFailureRecovering: the latter is also checked inside
+      // finishAfterRecordingSettles's own recordingPromise callback below,
+      // so setting it here made this very call suppress itself and never
+      // settle -- a regression a later review caught.
+      terminationInProgress = true;
       killProcessTree(child);
-      finish({ status: "cancelled", output: stdout });
+      void (async () => {
+        if (child.pid !== undefined) {
+          let exited = childExited;
+          while (!exited && !settled) {
+            onProgress?.(
+              `Waiting for pid ${child.pid} to stop after Cancel...`.substring(0, 80)
+            );
+            // See the matching comment on the record-failure recovery path:
+            // race the close-event promise against the poll so confirmed
+            // exit is acted on immediately, not on the poll's own cadence.
+            exited = childExited || await Promise.race([
+              childExitedPromiseV1.then(() => true),
+              waitForPidToExitV1(child.pid),
+            ]);
+          }
+        }
+        finishAfterRecordingSettles({ status: "cancelled", output: stdout });
+      })();
     });
 
     child.on("error", (error) => {
-      finish(classifyCliFailure({
+      if (recordFailureRecovering || terminationInProgress) {
+        return;
+      }
+      finishAfterRecordingSettles(classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage: `Could not start the ${cliDisplayLabel(def)} CLI (${resolvedCommand}): ${error.message}. ${def.installHint}`,
@@ -3317,8 +3645,23 @@ export async function execCliAgent(options: {
     });
 
     child.on("close", (code) => {
+      // Recorded unconditionally, even when a recovery/cancellation path
+      // below owns settlement: this is the authoritative signal (from
+      // Node's own tracking of this exact child, immune to pid reuse)
+      // that the wait loops in those paths check instead of relying
+      // solely on process.kill(pid, 0) polling.
+      childExited = true;
+      resolveChildExitedV1?.();
+      // The post-spawn record-failure recovery path (above), or
+      // cancellation, owns settlement once it starts: it needs to confirm
+      // termination itself before finishing, so this ordinary close
+      // handler must not race it to settle first with a generic provider
+      // error.
+      if (recordFailureRecovering || terminationInProgress) {
+        return;
+      }
       if (cancelled) {
-        finish({ status: "cancelled", output: stdout });
+        finishAfterRecordingSettles({ status: "cancelled", output: stdout });
         return;
       }
 
@@ -3494,6 +3837,8 @@ export class CliAgentRunner implements AgentRunner {
         cwd: request.workspaceUri.fsPath,
         token,
         resumePreviousConversation,
+        taskFolderPath: request.taskFolderUri.fsPath,
+        roundProcessClaimId: request.roundProcessClaimId,
       });
       if (!shouldRetryReadOnlyRun(result, attempt, token.isCancellationRequested)) {
         break;
@@ -3939,8 +4284,11 @@ export async function runImplementationWithCli(options: {
     cwd: string,
     token: vscode.CancellationToken
   ) => Promise<PostImplementationTypeCheckResult>;
+  /** See execCliAgent's own doc — forwarded verbatim so this round's edit
+   * process is recorded next to its lock exactly like a text/review run's. */
+  roundProcessClaimId?: string;
 }): Promise<ImplementationRunResult> {
-  const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange } = options;
+  const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange, taskFolderUri, roundProcessClaimId } = options;
   const cwd = workspaceUri.fsPath;
 
   // (2j) Same structural, guaranteed-failure pre-check as CliAgentRunner.run
@@ -3975,6 +4323,8 @@ export async function runImplementationWithCli(options: {
     cwd,
     token,
     onProgress,
+    taskFolderPath: taskFolderUri?.fsPath,
+    roundProcessClaimId,
   });
 
   // Edit-capable runs normally replay only when a provider flush guarantee,
@@ -4078,6 +4428,8 @@ export async function runImplementationWithCli(options: {
       // Continue THIS run's conversation, not whatever ran last in the
       // directory — see CliBuildArgsContext.resumeSessionId.
       ...(lastKnownSessionId !== undefined ? { resumeSessionId: lastKnownSessionId } : {}),
+      taskFolderPath: taskFolderUri?.fsPath,
+      roundProcessClaimId,
     });
   }
   await persistRetryAuditLog(

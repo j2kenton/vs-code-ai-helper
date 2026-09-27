@@ -51,6 +51,21 @@ export interface TaskContextInput {
    * against rendering an option already known to be wrong.
    */
   hasRestorableImplRound?: boolean;
+  /**
+   * "Run Implementation" is offerable as a task-row action — Part 4 Step 12
+   * (item 16): `impl-summary.md` is the Implementation Summary Unusable
+   * stamp and no `implRecovery` is already live to fix it automatically.
+   * Resolved via `hasOfferableRunImplementationForUnusableSummaryV1`
+   * (implementationArtifactResolver.ts) — the same predicate the review
+   * stage's own row uses (see `StageContextInput`'s identically-named
+   * field). A restorable `_prev` backup does NOT suppress this: the two
+   * actions may be offered together, since a human may still want to rerun
+   * implementation with a backup present. Gates the "Run Implementation"
+   * context-menu entry (package.json matches /-runImplementationOfferable/)
+   * so it is not offered on every active/paused task regardless of whether
+   * anything is actually stuck.
+   */
+  offerRunImplementationForUnusableSummary?: boolean;
   /** Present only when `status === "creating"` and a classification has published. */
   creationFootprint?: TaskCreationContextInput;
 }
@@ -120,6 +135,20 @@ export interface StageContextInput {
    * button, so the stage row is where the only reachable action lives.
    */
   hasPendingDecision?: boolean;
+  /**
+   * "Run Implementation" is offerable as an action on THIS stage's own row —
+   * the review-stage-row half of Part 4 Step 12 (item 16). Only ever set by
+   * the caller for the `impl-high-review`/`impl-low-review` stage that is
+   * currently active, resolved the same way as the task-row token (see
+   * `TaskContextInput.offerRunImplementationForUnusableSummary`) via
+   * `hasOfferableRunImplementationForUnusableSummaryV1`
+   * (implementationArtifactResolver.ts). Gates a second "Run Implementation"
+   * context-menu entry scoped to the review stage row (package.json matches
+   * /-runImplementationOfferable/), so a task stuck with an unusable
+   * `impl-summary.md` has a way forward from the row where the problem
+   * actually occurred, not only from the task row.
+   */
+  offerRunImplementationForUnusableSummary?: boolean;
 }
 
 /**
@@ -203,6 +232,14 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // so /-pinned$/ clauses keep matching.
   if (input.hasRestorableImplRound) {
     tokens.push("restorableRound");
+  }
+
+  // "Run Implementation" offerable as a task-row action: gates the "Run
+  // Implementation" menu entry (menus match /-runImplementationOfferable/).
+  // Kept before the trailing pinned token so /-pinned$/ clauses keep
+  // matching.
+  if (input.offerRunImplementationForUnusableSummary) {
+    tokens.push("runImplementationOfferable");
   }
 
   // Pinned marker last so menu `when` clauses can match /-pinned$/ without
@@ -320,6 +357,15 @@ export function buildStageContextValue(input: StageContextInput): string {
   // same rule has-backup above follows.
   if (input.hasPendingDecision) {
     tokens.push("decisionPending");
+  }
+
+  // "Run Implementation" offerable on the review stage's own row: gates a
+  // second "Run Implementation" menu entry scoped to this row (menus match
+  // /-runImplementationOfferable/), mirroring the task-row token. Kept
+  // before the trailing modelable token so /-modelable$/ clauses keep
+  // matching.
+  if (input.offerRunImplementationForUnusableSummary) {
+    tokens.push("runImplementationOfferable");
   }
 
   // Modelable state (always at the end for regex compatibility)
