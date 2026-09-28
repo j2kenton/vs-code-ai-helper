@@ -8,6 +8,11 @@ import { getConfiguredTaskRoot, normalizePath, resolveTaskRootCandidates, TaskRo
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
+  formatNotificationTaskLabelV1,
+  notificationTaskDisplayNameV1,
+  runWithNotificationTaskContextV1,
+} from "../utils/notificationTaskContextV1";
+import {
   taskOperations,
   runTrackedOperation,
   linkCancellationTokens,
@@ -158,6 +163,7 @@ import {
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   attributionModelLabel,
+  deletePath,
   openOrCreateDocument,
   readNonEmptyText,
   readTextIfExists,
@@ -173,6 +179,7 @@ import {
   classifyUncheckedChecklistItemsV1,
   detectChecklistItemSetMutationV1,
   formatChecklistItemGlyphV1,
+  formatChecklistProgressForReviewerV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
@@ -235,6 +242,13 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
+import { describeChainExhaustionTailV1 } from "../utils/chainExhaustionMessageV1";
+import {
+  describeAutomationDefaultV1,
+  isAutomationDispatchContextV1,
+  withAutomationDispatchContextV1,
+} from "../state/automationDispatchContextV1";
 import {
   backupArtifactBeforeWrite,
   previousVersionUri,
@@ -280,7 +294,12 @@ import {
 } from "./reconcilePlanChecklist";
 import { postHandoffChecksDecisionV1 } from "./handoffChecksV1";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
-import { IMPL_REVIEW_MAX_TOTAL_CHARS } from "../utils/implReviewFileSelection";
+import {
+  describeOversizedInputRemedyV1,
+  IMPL_REVIEW_MAX_TOTAL_CHARS,
+  isImplReviewOnZeroFilesV1,
+  shouldClearImplReviewFilesAfterReviewV1,
+} from "../utils/implReviewFileSelection";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -341,7 +360,11 @@ import {
   ensurePublishReviewLegacySectionsImportedV1,
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
-import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import {
+  computeWorkingTreeFingerprintV1,
+  countCommitsSinceSha,
+  resolveHeadCommitSha,
+} from "../utils/gitRepoInfo";
 import {
   readTaskImplementationBaselineShaV1,
   recordTaskImplementationBaselineShaIfAbsentV1,
@@ -1292,18 +1315,22 @@ async function resolveTask(
     const strict = await readTaskProgressStrictV1(folderUri, {
       expectedTaskFolder: path.basename(folderUri.fsPath),
     });
+    const nodeTaskLabel = formatNotificationTaskLabelV1(
+      strict.ok ? strict.decoded.progress.displayName : node.task.progress?.displayName,
+      folderUri.fsPath
+    );
     if (!strict.ok) {
       NotificationRouter.showError(
         strict.code === "missing"
-          ? `Could not read task progress for ${node.task.folderName}.`
-          : `Task progress for ${node.task.folderName} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
+          ? `${nodeTaskLabel}: could not read task progress.`
+          : `${nodeTaskLabel}: task progress could not be read (${strict.code}) and needs recovery: ${strict.reason}`
       );
       return undefined;
     }
     const progress: TaskProgress = strict.decoded.progress;
     if (!eligibleStages.includes(progress.currentStage)) {
       NotificationRouter.showWarning(
-        `${node.task.folderName} is at stage "${
+        `${nodeTaskLabel} is at stage "${
           STAGE_DISPLAY_NAMES[progress.currentStage]
         }", which this action doesn't apply to.`
       );
@@ -1314,7 +1341,7 @@ async function resolveTask(
       owner && isSameWorkspacePath(folder.uri.fsPath, owner)
     );
     if (owner && !owningWorkspace) {
-      NotificationRouter.showError("This task belongs to a different workspace and cannot be operated on here.");
+      NotificationRouter.showError(`${nodeTaskLabel}: this task belongs to a different workspace and cannot be operated on here.`);
       return undefined;
     }
     return { folderUri, progress };
@@ -1465,7 +1492,7 @@ async function resolveTask(
 
   if ("corrupt" in picked) {
     NotificationRouter.showError(
-      `Task progress for ${picked.folderName} could not be read (${picked.code}) and needs recovery: ${picked.reason}`
+      `${formatNotificationTaskLabelV1(undefined, picked.folderName)}: task progress could not be read (${picked.code}) and needs recovery: ${picked.reason}`
     );
     return undefined;
   }
@@ -1473,18 +1500,22 @@ async function resolveTask(
   const strictPicked = await readTaskProgressStrictV1(picked.folderUri, {
     expectedTaskFolder: path.basename(picked.folderUri.fsPath),
   });
+  const pickedTaskLabel = formatNotificationTaskLabelV1(
+    strictPicked.ok ? strictPicked.decoded.progress.displayName : picked.progress.displayName,
+    picked.folderUri.fsPath
+  );
   if (!strictPicked.ok) {
     NotificationRouter.showError(
       strictPicked.code === "missing"
-        ? `Could not read task progress for ${picked.folderName}.`
-        : `Task progress for ${picked.folderName} could not be read (${strictPicked.code}) and needs recovery: ${strictPicked.reason}`
+        ? `${pickedTaskLabel}: could not read task progress.`
+        : `${pickedTaskLabel}: task progress could not be read (${strictPicked.code}) and needs recovery: ${strictPicked.reason}`
     );
     return undefined;
   }
   const pickedProgress = strictPicked.decoded.progress;
   if (!eligibleStages.includes(pickedProgress.currentStage)) {
     NotificationRouter.showWarning(
-      `${picked.folderName} is at stage "${
+      `${pickedTaskLabel} is at stage "${
         STAGE_DISPLAY_NAMES[pickedProgress.currentStage]
       }", which this action doesn't apply to.`
     );
@@ -1517,8 +1548,9 @@ async function readTaskProgressAdvisoryV1(
     return strict.decoded.progress;
   }
   if (strict.code !== "missing") {
+    const taskLabel = formatNotificationTaskLabelV1(undefined, folderUri.fsPath);
     NotificationRouter.showError(
-      `Task progress for ${path.basename(folderUri.fsPath)} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
+      `${taskLabel}: task progress could not be read (${strict.code}) and needs recovery: ${strict.reason}`
     );
     throw new Error(
       `Task progress recovery required for ${path.basename(folderUri.fsPath)} (${strict.code}): ${strict.reason}`
@@ -2279,7 +2311,7 @@ async function requirePublishChecksFreshnessOrWarnV1(
     };
   }
   NotificationRouter.showWarning(
-    describePublishChecksFreshnessFailureV1(check),
+    `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)}`,
     undefined,
     undefined,
     undefined,
@@ -2859,6 +2891,7 @@ export async function handleReviewRoutingOutcome(options: {
     identityAttachmentDegraded,
     reservedReviewPass, reviewScope,
   } = options;
+  let progressBefore: TaskProgress | undefined;
   try {
     const resilience = getResilienceSettings();
     const blockerEvidence = parseReviewBlockersDetailed(content);
@@ -2869,6 +2902,7 @@ export async function handleReviewRoutingOutcome(options: {
     // feeds history/routing even if the reviewer's own prose description of
     // it never round-trips through BLOCKER_LINE_RE at all.
     const parsedBlockers = [...blockerEvidence.blockers, ...getMechanicalBlockersForStage(folderUri, targetStage)];
+    progressBefore = await readTaskProgressAdvisoryV1(folderUri);
     if (blockerEvidence.malformedLines.length > 0) {
       // A malformed line is UNKNOWN, not clean — never let it look identical
       // to a round that stalled for any other reason. Record what could not
@@ -2884,13 +2918,13 @@ export async function handleReviewRoutingOutcome(options: {
           `${blockerEvidence.malformedLines.length} line(s) could not be parsed.\n\n` +
           `## Malformed lines\n\n${blockerEvidence.malformedLines.map((l) => `- ${l}`).join("\n")}`
       );
+      const malformedBlockersTaskLabel = formatNotificationTaskLabelV1(progressBefore?.displayName, folderUri.fsPath);
       NotificationRouter.showWarning(
-        `${STAGE_DISPLAY_NAMES[targetStage]} review parsed ${parsedBlockers.length} blocker(s), but ` +
+        `${malformedBlockersTaskLabel} — ${STAGE_DISPLAY_NAMES[targetStage]} review parsed ${parsedBlockers.length} blocker(s), but ` +
           `${blockerEvidence.malformedLines.length} blocker line(s) could not be read and were not counted. ` +
           "Check the review-guard run log."
       );
     }
-    const progressBefore = await readTaskProgressAdvisoryV1(folderUri);
     if (!progressBefore) {
       return { escalated: false };
     }
@@ -3080,9 +3114,10 @@ export async function handleReviewRoutingOutcome(options: {
         currentModelId: degenerateModelId,
         episodeTriedModelIds,
       });
+      const degenerateBackupTaskLabel = formatNotificationTaskLabelV1(progressBefore.displayName, folderUri.fsPath);
       if (degenerateBackupAdvance.kind === "stop") {
         NotificationRouter.showWarning(
-          `${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) was not tried because this stage is set to Never switch.`
+          `${degenerateBackupTaskLabel} — ${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) was not tried because this stage is set to Never switch.`
         );
       } else if (degenerateBackupAdvance.kind === "exhausted") {
         // wf10 review fix (Part 5 step 15): with every configured backup
@@ -3093,7 +3128,7 @@ export async function handleReviewRoutingOutcome(options: {
         // not a fallback-chain switch, so it remains available regardless of
         // the Never switch setting.
         NotificationRouter.showWarning(
-          `${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`,
+          `${degenerateBackupTaskLabel} — ${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`,
           undefined,
           undefined,
           undefined,
@@ -3106,7 +3141,7 @@ export async function handleReviewRoutingOutcome(options: {
             : undefined
         );
       } else {
-        NotificationRouter.showWarning(rejectionReason);
+        NotificationRouter.showWarning(`${degenerateBackupTaskLabel} — ${rejectionReason}`);
       }
       return { escalated: false, degenerateBackupAdvance };
     }
@@ -3230,7 +3265,13 @@ export async function handleReviewRoutingOutcome(options: {
       // unboundedly across the task's entire history. Scoped to impl-review
       // stages only — `implReviewFiles` has no meaning for plan/publish
       // reviews.
-      if (IMPL_REVIEW_STAGES_V1.includes(targetStage) && historyEntry.taskFixableCount === 0) {
+      //
+      // RC1 item 5: only the LAST implementation review (low-level) clears the
+      // set. `implReviewFiles` is shared by both impl-review stages, and the
+      // low-level review comes AFTER the high-level one — a clean high-level
+      // review used to wipe it, so the low-level review ran on nothing (the
+      // pack fell back to open editors, or listed no files at all).
+      if (shouldClearImplReviewFilesAfterReviewV1(targetStage, historyEntry.taskFixableCount)) {
         withHistory = clearImplReviewFiles(withHistory);
       }
       return withHistory;
@@ -3424,7 +3465,7 @@ export async function handleReviewRoutingOutcome(options: {
       });
       if (!posted) {
         NotificationRouter.showInformation(
-          `${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
+          `${formatNotificationTaskLabelV1(updated.displayName, folderUri.fsPath)} — ${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
         );
       }
       return { escalated: false };
@@ -3463,8 +3504,9 @@ export async function handleReviewRoutingOutcome(options: {
     );
     return { escalated };
   } catch (error) {
+    const routingCheckTaskLabel = formatNotificationTaskLabelV1(progressBefore?.displayName, folderUri.fsPath);
     NotificationRouter.showWarning(
-      `Review routing check failed (the review itself still published successfully): ${
+      `${routingCheckTaskLabel} — Review routing check failed (the review itself still published successfully): ${
         error instanceof Error ? error.message : String(error)
       }`
     );
@@ -3916,8 +3958,10 @@ async function notifyReviewerVerifiedTicksV1(
     // pauseTaskForExhaustedChainV1) when there is no active extension
     // context to post a WorkflowDecisionV1 into.
     const { reviewFilename, applicable } = derived.derivation;
+    const verifiedTicksProgress = await readTaskProgressAdvisoryV1(folderUri);
+    const taskLabel = formatNotificationTaskLabelV1(verifiedTicksProgress?.displayName, folderUri.fsPath);
     NotificationRouter.showWarning(
-      `${reviewFilename} named ${applicable.length} plan item(s) as verified complete that are still unticked ` +
+      `${taskLabel} — ${reviewFilename} named ${applicable.length} plan item(s) as verified complete that are still unticked ` +
         "in plan-final.md. Could not post the reviewer-verified-ticks decision to Chat With AI " +
         "(no active extension context); run \"Apply Reviewer-Verified Ticks\" once the extension is active."
     );
@@ -3949,6 +3993,7 @@ export async function dispatchDegenerateReviewBackupAdvanceV1(
     nextModelId: string;
     operation?: TaskOperationHandle;
     chatViewProvider?: ChatViewProvider;
+    taskDisplayName?: string;
   },
   deps: {
     recordActiveFallbackModel: typeof recordActiveFallbackModel;
@@ -3959,7 +4004,16 @@ export async function dispatchDegenerateReviewBackupAdvanceV1(
     recordActiveFallbackModel,
     getWorkspaceFolder: (uri) => vscode.workspace.getWorkspaceFolder(uri),
     runReviewForFolder,
-    showWarning: (...args) => NotificationRouter.showWarning(...args),
+    showWarning: (message, filePath, resultTargetUri, sourceOperationId, actionCommand): void => {
+      const taskLabel = formatNotificationTaskLabelV1(input.taskDisplayName, input.folderUri.fsPath);
+      NotificationRouter.showWarning(
+        `${taskLabel} — ${message}`,
+        filePath,
+        resultTargetUri,
+        sourceOperationId,
+        actionCommand
+      );
+    },
   }
 ): Promise<{ dispatched: boolean }> {
   await deps.recordActiveFallbackModel(input.folderUri, input.targetStage, input.nextModelId);
@@ -4033,9 +4087,10 @@ export function reviewRanWithoutTrackedFileSetV1(
  */
 export async function qualifyOpenEditorScopeInReviewV1(
   reviewUri: vscode.Uri,
-  content: string
+  content: string,
+  taskDisplayName?: string
 ): Promise<string> {
-  return (await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content)).content;
+  return (await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content, taskDisplayName)).content;
 }
 
 /**
@@ -4046,7 +4101,8 @@ export async function qualifyOpenEditorScopeInReviewV1(
  */
 export async function qualifyOpenEditorScopeWithDispositionV1(
   reviewUri: vscode.Uri,
-  content: string
+  content: string,
+  taskDisplayName?: string
 ): Promise<{ content: string; disposition: ScopeReviewDispositionV1 }> {
   if (REVIEW_SCOPE_MARKER_RE.test(content)) {
     return { content, disposition: "qualified" };
@@ -4064,7 +4120,7 @@ export async function qualifyOpenEditorScopeWithDispositionV1(
     return { content: qualified, disposition: "qualified" };
   }
   const disposition = await settleUnqualifiableScopeReviewV1(reviewUri, qualified); // persistent failure: node-fs write, else fail closed
-  warnOpenEditorScopeNoteUnsavedV1(failure, disposition);
+  warnOpenEditorScopeNoteUnsavedV1(reviewUri, failure, disposition, taskDisplayName);
   return { content: qualified, disposition };
 }
 
@@ -4084,6 +4140,13 @@ async function routeReviewOutcomeV1(
     providerId,
     variables,
   } = ctx;
+  // Every notification below is about this one task (`folderUri`) — wrapped
+  // once here (rather than interpolating a task label at each of the many
+  // showWarning/showInformation/showError call sites in this large function)
+  // so notification-task-naming attribution (both the static scanner and the
+  // runtime `attributeNotificationMessageV1` prefixer) covers all of them.
+  const outcomeRoutingProgress = await readTaskProgressAdvisoryV1(folderUri);
+  return runWithNotificationTaskContextV1(outcomeRoutingProgress?.displayName, folderUri.fsPath, async () => {
   // v1 fixes 2, item 32 review fix: the pass `claimReviewAttempt` reserved
   // for THIS round, echoed into the prompt variables at dispatch time (see
   // `runReviewForFolder`/`buildReviewResumeVariablesV1`) — carried through to
@@ -4135,7 +4198,7 @@ async function routeReviewOutcomeV1(
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
         let content = new TextDecoder().decode(contentBytes);
         if (noTrackedFileSet) {
-          const qualifiedReview = await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content);
+          const qualifiedReview = await qualifyOpenEditorScopeWithDispositionV1(reviewUri, content, outcomeRoutingProgress?.displayName);
           content = qualifiedReview.content;
           // Open only after qualification, and only a file that now carries
           // the scope note: a review that could not be qualified was moved
@@ -4241,6 +4304,7 @@ async function routeReviewOutcomeV1(
             nextModelId: degenerateBackupAdvance.nextModelId,
             operation,
             chatViewProvider,
+            taskDisplayName: outcomeRoutingProgress?.displayName,
           });
           return;
         }
@@ -4760,6 +4824,7 @@ async function routeReviewOutcomeV1(
         "The run log under runs/ records this settlement."
     );
   }
+  }, targetStage);
 }
 
 /**
@@ -4869,25 +4934,26 @@ export async function pauseTaskForExhaustedChainV1(
         observedAt: new Date().toISOString(),
       }
     : undefined;
+  // One message naming every model the chain tried and why, and where to
+  // change the list (item 11) — not a pointer at the run log.
+  const chainTail = describeChainExhaustionTailV1(STAGE_DISPLAY_NAMES[stage], exhaustion.candidates);
   const reason =
     code === "candidatesDeferred" && quotaCandidate !== undefined
       ? `Every configured model for ${stageName} is currently blocked by a ` +
         `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
         `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
         `fault (${quotaCandidate.candidate.reason}). Deferred, not exhausted: the task is parked until the known ` +
-        "reset. See the run log for the remaining per-candidate reasons."
+        `reset. ${chainTail}`
       : code === "candidatesExhausted" && quotaCandidate !== undefined
         ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
           `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
           `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
-          `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
+          `fault (${quotaCandidate.candidate.reason}). ${chainTail}`
         : code === "candidatesExhausted"
           ? `Every configured model for ${stageName} was tried and failed — ` +
-            `the resolved chain was exhausted (${chain}). ` +
-            "See the run log for per-candidate reasons."
+            `the resolved chain was exhausted (${chain}). ${chainTail}`
           : `No configured provider for ${stageName} is available — ` +
-            `the resolved chain was exhausted (${chain}). ` +
-            "See the run log for per-candidate reasons.";
+            `the resolved chain was exhausted (${chain}). ${chainTail}`;
   await patchTaskProgressStrictV1(folderUri, (current) =>
     pauseTaskWithReason(current, reason, quotaParkRecord)
   );
@@ -5018,7 +5084,9 @@ export async function pauseTaskForExhaustedChainV1(
     target
   );
   if (!decision) {
-    NotificationRouter.showWarning(`⚠️ ${reason} The task has been paused; fix provider availability or the stage's model configuration, then resume.`);
+    const exhaustedChainProgress = await readTaskProgressAdvisoryV1(folderUri);
+    const exhaustedChainTaskLabel = formatNotificationTaskLabelV1(exhaustedChainProgress?.displayName, folderUri.fsPath);
+    NotificationRouter.showWarning(`${exhaustedChainTaskLabel} — ⚠️ ${reason} The task has been paused; fix provider availability or the stage's model configuration, then resume.`);
   }
 }
 
@@ -5116,14 +5184,16 @@ export async function runReviewForFolder(
   if (!targetStage || !reviewUri) {
     return;
   }
-
   // Notifications in-flight visibility: report the stage transition here, at
-  // the top of the function before any awaited work — including the
-  // unchanged-tree guard below, which itself awaits a file read and a git
-  // call (2026-09-04 review follow-up: reviewActionsStageActivity.test.ts's
-  // "reports 'starting'... before its first await" assertion caught this
-  // ordering breaking the moment the guard was inserted above this call in an
-  // earlier revision — the guard must never be allowed back above this line).
+  // the top of the function before any asynchronous work — including the
+  // notification-task-context lookup just below (RC1 item 3 regression: that
+  // lookup reads task progress asynchronously, which pushed a pending read
+  // ahead of this report) and the unchanged-tree guard further down, which
+  // itself reads a file and calls git asynchronously (2026-09-04 review
+  // follow-up: reviewActionsStageActivity.test.ts's "reports 'starting'...
+  // before its first await" assertion caught this ordering breaking the
+  // moment a guard was inserted above this call in an earlier revision —
+  // nothing asynchronous may ever be allowed back above this line).
   // The model itself is not resolved yet at this point, so this call carries
   // none — `setModel` is called on its own, without touching activity or the
   // elapsed origin this sets, once `dispatchModelId` is actually resolved
@@ -5136,6 +5206,14 @@ export async function runReviewForFolder(
   // restore this exact origin between check batches instead of the last
   // active check's now-stale start time.
   const stageElapsedOrigin = Date.now();
+
+  // Every notification below is about this one task (`folderUri`) — wrapped
+  // once here (rather than interpolating a task label at each of the many
+  // showWarning/showInformation/showError call sites in this large function)
+  // so notification-task-naming attribution (both the static scanner and the
+  // runtime `attributeNotificationMessageV1` prefixer) covers all of them.
+  const runReviewForFolderProgress = await readTaskProgressAdvisoryV1(folderUri);
+  return runWithNotificationTaskContextV1(runReviewForFolderProgress?.displayName, folderUri.fsPath, async () => {
 
   // A1 (1.0.0 gate) Part C, Step 5: never dispatch a review against a tree
   // that is provably unchanged since the LAST review of this exact stage —
@@ -5161,8 +5239,19 @@ export async function runReviewForFolder(
   if (!options.skipUnchangedTreeGuard && REVIEWED_COMMIT_STAGES.has(targetStage)) {
     const existingReviewContent = await readNonEmptyText(reviewUri);
     const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
-    if (isReviewDispatchAgainstUnchangedTreeV1(existingReviewContent, headSha)) {
-      if (options.automationDispatch) {
+    // Exclude this stage's own review artifact (and its backup) from its own
+    // fingerprint: both are OUTPUTS of the last time this exact review ran,
+    // not inputs it assesses — including them would make every dispatch see
+    // its own previous write as "the tree changed," and "unchanged" could
+    // then never be reported even when nothing else did.
+    const currentTreeFingerprint = await computeWorkingTreeFingerprintV1(
+      workspaceRoot.uri.fsPath,
+      { excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath] }
+    );
+    if (
+      isReviewDispatchAgainstUnchangedTreeV1(existingReviewContent, headSha, currentTreeFingerprint)
+    ) {
+      if (options.automationDispatch || isAutomationDispatchContextV1()) {
         // No human is synchronously attached to this dispatch — a modal
         // here would await a click that never comes and hang the chain.
         // Refuse silently instead, with a notification naming why, rather
@@ -5235,6 +5324,14 @@ export async function runReviewForFolder(
   if (REVIEWED_COMMIT_STAGES.has(targetStage)) {
     const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
     variables.reviewedCommitSha = headSha ?? "unknown";
+    // RC1 item 3: stamped alongside reviewedCommitSha so a later dispatch of
+    // this same stage can tell "the working tree changed by hand" from
+    // "nothing changed" even though HEAD (which uncommitted edits never
+    // move) still reads the same — see isReviewDispatchAgainstUnchangedTreeV1.
+    variables.reviewedTreeFingerprint =
+      (await computeWorkingTreeFingerprintV1(workspaceRoot.uri.fsPath, {
+        excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
+      })) ?? "unknown";
     if (previousReview !== undefined) {
       // The previous review is about to be reconciled against — or superseded.
       // If its recorded commit has fallen behind HEAD, its on-disk copy must
@@ -5401,8 +5498,12 @@ export async function runReviewForFolder(
         variables.acceptedNonGoals = formatAcceptedNonGoalsVariableV1(
           planFinalContent ? parseAcceptedNonGoalsV1(planFinalContent) : []
         );
+        // RC1 item 7: Ensemble's own settled/total, handed to the reviewer as
+        // the number to report (the task view always shows Ensemble's count).
+        variables.checklistProgress = formatChecklistProgressForReviewerV1(planFinalContent);
       } catch {
         variables.acceptedNonGoals = formatAcceptedNonGoalsVariableV1([]);
+        variables.checklistProgress = "unknown";
       }
       try {
         const currentProgress = await readTaskProgressAdvisoryV1(folderUri);
@@ -5452,7 +5553,7 @@ export async function runReviewForFolder(
   // blocker: "Step 41 measures a synthetic prompt object rather than the
   // actual validated transaction input") — the loop must probe an object
   // shaped like the one the coordinator will canonicalize and check against
-  // the 256 KB transport limit (`ReviewActionInputV1`: `{ prompt,
+  // the `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` transport limit (`ReviewActionInputV1`: `{ prompt,
   // targetLocator, baselineRevision?, publishFreshnessGuard? }`), not
   // `{ templateName, prompt }`. `rootId`/`targetLocator` depend only on the
   // folder/artifact path, so they are safe to compute once here and reuse
@@ -5534,16 +5635,10 @@ export async function runReviewForFolder(
     let lastEmbeddedContentBytes = 0;
     let lastOmittedRelPaths: readonly string[] = [];
     const shrinkFloorChars = 2000;
-    // Safety ceiling only — the floor check below (`maxTotalChars <=
-    // shrinkFloorChars`) is what actually stops the loop in the normal case.
-    // A single halving variable converges from IMPL_REVIEW_MAX_TOTAL_CHARS
-    // (15000) to the 2000 floor in ~3 iterations; this bound exists only to
-    // guarantee termination if that convergence assumption is ever violated,
-    // never to cut the reduction short (2026-08-29 review, completion
-    // blocker: an equivalent fixed ceiling on the apply-review path below
-    // aborted before its floors were reached).
-    const maxShrinkAttempts = 64;
-    for (let attempt = 0; ; attempt++) {
+    // RC1 item 4: the pack is rebuilt AT MOST ONCE — from the default budget
+    // straight to the floor — so an input that cannot fit fails within
+    // seconds instead of after a series of halving rebuilds.
+    for (;;) {
       const written = await writeImplReviewContextPack(
         folderUri,
         workspaceRoot.uri,
@@ -5575,18 +5670,13 @@ export async function runReviewForFolder(
       if (lastCanonicalBytes <= MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) {
         break;
       }
-      if (maxTotalChars !== undefined && maxTotalChars <= shrinkFloorChars) {
+      if (maxTotalChars !== undefined) {
+        // Already rebuilt once at the floor and still over: no further
+        // rebuild can change the outcome.
         oversizedAfterShrink = true;
         break;
       }
-      if (attempt >= maxShrinkAttempts) {
-        oversizedAfterShrink = true;
-        break;
-      }
-      maxTotalChars = Math.max(
-        shrinkFloorChars,
-        Math.floor((maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS) / 2)
-      );
+      maxTotalChars = shrinkFloorChars;
     }
     if (oversizedAfterShrink) {
       const kb = Math.round(lastCanonicalBytes / 1024);
@@ -5601,18 +5691,53 @@ export async function runReviewForFolder(
       );
       const planBytes = Buffer.byteLength(variables.plan ?? "", "utf8");
       const reviewBytes = Buffer.byteLength(previousReview ?? "", "utf8");
-      const taskMdKb = Math.round(taskMdBytes / 1024);
-      const planKb = Math.round(planBytes / 1024);
-      const reviewKb = Math.round(reviewBytes / 1024);
-      const trackedFileContentKb = Math.round(lastEmbeddedContentBytes / 1024);
-      const fileCount = taskProgress?.implReviewFiles?.length ?? 0;
-      NotificationRouter.showError(
-        `This review's assembled input is ${kb} KB even after shrinking embedded file content to its floor — ` +
-          `over the ${limitKb} KB limit the transaction store enforces. Size drivers: task.md ${taskMdKb} KB, ` +
-          `plan.md ${planKb} KB, previous review ${reviewKb} KB, tracked file content ${trackedFileContentKb} KB ` +
-          `(${fileCount} tracked file(s), ${lastOmittedRelPaths.length} already dropped), none of which this ` +
-          "shrink reduces further. Consider splitting the task."
-      );
+      // EVERY input, with its size (RC1 item 4): the named drivers above plus
+      // each remaining prompt variable, and whatever the rendered prompt
+      // holds beyond them (the template's own fixed text).
+      const driverBytes: Record<string, number> = {
+        "task.md": taskMdBytes,
+        "plan.md": planBytes,
+        "previous review": reviewBytes,
+        "tracked file content (context pack)": lastEmbeddedContentBytes,
+      };
+      const namedVariables = new Set(["plan", "contextPack"]);
+      let variablesTotalBytes = 0;
+      for (const [name, value] of Object.entries(variables)) {
+        const bytes = Buffer.byteLength(value ?? "", "utf8");
+        variablesTotalBytes += bytes;
+        if (name === "contextPack") {
+          // The pack as a whole; its file-content share is listed above.
+          driverBytes["context pack (whole)"] = bytes;
+        } else if (!namedVariables.has(name) && bytes > 0) {
+          driverBytes[`prompt variable: ${name}`] = bytes;
+        }
+      }
+      driverBytes["template text and encoding overhead"] = Math.max(0, lastCanonicalBytes - variablesTotalBytes);
+      const remedy = describeOversizedInputRemedyV1(driverBytes, MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1, lastCanonicalBytes);
+      const abortMessage =
+        `This review's assembled input is ${kb} KB even after the context pack was rebuilt once at its smallest — ` +
+        `over the ${limitKb} KB limit the transaction store enforces. Nothing was sent to a model. ` +
+        `${remedy} (${taskProgress?.implReviewFiles?.length ?? 0} tracked file(s), ` +
+        `${lastOmittedRelPaths.length} already dropped from the pack.)`;
+      NotificationRouter.showError(abortMessage);
+      // A pre-dispatch abort is a failed round on the task, not nothing: no
+      // round was claimed yet, so one is recorded straight into its terminal
+      // state (`synthesizeIfMissing`) and shows in the round history and chat.
+      // Best-effort: the notification and the abort record below still stand.
+      try {
+        const abortRoundId = crypto.randomUUID();
+        await terminalizeRoundV1(
+          abortRoundId,
+          "failed",
+          { rejectionReason: `Review not started — input over the ${limitKb} KB limit (${kb} KB). ${remedy}` },
+          {
+            taskFolderUri: folderUri,
+            synthesizeIfMissing: () => ({ roundId: abortRoundId, stage: targetStage, mode: "review" }),
+          }
+        );
+      } catch {
+        // Best-effort — see above.
+      }
       // Persist the exact driver breakdown (2026-08-29 review, completion
       // blocker: "... and persist exact drivers/dropped content") — this
       // round never dispatches, so it has no `roundId` to key a prompt
@@ -5626,12 +5751,7 @@ export async function runReviewForFolder(
           path: "review",
           assembledCanonicalBytes: lastCanonicalBytes,
           limitCanonicalBytes: MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
-          driverBytes: {
-            "task.md": taskMdBytes,
-            "plan.md": planBytes,
-            "previous review": reviewBytes,
-            "tracked file content (context pack)": lastEmbeddedContentBytes,
-          },
+          driverBytes,
           reductionApplied: {
             "context pack char budget": maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS,
           },
@@ -5641,6 +5761,26 @@ export async function runReviewForFolder(
         // Best-effort diagnostic only — never blocks the abort it is recording.
       }
       return;
+    }
+    // RC1 item 5: a review that would run on zero files refuses and says so,
+    // instead of producing a verdict about nothing. Tracked mode: the task's
+    // changed-file set is empty. Fallback mode: no open editor supplied any
+    // file either.
+    if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      if (
+        isImplReviewOnZeroFilesV1({
+          trackedFileCount: taskProgress?.implReviewFiles?.length,
+          embeddedContentBytes: lastEmbeddedContentBytes,
+          omittedFileCount: lastOmittedRelPaths.length,
+        })
+      ) {
+        NotificationRouter.showWarning(
+          `${STAGE_DISPLAY_NAMES[targetStage] ?? targetStage} was not run: there are no changed files to review. ` +
+            "Run an Implementation round so the review has changes to look at, or move the task back a stage. " +
+            "If you changed files by hand, open them in the editor and run the review again."
+        );
+        return;
+      }
     }
     if (isFallback) {
       NotificationRouter.showWarning(
@@ -5964,6 +6104,8 @@ export async function runReviewForFolder(
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceRoot.uri.fsPath,
       resolveStagePrimaryModel: () => ({ modelId: dispatchModelId, stage: targetStage }),
+      taskDisplayName: runReviewForFolderProgress?.displayName,
+      taskFolderPath: folderUri.fsPath,
     });
 
     const reviewStatResult = await getWorkflowFileStoreV1().stat(targetLocator);
@@ -6092,6 +6234,7 @@ export async function runReviewForFolder(
     }
     void clearRoundLiveV1(reviewAttemptId);
   }
+  }, targetStage);
 }
 
 /**
@@ -6497,10 +6640,12 @@ export async function restoreRejectedImplementationRoundV1(
   const folderUri = vscode.Uri.file(taskFolderPath);
   const summaryUri = getImplementationSummaryUri(folderUri);
 
+  const restoreProgress = await readTaskProgressAdvisoryV1(folderUri);
+  const restoreTaskLabel = formatNotificationTaskLabelV1(restoreProgress?.displayName, folderUri.fsPath);
   const currentSummary = await readTextIfExists(summaryUri);
   if (currentSummary === undefined || !isUnusableImplementationSummaryV1(currentSummary)) {
     NotificationRouter.showInformation(
-      "Nothing to restore — the current implementation summary is not a rejected-round stamp " +
+      `${restoreTaskLabel} — nothing to restore — the current implementation summary is not a rejected-round stamp ` +
         "(it may already have been restored, or a later round already replaced it)."
     );
     return false;
@@ -6528,14 +6673,14 @@ export async function restoreRejectedImplementationRoundV1(
 
   if (restored.length === 0) {
     NotificationRouter.showWarning(
-      "Could not restore the prior round: no backup (_prev) file was found for the implementation " +
+      `${restoreTaskLabel} — could not restore the prior round: no backup (_prev) file was found for the implementation ` +
         "summary" + (reviewUri ? " or review" : "") + "."
     );
     return false;
   }
 
   NotificationRouter.showInformation(
-    `Restored the prior ${restored.join(" and ")} — the task is back to its pre-rejection state.` +
+    `${restoreTaskLabel} — restored the prior ${restored.join(" and ")} — the task is back to its pre-rejection state.` +
       (missing.length > 0 ? ` (No backup was found for the ${missing.join(" and ")}.)` : "")
   );
   return true;
@@ -6662,7 +6807,9 @@ export async function runReviewWithAI(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(
+      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+    );
     return;
   }
 
@@ -6710,6 +6857,7 @@ export async function runReviewWithAI(
     if (!resolved) {
       return;
     }
+    const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath);
 
     if (!handle) {
       // No-arg QuickPick path: nothing was known to protect until resolution
@@ -6725,7 +6873,12 @@ export async function runReviewWithAI(
         handoffToken: extractAdmissionHandoffTokenV1(arg),
       });
       if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        NotificationRouter.showWarning(
+          describeWorkAdmissionRefusalV1(
+            late,
+            notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+          )
+        );
         return;
       }
       handle = late.handle;
@@ -6749,11 +6902,11 @@ export async function runReviewWithAI(
     // recorded reason before touching it).
     const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
     if (reconciled.outcome === "unreadable") {
-      NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+      NotificationRouter.showError(`${taskLabel}: could not read task progress.`);
       return;
     }
     if (reconciled.outcome === "userPaused") {
-      NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+      showPausedTaskRefusalV1("running a review", resolved.folderUri.fsPath);
       return;
     }
     if (reconciled.outcome === "reversed") {
@@ -6765,7 +6918,7 @@ export async function runReviewWithAI(
     const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!workspaceRoot) {
       NotificationRouter.showError(
-        "Could not determine the owning workspace for this task. Please open the workspace that created it."
+        `${taskLabel}: could not determine the owning workspace for this task. Please open the workspace that created it.`
       );
       return;
     }
@@ -6844,8 +6997,12 @@ export async function applyReviewWithAI(
 
   if (targetStage && IMPL_REVIEW_STAGES.includes(targetStage as TaskStage)) {
     assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+    const argTask = arg && typeof arg === "object" && "task" in arg ? arg.task : undefined;
+    const earlyWrongStageTaskLabel = argTask
+      ? formatNotificationTaskLabelV1(argTask.progress.displayName, argTask.folderUri.fsPath)
+      : "This task";
     NotificationRouter.showWarning(
-      "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
+      `${earlyWrongStageTaskLabel} — Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI.`
     );
     return false;
   }
@@ -6886,7 +7043,9 @@ export async function applyReviewWithAI(
         })
       : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(
+      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+    );
     return false;
   }
 
@@ -6916,8 +7075,9 @@ export async function applyReviewWithAI(
     });
     if (strictCheck.ok && IMPL_REVIEW_STAGES.includes(strictCheck.decoded.progress.currentStage)) {
       assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+      const wrongStageTaskLabel = formatNotificationTaskLabelV1(strictCheck.decoded.progress.displayName, taskFolderUri.fsPath);
       NotificationRouter.showWarning(
-        "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
+        `${wrongStageTaskLabel} — Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI.`
       );
       return false;
     }
@@ -6945,7 +7105,12 @@ export async function applyReviewWithAI(
       handoffToken: extractAdmissionHandoffTokenV1(arg),
     });
     if (late.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          late,
+          notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+        )
+      );
       return false;
     }
     handle = late.handle;
@@ -6958,11 +7123,11 @@ export async function applyReviewWithAI(
   // like `runReviewWithAI`/`fastForwardReviewWithAI`.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
-    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    NotificationRouter.showError(`${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not read task progress.`);
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -6994,7 +7159,7 @@ export async function applyReviewWithAI(
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
   if (!workspaceRoot) {
     NotificationRouter.showError(
-      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
     );
     return false;
   }
@@ -7011,6 +7176,7 @@ export async function applyReviewWithAI(
   // reported this; this closes the gap for refusals made INSIDE the tracked
   // operation).
   const runApply = async (op: TaskOperationHandle): Promise<boolean> => {
+    return runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
     if (!reviewContent) {
@@ -7080,6 +7246,8 @@ export async function applyReviewWithAI(
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceRoot.uri.fsPath,
       resolveStagePrimaryModel: () => ({ modelId, stage: "plan" }),
+      taskDisplayName: resolved.progress.displayName,
+      taskFolderPath: resolved.folderUri.fsPath,
     });
 
     const targetLocator = { rootId, relativePath: PLAN_FILENAME };
@@ -7171,6 +7339,7 @@ export async function applyReviewWithAI(
     // settled outcome kind (completed/questions/anything else) — this
     // attempt is not a refusal.
     return true;
+    }, stage);
   };
 
   let dispatchedV1: boolean;
@@ -7359,7 +7528,9 @@ export async function fastForwardReviewWithAI(
       })
     : undefined;
   if (ffEarly && ffEarly.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffEarly));
+    NotificationRouter.showWarning(
+      describeWorkAdmissionRefusalV1(ffEarly, notificationTaskDisplayNameV1(undefined, ffEarlyFolderPath!))
+    );
     return;
   }
 
@@ -7506,7 +7677,12 @@ export async function fastForwardReviewWithAI(
       handoffToken: extractAdmissionHandoffTokenV1(arg),
     });
     if (ffLate.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(ffLate));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          ffLate,
+          notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+        )
+      );
       return;
     }
     ffHandle = ffLate.handle;
@@ -7522,11 +7698,11 @@ export async function fastForwardReviewWithAI(
   // never reversed.
   const ffReconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (ffReconciled.outcome === "unreadable") {
-    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    NotificationRouter.showError(`${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not read task progress.`);
     return;
   }
   if (ffReconciled.outcome === "userPaused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
+    showPausedTaskRefusalV1("fast-forwarding", resolved.folderUri.fsPath);
     return;
   }
   if (ffReconciled.outcome === "reversed") {
@@ -7599,7 +7775,7 @@ export async function fastForwardReviewWithAI(
     const editWorkspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!editWorkspaceRoot) {
       NotificationRouter.showError(
-        "Could not determine the owning workspace for this task. Please open the workspace that created it."
+        `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
       );
       return;
     }
@@ -7647,7 +7823,7 @@ export async function fastForwardReviewWithAI(
     const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!workspaceRoot) {
       NotificationRouter.showError(
-        "Could not determine the owning workspace for this task. Please open the workspace that created it."
+        `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
       );
       return;
     }
@@ -7666,6 +7842,9 @@ export async function fastForwardReviewWithAI(
           // not plain Review — the user asked to fast-forward, and Fast
           // Forward's own "no initial review yet" branch is exactly this call.
           rerunCommandId: "vs-code-ai-helper.fastForwardReviewWithAI",
+          // Carries the caller's automation marker (also held by the scoped
+          // context) so a would-be modal in the initial review never opens.
+          automationDispatch: isAutomationDispatchV1(arg),
         })
     );
     initialContent = await readNonEmptyText(reviewUri);
@@ -7757,6 +7936,11 @@ export async function fastForwardReviewWithAI(
   const preLoopEvidence = {
     zeroFixableEvidence: resolveZeroFixableEvidenceV1(initialMechanicalBlockers, initialContent),
     planIncomplete: isPlanIncomplete(initialProgress),
+    // Lets the loop seed `previousComplete` from the actual baseline instead
+    // of leaving the first in-loop build round exempt from the stall guard
+    // (2026-09-25 finding: the stall guard undercounted stagnant build
+    // rounds by one because it had nothing to compare attempt 1 against).
+    initialComplete: initialProgress?.complete ?? null,
   };
   // Reviewer identity + task-fixable count already on record for this stage's
   // most recent review round (the one that produced baselineScore), so the
@@ -8321,9 +8505,14 @@ export async function fastForwardReviewWithAI(
         : undefined
     );
   } else if (outcome.stalled) {
+    const buildRoundsStalled = outcome.buildRoundsWithoutProgress ?? 0;
+    const stalledDetail =
+      buildRoundsStalled > 0
+        ? `${buildRoundsStalled} consecutive build round(s) ran without landing a new plan-checklist tick`
+        : "the review did not produce a new, comparable result";
     NotificationRouter.showWarning(
-      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the last rounds changed nothing, so the review did not move. ` +
-        "If the review is clean and plan steps remain, run Implementation to build them; otherwise check the run log for a failed or blocked round." +
+      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): ${stalledDetail}. ` +
+        "Running Fast Forward again continues from here — if the review is clean and plan steps remain, run Implementation to build them; otherwise check the run log for a failed or blocked round." +
         (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
       undefined,
       undefined,
@@ -8528,6 +8717,11 @@ async function applyImplementationReviewWithAI(
   // CLI-resolved one). The assertion is kept under its own route id so
   // re-gating "applyReview.v1" for plan-review stages never implicitly
   // toggles implementation-review edit runs.
+  // Every notification below is about this one task (`folderUri`) — wrapped
+  // once here (rather than interpolating a task label at each call site) so
+  // notification-task-naming attribution covers all of them.
+  const applyReviewEditProgress = await readTaskProgressAdvisoryV1(folderUri);
+  return runWithNotificationTaskContextV1(applyReviewEditProgress?.displayName, folderUri.fsPath, async () => {
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
   // §7.5 host gate (AC-HOST-03): the full provider/root availability gate
   // already ran in the caller before any read; this cheap host-only check is
@@ -8592,7 +8786,7 @@ async function applyImplementationReviewWithAI(
   // Item 9's canonical-limit guarantee (Part 16 step 41). `checkAndConfirmPromptSize`
   // below guards a DIFFERENT, larger ceiling (`PROMPT_TOTAL_MAX_BYTES`,
   // 600 KB) aimed at quota/token cost — it does not protect against the
-  // 256 KB `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` the transaction store
+  // `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` the transaction store
   // actually enforces, so a prompt between the two ceilings would pass it and
   // still be rejected by `chatTransactionRejected` after the round is claimed.
   // Only a Copilot-resolved model's edit dispatches through that
@@ -8700,12 +8894,38 @@ async function applyImplementationReviewWithAI(
     const planKb = Math.round(planBytes / 1024);
     const implKb = Math.round(implBytes / 1024);
     const reviewKb = Math.round(reviewBytes / 1024);
+    const applyRemedy = describeOversizedInputRemedyV1(
+      {
+        "plan.md": planBytes,
+        "implementation notes (impl-summary.md)": implBytes,
+        "previous review": reviewBytes,
+      },
+      MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+      lastCanonicalBytes
+    );
     NotificationRouter.showError(
       `Applying this review would assemble a ${kb} KB input even after shrinking the review and implementation ` +
-        `notes to their floor — over the ${limitKb} KB limit the transaction store enforces. Size drivers: ` +
-        `plan ${planKb} KB, implementation notes ${implKb} KB, review ${reviewKb} KB. Consider splitting the ` +
-        "task or applying the review manually against a narrower scope."
+        `notes to their floor — over the ${limitKb} KB limit the transaction store enforces. Nothing was sent ` +
+        `to a model. Size drivers: plan ${planKb} KB, implementation notes ${implKb} KB, review ${reviewKb} KB. ` +
+        applyRemedy
     );
+    // Recorded as a failed round on the task (RC1 item 4), not left as a bare
+    // notification: no round was claimed yet, so one is written straight into
+    // its terminal state. Best-effort — the notification and record stand.
+    try {
+      const abortRoundId = crypto.randomUUID();
+      await terminalizeRoundV1(
+        abortRoundId,
+        "failed",
+        { rejectionReason: `Apply Review not started — input over the ${limitKb} KB limit (${kb} KB). ${applyRemedy}` },
+        {
+          taskFolderUri: folderUri,
+          synthesizeIfMissing: () => ({ roundId: abortRoundId, stage, mode: "apply-review" }),
+        }
+      );
+    } catch {
+      // Best-effort — see above.
+    }
     // Persist the exact driver breakdown (2026-08-29 review, completion
     // blocker: "... and persist exact drivers/dropped content") — see the
     // review-path abort above and `OversizedInputAbortRecordV1`'s doc
@@ -8737,7 +8957,10 @@ async function applyImplementationReviewWithAI(
   const prompt = parts.prompt;
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+    displayName: applyReviewEditProgress?.displayName,
+    folderPath: folderUri.fsPath,
+  });
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
@@ -8769,6 +8992,7 @@ async function applyImplementationReviewWithAI(
       dispatchedBlockerIds,
     }
   );
+  }, stage);
 }
 
 /**
@@ -8804,8 +9028,9 @@ export async function viewReview(
   }
   const content = await readNonEmptyText(reviewUri);
   if (!content) {
+    const viewReviewTaskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath);
     const choice = await vscode.window.showInformationMessage(
-      `No ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
+      `${viewReviewTaskLabel}: no ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
       "Review with AI",
       "Create Manually"
     );
@@ -8991,6 +9216,7 @@ async function advanceStageViaNextStageRowV1(
       // hands control back, with nothing further arranged).
       nextActorOnAdvance: shouldAutoReviewForWrite ? "automation" as const : "human" as const,
     },
+    taskDisplayName: baselineForRefusalGuard?.displayName,
   });
   if (outcome.kind !== "completed") {
     // v1 fixes 2 review fix (2026-09-17, narrowed completion blocker): "the
@@ -9086,6 +9312,26 @@ async function getOutstandingPlanReviewBlockersForAdvanceV1(
   return filterSupersededBlockersV1(stage, blockers, blockerSupersessions, mtimeMs);
 }
 
+/**
+ * Handler for `vs-code-ai-helper.completeStageAnywayV1` (the "Complete
+ * Anyway" notification action and the hand-off card's Advance option):
+ * force-advances the task named by `arg.taskFolderPath`, bypassing the
+ * blocker gate. Extracted from the registration so tests execute the real
+ * handler.
+ */
+export function completeStageAnywayV1(
+  context: vscode.ExtensionContext,
+  arg?: { taskFolderPath: string; artifactOverride?: "user" }
+): Promise<void> {
+  return nextStage(
+    context.extensionUri,
+    context,
+    normalizeReviewArg(arg),
+    true,
+    arg?.artifactOverride === "user"
+  );
+}
+
 export async function nextStage(
   _extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
@@ -9107,6 +9353,10 @@ export async function nextStage(
   if (!resolved) {
     return;
   }
+  // Every notification below is about this one task (`resolved`) — wrapped
+  // once here (rather than interpolating a task label at each call site) so
+  // notification-task-naming attribution covers all of them.
+  return runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
 
   // "Complete Stage & Move On" must abort whatever the current stage was
   // still running FIRST — before resolving configured review stages (which
@@ -9516,6 +9766,7 @@ export async function nextStage(
       },
     });
   }
+  }, resolved.progress.currentStage);
 }
 
 interface GenerateImplementationOutcomeContextV1 {
@@ -9551,6 +9802,10 @@ async function handleGenerateImplementationOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: GenerateImplementationOutcomeContextV1
 ): Promise<{ succeeded: boolean }> {
+  // Every notification below is about this one task (`ctx.folderUri`) —
+  // wrapped once here (rather than interpolating a task label at each call
+  // site) so notification-task-naming attribution covers all of them.
+  return runWithNotificationTaskContextV1(ctx.taskName, ctx.folderUri.fsPath, async () => {
   let succeeded = false;
 
   if (outcome.kind === "completed") {
@@ -9643,6 +9898,7 @@ async function handleGenerateImplementationOutcomeV1(
   }
 
   return { succeeded };
+  });
 }
 
 interface GenerateImplementationInvocationParamsV1 {
@@ -9695,6 +9951,8 @@ async function invokeGenerateImplementationActionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: params.workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: params.modelId, stage: "impl" as TaskStage }),
+    taskDisplayName: params.progress.displayName,
+    taskFolderPath: params.folderUri.fsPath,
   });
 
   const outcome = await coordinator.executeAction({
@@ -9796,7 +10054,7 @@ export async function generateImplementationWithAI(
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
   if (await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress)) {
-    NotificationRouter.showInformation("This task is paused. Resume it before generating implementation notes.");
+    showPausedTaskRefusalV1("generating implementation notes", resolved.folderUri.fsPath);
     return;
   }
 
@@ -9837,7 +10095,7 @@ export async function generateImplementationWithAI(
       const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
       if (!workspaceRoot) {
         NotificationRouter.showError(
-          "Could not determine the owning workspace for this task. Please open the workspace that created it."
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
         );
         return;
       }
@@ -9882,7 +10140,10 @@ export async function generateImplementationWithAI(
         { contextPack: contextPackContent, plan: planFinalContent }
       );
 
-      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+        displayName: resolved.progress.displayName,
+        folderPath: resolved.folderUri.fsPath,
+      });
       if (sizeCheck === "abort" || sizeCheck === "declined") {
         return;
       }
@@ -9964,6 +10225,8 @@ export async function resumeGenerateImplementationInteractionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "impl" as TaskStage }),
+    taskDisplayName: ownedTask.progress.displayName,
+    taskFolderPath: ownedTask.taskFolderPath,
   });
   const orchestrator = getProductionActionConversationOrchestratorV1();
 
@@ -10129,7 +10392,27 @@ async function executeImplementationRun(
   postRunReviewStage: TaskStage = "impl",
   options: ExecuteImplementationRunOptions
 ): Promise<boolean> {
+  // Every notification below is about this one task (`folderUri`) — wrapped
+  // once here (rather than interpolating a task label at each of the many
+  // showWarning/showInformation/showError call sites in this large function)
+  // so notification-task-naming attribution covers all of them.
+  const executeImplRunProgress = await readTaskProgressAdvisoryV1(folderUri);
+  return runWithNotificationTaskContextV1(executeImplRunProgress?.displayName, folderUri.fsPath, async () => {
   const cwd = workspaceRoot.uri.fsPath;
+
+  // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): clear any
+  // bookkeeping left behind by a round that never reached one of the
+  // accepted/incomplete/rejected cleanup points below (e.g. the window
+  // crashed mid-round). Deleting at the START of the NEXT round — rather
+  // than only relying on the previous round's own cleanup — closes the
+  // window where a crashed round's stale ticks would otherwise keep
+  // inflating the displayed percentage until some later round happened to
+  // overwrite them. Best-effort: a delete failure must never block dispatch.
+  // `.catch` rather than an inline `try`: `reviewActionsStageActivity.test.ts`
+  // locates the dispatch `try` block as the FIRST `try` after this function's
+  // start, so an earlier one here would shadow it.
+  await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md")).catch(() => undefined);
+
   // Allocated once, before dispatch, so the run log and the prompt manifest
   // (Part 2 step 7) can be correlated by this id rather than by parsing the
   // run log's incrementing-counter filename. Not a coordinator
@@ -10146,6 +10429,18 @@ async function executeImplementationRun(
   // Pre-run safety checks for agentic file-editing runs
   if (!options.skipPreRunSafetyCheck) {
     const isGit = await isGitWorkspace(cwd);
+    if (!isGit && isAutomationDispatchContextV1()) {
+      // No human attached to answer the modal below. The non-destructive
+      // default is to not start an edit run whose changes cannot be tracked
+      // or reverted; say so instead of hanging.
+      console.log(describeAutomationDefaultV1("Implementation run in a workspace not tracked by git", "cancelled"));
+      NotificationRouter.showWarning(
+        "An automated implementation round was not started: this workspace is not tracked by git, so its edits " +
+          "could not be reviewed or undone, and starting it needs a confirmation no one was attached to give. " +
+          "Run Implementation yourself to confirm, or put the workspace under git."
+      );
+      return false;
+    }
     if (!isGit) {
       // Non-git workspace: changes cannot be tracked or reverted
       const proceed = await vscode.window.showWarningMessage(
@@ -10166,7 +10461,18 @@ async function executeImplementationRun(
       // implementation run. Changes already associated with this task are
       // expected, so do not make users repeatedly approve their own work.
       const unrelatedChanges = await getUnrelatedWorkspaceChanges(cwd, folderUri);
-      if (unrelatedChanges.length > 0 && !allowsDirtyWorktreeChanges()) {
+      if (unrelatedChanges.length > 0 && !allowsDirtyWorktreeChanges() && isAutomationDispatchContextV1()) {
+        // Advisory prompt only (unrelated changes are already excluded from
+        // the round's own accounting). Nobody to click Proceed, so an
+        // unanswered prompt would cancel the chain: log the choice and carry
+        // on, as Fast Forward's later attempts already do.
+        console.log(
+          describeAutomationDefaultV1(
+            `Implementation run with ${unrelatedChanges.length} unrelated uncommitted change(s)`,
+            "proceeded"
+          )
+        );
+      } else if (unrelatedChanges.length > 0 && !allowsDirtyWorktreeChanges()) {
         const preview = unrelatedChanges.slice(0, 5).map((file) => `• ${file}`).join("\n");
         const more = unrelatedChanges.length > 5
           ? `\n• … and ${unrelatedChanges.length - 5} more`
@@ -10345,6 +10651,7 @@ async function executeImplementationRun(
           taskStage: postRunReviewStage,
           token: linked.token,
           onProgress: (message) => progress.report({ message }),
+          taskDisplayName: executeImplRunProgress?.displayName,
         });
         return;
       }
@@ -10374,6 +10681,7 @@ async function executeImplementationRun(
         // review stage when at review, "impl" otherwise.
         taskStage: postRunReviewStage,
         taskFolderUri: folderUri,
+        taskDisplayName: executeImplRunProgress?.displayName,
         // Part 4 architectural fix (2026-08-27 review follow-up): give the
         // sealed Copilot pipeline this round's own round-ledger row identity
         // so its coordinator attempts attach to it at allocation time, the
@@ -10914,6 +11222,20 @@ async function executeImplementationRun(
       options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
       await writeTextFile(summaryUri, `${signedSummary}\n`);
 
+      // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): once this
+      // round's report is accepted and banked, its in-round bookkeeping file
+      // is stale — any ticks it recorded are now either merged into
+      // plan-final.md below (kind === "merged") or superseded by this
+      // round's own summary. Leaving it behind risked the display-only merge
+      // in effectiveReviewProgress.ts showing those same ticks again for a
+      // LATER round that never re-earned them. Best-effort: a delete failure
+      // must never block acceptance — the file is bookkeeping only.
+      try {
+        await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
+      } catch {
+        // best-effort — see comment above.
+      }
+
       if (planChecklist !== undefined) {
         const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
         if (mergeResult.kind === "merged") {
@@ -10945,7 +11267,15 @@ async function executeImplementationRun(
               }
             }
           }
-        } else if (mergeResult.kind === "no-match") {
+        } else if (
+          mergeResult.kind === "no-match" &&
+          listUncheckedChecklistItemTextsV1(planChecklist).total > 0
+        ) {
+          // RC1 item 6 / f3 Part 10 (Guard the no-match warning): a plan
+          // that is already fully settled (0 outstanding items) must never
+          // surface this warning — an unmatched claim against a complete
+          // checklist is not evidence of a real problem, it is just a round
+          // reporting more than there was left to tick.
           NotificationRouter.showWarning(
             "⚠️ The implementation round reported checklist progress that did not match any " +
               "item in the plan of record, so no boxes were ticked. Unmatched: " +
@@ -10981,7 +11311,17 @@ async function executeImplementationRun(
       //    `reviewInvalidatedByRound` marker records instead that it no
       //    longer describes the workspace.
       await recovery.finishDispatch();
-      await safeOpenTextDocument(logUri, "implementation run log");
+      // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): an incomplete
+      // round is never banked as completed, so any ticks it appended to its
+      // in-round bookkeeping file were never accepted as real progress
+      // either — clear it here so the display-only merge does not keep
+      // showing them as live percentage after this round.
+      try {
+        await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
+      } catch {
+        // best-effort — see comment above.
+      }
+      await safeOpenTextDocument(logUri, "implementation run log", folderUri);
       return false;
     }
 
@@ -11242,7 +11582,7 @@ async function executeImplementationRun(
               : undefined
           );
         }
-        await safeOpenTextDocument(logUri, "implementation run log");
+        await safeOpenTextDocument(logUri, "implementation run log", folderUri);
         return false;
       }
       // 2b: the model reported completion, prior rounds already changed the
@@ -11623,7 +11963,13 @@ async function executeImplementationRun(
           // have already decided to apply.
           (current) => {
             const cleared = setZeroChangeImplRounds(current, undefined);
-            return checklistClaimedButUnmerged
+            // RC1 item 6 / f3 Part 10 (Guard the no-match warning/latch):
+            // a plan with nothing outstanding must never be latched
+            // unreliable over an unmatched claim — see the identical guard
+            // on the no-match warning above.
+            return checklistClaimedButUnmerged &&
+              remainingChecklistProgress !== undefined &&
+              remainingChecklistProgress.remaining > 0
               ? { ...cleared, checklistProgressUnreliable: true }
               : cleared;
           }
@@ -11688,7 +12034,7 @@ async function executeImplementationRun(
             }
           );
         }
-        await safeOpenTextDocument(logUri, "implementation run log");
+        await safeOpenTextDocument(logUri, "implementation run log", folderUri);
         return false;
       }
     } else if (!result.filesChangedUnknown && result.filesChanged.length > 0) {
@@ -11818,6 +12164,16 @@ async function executeImplementationRun(
     if (!summaryIssue) {
       await bankValidImplementationSummaryV1();
     } else {
+      // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): a rejected
+      // report never earns its bookkeeping ticks, regardless of whether the
+      // unusable-summary stamp below is actually written (that write is
+      // skipped when one is already in place, or the existing summary is
+      // preserved) — so this cleanup must not be conditioned on that write.
+      try {
+        await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
+      } catch {
+        // best-effort — see comment above.
+      }
       // Stamped HERE, next to the write it replaces, rather than beside the
       // warning further down: a round can fail its type-check AND return a
       // malformed summary, and the type-check gate returns first. Stamping at
@@ -12022,13 +12378,28 @@ async function executeImplementationRun(
       // itself, regardless of what it found (plan Part 4: "never
       // auto-exempt"). Only an explicit human attestation
       // (`reconcilePlanChecklistConfirmedV1`) clears this latch.
-      const checklistStateUnrecorded = computeSyntheticRoundChecklistLatchV1({
-        planChecklistPresent: planChecklist !== undefined,
-        roundMayHaveChangedFiles,
-        summaryIsSynthetic: result!.summaryIsSynthetic === true,
-        summaryIssuePresent: summaryIssue !== undefined,
-        checklistClaimedButUnmerged,
-      });
+      // RC1 item 6 / f3 Part 10 (Guard the no-match warning/latch, review
+      // completion blocker 2026-09-26): this latch exists to flag work a
+      // round MIGHT have finished that the plan's own counts cannot account
+      // for — but when the plan (post-merge, `effectivePlanChecklist`)
+      // already shows zero outstanding items, there is nothing left to
+      // under-count, so the concern this latch exists for does not apply.
+      // Same guard already applied to the no-match warning and the other two
+      // `checklistProgressUnreliable` writes above; this was the one site
+      // still missing it.
+      const outstandingChecklistItemCount =
+        effectivePlanChecklist !== undefined
+          ? listUncheckedChecklistItemTextsV1(effectivePlanChecklist).total
+          : 0;
+      const checklistStateUnrecorded =
+        outstandingChecklistItemCount > 0 &&
+        computeSyntheticRoundChecklistLatchV1({
+          planChecklistPresent: planChecklist !== undefined,
+          roundMayHaveChangedFiles,
+          summaryIsSynthetic: result!.summaryIsSynthetic === true,
+          summaryIssuePresent: summaryIssue !== undefined,
+          checklistClaimedButUnmerged,
+        });
       // updatedAt is bumped with the latch. patchTaskProgressStrictV1 does not
       // set it (only creation does), and the updateImplReviewFiles branch below
       // — which would have — is skipped when the change set is unknown. Without
@@ -12273,22 +12644,50 @@ async function executeImplementationRun(
     // how a later manual Review or stage advance ends up scoring evidence
     // that no longer matches the workspace. Staling first makes the early
     // returns safe; isUnusableAsExistingReview then refuses the placeholder.
-    if (isReviewStage(postRunReviewStage)) {
-      const reviewUri = artifactUri(folderUri, postRunReviewStage);
-      if (reviewUri) {
-        await markReviewArtifactStale(reviewUri, "workspace files");
-        // Ordering invariant for the incomplete-round marker: the stale stamp
-        // just written IS the replacement review-tracking state ("a fresh
-        // review is required" is now durable on the artifact itself), so the
-        // `reviewInvalidatedByRound` marker may be cleared only NOW — never
-        // before. Every persisted state therefore has either the marker set
-        // or review-tracking state already showing a fresh review is needed.
-        await patchTaskProgressStrictV1(folderUri, (current) =>
-          current.reviewInvalidatedByRound?.stage === postRunReviewStage
-            ? clearReviewInvalidatedByRound(current)
-            : current
-        );
+    //
+    // RC1 item 3: this used to stale only when `postRunReviewStage` was
+    // ITSELF a review stage (`isReviewStage(postRunReviewStage)`). A plain
+    // Implementation round dispatched while `currentStage === "impl"` (the
+    // ordinary "Run Implementation" click, or a round after the task was
+    // sent back to `impl` from a review) sets `postRunReviewStage = "impl"`
+    // (`isReviewStage("impl")` is false), so the whole block was skipped —
+    // an EXISTING `impl-high-review.md` and/or `impl-low-review.md` left on
+    // disk from before the task returned to `impl` kept reading as current
+    // even though this round's edits invalidate them. That is exactly the
+    // "false success" shape this task exists to close: a later manual Review
+    // or stage advance could score evidence that no longer matches the
+    // workspace. `impl-high-review.md` and `impl-low-review.md` are
+    // independent files, so both are staled whenever an implementation round
+    // ran (`postRunReviewStage` is `impl` or one of `IMPL_REVIEW_STAGES`),
+    // whatever stage the round itself ran from or is heading to next;
+    // `markReviewArtifactStale` is already a no-op for an absent/empty
+    // artifact, so staling a sibling that was never written is harmless.
+    // `publish` (the only other stage this function ever runs against) keeps
+    // its original single-artifact behavior.
+    const isImplRound = postRunReviewStage === "impl" || IMPL_REVIEW_STAGES.includes(postRunReviewStage);
+    const stagesToStale = isImplRound
+      ? IMPL_REVIEW_STAGES
+      : isReviewStage(postRunReviewStage)
+        ? [postRunReviewStage]
+        : [];
+    for (const staleStage of stagesToStale) {
+      const staleUri = artifactUri(folderUri, staleStage);
+      if (staleUri) {
+        await markReviewArtifactStale(staleUri, "workspace files");
       }
+    }
+    if (isReviewStage(postRunReviewStage)) {
+      // Ordering invariant for the incomplete-round marker: the stale stamp
+      // just written IS the replacement review-tracking state ("a fresh
+      // review is required" is now durable on the artifact itself), so the
+      // `reviewInvalidatedByRound` marker may be cleared only NOW — never
+      // before. Every persisted state therefore has either the marker set
+      // or review-tracking state already showing a fresh review is needed.
+      await patchTaskProgressStrictV1(folderUri, (current) =>
+        current.reviewInvalidatedByRound?.stage === postRunReviewStage
+          ? clearReviewInvalidatedByRound(current)
+          : current
+      );
     }
 
     // (2g) A round that leaves the tree non-compiling must never be handed
@@ -12317,7 +12716,7 @@ async function executeImplementationRun(
       if (recovery) {
         await recovery.finishDispatch();
       }
-      await safeOpenTextDocument(logUri, "implementation run log");
+      await safeOpenTextDocument(logUri, "implementation run log", folderUri);
       return false;
     }
 
@@ -12341,7 +12740,7 @@ async function executeImplementationRun(
       if (recovery) {
         await recovery.finishDispatch();
       }
-      await safeOpenTextDocument(logUri, "implementation run log");
+      await safeOpenTextDocument(logUri, "implementation run log", folderUri);
       return false;
     }
 
@@ -12501,6 +12900,17 @@ async function executeImplementationRun(
       }
     );
     await appendRoundOutcomeLogNoteV1(logUri, "cancelled");
+    // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): a cancelled
+    // round never reaches acceptance, so nothing else deletes its
+    // bookkeeping file — without this, ticks it appended before
+    // cancellation would keep merging into the displayed percentage as if
+    // they were still live. Best-effort: a delete failure must never affect
+    // the cancellation outcome.
+    try {
+      await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
+    } catch {
+      // best-effort — see comment above.
+    }
     return false;
   } else {
     // Part 7: an externally-terminated round (wall-clock/inactivity
@@ -12516,8 +12926,21 @@ async function executeImplementationRun(
         `Implementation failed: ${result.errorMessage ?? "unknown error"}`
       );
     }
+    // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): an ordinary
+    // failed round (including a watchdog-terminated one) never reaches
+    // acceptance either, so its bookkeeping file must be cleared here for
+    // the same reason as the cancelled branch above — otherwise its ticks
+    // would keep inflating the displayed percentage until some later round
+    // happened to overwrite them. Best-effort: a delete failure must never
+    // affect the failure outcome.
+    try {
+      await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
+    } catch {
+      // best-effort — see comment above.
+    }
     return false;
   }
+  }, postRunReviewStage);
 }
 
 /**
@@ -12567,7 +12990,7 @@ export async function recordHandoffOnlyStopV1(
   }
   await patchTaskProgressStrictV1(folderUri, (current) => setNextActorV1(current, "human")).catch(() => undefined);
   NotificationRouter.showInformation(
-    `"${displayName ?? path.basename(folderUri.fsPath)}" is waiting for you: only hand-off checks remain, so no further ` +
+    `${formatNotificationTaskLabelV1(displayName, folderUri.fsPath)} is waiting for you: only hand-off checks remain, so no further ` +
       "Implementation round was started. The remaining checks are listed in the task's chat."
   );
 }
@@ -12619,7 +13042,9 @@ export async function runImplementationWithAI(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(
+      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+    );
     return false;
   }
 
@@ -12700,7 +13125,12 @@ export async function runImplementationWithAI(
       handoffToken: extractAdmissionHandoffTokenV1(arg),
     });
     if (late.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          late,
+          notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+        )
+      );
       return false;
     }
     handle = late.handle;
@@ -12712,7 +13142,7 @@ export async function runImplementationWithAI(
   // below, exactly like `runReviewWithAI`.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
-    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    NotificationRouter.showError(`${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not read task progress.`);
     return false;
   }
   // 2026-09-09 review (blocker `fc4ab7c1-b7bf-43bb-aa59-e3c5a5937c97-1`):
@@ -12723,7 +13153,7 @@ export async function runImplementationWithAI(
   // `resolved.progress.status` stale at "active" and slip past a raw
   // `resolved.progress.status === "paused"` fallback check.
   if (reconciled.outcome === "userPaused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
+    showPausedTaskRefusalV1("running implementation", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -12754,7 +13184,7 @@ export async function runImplementationWithAI(
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
   if (!workspaceRoot) {
     NotificationRouter.showError(
-      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
     );
     return false;
   }
@@ -12781,7 +13211,9 @@ export async function runImplementationWithAI(
     stage: "impl",
   });
   if (!editAvailability.ok) {
-    NotificationRouter.showWarning(editAvailability.reason);
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — ${editAvailability.reason}`
+    );
     return false;
   }
 
@@ -12940,7 +13372,7 @@ export async function runImplementationWithAI(
       if (!checklistWorkspace) {
         op.settleAs("failed", "could not determine the owning workspace for this task");
         NotificationRouter.showError(
-          "Could not determine the owning workspace for this task. Please open the workspace that created it."
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
         );
         return false;
       }
@@ -12984,7 +13416,10 @@ export async function runImplementationWithAI(
         );
         return false;
       }
-      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);
+      const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel, 0, {
+        displayName: resolved.progress.displayName,
+        folderPath: resolved.folderUri.fsPath,
+      });
       if (checklistSizeCheck === "abort" || checklistSizeCheck === "declined") {
         return false;
       }
@@ -13437,7 +13872,10 @@ export async function runImplementationWithAI(
     });
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
-    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+      displayName: resolved.progress.displayName,
+      folderPath: resolved.folderUri.fsPath,
+    });
     if (sizeCheck === "abort" || sizeCheck === "declined") {
       return false;
     }
@@ -13607,7 +14045,9 @@ export async function applyReviewEditWithAI(
         })
       : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(
+      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+    );
     return false;
   }
 
@@ -13673,7 +14113,12 @@ export async function applyReviewEditWithAI(
       handoffToken: extractAdmissionHandoffTokenV1(arg),
     });
     if (late.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          late,
+          notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+        )
+      );
       return false;
     }
     handle = late.handle;
@@ -13685,11 +14130,11 @@ export async function applyReviewEditWithAI(
   // watchdog-provenance pause (never a user pause) before proceeding.
   const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(resolved.folderUri);
   if (reconciled.outcome === "unreadable") {
-    NotificationRouter.showError(`Could not read task progress for ${resolved.progress.taskFolder}.`);
+    NotificationRouter.showError(`${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not read task progress.`);
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -13712,7 +14157,7 @@ export async function applyReviewEditWithAI(
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
   if (!workspaceRoot) {
     NotificationRouter.showError(
-      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
     );
     return false;
   }
@@ -13734,7 +14179,9 @@ export async function applyReviewEditWithAI(
     stage: "impl",
   });
   if (!editAvailability.ok) {
-    NotificationRouter.showWarning(editAvailability.reason);
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — ${editAvailability.reason}`
+    );
     return false;
   }
 
@@ -13744,7 +14191,8 @@ export async function applyReviewEditWithAI(
   // no/empty/stale/invalid review artifact, or a still-owed continuation
   // blocking a stale-invalidated review). Mirrors `applyReviewWithAI`'s
   // identical contract (2026-09-09 review completion blocker, narrowed).
-  const runApply = async (op: TaskOperationHandle): Promise<boolean> => {
+  const runApply = (op: TaskOperationHandle): Promise<boolean> =>
+    runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
     if (!reviewContent) {
@@ -13918,7 +14366,7 @@ export async function applyReviewEditWithAI(
     // whether this attempt counts as dispatched); this attempt is not a
     // refusal.
     return true;
-  };
+    }, stage);
 
   let dispatchedV1: boolean;
   if (options.parentOperation) {
@@ -13966,33 +14414,33 @@ export function registerReviewActionCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.generateImplementationWithAI",
-      forwardInViewerV1("vs-code-ai-helper.generateImplementationWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.generateImplementationWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         generateImplementationWithAI(context.extensionUri, context, chatViewProvider, arg)
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
-      forwardInViewerV1("vs-code-ai-helper.runReviewWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.runReviewWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         runReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
-      forwardInViewerV1("vs-code-ai-helper.applyReviewWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.applyReviewWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         applyReviewWithAI(context.extensionUri, context, arg, { chatViewProvider })
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewEditWithAI",
-      forwardInViewerV1("vs-code-ai-helper.applyReviewEditWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.applyReviewEditWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         applyReviewEditWithAI(context.extensionUri, context, arg, { chatViewProvider })
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.fastForwardReviewWithAI",
-      forwardInViewerV1("vs-code-ai-helper.fastForwardReviewWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.fastForwardReviewWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         fastForwardReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
@@ -14013,7 +14461,11 @@ export function registerReviewActionCommands(
       async (arg: string | TaskNodeArg | undefined, stage?: TaskStage, rerunCommandId?: string) => {
         if (typeof arg === "string") {
           if (!stage) {
-            NotificationRouter.showWarning("Could not discard the last round: no stage was supplied.");
+            const noStageProgress = await readTaskProgressAdvisoryV1(vscode.Uri.file(arg));
+            const noStageTaskLabel = formatNotificationTaskLabelV1(noStageProgress?.displayName, arg);
+            NotificationRouter.showWarning(
+              `${noStageTaskLabel}: could not discard the last round — no stage was supplied.`
+            );
             return undefined;
           }
           const restored = await restoreRejectedImplementationRoundV1(arg, stage);
@@ -14049,8 +14501,10 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.discardOwedImplRecoveryV1",
       async (taskFolderPath: string) => {
+        const discardOwedProgress = await readTaskProgressAdvisoryV1(vscode.Uri.file(taskFolderPath));
+        const discardOwedTaskLabel = formatNotificationTaskLabelV1(discardOwedProgress?.displayName, taskFolderPath);
         const confirmation = await vscode.window.showWarningMessage(
-          "Discard this owed implementation continuation?\n\n" +
+          `${discardOwedTaskLabel}: discard this owed implementation continuation?\n\n` +
             "This stops waiting for a conforming re-report of the round that made these edits, and moves its " +
             "already-applied files into normal review scope so the next review judges them like any other " +
             "change. It never runs the round it was waiting for, and it cannot be undone.",
@@ -14078,12 +14532,12 @@ export function registerReviewActionCommands(
           // one click away, so this leaves that decision to the gate
           // instead of bypassing it here.
           NotificationRouter.showInformation(
-            "Discarded the owed implementation continuation and moved its files into review scope. " +
+            `${discardOwedTaskLabel}: discarded the owed implementation continuation and moved its files into review scope. ` +
               "Run the review, then use Complete Stage & Move On when you're ready to advance."
           );
         } else {
           NotificationRouter.showInformation(
-            "Nothing to discard — the owed continuation already cleared on its own."
+            `${discardOwedTaskLabel}: nothing to discard — the owed continuation already cleared on its own.`
           );
         }
       }
@@ -14103,22 +14557,16 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.completeStageAnywayV1",
       (arg?: { taskFolderPath: string; artifactOverride?: "user" }) =>
-        nextStage(
-          context.extensionUri,
-          context,
-          normalizeReviewArg(arg),
-          true,
-          arg?.artifactOverride === "user"
-        )
+        completeStageAnywayV1(context, arg)
     ),
     // The standalone "Generate Implementation Checklist" command was merged
     // into "Implement Actual Work": runImplementationWithAI generates the
     // checklist automatically when it is absent, then implements.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runImplementationWithAI",
-      forwardInViewerV1("vs-code-ai-helper.runImplementationWithAI", (arg?: ReviewCommandArg) =>
+      forwardInViewerV1("vs-code-ai-helper.runImplementationWithAI", withAutomationDispatchContextV1((arg?: ReviewCommandArg) =>
         runImplementationWithAI(context.extensionUri, context, arg, chatViewProvider)
-      )
+      ))
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.release",
@@ -14367,11 +14815,12 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   const strictRelease = await readTaskProgressStrictV1(candidateUri, {
     expectedTaskFolder: path.basename(candidateUri.fsPath),
   });
+  const preReadTaskLabel = formatNotificationTaskLabelV1(arg?.task?.progress?.displayName, candidate);
   if (!strictRelease.ok) {
     NotificationRouter.showWarning(
       strictRelease.code === "missing"
-        ? "Release requires an active task at the Publish stage. Resume the task first if it is paused."
-        : `Task progress could not be read (${strictRelease.code}) and needs recovery: ${strictRelease.reason}`
+        ? `${preReadTaskLabel}: release requires an active task at the Publish stage. Resume the task first if it is paused.`
+        : `${preReadTaskLabel}: task progress could not be read (${strictRelease.code}) and needs recovery: ${strictRelease.reason}`
     );
     return;
   }
@@ -14379,8 +14828,11 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   // v1 fixes item 1, Part 1b step 13: see fastForwardCurrentTaskReview.ts's
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
+  const releaseTaskLabel = formatNotificationTaskLabelV1(progress.displayName, candidate);
   if (progress.currentStage !== "publish" || (await isEffectivelyPausedV1(candidateUri.fsPath, progress))) {
-    NotificationRouter.showWarning("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
+    NotificationRouter.showWarning(
+      `${releaseTaskLabel}: release requires an active task at the Publish stage. Resume the task first if it is paused.`
+    );
     return;
   }
   // Tasks can live in an external metadata root, so task-folder containment
@@ -14388,7 +14840,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   // binding and only use containment for legacy tasks without ownership.
   const ownershipValidation = await validateReleaseTaskOwnership(candidate, progress);
   if (!ownershipValidation.ok) {
-    NotificationRouter.showError(ownershipValidation.message);
+    NotificationRouter.showError(`${releaseTaskLabel}: ${ownershipValidation.message}`);
     return;
   }
   progress = ownershipValidation.progress;
@@ -14399,11 +14851,11 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     vscode.workspace.workspaceFolders ?? []
   );
   if (persistedOwner && !owner) {
-    NotificationRouter.showError("This task belongs to a different workspace and cannot be released here.");
+    NotificationRouter.showError(`${releaseTaskLabel}: this task belongs to a different workspace and cannot be released here.`);
     return;
   }
   const root = owner?.uri.fsPath;
-  if (!root) { NotificationRouter.showWarning("Open a workspace before releasing."); return; }
+  if (!root) { NotificationRouter.showWarning(`${releaseTaskLabel}: open a workspace before releasing.`); return; }
 
   await runTrackedOperation(
     candidate,
@@ -14731,6 +15183,8 @@ export async function resumeReviewInteractionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+    taskDisplayName: ownedTask.progress.displayName,
+    taskFolderPath: ownedTask.taskFolderPath,
   });
   const orchestrator = getProductionActionConversationOrchestratorV1();
 
@@ -14772,8 +15226,9 @@ export async function resumeReviewInteractionV1(
       cancellationToken
     );
     if (!variablesResult.ok) {
+      const resumeReviewTaskLabel = formatNotificationTaskLabelV1(ownedTask.progress.displayName, taskFolderUri.fsPath);
       NotificationRouter.showWarning(
-        variablesResult.warning,
+        `${resumeReviewTaskLabel} — ${variablesResult.warning}`,
         undefined,
         undefined,
         undefined,
@@ -14922,6 +15377,8 @@ export async function resumeApplyReviewInteractionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "plan" }),
+    taskDisplayName: ownedTask.progress.displayName,
+    taskFolderPath: ownedTask.taskFolderPath,
   });
   const orchestrator = getProductionActionConversationOrchestratorV1();
 
@@ -15108,7 +15565,7 @@ export async function settleUnqualifiableScopeReviewV1(
   }
 }
 
-function warnOpenEditorScopeNoteUnsavedV1(error: unknown, disposition: ScopeReviewDispositionV1): void {
+function warnOpenEditorScopeNoteUnsavedV1(reviewUri: vscode.Uri, error: unknown, disposition: ScopeReviewDispositionV1, taskDisplayName?: string): void {
   if (disposition === "qualified") {
     return;
   }
@@ -15119,8 +15576,9 @@ function warnOpenEditorScopeNoteUnsavedV1(error: unknown, disposition: ScopeRevi
       : disposition === "removed"
         ? "The unqualified verdict was removed so it cannot be read as a task-wide score; re-run the review once the task tracks files."
         : "Treat its score as covering those open files only.";
+  const scopeNoteTaskLabel = formatNotificationTaskLabelV1(taskDisplayName, path.dirname(reviewUri.fsPath));
   NotificationRouter.showWarning(
-    "This review covered only the files open in the editor (the task has no tracked implementation file set), " +
+    `${scopeNoteTaskLabel} — this review covered only the files open in the editor (the task has no tracked implementation file set), ` +
       `but the scope note could not be saved to the review file (${message}). ${outcome} The stage was not advanced.`
   );
 }

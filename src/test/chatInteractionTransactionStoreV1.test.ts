@@ -46,6 +46,8 @@ import {
   CHAT_TRANSACTION_RESUME_INVOCATION_CLAIM_FILENAME_V1,
   decodeChatInteractionTransactionV1,
   isInputSnapshotSizeRejectionReasonV1,
+  MAX_CHAT_TRANSACTION_FILE_BYTES_V1,
+  MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
 } from "../types/chatInteractionTransactionV1";
 import {
   BeginChatTransactionInputV1,
@@ -780,8 +782,41 @@ void describe("chatInteractionTransactionStoreV1", () => {
     }
   });
 
+  void it("accepts a snapshot just under the limit and keeps the record readable within its ceiling", async () => {
+    const nearLimit = beginInput({
+      validatedInput: { blob: "x".repeat(MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 - 4096) },
+    });
+    const result = await store.begin(nearLimit);
+    expectOk(result);
+    const bytes = fs.statSync(recordPath(tmpRoot, nearLimit.correlation.operationId)).size;
+    assert.ok(
+      bytes <= MAX_CHAT_TRANSACTION_FILE_BYTES_V1,
+      `the persisted record (${bytes} bytes) must stay under its ${MAX_CHAT_TRANSACTION_FILE_BYTES_V1}-byte read ceiling`
+    );
+  });
+
+  void it("refuses an escape-heavy snapshot whose ENCODED record would exceed the read ceiling", async () => {
+    // Backslashes double in the canonical JSON and again when that JSON is
+    // embedded as a string in the record, so a snapshot that passes the
+    // canonical limit can still encode past the 1 MB read ceiling.
+    const escapeHeavy = beginInput({
+      validatedInput: { blob: "\\".repeat(Math.floor((MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 - 64) / 2)) },
+    });
+    const result = await store.begin(escapeHeavy);
+    assert.equal(result.kind, "rejected");
+    if (result.kind === "rejected") {
+      assert.equal(isInputSnapshotSizeRejectionReasonV1(result.reason), true);
+      assert.match(result.reason, /record ceiling/);
+    }
+    // Nothing was persisted, so nothing unreadable is left behind.
+    assert.equal(fs.existsSync(recordPath(tmpRoot, escapeHeavy.correlation.operationId)), false);
+  });
+
   void it("rejects content the strict decoder could never re-read", async () => {
-    const oversizedInput = beginInput({ validatedInput: { blob: "x".repeat(300 * 1024) } });
+    // Derived from the limit, not a literal, so it follows the ceiling.
+    const oversizedInput = beginInput({
+      validatedInput: { blob: "x".repeat(MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 + 1024) },
+    });
     const oversized = await store.begin(oversizedInput);
     assert.equal(oversized.kind, "rejected");
     // Item 9 (Part 16 step 43): this specific rejection must be recognizable

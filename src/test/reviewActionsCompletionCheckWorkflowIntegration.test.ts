@@ -99,12 +99,24 @@ setChatInteractionTransactionStoreV1(
 function makeImplReviewTaskFolder(name: string): { folderPath: string } {
   const folderPath = path.join(REAL_ROOT, "plans", name);
   fs.mkdirSync(folderPath, { recursive: true });
+  // RC1 item 5's zero-file refusal (isImplReviewOnZeroFilesV1) short-circuits
+  // the review before dispatch whenever `implReviewFiles` is tracked-but-empty.
+  // This fixture models a real round that changed one file, so it needs a
+  // genuine tracked, existing file for the refusal to see a non-zero count.
+  const changedRelPath = "src/changed-thing.ts";
+  fs.mkdirSync(path.join(REAL_ROOT, "src"), { recursive: true });
+  fs.writeFileSync(
+    path.join(REAL_ROOT, changedRelPath),
+    "export const thing = 1;\n",
+    "utf8"
+  );
   const progress = {
     taskFolder: name,
     currentStage: "impl-high-review",
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    implReviewFiles: [changedRelPath],
     ownership: {
       metaRoot: path.join(REAL_ROOT, "plans"),
       projectRoot: REAL_ROOT,

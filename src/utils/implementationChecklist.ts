@@ -119,9 +119,11 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
  * merge legitimately returned "no-match", but the marker already satisfied
  * `checklistEchoPresent`, so the round was silently accepted as complete with
  * only a warning notification. No merge/scoping bug was found; the missing
- * guard is this contradiction itself, caught BEFORE the merge runs so the
- * round is rejected and retried with either a real echo or a genuinely empty
- * claim, rather than completing while its claimed progress silently evaporates.
+ * guard was taken to be this contradiction itself, and the shape gate
+ * rejected such a round before the merge ran. RC2 #10 (2026-09-27) removed
+ * that rejection, since it looped tasks on their report format: the claims
+ * now go through the merge like any others. This function has no production
+ * caller at present.
  *
  * The declaration check requires the marker on its OWN line
  * (`declaresNoChecklistChangeV1`), and the claims check is scoped to `own`
@@ -225,9 +227,24 @@ export function hasContradictoryNoChecklistChangeClaimV1(
  */
 export const EXCLUDED_CHECKLIST_ITEM_MARKER_V1 = "<!-- ensemble:excluded -->";
 
-/** True when `itemText` (the checklist line's captured text) carries the exclusion marker. */
-function isExcludedChecklistItemText(itemText: string): boolean {
-  return itemText.trimEnd().endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+/**
+ * True when `itemText` (the checklist line's captured text) genuinely carries
+ * the exclusion marker, as opposed to merely mentioning it. The marker counts
+ * only as a TRAILING comment: it ends the line, follows real item text, is
+ * and is separated from that text by whitespace (a marker inside an inline
+ * code span never ends the line, so it is already not trailing). So an item
+ * that is ABOUT the marker ("Add the marker `<!-- ensemble:excluded -->`",
+ * "… the literal<!-- ensemble:excluded -->") stays an ordinary open item
+ * rather than silently settling as excluded and shrinking the count (RC1
+ * item 7).
+ */
+export function isExcludedChecklistItemText(itemText: string): boolean {
+  const trimmed = itemText.trimEnd();
+  if (!trimmed.endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1)) {
+    return false;
+  }
+  const before = trimmed.slice(0, trimmed.length - EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length);
+  return before.trim().length > 0 && /\s$/.test(before);
 }
 
 /**
@@ -971,6 +988,64 @@ export function tickHandoffChecksV1(
   };
 }
 
+/** Result of {@link settleChecklistItemV1}. */
+export interface SettleChecklistItemResultV1 {
+  /** The updated plan text — `planOfRecord` itself when no line matched. */
+  readonly content: string;
+  /** The plan's own text of the item that was settled, or `undefined` when none matched. */
+  readonly settledItemText: string | undefined;
+}
+
+/**
+ * Settles ONE checklist item on the user's word (RC1 item 8): ticks it, or
+ * excludes it (leaves the box open and appends the trailing exclusion marker).
+ * Unlike {@link tickHandoffChecksV1} this works in any section, because it is
+ * the user's explicit choice from a command — but it is otherwise as narrow: an
+ * unticked, non-excluded, top-level item in the latest rendering, matched by
+ * normalized text, first match only. Only that one line changes; every other
+ * byte is preserved, so the item set and the denominator cannot change.
+ */
+export function settleChecklistItemV1(
+  planOfRecord: string,
+  itemText: string,
+  mode: "tick" | "exclude",
+  note: string
+): SettleChecklistItemResultV1 {
+  const key = normalizeChecklistItemTextV1(itemText);
+  const cleanNote = note.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+  let settledItemText: string | undefined;
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  const mergedRegion = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced || settledItemText !== undefined) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          if (
+            state !== " " ||
+            /^[ \t]/.test(open) ||
+            isExcludedChecklistItemText(text) ||
+            normalizeChecklistItemTextV1(text) !== key
+          ) {
+            return whole;
+          }
+          settledItemText = unescapeChecklistItemTextV1(text);
+          if (mode === "tick") {
+            return `${open}x${close}${text}${cleanNote ? ` — Checked: ${cleanNote}.` : ""}${trailing}`;
+          }
+          return `${open}${state}${close}${text}${cleanNote ? ` — Excluded by you: ${cleanNote}.` : ""} ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}${trailing}`;
+        }
+      );
+    })
+    .join("");
+  return {
+    content: settledItemText !== undefined ? `${prefix}${mergedRegion}` : planOfRecord,
+    settledItemText,
+  };
+}
+
 /**
  * Count the plan of record's checklist, or `undefined` when it carries none.
  *
@@ -1056,6 +1131,33 @@ export function formatChecklistPercentV1(settled: number, total: number): number
     return 100;
   }
   return Math.min(99, Math.floor((settled / total) * 100));
+}
+
+/**
+ * Ensemble's own `settled/total` for the plan of record, in the exact form the
+ * reviewer echoes as `<!-- progress: N/M -->` (RC1 item 7: Ensemble computes
+ * the count and hands it over; the displayed figure is always Ensemble's).
+ * `unknown` when there is no readable checklist, in which case the prompt tells
+ * the reviewer to count for itself.
+ */
+export function formatChecklistProgressForReviewerV1(planOfRecord: string | undefined): string {
+  const counted = planOfRecord ? countChecklistProgressV1(planOfRecord) : undefined;
+  return counted ? `${counted.settled}/${counted.total}` : "unknown";
+}
+
+/**
+ * The Implementation row's progress label. ALWAYS a percentage, never a
+ * fraction competing with the review row's score — including a latched
+ * (unverified) count, which keeps its qualifier instead of switching format
+ * (RC1 item 7: "84/243 · unverified" read as a different kind of number).
+ */
+export function formatImplementationProgressLabelV1(
+  settled: number,
+  total: number,
+  unverified: boolean
+): string {
+  const percent = `${formatChecklistPercentV1(settled, total)}%`;
+  return unverified ? `${percent} · unverified` : percent;
 }
 
 /**

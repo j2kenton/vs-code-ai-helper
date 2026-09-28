@@ -351,7 +351,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(reportIdx >= 0, "expected a reading-context report sized from contextPackContent right after assembly");
       const sizeCheckIdx = source.indexOf(
-        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {",
         reportIdx
       );
       assert.ok(sizeCheckIdx >= 0);
@@ -369,7 +369,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(reportIdx >= 0);
       const sizeCheckIdx = source.indexOf(
-        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {",
         reportIdx
       );
       assert.ok(sizeCheckIdx >= 0);
@@ -439,7 +439,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(reportIdx >= 0);
       const sizeCheckIdx = source.indexOf(
-        "const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel);",
+        "const checklistSizeCheck = await checkAndConfirmPromptSize(checklistPrompt, checklistProviderLabel, 0, {",
         reportIdx
       );
       assert.ok(sizeCheckIdx >= 0);
@@ -465,7 +465,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(reportIdx >= 0);
       const sizeCheckIdx = source.indexOf(
-        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);",
+        "const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {",
         reportIdx
       );
       assert.ok(sizeCheckIdx >= 0);

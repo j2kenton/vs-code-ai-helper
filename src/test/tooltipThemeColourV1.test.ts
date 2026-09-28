@@ -275,6 +275,26 @@ void describe("tooltips — artifact, model id and folder name are HTML-escaped"
       provider.dispose();
     }
   });
+
+  void it("names the provider of a quota-blocked model in words, never by id prefix", async () => {
+    const inventory = makeInventory({
+      quotaParkRecord: {
+        modelId: "codex-cli:gpt-5.6-sol",
+        providerId: "codex-cli",
+        failureKind: "quota",
+        observedAt: "2026-09-06T00:00:00.000Z",
+      },
+    });
+    const provider = new TaskTreeProvider(inventory, undefined, new FakeMemento() as unknown as vscode.Memento);
+    try {
+      const node = await firstTaskNode(provider);
+      const value = (node.tooltip as vscode.MarkdownString).value;
+      assert.ok(value.includes("gpt-5.6-sol (OpenAI Codex)"), value);
+      assert.doesNotMatch(value, /codex-cli:/);
+    } finally {
+      provider.dispose();
+    }
+  });
 });
 
 void describe("task tree tooltip — paused reason, unchecked and manual checklist items are escaped", () => {

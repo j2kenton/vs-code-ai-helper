@@ -19,6 +19,18 @@ export interface UnresolvedCopilotModel {
 }
 
 /**
+ * The ids Copilot currently offers, for the "not available" message so the
+ * user can pick a real one. Capped so a large catalogue cannot flood a toast.
+ */
+export function describeAvailableCopilotModels(
+  models: readonly vscode.LanguageModelChat[],
+  max = 12
+): string {
+  const ids = models.map((model) => model.id);
+  return ids.length <= max ? ids.join(", ") : `${ids.slice(0, max).join(", ")}, … (${ids.length - max} more)`;
+}
+
+/**
  * Picks the Copilot model to run against: the explicitly requested model, or
  * the "auto" model when none was configured. Fails explicitly instead of
  * silently falling back to an unrelated model — the user must always know
@@ -37,7 +49,8 @@ export function resolveCopilotModel(
         ok: false,
         failureKind: "temporarily-unavailable",
         errorMessage:
-          `The configured Copilot model "${parsedModel.model}" is not available. ` +
+          `The configured GitHub Copilot model "${parsedModel.model}" is not available. ` +
+          `Available Copilot models: ${describeAvailableCopilotModels(models)}. ` +
           "Select an available model in Settings.",
       };
     }
@@ -54,7 +67,9 @@ export function resolveCopilotModel(
       ok: false,
       failureKind: "temporarily-unavailable",
       errorMessage:
-        "The configured Copilot model is unavailable. Select an available model in Settings.",
+        "No Copilot model was configured and Copilot's \"auto\" model is unavailable. " +
+        `Available Copilot models: ${describeAvailableCopilotModels(models)}. ` +
+        "Select an available model in Settings.",
     };
   }
   return { ok: true, model, parsedModel };

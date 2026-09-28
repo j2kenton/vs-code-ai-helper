@@ -42,12 +42,14 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
+import { describeModelWithProviderV1 } from "../runners/providers";
 import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1 } from "../state/effectivePauseStatusV1";
 import {
   formatChecklistItemGlyphV1,
   formatChecklistPercentV1,
+  formatImplementationProgressLabelV1,
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
@@ -205,6 +207,21 @@ export function sortPendingDecisionsByRecencyV1(
 }
 
 /**
+ * How many pending decisions a stage row shows an icon for (RC1 item 9): only
+ * decisions raised on that stage AND only while it is the task's current
+ * stage. A decision left behind on a stage the task has since left is stale —
+ * it must not keep flagging a row the user is no longer waiting on. Exported
+ * for direct unit testing.
+ */
+export function countPendingDecisionsForStageRowV1(
+  decisions: readonly WorkflowDecisionV1[],
+  stage: TaskStage,
+  currentStage: TaskStage
+): number {
+  return stage === currentStage ? decisions.filter((decision) => decision.stage === stage).length : 0;
+}
+
+/**
  * Build a markdown tooltip summarizing a task's full stage checklist
  */
 function buildTaskTooltip(
@@ -261,7 +278,7 @@ function buildTaskTooltip(
     const label =
       park.failureKind === "model-entitlement" ? "model-entitlement block" : "quota/rate limit";
     lines.push(
-      `$(clock) **Blocked by a ${label}** on ${tooltipLiteralTextV1(park.modelId)} as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
+      `$(clock) **Blocked by a ${label}** on ${tooltipLiteralTextV1(describeModelWithProviderV1(park.modelId))} as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
       ""
     );
   }
@@ -412,7 +429,9 @@ export function describeOwedContinuationRowIndicatorV1(
       : undefined;
   return {
     description: nextAttempt
-      ? `Continuation owed — next attempt ${nextAttempt}`
+      ? // `leaseUntil` is when the current claim expires, i.e. the EARLIEST the
+        // retry can start — not a promise of a start time (RC1 item 11).
+        `Continuation owed — will retry after ${nextAttempt}`
       : "Continuation owed — retrying automatically",
     iconId: "history",
     colorId: "charts.yellow",
@@ -863,11 +882,14 @@ export class StageNode extends vscode.TreeItem {
       // fraction competing with the review row's score.
       const percentLabel =
         stage === "impl" && implementationProgress
-          ? implementationProgress.unverified
-            ? // Latched count: shown but qualified — absence would read as
-              // "this task has no checklist", a different and wrong statement.
-              `${implementationProgress.complete}/${implementationProgress.total} · unverified`
-            : `${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%`
+          ? // Always a percentage. A latched count is shown but qualified —
+            // absence would read as "this task has no checklist", a different
+            // and wrong statement.
+            formatImplementationProgressLabelV1(
+              implementationProgress.complete,
+              implementationProgress.total,
+              implementationProgress.unverified === true
+            )
           : undefined;
       const statusLabel = readinessLabel ?? percentLabel;
       switch (status) {
@@ -2048,7 +2070,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           redoAvailable,
           missingPrerequisite,
           implementationProgress,
-          pendingDecisions.filter((decision) => decision.stage === stage).length,
+          countPendingDecisionsForStageRowV1(pendingDecisions, stage, task.progress.currentStage),
           offerRunImplementationOnThisStageRow
         )
       );

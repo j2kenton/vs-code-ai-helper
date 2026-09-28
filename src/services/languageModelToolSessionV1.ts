@@ -593,7 +593,13 @@ export function createCopilotLmToolSessionTransportV1(
       }
       const resolved = resolveCopilotModel(models, options.model);
       if (!resolved.ok) {
-        return { kind: "transportFailure", code: "copilotModelUnresolved" };
+        // Carries the resolver's message (requested model + available ones).
+        const detail = boundedTransportDetailV1(resolved.errorMessage, 600);
+        return {
+          kind: "transportFailure",
+          code: "copilotModelUnresolved",
+          ...(detail !== undefined ? { detail } : {}),
+        };
       }
 
       const requestOptions = attachLmToolsV1(

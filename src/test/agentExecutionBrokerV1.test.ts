@@ -130,6 +130,120 @@ void describe("agentExecutionBrokerV1", () => {
     assert.equal(result.payload.sha256, createHash("sha256").update(bytes).digest("hex"));
   });
 
+  void it("returns a retryable transport failure when a transport never resolves", async () => {
+    const { request, claimed } = makeFixture();
+    const result = await executeAgentRequestV1(
+      request,
+      claimed,
+      {
+        runnerId: "scripted-transport",
+        invoke: () => new Promise<AgentTransportExitV1>(() => undefined),
+      },
+      { invocationTimeoutMs: 1 }
+    );
+
+    assert.deepEqual(result, {
+      kind: "transportFailure",
+      code: "invocationDeadlineExceeded",
+      responseStarted: false,
+      detail: "provider invocation exceeded 1ms",
+    });
+  });
+
+  /** A token the test can fire, like `vscode.CancellationTokenSource`'s. */
+  function controllableToken(): { token: vscode.CancellationToken; cancel: () => void } {
+    const listeners: Array<() => void> = [];
+    let requested = false;
+    const token = {
+      get isCancellationRequested(): boolean {
+        return requested;
+      },
+      onCancellationRequested: (listener: () => void) => {
+        listeners.push(listener);
+        return { dispose: (): void => undefined };
+      },
+    } as unknown as vscode.CancellationToken;
+    return {
+      token,
+      cancel: (): void => {
+        requested = true;
+        for (const listener of listeners) {
+          listener();
+        }
+      },
+    };
+  }
+
+  /** Stands in for a CLI transport: on cancellation it "stops its process" after a delay, then resolves. */
+  function processOwningTransport(state: { processRunning: boolean }, stopDelayMs: number): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      confirmsProcessExitBeforeSettling: true,
+      invoke: (request): Promise<AgentTransportExitV1> =>
+        new Promise((resolve) => {
+          state.processRunning = true;
+          request.cancellationToken.onCancellationRequested(() => {
+            setTimeout(() => {
+              state.processRunning = false;
+              resolve({ kind: "callerCancelled" });
+            }, stopDelayMs);
+          });
+        }),
+    };
+  }
+
+  void it("Cancel on a process-owning transport settles only after its process is confirmed gone", async () => {
+    const fixture = makeFixture();
+    const { token, cancel } = controllableToken();
+    const state = { processRunning: false };
+    const running = executeAgentRequestV1(
+      { ...fixture.request, cancellationToken: token },
+      fixture.claimed,
+      processOwningTransport(state, 60)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(state.processRunning, true);
+    cancel();
+    const result = await running;
+    assert.equal(result.kind, "callerCancelled");
+    // The caller's `finally` releases admission the moment this resolves.
+    assert.equal(state.processRunning, false, "the process must be gone before the broker settles a Cancel");
+  });
+
+  void it("the broker deadline on a process-owning transport stops it and settles only after it is gone", async () => {
+    const { request, claimed } = makeFixture();
+    const state = { processRunning: false };
+    const result = await executeAgentRequestV1(request, claimed, processOwningTransport(state, 60), {
+      invocationTimeoutMs: 20,
+    });
+    assert.deepEqual(result, {
+      kind: "transportFailure",
+      code: "invocationDeadlineExceeded",
+      responseStarted: false,
+      detail: "provider invocation exceeded 20ms",
+    });
+    assert.equal(state.processRunning, false, "the process must be gone before the broker reports the deadline");
+  });
+
+  void it("a response a process-owning transport had already completed survives a late Cancel", async () => {
+    const fixture = makeFixture();
+    const { token, cancel } = controllableToken();
+    const result = await executeAgentRequestV1(
+      { ...fixture.request, cancellationToken: token },
+      fixture.claimed,
+      {
+        runnerId: "scripted-transport",
+        confirmsProcessExitBeforeSettling: true,
+        invoke: (_request, output): Promise<AgentTransportExitV1> => {
+          output.write("done");
+          cancel();
+          return Promise.resolve({ kind: "completed" });
+        },
+      }
+    );
+    assert.equal(result.kind, "response");
+  });
+
   void it("rejects an unmigrated action key at the V1 boundary", async () => {
     const key = "unmigratedAction.v1";
     const { request, claimed } = makeFixture({ actionKey: key });

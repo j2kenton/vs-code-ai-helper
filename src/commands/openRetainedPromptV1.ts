@@ -23,6 +23,7 @@ import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { safeOpenTextDocument, statIfExists } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 
 interface OpenRetainedPromptArg {
   task?: IncompleteTask;
@@ -124,7 +125,7 @@ export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise
   const prompts = await listRetainedPromptsV1(task.folderUri);
   if (prompts.length === 0) {
     NotificationRouter.showInformation(
-      `No retained prompts found for ${task.progress.displayName ?? task.folderName} yet — they are written starting with this task's next implementation round.`
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: no retained prompts found yet — they are written starting with this task's next implementation round.`
     );
     return;
   }
@@ -150,12 +151,13 @@ export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise
     return;
   }
 
+  const taskLabel = formatNotificationTaskLabelV1(task.progress.displayName, task.folderName);
   if (!(await statIfExists(selected.promptUri))) {
-    NotificationRouter.showWarning("The retained prompt file no longer exists on disk.");
+    NotificationRouter.showWarning(`${taskLabel}: the retained prompt file no longer exists on disk.`);
     return;
   }
-  await warnIfPromptCaptureIncompleteV1(selected.promptUri);
-  await safeOpenTextDocument(selected.promptUri, `${selected.label}.prompt.txt`);
+  await warnIfPromptCaptureIncompleteV1(selected.promptUri, taskLabel);
+  await safeOpenTextDocument(selected.promptUri, `${selected.label}.prompt.txt`, task.folderUri);
 }
 
 /**
@@ -166,14 +168,14 @@ export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise
  * saw", is what keeps the manifest's honesty useful rather than merely
  * recorded.
  */
-async function warnIfPromptCaptureIncompleteV1(promptUri: vscode.Uri): Promise<void> {
+async function warnIfPromptCaptureIncompleteV1(promptUri: vscode.Uri, taskLabel: string): Promise<void> {
   const manifestUri = vscode.Uri.file(promptUri.fsPath.replace(/\.prompt\.txt$/, ".prompt-manifest.json"));
   try {
     const raw = await vscode.workspace.fs.readFile(manifestUri);
     const manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as { promptCaptureComplete?: boolean };
     if (manifest.promptCaptureComplete === false) {
       NotificationRouter.showWarning(
-        "This round ran through the Copilot sealed pipeline: the retained text is the pre-dispatch template only. " +
+        `${taskLabel}: this round ran through the Copilot sealed pipeline: the retained text is the pre-dispatch template only. ` +
           "The provider also received a preflight tool-session preamble and a result-contract suffix that are not captured here."
       );
     }

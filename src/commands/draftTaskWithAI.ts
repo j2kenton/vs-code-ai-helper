@@ -55,6 +55,8 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 
 import {
@@ -176,7 +178,8 @@ type ResolveDraftCoordinatorFailureV1 =
  */
 async function resolveDraftCoordinatorV1(
   taskFolderUri: vscode.Uri,
-  workspaceFolderUri: vscode.Uri
+  workspaceFolderUri: vscode.Uri,
+  taskDisplayName?: string
 ): Promise<
   | { readonly ok: true; readonly value: ResolvedDraftCoordinatorV1 }
   | { readonly ok: false; readonly failure: ResolveDraftCoordinatorFailureV1 }
@@ -199,6 +202,8 @@ async function resolveDraftCoordinatorV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "desc" as TaskStage }),
+    taskDisplayName,
+    taskFolderPath: taskFolderUri.fsPath,
   });
   return { ok: true, value: { coordinator, providerLabel, modelLabel: nativeModelId } };
 }
@@ -243,6 +248,7 @@ async function handleDraftOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: DraftOutcomeContextV1
 ): Promise<DraftOutcomeResultV1> {
+  return runWithNotificationTaskContextV1(ctx.taskRef.taskName, ctx.taskRef.taskFolderPath, async () => {
   const taskFolderUri = vscode.Uri.file(ctx.taskRef.taskFolderPath);
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
@@ -330,6 +336,7 @@ async function handleDraftOutcomeV1(
   );
 
   return { succeeded, runLogUri };
+  });
 }
 
 interface DraftResultV1 {
@@ -342,6 +349,10 @@ async function draftTaskWithAIForResolvedTask(
   resolvedTask: ResolvedTaskContext,
   op: TaskOperationHandle
 ): Promise<DraftResultV1> {
+  return runWithNotificationTaskContextV1(
+    resolvedTask.progress.displayName,
+    resolvedTask.taskFolderPath,
+    async () => {
   // resolveTaskContext already computed the owning workspace folder (with a
   // fallback for tasks that predate the `ownership` field), so reuse it
   // instead of re-deriving it from ownership.workspaceRoot directly — that
@@ -414,7 +425,7 @@ async function draftTaskWithAIForResolvedTask(
     return { succeeded: false };
   }
 
-  const resolved = await resolveDraftCoordinatorV1(taskFolderUri, workspaceFolder.uri);
+  const resolved = await resolveDraftCoordinatorV1(taskFolderUri, workspaceFolder.uri, resolvedTask.progress.displayName);
   if (!resolved.ok) {
     if (resolved.failure.kind === "noModel") {
       NotificationRouter.showWarning(
@@ -443,7 +454,10 @@ async function draftTaskWithAIForResolvedTask(
   );
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+    displayName: resolvedTask.progress.displayName,
+    folderPath: resolvedTask.taskFolderPath,
+  });
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return { succeeded: false };
   }
@@ -551,6 +565,9 @@ async function draftTaskWithAIForResolvedTask(
       }
     );
   return { succeeded };
+    },
+    resolvedTask.progress.currentStage
+  );
 }
 
 /**
@@ -783,17 +800,21 @@ export async function draftTaskWithAI(
     // this command — only a watchdog-provenance pause is reversible, and
     // that reversal already happened above, before the allowPaused gate.
     if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
-      NotificationRouter.showWarning(
-        "Draft Task with AI is only available for tasks that are not paused. Resume the task first."
-      );
+      showPausedTaskRefusalV1("using Draft Task with AI", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
       return;
     }
 
     if (!handle) {
       NotificationRouter.showWarning(
         lateAdmissionRefusalV1
-          ? describeWorkAdmissionRefusalV1(lateAdmissionRefusalV1)
-          : "Could not acquire work admission for this task."
+          ? describeWorkAdmissionRefusalV1(
+              lateAdmissionRefusalV1,
+              notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
+            )
+          : `Could not acquire work admission for "${notificationTaskDisplayNameV1(
+              resolvedTask.progress.displayName,
+              resolvedTask.taskFolderPath
+            )}".`
       );
       return;
     }

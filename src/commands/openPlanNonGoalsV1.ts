@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 // plan-final.md's constant is (confusingly) named IMPLEMENTATION_FILENAME —
 // PLAN_FILENAME is plan.md, the pre-review draft. See taskProgress.ts's doc
 // comment on IMPLEMENTATION_FILENAME.
@@ -23,11 +24,12 @@ export async function openPlanNonGoalsV1(arg?: OpenPlanNonGoalsArg): Promise<voi
   if (!arg?.taskFolderPath) {
     return;
   }
+  const folderName = path.basename(arg.taskFolderPath);
   const folderUri = vscode.Uri.file(arg.taskFolderPath);
   const planUri = vscode.Uri.joinPath(folderUri, PLAN_FINAL_FILENAME);
   const content = await readTextIfExists(planUri);
   if (content === undefined) {
-    NotificationRouter.showInformation(`${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
+    NotificationRouter.showInformation(`${folderName}: ${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
     return;
   }
   const opened = await safeOpenTextDocument(planUri, PLAN_FINAL_FILENAME);
@@ -37,7 +39,7 @@ export async function openPlanNonGoalsV1(arg?: OpenPlanNonGoalsArg): Promise<voi
   const match = ACCEPTED_NON_GOALS_HEADING_RE.exec(content);
   if (!match) {
     NotificationRouter.showInformation(
-      `${PLAN_FINAL_FILENAME} has no "## Accepted Non-Goals" section yet — showing the top of the file.`
+      `${folderName}: ${PLAN_FINAL_FILENAME} has no "## Accepted Non-Goals" section yet — showing the top of the file.`
     );
     return;
   }
@@ -64,11 +66,12 @@ export async function openPlanFinalV1(arg?: OpenPlanNonGoalsArg): Promise<void> 
   if (!arg?.taskFolderPath) {
     return;
   }
+  const folderName = path.basename(arg.taskFolderPath);
   const folderUri = vscode.Uri.file(arg.taskFolderPath);
   const planUri = vscode.Uri.joinPath(folderUri, PLAN_FINAL_FILENAME);
   const content = await readTextIfExists(planUri);
   if (content === undefined) {
-    NotificationRouter.showInformation(`${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
+    NotificationRouter.showInformation(`${folderName}: ${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
     return;
   }
   await safeOpenTextDocument(planUri, PLAN_FINAL_FILENAME);

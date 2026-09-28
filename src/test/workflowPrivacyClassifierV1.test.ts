@@ -136,6 +136,20 @@ void describe("workflowPrivacyClassifierV1", () => {
     );
   });
 
+  void it("classifies round-progress.md as workflow-control, out of filesChanged/pendingImplReviewFiles (Ensemble 1.0 RC1, item 6)", () => {
+    assert.equal(classifyWorkflowPathV1("round-progress.md"), "workflowControl");
+    assert.equal(classifyWorkflowPathV1("plans/t/round-progress.md"), "workflowControl");
+    assert.equal(
+      classifyWorkflowPathV1("C:\\ws\\plans\\t\\ROUND-PROGRESS.MD"),
+      "workflowControl"
+    );
+    assert.equal(isWorkflowPrivatePathV1("round-progress.md"), true);
+    assert.deepEqual(
+      sanitizeChangeSetV1(["src/a.ts", "round-progress.md", "src/b.ts"]),
+      ["src/a.ts", "src/b.ts"]
+    );
+  });
+
   void it("classifies crash-surviving atomic-write temp records as workflow-control (pinned to the owner's formatter)", () => {
     assert.equal(classifyWorkflowPathV1(ATOMIC_TEMP_FIXTURE), "workflowControl");
     assert.equal(classifyWorkflowPathV1(`plans/t/${ATOMIC_TEMP_FIXTURE}`), "workflowControl");

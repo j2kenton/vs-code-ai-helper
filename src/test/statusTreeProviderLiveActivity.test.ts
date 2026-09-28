@@ -32,6 +32,7 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
+import { describeModelWithProviderV1 } from "../runners/providers";
 
 function operationNodes(provider: StatusTreeProvider): StatusOperationNode[] {
   const children = (provider.getChildren() ?? []) as StatusTreeNode[];
@@ -190,7 +191,12 @@ void describe("StatusTreeProvider row identity and lifecycle exclusivity", () =>
       const nodeWithModel = operationNodes(provider).find((n) => n.taskName === "no_model");
       assert.ok(nodeWithModel);
       const withModel = String(provider.getTreeItem(nodeWithModel).description ?? "");
-      assert.equal(withModel, "Implementation · running · claude-cli:sonnet@high · 0s");
+      assert.equal(
+        withModel,
+        `Implementation · running · ${describeModelWithProviderV1("claude-cli:sonnet@high")} · 0s`
+      );
+      assert.match(withModel, /\(Claude Code\)/, "the operation row names the provider in words, not by prefix");
+      assert.ok(!withModel.includes("claude-cli:"), "the raw provider prefix must not be shown");
     } finally {
       taskOperations.end(op);
       provider.dispose();

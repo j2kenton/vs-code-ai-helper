@@ -6,8 +6,14 @@
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { attributeNotificationMessageV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
+import {
+  attributeNotificationMessageV1,
+  formatNotificationTaskLabelV1,
+  formatTaskNameForDisplay,
+  runWithNotificationTaskContextV1,
+} from "../utils/notificationTaskContextV1";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
+import { formatTaskNameForDisplay as formatTaskNameForDisplayFromOperations } from "../utils/taskOperations";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
 
 const tick = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,6 +29,15 @@ void describe("notification task context", () => {
       return attributeNotificationMessageV1("Review is stale.");
     });
     assert.equal(seen, '"alpha" — Review is stale.');
+  });
+
+  void it("quotes a task name the same way on every surface, and names an un-renamed task by number", async () => {
+    assert.equal(formatTaskNameForDisplay("alpha"), '"alpha"');
+    assert.equal(formatTaskNameForDisplay, formatTaskNameForDisplayFromOperations);
+    const seen = await runWithNotificationTaskContextV1(undefined, "/w/2026-09-20_task_7", () =>
+      Promise.resolve(attributeNotificationMessageV1("Review is stale."))
+    );
+    assert.equal(seen, `${formatTaskNameForDisplay("Task 7 (2026-09-20)")} — Review is stale.`);
   });
 
   void it("does not double a message that already names the task", async () => {
@@ -118,5 +133,20 @@ void describe("terminal notification stage attribution", () => {
 
   void it("omits the stage when the snapshot has none", () => {
     assert.equal(terminalEntryFor(base)?.message, 'Fast Forward — "alpha": completed');
+  });
+});
+
+void describe("self-named notification task label", () => {
+  void it("quotes a real display name", () => {
+    assert.equal(formatNotificationTaskLabelV1("Login rework", "/ws/.ensemble/2026-09-20_task_7"), '"Login rework"');
+  });
+
+  void it("never shows the raw folder default", () => {
+    assert.equal(formatNotificationTaskLabelV1(undefined, "/ws/.ensemble/2026-09-20_task_7"), '"Task 7 (2026-09-20)"');
+    assert.equal(formatNotificationTaskLabelV1(undefined, "2026-09-20_task_7"), '"Task 7 (2026-09-20)"');
+  });
+
+  void it("keeps a user-chosen folder name that is not the default pattern", () => {
+    assert.equal(formatNotificationTaskLabelV1(undefined, "my-task"), '"my-task"');
   });
 });

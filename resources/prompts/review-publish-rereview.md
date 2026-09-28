@@ -26,10 +26,11 @@ Then structure your review as:
 
 If a Sibling Review Disagreement section appears below, it is also a mechanical, deterministic check, not an AI claim: the high-level and low-level implementation reviews reported contradictory facts about the identical commit. Resolve it explicitly by deriving the current state from the workspace yourself — never by silently averaging the two scores or verdicts together.
 
-Record which commit you reviewed. End your response with this marker on its own line, using the exact value shown below (copy it — do not compute or guess a SHA yourself):
+Record which commit you reviewed. End your response with these markers on their own lines, using the exact values shown below (copy them — do not compute or guess a SHA or a fingerprint yourself):
 
 ```
 <!-- reviewed-commit: {{reviewedCommitSha}} -->
+<!-- reviewed-tree-fingerprint: {{reviewedTreeFingerprint}} -->
 <!-- review-pass: {{reviewPass}} -->
 ```
 

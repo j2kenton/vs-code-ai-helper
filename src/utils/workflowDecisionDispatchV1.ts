@@ -26,6 +26,7 @@ import {
 } from "../state/workflowDecisionStoreV1";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { HandoffGatingV1 } from "../types/handoffGuidanceV1";
+import type { TaskStage } from "../types/taskProgress";
 import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 import { recommendationPreconditionsV1 } from "./recommendationPreconditionsV1";
@@ -507,14 +508,25 @@ export async function withdrawWorkflowDecisionsByKeyV1(
  */
 export async function retirePendingWorkflowDecisionsForTaskV1(
   target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
-  reason: string
+  reason: string,
+  filter?: {
+    /** Retire only decisions raised on this stage (RC1 item 9: the stage being left). */
+    readonly stage?: TaskStage;
+    /** Retire only decisions raised at or before this instant (ISO), so one raised after it survives. */
+    readonly raisedAtOrBefore?: string;
+  }
 ): Promise<void> {
   const context = getExtensionContextV1();
   if (!context) {
     return;
   }
   const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
-  const matches = store.listPending(target.canonicalId);
+  const cutoff = filter?.raisedAtOrBefore === undefined ? undefined : Date.parse(filter.raisedAtOrBefore);
+  const matches = store.listPending(target.canonicalId).filter(
+    (decision) =>
+      (filter?.stage === undefined || decision.stage === filter.stage) &&
+      (cutoff === undefined || Number.isNaN(cutoff) || Date.parse(decision.createdAt) <= cutoff)
+  );
   for (const decision of matches) {
     try {
       const result = await store.withdraw(decision.decisionId, reason);

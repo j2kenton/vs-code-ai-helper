@@ -18,7 +18,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { nextStage } from "../commands/reviewActions";
+import { completeStageAnywayV1, nextStage } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { OWNED_FIXTURE_BOUND_AT } from "./taskFolderFixture";
 import { IncompleteTask } from "../types/incompleteTask";
@@ -27,6 +27,7 @@ import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const taskOperationsModule = require("../utils/taskOperations") as Record<string, unknown>;
+const settingsModule = require("../config/settings") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 interface RecordedEntry {
@@ -218,6 +219,50 @@ void describe("nextStage — blocker-gate warning on manual advance (wf10 item 1
         "a fully-superseded blocker must not trigger the gate warning"
       );
     } finally {
+      taskOperationsModule.cancelRunningOperationsForTask = origCancel;
+      fsBridge.restore();
+      deactivateNotificationRouter();
+      safeRemoveDir(container);
+    }
+  });
+});
+
+void describe("completeStageAnywayV1 — the registered force-advance handler (hand-off card Advance)", () => {
+  void it("advances the task named by taskFolderPath past an outstanding blocker, persisting the new stage", async () => {
+    const container = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-complete-anyway-"));
+    const taskFolder = path.join(container, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    writeTaskProgress(taskFolder);
+    fs.writeFileSync(path.join(taskFolder, "plan.md"), "# Plan\n\n- [ ] Do the work\n");
+    fs.writeFileSync(path.join(taskFolder, "plan-high-review.md"), REVIEW_WITH_BLOCKER);
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const fsBridge = installFsBridge();
+    const origCancel = taskOperationsModule.cancelRunningOperationsForTask;
+    taskOperationsModule.cancelRunningOperationsForTask = (): Promise<{ ok: boolean; reason?: string }> =>
+      Promise.resolve({ ok: true });
+
+    // Keep the destination stage's own AI action out of this test: only the
+    // force-advance itself is under test.
+    const origTriggers = settingsModule.completeAndMoveOnTriggersAI;
+    settingsModule.completeAndMoveOnTriggersAI = (): boolean => false;
+
+    try {
+      await completeStageAnywayV1(makeContext(), { taskFolderPath: taskFolder });
+
+      assert.ok(
+        !surface.entries.some((entry) => entry.actionCommand?.command === "vs-code-ai-helper.completeStageAnywayV1"),
+        "the blocker gate is bypassed: no Complete Anyway warning is posted again"
+      );
+      const persisted = JSON.parse(fs.readFileSync(path.join(taskFolder, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.notEqual(
+        persisted.currentStage,
+        "plan-high-review",
+        `the task's persisted stage must have moved on; notifications: ${JSON.stringify(surface.entries)}`
+      );
+    } finally {
+      settingsModule.completeAndMoveOnTriggersAI = origTriggers;
       taskOperationsModule.cancelRunningOperationsForTask = origCancel;
       fsBridge.restore();
       deactivateNotificationRouter();

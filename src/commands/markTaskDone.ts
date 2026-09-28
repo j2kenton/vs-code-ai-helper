@@ -6,6 +6,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { invokeLifecycleRowV1 } from "../actions/productionTaskActionRuntimeV1";
@@ -170,7 +171,7 @@ export async function markTaskDone(
     const currentStageName =
       STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
     NotificationRouter.showWarning(
-      `"Complete Task" is only available once the task ` +
+      `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: "Complete Task" is only available once the task ` +
         `has reached ${STAGE_DISPLAY_NAMES["publish"]}. ` +
         `Current stage: ${currentStageName}.`
     );
@@ -181,7 +182,7 @@ export async function markTaskDone(
   const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, "publish");
   if (missingArtifacts.length > 0 && resolverArg?.artifactOverride !== "user") {
     NotificationRouter.showWarning(
-      `Cannot complete ${resolvedTask.folderName}: ${missingArtifacts.join(", ")} has not been created. ` +
+      `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: cannot complete — ${missingArtifacts.join(", ")} has not been created. ` +
         "Run or create the Publish review first, or explicitly complete anyway.",
       undefined,
       undefined,
@@ -216,7 +217,7 @@ export async function markTaskDone(
     if (!derivedBinding.ok) {
       op.settleAs("failed", "ownership binding could not be verified");
       NotificationRouter.showError(
-        `Could not complete ${resolvedTask.folderName}: its ownership binding could not be verified. ` +
+        `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: could not complete — its ownership binding could not be verified. ` +
           `The task's progress file needs recovery.`
       );
       return;
@@ -234,11 +235,14 @@ export async function markTaskDone(
         taskFolderPath: taskFolderUri.fsPath,
         ...(resolverArg?.artifactOverride === "user" ? { artifactOverride: "user" as const } : {}),
       },
+      taskDisplayName: resolvedTask.progress.displayName,
     });
     if (outcome.kind !== "completed") {
       const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
       op.settleAs("failed", detail);
-      NotificationRouter.showError(`Could not complete ${resolvedTask.folderName}: ${detail}.`);
+      NotificationRouter.showError(
+        `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: could not complete — ${detail}.`
+      );
       return;
     }
     await inventory.refresh();
@@ -264,10 +268,11 @@ export async function markTaskDone(
     // ── Step 3: Record the completion in the Notifications section ──────────
     // (taxonomy: instant-mutation → terminal entry there, no duplicate native
     // IDE toast for a success the Notifications section already records).
+    const completedLabel = formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName);
     NotificationRouter.showInformation(
       nextCanonicalId
-        ? `${resolvedTask.folderName} complete. Next task selected.`
-        : `${resolvedTask.folderName} complete. No remaining active tasks.`
+        ? `${completedLabel} complete. Next task selected.`
+        : `${completedLabel} complete. No remaining active tasks.`
     );
     }
   );

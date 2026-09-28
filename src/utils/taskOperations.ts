@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
-import { runWithNotificationTaskContextV1 } from "./notificationTaskContextV1";
+import { formatTaskNameForDisplay, notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "./notificationTaskContextV1";
 import { normalizePath } from "./taskRoot";
 import { OperationKind } from "./operationTaxonomy";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -10,6 +10,7 @@ import { describeOwedContinuationRefusalV1 } from "./owedContinuationRefusalV1";
 import { writeRunLog } from "./runLog";
 import { isViewerHostV1 } from "../state/hostRoleV1";
 import { isUnrecoverableImplRecoveryV1 } from "./taskWatchdogV1";
+import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1";
 import type { TaskProgress } from "../types/taskProgress";
 
 /**
@@ -357,16 +358,9 @@ export function linkCancellationTokens(
   };
 }
 
-/**
- * Render a task name for user-facing display, wrapped in straight double
- * quotes: Notifications rows and terminal entries read `Rename Task —
- * "ff for 1 pt 2": completed`. The semantic `taskName` stored on operation
- * snapshots (and in persisted entries) stays unquoted — quoting happens only
- * at the render boundary, so historical data never carries quote characters.
- */
-export function formatTaskNameForDisplay(taskName: string): string {
-  return `"${taskName}"`;
-}
+// Defined in notificationTaskContextV1.ts so the notification attribution prefix
+// and every other surface quote a task name identically; re-exported for importers.
+export { formatTaskNameForDisplay };
 
 /**
  * Default task-folder naming scheme (`YYYY-MM-DD_task_N`) — the exact shape
@@ -393,9 +387,9 @@ export function resolveWorkflowRootTaskName(
   displayName: string | undefined,
   taskFolderPath: string
 ): string {
-  const name = displayName ?? path.basename(taskFolderPath);
-  const match = WORKFLOW_ROOT_FOLDER_NAME_PATTERN.exec(name);
-  return match ? `Task ${match[2]} (${match[1]})` : name;
+  // One implementation for every notification surface (item 11): the same
+  // `displayName ?? folder name` rule, with the raw folder default reformatted.
+  return notificationTaskDisplayNameV1(displayName, taskFolderPath);
 }
 
 export interface TaskOperationChangeEvent {
@@ -1261,7 +1255,9 @@ export async function runTrackedOperation<T>(
   // operation's own task (item 6). Per-operation, not ambient: overlapping
   // operations on other tasks attribute their own, and the context is ended
   // when this operation settles so a late emission is left unattributed.
-  return runWithNotificationTaskContextV1(spec.taskName, taskPath, async () => {
+  // Provider CLIs the operation starts resolve the task's admission lock from
+  // this folder path (roundProcessContextV1.ts, 1.0 RC1 Part B item 2).
+  return runWithNotificationTaskContextV1(spec.taskName, taskPath, () => runWithRoundProcessTaskFolderV1(taskPath, async () => {
     try {
       const result = await fn(handle);
       const explicit = taskOperations.getExplicitOutcome(handle);
@@ -1303,7 +1299,7 @@ export async function runTrackedOperation<T>(
       taskOperations.end(handle, finalState);
       throw error;
     }
-  }, spec.stage);
+  }), spec.stage);
 }
 
 /**

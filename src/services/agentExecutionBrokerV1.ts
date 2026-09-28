@@ -37,6 +37,7 @@ import {
   RawAgentExecutionResultV1,
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
+import type * as vscode from "vscode";
 import { createHash } from "crypto";
 import { MIGRATED_ACTION_KEYS_V0 } from "./legacyAiActionSafetyGateV0";
 import { assertAiExecutionAllowedInThisHostV1 } from "../state/hostRoleV1";
@@ -52,6 +53,21 @@ export class AgentExecutionBrokerErrorV1 extends Error {
 
 /** Sealed responses larger than this go to the spool store (when one is configured). */
 export const DEFAULT_SPOOL_THRESHOLD_BYTES_V1 = 256 * 1024;
+
+/**
+ * Hard upper bound for a brokered provider invocation. Individual transports
+ * may finish sooner, but no unresolved transport may hold a task operation
+ * and its admission indefinitely.
+ *
+ * 60 minutes, the same wall clock a CLI round gets (`cliAgentRunner.ts`
+ * `RUN_TIMEOUT_MS`). It was 15 minutes, which only ever bit Copilot: a Copilot
+ * round or plan runs as one brokered tool session of up to `MAX_TOOL_ROUNDS_V1`
+ * sequential model calls, and a Copilot plan generation on a large task was
+ * cut off at exactly 15:00 per model (observed 2026-09-25, wt-b, two models,
+ * 30:00 total, then `candidatesExhausted`). The bound exists to stop a hung
+ * transport from holding the task for ever, not to budget a working session.
+ */
+export const DEFAULT_INVOCATION_WALL_CLOCK_MS_V1 = 60 * 60_000;
 
 /**
  * Legacy output-destination field names that must never appear on a V1
@@ -118,6 +134,8 @@ export interface AgentExecutionBrokerOptionsV1 {
   readonly spoolStore?: BoundedResultStoreV1;
   /** Byte size above which a sealed response is spooled instead of held in memory. */
   readonly spoolThresholdBytes?: number;
+  /** Wall-clock limit for one transport invocation; defaults to 60 minutes. */
+  readonly invocationTimeoutMs?: number;
   /**
    * Identity of the reservation actually invoked, stamped onto a spooled
    * response's metadata so a later claim (or an unclaimed recovery read) can
@@ -311,7 +329,17 @@ async function finishInvocation(
 ): Promise<RawAgentExecutionResultV1> {
   let exit: AgentTransportExitV1;
   try {
-    exit = await transport.invoke(request, writer);
+    const invocationTimeoutMs = options.invocationTimeoutMs ?? DEFAULT_INVOCATION_WALL_CLOCK_MS_V1;
+    const deadline = await awaitTransportExitV1(transport, request, writer, invocationTimeoutMs);
+    if (deadline.kind === "timedOut") {
+      return {
+        kind: "transportFailure",
+        code: "invocationDeadlineExceeded",
+        responseStarted: writer.bytesWritten > 0,
+        detail: `provider invocation exceeded ${invocationTimeoutMs}ms`,
+      };
+    }
+    exit = deadline.exit;
   } catch (error) {
     // A transport that throws directly (rather than resolving a
     // `transportFailure` exit) never gets a chance to classify its own
@@ -361,6 +389,152 @@ async function finishInvocation(
         ...(exit.networkFault === true ? { networkFault: true } : {}),
       };
   }
+}
+
+/**
+ * A cancellation token the broker controls, fed by the caller's token. Handed
+ * to a process-owning transport in place of the caller's so the broker can also
+ * ask it to stop when the wall-clock deadline passes.
+ */
+function createDerivedCancellationV1(parent: vscode.CancellationToken): {
+  readonly token: vscode.CancellationToken;
+  cancel(): void;
+  dispose(): void;
+} {
+  const listeners = new Set<(e: unknown) => unknown>();
+  let requested = parent.isCancellationRequested;
+  const cancel = (): void => {
+    if (requested && listeners.size === 0) {
+      return;
+    }
+    requested = true;
+    for (const listener of [...listeners]) {
+      try {
+        listener(undefined);
+      } catch {
+        // A throwing listener must not stop the others from stopping the process.
+      }
+    }
+    listeners.clear();
+  };
+  const parentSubscription = parent.onCancellationRequested(cancel);
+  const token = {
+    get isCancellationRequested(): boolean {
+      return requested;
+    },
+    onCancellationRequested: (listener: (e: unknown) => unknown): vscode.Disposable => {
+      if (requested) {
+        // Like vscode's own tokens, a listener added after cancellation still hears it.
+        queueMicrotask(() => listener(undefined));
+        return { dispose: () => undefined };
+      }
+      listeners.add(listener);
+      return { dispose: () => void listeners.delete(listener) };
+    },
+  } as unknown as vscode.CancellationToken;
+  return {
+    token,
+    cancel,
+    dispose: (): void => {
+      parentSubscription.dispose();
+      listeners.clear();
+    },
+  };
+}
+
+/**
+ * Invoke a transport that owns an OS process. Cancel and the wall-clock
+ * deadline are delivered to it through a broker-controlled token and the
+ * broker waits for the transport's own result, which arrives only once its
+ * process is confirmed gone — the caller releases the task's admission lock as
+ * soon as this settles, so settling ahead of the transport would let the next
+ * action start over a still-running provider CLI.
+ */
+async function awaitProcessOwningTransportExitV1(
+  transport: AgentTransportV1,
+  request: AgentExecutionRequestV1,
+  writer: BoundedWriterInternalV1,
+  timeoutMs: number
+): Promise<{ readonly kind: "completed"; readonly exit: AgentTransportExitV1 } | { readonly kind: "timedOut" }> {
+  const derived = createDerivedCancellationV1(request.cancellationToken);
+  let deadlineHit = false;
+  const timeout = setTimeout(() => {
+    deadlineHit = true;
+    derived.cancel();
+  }, timeoutMs);
+  try {
+    const transportExit = await transport.invoke({ ...request, cancellationToken: derived.token }, writer);
+    // The transport has settled, so its process (if any) is confirmed gone.
+    // A response the transport had already completed is kept. Otherwise the
+    // caller's Cancel reports as a cancel and a deadline the broker forced
+    // reports as one, whatever failure code the stopped transport used.
+    if (transportExit.kind !== "completed") {
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "completed", exit: { kind: "callerCancelled" } };
+      }
+      if (deadlineHit) {
+        return { kind: "timedOut" };
+      }
+    }
+    return { kind: "completed", exit: transportExit };
+  } finally {
+    clearTimeout(timeout);
+    derived.dispose();
+  }
+}
+
+async function awaitTransportExitV1(
+  transport: AgentTransportV1,
+  request: AgentExecutionRequestV1,
+  writer: BoundedWriterInternalV1,
+  timeoutMs: number
+): Promise<{ readonly kind: "completed"; readonly exit: AgentTransportExitV1 } | { readonly kind: "timedOut" }> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new AgentExecutionBrokerErrorV1(`invocationTimeoutMs must be a positive finite number; received ${String(timeoutMs)}`);
+  }
+
+  if (transport.confirmsProcessExitBeforeSettling === true) {
+    return awaitProcessOwningTransportExitV1(transport, request, writer, timeoutMs);
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => finish({ kind: "timedOut" }), timeoutMs);
+    const cancellation = request.cancellationToken.onCancellationRequested(() =>
+      finish({ kind: "completed", exit: { kind: "callerCancelled" } })
+    );
+
+    function finish(
+      result: { readonly kind: "completed"; readonly exit: AgentTransportExitV1 } | { readonly kind: "timedOut" }
+    ): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      cancellation.dispose();
+      resolve(result);
+    }
+
+    function fail(error: unknown): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      cancellation.dispose();
+      reject(error);
+    }
+
+    try {
+      Promise.resolve(transport.invoke(request, writer)).then(
+        (transportExit) => finish({ kind: "completed", exit: transportExit }),
+        fail
+      );
+    } catch (error) {
+      fail(error);
+    }
+  });
 }
 
 /**

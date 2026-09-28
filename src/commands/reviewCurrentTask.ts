@@ -4,6 +4,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 
@@ -37,9 +38,7 @@ export async function reviewCurrentTask(
   // command self-checks"): see fastForwardCurrentTaskReview.ts's identical
   // check for why this must use the resolver rather than the raw field.
   if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-    NotificationRouter.showWarning(
-      "Task is paused. Resume it before using this shortcut."
-    );
+    showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath);
     return;
   }
 

@@ -301,10 +301,10 @@ void describe("handleImplementationChecklistChangeV1", () => {
     return { calls, deps };
   }
 
-  void it("ignores files that are not a known task's plan, and tasks not at the implementation stage", async () => {
+  void it("ignores files that are not a known task's plan, but refreshes a known task at any stage", async () => {
     const { calls, deps } = harness({ [folderFsPath("/t/planning")]: "plan" });
     await handleImplementationChecklistChangeV1([plan("/elsewhere/project"), plan("/t/planning")], deps);
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, ["tree", `chat:${folderFsPath("/t/planning")}`]);
   });
 
   void it("refreshes the tree, and the status bar only when it shows a changed folder", async () => {
@@ -327,7 +327,12 @@ void describe("handleImplementationChecklistChangeV1", () => {
       [plan("/t/a"), plan("/t/a"), plan("/t/b"), plan("/t/c")],
       deps
     );
-    assert.deepEqual(calls, ["tree", `chat:${folderFsPath("/t/a")}`, `chat:${folderFsPath("/t/b")}`]);
+    assert.deepEqual(calls, [
+      "tree",
+      `chat:${folderFsPath("/t/a")}`,
+      `chat:${folderFsPath("/t/b")}`,
+      `chat:${folderFsPath("/t/c")}`,
+    ]);
   });
 
   void it("survives a chat refresh that rejects", async () => {

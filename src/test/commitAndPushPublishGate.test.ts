@@ -207,7 +207,7 @@ function installGateHarness(
     // The failing-checks decision modal is answered by the test; every other
     // warning modal (the staging confirmation) is dismissed, cancelling
     // cleanly before any git mutation.
-    const answer = /Completion checks failed/.test(message)
+    const answer = /completion checks failed/i.test(message)
       ? answerChecksModal()
       : undefined;
     return Promise.resolve(answer);
@@ -236,7 +236,7 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
     try {
       await commitAndPushTask(harness.inventory, { canonicalId: harness.taskFolderPath });
 
-      const checksModal = harness.warningCalls.find((c) => /Completion checks failed/.test(c.message));
+      const checksModal = harness.warningCalls.find((c) => /completion checks failed/i.test(c.message));
       assert.ok(checksModal, "the failing-checks decision modal must be shown");
       assert.deepEqual(
         checksModal.items,
@@ -253,7 +253,7 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
       // The flow continued into publishing (reaching the staging confirmation
       // modal) rather than terminating at the gate.
       assert.ok(
-        harness.warningCalls.some((c) => /Commit and push/.test(c.message) && !/Completion checks failed/.test(c.message)),
+        harness.warningCalls.some((c) => /Commit and push/.test(c.message) && !/completion checks failed/i.test(c.message)),
         `publishing must continue after the override; warning calls: ${JSON.stringify(harness.warningCalls.map((c) => c.items))}`
       );
     } finally {
@@ -310,11 +310,11 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
         "the rerun must replace the earlier failing section, not sit alongside it"
       );
       assert.ok(
-        harness.warningCalls.some((c) => !/Completion checks failed/.test(c.message)),
+        harness.warningCalls.some((c) => !/completion checks failed/i.test(c.message)),
         "once the rerun passes, publishing must continue to the staging confirmation"
       );
       assert.equal(
-        harness.warningCalls.filter((c) => /Completion checks failed/.test(c.message)).length,
+        harness.warningCalls.filter((c) => /completion checks failed/i.test(c.message)).length,
         1,
         "a passing rerun must not re-surface the failing-checks modal"
       );
@@ -377,7 +377,7 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
       await commitAndPushTask(harness.inventory, { canonicalId: harness.taskFolderPath });
 
       assert.equal(
-        harness.warningCalls.filter((c) => /Completion checks failed/.test(c.message)).length,
+        harness.warningCalls.filter((c) => /completion checks failed/i.test(c.message)).length,
         0,
         "passing checks must not surface the failing-checks modal"
       );

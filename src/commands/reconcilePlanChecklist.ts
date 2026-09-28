@@ -4,6 +4,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
@@ -1797,7 +1798,7 @@ export async function reconcilePlanChecklist(
   }
   if (!resolved.progress.checklistProgressUnreliable) {
     NotificationRouter.showInformation(
-      "This task's plan checklist is already treated as a complete record."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — This task's plan checklist is already treated as a complete record.`
     );
     return;
   }
@@ -1811,12 +1812,12 @@ export async function reconcilePlanChecklist(
   );
   if (result.kind === "noChecklist") {
     NotificationRouter.showWarning(
-      "plan-final.md has no implementation checklist to reconcile, so completeness cannot gate " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md has no implementation checklist to reconcile, so completeness cannot gate ` +
         "this task. Generate or restore the checklist first, then run this again."
     );
   } else if (result.kind === "noContext") {
     NotificationRouter.showWarning(
-      "Could not post the checklist-reconciliation decision to Chat With AI (no active extension context)."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Could not post the checklist-reconciliation decision to Chat With AI (no active extension context).`
     );
   }
 }
@@ -1856,7 +1857,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   }
   if (!resolved.progress.checklistProgressUnreliable) {
     NotificationRouter.showInformation(
-      "This task's plan checklist is already treated as a complete record."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — This task's plan checklist is already treated as a complete record.`
     );
     return;
   }
@@ -1866,7 +1867,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   const plan = await readTextIfExists(planUri);
   if (plan === undefined) {
     NotificationRouter.showWarning(
-      "plan-final.md could not be read, so there is nothing to reconcile against."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md could not be read, so there is nothing to reconcile against.`
     );
     return;
   }
@@ -1878,7 +1879,7 @@ export async function reconcilePlanChecklistConfirmedV1(
       const stat = await statIfExists(planUri);
       if (stat && stat.mtime > Date.parse(decision.createdAt)) {
         NotificationRouter.showWarning(
-          "plan-final.md changed since this decision was posted, so the evidence it showed may be stale. " +
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed since this decision was posted, so the evidence it showed may be stale. ` +
             "Re-check plan-final.md and run this again."
         );
         return;
@@ -1916,7 +1917,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   });
   if (raced) {
     NotificationRouter.showWarning(
-      "The task changed while this was being applied — a round may have landed work the checklist " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — The task changed while this was being applied — a round may have landed work the checklist ` +
         "does not record. Re-check plan-final.md and run this again."
     );
     return;
@@ -1938,7 +1939,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   );
   await inventory.refresh();
   NotificationRouter.showInformation(
-    "Plan checklist marked as reconciled — completeness now gates advancement again."
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Plan checklist marked as reconciled — completeness now gates advancement again.`
   );
   // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
   // it"): the option that clears the latch is the only reason to clear it, so
@@ -2053,19 +2054,19 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   const result = await applyReconciliationReviewVerifiedTicksV1(folderUri);
   if (result.kind === "noChecklist") {
     NotificationRouter.showWarning(
-      "plan-final.md has no implementation checklist to tick, so there is nothing to apply."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md has no implementation checklist to tick, so there is nothing to apply.`
     );
     return;
   }
   if (result.kind === "noCandidates") {
     NotificationRouter.showInformation(
-      "No implementation review on file currently names an unticked plan item as verified complete."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — No implementation review on file currently names an unticked plan item as verified complete.`
     );
     return;
   }
   if (result.kind === "changedUnderneath") {
     NotificationRouter.showWarning(
-      "plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision ` +
         "and try again."
     );
     return;
@@ -2083,7 +2084,7 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   );
   await inventory.refresh();
   NotificationRouter.showInformation(
-    `Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
   );
   // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
@@ -2220,7 +2221,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
   const itemTexts = explicitArg?.itemTexts ?? [];
   if (stepNumber === undefined || itemTexts.length === 0) {
     NotificationRouter.showWarning(
-      "Nothing to link — no outstanding checks or target step were supplied."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Nothing to link — no outstanding checks or target step were supplied.`
     );
     return;
   }
@@ -2236,7 +2237,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
     const decision = context && new WorkflowDecisionStoreV1(context.workspaceState).get(explicitArg.decisionId);
     if (decision && initialStat && initialStat.mtime > Date.parse(decision.createdAt)) {
       NotificationRouter.showWarning(
-        "plan-final.md changed since this decision was posted, so the confirmed link may no longer apply. " +
+        `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed since this decision was posted, so the confirmed link may no longer apply. ` +
           "Re-open the reconcile decision and try again."
       );
       return;
@@ -2246,7 +2247,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
   const plan = await readTextIfExists(planUri);
   if (plan === undefined) {
     NotificationRouter.showWarning(
-      "plan-final.md could not be read, so there is nothing to link."
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md could not be read, so there is nothing to link.`
     );
     return;
   }
@@ -2259,7 +2260,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
     currentUnchecked.total === 1 ? parseChecklistItemStepNumberV1(currentUnchecked.items[0] ?? "") : undefined;
   if (currentSoleStep !== stepNumber) {
     NotificationRouter.showWarning(
-      "plan-final.md no longer has Step " + stepNumber + " as its sole outstanding item, so linking now could " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md no longer has Step ` + stepNumber + " as its sole outstanding item, so linking now could " +
         "record a false association. Re-open the reconcile decision to see the current state and try again."
     );
     return;
@@ -2293,7 +2294,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
     );
     if (!stillActive) {
       NotificationRouter.showWarning(
-        `The ${STAGE_DISPLAY_NAMES[explicitArg.blockerStage]} review no longer names the blocker this link was ` +
+        `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — The ${STAGE_DISPLAY_NAMES[explicitArg.blockerStage]} review no longer names the blocker this link was ` +
           "confirmed against as an active environmental blocker, so linking now could record a false " +
           "association. Re-open the reconcile decision to see the current state and try again."
       );
@@ -2304,7 +2305,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
   const { content, appliedCount } = appendCoversAnnotationV1(plan, itemTexts, stepNumber);
   if (appliedCount === 0) {
     NotificationRouter.showInformation(
-      "Every listed check already carries a Covers: annotation, or plan-final.md has changed since — nothing " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Every listed check already carries a Covers: annotation, or plan-final.md has changed since — nothing ` +
         "to link."
     );
     return;
@@ -2317,7 +2318,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
   const written = await writeTextFileIfUnchangedV1(planUri, plan, content);
   if (!written) {
     NotificationRouter.showWarning(
-      "plan-final.md changed while this link was being applied — nothing was written. Re-open the reconcile " +
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed while this link was being applied — nothing was written. Re-open the reconcile ` +
         "decision and try again."
     );
     return;
@@ -2325,7 +2326,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
 
   await inventory.refresh();
   NotificationRouter.showInformation(
-    `Linked ${appliedCount} outstanding check(s) to Step ${stepNumber} in plan-final.md via a Covers: annotation.`
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Linked ${appliedCount} outstanding check(s) to Step ${stepNumber} in plan-final.md via a Covers: annotation.`
   );
   // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
   // Linking alone does not resolve the blocker (a human still has to do the

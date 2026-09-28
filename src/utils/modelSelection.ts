@@ -7,6 +7,7 @@ import {
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
+import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
 import { type FallbackStrategy, type StageModelSetting } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
@@ -18,6 +19,7 @@ import {
   CODEX_MODEL_CAPABILITIES,
   type CliProviderId,
   type CliProviderDefinition,
+  describeModelWithProviderV1,
   providerAccountIdForModelId,
   toQualifiedModelId,
 } from "../runners/providers";
@@ -250,7 +252,7 @@ export function describeStageSubstitutesV1(
         (candidate) => providerAccountIdForModelId(candidate) !== blockedAccount
       );
       return substitute
-        ? `${STAGE_DISPLAY_NAMES[stage]} → ${substitute}`
+        ? `${STAGE_DISPLAY_NAMES[stage]} → ${describeModelWithProviderV1(substitute)}`
         : `${STAGE_DISPLAY_NAMES[stage]}: no backup configured — this stage will pause`;
     });
 }
@@ -459,7 +461,8 @@ export async function resolveModelForStage(
  */
 export async function ensureStageModelConfigured(
   taskFolderUri: vscode.Uri,
-  stage: TaskStage
+  stage: TaskStage,
+  taskDisplayName?: string
 ): Promise<boolean> {
   if (!isConfigurableStage(stage)) {
     return true;
@@ -468,6 +471,7 @@ export async function ensureStageModelConfigured(
     ignoreActiveFallback: true,
   });
   const stageName = STAGE_DISPLAY_NAMES[stage];
+  const taskLabel = formatNotificationTaskLabelV1(taskDisplayName, taskFolderUri.fsPath);
   if (!resolved.modelId) {
     // A stage with no model of its own resolves through the general model
     // (source "general"), so this warns/blocks ONLY when the resolver
@@ -475,7 +479,7 @@ export async function ensureStageModelConfigured(
     // general model.
     if (resolved.source === "none") {
       NotificationRouter.showWarning(
-        `No AI model is configured for the ${stageName} stage. Configure one in AI Models.`
+        `${taskLabel}: no AI model is configured for the ${stageName} stage. Configure one in AI Models.`
       );
       void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
       return false;
@@ -484,7 +488,7 @@ export async function ensureStageModelConfigured(
   }
   if (!isModelProviderEnabled(resolved.modelId)) {
     NotificationRouter.showWarning(
-      `The model configured for the ${stageName} stage (${resolved.modelId}) belongs to a disabled provider. ` +
+      `${taskLabel}: the model configured for the ${stageName} stage (${describeModelWithProviderV1(resolved.modelId)}) belongs to a disabled provider. ` +
         "Enable the provider or choose another model in AI Models."
     );
     void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
@@ -1894,10 +1898,10 @@ export function describeModel(
 
   const model = availableModels.find((candidate) => candidate.id === modelId);
   if (model) {
-    return `${model.name} (${model.id})`;
+    return `${model.name} (${model.providerLabel})`;
   }
 
-  return `${modelId} (currently unavailable)`;
+  return `${describeModelWithProviderV1(modelId)} — currently unavailable`;
 }
 
 export function getModelDisplayName(

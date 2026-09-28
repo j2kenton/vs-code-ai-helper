@@ -8,6 +8,7 @@ import { updateLintPayload } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { readNonEmptyText } from "../utils/fileUtils";
 import {
   extractCompletionChecksSectionV1,
@@ -217,12 +218,19 @@ export async function runLintingFixes(
       commandId: "runLintingFixes",
     });
     if (late.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          late,
+          notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
+        )
+      );
       return;
     }
     handle = late.handle;
     heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
+
+  const taskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
 
   // Admission is now guaranteed live for this exact target — reverse a
   // watchdog-provenance pause (never a user pause) before any further setup,
@@ -236,7 +244,7 @@ export async function runLintingFixes(
     resolvedTask.progress.currentStage !== "publish"
   ) {
     NotificationRouter.showWarning(
-      "Linting fixes are only available at the Publish stage. Advance this task to Publish first."
+      `${taskLabel}: linting fixes are only available at the Publish stage. Advance this task to Publish first.`
     );
     return;
   }
@@ -284,9 +292,9 @@ export async function runLintingFixes(
           : undefined;
     NotificationRouter.showWarning(
       reportFilename
-        ? `A ${reportFilename} report exists on disk, but no usable Publish check result is ` +
+        ? `${taskLabel}: a ${reportFilename} report exists on disk, but no usable Publish check result is ` +
           "currently recorded for this task. Run the Publish checks again to refresh the report this action fixes."
-        : "The Publish checks have not been run for this task yet. Run the Publish checks first to generate " +
+        : `${taskLabel}: the Publish checks have not been run for this task yet. Run the Publish checks first to generate ` +
           "the report this action fixes.",
       undefined,
       undefined,
@@ -301,7 +309,7 @@ export async function runLintingFixes(
   }
   if (lastReport.passed) {
     NotificationRouter.showInformation(
-      "The latest Publish checks passed — there is nothing to fix. " +
+      `${taskLabel}: the latest Publish checks passed — there is nothing to fix. ` +
         "Re-run the Publish checks if files changed since the last report."
     );
     return;
@@ -314,7 +322,7 @@ export async function runLintingFixes(
   // too — and before any mutation: with no Publish model configured, or
   // its provider disabled, the action must warn and open AI Models rather
   // than autofix/format files first and only fail at the AI pass.
-  if (!(await ensureStageModelConfigured(taskFolderUri, "publish"))) {
+  if (!(await ensureStageModelConfigured(taskFolderUri, "publish", resolvedTask.progress.displayName))) {
     return;
   }
 
@@ -328,7 +336,7 @@ export async function runLintingFixes(
   const scope = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress);
   if (scope.stale) {
     NotificationRouter.showWarning(
-      "No valid Publish verification scope could be resolved (the saved scope " +
+      `${taskLabel}: no valid Publish verification scope could be resolved (the saved scope ` +
         "or the task's project-root binding no longer exists). Re-run the " +
         "Publish checks to choose a new scope before applying fixes.",
       undefined,
@@ -526,7 +534,10 @@ export async function runLintingFixes(
                 }, null, 2);
                 const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
                 const prompt = await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint, contextPack });
-                const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured Publish-stage agent");
+                const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured Publish-stage agent", 0, {
+                  displayName: resolvedTask.progress.displayName,
+                  folderPath: taskFolderUri.fsPath,
+                });
                 if (sizeCheck === "ok" || sizeCheck === "confirmed") {
                   if (!context || !(await ensureAiConsent(context))) {
                     return;
@@ -607,6 +618,7 @@ export async function runLintingFixes(
                       stage: "publish",
                       taskStage: "publish",
                       taskFolderUri: taskFolderUri,
+                      taskDisplayName: resolvedTask.progress.displayName,
                       roundProcessClaimId: handle?.claimId,
                       onProgress: (message) => aiProgress.report({ message }),
                       // Mirror structured preflight questions into task-local

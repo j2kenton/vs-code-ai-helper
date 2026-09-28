@@ -15,6 +15,7 @@ import {
   TransitionKind,
 } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { scheduleAutomationChain } from "../utils/automationChain";
@@ -385,7 +386,7 @@ export async function setTaskStage(
     // `enterStageV1` reports with this exact, non-caller-specific reason.
     if (entryResult.reason === "could not read or update task progress") {
       NotificationRouter.showError(
-        `Could not read or update task progress for ${task.folderName}.`
+        `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: could not read or update task progress.`
       );
       return false;
     }
@@ -417,14 +418,15 @@ export async function setTaskStage(
         : undefined;
       NotificationRouter.showWarning(
         actualStage !== undefined
-          ? `"Set stage to ${STAGE_DISPLAY_NAMES[newStage]}" no longer applies — ${task.folderName} has since moved on ` +
-              `to ${STAGE_DISPLAY_NAMES[actualStage]}. No stage change was made.`
-          : `Could not set stage for ${task.folderName}: ${entryResult.reason}`
+          ? `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} has since moved on to ` +
+              `${STAGE_DISPLAY_NAMES[actualStage]}, so "Set stage to ${STAGE_DISPLAY_NAMES[newStage]}" no longer applies. ` +
+              `No stage change was made.`
+          : `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: Could not set stage — ${entryResult.reason}`
       );
       return false;
     }
     NotificationRouter.showWarning(
-      `Could not set stage for ${task.folderName}: ${entryResult.reason}`
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: Could not set stage — ${entryResult.reason}`
     );
     return false;
   }
@@ -479,7 +481,7 @@ export async function setTaskStage(
   }
   if (!cancelResult.ok) {
     NotificationRouter.showWarning(
-      `${task.folderName} was set to stage ${STAGE_DISPLAY_NAMES[newStage]}, but a previously running operation ` +
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} was set to stage ${STAGE_DISPLAY_NAMES[newStage]}, but a previously running operation ` +
         `for the prior stage could not be stopped: ${cancelResult.reason} No automatic follow-up was started for ` +
         `the new stage — stop the stale operation from its Notifications row (or wait for it to actually finish), ` +
         `then use the stage's own action to continue.`
@@ -523,7 +525,7 @@ export async function setTaskStage(
   }
 
   NotificationRouter.showInformation(
-    `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
+    `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
 
   // Commit and push is never scheduled automatically — landing on Publish
@@ -533,7 +535,7 @@ export async function setTaskStage(
   // instead of only being discovered later inside Commit and Push's own gate.
   if (newStage === "publish" && publishPreflight?.ok === false) {
     NotificationRouter.showWarning(
-      `${task.folderName}: ${publishPreflight.reason}. Publish once checks pass, or use Publish Anyway from Commit and Push.`,
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: ${publishPreflight.reason}. Publish once checks pass, or use Publish Anyway from Commit and Push.`,
       undefined,
       undefined,
       undefined,
@@ -569,7 +571,7 @@ export async function setTaskStage(
     // Run-time model guard: entering a review stage with no configured
     // model (or a disabled provider) alerts and opens AI Models instead of
     // silently kicking off a run that would fail.
-    if (!(await ensureStageModelConfigured(taskFolderUri, newStage))) {
+    if (!(await ensureStageModelConfigured(taskFolderUri, newStage, task.progress.displayName))) {
       // The stage transition itself already committed above — only the
       // auto-review dispatch is skipped — so this still reports `true`.
       return true;
@@ -639,7 +641,7 @@ async function setTaskStageOnCompletedTask(
   const cancelResult = await cancelRunningOperationsForTask(task.taskFolderPath);
   if (!cancelResult.ok) {
     NotificationRouter.showError(
-      `Could not reopen ${task.folderName}: ${cancelResult.reason}`
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: could not reopen — ${cancelResult.reason}`
     );
     return false;
   }
@@ -652,18 +654,19 @@ async function setTaskStageOnCompletedTask(
     capturedCompletedAt
   );
 
+  const taskLabel = formatNotificationTaskLabelV1(task.progress.displayName, task.folderName);
   if (result.outcome === "stale") {
-    NotificationRouter.showWarning(result.message!);
+    NotificationRouter.showWarning(`${taskLabel}: ${result.message!}`);
     return false;
   }
   if (result.outcome === "failed") {
-    NotificationRouter.showError(result.message ?? "Could not reopen the task.");
+    NotificationRouter.showError(`${taskLabel}: ${result.message ?? "Could not reopen the task."}`);
     return false;
   }
 
   await inventory.refresh();
   NotificationRouter.showInformation(
-    `${task.folderName} reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}.`
+    `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}.`
   );
   return true;
 }

@@ -69,23 +69,26 @@ import type { RecordedProcessIdentityV1 } from "./processLivenessClassifierV1";
  * NO-RECORD AMBIGUITY. `listRoundProcessesV1` returning `[]` is ambiguous on
  * its own between "this claim genuinely started no provider CLI" and "a
  * record write failed or never landed before a crash" — a real gap a review
- * identified, and one this module cannot close by itself: there is no
- * always-succeeding channel to make an arbitrary write durably observable
- * across a crash of a DIFFERENT window without also making every OTHER write
- * in the extension that strong. What this module CAN do, and does, is remove
- * the most common source of that ambiguity: `beginRoundProcessRecordingV1`
- * persists an (initially empty) record for `claimId` before any process is
- * spawned, so "no record at all, or a record for a DIFFERENT claimId" comes
- * to mean "this claim never even started recording" (safe to treat as no
- * CLI launched under it), while "a record for THIS claimId with zero
- * processes" means recording began but nothing has been added yet (a narrow
- * window, not a silent gap spanning the round's whole life). A caller that
- * gets `false` back from `beginRoundProcessRecordingV1` (or from
- * `recordRoundProcessV1`) MUST NOT treat this claim's process list as a
+ * identified. `beginRoundProcessRecordingV1` removes the coarsest form of it:
+ * persisting an (initially empty) record for `claimId` before any process is
+ * spawned means "no record at all, or a record for a DIFFERENT claimId"
+ * comes to mean "this claim never even started recording" (safe to treat as
+ * no CLI launched under it). That alone still leaves a narrower gap a
+ * SECOND review caught: a crash between `cp.spawn()` handing back a pid and
+ * the post-spawn `recordRoundProcessV1` append landing would leave
+ * `processes` empty too, looking identical to "recording began, nothing
+ * spawned yet". `spawnsStarted`/`spawnsAbandoned` close that: a caller
+ * durably increments `spawnsStarted` (`beginProcessSpawnAttemptV1`) BEFORE
+ * every `cp.spawn()` call, and either appends the resulting process
+ * (`recordRoundProcessV1`) or durably proves it produced none
+ * (`abandonProcessSpawnAttemptV1`). `unconfirmedProcessSpawnCountV1` reads
+ * the difference back; a caller that gets `false` from ANY of
+ * `beginRoundProcessRecordingV1`, `beginProcessSpawnAttemptV1`, or
+ * `recordRoundProcessV1` MUST NOT treat this claim's process list as a
  * complete account when deciding whether it is safe to release the lock —
- * that write-failure-aware caller contract (still unbuilt; see the doc
- * comment on `recordRoundProcessV1`) is what ultimately closes the gap, not
- * this module in isolation.
+ * `stopRecordedCliProcessesV1` is the write-failure-aware caller that closes
+ * the gap by consulting `unconfirmedProcessSpawnCountV1` before ever
+ * reporting `allGone`.
  *
  * Best-effort, but NOT silently so: every write here returns whether it was
  * durably persisted. A caller that gets `false` back cannot assume the
@@ -93,10 +96,10 @@ import type { RecordedProcessIdentityV1 } from "./processLivenessClassifierV1";
  * pass, and per the plan's safety rule ("a lock is never released while a
  * provider CLI recorded against it may still be running") must not treat
  * this record as a complete account of this round's processes when deciding
- * whether it is safe to auto-release a lock — that integration is still
- * unbuilt (see the doc comment on `recordRoundProcessV1`); this module only
- * guarantees the write outcome is not thrown away unreported the way a
- * void-returning best-effort write would.
+ * whether it is safe to auto-release a lock — see `stopRecordedCliProcessesV1`
+ * for how that integration is built; this module only guarantees the write
+ * outcome is not thrown away unreported the way a void-returning
+ * best-effort write would.
  *
  * `RecordedProcessIdentityV1` (`processLivenessClassifierV1.ts`) is reused
  * as-is for the (pid, processStartTime) pair every recorded process carries,
@@ -126,6 +129,20 @@ interface RoundProcessRecordEntryV1 {
    * to — the lock's own immutable identity, never a caller-supplied string. */
   readonly claimId: string;
   readonly processes: readonly RecordedProviderProcessV1[];
+  /**
+   * Spawn attempts begun under this claim (`beginProcessSpawnAttemptV1`,
+   * durably written BEFORE `cp.spawn()` is called) minus the ones later
+   * proven to have produced no live process (`abandonProcessSpawnAttemptV1`).
+   * Closes the residual crash window `processes` alone cannot: a crash
+   * between `cp.spawn()` returning a pid and the post-spawn append in
+   * `processes` landing would otherwise leave `processes` looking exactly
+   * like "no CLI was ever spawned" — see `unconfirmedProcessSpawnCountV1`'s
+   * doc comment and the review this closes (1.0 RC1, Part B, item 2 defect
+   * blocker: a dead-owner cleanup treating that empty list as `allGone` could
+   * release the lock while the unrecorded CLI was still editing).
+   */
+  readonly spawnsStarted: number;
+  readonly spawnsAbandoned: number;
 }
 
 function readRecordV1(taskFolderPath: string): RoundProcessRecordEntryV1 | undefined {
@@ -202,7 +219,13 @@ export async function beginRoundProcessRecordingV1(taskFolderPath: string, claim
     if (existing && existing.claimId === claimId) {
       return true;
     }
-    return writeRecordV1(taskFolderPath, { taskFolderPath, claimId, processes: [] });
+    return writeRecordV1(taskFolderPath, {
+      taskFolderPath,
+      claimId,
+      processes: [],
+      spawnsStarted: 0,
+      spawnsAbandoned: 0,
+    });
   });
 }
 
@@ -230,13 +253,105 @@ export async function recordRoundProcessV1(
   }
   return enqueueWriteV1(taskFolderPath, async () => {
     const existing = readRecordV1(taskFolderPath);
-    const carried = existing && existing.claimId === claimId ? existing.processes : [];
+    const carriedProcesses = existing && existing.claimId === claimId ? existing.processes : [];
+    const carriedStarted = existing && existing.claimId === claimId ? existing.spawnsStarted : 0;
+    const carriedAbandoned = existing && existing.claimId === claimId ? existing.spawnsAbandoned : 0;
     return writeRecordV1(taskFolderPath, {
       taskFolderPath,
       claimId,
-      processes: [...carried, process],
+      processes: [...carriedProcesses, process],
+      spawnsStarted: carriedStarted,
+      spawnsAbandoned: carriedAbandoned,
     });
   });
+}
+
+/**
+ * Mark one spawn attempt as begun under `claimId`, durably, BEFORE the
+ * caller calls `cp.spawn()`. Pairs with `abandonProcessSpawnAttemptV1` (if
+ * the attempt never produces a live process) or an ordinary
+ * `recordRoundProcessV1` append (once it does) — see
+ * `unconfirmedProcessSpawnCountV1` for how the pairing is read back.
+ *
+ * Like `beginRoundProcessRecordingV1`, a caller that gets `false` back must
+ * not proceed to spawn: this write is what lets a later reader tell "this
+ * claim attempted a spawn" apart from "recording began but nothing was ever
+ * attempted", so a spawn that goes ahead without it succeeding could vanish
+ * from both `processes` and this counter if the window crashes right after.
+ *
+ * Never throws. Idempotent is NOT meaningful here (unlike
+ * `beginRoundProcessRecordingV1`): every call is a distinct attempt and
+ * always increments.
+ */
+export async function beginProcessSpawnAttemptV1(taskFolderPath: string, claimId: string): Promise<boolean> {
+  if (!getExtensionContextV1()?.workspaceState) {
+    return false;
+  }
+  return enqueueWriteV1(taskFolderPath, async () => {
+    const existing = readRecordV1(taskFolderPath);
+    const carriedProcesses = existing && existing.claimId === claimId ? existing.processes : [];
+    const carriedStarted = existing && existing.claimId === claimId ? existing.spawnsStarted : 0;
+    const carriedAbandoned = existing && existing.claimId === claimId ? existing.spawnsAbandoned : 0;
+    return writeRecordV1(taskFolderPath, {
+      taskFolderPath,
+      claimId,
+      processes: carriedProcesses,
+      spawnsStarted: carriedStarted + 1,
+      spawnsAbandoned: carriedAbandoned,
+    });
+  });
+}
+
+/**
+ * Mark one spawn attempt begun via `beginProcessSpawnAttemptV1` as proven to
+ * have left no live process behind — either because `cp.spawn()` threw
+ * synchronously or returned a child with no `pid`, or because the child ran
+ * and is now confirmed exited (the caller's own `settled`/`childExited`
+ * flag) before its post-spawn `recordSpawnedCliProcessV1` write could be
+ * confirmed durable — so it must not count as unconfirmed. Best-effort,
+ * matching `clearRoundProcessesV1`: a caller that gets no
+ * confirmation back has no further action to take (the attempt already
+ * produced no process either way), and per the module's fail-open-to-blocked
+ * rule, a write that does not land here only leaves the lock held slightly
+ * more conservatively than necessary — never less. A record belonging to a
+ * different `claimId` is not this claim's to abandon against; a silent no-op.
+ */
+export async function abandonProcessSpawnAttemptV1(taskFolderPath: string, claimId: string): Promise<void> {
+  const state = getExtensionContextV1()?.workspaceState;
+  if (!state) {
+    return;
+  }
+  await enqueueWriteV1(taskFolderPath, async () => {
+    const existing = readRecordV1(taskFolderPath);
+    if (!existing || existing.claimId !== claimId) {
+      return;
+    }
+    try {
+      await state.update(storageKeyForTaskV1(taskFolderPath), {
+        ...existing,
+        spawnsAbandoned: existing.spawnsAbandoned + 1,
+      });
+    } catch {
+      // Best-effort, same reasoning as recordRoundProcessV1.
+    }
+  });
+}
+
+/**
+ * How many spawn attempts begun under `claimId` are neither proven abandoned
+ * nor accounted for in `processes` — i.e. attempts whose outcome a crash
+ * could have erased before it was durably recorded. `0` is the ordinary
+ * case; a caller such as `stopRecordedCliProcessesV1` must treat anything
+ * greater as "cannot prove this claim started no CLI beyond what
+ * `processes` shows" and refuse to report `allGone` on that basis alone. A
+ * record belonging to a different `claimId` (or no record at all) counts as
+ * `0` — matching `listRoundProcessesV1`'s own "nothing recorded" contract. */
+export function unconfirmedProcessSpawnCountV1(taskFolderPath: string, claimId: string): number {
+  const existing = readRecordV1(taskFolderPath);
+  if (!existing || existing.claimId !== claimId) {
+    return 0;
+  }
+  return Math.max(0, existing.spawnsStarted - existing.spawnsAbandoned - existing.processes.length);
 }
 
 /** Every process recorded for `taskFolderPath`'s current lock, oldest first,

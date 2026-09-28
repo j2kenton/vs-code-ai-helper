@@ -17,6 +17,7 @@ import {
 } from "../state/workAdmissionV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
+import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { CancelRunningOperationsResultV1, runTrackedOperation } from "../utils/taskOperations";
@@ -253,8 +254,10 @@ export async function resumePausedTask(
     return { outcome: "completed" };
   }
 
+  const taskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
+
   if (resolvedTask.progress.status !== "paused") {
-    NotificationRouter.showInformation(`Task is not paused.`);
+    NotificationRouter.showInformation(`${taskLabel} is not paused.`);
     return { outcome: "notPaused" };
   }
 
@@ -276,7 +279,7 @@ export async function resumePausedTask(
     commandId: "resumeTask",
   });
   if (admission.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(admission));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(admission, taskLabel));
     return { outcome: "busy" };
   }
   let admissionReleased = false;
@@ -317,7 +320,7 @@ export async function resumePausedTask(
     // surface the reader's own reason and stop, mirroring the
     // activateTask-threw catch below, before any mutation is even attempted.
     NotificationRouter.showError(
-      `Could not confirm the task's status before resuming: ${freshStatus.reason}`
+      `${taskLabel}: Could not confirm the task's status before resuming: ${freshStatus.reason}`
     );
     await releaseAdmissionV1();
     return { outcome: "failed" };
@@ -478,7 +481,7 @@ export async function resumePausedTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(message);
+    NotificationRouter.showError(`${taskLabel}: ${message}`);
     // The resume mutation itself did not succeed, so there is nothing for a
     // caller to hold or dispatch against — always release here regardless of
     // `holdAdmissionForCaller`. Previously this fell through to the shared
@@ -851,10 +854,11 @@ async function resumeCompletedTask(
       }
     );
   } catch {
+    const completedTaskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
     if (result?.outcome === "stale") {
-      NotificationRouter.showWarning(result.message!);
+      NotificationRouter.showWarning(`${completedTaskLabel}: ${result.message!}`);
     } else {
-      NotificationRouter.showError(result?.message ?? "Could not reopen the task.");
+      NotificationRouter.showError(`${completedTaskLabel}: ${result?.message ?? "Could not reopen the task."}`);
     }
     return;
   }
@@ -1159,6 +1163,7 @@ export async function resumeAndSetTaskStageV1(
   if (!target || !explicitArg?.stage) {
     return;
   }
+  const taskName = target.progress.displayName ?? target.folderName;
   const stage = explicitArg.stage;
   const resumeFastForward = explicitArg.resumeFastForward === true;
   const expectedSourceStage = explicitArg.expectedSourceStage;
@@ -1212,9 +1217,8 @@ export async function resumeAndSetTaskStageV1(
           preCheck.decoded.progress.currentStage !== expectedSourceStage &&
           preCheck.decoded.progress.currentStage !== stage
         ) {
-          const staleTaskName = preCheck.decoded.progress.displayName ?? target.folderName;
           NotificationRouter.showWarning(
-            `"Advance to ${STAGE_DISPLAY_NAMES[stage]}" no longer applies — ${staleTaskName} has since moved on ` +
+            `"Advance to ${STAGE_DISPLAY_NAMES[stage]}" no longer applies — ${preCheck.decoded.progress.displayName ?? taskName} has since moved on ` +
               `to ${STAGE_DISPLAY_NAMES[preCheck.decoded.progress.currentStage]}. No stage change was made.`
           );
           // Review fix (2026-09-23, completion blocker
@@ -1317,7 +1321,7 @@ export async function resumeAndSetTaskStageV1(
           setNextActorV1(p, "human")
         );
         NotificationRouter.showWarning(
-          `Moved to ${STAGE_DISPLAY_NAMES[stage]}, but a previously running operation for the prior stage could ` +
+          `${taskName}: moved to ${STAGE_DISPLAY_NAMES[stage]}, but a previously running operation for the prior stage could ` +
             `not be stopped: ${advanceCancelResult.reason} No automatic follow-up was started — stop the stale ` +
             `operation from its Notifications row (or wait for it to actually finish), then use the stage's own ` +
             `action to continue.`
@@ -1354,7 +1358,7 @@ export async function resumeAndSetTaskStageV1(
           setNextActorV1(p, "human")
         );
         NotificationRouter.showInformation(
-          `Moved to ${STAGE_DISPLAY_NAMES[stage]}. ${plan.kind === "blocked" ? plan.precondition : plan.reason}`
+          `${taskName}: moved to ${STAGE_DISPLAY_NAMES[stage]}. ${plan.kind === "blocked" ? plan.precondition : plan.reason}`
         );
         return true;
       }

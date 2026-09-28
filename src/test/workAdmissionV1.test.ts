@@ -3073,6 +3073,69 @@ void test("attemptAutomaticWorkAdmissionReclamationV1: a fresh (non-stale) marke
   assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "an unreclaimed marker must still be reported live");
 });
 
+// ── 1.0 RC1 Part B: a dead owner's lock is not waited out, but never released past a live recorded CLI ──
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: given a recorded-CLI gate, a FRESH marker with a dead owner is reclaimed at once, after the gate cleared it", async () => {
+  const task = freshTaskFolder("reclaim-fresh-dead-with-gate");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId, ownerToken: "fresh-dead-owner" });
+  const gateCalls: string[] = [];
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task, Date.now(), (owner) => {
+    gateCalls.push(owner.claimId);
+    return Promise.resolve([]);
+  });
+  assert.equal(outcome.outcome, "reclaimed");
+  assert.deepEqual(gateCalls, ["fresh-dead-owner-claim"], "the gate must be consulted exactly once, for the dead owner's claim");
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), false, "the reclaimed marker must no longer be reported live");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a dead owner whose recorded CLI survives keeps its lock and reports the survivor", async () => {
+  const task = freshTaskFolder("reclaim-dead-owner-cli-survives");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  writeFakeMarkerV1(task, { purpose: "admission", pid: deadPid, hostId: myHostId, ownerToken: "survivor-owner" });
+  const survivor = {
+    pid: 4321,
+    providerLabel: "Codex CLI",
+    command: "codex exec --json <prompt omitted>",
+    processStartTime: Number.NaN,
+    classification: "inconclusive" as const,
+  };
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task, Date.now(), () => Promise.resolve([survivor]));
+  assert.equal(outcome.outcome, "cliSurvivors");
+  if (outcome.outcome === "cliSurvivors") {
+    assert.deepEqual(outcome.survivors, [survivor]);
+    assert.equal(outcome.owner.ownerToken, "survivor-owner");
+  }
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true, "a lock with a surviving recorded CLI must stay held");
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a fresh marker with a LIVE owner is never reclaimed and never consults the CLI gate", async () => {
+  const task = freshTaskFolder("reclaim-fresh-live-owner-with-gate");
+  const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "live-owner" });
+  assert.equal(acquired.outcome, "acquired");
+  if (acquired.outcome !== "acquired") return;
+  let gateCalled = false;
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task, Date.now(), () => {
+    gateCalled = true;
+    return Promise.resolve([]);
+  });
+  assert.deepEqual(outcome, { outcome: "notStale" });
+  assert.equal(gateCalled, false);
+  assert.equal(hasLiveWorkAdmissionBestEffortV1(task), true);
+  await acquired.handle.release();
+});
+
+void test("attemptAutomaticWorkAdmissionReclamationV1: a fresh dead pauseCommit marker still waits for staleness, gate or not", async () => {
+  const task = freshTaskFolder("reclaim-fresh-dead-pausecommit-with-gate");
+  const deadPid = await spawnAndWaitForDeadPidV1();
+  const myHostId = await resolveHostIdentityV1();
+  writeFakeMarkerV1(task, { purpose: "pauseCommit", pid: deadPid, hostId: myHostId });
+  const outcome = await attemptAutomaticWorkAdmissionReclamationV1(task, Date.now(), () => Promise.resolve([]));
+  assert.deepEqual(outcome, { outcome: "notStale" });
+});
+
 void test("attemptAutomaticWorkAdmissionReclamationV1: a stale marker whose owner is alive (this test's own process) fails open to notDead/sameHostAlive, never reclaimed", async () => {
   const task = freshTaskFolder("reclaim-stale-but-alive");
   const acquired = await acquireWorkAdmissionV1({ taskFolderPath: task, purpose: "admission", commandId: "alive-owner" });

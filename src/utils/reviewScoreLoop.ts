@@ -149,6 +149,17 @@ export interface ImproveReviewScoreResult {
    * movement. Mutually exclusive with `improved`.
    */
   zeroFixableSuccess: boolean;
+  /**
+   * How many consecutive build-mandate rounds (rounds whose apply() was
+   * actually asked to build next plan steps — the mandate carried over
+   * from the round before, not this round's own outcome) ran without
+   * `progress.complete` advancing. Populated only on the `stalled` outcome
+   * caused by this guard (PROGRESS_STALL_ROUNDS); absent/0 otherwise. Lets
+   * the caller report accurately how many unproductive build rounds ran,
+   * instead of a blanket "the last rounds changed nothing" that is false
+   * whenever blocker-fix rounds actually changed files.
+   */
+  buildRoundsWithoutProgress?: number;
 }
 
 /**
@@ -231,6 +242,16 @@ export async function improveReviewScore(options: {
     zeroFixableEvidence: boolean;
     /** Same contract as ReviewRoundOutcome.progress → isPlanIncomplete. */
     planIncomplete: boolean;
+    /**
+     * The pre-loop review's own reported `progress.complete`, or null when it
+     * emitted no progress marker. Seeds `previousComplete` below so the
+     * FIRST in-loop build round can be compared against the baseline it
+     * actually started from, instead of being silently exempted from the
+     * stall guard because there was no prior in-loop round to compare
+     * against (2026-09-25 finding: this let one stagnant build round go
+     * uncounted and the reported stall message undercount by exactly one).
+     */
+    initialComplete?: number | null;
   };
   /**
    * Identity of the reviewer that produced `baselineScore` (read by the
@@ -253,9 +274,25 @@ export async function improveReviewScore(options: {
   // run generates — without this, a zero-fixable baseline is invisible to
   // the ZERO_FIXABLE_TERMINAL_ROUNDS check and costs one extra round.
   let consecutiveZeroFixable = options.preLoopEvidence?.zeroFixableEvidence ? 1 : 0;
-  /** Last round's reported `progress.complete`, for detecting forward movement. */
-  let previousComplete: number | null = null;
+  /** Last round's reported `progress.complete`, for detecting forward movement.
+   * Seeded from the pre-loop review's own reported complete count (when the
+   * pre-loop evidence already showed a build mandate) so the first in-loop
+   * build round is compared against the actual baseline it started from,
+   * rather than being exempt from the stall guard for lack of a prior
+   * in-loop reading (2026-09-25 finding). */
+  let previousComplete: number | null =
+    options.preLoopEvidence?.zeroFixableEvidence === true && options.preLoopEvidence.planIncomplete === true
+      ? options.preLoopEvidence.initialComplete ?? null
+      : null;
   let roundsWithoutProgressAdvance = 0;
+  // Whether the apply() about to run THIS attempt was actually asked to
+  // build next plan steps — carried over from the round BEFORE it (or from
+  // preLoopEvidence for attempt 1) — as opposed to this round's own outcome,
+  // which only shows what apply() produced, not what it was mandated to do.
+  // A blocker-fix round (mandate false) must never consume the
+  // PROGRESS_STALL_ROUNDS allowance (2026-09-24 finding).
+  let previousWasBuildMandate =
+    options.preLoopEvidence?.zeroFixableEvidence === true && options.preLoopEvidence.planIncomplete === true;
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
   const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
   // The reviewer identity + score/blocker-count a round's `improved` test is
@@ -326,13 +363,27 @@ export async function improveReviewScore(options: {
     // below is bit-for-bit the pre-marker behavior for those reviews.
     const progress = round.progress ?? null;
     const planIncomplete = isPlanIncomplete(progress);
+    // Only rounds whose apply() was ACTUALLY ASKED to build next steps count
+    // toward the stall guard below — that mandate was set by the round
+    // BEFORE this one (or preLoopEvidence for attempt 1), tracked in
+    // previousWasBuildMandate. Using this round's OWN zeroFixableEvidence
+    // here would be wrong: that only reflects what THIS round produced, not
+    // what it was asked to do, so a blocker-fix round that happens to end
+    // clean would wrongly consume the PROGRESS_STALL_ROUNDS allowance
+    // (2026-09-24 finding: blocker-fix rounds burned the allowance before
+    // the first build round ever ran).
+    const thisRoundWasBuildMandate = previousWasBuildMandate;
     if (progress !== null) {
-      if (previousComplete !== null) {
+      if (previousComplete !== null && thisRoundWasBuildMandate) {
         roundsWithoutProgressAdvance =
           progress.complete > previousComplete ? 0 : roundsWithoutProgressAdvance + 1;
       }
       previousComplete = progress.complete;
     }
+    // This round's own outcome sets the mandate for the NEXT attempt's
+    // apply(): clean and plan-incomplete means the next apply() will indeed
+    // be asked to build.
+    previousWasBuildMandate = round.zeroFixableEvidence && planIncomplete;
 
     // Reviewer-substitution scale break (workflow-2 item 7): once BOTH the
     // reference and this round carry a recorded identity and they differ,
@@ -419,7 +470,16 @@ export async function improveReviewScore(options: {
       // ...unless implementation has stopped actually landing steps, in which
       // case "keep going" would just burn the attempt budget (PROGRESS_STALL_ROUNDS).
       if (roundsWithoutProgressAdvance >= PROGRESS_STALL_ROUNDS) {
-        return { score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false };
+        return {
+          score: best,
+          attempts: attempt,
+          improved: false,
+          stalled: true,
+          paused: false,
+          escalationDeferred,
+          zeroFixableSuccess: false,
+          buildRoundsWithoutProgress: roundsWithoutProgressAdvance,
+        };
       }
     }
   }

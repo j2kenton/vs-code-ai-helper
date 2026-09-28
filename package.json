@@ -173,6 +173,12 @@
         "icon": "$(checklist)"
       },
       {
+        "command": "vs-code-ai-helper.settleChecklistItem",
+        "title": "Tick or Exclude a Checklist Item…",
+        "category": "Ensemble",
+        "icon": "$(tasklist)"
+      },
+      {
         "command": "vs-code-ai-helper.applyReviewerVerifiedTicks",
         "title": "Apply Reviewer-Verified Ticks",
         "category": "Ensemble",
@@ -381,10 +387,16 @@
         "icon": "$(comment-unresolved)"
       },
       {
+        "command": "vs-code-ai-helper.checkAndReviewPublish",
+        "title": "Check and Review (Publish)",
+        "category": "Ensemble",
+        "icon": "$(checklist)"
+      },
+      {
         "command": "vs-code-ai-helper.runPublishChecks",
         "title": "Run Publish Checks (Lint, Tests & Plan)",
         "category": "Ensemble",
-        "icon": "$(law)"
+        "icon": "$(beaker)"
       },
       {
         "command": "vs-code-ai-helper.runLintingFixes",
@@ -833,19 +845,24 @@
           "group": "inline@99"
         },
         {
-          "command": "vs-code-ai-helper.runPublishChecks",
+          "command": "vs-code-ai-helper.checkAndReviewPublish",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@10"
         },
         {
           "command": "vs-code-ai-helper.runLintingFixes",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && viewItem =~ /-lint-failed/ && !(viewItem =~ /-paused/)",
           "group": "inline@20"
+        },
+        {
+          "command": "vs-code-ai-helper.runPublishChecks",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "publish@1"
         },
         {
           "command": "vs-code-ai-helper.runReviewWithAI",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@25"
+          "group": "publish@2"
         },
         {
           "command": "vs-code-ai-helper.viewStageChanges",
@@ -966,6 +983,11 @@
           "command": "vs-code-ai-helper.reconcilePlanChecklist",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-checklistUnreliable/",
           "group": "9_troubleshoot"
+        },
+        {
+          "command": "vs-code-ai-helper.settleChecklistItem",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/",
+          "group": "9_troubleshoot"
         }
       ]
     },
@@ -1036,7 +1058,7 @@
           ],
           "default": "standalone",
           "scope": "machine-overridable",
-          "markdownDescription": "Cloud runner/viewer split. The `ENSEMBLE_HOST_ROLE` environment variable, when set, overrides this setting. Fixed for the life of the window: change it, then reload."
+          "markdownDescription": "**Experimental — beta, not supported in 1.0.** Cloud runner/viewer split. The `ENSEMBLE_HOST_ROLE` environment variable, when set, overrides this setting. Fixed for the life of the window: change it, then reload."
         },
         "ensemble.autoAdvanceEnabled": {
           "type": [
@@ -1298,18 +1320,6 @@
           "additionalProperties": {
             "type": "string"
           }
-        },
-        "vs-code-ai-helper.hostRole": {
-          "deprecationMessage": "Use `ensemble.hostRole` instead.",
-          "type": "string",
-          "enum": [
-            "standalone",
-            "runner",
-            "viewer"
-          ],
-          "default": "standalone",
-          "scope": "machine-overridable",
-          "description": "Cloud runner/viewer split: standalone (default), runner, or viewer."
         },
         "vs-code-ai-helper.modelSettings": {
           "deprecationMessage": "Use `ensemble.modelSettings` instead.",
@@ -1579,7 +1589,8 @@
     "test:workflow:host-fs": "node scripts/runWorkflowSuite.mjs host-fs",
     "verify:workflow-suite-runner": "node scripts/runWorkflowSuite.mjs --self-test",
     "verify:toast-allowlist": "node scripts/verifyToastAllowlistV1.mjs",
-    "verify:workflow-safety": "npm-run-all -s verify:workflow-suite-runner verify:vscode-lm-boundary verify:structured-questions verify:vscode-1.93-compat verify:toast-allowlist",
+    "verify:notification-task-naming": "node scripts/verifyNotificationTaskNamingV1.mjs",
+    "verify:workflow-safety": "npm-run-all -s verify:workflow-suite-runner verify:vscode-lm-boundary verify:structured-questions verify:vscode-1.93-compat verify:toast-allowlist verify:notification-task-naming",
     "publish": "vsce publish",
     "publish:patch": "vsce publish patch",
     "publish:minor": "vsce publish minor",

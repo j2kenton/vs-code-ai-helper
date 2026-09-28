@@ -146,6 +146,7 @@ export async function reopenCompletedTask(
         selectedStage: chosenStage,
         ...(capturedCompletedAt !== undefined ? { expectedCompletedAt: capturedCompletedAt } : {}),
       },
+      taskDisplayName: task.progress.displayName,
       skipTaskLock: true,
       postCommitSink: (result) => {
         deferredPostCommit = result as Extract<StageEntryResultV1, { ready: true }>;

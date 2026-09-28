@@ -7,6 +7,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/taskOperations";
 import { clearZeroChangeImplRoundCounter } from "./reviewActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
@@ -83,14 +84,15 @@ export async function archiveTask(
     return;
   }
 
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const status = resolved.progress.status ?? "active";
   if (status === "archived") {
-    NotificationRouter.showInformation("Task is already archived.");
+    NotificationRouter.showInformation(`${taskLabel} is already archived.`);
     return;
   }
   if (!ARCHIVABLE_STATUSES.includes(status)) {
     NotificationRouter.showInformation(
-      "Only active, paused, or completed tasks can be archived."
+      `${taskLabel}: only active, paused, or completed tasks can be archived.`
     );
     return;
   }
@@ -100,7 +102,7 @@ export async function archiveTask(
   const cancelResult = await cancelRunningOperationsForArchive(resolved.taskFolderPath);
   if (!cancelResult.ok) {
     NotificationRouter.showError(
-      `Could not archive "${resolved.folderName}": ${cancelResult.reason}`
+      `${taskLabel}: could not archive — ${cancelResult.reason}`
     );
     return;
   }
@@ -147,7 +149,7 @@ export async function archiveTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(message);
+    NotificationRouter.showError(`${taskLabel}: ${message}`);
   }
 }
 
@@ -183,8 +185,9 @@ export async function resumeArchivedTask(
     );
     return;
   }
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   if (resolved.progress.status !== "archived") {
-    NotificationRouter.showInformation("Task is not archived.");
+    NotificationRouter.showInformation(`${taskLabel} is not archived.`);
     return;
   }
 
@@ -224,14 +227,14 @@ export async function resumeArchivedTask(
         }
         if (dropPin) {
           NotificationRouter.showInformation(
-            `Pin limit of ${MAX_PINNED_TASKS} reached — "${resolved.progress.displayName ?? resolved.folderName}" was resumed unpinned.`
+            `${taskLabel} was resumed unpinned: the pin limit of ${MAX_PINNED_TASKS} was reached.`
           );
         }
       }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(message);
+    NotificationRouter.showError(`${taskLabel}: ${message}`);
   }
 }
 

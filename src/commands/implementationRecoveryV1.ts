@@ -87,6 +87,7 @@ import {
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import type { TaskOperationHandle, TaskOperationState } from "../utils/taskOperations";
@@ -613,8 +614,10 @@ export async function beginImplementationRecoveryV1(
       // reference one. Stamp the honest outcome instead of claiming a
       // continuation is scheduled (item 16's "never claim work that did not
       // happen" rule, applied to this failure mode too).
+      const folderName = folderUri.fsPath;
       NotificationRouter.showWarning(
-        `⚠️ The implementation round did not finish its turn (${input.reason}), and the continuation could ` +
+        `${formatNotificationTaskLabelV1(undefined, folderName)} — ` +
+          `⚠️ The implementation round did not finish its turn (${input.reason}), and the continuation could ` +
           "not be recorded (the progress write failed, even after a retry). No continuation round could be " +
           "scheduled — rerun the implementation manually. The unreported edits are preserved in " +
           "pendingImplReviewFiles."
@@ -751,10 +754,14 @@ export async function beginImplementationRecoveryV1(
       if (!decision) {
         // No activating extension context (e.g. a unit test) — fall back to
         // the plain announcement so the outcome is still surfaced somewhere.
-        NotificationRouter.showWarning(whatHappened);
+        NotificationRouter.showWarning(
+          `${formatNotificationTaskLabelV1(persisted?.displayName, folderUri.fsPath)} — ${whatHappened}`
+        );
       }
     } else {
-      NotificationRouter.showWarning(whatHappened);
+      NotificationRouter.showWarning(
+        `${formatNotificationTaskLabelV1(persisted?.displayName, folderUri.fsPath)} — ${whatHappened}`
+      );
     }
 
     if (capReached) {
@@ -781,7 +788,8 @@ export async function beginImplementationRecoveryV1(
         // not be silent — without a continuation OR an escalation the task
         // would go quiet exactly the way this transition exists to prevent.
         NotificationRouter.showWarning(
-          "⚠️ Automated continuation stopped after repeated implementation rounds without a " +
+          `${formatNotificationTaskLabelV1(persisted?.displayName, folderUri.fsPath)} — ` +
+            "⚠️ Automated continuation stopped after repeated implementation rounds without a " +
             "usable report, and the task could not be paused automatically. Rerun the " +
             "implementation manually — the unreported edits are preserved and listed in the run log."
         );

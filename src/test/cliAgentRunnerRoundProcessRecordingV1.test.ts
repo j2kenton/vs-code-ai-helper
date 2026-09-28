@@ -17,16 +17,25 @@ import * as vscode from "vscode";
 import { execCliAgent } from "../runners/cliAgentRunner";
 import { CliProviderDefinition } from "../runners/providers";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
-import { listRoundProcessesV1, recordedClaimIdForTaskV1 } from "../state/roundProcessRecordV1";
+import {
+  listRoundProcessesV1,
+  recordedClaimIdForTaskV1,
+  unconfirmedProcessSpawnCountV1,
+} from "../state/roundProcessRecordV1";
 import { acquireWorkAdmissionV1, hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 
 /** Same shape as {@link installFakeExtensionContextV1}, but the Nth call to
  * `workspaceState.update` (1-indexed, across every key) rejects — used to
  * simulate a durable-write failure at a specific point in
- * `roundProcessRecordV1.ts`'s write sequence (the initial `begin` write is
- * always call 1; the post-spawn `record` write is always call 2). */
-function installFakeExtensionContextV1WithUpdateFailureV1(failOnCallNumber: number): { restore: () => void } {
+ * `roundProcessRecordV1.ts`'s write sequence: the round-level `begin` write
+ * is always call 1, the pre-spawn per-attempt `beginProcessSpawnAttemptV1`
+ * write is always call 2, and the post-spawn `record` write is always
+ * call 3. */
+function installFakeExtensionContextV1WithUpdateFailureV1(
+  failOnCallNumber: number,
+  failDelayMs = 0
+): { restore: () => void } {
   const values = new Map<string, unknown>();
   let callCount = 0;
   const memento = {
@@ -36,6 +45,11 @@ function installFakeExtensionContextV1WithUpdateFailureV1(failOnCallNumber: numb
     update(key: string, value: unknown): Promise<void> {
       callCount += 1;
       if (callCount === failOnCallNumber) {
+        if (failDelayMs > 0) {
+          return new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new Error("simulated workspaceState write failure")), failDelayMs);
+          });
+        }
         return Promise.reject(new Error("simulated workspaceState write failure"));
       }
       if (value === undefined) {
@@ -114,6 +128,33 @@ function installFakeExtensionContextV1(): { restore: () => void } {
   } as unknown as vscode.Memento;
   __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
   return { restore: (): void => __extensionContextV1TestOnly.reset() };
+}
+
+/** buildArgs returns an argv element containing a NUL byte, which makes
+ * `cp.spawn` throw SYNCHRONOUSLY (before any OS process exists) rather than
+ * emitting an async 'error' event — the exact case a review flagged: the
+ * pre-spawn `beginProcessSpawnAttemptV1` write has already landed by the
+ * time this throws, so the catch block must prove that attempt abandoned
+ * before resolving, or a crash in that window leaves a permanently
+ * unconfirmed, no-pid "survivor" that blocks dead-owner lock reclamation. */
+function makeSyncSpawnFailureProvider(): CliProviderDefinition {
+  return {
+    id: "claude-cli",
+    label: "Fake Sync-Spawn-Failure CLI",
+    command: "node",
+    installHint: "install",
+    loginHint: "login",
+    authErrorMarkers: [],
+    signInCommand: "login",
+    signInLabel: "Sign in",
+    useShell: false,
+    models: [{ model: undefined, name: "default" }],
+    usesLastMessageFile: false,
+    textModeResponseContractV1: "honours",
+    buildArgs(): string[] {
+      return ["-e", "x\u0000y"];
+    },
+  };
 }
 
 function makeFastExitProvider(): CliProviderDefinition {
@@ -285,10 +326,42 @@ void test("execCliAgent refuses to spawn when the pre-spawn process record canno
   }
 });
 
-void test("execCliAgent stops and fails a spawned process whose post-spawn process record cannot be durably written", async () => {
-  // Call 1 (beginRoundProcessRecordingV1) succeeds; call 2 (the post-spawn
-  // recordRoundProcessV1 append) fails.
+void test("execCliAgent refuses to spawn when the pre-spawn per-attempt spawn-record cannot be durably written", async () => {
+  // Call 1 (beginRoundProcessRecordingV1) succeeds; call 2
+  // (beginProcessSpawnAttemptV1, taken right before cp.spawn) fails — this
+  // is the review's own defect-blocker fix: refusing to spawn here, exactly
+  // like a failed call 1, is what closes the crash window between cp.spawn
+  // returning a pid and the post-spawn append landing (1.0 RC1 Part B item 2).
   const fakeContext = installFakeExtensionContextV1WithUpdateFailureV1(2);
+  try {
+    const cts = new vscode.CancellationTokenSource();
+    const taskFolderPath = "/tasks/.ensemble/2026-09-24_task_4b";
+    const claimId = "claim-spawn-attempt-write-fails";
+
+    const result = await execCliAgent({
+      def: makeFastExitProvider(),
+      mode: "text",
+      model: undefined,
+      prompt: "irrelevant",
+      cwd: process.cwd(),
+      token: cts.token,
+      taskFolderPath,
+      roundProcessClaimId: claimId,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.match(result.errorMessage ?? "", /bookkeeping/);
+    assert.match(result.errorMessage ?? "", /not started/);
+    assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("execCliAgent stops and fails a spawned process whose post-spawn process record cannot be durably written", async () => {
+  // Call 1 (beginRoundProcessRecordingV1) and call 2 (beginProcessSpawnAttemptV1)
+  // succeed; call 3 (the post-spawn recordRoundProcessV1 append) fails.
+  const fakeContext = installFakeExtensionContextV1WithUpdateFailureV1(3);
   try {
     const cts = new vscode.CancellationTokenSource();
     const taskFolderPath = "/tasks/.ensemble/2026-09-24_task_5";
@@ -321,6 +394,98 @@ void test("execCliAgent stops and fails a spawned process whose post-spawn proce
     fakeContext.restore();
   }
 });
+
+void test(
+  "execCliAgent leaves no unconfirmed spawn attempt behind when the post-spawn record write fails after a short-lived process already exited",
+  async () => {
+    // Call 1 and call 2 succeed; call 3 (the post-spawn recordRoundProcessV1
+    // append) fails, but only after a delay — long enough for this
+    // fast-exiting process to have already run to completion and settled.
+    // This reproduces the crash-adjacent race a review flagged: a spawn
+    // attempt whose process is confirmed gone must not be left neither
+    // recorded nor abandoned, which would otherwise inflate
+    // unconfirmedProcessSpawnCountV1 forever and block a later dead-owner
+    // cleanup (recordedCliStopV1.ts) even though nothing is running.
+    const fakeContext = installFakeExtensionContextV1WithUpdateFailureV1(3, 300);
+    try {
+      const cts = new vscode.CancellationTokenSource();
+      const taskFolderPath = "/tasks/.ensemble/2026-09-24_task_5b";
+      const claimId = "claim-record-write-fails-after-exit";
+
+      const result = await execCliAgent({
+        def: makeFastExitProvider(),
+        mode: "text",
+        model: undefined,
+        prompt: "irrelevant",
+        cwd: process.cwd(),
+        token: cts.token,
+        taskFolderPath,
+        roundProcessClaimId: claimId,
+      });
+
+      assert.strictEqual(result.status, "completed");
+      // No post-completion sleep: `execCliAgent()` having already resolved
+      // is exactly the claim under test — the delayed, failing record
+      // write's abandonment fallback must be durable BEFORE "completed"
+      // settles (the close handler now routes through
+      // finishAfterRecordingSettles, which awaits it), not merely
+      // "eventually, if you wait long enough after". A version of this fix
+      // that only scheduled the abandonment without awaiting it would still
+      // pass an assertion taken after a sleep, which is why an earlier
+      // round's version of this test slept 500ms here and a review
+      // correctly flagged that as not proving the required ordering.
+      assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+      assert.strictEqual(
+        unconfirmedProcessSpawnCountV1(taskFolderPath, claimId),
+        0,
+        "a spawn attempt proven to have exited must not stay unconfirmed forever, " +
+          "and must already be durable by the time the attempt settles as completed"
+      );
+    } finally {
+      fakeContext.restore();
+    }
+  }
+);
+
+void test(
+  "execCliAgent leaves no unconfirmed spawn attempt behind when cp.spawn itself throws synchronously",
+  async () => {
+    const fakeContext = installFakeExtensionContextV1();
+    try {
+      const cts = new vscode.CancellationTokenSource();
+      const taskFolderPath = "/tasks/.ensemble/2026-09-24_task_5c";
+      const claimId = "claim-sync-spawn-throw";
+
+      const result = await execCliAgent({
+        def: makeSyncSpawnFailureProvider(),
+        mode: "text",
+        model: undefined,
+        prompt: "irrelevant",
+        cwd: process.cwd(),
+        token: cts.token,
+        taskFolderPath,
+        roundProcessClaimId: claimId,
+      });
+
+      assert.strictEqual(result.status, "failed");
+      assert.match(result.errorMessage ?? "", /Could not start/);
+      assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+      // No post-completion sleep: this is exactly the ordering under test --
+      // the abandonment write behind the synchronous catch must already be
+      // durable by the time execCliAgent() itself resolves, not merely
+      // "eventually". Before the fix this call was fired with `void` and
+      // resolve() happened immediately, so this assertion could observe the
+      // pre-spawn attempt still counted as unconfirmed.
+      assert.strictEqual(
+        unconfirmedProcessSpawnCountV1(taskFolderPath, claimId),
+        0,
+        "a synchronous cp.spawn throw must not leave the pre-spawn attempt unconfirmed"
+      );
+    } finally {
+      fakeContext.restore();
+    }
+  }
+);
 
 void test("execCliAgent settles an ordinary recorded Cancel promptly once the child's close event fires, stopping the recorded process and leaving nothing that would block the next action's admission", async () => {
   // Regression coverage for the review's remaining Part B completion

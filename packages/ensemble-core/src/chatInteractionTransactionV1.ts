@@ -133,8 +133,13 @@ export const CHAT_TRANSACTION_RESUME_INVOCATION_CLAIM_FILENAME_V1 = "resume-invo
 /** Bounded read ceiling for a persisted transaction record. */
 export const MAX_CHAT_TRANSACTION_FILE_BYTES_V1 = 1024 * 1024;
 
-/** Bounded canonical size of the validated original action input snapshot. */
-export const MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = 256 * 1024;
+/**
+ * Bounded canonical size of the validated original action input snapshot.
+ * Half the record's read ceiling, matching the extension's
+ * `src/types/chatInteractionTransactionV1.ts` (see its comment for why);
+ * `tests/conformance.test.ts` requires the two to be equal.
+ */
+export const MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = Math.floor(MAX_CHAT_TRANSACTION_FILE_BYTES_V1 / 2);
 
 /**
  * Journaled transition receipts are bounded because draft re-saves do not

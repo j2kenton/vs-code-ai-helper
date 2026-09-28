@@ -64,6 +64,11 @@ import {
   SchedulingPostureV1,
 } from "../state/schedulingIntentV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { describeModelWithProviderV1 } from "../runners/providers";
+import {
+  formatNotificationTaskLabelV1,
+  notificationTaskDisplayNameV1,
+} from "../utils/notificationTaskContextV1";
 
 export type { ChatMessage };
 
@@ -378,6 +383,17 @@ function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined):
 }
 
 /**
+ * Best-effort `displayName` lookup for a notification label — a fresh read,
+ * not a fabricated one: an unreadable/missing progress file yields
+ * `undefined`, and `formatNotificationTaskLabelV1` falls back to the
+ * reformatted folder name exactly as it does for any other unresolved task.
+ */
+async function resolveChatTaskDisplayNameV1(taskFolderPath: string): Promise<string | undefined> {
+  const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath)).catch(() => undefined);
+  return read && read.ok ? read.decoded.progress.displayName : undefined;
+}
+
+/**
  * Full-identity match for `render()`'s own async-boundary staleness guards.
  * `sameIdentity` (task+folder only) is right for callers deciding whether to
  * re-render or refocus at all — a stage switch within the same task there is
@@ -456,7 +472,9 @@ export function formatChatSchedulingPostureLineV1(
     case "running":
       return "running — a round is running now";
     case "scheduled": {
-      const next = leaseUntil ? ` — next attempt ${formatTimestampForDisplay(new Date(leaseUntil))}` : "";
+      // `leaseUntil` is when the current claim expires — the earliest the retry
+      // can start, not a promised start time (RC1 item 11).
+      const next = leaseUntil ? ` — will retry after ${formatTimestampForDisplay(new Date(leaseUntil))}` : "";
       return `scheduled${next}`;
     }
     case "owedWillNotRetry":
@@ -569,7 +587,7 @@ function buildChatTimelineV1<
  */
 export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, target: ChatTarget): void {
   if (!getNotificationRouterStatus()) return;
-  const label = target.taskName ?? target.taskFolderPath;
+  const taskLabel = target.taskName ?? target.taskFolderPath;
   const stageName = STAGE_DISPLAY_NAMES[target.stage];
   // A record predating the `gating` field (or one from a call site that
   // regresses and omits it) is treated as blocking — absence is never
@@ -597,7 +615,7 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
   // this surface.
   if (isBlocking) {
     NotificationRouter.showWarning(
-      `Decision needed — ${label} (${stageName}): ${decision.whatHappened}`,
+      `Decision needed — ${taskLabel} (${stageName}): ${decision.whatHappened}`,
       undefined,
       undefined,
       undefined,
@@ -607,7 +625,7 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
     const detail = decision.gating?.detail;
     const body = detail ? `${decision.whatHappened} ${detail}` : decision.whatHappened;
     NotificationRouter.showInformation(
-      `Optional — ${label} (${stageName}): ${body}`,
+      `Optional — ${taskLabel} (${stageName}): ${body}`,
       undefined,
       undefined,
       undefined,
@@ -875,7 +893,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         } catch (error) {
           NotificationRouter.showError(
-            error instanceof Error ? error.message : String(error)
+            `${formatNotificationTaskLabelV1(target.taskName, target.taskFolderPath)} — ${error instanceof Error ? error.message : String(error)}`
           );
           return;
         }
@@ -886,7 +904,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (this.interactionServices?.validateSend) {
           const validated = await this.interactionServices.validateSend(target, text);
           if (!validated.ok) {
-            NotificationRouter.showWarning(validated.reason);
+            NotificationRouter.showWarning(
+              `${formatNotificationTaskLabelV1(target.taskName, target.taskFolderPath)} — ${validated.reason}`
+            );
             return;
           }
         }
@@ -910,8 +930,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         try {
           assertLegacyAiRouteAllowedV0("globalAssistantSend.v1");
         } catch (error) {
+          const taskLabel = "Global Assistant";
           NotificationRouter.showError(
-            error instanceof Error ? error.message : String(error)
+            `${taskLabel} — ${error instanceof Error ? error.message : String(error)}`
           );
           return;
         }
@@ -958,12 +979,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning("Open a chat conversation first.");
       return;
     }
-    const uri = vscode.Uri.file(path.join(this.target.taskFolderPath, CHAT_HISTORY_FILENAME));
+    const target = this.target;
+    const uri = vscode.Uri.file(path.join(target.taskFolderPath, CHAT_HISTORY_FILENAME));
     try {
       await vscode.window.showTextDocument(uri);
     } catch (error) {
       NotificationRouter.showWarning(
-        `Could not open ${CHAT_HISTORY_FILENAME}. (${error instanceof Error ? error.message : String(error)})`
+        `${formatNotificationTaskLabelV1(target.taskName, target.taskFolderPath)} — Could not open ${CHAT_HISTORY_FILENAME}. (${error instanceof Error ? error.message : String(error)})`
       );
     }
   }
@@ -981,8 +1003,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return;
     }
     const identity = this.target;
+    const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
     const confirmed = await vscode.window.showWarningMessage(
-      "Reset Chat History clears this conversation's unresolved questions, after saving a private recovery " +
+      `${taskLabel} — Reset Chat History clears this conversation's unresolved questions, after saving a private recovery ` +
         "snapshot. This cannot be undone from Chat With AI. Continue?",
       { modal: true },
       "Reset Chat History"
@@ -994,11 +1017,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       try {
         const result = await resetChatHistoryV1(identity.taskFolderPath, identity.canonicalId);
         if (!result.ok) {
-          NotificationRouter.showWarning(`Could not reset chat history: ${result.reason}`);
+          NotificationRouter.showWarning(`${taskLabel} — Could not reset chat history: ${result.reason}`);
         }
       } catch (error) {
         NotificationRouter.showWarning(
-          `Could not reset chat history. (${error instanceof Error ? error.message : String(error)})`
+          `${taskLabel} — Could not reset chat history. (${error instanceof Error ? error.message : String(error)})`
         );
       }
     });
@@ -1131,11 +1154,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // this keeps ask() safe to call from any context (e.g. tests) that
     // hasn't wired one up.
     if (!getNotificationRouterStatus()) return;
-    const label = question.taskName ?? question.taskFolderPath;
+    const taskLabel = question.taskName ?? question.taskFolderPath;
     const stageName = STAGE_DISPLAY_NAMES[question.stage];
     if (blocking) {
       NotificationRouter.showError(
-        `Can't proceed without user feedback — ${label}: ${blockedReason ?? `${stageName} needs your input.`}`,
+        `Can't proceed without user feedback — ${taskLabel}: ${blockedReason ?? `${stageName} needs your input.`}`,
         undefined,
         undefined,
         undefined,
@@ -1143,7 +1166,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       );
     } else {
       NotificationRouter.showWarning(
-        `Waiting for user feedback — ${label}: the ${stageName} stage asked a question.`,
+        `Waiting for user feedback — ${taskLabel}: the ${stageName} stage asked a question.`,
         undefined,
         undefined,
         undefined,
@@ -1237,7 +1260,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     });
 
     if (outcome.kind === "alreadyAnswered") {
-      NotificationRouter.showInformation("This question was already answered.");
+      const taskLabel = formatNotificationTaskLabelV1(
+        await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+        identity.taskFolderPath
+      );
+      NotificationRouter.showInformation(`${taskLabel} — This question was already answered.`);
     }
 
     if (sameIdentity(this.target, identity)) {
@@ -1280,8 +1307,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      NotificationRouter.showWarning(`"${option.label}" could not be completed. (${message})`);
-      await this.append("assistant", `"${option.label}" could not be completed. (${message})`, stage, identity);
+      const optionFailureMessage = `"${option.label}" could not be completed. (${message})`;
+      const taskLabel = formatNotificationTaskLabelV1(
+        await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+        identity.taskFolderPath
+      );
+      NotificationRouter.showWarning(`${taskLabel} — ${optionFailureMessage}`);
+      await this.append("assistant", optionFailureMessage, stage, identity);
     }
   }
 
@@ -1366,10 +1398,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   ): Promise<boolean> {
     if (!this.target) return false;
     const identity = this.target;
+    const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
     const decoded = decodeStructuredAnswersArrayV1(rawAnswers);
     if (!decoded.ok) {
       const message = `Could not submit your answers: ${decoded.reason}`;
-      NotificationRouter.showWarning(message);
+      NotificationRouter.showWarning(`${taskLabel} — ${message}`);
       await this.append("assistant", message, identity.stage, identity);
       return false;
     }
@@ -1408,6 +1441,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     | { readonly ok: true; readonly effectToRun?: LocalInteractionPendingEffectV1 }
     | { readonly ok: false; readonly message: string }
   > {
+    const taskLabel = formatNotificationTaskLabelV1(
+      await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+      identity.taskFolderPath
+    );
     const interactions = await readChatInteractions(identity.taskFolderPath, identity.canonicalId);
     const localRecord = interactions.find(
       (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
@@ -1419,7 +1456,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const ref = await this.resolveInteractionRef(identity, clientRef);
       if (!ref) {
         const message = "Could not submit answers: no matching question exists in this task's chat.";
-        NotificationRouter.showWarning(message);
+        NotificationRouter.showWarning(`${taskLabel} — ${message}`);
         return { ok: false, message };
       }
       let result: ChatInteractionServiceResultV1;
@@ -1431,12 +1468,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         );
       } catch (error) {
         const message = `Could not submit answers. (${error instanceof Error ? error.message : String(error)})`;
-        NotificationRouter.showWarning(message);
+        NotificationRouter.showWarning(`${taskLabel} — ${message}`);
         return { ok: false, message };
       }
       if (!result.ok) {
         const message = `Could not submit answers: ${result.reason}`;
-        NotificationRouter.showWarning(message);
+        NotificationRouter.showWarning(`${taskLabel} — ${message}`);
         return { ok: false, message };
       }
     }
@@ -1449,7 +1486,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       );
     } catch (error) {
       NotificationRouter.showWarning(
-        `Could not save your answers. (${error instanceof Error ? error.message : String(error)})`
+        `${taskLabel} — Could not save your answers. (${error instanceof Error ? error.message : String(error)})`
       );
       // The transcript record failed, but the answer WAS accepted by the
       // interaction service above — so this is not a submission failure and
@@ -1502,10 +1539,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (record.state !== "unresolved") {
       return { ok: true };
     }
+    const taskLabel = formatNotificationTaskLabelV1(
+      await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+      identity.taskFolderPath
+    );
     const validation = validateStructuredAnswersV1(record.questions, answers);
     if (!validation.ok) {
       const message = `Could not submit your answers: ${validation.reason}`;
-      NotificationRouter.showWarning(message);
+      NotificationRouter.showWarning(`${taskLabel} — ${message}`);
       return { ok: false, message };
     }
     try {
@@ -1513,7 +1554,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await settleChatInteraction(identity.taskFolderPath, identity.canonicalId, record.interactionId, "resumed");
     } catch (error) {
       const message = `Could not save your answers. (${error instanceof Error ? error.message : String(error)})`;
-      NotificationRouter.showWarning(message);
+      NotificationRouter.showWarning(`${taskLabel} — ${message}`);
       return { ok: false, message };
     }
     const singleChoiceAnswer = answers.find(
@@ -1545,6 +1586,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async cancelInteraction(clientRef: ChatInteractionClientRefV1): Promise<void> {
     if (!this.target) return;
     const identity = this.target;
+    const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
     let cancelled = false;
     let declineMessage: string | undefined;
     await this.runQueued(identity.taskFolderPath, async () => {
@@ -1558,13 +1600,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const ref = await this.resolveInteractionRef(identity, clientRef);
           if (!ref) {
             declineMessage = "Could not cancel: no matching question exists in this task's chat.";
-            NotificationRouter.showWarning(declineMessage);
+            NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
             return;
           }
           const result = await this.interactionServices.cancel(ref);
           if (!result.ok) {
             declineMessage = `Could not cancel: ${result.reason}`;
-            NotificationRouter.showWarning(declineMessage);
+            NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
             return;
           }
         }
@@ -1577,7 +1619,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         cancelled = true;
       } catch (error) {
         declineMessage = `Could not cancel this question. (${error instanceof Error ? error.message : String(error)})`;
-        NotificationRouter.showWarning(declineMessage);
+        NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
       }
     });
     if (cancelled) {
@@ -1659,8 +1701,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           commandId: "chatResumeInteractionV1",
         });
     if (admission !== undefined && admission.outcome !== "acquired") {
-      const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(admission)}`;
-      NotificationRouter.showWarning(declineMessage);
+      const unavailableDisplayName = await resolveChatTaskDisplayNameV1(unavailableIdentity.taskFolderPath);
+      const taskLabel = formatNotificationTaskLabelV1(unavailableDisplayName, unavailableIdentity.taskFolderPath);
+      const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(
+        admission,
+        notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
+      )}`;
+      NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
       await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
       if (sameIdentity(this.target, unavailableIdentity)) {
         await this.render();
@@ -1684,7 +1731,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       if (!this.interactionServices?.resume) {
         NotificationRouter.showWarning(
-          "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow."
+          `${formatNotificationTaskLabelV1(unavailableIdentity.taskName, unavailableIdentity.taskFolderPath)} — Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.`
         );
         await this.append(
           "assistant",
@@ -1695,6 +1742,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         return;
       }
       const identity = this.target;
+      const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
       const services = this.interactionServices;
       const resume = (
         r: ChatInteractionRefV1,
@@ -1708,7 +1756,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const ref = await this.resolveInteractionRef(identity, clientRef);
           if (!ref) {
             declineMessage = "Could not resume: no matching question exists in this task's chat.";
-            NotificationRouter.showWarning(declineMessage);
+            NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
             return;
           }
           // Minted immediately before the dispatch it authorizes, matching
@@ -1723,7 +1771,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const result = await resume(ref, crypto.randomBytes(16).toString("hex"), admissionHandoffTokenV1);
             if (!result.ok) {
               declineMessage = `Could not resume: ${result.reason}`;
-              NotificationRouter.showWarning(declineMessage);
+              NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
               return;
             }
             // A viewer's Resume ran on the runner, which settles the shared
@@ -1745,7 +1793,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         } catch (error) {
           declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
-          NotificationRouter.showWarning(declineMessage);
+          NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
         }
       });
       if (resumed) {
@@ -2101,7 +2149,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await this.runDecisionEffectV1(relayed.viewerEffect, decisionId, answeredIdentityV1);
         } else if (relayed?.message) {
           // e.g. "This decision was already submitted." — never silent.
-          NotificationRouter.showInformation(relayed.message);
+          const relayedFolderPath = answered?.taskCanonicalId ?? ctx?.identity?.taskFolderPath;
+          const taskLabel = relayedFolderPath
+            ? formatNotificationTaskLabelV1(await resolveChatTaskDisplayNameV1(relayedFolderPath), relayedFolderPath)
+            : undefined;
+          NotificationRouter.showInformation(taskLabel ? `${taskLabel} — ${relayed.message}` : relayed.message);
         }
         if (relayed?.ok === false) {
           // It did not land: the card must come back, so the user can retry
@@ -2126,21 +2178,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const knownDecision = this.workflowDecisionStore.get(decisionId);
     const refusalStage = knownDecision?.stage ?? panelTarget?.stage;
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
+    const clickTaskLabel = clickIdentity
+      ? formatNotificationTaskLabelV1(
+          await resolveChatTaskDisplayNameV1(clickIdentity.taskFolderPath),
+          clickIdentity.taskFolderPath
+        )
+      : undefined;
     let outcome: RelayedResolutionOutcomeV1 = { ok: true };
     if (result.kind === "missing") {
       const message = "This decision is no longer pending — it may have already been resolved elsewhere.";
       outcome = { ok: false, message };
-      NotificationRouter.showWarning(message);
+      NotificationRouter.showWarning(clickTaskLabel ? `${clickTaskLabel} — ${message}` : message);
       if (clickIdentity && refusalStage) await this.append("assistant", message, refusalStage, clickIdentity);
     } else if (result.kind === "rejected") {
       const message = `Could not record your choice: ${result.reason}`;
       outcome = { ok: false, message };
-      NotificationRouter.showWarning(message);
+      NotificationRouter.showWarning(clickTaskLabel ? `${clickTaskLabel} — ${message}` : message);
       if (clickIdentity && refusalStage) await this.append("assistant", message, refusalStage, clickIdentity);
     } else if (result.kind === "alreadySettled") {
       const message = "This decision was already submitted.";
       outcome = { ok: true, message };
-      NotificationRouter.showInformation(message);
+      const settledTaskLabel = formatNotificationTaskLabelV1(
+        await resolveChatTaskDisplayNameV1(result.decision.taskCanonicalId),
+        result.decision.taskCanonicalId
+      );
+      NotificationRouter.showInformation(`${settledTaskLabel} — ${message}`);
       const identity = this.identityForDecision(result.decision, ctx) ?? clickIdentity;
       if (identity) await this.append("assistant", message, result.decision.stage, identity);
     } else if (result.kind === "orphaned") {
@@ -2151,7 +2213,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const message =
         "This decision's operation has already ended, so this answer can no longer be applied. It will clear on its own.";
       outcome = { ok: false, message };
-      NotificationRouter.showInformation(message);
+      NotificationRouter.showInformation(clickTaskLabel ? `${clickTaskLabel} — ${message}` : message);
       if (clickIdentity && refusalStage) await this.append("assistant", message, refusalStage, clickIdentity);
     } else {
       const { decision, option } = result;
@@ -2189,7 +2251,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          NotificationRouter.showWarning(`"${option.label}" could not be completed. (${message})`);
+          const decisionTaskLabel = formatNotificationTaskLabelV1(
+            await resolveChatTaskDisplayNameV1(decision.taskCanonicalId),
+            decision.taskCanonicalId
+          );
+          NotificationRouter.showWarning(`${decisionTaskLabel} — "${option.label}" could not be completed. (${message})`);
           if (identity) {
             await this.append(
               "assistant",
@@ -2225,7 +2291,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const decision =
       stored !== undefined ? { stage: stored.stage, taskCanonicalId: stored.taskCanonicalId } : capturedV1;
     const reportFailure = async (reason: string): Promise<void> => {
-      NotificationRouter.showWarning(`Your answer was recorded, but the follow-up did not complete: ${reason}`);
+      const taskLabel = decision
+        ? formatNotificationTaskLabelV1(await resolveChatTaskDisplayNameV1(decision.taskCanonicalId), decision.taskCanonicalId)
+        : undefined;
+      const failureMessage = `Your answer was recorded, but the follow-up did not complete: ${reason}`;
+      NotificationRouter.showWarning(taskLabel ? `${taskLabel} — ${failureMessage}` : failureMessage);
       if (decision) {
         await this.append(
           "assistant",
@@ -2270,8 +2340,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // being attempted — the queue this runs under already keeps advancing.
       if (!this.warnedTasks.has(identity.taskFolderPath)) {
         this.warnedTasks.add(identity.taskFolderPath);
+        const taskLabel = formatNotificationTaskLabelV1(
+          await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+          identity.taskFolderPath
+        );
         NotificationRouter.showWarning(
-          `Could not save chat history to disk for this task. (${error instanceof Error ? error.message : String(error)})`
+          `${taskLabel} — Could not save chat history to disk for this task. (${error instanceof Error ? error.message : String(error)})`
         );
       }
     }
@@ -2338,6 +2412,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const reason = error instanceof Error ? error.message : String(error);
       console.error("Ensemble chat panel could not be rendered", error);
       const message = `This conversation could not be refreshed. (${reason}) What you see may be out of date.`;
+      const taskLabel = this.target
+        ? this.target.kind === "global"
+          ? "Global Assistant"
+          : formatNotificationTaskLabelV1(this.target.taskName, this.target.taskFolderPath)
+        : undefined;
       // A banner, NOT a fresh empty state: see the webview's `renderFailed`
       // handler. Anything already painted for THIS conversation — the
       // transcript, a pending decision card, the busy banner — stays usable.
@@ -2366,7 +2445,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (!this.renderFailureNoticesV1.has(reason)) {
         this.renderFailureNoticesV1.set(reason, now);
         try {
-          NotificationRouter.showError(message);
+          NotificationRouter.showError(taskLabel ? `${taskLabel} — ${message}` : message);
         } catch {
           // The router may not be initialized yet (activation order): the
           // panel's own banner has already gone out, which is what the user
@@ -2454,6 +2533,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const isRecovery = error instanceof ChatHistoryRecoveryErrorV1;
         if (!this.warnedTasks.has(target.taskFolderPath)) {
           this.warnedTasks.add(target.taskFolderPath);
+          const taskLabel =
+            target.kind === "global"
+              ? "Global Assistant"
+              : formatNotificationTaskLabelV1(target.taskName, target.taskFolderPath);
           if (isRecovery) {
             // plan §5.1: offer both Open Chat Data and Reset Chat History.
             // NotificationRouter carries one action button per entry, so
@@ -2461,7 +2544,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             // Chat Data is named in the message text as the inspect-first
             // alternative, and is always reachable from the Command Palette.
             NotificationRouter.showWarning(
-              `Chat history needs recovery for this task. (${error.message}) Use "Ensemble: Open Chat Data" to ` +
+              `${taskLabel} — Chat history needs recovery for this task. (${error.message}) Use "Ensemble: Open Chat Data" to ` +
                 "inspect the preserved file, or reset it below.",
               undefined,
               undefined,
@@ -2470,7 +2553,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             );
           } else {
             NotificationRouter.showWarning(
-              `Could not load chat history for this task. (${error instanceof Error ? error.message : String(error)})`
+              `${taskLabel} — Could not load chat history for this task. (${error instanceof Error ? error.message : String(error)})`
             );
           }
         }
@@ -2574,7 +2657,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ? "cannot determine what this task is doing"
         : `Running ${busyOperation.stage ? STAGE_DISPLAY_NAMES[busyOperation.stage] : busyOperation.label} since ` +
           `${formatTimestampForDisplay(new Date(busyOperation.startedAt))}` +
-          `${busyOperation.modelId ? ` — ${busyOperation.modelId}` : ""}` +
+          `${busyOperation.modelId ? ` — ${describeModelWithProviderV1(busyOperation.modelId)}` : ""}` +
           `${busyDetail ? ` — ${busyDetail}` : ""}`;
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
@@ -3237,7 +3320,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const priorSelected=new Set(prior && prior.state==='answered' ? prior.selectedOptionIds : []);
             for(const opt of q.options){
               const optWrap=document.createElement('label'); optWrap.className='interaction-option';
-              const cb=document.createElement('input'); cb.type='checkbox'; cb.value=opt.optionId;
+              const cb=document.createElement('input'); cb.type='checkbox'; cb.name='q-'+q.questionId; cb.value=opt.optionId;
               if(priorSelected.has(opt.optionId)) cb.checked=true;
               optWrap.appendChild(cb); optWrap.appendChild(document.createTextNode(' '+opt.label));
               wrap.appendChild(optWrap);
@@ -3321,6 +3404,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // basis"), and ONE Confirm button per card — the same single-commit-
       // path and acknowledge-on-press rules renderInteraction above applies
       // to structured questions, so the two decision surfaces do not diverge.
+      // A re-render rebuilds every card from persisted state, which knows
+      // nothing about a choice the user has made but not yet confirmed. Any
+      // running operation's progress triggers a re-render every few seconds,
+      // so an unconfirmed radio choice, checkbox or typed reply vanished
+      // before the user could press Confirm (RC1, 2026-09-27). Capture those
+      // drafts before a same-conversation rebuild and put them back after.
+      // Matched by group name and value (radios, checkboxes) or aria-label
+      // (text replies), never by position, so a card that went away simply
+      // has nothing to restore. Disabled controls are left alone.
+      function draftControls(){
+        return [...m.querySelectorAll('input,textarea'),...dc.querySelectorAll('input,textarea'),...ic.querySelectorAll('input,textarea')];
+      }
+      function captureDrafts(){
+        const checked=[]; const texts=[];
+        for(const el of draftControls()){
+          if(el.disabled) continue;
+          if((el.type==='radio'||el.type==='checkbox')&&el.name&&el.checked){ checked.push({type:el.type,name:el.name,value:el.value}); }
+          else if(el.tagName==='TEXTAREA'&&el.value&&el.getAttribute('aria-label')){ texts.push({label:el.getAttribute('aria-label'),value:el.value}); }
+        }
+        const unchecked=[];
+        for(const el of draftControls()){
+          if(!el.disabled&&el.type==='checkbox'&&el.name&&!el.checked){ unchecked.push({name:el.name,value:el.value}); }
+        }
+        return {checked,unchecked,texts};
+      }
+      function restoreDrafts(d){
+        const controls=draftControls();
+        for(const saved of d.checked){
+          for(const el of controls){
+            if(!el.disabled&&el.type===saved.type&&el.name===saved.name&&el.value===saved.value){ el.checked=true; }
+          }
+        }
+        for(const saved of d.unchecked){
+          for(const el of controls){
+            if(!el.disabled&&el.type==='checkbox'&&el.name===saved.name&&el.value===saved.value){ el.checked=false; }
+          }
+        }
+        for(const saved of d.texts){
+          for(const el of controls){
+            if(!el.disabled&&el.tagName==='TEXTAREA'&&!el.value&&el.getAttribute('aria-label')===saved.label){ el.value=saved.value; }
+          }
+        }
+      }
       function renderDecisions(decisions,container){
         const root=container||dc;
         root.replaceChildren();
@@ -3481,6 +3607,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if(s.type!=='state')return;
         const nextKey=targetKey(s.target);
         const switchedChat=nextKey!==currentKey;
+        const drafts=switchedChat?null:captureDrafts();
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
         sn.style.display=(s.target&&s.target.kind!=='global')?'block':'none';
@@ -3538,6 +3665,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         }
         renderInteractions(s.interactions);
+        if(drafts){ restoreDrafts(drafts); }
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
         if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyText||'cannot determine what this task is doing';b.style.display='block';b.title='';}

@@ -16,7 +16,7 @@
     {
       "file": "src/commands/commitAndPushTask.ts",
       "reason": "Direct synchronous confirmation inside the user-invoked Publish flow when completion checks fail — 'Publish Anyway' vs 'Fix with AI' is answered in the same synchronous command invocation, not posted from a background round. (Line moved 1793 -> 1794 -> 1795 -> 1796 -> 1797, see commitAndPushTask.ts:336's note.)",
-      "snippet": "vscode.window.showWarningMessage( `Completion checks failed for \"${resolvedTask.folderName}\"${summary}.\\n\\n` + \"Publish Anyway records the failing checks in the"
+      "snippet": "vscode.window.showWarningMessage( `${commitPushTaskLabel(resolvedTask)}: completion checks failed${summary}.\\n\\n` + \"Publish Anyway records"
     },
     {
       "file": "src/commands/commitAndPushTask.ts",
@@ -26,7 +26,7 @@
     {
       "file": "src/commands/reviewActions.ts",
       "reason": "Direct synchronous response to the user explicitly invoking 'View Review' when no review artifact exists yet — offers to dispatch a review or create the file by hand. Not a decision surfaced from an automated round. (Line moved 8010 -> ... -> 8738 -> 8739 as the fixes noted in prior revisions of this entry, landing at 8739, then a prior round's Part 4 Step 12 fix (offering 'Run Implementation' on the unusable-summary refusal path, earlier in this file) added 34 more lines above it, net, landing at 8773, then a prior round's item-16 no-op-continuation correctness fix (the `providerInvokedThisRound` tracking added to `runImplementationWithAI`, earlier in this file) added 2 more lines above it, net, landing at 8775, then this round's fix decoupling the unusable-summary refusal messages' 'offer Run Implementation' condition from restorability (2026-09-24 review, narrowed completion blocker; three call sites earlier in this file, each restructured to check `offerRunImplementation`/`shouldOfferRunImplementationForUnusableSummaryV1` first) added 18 more lines above it, net, landing at 8793; call is unchanged, verified by content match.)",
-      "snippet": "vscode.window.showInformationMessage( `No ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`, \"Review with AI\", \"Create Manually\" )"
+      "snippet": "vscode.window.showInformationMessage( `${viewReviewTaskLabel}: no ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`"
     },
     {
       "file": "src/commands/reviewActions.ts",
@@ -41,7 +41,7 @@
     {
       "file": "src/extension.ts",
       "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision.",
-      "snippet": "vscode.window.showWarningMessage( `${detail} Complete the revert, or keep the file as it is now?`, { modal: true }, \"Complete Revert\", \"Keep Current File\" )"
+      "snippet": "vscode.window.showWarningMessage( `${artifactTaskLabel} — ${detail} Complete the revert, or keep the file as it is now?`"
     },
     {
       "file": "src/utils/aiConsent.ts",
@@ -56,7 +56,7 @@
     {
       "file": "src/utils/promptSizeGuard.ts",
       "reason": "Direct synchronous pre-dispatch size warning inline in whichever command is about to send an oversized prompt — a cost/quota guard on the calling command's own flow, not a review/round outcome to record in chat.",
-      "snippet": "vscode.window.showWarningMessage( `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` + `This may use significa"
+      "snippet": "vscode.window.showWarningMessage( withTaskLabel( `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}."
     },
     {
       "file": "src/runners/copilotImplementationRunner.ts",
@@ -76,6 +76,11 @@
   ],
   "directActionEntriesNote": "Every NotificationRouter.show(Information/Warning/Error) call under src/ whose actionCommand dispatches a workflow command directly (rather than the chat-pointer vs-code-ai-helper.openWorkflowDecision) must either be converted to point at a WorkflowDecisionV1 in the chat, or be listed here with a reason it is NOT a hidden workflow decision (task 'stage chat as a record of work', item 13 / Part 12 step 35e, review round 2). Two shapes qualify: (1) a synchronous gate/nudge inline in the user-invoked command it belongs to, pointing at a command already reachable another way (Command Palette, another button) and never the only record of a background round's outcome; (2) a best-effort fallback for when a WorkflowDecisionV1 could not be posted to chat (no activating extension context), degrading to a single pointer at the same option the decision would have recommended. Entries are keyed by file plus a `snippet` — a normalized prefix of the call's own source text — not by line number (1.0 plan item 14), same convention as `entries` above.",
   "directActionEntries": [
+    {
+      "file": "src/utils/pausedTaskRefusalV1.ts",
+      "reason": "RC1 item 11: shape (1) — a synchronous refusal inline in the user-invoked command it belongs to (review, Fast Forward, implementation, plan generation, or a shortcut), shown the instant the command is declined because the task is paused. Offers 'Resume' for exactly that task, the same resumeTask command already reachable from the task tree and Command Palette; never the only record of a background round's outcome.",
+      "snippet": "NotificationRouter.showWarning( `${taskLabel} is paused. Resume it before ${action}.`,"
+    },
     {
       "file": "src/commands/resumeTask.ts",
       "reason": "(Line moved 753 -> 754: this round's fix updating the stale dispatchesAutomationWork doc comment above added 1 line, net.) v1 fixes 2, items 14 + 25: direct synchronous refusal in showResumeStaysPausedV1, shared by resumeAndApplyCurrentStageActionV1, resumeAndRerunReviewV1 and resumeAndDispatchImplementationV1 — shown the instant a user-invoked Resume is declined because the Review it would arrange would be refused (the last round left the implementation summary unusable). Offers restoreRejectedImplementationRoundV1, the same deterministic artifact restore the review-dispatch refusal offers; no rerun command is passed because the task stays paused. Not a review/round outcome posted from a background round.",
@@ -119,7 +124,7 @@
     {
       "file": "src/commands/markTaskDone.ts",
       "reason": "Direct synchronous response to the user-invoked Complete Task command when the Publish artifact is missing — 'Complete Anyway' re-invokes the same command with an explicit override, not a decision surfaced from a background round.",
-      "snippet": "NotificationRouter.showWarning( `Cannot complete ${resolvedTask.folderName}: ${missingArtifacts.join(\", \")} has not been created. ` + \"Run or create the Publish"
+      "snippet": "NotificationRouter.showWarning( `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: cannot complete"
     },
     {
       "file": "src/commands/reviewActions.ts",
@@ -154,22 +159,22 @@
     {
       "file": "src/commands/reviewActions.ts",
       "reason": "(Line moved 2259 -> ... -> 2271 -> 2272: the fixes noted in prior revisions of this entry, landing at 2272, then a prior round's import-block addition (a new `shouldOfferRunImplementationForUnusableSummaryV1` import for the Part 4 Step 12 fix) added 1 more line above it, net, landing at 2273, then a prior round's `shouldLogNoOpContinuationRoundV1` import addition (also above it) added 1 more line, net, landing at 2274, then this round's own new import additions earlier in the file (2026-09-24 review, narrowed completion blocker fix decoupling the unusable-summary refusal toasts' 'offer Run Implementation' condition from restorability) added 1 more line above it, net, landing at 2275; call is unchanged, verified by content match.) Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome. (Line moved 2214 -> ... -> 2259, see reviewActions.ts:8232's note.)",
-      "snippet": "NotificationRouter.showWarning( describePublishChecksFreshnessFailureV1(check), undefined, undefined, undefined, { command: \"vs-code-ai-helper.runPublishChecks\""
+      "snippet": "NotificationRouter.showWarning( `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)"
     },
     {
       "file": "src/commands/runLintingFixes.ts",
       "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when no usable Publish check result is recorded — points to Run Publish Checks, the action the message names. Not a review/round outcome.",
-      "snippet": "NotificationRouter.showWarning( reportFilename ? `A ${reportFilename} report exists on disk, but no usable Publish check result is ` + \"currently recorded for t"
+      "snippet": "NotificationRouter.showWarning( reportFilename ? `${taskLabel}: a ${reportFilename} report exists on disk, but no usable Publish check result is"
     },
     {
       "file": "src/commands/runLintingFixes.ts",
       "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when the persisted Publish verification scope is stale — points to Run Publish Checks to choose a new scope. Not a review/round outcome.",
-      "snippet": "NotificationRouter.showWarning( \"No valid Publish verification scope could be resolved (the saved scope \" + \"or the task's project-root binding no longer exists"
+      "snippet": "NotificationRouter.showWarning( `${taskLabel}: no valid Publish verification scope could be resolved (the saved scope `"
     },
     {
       "file": "src/commands/reviewActions.ts",
       "reason": "(Line moved 3009 -> ... -> 3080 -> 3081, see reviewActions.ts:2275's note, landing at 3081.) Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15). (Line moved 2954 -> ... -> 3009, see reviewActions.ts:2259's note; the fixes noted in prior revisions of this entry, landing at 3081, then a prior round's import-block addition (a new `shouldOfferRunImplementationForUnusableSummaryV1` import for the Part 4 Step 12 fix) added 1 more line above it, net, landing at 3082, then a prior round's `shouldLogNoOpContinuationRoundV1` import addition (also above it) added 1 more line, net, landing at 3083, then this round's own new import additions earlier in the file (see reviewActions.ts:2275's note) added 1 more line above it, net, landing at 3084; call is unchanged, verified by content match.)",
-      "snippet": "NotificationRouter.showWarning( `${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`, undefin"
+      "snippet": "NotificationRouter.showWarning( `${degenerateBackupTaskLabel} — ${rejectionReason} Every configured backup for this stage has also failed"
     },
     {
       "file": "src/commands/reviewActions.ts",
@@ -189,7 +194,7 @@
     {
       "file": "src/commands/setTaskStage.ts",
       "reason": "(Line moved 313 -> 326 -> 339 -> 447 -> 443 -> 458 -> 497 -> 533 -> 537 -> 535 as earlier edits to this file shifted it, most recently this round's fix for the reviewer's completion blocker on the second, blind cancelRunningOperationsForTask call in resumeAndSetTaskStageV1 (a cancelResultOutV1 out-box on SetTaskStageArg, its doc comment, normalizeArg plumbing, and the deposit beside the cancelRunningOperationsForTask call here) added 39 lines above it, net, then a round's fix for the narrowed completion blocker 906d1f21-e807-48d3-9468-62856cdc7e7a-0 (an additionalBeforeWrite option requesting cancellation atomically inside enterStageV1's locked commit, plus an expanded comment above the post-commit cancelRunningOperationsForTask call) added 40 more lines above it, net, then this round reverted that option as architecturally unsafe and replaced both comment blocks with an explanation of why cancellation is requested only post-commit, net -2 lines.) Publish Anyway nudge pointing at commitAndPushTask when an explicit stage-set to Publish finds failing completion checks — the same user-owned, never-auto-scheduled action every sibling Publish Anyway nudge in reviewActions.ts points at.",
-      "snippet": "NotificationRouter.showWarning( `${task.folderName}: ${publishPreflight.reason}. Publish once checks pass, or use Publish Anyway from Commit and Push.`, undefin"
+      "snippet": "NotificationRouter.showWarning( `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: ${publishPreflight.reason}."
     },
     {
       "file": "src/commands/reviewActions.ts",
@@ -214,7 +219,7 @@
     {
       "file": "src/commands/startNewTask.ts",
       "reason": "(Line moved 516 -> 525: the 2026-09-17 v1 fixes 2 Wave I review-fix round's nextActor chokepoint write at task creation added a setNextActorV1 import and a multi-line writeTaskProgressV1 call above it.) Direct synchronous notice inline in the user-invoked Start New Task command that the new task landed paused because another task is already active — 'Resume' is the one-click follow-up to the command that just ran, not a background round decision.",
-      "snippet": "NotificationRouter.showWarning( \"Task created in paused state.\", undefined, undefined, undefined, { command: \"vs-code-ai-helper.resumeTask\", title: \"Resume\", ar"
+      "snippet": "NotificationRouter.showWarning( `${folderName}: task created in paused state.`,"
     },
     {
       "file": "src/commands/taskCreationRecovery.ts",
@@ -229,7 +234,7 @@
     {
       "file": "src/views/chatView.ts",
       "reason": "(Line moved 2462 -> 2463: the pre-1.0.0 fixes register item 16 waiting-for-you work added a `withWaitingForHumanFallbackV1` import above it.) Chat-history recovery notice (plan §5.1) — a corrupted local chat-v1.json needs 'Reset Chat History' or manual inspection via 'Ensemble: Open Chat Data'; a data-recovery affordance, not a task review/round workflow decision.",
-      "snippet": "NotificationRouter.showWarning( `Chat history needs recovery for this task. (${error.message}) Use \"Ensemble: Open Chat Data\" to ` + \"inspect the preserved file"
+      "snippet": "NotificationRouter.showWarning( `${taskLabel} — Chat history needs recovery for this task. (${error.message}) Use \"Ensemble: Open Chat Data\" to `"
     },
     {
       "file": "src/commands/scheduleTaskResume.ts",

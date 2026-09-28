@@ -168,6 +168,18 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   viewPendingTaskDecision: { kind: "notWatchdogSusceptible", reason: "opens an already-recorded decision; no provider dispatch" },
   runPublishChecks: { kind: "admissionWired", evidence: "src/commands/runPublishChecks.ts — runPublishChecks" },
   runLintingFixes: { kind: "admissionWired", evidence: "src/commands/runLintingFixes.ts — runLintingFixes" },
+  checkAndReviewPublish: {
+    kind: "delegatesTo",
+    to: "runPublishChecks",
+    evidence:
+      "src/commands/checkAndReviewPublish.ts — takes no admission itself; awaits runPublishChecks (when the checks are missing or " +
+      "stale) and then runReviewWithAI through vscode.commands.executeCommand, so each acquires and releases its own admission " +
+      "and nothing is handed between them",
+  },
+  settleChecklistItem: {
+    kind: "notWatchdogSusceptible",
+    reason: "deterministic single-line checklist edit on a user's explicit action; no provider dispatch",
+  },
   scheduleTaskResume: { kind: "admissionWired", evidence: "src/commands/scheduleTaskResume.ts — SchedulerV1.fire (withWorkAdmissionV1 is its first statement)" },
   cancelScheduledTaskAction: { kind: "notWatchdogSusceptible", reason: "deterministic schedule-record removal; no provider dispatch" },
   viewTask: { kind: "notWatchdogSusceptible", reason: "opens a document" },

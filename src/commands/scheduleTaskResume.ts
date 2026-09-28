@@ -10,7 +10,11 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
-import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
+import {
+  formatNotificationTaskLabelV1,
+  notificationTaskDisplayNameV1,
+  runWithNotificationTaskContextV1,
+} from "../utils/notificationTaskContextV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
   isAutomationChainActive,
@@ -35,9 +39,10 @@ import { pauseTaskWithReasonForClaimV1, setNextActorV1 } from "../utils/taskProg
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
 import {
-  STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+  stalledActivePauseReasonForReadingV1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
   describeStalledActiveTaskEscalationV1,
+  readStalledRoundReadingV1,
   describeUnrecoverableRecoveryEscalationV1,
   isImpossibleActiveStateV1,
   isReconstructableImplRecoveryV1,
@@ -60,7 +65,22 @@ import {
   takeOverStaleWorkAdmissionMarkerV1,
   withWorkAdmissionV1,
   WorkAdmissionAutomaticReclamationOutcomeV1,
+  WorkAdmissionDeadOwnerGateV1,
 } from "../state/workAdmissionV1";
+import { describeSurvivingRecordedProcessV1, stopRecordedCliProcessesV1 } from "../state/recordedCliStopV1";
+
+/**
+ * The recorded-CLI gate for a dead owner's lock on `taskFolderPath` (1.0 RC1
+ * Part B): stops any provider CLI the dead round left running, confirms it,
+ * and reports whichever survive. An empty list lets the reclamation release
+ * the lock; anything else keeps it held.
+ */
+function deadOwnerGateForTaskV1(taskFolderPath: string): WorkAdmissionDeadOwnerGateV1 {
+  return async (owner) => {
+    const stopped = await stopRecordedCliProcessesV1(taskFolderPath, owner.claimId);
+    return stopped.outcome === "survivors" ? stopped.survivors : [];
+  };
+}
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import {
   postWorkflowDecisionV1,
@@ -122,12 +142,20 @@ export function setPauseCommitTestHooksForTestV1(hooks: PauseCommitTestHooksV1 |
 export function buildStalledTaskEscalationDecisionV1(
   stuckRecovery: boolean,
   target: ChatTarget,
-  resumePlan?: ResumeActionPlanV1
+  resumePlan?: ResumeActionPlanV1,
+  progress?: TaskProgress
 ): PostWorkflowDecisionInputV1 {
   const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
+  // RC1 item 9: read the round ledger so the card says whether the last round
+  // finished (nothing queued after it) or rounds were lost leading into the
+  // stall, and names the action Resume will run when one is known.
   const whatHappened = stuckRecovery
     ? describeUnrecoverableRecoveryEscalationV1(displayName)
-    : describeStalledActiveTaskEscalationV1(displayName);
+    : describeStalledActiveTaskEscalationV1(
+        displayName,
+        progress ? readStalledRoundReadingV1(progress) : undefined,
+        resumePlan && resumePlan.kind !== "blocked" ? describeResumeOptionV1(resumePlan).label : undefined
+      );
   if (resumePlan?.kind === "blocked") {
     return buildBlockedStalledTaskDecisionV1(target, whatHappened, resumePlan);
   }
@@ -559,7 +587,8 @@ export class TaskActionScheduler implements vscode.Disposable {
     }
     if (posted === undefined && kind === "refused") {
       NotificationRouter.showWarning(
-        `A scheduled stage action could not start yet (${holderNote ?? "another action holds the task"}); ` +
+        `${formatNotificationTaskLabelV1(target.taskName, taskFolderPath)} — ` +
+          `A scheduled stage action could not start yet (${holderNote ?? "another action holds the task"}); ` +
           "it remains scheduled and will be retried automatically."
       );
     }
@@ -667,7 +696,13 @@ export class TaskActionScheduler implements vscode.Disposable {
         taskFolderPath,
         purpose: "admission",
         commandId: "vs-code-ai-helper.scheduleTaskResume.fire",
-        onRefused: (outcome) => recordRefusal(describeWorkAdmissionRefusalV1(outcome)),
+        onRefused: (outcome) =>
+          recordRefusal(
+            describeWorkAdmissionRefusalV1(
+              outcome,
+              notificationTaskDisplayNameV1(this.taskNames.get(taskFolderPath), taskFolderPath)
+            )
+          ),
       },
       async () => {
         let clearedByThisOwner = false;
@@ -764,7 +799,10 @@ export class TaskActionScheduler implements vscode.Disposable {
             canonicalId,
             "the task moved to a different stage, so the scheduled action was skipped"
           );
-          NotificationRouter.showInformation("Scheduled action was skipped because the task moved to a different stage.");
+          const taskName = this.taskNames.get(taskFolderPath);
+          NotificationRouter.showInformation(
+            `${formatNotificationTaskLabelV1(taskName, taskFolderPath)} — Scheduled action was skipped because the task moved to a different stage.`
+          );
         }
       }
     );
@@ -885,6 +923,40 @@ export class TaskActionScheduler implements vscode.Disposable {
    * spacing); this only needs to rule out a single transient blip. */
   private static readonly STALE_ADMISSION_TAKEOVER_NOTICE_THRESHOLD_V1 = 3;
 
+  /** Task folder → the survivor set already announced, so a sweep that keeps finding the same survivors says nothing new. */
+  private readonly survivingCliNoticeKeysV1 = new Map<string, string>();
+
+  /**
+   * 1.0 RC1 Part B: a dead owner's lock is kept because a provider CLI it
+   * recorded is still running (or could not be proven gone). Says so once per
+   * distinct survivor set, naming the task and each process; every later sweep
+   * re-checks, so ending the process by hand releases the lock without
+   * another step. An unverified pid is never described as safe to kill.
+   */
+  private surfaceSurvivingRecordedCliNoticeV1(
+    task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
+    outcome: Extract<WorkAdmissionAutomaticReclamationOutcomeV1, { outcome: "cliSurvivors" }>
+  ): void {
+    const key = `${outcome.owner.claimId}:${outcome.survivors.map((s) => s.pid).join(",")}`;
+    if (this.survivingCliNoticeKeysV1.get(task.taskFolderPath) === key) {
+      return;
+    }
+    this.survivingCliNoticeKeysV1.set(task.taskFolderPath, key);
+    const displayName = notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath);
+    const verifiedAlive = outcome.survivors.some((s) => s.classification === "alive");
+    try {
+      NotificationRouter.showWarning(
+        `"${displayName}" is still locked: the window that was working on it has closed, but ` +
+          `${outcome.survivors.length === 1 ? "a provider process it started is" : "provider processes it started are"} still running. ` +
+          `${outcome.survivors.map(describeSurvivingRecordedProcessV1).join("; ")}. ` +
+          (verifiedAlive ? "End the process that is still running; " : "") +
+          "Ensemble re-checks every few minutes and releases the lock as soon as none is left, so the task can be used again."
+      );
+    } catch (error) {
+      console.error(`surfaceSurvivingRecordedCliNoticeV1: could not surface the notice for "${task.taskFolderPath}"`, error);
+    }
+  }
+
   private surfaceStaleWorkAdmissionTakeoverNoticeV1(
     task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
     outcome: Extract<WorkAdmissionAutomaticReclamationOutcomeV1, { outcome: "notDead" }>
@@ -948,7 +1020,11 @@ export class TaskActionScheduler implements vscode.Disposable {
     for (const task of this.inventory.getTasks()) {
       let outcome: WorkAdmissionAutomaticReclamationOutcomeV1;
       try {
-        outcome = await attemptAutomaticWorkAdmissionReclamationV1(task.taskFolderPath, now);
+        outcome = await attemptAutomaticWorkAdmissionReclamationV1(
+          task.taskFolderPath,
+          now,
+          deadOwnerGateForTaskV1(task.taskFolderPath)
+        );
       } catch (error) {
         console.error(
           `reclaimStaleWorkAdmissionMarkersV1: unexpected error probing "${task.taskFolderPath}" for a reclaimable ` +
@@ -969,6 +1045,12 @@ export class TaskActionScheduler implements vscode.Disposable {
           outcome.error
         );
       }
+      if (outcome.outcome === "cliSurvivors") {
+        this.surfaceSurvivingRecordedCliNoticeV1(task, outcome);
+        this.staleAdmissionNoticeStateV1.delete(task.taskFolderPath);
+        continue;
+      }
+      this.survivingCliNoticeKeysV1.delete(task.taskFolderPath);
       if (outcome.outcome === "notDead") {
         // v1 fixes item 1, Part 1c step 16: track this task's consecutive
         // observations of a stuck, unreclaimable owner — may surface a
@@ -1787,7 +1869,7 @@ export class TaskActionScheduler implements vscode.Disposable {
           recovery !== undefined && isUnrecoverableImplRecoveryV1(recovery, task.progress, this.clock.now());
         const expectedReason = stuckRecovery
           ? UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1
-          : STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
+          : stalledActivePauseReasonForReadingV1(readStalledRoundReadingV1(task.progress));
         const { progress: patched, transitioned } = await this.closeStalledTaskThroughLedgerV1(
           task,
           stuckRecovery ? recovery?.attemptId : undefined,
@@ -1879,7 +1961,7 @@ export class TaskActionScheduler implements vscode.Disposable {
           () => undefined
         );
         const posted = await postWorkflowDecisionV1(
-          buildStalledTaskEscalationDecisionV1(stuckRecovery, target, resumePlan),
+          buildStalledTaskEscalationDecisionV1(stuckRecovery, target, resumePlan, task.progress),
           target
         );
         if (!posted) {
@@ -1892,7 +1974,11 @@ export class TaskActionScheduler implements vscode.Disposable {
           NotificationRouter.showWarning(
             stuckRecovery
               ? describeUnrecoverableRecoveryEscalationV1(notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath))
-              : describeStalledActiveTaskEscalationV1(notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath))
+              : describeStalledActiveTaskEscalationV1(
+                  notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath),
+                  readStalledRoundReadingV1(task.progress),
+                  resumePlan && resumePlan.kind !== "blocked" ? describeResumeOptionV1(resumePlan).label : undefined
+                )
           );
         }
       } finally {
@@ -1983,7 +2069,10 @@ export async function scheduleTaskResume(
   const value = await vscode.window.showInputBox({ prompt: "Schedule current-stage action (ISO date/time)", value: new Date(clock.now() + LEASE_DURATION_MS).toISOString() });
   const runAt = value ? new Date(value) : undefined;
   if (!runAt || Number.isNaN(runAt.getTime()) || runAt.getTime() <= clock.now()) {
-    if (value) NotificationRouter.showWarning("Enter a future date/time.");
+    if (value) {
+      const taskName = task.progress.displayName;
+      NotificationRouter.showWarning(`${formatNotificationTaskLabelV1(taskName, task.taskFolderPath)} — Enter a future date/time.`);
+    }
     return;
   }
   // v1 fixes 2, Wave I chokepoint (arms a schedule): arming a scheduled run
@@ -2053,7 +2142,10 @@ export async function scheduleQuotaResumeAtV1(
   if (!task) return;
   const runAt = new Date(resetAt.getTime() + QUOTA_RESUME_SCHEDULE_BUFFER_MS);
   if (Number.isNaN(runAt.getTime())) {
-    NotificationRouter.showWarning("Could not schedule a rerun: the reported reset time is unreadable.");
+    const taskName = task.progress.displayName;
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(taskName, task.taskFolderPath)} — Could not schedule a rerun: the reported reset time is unreadable.`
+    );
     return;
   }
   // A reset time already in the past (the operator clicked the action well
@@ -2152,7 +2244,13 @@ export async function takeOverStaleWorkAdmissionCommandV1(
   const taskFolderPath = arg.taskFolderPath;
   const task = inventory.getTasks().find((t) => t.taskFolderPath === taskFolderPath);
   const displayName = notificationTaskDisplayNameV1(task?.progress.displayName, taskFolderPath);
-  const outcome = await takeOverStaleWorkAdmissionMarkerV1(taskFolderPath, arg.expectedMarkerPath, arg.expectedClaimId);
+  const outcome = await takeOverStaleWorkAdmissionMarkerV1(
+    taskFolderPath,
+    arg.expectedMarkerPath,
+    arg.expectedClaimId,
+    Date.now(),
+    deadOwnerGateForTaskV1(taskFolderPath)
+  );
   switch (outcome.outcome) {
     case "takenOver":
     case "reclaimedAsDead": {

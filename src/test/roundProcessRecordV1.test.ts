@@ -8,11 +8,14 @@ import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import {
+  abandonProcessSpawnAttemptV1,
+  beginProcessSpawnAttemptV1,
   beginRoundProcessRecordingV1,
   clearRoundProcessesV1,
   listRoundProcessesV1,
   recordedClaimIdForTaskV1,
   recordRoundProcessV1,
+  unconfirmedProcessSpawnCountV1,
   type RecordedProviderProcessV1,
 } from "../state/roundProcessRecordV1";
 
@@ -232,6 +235,82 @@ void test("recordRoundProcessV1, listRoundProcessesV1, and clearRoundProcessesV1
   assert.equal(await beginRoundProcessRecordingV1(TASK_A, "claim-x"), false);
   assert.deepEqual(listRoundProcessesV1(TASK_A), []);
   await clearRoundProcessesV1(TASK_A);
+});
+
+void test("unconfirmedProcessSpawnCountV1 is 0 for a claim that never began, and for a matched begin+record pair (the ordinary path)", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-a"), 0);
+    await beginRoundProcessRecordingV1(TASK_A, "claim-a");
+    assert.equal(await beginProcessSpawnAttemptV1(TASK_A, "claim-a"), true);
+    await recordRoundProcessV1(TASK_A, "claim-a", makeProcess({ pid: 1 }));
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-a"), 0);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("unconfirmedProcessSpawnCountV1 is 1 between a durable beginProcessSpawnAttemptV1 and its matching append — the exact crash window the append alone cannot prove closed", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK_A, "claim-crash");
+    assert.equal(await beginProcessSpawnAttemptV1(TASK_A, "claim-crash"), true);
+    // Simulates a crash right after cp.spawn returned a pid but before the
+    // post-spawn recordRoundProcessV1 append landed: processes stays empty,
+    // exactly like "recording began, nothing spawned yet" — but the spawn
+    // counter proves otherwise.
+    assert.deepEqual(listRoundProcessesV1(TASK_A), []);
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-crash"), 1);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("abandonProcessSpawnAttemptV1 clears the count once a spawn is proven to have produced no process (cp.spawn threw, or no pid)", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK_A, "claim-a");
+    await beginProcessSpawnAttemptV1(TASK_A, "claim-a");
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-a"), 1);
+    await abandonProcessSpawnAttemptV1(TASK_A, "claim-a");
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-a"), 0);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("unconfirmedProcessSpawnCountV1 tracks multiple attempts under one claim independently (retry loop): two begun, one recorded, one abandoned leaves 0", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK_A, "claim-retry");
+    await beginProcessSpawnAttemptV1(TASK_A, "claim-retry");
+    await beginProcessSpawnAttemptV1(TASK_A, "claim-retry");
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-retry"), 2);
+    await recordRoundProcessV1(TASK_A, "claim-retry", makeProcess({ pid: 1 }));
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-retry"), 1);
+    await abandonProcessSpawnAttemptV1(TASK_A, "claim-retry");
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-retry"), 0);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("unconfirmedProcessSpawnCountV1 is 0 for a record belonging to a different claimId (a stale prior generation is not this claim's to report)", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK_A, "claim-1");
+    await beginProcessSpawnAttemptV1(TASK_A, "claim-1");
+    assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-2"), 0);
+  } finally {
+    fakeContext.restore();
+  }
+});
+
+void test("beginProcessSpawnAttemptV1 and abandonProcessSpawnAttemptV1 are no-ops with no ExtensionContext installed (fail closed, never throws)", async () => {
+  __extensionContextV1TestOnly.reset();
+  assert.equal(await beginProcessSpawnAttemptV1(TASK_A, "claim-x"), false);
+  await assert.doesNotReject(() => abandonProcessSpawnAttemptV1(TASK_A, "claim-x"));
+  assert.equal(unconfirmedProcessSpawnCountV1(TASK_A, "claim-x"), 0);
 });
 
 void test("recordRoundProcessV1 does not throw when the workspaceState write itself rejects, and reports the failure back to the caller", async () => {

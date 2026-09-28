@@ -216,7 +216,7 @@ void describe("CopilotLanguageModelRunner", () => {
       assert.strictEqual(result.failureKind, "temporarily-unavailable");
       assert.match(
         result.errorMessage ?? "",
-        /configured Copilot model "copilot-gpt-5\.6-sol" is not available/
+        /configured GitHub Copilot model "copilot-gpt-5\.6-sol" is not available\. Available Copilot models: auto\./
       );
     } finally {
       lm.selectChatModels = originalSelectChatModels;

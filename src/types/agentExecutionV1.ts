@@ -295,6 +295,12 @@ const NETWORK_FAULT_MESSAGE_MARKERS_V1 = [
   "net::err_tunnel_connection_failed",
   "net::err_address_unreachable",
   "socket hang up",
+  // Copilot's own server dropping an in-flight request. Observed 2026-09-25
+  // (`rc1`, run 072): a High-Level review failed with `copilotRequestFailed:
+  // canceled by server`, and with one model configured the task paused on a
+  // fault that a single resend would have cleared.
+  "canceled by server",
+  "cancelled by server",
 ];
 
 /**
@@ -341,6 +347,17 @@ export function classifyNetworkFaultV1(error: unknown): boolean {
  */
 export interface AgentTransportV1 {
   readonly runnerId: string;
+  /**
+   * True for a transport that starts an OS process and, when its request's
+   * cancellation token fires, stops that process and resolves only once it is
+   * CONFIRMED gone (the CLI text transport). The broker then never settles a
+   * Cancel or its own wall-clock deadline ahead of the transport: it signals
+   * the transport through the token and waits for the transport's own result,
+   * because the caller releases the task's admission lock the moment the
+   * invocation settles. Absent/false: the broker may settle ahead of a
+   * transport that ignores cancellation (nothing is running out of process).
+   */
+  readonly confirmsProcessExitBeforeSettling?: boolean;
   invoke(
     request: AgentExecutionRequestV1,
     output: BoundedResultWriterV1

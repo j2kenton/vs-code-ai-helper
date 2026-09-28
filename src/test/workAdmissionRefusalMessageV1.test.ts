@@ -20,6 +20,8 @@ import { describe, it } from "node:test";
 import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
   WorkAdmissionBusyV1,
+  describeTargetResolutionUnprotectedRootsV1,
+  describeTargetResolutionWriteFailureV1,
   describeWorkAdmissionRefusalV1,
 } from "../state/workAdmissionV1";
 
@@ -120,5 +122,28 @@ void describe("describeWorkAdmissionRefusalV1", () => {
       describeWorkAdmissionRefusalV1({ outcome: "writeFailed", error: new Error("EACCES: permission denied") }),
       "Could not start this stage action: EACCES: permission denied"
     );
+  });
+
+  void it("names the task in the sentence when the caller knows it, and never invents one otherwise", () => {
+    assert.match(describeWorkAdmissionRefusalV1(busy(), "Ship the login fix"), /^"Ship the login fix" already has a stage action in progress/);
+    assert.match(describeWorkAdmissionRefusalV1(busy()), /^This task already has a stage action in progress/);
+    assert.match(
+      describeWorkAdmissionRefusalV1(busy({ ageMs: 20 * 60 * 1000 }), "Ship the login fix"),
+      /^"Ship the login fix" looks stuck rather than busy/
+    );
+    assert.equal(
+      describeWorkAdmissionRefusalV1({ outcome: "writeFailed", error: new Error("EACCES") }, "Ship the login fix"),
+      'Could not start this stage action for "Ship the login fix": EACCES'
+    );
+  });
+
+  void it("target-resolution refusals take the same optional task name", () => {
+    const handle = { writeFailedRootPaths: ["/w/.ensemble"], unprotectedRootPaths: ["/w/.ensemble"] } as unknown as Parameters<
+      typeof describeTargetResolutionWriteFailureV1
+    >[0];
+    assert.match(describeTargetResolutionWriteFailureV1(handle, "Ship the login fix"), /^Could not start this stage action for "Ship the login fix": failed/);
+    assert.match(describeTargetResolutionWriteFailureV1(handle), /^Could not start this stage action: failed/);
+    assert.match(describeTargetResolutionUnprotectedRootsV1(handle, "Ship the login fix"), /^Could not start this stage action for "Ship the login fix": task-root/);
+    assert.match(describeTargetResolutionUnprotectedRootsV1(handle), /^Could not start this stage action: task-root/);
   });
 });

@@ -20,13 +20,13 @@ export interface ImplementationChecklistRefreshDepsV1 {
  * Refresh the implementation percentage on every surface that shows it after
  * one or more `plan-final.md` files changed on disk (a run ticking boxes).
  *
- * Deliberately narrow: only known tasks currently AT the implementation
- * stage count, and the only work done is re-rendering. It never refreshes the
- * task inventory and never arms schedules — a checklist tick changes no
- * progress record, and re-arming from a file watcher would let a viewer claim
- * leases the runner owns. No document is written or saved here either; the
- * surfaces re-read through the display-only reader
- * (`readPlanOfRecordForDisplayV1`).
+ * Deliberately narrow: any known task counts, whatever stage it is
+ * currently at (including the review stages), and the only work done is
+ * re-rendering. It never refreshes the task inventory and never arms
+ * schedules — a checklist tick changes no progress record, and re-arming
+ * from a file watcher would let a viewer claim leases the runner owns. No
+ * document is written or saved here either; the surfaces re-read through the
+ * display-only reader (`readPlanOfRecordForDisplayV1`).
  */
 export async function handleImplementationChecklistChangeV1(
   changedFiles: readonly vscode.Uri[],
@@ -35,7 +35,7 @@ export async function handleImplementationChecklistChangeV1(
   const folders = new Map<string, vscode.Uri>();
   for (const file of changedFiles) {
     const folder = path.dirname(file.fsPath);
-    if (!folders.has(folder) && deps.findTaskStage(folder) === "impl") {
+    if (!folders.has(folder) && deps.findTaskStage(folder) !== undefined) {
       folders.set(folder, vscode.Uri.file(folder));
     }
   }

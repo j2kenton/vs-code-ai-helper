@@ -295,6 +295,20 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
   return { restore: (): void => { ws.workspaceFolders = orig; } };
 }
 
+/** The test-stubs `vscode` module has no `window.tabGroups` at all — fine for
+ * every other test in this file, but `deletePath` (fileUtils.ts, used by the
+ * round-progress.md cleanup below) reads `vscode.window.tabGroups.all` to
+ * close any open editor for the path first. With no stub that access throws,
+ * which `deletePath`'s caller swallows as best-effort — silently turning
+ * every deletion in this suite into a no-op. An empty tab list is enough:
+ * `findOpenTabsUnder` short-circuits on nothing to `flatMap`. */
+function installTabGroupsStub(): { restore: () => void } {
+  const win = vscode.window as unknown as Record<string, unknown>;
+  const orig = win.tabGroups;
+  win.tabGroups = { all: [], close: () => Promise.resolve(true) };
+  return { restore: (): void => { win.tabGroups = orig; } };
+}
+
 /** The non-git-workspace safety modal executeImplementationRun shows before
  * any dispatch (REAL_ROOT is a plain temp dir, not a git repo) — answered
  * exactly as a user clicking through it would. */
@@ -906,6 +920,268 @@ void describe("runImplementationWithAI — real in-flight activity through the p
     } finally {
       endSub.dispose();
       for (const p of patches.reverse()) { p.restore(); }
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * RC1 item 6 / f3 Part 10: round-progress.md lifecycle. The in-round
+ * bookkeeping file must never survive past the round it belongs to, whether
+ * that round's report is accepted and banked or rejected as malformed — a
+ * survivor would leave the display-only merge in effectiveReviewProgress.ts
+ * showing a later round's percentage as if it still carried the earlier
+ * round's (never-validated) ticks. Drives the REAL `executeImplementationRun`
+ * end to end, same seam as the suite above, with a round-progress.md file
+ * seeded on real disk before dispatch.
+ */
+void describe("round-progress.md lifecycle through the real implementation dispatch", () => {
+  void it("accepted-replaces: a banked (accepted) round deletes round-progress.md", async () => {
+    const { folderPath } = makeImplTaskFolder(`impl-activity-rp-accept-${Math.floor(Math.random() * 1e9)}`);
+    const roundProgressPath = path.join(folderPath, "round-progress.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const controllable = controllableImplementationRun();
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", controllable.fn),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchPromise = runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+      await controllable.invoked;
+
+      // Written only AFTER the provider has been invoked — i.e. after the
+      // round-start deletion at the top of executeImplementationRun has
+      // already run (review fix, 2026-09-27: writing before dispatch let
+      // that round-start delete satisfy this assertion even if the
+      // TERMINAL cleanup below were removed). This simulates the round
+      // itself appending ticks while it runs, so only the accepted-path
+      // cleanup below can make this assertion pass.
+      fs.writeFileSync(roundProgressPath, "- [x] Do the thing.\n", "utf8");
+
+      controllable.resolveWith({
+        status: "completed",
+        filesChanged: ["src/a.ts"],
+        summary: "stub implementation run",
+        summaryIsSynthetic: true,
+        runnerId: "claude-cli",
+        actualProviderLabel: "Claude Code",
+        actualStoredModelId: "claude-cli:sonnet@high",
+      });
+
+      await dispatchPromise;
+
+      assert.equal(
+        fs.existsSync(roundProgressPath),
+        false,
+        "an accepted, banked round must delete its in-round bookkeeping file"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      tabGroupsStub.restore();
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("rejected-reverts: a round whose summary fails the shape gate still deletes round-progress.md", async () => {
+    const { folderPath } = makeImplTaskFolder(`impl-activity-rp-reject-${Math.floor(Math.random() * 1e9)}`);
+    const roundProgressPath = path.join(folderPath, "round-progress.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const controllable = controllableImplementationRun();
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", controllable.fn),
+      // The base patch set stubs `writeRunLog` to resolve `undefined` — fine
+      // for the accepted/incomplete paths this suite otherwise exercises, but
+      // the rejected-summary path below reads `logUri.fsPath` to name the run
+      // log in the unusable-summary stamp, so this path needs a real Uri.
+      patch(runLogModule, "writeRunLog", () =>
+        Promise.resolve(vscode.Uri.joinPath(vscode.Uri.file(folderPath), "runs", "001-test.md"))),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchPromise = runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+      await controllable.invoked;
+
+      // Written only AFTER the provider has been invoked — same reasoning
+      // as the accepted-path test above: writing it before dispatch would
+      // let the ROUND-START delete (top of executeImplementationRun)
+      // satisfy this assertion even with the rejected-path cleanup removed.
+      fs.writeFileSync(roundProgressPath, "- [x] Do the thing.\n", "utf8");
+
+      controllable.resolveWith({
+        status: "completed",
+        filesChanged: ["src/a.ts"],
+        // Model-authored (not synthetic), with `## Files Changed` present
+        // but NO `## Verification` — fails
+        // `describeImplementationSummaryShapeIssue` while still passing
+        // `describeIncompleteImplementationRoundV1` (a present, non-empty
+        // `## Files Changed` section is enough to rule out "incomplete").
+        // (A missing checklist echo no longer rejects — RC2 #10.)
+        summary: "## Files Changed\n\n- `src/a.ts` — did a thing\n",
+        summaryIsSynthetic: false,
+        runnerId: "claude-cli",
+        actualProviderLabel: "Claude Code",
+        actualStoredModelId: "claude-cli:sonnet@high",
+      });
+
+      await dispatchPromise;
+
+      assert.equal(
+        fs.existsSync(roundProgressPath),
+        false,
+        "a rejected round must also delete its in-round bookkeeping file — it never earned its ticks"
+      );
+      assert.ok(
+        fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8").startsWith(
+          "<!-- ensemble:implementation-summary-unusable -->"
+        ),
+        "sanity check: this really took the rejected path (impl-summary.md stamped unusable)"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      tabGroupsStub.restore();
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("cancelled-deletes: a cancelled round deletes round-progress.md (review fix, 2026-09-27)", async () => {
+    // Review blocker (2026-09-27): the cancelled and ordinary-failed
+    // terminal branches of executeImplementationRun returned without
+    // deleting round-progress.md — a round cancelled mid-flight, after
+    // appending ticks, left them behind to keep merging into the displayed
+    // percentage until some later round happened to overwrite the file.
+    const { folderPath } = makeImplTaskFolder(`impl-activity-rp-cancel-${Math.floor(Math.random() * 1e9)}`);
+    const roundProgressPath = path.join(folderPath, "round-progress.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const controllable = controllableImplementationRun();
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", controllable.fn),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchPromise = runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+      await controllable.invoked;
+
+      // Written only AFTER the provider has been invoked, so only the
+      // cancelled-path cleanup (not the round-start delete) can be
+      // responsible for its absence below.
+      fs.writeFileSync(roundProgressPath, "- [x] Do the thing.\n", "utf8");
+
+      controllable.resolveWith({
+        status: "cancelled",
+        filesChanged: ["src/a.ts"],
+      });
+
+      await dispatchPromise;
+
+      assert.equal(
+        fs.existsSync(roundProgressPath),
+        false,
+        "a cancelled round must delete its in-round bookkeeping file — it never earned its ticks"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      tabGroupsStub.restore();
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("failed-deletes: an ordinary failed round deletes round-progress.md (review fix, 2026-09-27)", async () => {
+    // Same review blocker as the cancelled case above, for the "failed"
+    // outcome branch (provider error, not a watchdog timeout).
+    const { folderPath } = makeImplTaskFolder(`impl-activity-rp-fail-${Math.floor(Math.random() * 1e9)}`);
+    const roundProgressPath = path.join(folderPath, "round-progress.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const controllable = controllableImplementationRun();
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", controllable.fn),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchPromise = runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+      await controllable.invoked;
+
+      fs.writeFileSync(roundProgressPath, "- [x] Do the thing.\n", "utf8");
+
+      controllable.resolveWith({
+        status: "failed",
+        filesChanged: [],
+        errorMessage: "stub provider failure",
+      });
+
+      await dispatchPromise;
+
+      assert.equal(
+        fs.existsSync(roundProgressPath),
+        false,
+        "an ordinary failed round must delete its in-round bookkeeping file — it never earned its ticks"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      tabGroupsStub.restore();
       warnStub.restore();
       wsStub.restore();
       fsBridge.restore();

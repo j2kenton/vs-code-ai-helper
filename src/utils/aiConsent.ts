@@ -1,6 +1,11 @@
 import * as vscode from "vscode";
 import { isRunnerHostV1 } from "../state/hostRoleV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import {
+  describeAutomationDefaultV1,
+  isAutomationDispatchContextV1,
+} from "../state/automationDispatchContextV1";
+import { NotificationRouter } from "./notificationRouter";
 
 /**
  * Workspace-state key for the current disclaimer version's consent record.
@@ -45,6 +50,17 @@ export async function ensureAiConsent(
   // runner up to run their workflow (hostRoleV1.ts).
   if (isRunnerHostV1()) {
     return true;
+  }
+  // An automation-driven call tree has no one to answer the modal below, so it
+  // takes the non-destructive default: no consent recorded means no AI run.
+  // Say so visibly, and name the way out (run any AI action by hand once).
+  if (isAutomationDispatchContextV1()) {
+    console.log(describeAutomationDefaultV1("AI consent prompt", "declined"));
+    NotificationRouter.showWarning(
+      "An automated round did not run: AI consent has not been given in this workspace and no one was attached " +
+        "to give it. Run any Ensemble AI action once by hand and accept the notice, then run the automation again."
+    );
+    return false;
   }
 
   const ACCEPT = "I Understand — Enable AI Features";

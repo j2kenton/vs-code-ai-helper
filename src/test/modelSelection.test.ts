@@ -13,6 +13,7 @@ import {
   getModelDisplayName,
   describeModelSource,
 } from "../utils/modelSelection";
+import { describeModelWithProviderV1 } from "../runners/providers";
 
 /** Mirrors runnerRegistry.test.ts's own `installModelSettings` helper. */
 function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
@@ -1273,8 +1274,9 @@ void describe("Model Selection Display States", () => {
 
   void it("describeModel returns correct strings", () => {
     assert.strictEqual(describeModel(undefined, mockModels), "Automatic (no explicit selection)");
-    assert.strictEqual(describeModel("gemini-3.5-flash", mockModels), "Gemini 3.5 Flash (gemini-3.5-flash)");
-    assert.strictEqual(describeModel("gpt-5", mockModels), "gpt-5 (currently unavailable)");
+    assert.strictEqual(describeModel("gemini-3.5-flash", mockModels), "Gemini 3.5 Flash (Antigravity)");
+    assert.strictEqual(describeModel("gpt-5", mockModels), "gpt-5 (GitHub Copilot) — currently unavailable");
+    assert.strictEqual(describeModel("codex-cli:gpt-5", mockModels), "gpt-5 (OpenAI Codex) — currently unavailable");
   });
 
   void it("getModelDisplayName returns correct strings", () => {
@@ -1364,7 +1366,7 @@ void describe("describeStageSubstitutesV1 (workflow 3 continuation, first item �
     });
     try {
       const descriptions = describeStageSubstitutesV1("claude-cli:opus");
-      assert.deepEqual(descriptions, ["Plan → kiro-cli:default"]);
+      assert.deepEqual(descriptions, [`Plan → ${describeModelWithProviderV1("kiro-cli:default")}`]);
     } finally {
       settings.restore();
     }
@@ -1409,7 +1411,7 @@ void describe("describeStageSubstitutesV1 (workflow 3 continuation, first item �
     });
     try {
       const descriptions = describeStageSubstitutesV1("claude-cli:opus");
-      assert.deepEqual(descriptions, ["Plan → kiro-cli:default"]);
+      assert.deepEqual(descriptions, [`Plan → ${describeModelWithProviderV1("kiro-cli:default")}`]);
     } finally {
       settings.restore();
     }

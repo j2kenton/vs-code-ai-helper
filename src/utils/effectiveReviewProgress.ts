@@ -12,14 +12,49 @@ import * as vscode from "vscode";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isPlanReviewStage, TaskProgress, TaskStage } from "../types/taskProgress";
-import { ChecklistProgressV1 } from "./implementationChecklist";
+import { ChecklistProgressV1, countChecklistProgressV1, mergeChecklistProgressV1 } from "./implementationChecklist";
 import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "./implementationArtifactResolver";
 import { NotificationRouter } from "./notificationRouter";
+import { readTextIfExists } from "./fileUtils";
 import {
   parseReviewProgress,
   reconcileProgressWithChecklistV1,
   ReviewProgress,
 } from "./reviewReadiness";
+
+/** Basename of the in-round, best-effort progress bookkeeping file a round
+ * appends to (Ensemble 1.0 RC1, item 6 / f3 Part 10). Never written to
+ * plan-final.md, and never read by the gate reader — only by the two
+ * display readers below. */
+const ROUND_PROGRESS_FILENAME_V1 = "round-progress.md";
+
+/**
+ * Best-effort read of `round-progress.md`, merged IN MEMORY against
+ * `planText` (the plan bytes already read by the caller) via
+ * `mergeChecklistProgressV1`, and counted — never written back to
+ * plan-final.md. A missing, empty, unreadable, or non-matching file yields
+ * `counted` unchanged and silently: this is display bookkeeping only, never
+ * a source of a warning or a latch.
+ */
+async function applyRoundProgressBestEffortV1(
+  folderUri: vscode.Uri,
+  planText: string | undefined,
+  counted: ChecklistProgressV1
+): Promise<ChecklistProgressV1> {
+  if (planText === undefined) {
+    return counted;
+  }
+  const roundProgressUri = vscode.Uri.joinPath(folderUri, ROUND_PROGRESS_FILENAME_V1);
+  const roundProgressText = await readTextIfExists(roundProgressUri);
+  if (!roundProgressText) {
+    return counted;
+  }
+  const merged = mergeChecklistProgressV1(planText, roundProgressText);
+  if (merged.kind !== "merged") {
+    return counted;
+  }
+  return countChecklistProgressV1(merged.content) ?? counted;
+}
 
 /**
  * How an unreadable/corrupt task-progress file behaves mid-read:
@@ -65,11 +100,12 @@ async function readTaskProgressForChecklistV1(
   if (policy === "lenient") {
     return { kind: "unreadable" };
   }
+  const folderName = path.basename(folderUri.fsPath);
   NotificationRouter.showError(
-    `Task progress for ${path.basename(folderUri.fsPath)} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
+    `Task progress for ${folderName} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
   );
   throw new Error(
-    `Task progress recovery required for ${path.basename(folderUri.fsPath)} (${strict.code}): ${strict.reason}`
+    `Task progress recovery required for ${folderName} (${strict.code}): ${strict.reason}`
   );
 }
 
@@ -131,7 +167,8 @@ export async function readDisplayPlanChecklistProgressV1(
   if (advisory.kind === "unreadable") {
     return undefined;
   }
-  return { counts: counted, unverified: advisory.progress?.checklistProgressUnreliable === true };
+  const withRoundProgress = await applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
+  return { counts: withRoundProgress, unverified: advisory.progress?.checklistProgressUnreliable === true };
 }
 
 /**
@@ -157,7 +194,7 @@ export async function readEffectivePlanChecklistProgressForDisplayV1(
   if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
     return undefined;
   }
-  return counted;
+  return applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
 }
 
 /**

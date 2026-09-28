@@ -13,6 +13,7 @@ import {
   type ArtifactPickerOptions,
 } from "../utils/artifactPicker";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 
 interface ViewTaskArg {
   task?: IncompleteTask;
@@ -108,7 +109,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
       await safeOpenTextDocument(planUri, "plan.md");
     } catch (error) {
       NotificationRouter.showError(
-        `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
+        `${formatNotificationTaskLabelV1(arg.task.progress.displayName, arg.task.folderName)}: failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
       );
     }
     return;
@@ -163,7 +164,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     await safeOpenTextDocument(planUri, "plan.md");
   } catch (error) {
     NotificationRouter.showError(
-      `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
+      `${formatNotificationTaskLabelV1(selected.task.displayName, selected.task.folderName)}: failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
     );
   }
 }

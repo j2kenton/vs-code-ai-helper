@@ -317,7 +317,7 @@ void describe("generatePlanWithAI watchdog-pause reconciliation (v1 fixes item 1
 
       assert.equal(result, undefined);
       assert.equal(surface.entries.length, 1);
-      assert.equal(surface.entries[0]?.level, "info");
+      assert.equal(surface.entries[0]?.level, "warning");
       assert.match(surface.entries[0]?.message ?? "", /paused/i);
       assert.equal(
         hasLiveWorkAdmissionBestEffortV1(taskFolderPath),

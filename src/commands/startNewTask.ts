@@ -169,8 +169,9 @@ async function getNextTaskNumber(
  */
 function notifyLegacyCreatingFootprint(footprint: ClassifiedCreatingFootprintV1): void {
   const taskFileUri = vscode.Uri.joinPath(vscode.Uri.file(footprint.taskFolderPath), TASK_FILENAME);
+  const folderName = footprint.taskFolderName;
   NotificationRouter.showWarning(
-    `${footprint.taskFolderName} was left in an incomplete "creating" state (likely an interrupted extension host). ` +
+    `${folderName} was left in an incomplete "creating" state (likely an interrupted extension host). ` +
       (footprint.hasTaskMd
         ? "It was not automatically resumed — open it to inspect and finish it manually."
         : "It has no task.md yet — open its folder to inspect it manually."),
@@ -517,13 +518,15 @@ async function createTask(
     // No other task under this meta root was active, so this one becomes the
     // target of shortcuts and in-flight operations immediately.
     await currentTaskStore.set(normalizePath(taskFolderPath));
-    NotificationRouter.showInformation(`${taskFolderName} created and set as the active task.`);
+    const folderName = taskFolderName;
+    NotificationRouter.showInformation(`${folderName} created and set as the active task.`);
   } else {
     // An existing active task remains the target of shortcuts and in-flight
     // operations. The explicit argument is essential; a bare resume command
     // would instead resume the older current task.
+    const folderName = taskFolderName;
     NotificationRouter.showWarning(
-      "Task created in paused state.",
+      `${folderName}: task created in paused state.`,
       undefined,
       undefined,
       undefined,

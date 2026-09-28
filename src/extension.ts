@@ -48,6 +48,11 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "./state/workAdmissionV1";
 import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
+import {
+  notificationTaskDisplayNameV1,
+  formatNotificationTaskLabelV1,
+  formatTaskNameForDisplay,
+} from "./utils/notificationTaskContextV1";
 // Side-effect only: registers `effectivePauseStatusV1.ts`'s pause-revocation
 // cleanup hook with `workAdmissionV1.ts` (2026-09-11 review completion
 // blocker `dceb2646...-2`). No other production module reaches this file yet
@@ -102,6 +107,7 @@ import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerReconcilePlanChecklistCommands } from "./commands/reconcilePlanChecklist";
 import { registerHandoffChecksCommandsV1 } from "./commands/handoffChecksV1";
+import { registerSettleChecklistItemCommandV1 } from "./commands/settleChecklistItem";
 import { registerApplyReviewerVerifiedTicksCommands } from "./commands/applyReviewerVerifiedTicks";
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
@@ -126,6 +132,7 @@ import {
 import { setGlobalAssistantRuntimeDepsV1 } from "./utils/globalAssistantActions";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerRunPublishChecksCommand } from "./commands/runPublishChecks";
+import { registerCheckAndReviewPublishCommand } from "./commands/checkAndReviewPublish";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
@@ -600,6 +607,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * runner: …" for the full 30-minute relay wait before failing (review,
    * 2026-09-17).
    */
+  /**
+   * The quoted label of the task a workflow decision belongs to, for
+   * notifications about resolving it — looked up via the decision's own
+   * `taskCanonicalId` rather than trusting anything the caller passed in,
+   * since a decision may sit for a while before it is answered. Undefined
+   * when the decision (or its task) can no longer be found, in which case
+   * callers fall back to the unprefixed message rather than fabricate a name.
+   */
+  function describeDecisionTaskLabelV1(decisionId: string): string | undefined {
+    const decision = new WorkflowDecisionStoreV1(context.workspaceState).get(decisionId);
+    const task = decision ? inventory.getTaskById(decision.taskCanonicalId) : undefined;
+    return task ? formatNotificationTaskLabelV1(task.progress.displayName, task.folderName) : undefined;
+  }
   async function describeRunnerNotReportingV1(): Promise<string | undefined> {
     if (relayDirPath === undefined) {
       return relayUnavailable.reason;
@@ -655,13 +675,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // for effects that belong where the user is, which come back to be run
     // here (VIEWER_DECISION_EFFECT_COMMANDS_V1).
     resolveWorkflowDecision: async (decisionId, optionId) => {
+      const decisionTaskLabel = describeDecisionTaskLabelV1(decisionId);
       if (hostRelay === undefined) {
-        NotificationRouter.showWarning(relayUnavailable.reason);
+        NotificationRouter.showWarning(
+          decisionTaskLabel !== undefined ? `${decisionTaskLabel} — ${relayUnavailable.reason}` : relayUnavailable.reason
+        );
         return { ok: false, message: relayUnavailable.reason };
       }
       const notReporting = await describeRunnerNotReportingV1();
       if (notReporting !== undefined) {
-        NotificationRouter.showWarning(`Your answer was not sent: ${notReporting}`);
+        NotificationRouter.showWarning(
+          decisionTaskLabel !== undefined
+            ? `${decisionTaskLabel} — Your answer was not sent: ${notReporting}`
+            : `Your answer was not sent: ${notReporting}`
+        );
         return { ok: false, message: notReporting };
       }
       try {
@@ -675,7 +702,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
         if (!response.ok) {
           const reason = response.reason ?? "unknown reason";
-          NotificationRouter.showWarning(`The runner could not apply your decision: ${reason}`);
+          NotificationRouter.showWarning(
+            decisionTaskLabel !== undefined
+              ? `${decisionTaskLabel} — The runner could not apply your decision: ${reason}`
+              : `The runner could not apply your decision: ${reason}`
+          );
           return { ok: false, message: reason };
         }
         // The runner hands back an effect that belongs in this window.
@@ -685,7 +716,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           viewerEffect?: { command: string; args?: readonly unknown[] };
         };
         if (outcome.ok === false && outcome.message) {
-          NotificationRouter.showWarning(`The runner could not apply your decision: ${outcome.message}`);
+          NotificationRouter.showWarning(
+            decisionTaskLabel !== undefined
+              ? `${decisionTaskLabel} — The runner could not apply your decision: ${outcome.message}`
+              : `The runner could not apply your decision: ${outcome.message}`
+          );
         }
         return {
           ok: outcome.ok !== false,
@@ -694,7 +729,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         };
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        NotificationRouter.showWarning(`Could not reach the runner: ${reason}`);
+        NotificationRouter.showWarning(
+          decisionTaskLabel !== undefined
+            ? `${decisionTaskLabel} — Could not reach the runner: ${reason}`
+            : `Could not reach the runner: ${reason}`
+        );
         return { ok: false, message: reason };
       }
     },
@@ -726,7 +765,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         commandId: "relayResumeInteractionV1",
       });
       if (admission.outcome !== "acquired") {
-        return { ok: false, reason: describeWorkAdmissionRefusalV1(admission) };
+        return {
+          ok: false,
+          reason: describeWorkAdmissionRefusalV1(
+            admission,
+            notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)
+          ),
+        };
       }
       const heartbeat = setInterval(() => void admission.handle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
       const handoffToken = authorizeWorkAdmissionHandoffV1(task.taskFolderPath);
@@ -905,10 +950,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       NotificationRouter.showWarning("Select a task first — the action runs on the runner for that task.");
       return { ok: false };
     }
+    const taskLabel = formatNotificationTaskLabelV1(inventory.getTaskByPath(task)?.progress.displayName, task);
     // Do not claim to be running something on a runner that is not there.
     const notReporting = await describeRunnerNotReportingV1();
     if (notReporting !== undefined) {
-      NotificationRouter.showWarning(`${label} was not started: ${notReporting}`);
+      NotificationRouter.showWarning(`${taskLabel} — ${label} was not started: ${notReporting}`);
       return { ok: false };
     }
     try {
@@ -926,13 +972,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           )
       );
       if (!response.ok) {
-        NotificationRouter.showWarning(`The runner could not run ${label}: ${response.reason ?? "unknown reason"}`);
+        NotificationRouter.showWarning(`${taskLabel} — The runner could not run ${label}: ${response.reason ?? "unknown reason"}`);
         return { ok: false };
       }
       return { ok: true };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      NotificationRouter.showWarning(`${label}: could not reach the runner — ${reason}`);
+      NotificationRouter.showWarning(`${taskLabel} — ${label}: could not reach the runner — ${reason}`);
       // "took this but has not finished" means the work may still be running:
       // the caller must not offer it back as if nothing happened.
       return { ok: false, indeterminate: /has not finished/.test(reason) };
@@ -1164,7 +1210,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // Strict cutover (plan §3.12): a corrupt progress file now warns
             // with the decoder's specific reason instead of being
             // indistinguishable from a missing one.
-            NotificationRouter.showWarning(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder} (${progressResult.reason}). Please check its files manually.`);
+            NotificationRouter.showWarning(`${formatNotificationTaskLabelV1(inventory.getTaskByPath(journal.taskFolder)?.progress.displayName, journal.taskFolder)} — Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder} (${progressResult.reason}). Please check its files manually.`);
           }
         }
       }).catch(err => console.error("Finalization recovery failed", err))
@@ -1228,6 +1274,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerPinTaskCommands(context, inventory);
   registerReconcilePlanChecklistCommands(context, inventory, currentTaskStore);
   registerHandoffChecksCommandsV1(context, inventory);
+  registerSettleChecklistItemCommandV1(context, inventory, currentTaskStore);
   registerApplyReviewerVerifiedTicksCommands(context, inventory, currentTaskStore);
   registerPlanRevisionCommandsV1(context, inventory, currentTaskStore);
   registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);
@@ -1239,6 +1286,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerChatWithStageCommand(context, inventory, chatViewProvider, currentTaskStore);
   registerRunLintingFixesCommand(context, inventory, chatViewProvider);
   registerRunPublishChecksCommand(context, inventory, currentTaskStore);
+  registerCheckAndReviewPublishCommand(context);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);
@@ -1372,9 +1420,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     (node?: { id?: string; sourceOperationId?: string }) => {
       const operationId = typeof node?.id === "string" ? node.id : node?.sourceOperationId;
       if (typeof operationId !== "string") return;
+      const opTaskName = taskOperations.getAll().find((op) => op.id === operationId)?.taskName;
       if (!taskOperations.cancelOperation(operationId)) {
+        const refusal = taskOperations.describeCancelRefusalV1(operationId);
         NotificationRouter.showInformation(
-          taskOperations.describeCancelRefusalV1(operationId)
+          opTaskName !== undefined ? `${formatTaskNameForDisplay(opTaskName)} — ${refusal}` : refusal
         );
       }
     }
@@ -1586,6 +1636,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // badges all render them exactly as they render a local run.
     let runnerActivationSeenV1: string | undefined;
     taskOperations.configureMirroredOperationCancel((operationId) => {
+      const opTaskName = taskOperations.getAll().find((op) => op.id === operationId)?.taskName;
+      const opTaskLabel = opTaskName !== undefined ? formatTaskNameForDisplay(opTaskName) : undefined;
       void hostRelay
         ?.send(
           { kind: "cancelOperation", operationId, ...(runnerActivationSeenV1 ? { activationId: runnerActivationSeenV1 } : {}) },
@@ -1593,12 +1645,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         )
         .then((response) => {
           if (!response.ok) {
-            NotificationRouter.showWarning(`The runner could not cancel the operation: ${response.reason ?? "unknown reason"}`);
+            NotificationRouter.showWarning(
+              opTaskLabel !== undefined
+                ? `${opTaskLabel} — The runner could not cancel the operation: ${response.reason ?? "unknown reason"}`
+                : `The runner could not cancel the operation: ${response.reason ?? "unknown reason"}`
+            );
           }
         })
         .catch((error: unknown) => {
           NotificationRouter.showWarning(
-            `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+            opTaskLabel !== undefined
+              ? `${opTaskLabel} — Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
+              : `Could not reach the runner: ${error instanceof Error ? error.message : String(error)}`
           );
         });
     });
@@ -1920,6 +1978,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   implChecklistWatcher.onDidChange(onImplChecklistChange);
   implChecklistWatcher.onDidDelete(onImplChecklistChange);
 
+  // RC1 item 6 / f3 Part 10: round-progress.md is best-effort, in-round
+  // bookkeeping a round appends to (see effectiveReviewProgress.ts). It is
+  // never itself the source of truth (plan-final.md still is), but a
+  // change to it should redraw the live percentage the same way a
+  // plan-final.md change does, on every stage (including impl-high-review
+  // and impl-low-review, where a round may still be appending ticks).
+  // Reuses the identical debounced handler so both files coalesce through
+  // one re-render path.
+  const roundProgressWatcher = vscode.workspace.createFileSystemWatcher(
+    "**/round-progress.md"
+  );
+  roundProgressWatcher.onDidCreate(onImplChecklistChange);
+  roundProgressWatcher.onDidChange(onImplChecklistChange);
+  roundProgressWatcher.onDidDelete(onImplChecklistChange);
+
   // A crashed window can leave a lease behind. Periodically retrying the
   // persisted schedules lets this window claim an expired lease even when no
   // task-progress file change happens after the crash.
@@ -1990,6 +2063,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statusBarMenuCommand,
     progressWatcher,
     implChecklistWatcher,
+    roundProgressWatcher,
     {
       dispose: () => {
         if (implChecklistTimer !== undefined) clearTimeout(implChecklistTimer);
@@ -2046,13 +2120,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Runs after initNotificationRouter (above) so status routing is live.
   void recoverRevertJournals(async (prompt) => {
     const name = prompt.artifactPath.split(/[\\/]/).pop() ?? prompt.artifactPath;
+    const artifactTaskFolder = path.dirname(prompt.artifactPath);
+    const artifactTaskLabel = formatNotificationTaskLabelV1(
+      inventory.getTaskByPath(artifactTaskFolder)?.progress.displayName,
+      artifactTaskFolder
+    );
     const detail = prompt.artifactDiverged
       ? `${name} was changed after the revert was interrupted; completing the revert would overwrite those changes.`
       : prompt.backupDiverged
         ? `The previous-version backup of ${name} was changed after the revert was interrupted; completing the revert would overwrite that backup.`
         : `An interrupted revert of ${name} was found from a previous session.`;
     const choice = await vscode.window.showWarningMessage(
-      `${detail} Complete the revert, or keep the file as it is now?`,
+      `${artifactTaskLabel} — ${detail} Complete the revert, or keep the file as it is now?`,
       { modal: true },
       "Complete Revert",
       "Keep Current File"

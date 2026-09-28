@@ -6,7 +6,8 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { captureRaisedNoticesV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
+import { captureRaisedNoticesV1, formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
@@ -109,6 +110,7 @@ async function applyCurrentStageActionCore(
     return false;
   }
   refusal.taskFolderPath = resolvedTask.taskFolderPath;
+  const taskLabel = formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName);
 
   if (resolvedTask.progress.status === "paused") {
     // A caller-presented handoff token means the caller (currently only
@@ -132,9 +134,7 @@ async function applyCurrentStageActionCore(
       : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress);
     if (stillPaused) {
       refusal.reason = "the task is paused, and nothing has resumed it";
-      NotificationRouter.showWarning(
-        "Task is paused. Resume it before using this shortcut."
-      );
+      showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
       return false;
     }
   }
@@ -147,7 +147,8 @@ async function applyCurrentStageActionCore(
   if (
     !(await ensureStageModelConfigured(
       vscode.Uri.file(resolvedTask.taskFolderPath),
-      stage
+      stage,
+      resolvedTask.progress.displayName
     ))
   ) {
     refusal.reason = `no model is configured for the ${stage} stage, or its provider is disabled`;
@@ -220,7 +221,7 @@ async function applyCurrentStageActionCore(
       // A silent substitution is the same opaque "big red button" problem in
       // the other direction.
       NotificationRouter.showInformation(
-        `Running Apply Review instead of Implementation. ${decision.reason}`
+        `${taskLabel}: running Apply Review instead of Implementation. ${decision.reason}`
       );
       // Moves to the review stage first: the task is at `impl` here, which is
       // precisely why this branch was reached, and every apply command
@@ -280,7 +281,7 @@ async function applyCurrentStageActionCore(
       } catch {
         refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
-          "No high-level review artifact found yet. Run Review first."
+          `${taskLabel}: no high-level review artifact found yet. Run Review first.`
         );
         return false;
       }
@@ -301,7 +302,7 @@ async function applyCurrentStageActionCore(
       } catch {
         refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
-          "No low-level review artifact found yet. Run Review first."
+          `${taskLabel}: no low-level review artifact found yet. Run Review first.`
         );
         return false;
       }
@@ -322,7 +323,7 @@ async function applyCurrentStageActionCore(
       } catch {
         refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
-          "No high-level review artifact found yet. Run Review first."
+          `${taskLabel}: no high-level review artifact found yet. Run Review first.`
         );
         return false;
       }
@@ -343,7 +344,7 @@ async function applyCurrentStageActionCore(
       } catch {
         refusal.reason = "there is no review artifact yet, so the review has to run first";
         NotificationRouter.showWarning(
-          "No low-level review artifact found yet. Run Review first."
+          `${taskLabel}: no low-level review artifact found yet. Run Review first.`
         );
         return false;
       }

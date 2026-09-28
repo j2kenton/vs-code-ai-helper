@@ -58,6 +58,29 @@ export function notificationTaskDisplayNameV1(taskName: string | undefined, task
 }
 
 /**
+ * Render a task name for user-facing display, wrapped in straight double
+ * quotes: Notifications rows and terminal entries read `Rename Task —
+ * "ff for 1 pt 2": completed`. The semantic `taskName` stored on operation
+ * snapshots (and in persisted entries) stays unquoted — quoting happens only
+ * at the render boundary, so historical data never carries quote characters.
+ * Lives here so the attribution prefix below and `taskOperations` quote a task
+ * identically; `taskOperations` re-exports it for its existing importers.
+ */
+export function formatTaskNameForDisplay(taskName: string): string {
+  return `"${taskName}"`;
+}
+
+/**
+ * The quoted label a message that names its own task should lead with:
+ * `displayName ?? folderName`, the raw `YYYY-MM-DD_task_N` default reformatted,
+ * then quoted like the attribution prefix. `folderNameOrPath` may be a bare
+ * folder name or a full path.
+ */
+export function formatNotificationTaskLabelV1(displayName: string | undefined, folderNameOrPath: string): string {
+  return formatTaskNameForDisplay(notificationTaskDisplayNameV1(displayName, folderNameOrPath));
+}
+
+/**
  * Runs `fn` with the task as the notification context for everything it
  * awaits, then marks the context ended. A nested call (a child operation) keeps
  * the enclosing root's context.
@@ -117,5 +140,5 @@ export function attributeNotificationMessageV1(message: string): string {
   }
   const stageName = context.stage !== undefined ? STAGE_DISPLAY_NAMES[context.stage] : undefined;
   const stageText = stageName !== undefined && !message.includes(stageName) ? ` (${stageName})` : "";
-  return `"${context.taskName}"${stageText} — ${message}`;
+  return `${formatTaskNameForDisplay(context.taskName)}${stageText} — ${message}`;
 }

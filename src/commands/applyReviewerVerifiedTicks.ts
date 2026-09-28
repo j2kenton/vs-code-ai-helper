@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
@@ -281,6 +282,7 @@ export async function applyReviewerVerifiedTicks(
     return;
   }
 
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
   const result = await postApplyReviewerVerifiedTicksDecisionV1(
@@ -292,13 +294,13 @@ export async function applyReviewerVerifiedTicks(
   );
   if (result.kind === "blocked") {
     if (result.severity === "warning") {
-      NotificationRouter.showWarning(result.message);
+      NotificationRouter.showWarning(`${taskLabel}: ${result.message}`);
     } else {
-      NotificationRouter.showInformation(result.message);
+      NotificationRouter.showInformation(`${taskLabel}: ${result.message}`);
     }
   } else if (result.kind === "noContext") {
     NotificationRouter.showWarning(
-      "Could not post the reviewer-verified-ticks decision to Chat With AI (no active extension context)."
+      `${taskLabel}: could not post the reviewer-verified-ticks decision to Chat With AI (no active extension context).`
     );
   }
 }
@@ -343,11 +345,12 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
     return;
   }
 
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
   const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage);
   if (derived.kind === "blocked") {
-    NotificationRouter.showInformation(derived.message);
+    NotificationRouter.showInformation(`${taskLabel}: ${derived.message}`);
     return;
   }
   const { reviewStage: resolvedStage, reviewFilename, applicable } = derived.derivation;
@@ -355,7 +358,7 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   const freshPlan = await readPlanOfRecordV1(folderUri);
   if (!freshPlan.hasChecklist || !freshPlan.text) {
     NotificationRouter.showWarning(
-      "plan-final.md changed while this was being applied and no longer has a checklist to tick."
+      `${taskLabel}: plan-final.md changed while this was being applied and no longer has a checklist to tick.`
     );
     return;
   }
@@ -365,7 +368,7 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   const merged = mergeChecklistProgressV1(freshPlan.text, synthetic);
   if (merged.kind !== "merged") {
     NotificationRouter.showWarning(
-      "Applying the reviewer's ticks did not change plan-final.md — the items no longer match the plan of record."
+      `${taskLabel}: applying the reviewer's ticks did not change plan-final.md — the items no longer match the plan of record.`
     );
     return;
   }
@@ -377,7 +380,7 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   );
   if (!written) {
     NotificationRouter.showWarning(
-      "plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision " +
+      `${taskLabel}: plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision ` +
         "and try again."
     );
     return;
@@ -397,7 +400,7 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   );
   await inventory.refresh();
   NotificationRouter.showInformation(
-    `Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`
+    `${taskLabel}: Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`
   );
   // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
   // it") — same note as reconcilePlanChecklist.ts's identical dispatch.

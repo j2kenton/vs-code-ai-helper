@@ -26,11 +26,9 @@ import {
 } from "./stageArtifactRequirementsV1";
 import {
   ChecklistProgressV1,
-  collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
   countChecklistProgressV1,
   declaresNoChecklistChangeV1,
-  hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
   hasPlanItemChecklistClaimV1,
   mergeChecklistProgressV1,
@@ -112,10 +110,10 @@ export interface ImplementationSummaryExpectationsV1 {
    * The plan of record's content, when it carries an
    * `<!-- ensemble:implementation-checklist -->` checklist that both
    * implementation prompts require the response to echo back with updated
-   * checkbox state. That echo is the only thing that advances plan progress
-   * (mergeChecklistProgressV1), so a response without it leaves the plan
-   * permanently reading as untouched — the round has to be rejected rather
-   * than silently recorded as progress-free.
+   * checkbox state. The echo (with retroactive claims) is what advances plan
+   * progress (mergeChecklistProgressV1). A response without it is accepted and
+   * ticks nothing (RC2 #10): it used to be rejected, which cost a continuation
+   * round per miss and looped tasks on their report format.
    *
    * The PLAN's text is needed, not just a "has a checklist" flag: the echo is
    * verified by matching item text against the plan's own items. Accepting any
@@ -262,40 +260,20 @@ export function describeImplementationSummaryShapeIssue(
     return "the provider returned no final summary text";
   }
 
-  // Checked before the section presence gates below: a response that
-  // declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing to tick") while also
-  // reporting retroactive completions in `## Plan Item Checklist` wants
-  // checklist state to change while explicitly declaring it does not — UNLESS
-  // every one of those completions names a plan item that is ALREADY ticked
-  // in the plan of record, in which case it is a genuine per-item status note
-  // ("already ticked in a prior round; this round only extended it" — the
-  // shape three independent providers converged on for a round that fixed a
-  // review blocker in already-complete work without ticking anything new;
-  // wf10 item 12) rather than a claim trying to advance state under a marker
-  // that says nothing changed. `hasContradictoryNoChecklistChangeClaimV1`
-  // draws that distinction against `alreadyCheckedPlanItemKeys` below; see its
-  // doc comment for both the round-013 reproduction (a claim naming NO real
-  // plan item at all — a paraphrase) and the run-064 reproduction (claims
-  // naming real, already-ticked items) that this now tells apart.
-  if (
-    expectations.planChecklist !== undefined &&
-    hasContradictoryNoChecklistChangeClaimV1(
-      trimmed,
-      collectChecklistItemKeysV1(expectations.planChecklist),
-      new Set(collectCheckedChecklistCountsV1(expectations.planChecklist).keys())
-    )
-  ) {
-    return (
-      "the final response declares `<!-- ensemble:no-checklist-change -->` (nothing to tick) but " +
-      "also reports a plan-item completion in `## Plan Item Checklist` that does not name an item " +
-      "already ticked in the plan of record — use exactly one: either omit the marker and echo the " +
-      "plan's checklist with the completed items ticked (quoting each item's exact text from the plan, " +
-      "not a paraphrase), or, if every claimed item really is already ticked, mark it accordingly " +
-      "(`<!-- ensemble:retroactive -->` with evidence, or a plain \"— done — already ticked...\" note); " +
-      "a claim about an item that is not yet ticked, or a whole-Part claim, cannot travel under this " +
-      "marker at all — drop the marker and echo the checklist, or drop the claim if truly nothing changed"
-    );
-  }
+  // No longer a rejection (RC2 #10, 2026-09-27). A response that declares
+  // `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing to tick") while also reporting a
+  // completion for an item not yet ticked used to be rejected here as
+  // self-contradictory. In practice that rejected rounds whose WORK was fine:
+  // on 2026-09-26 it rejected four RC1 rounds and two wt-b rounds, on Copilot
+  // and on Claude Code alike, each time owing a continuation, dropping the
+  // chained follow-up and re-latching the checklist, so a task looped on its
+  // report format for hours. The marker is now simply not decisive: the
+  // claims go through `mergeChecklistProgressV1` like any others (a claim
+  // needs evidence and must name a real plan item to tick anything; a
+  // paraphrase lands as "no-match"), and the round's changed files still go
+  // to review. `hasContradictoryNoChecklistChangeClaimV1` no longer has a
+  // production caller; RC2 #10's remaining work decides whether to surface it
+  // as a non-gating note or remove it.
 
   const sections = assessImplementationSummarySectionsV1(trimmed, expectations);
 
@@ -340,9 +318,12 @@ export function describeImplementationSummaryShapeIssue(
   // follow `## Files Changed`. Scoping to the run-owned region subsumes it —
   // the echo is no longer in view at all — so keeping it would be a guard for
   // a condition that can no longer arise.
-  if (!sections.checklistEchoPresent) {
-    missing.push("the plan's implementation checklist, echoed with updated checkbox state");
-  }
+  // A missing checklist echo is no longer a rejection either (RC2 #10). The
+  // echo exists only so a round's completed items get ticked; a round that
+  // does not echo simply ticks nothing, and its changed files still go to
+  // review (and to the reviewer-verified ticks path). Rejecting it cost a
+  // continuation round and a claim wait for no protection: nothing is ticked
+  // without a matching, evidenced claim either way.
   if (missing.length === 0) {
     return undefined;
   }
@@ -466,9 +447,9 @@ export function describeIncompleteImplementationRoundV1(
     } else if (expectations.roundChangedFiles && !sections.verificationHasContent) {
       missing.push("any content under `## Verification`");
     }
-    if (!sections.checklistEchoPresent) {
-      missing.push("the checklist echo");
-    }
+    // A missing checklist echo is not counted here (RC2 #10): the shape gate
+    // no longer requires it, so a report with both sections and an incidental
+    // deferral phrase is accepted rather than sent round as a continuation.
     if (missing.length > 0) {
       const match = deferral.exec(trimmed)?.[0] ?? "";
       return {

@@ -12,6 +12,8 @@ import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
@@ -128,8 +130,9 @@ export function refuseRenameWhileDescStageRuns(taskFolderPath: string): boolean 
   if (!descRunning) {
     return false;
   }
+  const folderName = taskFolderPath;
   NotificationRouter.showWarning(
-    "Renaming is unavailable while the Task Description is being generated, because that run works from the task's current name. Wait for it to finish, then rename."
+    `${formatNotificationTaskLabelV1(undefined, folderName)} — Renaming is unavailable while the Task Description is being generated, because that run works from the task's current name. Wait for it to finish, then rename.`
   );
   return true;
 }
@@ -340,6 +343,8 @@ async function requestAiNameV1(
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceFolder.uri.fsPath,
       resolveStagePrimaryModel: () => ({ modelId, stage: "desc" }),
+      taskDisplayName: task.progress.displayName,
+      taskFolderPath: taskFolderUri.fsPath,
     });
 
     const targetLocator = { rootId, relativePath: `runs/rename-suggestion-${Date.now()}.txt` };
@@ -550,10 +555,14 @@ export async function renameTaskWithAI(
     }
     if (!task) return;
     if (!handle) {
+      const taskLabel = formatNotificationTaskLabelV1(task.progress.displayName, task.folderName);
       NotificationRouter.showWarning(
         lateAdmissionRefusalV1
-          ? describeWorkAdmissionRefusalV1(lateAdmissionRefusalV1)
-          : "Could not acquire work admission for this task."
+          ? describeWorkAdmissionRefusalV1(
+              lateAdmissionRefusalV1,
+              notificationTaskDisplayNameV1(task.progress.displayName, task.folderName)
+            )
+          : `${taskLabel}: could not acquire work admission for this task.`
       );
       return;
     }
@@ -564,9 +573,7 @@ export async function renameTaskWithAI(
     // must stop this command, exactly as runPublishChecks/
     // completeCommitAndPushTask already do.
     if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
-      NotificationRouter.showWarning(
-        "Rename Task with AI is only available for tasks that are not paused. Resume the task first."
-      );
+      showPausedTaskRefusalV1("renaming with AI", task.taskFolderPath, task.progress.displayName);
       return;
     }
 
@@ -586,7 +593,7 @@ export async function renameTaskWithAI(
   }
   if (!sourceText.trim()) {
     NotificationRouter.showWarning(
-      "This task has no description yet. Write a task description before renaming with AI."
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} has no description yet. Write a task description before renaming with AI.`
     );
     return;
   }

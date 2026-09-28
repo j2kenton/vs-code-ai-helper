@@ -4,6 +4,7 @@ import type { TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "./desktopNotifier";
 import { taskOperations } from "./taskOperations";
 import { NotificationRouter } from "./notificationRouter";
+import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
 import { parseModelSelection } from "../runners/providers";
 import { getResilienceSettings, resolveQuotaAccountKeyV1 } from "../config/settings";
 import { awaitWorkflowDecisionAnswerV1 } from "./workflowDecisionDispatchV1";
@@ -562,7 +563,10 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   // record (per severity policy: exhausted credits block the run). The
   // interactive choice itself must stay a real decision below — "Resume" vs
   // "Switch model" are genuine alternative actions the caller branches on.
-  NotificationRouter.showError("AI credits are exhausted. Can't proceed without your input — resume when credits restore, or switch model.");
+  const taskLabel = formatNotificationTaskLabelV1(undefined, request.taskFolderUri.fsPath);
+  NotificationRouter.showError(
+    `${taskLabel}: AI credits are exhausted. Can't proceed without your input — resume when credits restore, or switch model.`
+  );
   // Migrated off `vscode.window.showWarningMessage` (task "Actionable
   // Hand-offs", Part 11 notification audit, site #23): this caller `await`s
   // the answer and branches on it, so — unlike the two advisory,

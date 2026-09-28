@@ -615,7 +615,8 @@ export function registerConditionalWriteSaveGuardV1(): vscode.Disposable {
 
 export async function safeOpenTextDocument(
   fileUri: vscode.Uri,
-  label = fileUri.fsPath
+  label = fileUri.fsPath,
+  taskFolderUri?: vscode.Uri
 ): Promise<boolean> {
   try {
     const doc = await vscode.workspace.openTextDocument(fileUri);
@@ -623,8 +624,14 @@ export async function safeOpenTextDocument(
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // Most callers pass a file directly inside the task folder (plan.md,
+    // task.md, a review artifact, ...), so its parent directory IS the task
+    // and needs no extra plumbing. A caller whose file lives in a
+    // subdirectory (a run log or retained prompt under runs/) passes
+    // `taskFolderUri` explicitly so the name isn't the subdirectory's.
+    const folderName = path.basename(taskFolderUri?.fsPath ?? path.dirname(fileUri.fsPath));
     NotificationRouter.showWarning(
-      `Could not open ${label}: ${message}`
+      `${folderName}: could not open ${label}: ${message}`
     );
     return false;
   }

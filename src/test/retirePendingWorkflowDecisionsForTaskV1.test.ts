@@ -10,12 +10,15 @@
  * task again.
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { DEPARTED_STAGE_DECISION_RETIRED_REASON_V1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
 import { CreateWorkflowDecisionInputV1 } from "../types/workflowDecisionV1";
 
 function makeExtensionContext(): vscode.ExtensionContext {
@@ -117,6 +120,104 @@ void describe("retirePendingWorkflowDecisionsForTaskV1", () => {
   void it("is a silent no-op when no extension context is available", async () => {
     await assert.doesNotReject(() =>
       retirePendingWorkflowDecisionsForTaskV1(TARGET, "the task was archived")
+    );
+  });
+
+  void it("with a stage filter, retires only that stage's decisions (RC1 item 9)", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    await store.post({ ...decisionInput("descCard", TARGET.canonicalId), stage: "desc" });
+    await store.post({ ...decisionInput("implCard", TARGET.canonicalId), stage: "impl" });
+
+    await retirePendingWorkflowDecisionsForTaskV1(TARGET, DEPARTED_STAGE_DECISION_RETIRED_REASON_V1, { stage: "desc" });
+
+    assert.equal(store.get(`descCard-${TARGET.canonicalId}-id`)?.state, "withdrawn");
+    assert.equal(store.get(`descCard-${TARGET.canonicalId}-id`)?.withdrawnReason, "retired by the task moving on, not answered");
+    assert.equal(store.get(`implCard-${TARGET.canonicalId}-id`)?.state, "pending");
+  });
+
+  void it("does not retire a decision raised after the cutoff (a late Phase B replay)", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    const startedAt = "2026-09-27T10:00:00.000Z";
+    await store.post({ ...decisionInput("before", TARGET.canonicalId), stage: "plan", createdAt: "2026-09-27T09:59:00.000Z" });
+    await store.post({ ...decisionInput("after", TARGET.canonicalId), stage: "plan", createdAt: "2026-09-27T10:05:00.000Z" });
+
+    await runStageEntryPostCommitV1(vscode.Uri.file(TARGET.taskFolderPath), {
+      departedStage: "plan",
+      departedStageRetireBefore: startedAt,
+    });
+
+    assert.equal(store.get(`before-${TARGET.canonicalId}-id`)?.state, "withdrawn");
+    assert.equal(store.get(`after-${TARGET.canonicalId}-id`)?.state, "pending");
+  });
+
+  void it("advancing retires the left stage's decisions but not the arrival stage's", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    await store.post({ ...decisionInput("left", TARGET.canonicalId), stage: "desc" });
+    await store.post({ ...decisionInput("arrival", TARGET.canonicalId), stage: "plan" });
+
+    await runStageEntryPostCommitV1(vscode.Uri.file(TARGET.taskFolderPath), {
+      departedStage: "desc",
+      departedStageRetireBefore: new Date(Date.now() + 1000).toISOString(),
+    });
+
+    assert.equal(store.get(`left-${TARGET.canonicalId}-id`)?.withdrawnReason, DEPARTED_STAGE_DECISION_RETIRED_REASON_V1);
+    assert.equal(store.get(`arrival-${TARGET.canonicalId}-id`)?.state, "pending");
+  });
+
+  void it("plan revision back to plan retires the departed review stage's decisions", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    await store.post({ ...decisionInput("reviewCard", TARGET.canonicalId), stage: "plan-high-review" });
+    await store.post({ ...decisionInput("planCard", TARGET.canonicalId), stage: "plan" });
+
+    await runStageEntryPostCommitV1(vscode.Uri.file(TARGET.taskFolderPath), {
+      departedStage: "plan-high-review",
+      departedStageRetireBefore: new Date(Date.now() + 1000).toISOString(),
+    });
+
+    assert.equal(store.get(`reviewCard-${TARGET.canonicalId}-id`)?.withdrawnReason, DEPARTED_STAGE_DECISION_RETIRED_REASON_V1);
+    assert.equal(store.get(`planCard-${TARGET.canonicalId}-id`)?.state, "pending");
+  });
+
+  void it("plan revision runs the entry result's post-commit work so the departed stage retires (source shape)", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "commands", "planRevisionV1.ts"), "utf8");
+    assert.match(source, /enterStageV1\(\s*folderUri,\s*sourceStage,\s*"plan"/);
+    assert.match(source, /await runStageEntryPostCommitV1\(folderUri, entryResult\);/);
+  });
+
+  void it("a same-stage entry (no departedStage) retires nothing", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    contextActive = true;
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    await store.post({ ...decisionInput("keep", TARGET.canonicalId), stage: "plan" });
+
+    await runStageEntryPostCommitV1(vscode.Uri.file(TARGET.taskFolderPath), {});
+
+    assert.equal(store.get(`keep-${TARGET.canonicalId}-id`)?.state, "pending");
+  });
+
+  void it("plan generation retires the departed desc decision without blocking the auto-review (source shape)", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "commands", "generatePlanWithAI.ts"), "utf8");
+    const at = source.indexOf("if (entryResult?.ready) {");
+    assert.ok(at >= 0, "success branch not found");
+    const branch = source.slice(at, at + 1200);
+    assert.match(branch, /triggerAutoReview = ctx\.effectiveReviewMode !== "off";/);
+    assert.match(branch, /await runStageEntryPostCommitV1\(taskFolderUri, entryResult\)\.catch\(/);
+    assert.ok(
+      branch.indexOf("triggerAutoReview =") < branch.indexOf("runStageEntryPostCommitV1"),
+      "the auto-review flag is set before post-commit work so a failure there cannot cancel it"
     );
   });
 });

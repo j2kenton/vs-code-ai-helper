@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
 import * as nodePath from "path";
 import * as nodeFs from "fs";
-import { CONTEXT_PACK_FILENAME, TASK_FILENAME } from "../types/taskProgress";
+import { CONTEXT_PACK_FILENAME, PLAN_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import {
   applyContentCapsWithRegionsV1,
+  boundTaskDescriptionForReviewV1,
+  REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1,
   IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
   isMachineMaintainedArtifactPathV1,
   type LineRange,
@@ -667,7 +669,15 @@ export async function generateImplReviewContextPack(
   omittedRelPaths: readonly string[];
 }> {
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
-  const taskContent = await readTextFileIfExists(taskFileUri);
+  const fullTaskContent = await readTextFileIfExists(taskFileUri);
+  // Once a plan exists it is the contract: the review gets a bounded task
+  // description (requirements), not the whole accumulated task.md.
+  const planExists =
+    fullTaskContent !== undefined &&
+    fullTaskContent.length > REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1 &&
+    ((await readTextFileIfExists(vscode.Uri.joinPath(taskFolderUri, PLAN_FILENAME)))?.trim().length ?? 0) > 0;
+  const taskContent =
+    fullTaskContent === undefined ? undefined : boundTaskDescriptionForReviewV1(fullTaskContent, planExists);
 
   // Resolved once and shared by both the tracked and fallback branches below
   // — undefined when the workspace isn't a git repo, in which case every

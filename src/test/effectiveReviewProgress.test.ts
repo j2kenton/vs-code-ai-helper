@@ -23,6 +23,7 @@ import * as vscode from "vscode";
 import {
   effectiveReviewProgressV1,
   readDisplayPlanChecklistProgressV1,
+  readEffectivePlanChecklistProgressForDisplayV1,
   readEffectivePlanChecklistProgressV1,
 } from "../utils/effectiveReviewProgress";
 import {
@@ -80,7 +81,7 @@ function validProgressRaw(name: string, extra: Record<string, unknown> = {}): st
 
 function makeTask(
   name: string,
-  files: { plan?: string; progressRaw?: string }
+  files: { plan?: string; progressRaw?: string; roundProgress?: string }
 ): vscode.Uri {
   const folder = nodePath.join(ROOT, name);
   nodeFs.mkdirSync(folder, { recursive: true });
@@ -89,6 +90,9 @@ function makeTask(
   }
   if (files.progressRaw !== undefined) {
     nodeFs.writeFileSync(nodePath.join(folder, "task-progress.json"), files.progressRaw, "utf8");
+  }
+  if (files.roundProgress !== undefined) {
+    nodeFs.writeFileSync(nodePath.join(folder, "round-progress.md"), files.roundProgress, "utf8");
   }
   return vscode.Uri.file(folder);
 }
@@ -414,6 +418,163 @@ void describe("readDisplayPlanChecklistProgressV1", () => {
     } finally {
       fsStub.restore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// round-progress.md (RC1 item 6 / f3 Part 10): a best-effort, in-round
+// bookkeeping file the two display readers merge in memory, but never write
+// back and never let gate anything. Covers both display readers.
+// ---------------------------------------------------------------------------
+
+void describe("round-progress.md — display-only merge", () => {
+  void it("counts round-progress.md's ticks toward the displayed percentage without writing plan-final.md", async () => {
+    const uri = makeTask("round-progress-live", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("round-progress-live"),
+      roundProgress: "- [x] Three\n",
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.unverified, false);
+      assert.equal(display?.counts.settled, 3, "the in-round tick must be merged into the displayed count");
+      assert.equal(display?.counts.total, 5);
+
+      const forDisplay = await readEffectivePlanChecklistProgressForDisplayV1(uri);
+      assert.equal(forDisplay?.settled, 3, "the second display reader must merge the same in-round tick");
+
+      const onDisk = nodeFs.readFileSync(nodePath.join(uri.fsPath, "plan-final.md"), "utf8");
+      assert.equal(onDisk, PLAN_TWO_OF_FIVE, "the merge must never write plan-final.md itself");
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("keeps an unverified qualifier through the round-progress merge while latched", async () => {
+    const uri = makeTask("round-progress-latched", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("round-progress-latched", { checklistProgressUnreliable: true }),
+      roundProgress: "- [x] Three\n",
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.unverified, true, "the latch qualifier must pass through unchanged");
+      assert.equal(display?.counts.settled, 3, "the merged count is still shown, just qualified");
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("leaves the displayed count unchanged when round-progress.md is missing", async () => {
+    const uri = makeTask("round-progress-missing", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("round-progress-missing"),
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.counts.settled, 2);
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("leaves the displayed count unchanged, with no warning, when round-progress.md is empty", async () => {
+    const uri = makeTask("round-progress-empty", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("round-progress-empty"),
+      roundProgress: "",
+    });
+    const fsStub = installRealFs();
+    const notifications = installNotifications();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.counts.settled, 2);
+      assert.deepEqual(notifications.captured, [], "an empty bookkeeping file must never warn");
+    } finally {
+      notifications.restore();
+      fsStub.restore();
+    }
+  });
+
+  void it("leaves the displayed count unchanged, with no warning, when round-progress.md matches no plan item", async () => {
+    const uri = makeTask("round-progress-no-match", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("round-progress-no-match"),
+      roundProgress: "- [x] Something not in the plan at all\n",
+    });
+    const fsStub = installRealFs();
+    const notifications = installNotifications();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.equal(display?.counts.settled, 2);
+      assert.deepEqual(notifications.captured, [], "an unmatched bookkeeping claim must never warn on a display read");
+    } finally {
+      notifications.restore();
+      fsStub.restore();
+    }
+  });
+});
+
+/**
+ * RC1 item 6 / f3 Part 10: "no non-display caller reads the file." Only this
+ * module's display readers may treat `round-progress.md`'s CONTENT as
+ * something to merge/count. Every other reference in the tree must be one of:
+ * deleting it (bookkeeping cleanup), watching it (redraw trigger), or listing
+ * it in a workflow-control/exclusion basename set — never parsing its bytes
+ * for a checklist count. A source scan rather than a single call-site check,
+ * so a future caller that starts reading it fails here directly rather than
+ * silently acquiring a second, divergent source of truth.
+ */
+void describe("round-progress.md — no non-display caller reads it (source scan)", () => {
+  const REPO_ROOT = nodePath.resolve(__dirname, "..", "..");
+  const SRC_ROOT = nodePath.join(REPO_ROOT, "src");
+  const READ_CALL_PATTERN = /\breadFileSync\s*\(|\breadFile\s*\(|\breadTextIfExists\s*\(|\bworkspace\.fs\.readFile\s*\(/;
+
+  function listSourceFiles(dir: string, out: string[]): void {
+    for (const entry of nodeFs.readdirSync(dir, { withFileTypes: true })) {
+      const full = nodePath.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "test") {
+          continue;
+        }
+        listSourceFiles(full, out);
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+        out.push(full);
+      }
+    }
+  }
+
+  void it("only effectiveReviewProgress.ts calls a read function on a line mentioning round-progress.md", () => {
+    const files: string[] = [];
+    listSourceFiles(SRC_ROOT, files);
+    assert.ok(files.length > 0, "sanity check: the scan must actually find source files");
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const relPath = nodePath.relative(REPO_ROOT, file);
+      const isDisplayReader = relPath === nodePath.join("src", "utils", "effectiveReviewProgress.ts");
+      const lines = nodeFs.readFileSync(file, "utf8").split("\n");
+      lines.forEach((line, index) => {
+        if (!line.includes("round-progress.md")) {
+          return;
+        }
+        if (!isDisplayReader && READ_CALL_PATTERN.test(line)) {
+          offenders.push(`${relPath}:${index + 1}: ${line.trim()}`);
+        }
+      });
+    }
+
+    assert.deepEqual(
+      offenders,
+      [],
+      "a non-display caller reads round-progress.md's content — only effectiveReviewProgress.ts may:\n" +
+        offenders.join("\n")
+    );
   });
 });
 

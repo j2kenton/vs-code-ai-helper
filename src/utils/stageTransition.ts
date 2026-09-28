@@ -38,6 +38,8 @@ import {
   LifecycleStageMismatchError,
 } from "../actions/rows/lifecyclePolicyRejection";
 import { withTaskLock } from "../state/taskStateStore";
+import { normalizePath } from "./taskRoot";
+import { retirePendingWorkflowDecisionsForTaskV1 } from "./workflowDecisionDispatchV1";
 import {
   beginStageEntryJournalV1,
   deleteStageEntryJournalV1,
@@ -614,7 +616,19 @@ export interface StageEntryPostCommitPayloadV1 {
    * comment) and either recovers-and-retries or is refused.
    */
   readonly journalTransitionId?: string;
+  /**
+   * RC1 item 9: the stage this transition LEFT. When set,
+   * {@link runStageEntryPostCommitV1} retires every still-pending decision
+   * raised on that stage at or before `departedStageRetireBefore` — the task
+   * moved on without answering it. Unset for a same-stage entry.
+   */
+  readonly departedStage?: TaskStage;
+  /** ISO instant the transition started; a decision raised after it is never retired. */
+  readonly departedStageRetireBefore?: string;
 }
+
+/** The reason recorded on a decision retired because its stage was left. */
+export const DEPARTED_STAGE_DECISION_RETIRED_REASON_V1 = "retired by the task moving on, not answered";
 
 /** Result of {@link enterStageV1}. */
 export type StageEntryResultV1 =
@@ -837,6 +851,9 @@ async function enterStageOnceV1(
     callerHoldsCoveringLock?: boolean;
   } = {}
 ): Promise<StageEntryResultV1> {
+  // Anything raised on the departed stage after this instant is not "left
+  // behind" by this transition (RC1 item 9's raised-at-or-before filter).
+  const transitionStartedAt = new Date().toISOString();
   // Refuse before writing anything: a destination with unmet entry
   // requirements (e.g. "impl" with no plan.md to promote) must never reach
   // the CAS/write step at all.
@@ -1159,6 +1176,9 @@ async function enterStageOnceV1(
     deferredPlanRevisionAdoption,
     postCommit: options.postCommit,
     journalTransitionId,
+    ...(sourceStage !== destinationStage
+      ? { departedStage: sourceStage, departedStageRetireBefore: transitionStartedAt }
+      : {}),
   };
 }
 
@@ -1215,6 +1235,17 @@ export async function runStageEntryPostCommitV1(
     await applyDeferredPlanRevisionAdoptionV1(taskFolderUri, result.deferredPlanRevisionAdoption);
   }
   await result.postCommit?.();
+  if (result.departedStage !== undefined) {
+    try {
+      await retirePendingWorkflowDecisionsForTaskV1(
+        { taskFolderPath: taskFolderUri.fsPath, canonicalId: normalizePath(taskFolderUri.fsPath) },
+        DEPARTED_STAGE_DECISION_RETIRED_REASON_V1,
+        { stage: result.departedStage, raisedAtOrBefore: result.departedStageRetireBefore }
+      );
+    } catch (retireError) {
+      console.error("runStageEntryPostCommitV1: could not retire the departed stage's pending decisions", retireError);
+    }
+  }
   if (result.journalTransitionId !== undefined) {
     try {
       await withTaskLock(taskFolderUri.fsPath, () =>

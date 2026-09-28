@@ -329,6 +329,15 @@ export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1):
   if (effectiveNextActorV1(progress) === "human") {
     return false;
   }
+  // RC1 item 9: Publish is a stage whose next step is a user action (Commit &
+  // Push, or Fix Linting after failed checks) — sitting there with nothing
+  // owed is legitimately idle, not stalled, even for a task whose `nextActor`
+  // was never written. Only an explicit "automation" claim falls through to
+  // the evidence checks, so a task that says automation owes work is still
+  // caught if that work is nowhere to be found.
+  if (progress.currentStage === "publish" && effectiveNextActorV1(progress) !== "automation") {
+    return false;
+  }
   // Recently touched: not yet evidence of a stall. See the constant above.
   const updatedAt = progress.updatedAt ? Date.parse(progress.updatedAt) : Number.NaN;
   if (Number.isFinite(updatedAt) && now - updatedAt < STALLED_TASK_QUIET_PERIOD_MS) {
@@ -392,10 +401,128 @@ export const UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 =
   "does not immediately re-trap the task; review the run log for what the round actually changed " +
   "before resuming.";
 
-export function describeStalledActiveTaskEscalationV1(displayName: string): string {
+/**
+ * What the task's own round ledger says happened just before the stall — the
+ * two readings the stalled card must not blur together (RC1 item 9): the last
+ * round FINISHED and simply nothing was queued after it, versus rounds that
+ * were LOST (failed, rejected, interrupted...) leading into it.
+ */
+export type StalledRoundReadingV1 =
+  | {
+      kind: "finished";
+      stage: string;
+      mode: string;
+      score?: number;
+      blockers?: number;
+    }
+  | { kind: "lost"; consecutive: number; lastState: string; stage: string }
+  | { kind: "none" };
+
+/** Terminal ledger states that mean a round did NOT finish what it set out to
+ * do. `cancelled` is deliberately absent: it is the user's own action, not a
+ * round that was lost. */
+const LOST_ROUND_STATES_V1: ReadonlySet<string> = new Set([
+  "failed",
+  "rejected",
+  "interrupted",
+  "quota-blocked",
+  "dropped",
+]);
+
+/**
+ * Reads the terminal rows of `progress.roundLedger`, newest last, into one of
+ * the two stalled-card readings. Pure; a missing or all-live ledger reads as
+ * `{ kind: "none" }`, which keeps the card's generic wording.
+ */
+export function readStalledRoundReadingV1(progress: TaskProgress): StalledRoundReadingV1 {
+  const terminal = (progress.roundLedger ?? [])
+    .filter((row) => row.state !== "scheduled" && row.state !== "open")
+    .sort((a, b) => Date.parse(a.endedAt ?? a.startedAt) - Date.parse(b.endedAt ?? b.startedAt));
+  const last = terminal[terminal.length - 1];
+  if (!last) {
+    return { kind: "none" };
+  }
+  if (last.state === "completed") {
+    const reviewer = last.outcome?.reviewerBlockers;
+    const mechanical = last.outcome?.mechanicalBlockers;
+    const blockers = reviewer === undefined && mechanical === undefined ? undefined : (reviewer ?? 0) + (mechanical ?? 0);
+    return { kind: "finished", stage: last.stage, mode: last.mode, score: last.outcome?.score, blockers };
+  }
+  if (!LOST_ROUND_STATES_V1.has(last.state)) {
+    return { kind: "none" };
+  }
+  let consecutive = 0;
+  for (let i = terminal.length - 1; i >= 0; i--) {
+    if (!LOST_ROUND_STATES_V1.has(terminal[i]?.state ?? "")) {
+      break;
+    }
+    consecutive += 1;
+  }
+  return { kind: "lost", consecutive, lastState: last.state, stage: last.stage };
+}
+
+/** Pause reason when the last round FINISHED and simply nothing was queued
+ * after it — nothing broke, the task was left without a next step. */
+export const STALLED_ACTIVE_TASK_FINISHED_PAUSE_REASON_V1 =
+  "Watchdog: this task's last round finished, but nothing was scheduled after it — no live " +
+  "operation, no owed continuation. Nothing broke. Resume it to continue with the next step.";
+
+/** Pause reason when rounds were LOST (failed, rejected, interrupted...) before
+ * the stall, so work silently stopped after something broke. */
+export const STALLED_ACTIVE_TASK_LOST_PAUSE_REASON_V1 =
+  "Watchdog: this task's last round ended without finishing (failed, rejected or interrupted) " +
+  "and nothing is running, owed, or scheduled — work silently stopped after something broke. " +
+  "Review the run log for what happened, then resume it.";
+
+/** The pause reason the watchdog records for a stalled task, chosen from the
+ * round-ledger reading so 'finished something' and 'broke' read differently.
+ * `none` keeps the generic reason. */
+export function stalledActivePauseReasonForReadingV1(reading: StalledRoundReadingV1): string {
+  if (reading.kind === "finished") {
+    return STALLED_ACTIVE_TASK_FINISHED_PAUSE_REASON_V1;
+  }
+  if (reading.kind === "lost") {
+    return STALLED_ACTIVE_TASK_LOST_PAUSE_REASON_V1;
+  }
+  return STALLED_ACTIVE_TASK_PAUSE_REASON_V1;
+}
+
+/** True for any of the watchdog's stalled-task pause reasons (generic, finished, lost). */
+export function isStalledActivePauseReasonV1(reason: string | undefined): boolean {
   return (
-    `⚠️ "${displayName}" was stalled — active with nothing running, owed, or scheduled. ` +
-    "Paused with an escalation so this is visible instead of silent; resume it from the task's stage actions once you've reviewed what happened."
+    reason === STALLED_ACTIVE_TASK_PAUSE_REASON_V1 ||
+    reason === STALLED_ACTIVE_TASK_FINISHED_PAUSE_REASON_V1 ||
+    reason === STALLED_ACTIVE_TASK_LOST_PAUSE_REASON_V1
+  );
+}
+
+export function describeStalledActiveTaskEscalationV1(
+  displayName: string,
+  reading: StalledRoundReadingV1 = { kind: "none" },
+  nextActionLabel?: string
+): string {
+  const next = nextActionLabel ? ` The obvious next step: ${nextActionLabel}.` : "";
+  const tail =
+    "Paused with an escalation so this is visible instead of silent; resume it from the task's stage actions once you've reviewed what happened.";
+  if (reading.kind === "finished") {
+    const verdict =
+      reading.score !== undefined
+        ? ` (score ${reading.score}/10${reading.blockers !== undefined ? `, ${reading.blockers} blocker${reading.blockers === 1 ? "" : "s"}` : ""})`
+        : "";
+    return (
+      `⚠️ "${displayName}" went quiet — its last round (${reading.mode} at ${reading.stage}) finished${verdict} ` +
+      `and nothing was scheduled after it. Nothing broke; the task was left with no next step queued.${next} ${tail}`
+    );
+  }
+  if (reading.kind === "lost") {
+    const rounds = reading.consecutive === 1 ? "1 round" : `${reading.consecutive} consecutive rounds`;
+    return (
+      `⚠️ "${displayName}" was stalled — ${rounds} at ${reading.stage} ended without finishing ` +
+      `(last: ${reading.lastState}) and nothing is running, owed, or scheduled.${next} ${tail}`
+    );
+  }
+  return (
+    `⚠️ "${displayName}" was stalled — active with nothing running, owed, or scheduled.${next} ${tail}`
   );
 }
 

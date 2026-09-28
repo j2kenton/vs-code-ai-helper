@@ -702,6 +702,77 @@ void describe("improveReviewScore — plan progress", () => {
     assert.ok(applies < 20, "stopped early rather than burning the whole attempt budget");
   });
 
+  void it("counts a stagnant FIRST in-loop build round against the stall guard when preLoopEvidence seeds the baseline (2026-09-25 finding)", async () => {
+    // Regression for the undercount: before seeding, previousComplete started
+    // null, so attempt 1's build round (frozen at the same complete count as
+    // the pre-loop baseline) was silently exempted from the stall guard and
+    // the stall message undercounted stagnant rounds by exactly one.
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6.3,
+      maxAttempts: 20,
+      zeroFixableTerminates: true,
+      preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: true, initialComplete: 8 },
+      apply: () => Promise.resolve(),
+      // Frozen at 8/25 on every in-loop round too — never advances past the
+      // pre-loop baseline of 8.
+      review: () => Promise.resolve(cleanAt(9, 8, 25)),
+    });
+
+    assert.strictEqual(result.stalled, true);
+    assert.strictEqual(
+      result.buildRoundsWithoutProgress,
+      2,
+      "must count the first in-loop build round too, not just the ones after it"
+    );
+  });
+
+  void it("does not count a blocker-fix round before the first build round, even with a seeded baseline", async () => {
+    // Complement: preLoopEvidence with planIncomplete=false (i.e. no build
+    // mandate carried in) must NOT seed previousWasBuildMandate true, so a
+    // blocker-fix round that happens to end clean still doesn't consume the
+    // allowance until an actual build round runs.
+    const context = fakeContext();
+    let applies = 0;
+    const rounds: ReviewRoundOutcome[] = [
+      // Round 1: blocker-fix round (pre-loop evidence was NOT clean), ends
+      // clean but plan-incomplete — this sets the mandate for round 2.
+      { score: 7, taskFixableCount: 0, zeroFixableEvidence: true, progress: { complete: 8, total: 25 } },
+      // Round 2 and 3: build-mandate rounds, frozen at 8/25.
+      { score: 9, taskFixableCount: 0, zeroFixableEvidence: true, progress: { complete: 8, total: 25 } },
+      { score: 9, taskFixableCount: 0, zeroFixableEvidence: true, progress: { complete: 8, total: 25 } },
+    ];
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6.3,
+      maxAttempts: 20,
+      zeroFixableTerminates: true,
+      preLoopEvidence: { zeroFixableEvidence: false, planIncomplete: true, initialComplete: 8 },
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => {
+        const index = Math.min(Math.max(applies - 1, 0), rounds.length - 1);
+        const outcome = rounds[index];
+        if (!outcome) {
+          throw new Error("test setup error: no round outcome at index " + index);
+        }
+        return Promise.resolve(outcome);
+      },
+    });
+
+    assert.strictEqual(result.stalled, true);
+    assert.strictEqual(
+      result.buildRoundsWithoutProgress,
+      2,
+      "round 1 (blocker-fix) must not count; only rounds 2 and 3 (build-mandate) count"
+    );
+  });
+
   void it("does not let a high score advance the stage mid-plan", async () => {
     // Scores now measure quality, so a flawless first batch can score high
     // while most of the plan is unbuilt. That must not count as success.

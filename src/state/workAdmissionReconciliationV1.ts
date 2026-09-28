@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
-  STALLED_ACTIVE_TASK_PAUSE_REASON_V1,
+  isStalledActivePauseReasonV1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
 } from "../utils/taskWatchdogV1";
 import { TaskProgress } from "../types/taskProgress";
@@ -37,7 +37,7 @@ export type WorkAdmissionPauseReconciliationV1 =
   | { readonly outcome: "unreadable" };
 
 function isWatchdogProvenancePauseV1(reason: string | undefined): boolean {
-  return reason === STALLED_ACTIVE_TASK_PAUSE_REASON_V1 || reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1;
+  return isStalledActivePauseReasonV1(reason) || reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1;
 }
 
 /**

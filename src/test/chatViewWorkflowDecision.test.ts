@@ -273,7 +273,7 @@ void describe("Chat With AI — stage-chat posture footer", () => {
         { kind: "scheduled", trigger: "continuation" },
         "2026-08-28T15:20:00.000Z"
       ),
-      /^scheduled — next attempt /
+      /^scheduled — will retry after /
     );
     assert.match(
       formatChatSchedulingPostureLineV1({
@@ -374,7 +374,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       notify.restore();
       cmds.restore();
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   }
 
@@ -409,7 +409,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       assert.equal(posted.ok, false);
     } finally {
       provider.dispose();
-      fs.rmSync(folder, { recursive: true, force: true });
+      safeRemoveDir(folder);
     }
   });
 
@@ -2460,8 +2460,8 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       );
       assert.match(
         String((lastState(fake) as { busyText?: string } | undefined)?.busyText ?? ""),
-        /^Running Implementation since .* — claude-code$/,
-        "a live operation without incremental detail must name its stage, start time, and resolved model"
+        /^Running Implementation since .* — claude-code \(GitHub Copilot\)$/,
+        "a live operation without incremental detail must name its stage, start time, and resolved model with its provider"
       );
 
       // The same operation reports an incremental detail: it must now

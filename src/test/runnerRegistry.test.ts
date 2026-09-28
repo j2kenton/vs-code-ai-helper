@@ -3604,7 +3604,7 @@ void describe("runImplementationForModel", () => {
         );
         assert.match(
           message,
-          /This also affects: High-Level Review \(Plan\) → kiro-cli:default; Low-Level Review \(Plan\): no backup configured — this stage will pause\./,
+          /This also affects: High-Level Review \(Plan\) → default model \(Kiro CLI\); Low-Level Review \(Plan\): no backup configured — this stage will pause\./,
           "expected every other stage sharing the blocked provider account to be named with its actual substitute (or its absence)"
         );
         assert.ok(

@@ -145,12 +145,13 @@ export async function retryTaskCreation(
 
   const taskFolderPath = task.folderUri.fsPath;
   const taskFolderName = task.folderName;
+  const folderName = taskFolderName;
   const metaFolderPath = path.dirname(taskFolderPath);
   const taskFolderUri = task.folderUri;
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
   const confirmation = await vscode.window.showWarningMessage(
-    `Retry creating "${taskFolderName}"? This writes task.md and marks the task ready to use.`,
+    `Retry creating "${folderName}"? This writes task.md and marks the task ready to use.`,
     { modal: true },
     "Retry"
   );
@@ -311,7 +312,7 @@ export async function retryTaskCreation(
     return result ?? false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(`Failed to retry task creation: ${message}`);
+    NotificationRouter.showError(`${folderName}: failed to retry task creation: ${message}`);
     return false;
   }
 }
@@ -421,12 +422,13 @@ export async function adoptAndRetryTaskCreation(
 
   const taskFolderPath = task.folderUri.fsPath;
   const taskFolderName = task.folderName;
+  const folderName = taskFolderName;
   const metaFolderPath = path.dirname(taskFolderPath);
   const taskFolderUri = task.folderUri;
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
   const confirmation = await vscode.window.showWarningMessage(
-    `Adopt and retry creating "${taskFolderName}"? Your existing task.md will be preserved exactly as-is and the task marked ready to use.`,
+    `Adopt and retry creating "${folderName}"? Your existing task.md will be preserved exactly as-is and the task marked ready to use.`,
     { modal: true },
     "Adopt and Retry"
   );
@@ -572,7 +574,7 @@ export async function adoptAndRetryTaskCreation(
     return result ?? false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(`Failed to adopt and retry task creation: ${message}`);
+    NotificationRouter.showError(`${folderName}: failed to adopt and retry task creation: ${message}`);
     return false;
   }
 }
@@ -706,6 +708,7 @@ export async function safeDeleteFailedTaskCreation(
 
   const taskFolderPath = task.folderUri.fsPath;
   const taskFolderName = task.folderName;
+  const folderName = taskFolderName;
   const metaFolderPath = path.dirname(taskFolderPath);
   const taskFolderUri = task.folderUri;
 
@@ -713,13 +716,13 @@ export async function safeDeleteFailedTaskCreation(
   const preFootprint = preCheck.find((f) => normalizePath(f.taskFolderPath) === normalizePath(taskFolderPath));
   if (!preFootprint || preFootprint.deletionPending || !(preFootprint.retryWithoutAdoptionEligible || preFootprint.footprintClass === "preservable")) {
     NotificationRouter.showWarning(
-      `${taskFolderName} cannot be safely deleted automatically in its current state. Use Open to inspect it instead.`
+      `${folderName} cannot be safely deleted automatically in its current state. Use Open to inspect it instead.`
     );
     return false;
   }
 
   const confirmation = await vscode.window.showWarningMessage(
-    `Permanently delete the incomplete task folder for "${taskFolderName}"? This cannot be undone.`,
+    `Permanently delete the incomplete task folder for "${folderName}"? This cannot be undone.`,
     { modal: true },
     "Delete"
   );
@@ -873,7 +876,7 @@ export async function safeDeleteFailedTaskCreation(
     return result ?? false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(`Failed to delete task: ${message}`);
+    NotificationRouter.showError(`${folderName}: failed to delete task: ${message}`);
     return false;
   }
 }

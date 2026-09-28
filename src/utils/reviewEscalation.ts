@@ -339,7 +339,7 @@ function buildReconsiderRequirementOptionV1(
  * plain data bag (not the raw `ReviewPlateauEvidenceV1`) so the builder stays
  * synchronous and does not need `folderUri`/plan-file access itself.
  */
-interface EscalationPlateauContextV1 {
+export interface EscalationPlateauContextV1 {
   readonly blockersCount: number;
   readonly primaryBlockerDescription?: string;
   /**
@@ -372,6 +372,21 @@ interface EscalationPlateauContextV1 {
 }
 
 /**
+ * RC1 item 11: the one sentence that states how many remaining blockers
+ * automation can still act on versus how many need the user — shared by
+ * `whatHappened` and `whyUserNeeded` so they cannot disagree with each other
+ * or with the "keep iterating" recommendation. Only called with a
+ * `fixable > 0`; the `== 0` case keeps its existing sentences.
+ * @internal exported for testing
+ */
+export function describeFixableSplitV1(fixable: number, total: number): string {
+  const plural = total === 1 ? "blocker" : "blockers";
+  return fixable >= total
+    ? `Automation can still act on ${total === 1 ? "the" : "all"} ${total} ${plural}, but it stopped iterating.`
+    : `Automation can still act on ${fixable} of the ${total} ${plural}; the other ${total - fixable} need you.`;
+}
+
+/**
  * The bounded, durable escalation shape every `EscalationKind` posts through
  * — the plain generic card (no `plateauContext`) for implementation-side and
  * environmental escalations, and the same rich, evidence-led
@@ -382,7 +397,7 @@ interface EscalationPlateauContextV1 {
  * single place both now go through, so a future card cannot silently drift
  * from the other's option ids, effects, or gating shape.
  */
-function buildEscalationDecisionV1(
+export function buildEscalationDecisionV1(
   kind: EscalationKind,
   stage: TaskStage,
   reason: string,
@@ -532,14 +547,21 @@ function buildEscalationDecisionV1(
       taskCanonicalId: target.canonicalId,
       stage,
       whatHappened:
-        `${stageName} can't progress on its own. ` +
+        // RC1 item 11: "can't progress on its own" is only true when nothing
+        // remaining is task-fixable; otherwise it contradicts the recommended
+        // "keep iterating" option, so the opening states the real split.
+        (taskFixableCount > 0
+          ? `${stageName} paused for your decision. ${describeFixableSplitV1(taskFixableCount, blockersCount)} `
+          : `${stageName} can't progress on its own. `) +
         (primaryBlockerDescription !== undefined
           ? `${blockersCount === 1 ? "One blocker remains" : `${blockersCount} blockers remain`}` +
             `, verbatim:\n\n${allBlockerDescriptions.map((d) => `"${d}"`).join("\n\n")}${narrowedNote}`
           : reason),
       whyUserNeeded:
-        `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
-        `${blockersCount} remaining blocker(s) are task-fixable.` +
+        (taskFixableCount > 0
+          ? `${describeFixableSplitV1(taskFixableCount, blockersCount)} ${progressNote}`
+          : `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
+            `${blockersCount} remaining blocker(s) are task-fixable.`) +
         (hasNonFixableBlocker
           ? " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
             "later, until it clears or you choose \"I'll publish over it\" below to override it there."
@@ -1577,8 +1599,9 @@ export async function escalateReviewToHuman(
     }
     return true;
   } catch (error) {
+    const taskLabel = progressHint?.displayName ?? folderUri.fsPath;
     NotificationRouter.showWarning(
-      `${STAGE_DISPLAY_NAMES[stage]} needs your input (${reason}), but recording the escalation failed: ` +
+      `${taskLabel}: ${STAGE_DISPLAY_NAMES[stage]} needs your input (${reason}), but recording the escalation failed: ` +
         (error instanceof Error ? error.message : String(error))
     );
     // Whether the patchTaskProgress write itself landed before throwing is

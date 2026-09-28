@@ -542,7 +542,7 @@ void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs provid
     assert.ok(message);
     assert.match(message, /candidatesExhausted/);
     assert.match(message, /Every configured model was tried and failed/);
-    assert.match(message, /claude-sonnet-4\.6 \(Copilot\)/);
+    assert.match(message, /claude-sonnet-4\.6 \(GitHub Copilot\)/);
     assert.doesNotMatch(message, /was unavailable/);
   });
 

@@ -4,6 +4,8 @@ import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -76,8 +78,9 @@ export async function applyHighLevelReviewChanges(
     resolvedTask.progress.currentStage !== "plan-high-review" &&
     resolvedTask.progress.currentStage !== "impl-high-review"
   ) {
+    const taskLabel = formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName);
     NotificationRouter.showWarning(
-      "Task is not at a High-Level Review stage."
+      `${taskLabel} is not at a High-Level Review stage.`
     );
     return false;
   }
@@ -89,9 +92,7 @@ export async function applyHighLevelReviewChanges(
     // identical check for why this must use the resolver rather than the raw
     // `status` field.
     if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-      NotificationRouter.showWarning(
-        "Task is paused. Resume it before applying review changes."
-      );
+      showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
       return false;
     }
 
@@ -113,9 +114,7 @@ export async function applyHighLevelReviewChanges(
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
   if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-    NotificationRouter.showWarning(
-      "Task is paused. Resume it before applying review changes."
-    );
+    showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
     return false;
   }
 

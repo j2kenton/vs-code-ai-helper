@@ -51,6 +51,7 @@ plans/**
 notes/**
 docs/**
 plan-final.md
+CONTRIBUTING.md
 
 # Test and build tooling.
 test-stubs/**
@@ -81,9 +82,16 @@ dist/meta.json
 # does not read .gitignore, so these shipped: three stray suite logs totalling
 # ~850KB of local absolute paths and test names. `.tmp-*` and `*.done` cover
 # throwaway root-level test-runner scripts and their exit-code marker files.
-*.log
+# Single-star `*.log` only matches log files at the package root; use a
+# double-star glob so logs anywhere in the tree (e.g. nested task/test
+# output directories) are excluded too.
+**/*.log
 .tmp-*
 *.done
+
+# Deployment scripts/config for the cloud control-plane — not part of the
+# shipped extension and not needed by any local user.
+deploy/**
 
 # A compiled mirror of the whole tree that an agentic implementation round
 # emitted on 2026-08-23 with a custom `--outDir` (12.6MB, ~838 files, a

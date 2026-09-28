@@ -182,7 +182,9 @@ void describe("Stage 3 action matrix contracts", () => {
     const contributes = readPackageContributes();
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];
     const publishActionCommands = new Set([
-      "vs-code-ai-helper.runPublishChecks",
+      // One "check and review" button replaces the separate checks and review buttons;
+      // the separate commands stay in the row's context menu (group publish@N).
+      "vs-code-ai-helper.checkAndReviewPublish",
       "vs-code-ai-helper.runLintingFixes",
       "vs-code-ai-helper.viewStageChanges",
       "vs-code-ai-helper.chatWithStage",
@@ -209,7 +211,7 @@ void describe("Stage 3 action matrix contracts", () => {
     ]);
   });
 
-  void it("makes 'run the checks' (scales icon) the first Publish action and 'fix the report' the second", () => {
+  void it("makes 'check and review' the first Publish action and 'fix the report' the second", () => {
     const contributes = readPackageContributes();
     const commands = contributes.commands ?? [];
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];
@@ -220,8 +222,8 @@ void describe("Stage 3 action matrix contracts", () => {
     const firstAction = publishInline.find((entry) => entry.group === "inline@10");
     assert.equal(
       firstAction?.command,
-      "vs-code-ai-helper.runPublishChecks",
-      "The first inline Publish action must run the checks and produce the report"
+      "vs-code-ai-helper.checkAndReviewPublish",
+      "The first inline Publish action must check (when needed) and review"
     );
     const secondAction = publishInline.find((entry) => entry.group === "inline@20");
     assert.equal(
@@ -230,14 +232,10 @@ void describe("Stage 3 action matrix contracts", () => {
       "The second inline Publish action must fix the report's findings"
     );
 
-    const checksCommand = commands.find(
-      (entry) => entry.command === "vs-code-ai-helper.runPublishChecks"
+    const checkAndReviewCommand = commands.find(
+      (entry) => entry.command === "vs-code-ai-helper.checkAndReviewPublish"
     );
-    assert.equal(
-      checksCommand?.icon,
-      "$(law)",
-      "The check-and-report action carries the scales icon"
-    );
+    assert.equal(checkAndReviewCommand?.icon, "$(checklist)");
     const fixCommand = commands.find(
       (entry) => entry.command === "vs-code-ai-helper.runLintingFixes"
     );
@@ -255,7 +253,7 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       checksSource,
-      /await ensureStageModelConfigured\(taskFolderUri, "publish"\)/,
+      /await ensureStageModelConfigured\(taskFolderUri, "publish"(?:, [^)]*)?\)/,
       "The directly-invocable check action must carry the missing-model guard itself (the inline button bypasses applyCurrentStageAction)"
     );
 
@@ -274,12 +272,16 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       fixesSource,
-      /await ensureStageModelConfigured\(taskFolderUri, "publish"\)/,
+      /await ensureStageModelConfigured\(taskFolderUri, "publish"(?:, [^)]*)?\)/,
       "The directly-invocable fix action must carry the missing-model guard before any mutation (the inline button bypasses applyCurrentStageAction)"
     );
+    const fixesModelGuardMatch = fixesSource.match(
+      /await ensureStageModelConfigured\(taskFolderUri, "publish"(?:, [^)]*)?\)/
+    );
     assert.ok(
-      fixesSource.indexOf('await ensureStageModelConfigured(taskFolderUri, "publish")') <
-        fixesSource.indexOf("runTrackedOperation("),
+      fixesModelGuardMatch &&
+        (fixesModelGuardMatch.index ?? -1) >= 0 &&
+        (fixesModelGuardMatch.index as number) < fixesSource.indexOf("runTrackedOperation("),
       "The fix action's model guard must run before the tracked operation so no autofix/format mutation happens without a usable Publish model"
     );
     assert.match(

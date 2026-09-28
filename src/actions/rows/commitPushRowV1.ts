@@ -131,6 +131,7 @@ import { ChatViewProvider } from "../../views/chatView";
 import { ResolvedTaskContext } from "../../utils/resolveTaskContext";
 import { checkGitPublishReadiness } from "../../utils/gitRepoInfo";
 import { NotificationRouter } from "../../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../../utils/notificationTaskContextV1";
 import { STAGE_DISPLAY_NAMES } from "../../types/taskProgress";
 
 export const COMMIT_PUSH_ACTION_KEY_V1 = "commitPush.v1";
@@ -355,13 +356,13 @@ const COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1: Readonly<Record<CommitAndPushNo
  *
  * @internal exported for testing
  */
-export function presentCommitPushCoreResultV1(result: CommitAndPushCoreResultV1): void {
+export function presentCommitPushCoreResultV1(result: CommitAndPushCoreResultV1, taskLabel: string): void {
   if (result.kind === "completed") {
-    NotificationRouter.showInformation(result.detail ?? "Committed and pushed successfully.");
+    NotificationRouter.showInformation(`${taskLabel}: ${result.detail ?? "committed and pushed successfully."}`);
     return;
   }
   if (result.kind === "noChanges") {
-    NotificationRouter.showInformation("No changes to commit — the repository is clean.");
+    NotificationRouter.showInformation(`${taskLabel}: no changes to commit — the repository is clean.`);
     return;
   }
   if (result.kind === "questionsPosted") {
@@ -375,13 +376,13 @@ export function presentCommitPushCoreResultV1(result: CommitAndPushCoreResultV1)
   const text = result.detail ?? COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1[result.reason];
   switch (COMMIT_PUSH_NOT_COMPLETED_LEVEL_V1[result.reason]) {
     case "error":
-      NotificationRouter.showError(text);
+      NotificationRouter.showError(`${taskLabel}: ${text}`);
       return;
     case "warning":
-      NotificationRouter.showWarning(text);
+      NotificationRouter.showWarning(`${taskLabel}: ${text}`);
       return;
     case "information":
-      NotificationRouter.showInformation(text);
+      NotificationRouter.showInformation(`${taskLabel}: ${text}`);
       return;
   }
 }
@@ -394,9 +395,10 @@ export function presentCommitPushCoreResultV1(result: CommitAndPushCoreResultV1)
  */
 function finishCommitPushV1(
   result: CommitAndPushCoreResultV1,
-  context: Pick<LifecycleExecutionContextV1, "actionKey" | "operationId" | "taskBindingId" | "chatDocumentId">
+  context: Pick<LifecycleExecutionContextV1, "actionKey" | "operationId" | "taskBindingId" | "chatDocumentId">,
+  taskLabel: string
 ): TaskActionOutcomeV1 {
-  presentCommitPushCoreResultV1(result);
+  presentCommitPushCoreResultV1(result, taskLabel);
   return mapCommitAndPushCoreResultToOutcomeV1(result, context);
 }
 
@@ -442,6 +444,7 @@ export async function executeCommitPushV1(
     // forgets the side channel, rather than a silent no-op run.
     return { kind: "failed", code: "commitPush.servicesUnavailable", retryable: false };
   }
+  const taskLabel = formatNotificationTaskLabelV1(services.resolvedTask.progress.displayName, services.resolvedTask.folderName);
 
   // §10.2 step 1 / §3.8: run the index/privacy check as its own
   // coordinator-native step, BEFORE ever opening the tracked operation or
@@ -458,7 +461,8 @@ export async function executeCommitPushV1(
   if (!indexCheck.ok) {
     return finishCommitPushV1(
       { kind: "notCompleted", reason: indexCheck.reason, detail: indexCheck.detail },
-      context
+      context,
+      taskLabel
     );
   }
 
@@ -483,7 +487,8 @@ export async function executeCommitPushV1(
         reason: "gitNotReady",
         detail: `Commit and push failed: ${gitReadinessCheck.reason}`,
       },
-      context
+      context,
+      taskLabel
     );
   }
 
@@ -657,7 +662,7 @@ export async function executeCommitPushV1(
   }
 
   taskOperations.end(op, deriveCommitPushOperationEndStateV1(op, result));
-  return finishCommitPushV1(result, context);
+  return finishCommitPushV1(result, context, taskLabel);
 }
 
 export function createCommitPushRowV1(): LifecycleTaskActionRowV1 {

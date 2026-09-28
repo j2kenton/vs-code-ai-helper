@@ -2466,6 +2466,26 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.presentationEnded.value, true);
   });
 
+  void it("settles a never-resolving provider invocation instead of leaving its admitted ticket pending", async () => {
+    const harness = makeHarness(
+      [{ runnerId: "scripted-transport", invoke: () => new Promise<AgentTransportExitV1>(() => undefined) }],
+      {},
+      [],
+      { invocationTimeoutMs: 1 }
+    );
+
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+
+    assert.equal(outcome.kind, "unavailable");
+    if (outcome.kind !== "unavailable") {
+      assert.fail("expected timed-out provider invocation to exhaust its provider chain");
+    }
+    assert.equal(outcome.code, "candidatesExhausted");
+    assert.equal(harness.presentationEnded.value, true);
+    assert.equal(harness.settlementRecords.length, 1);
+    assert.equal(harness.leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
+  });
+
   void it("abortAdmittedAction retires an admitted ticket without invoking the provider, settling exactly once (plan §5.4/AC-CHAT-TX-02)", async () => {
     let invoked = false;
     const harness = makeHarness([

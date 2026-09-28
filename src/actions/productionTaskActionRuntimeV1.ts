@@ -53,6 +53,7 @@ import {
   EDIT_EXECUTION_ACTION_KEY_V1,
   EditExecutionActionInputV1,
 } from "./rows/editExecutionRowV1";
+import { describeModelWithProviderV1 } from "../runners/providers";
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
@@ -69,6 +70,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import * as vscode from "vscode";
 
 let registry: TaskActionRegistryV1 | undefined;
@@ -116,10 +118,12 @@ const noopFollowUpSchedulerV1: TaskActionFollowUpSchedulerV1 = {
  * primary UI; this still gives a Resume-triggered run (which has no such
  * wrapper) a visible progress entry.
  */
-function notificationPresenterV1(): TaskActionPresenterV1 {
+function notificationPresenterV1(taskLabel?: string): TaskActionPresenterV1 {
   return {
     beginProgress(presentation): { end: () => void } {
-      NotificationRouter.emitProgressSummary(presentation.progressLabel);
+      NotificationRouter.emitProgressSummary(
+        taskLabel ? `${taskLabel} — ${presentation.progressLabel}` : presentation.progressLabel
+      );
       return { end: (): void => undefined };
     },
   };
@@ -407,7 +411,21 @@ export function createProductionTaskActionCoordinatorV1(options: {
    * and must not narrow their provider chain by it now.
    */
   readonly requireSummaryOnlyCapableText?: boolean;
+  /**
+   * The task this coordinator instance's invocations belong to, when the
+   * caller has one — every production caller does except the Global
+   * Assistant (task-independent by design). Names the task in the
+   * `onCandidateSkipped` warning and the `beginProgress` summary below,
+   * which otherwise had no task identity threaded through the coordinator's
+   * own cross-cutting types (`TaskActionRequestV1`/`TaskBindingRefV1` carry
+   * only a hash, no folder path) — see the notification-naming scan.
+   */
+  readonly taskDisplayName?: string;
+  readonly taskFolderPath?: string;
 }): TaskActionCoordinatorV1 {
+  const taskLabel = options.taskFolderPath
+    ? formatNotificationTaskLabelV1(options.taskDisplayName, options.taskFolderPath)
+    : undefined;
   return withMalformedResultRetryV1(createTaskActionCoordinatorV1({
     registry: getProductionTaskActionRegistryV1(),
     leaseStore: getWorkflowLeaseStoreV1(),
@@ -430,15 +448,15 @@ export function createProductionTaskActionCoordinatorV1(options: {
     // admission may abort before a reserved backup ever runs. The action's
     // own outcome notification reports what actually happened.
     onCandidateSkipped: (skip): void => {
-      NotificationRouter.showWarning(
-        `${skip.providerLabel} (${skip.storedModelId}) was skipped for ${skip.taskStage} and did not run: ` +
-          "the provider cannot satisfy this action's mode. The next configured model is tried if one remains. " +
-          "Check the model's provider settings if you expected it to answer."
-      );
+      const message =
+        `${describeModelWithProviderV1(skip.storedModelId)} was skipped for ${skip.taskStage} and did not run: ` +
+        "the provider cannot satisfy this action's mode. The next configured model is tried if one remains. " +
+        "Check the model's provider settings if you expected it to answer.";
+      NotificationRouter.showWarning(taskLabel ? `${taskLabel} — ${message}` : message);
     },
     orchestrator: lazyProductionActionConversationOrchestratorV1(),
     followUpScheduler: noopFollowUpSchedulerV1,
-    presenter: notificationPresenterV1(),
+    presenter: notificationPresenterV1(taskLabel),
     auditLogger: consoleAuditLoggerV1,
     // 2026-08-06 stability fix: without this, a `malformedResult` settlement's
     // recovery write (preserveRejectedResultForRecoveryV1) was silently a
@@ -529,6 +547,8 @@ export async function invokeLifecycleRowV1(options: {
   readonly services?: unknown;
   /** Forwarded to `TaskActionRequestV1.lifecyclePostCommitSink` — see its header. */
   readonly postCommitSink?: (result: unknown) => void;
+  /** The task's display name, for notification labels — see `createProductionTaskActionCoordinatorV1`'s identically-named option. */
+  readonly taskDisplayName?: string;
 }): Promise<TaskActionOutcomeV1> {
   let chatDocumentId: string;
   try {
@@ -553,6 +573,8 @@ export async function invokeLifecycleRowV1(options: {
     // A lifecycle row never consults provider selection, so this resolver
     // is never actually invoked.
     resolveStagePrimaryModel: () => ({ modelId: undefined, stage: undefined }),
+    taskDisplayName: options.taskDisplayName,
+    taskFolderPath: options.taskFolderPath,
   });
   const cancellation = new vscode.CancellationTokenSource();
   try {

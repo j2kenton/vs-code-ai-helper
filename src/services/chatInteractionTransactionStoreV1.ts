@@ -104,6 +104,7 @@ import {
   computeChatTransactionInputSha256V1,
   computeChatTransactionQuestionSetSha256V1,
   decodeChatInteractionTransactionV1,
+  describeEncodedRecordOverCeilingV1,
   encodeChatInteractionTransactionV1,
   MAX_CHAT_TRANSACTION_FILE_BYTES_V1,
 } from "../types/chatInteractionTransactionV1";
@@ -426,9 +427,14 @@ export function createChatInteractionTransactionStoreV1(options: {
     next: ChatInteractionTransactionV1,
     expectedRevision: WorkflowFileRevisionV1
   ): Promise<ChatTransactionStoreResultV1> {
+    const encoded = encodeChatInteractionTransactionV1(next);
+    const overCeiling = describeEncodedRecordOverCeilingV1(encoded.length);
+    if (overCeiling) {
+      return rejected(overCeiling);
+    }
     const replaced = await fileStore.replaceFileExact(
       registry.chatTransactionFile(privateRootId, operationId).locator,
-      encodeChatInteractionTransactionV1(next),
+      encoded,
       expectedRevision
     );
     if (replaced.kind === "unavailable") {
@@ -603,6 +609,11 @@ export function createChatInteractionTransactionStoreV1(options: {
     if (!selfCheck.ok) {
       return rejected(`transaction record would not decode: ${selfCheck.reason}`);
     }
+    const encoded = encodeChatInteractionTransactionV1(selfCheck.transaction);
+    const overCeiling = describeEncodedRecordOverCeilingV1(encoded.length);
+    if (overCeiling) {
+      return rejected(overCeiling);
+    }
     for (const allocated of [
       registry.workflowRuntimeDir(privateRootId),
       registry.chatTransactionsFamilyDir(privateRootId),
@@ -615,7 +626,7 @@ export function createChatInteractionTransactionStoreV1(options: {
     }
     const created = await fileStore.createFileExclusive(
       registry.chatTransactionFile(privateRootId, operationId).locator,
-      encodeChatInteractionTransactionV1(selfCheck.transaction)
+      encoded
     );
     if (created.kind === "unavailable") {
       return created;

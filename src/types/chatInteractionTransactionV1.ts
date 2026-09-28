@@ -132,8 +132,21 @@ export const CHAT_TRANSACTION_RESUME_INVOCATION_CLAIM_FILENAME_V1 = "resume-invo
 /** Bounded read ceiling for a persisted transaction record. */
 export const MAX_CHAT_TRANSACTION_FILE_BYTES_V1 = 1024 * 1024;
 
-/** Bounded canonical size of the validated original action input snapshot. */
-export const MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = 256 * 1024;
+/**
+ * Bounded canonical size of the validated original action input snapshot.
+ *
+ * Derived from the record's own 1 MB read ceiling (above), not a free number:
+ * the snapshot is stored as a JSON STRING inside the record, so its quotes and
+ * backslashes are escaped a second time. Measured expansion on real prompts is
+ * about 4.5% (see `implReviewFileSelection.ts`), so half the ceiling leaves the
+ * record's other fields and questions their room for real prompts. It is NOT
+ * a worst-case bound (backslash-heavy text can double twice), so every write
+ * also checks the encoded record against the ceiling — see
+ * `describeEncodedRecordOverCeilingV1`. Previously a fixed 256 KB,
+ * which large tasks outgrew — the field box ran a hand-patched 512 KB, which
+ * is exactly this value.
+ */
+export const MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = Math.floor(MAX_CHAT_TRANSACTION_FILE_BYTES_V1 / 2);
 
 /**
  * Whether a `chatTransactionRejected` reason string is THIS deterministic,
@@ -379,6 +392,25 @@ export function encodeChatInteractionTransactionV1(
   transaction: ChatInteractionTransactionV1
 ): Buffer {
   return Buffer.from(canonicalJsonTextV1(transaction), "utf8");
+}
+
+/**
+ * Rejection reason when an encoded record would exceed its own read ceiling,
+ * else `undefined`. The snapshot limit above bounds the DECODED snapshot; the
+ * record embeds it as a JSON string (escaped a second time), so an
+ * escape-heavy snapshot can pass that limit and still produce a record the
+ * store would refuse to read back. Checked at every write. Worded so
+ * `isInputSnapshotSizeRejectionReasonV1` recognises it (deterministic, so
+ * non-retryable: the same input encodes to the same size).
+ */
+export function describeEncodedRecordOverCeilingV1(encodedBytes: number): string | undefined {
+  if (encodedBytes <= MAX_CHAT_TRANSACTION_FILE_BYTES_V1) {
+    return undefined;
+  }
+  return (
+    `inputSnapshot exceeds the ${MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1}-byte canonical limit once encoded ` +
+    `in the transaction record (${encodedBytes} bytes > the ${MAX_CHAT_TRANSACTION_FILE_BYTES_V1}-byte record ceiling)`
+  );
 }
 
 export type DecodeChatInteractionTransactionResultV1 =

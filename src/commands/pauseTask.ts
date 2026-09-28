@@ -7,6 +7,7 @@ import { updateTaskStatus } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
@@ -114,6 +115,11 @@ export async function pauseTask(
     return;
   }
 
+  const taskLabel = formatNotificationTaskLabelV1(
+    resolvedTask.progress.displayName,
+    resolvedTask.folderName
+  );
+
   // §9.2: Pause is only for active tasks. Menus already hide Pause on
   // completed rows (contextTokens/package.json), but a programmatic
   // invocation (command palette arg, automation) could still reach here —
@@ -121,14 +127,14 @@ export async function pauseTask(
   // active lifecycles, with Resume's reopen flow no longer applicable.
   if (resolvedTask.progress.status === "completed") {
     NotificationRouter.showInformation(
-      "This task is completed — use Resume to reopen it at a stage."
+      `${taskLabel} is completed — use Resume to reopen it at a stage.`
     );
     return;
   }
 
   // If already paused, show message
   if (resolvedTask.progress.status === "paused") {
-    NotificationRouter.showInformation(`Task is already paused.`);
+    NotificationRouter.showInformation(`${taskLabel} is already paused.`);
     return;
   }
 
@@ -153,7 +159,7 @@ export async function pauseTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    NotificationRouter.showError(message);
+    NotificationRouter.showError(`${taskLabel}: ${message}`);
   }
 }
 

@@ -7,6 +7,7 @@ import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import type { SurvivingRecordedProcessV1 } from "./recordedCliStopV1";
 
 /**
  * Work admission (v1 fixes item 1, Part 1a — 1.0.0 gate).
@@ -217,9 +218,16 @@ function likelyStaleThresholdForPurposeV1(purpose: WorkAdmissionPurposeV1 | unde
  * so keeping it there forced `resumeTask.ts` to import from
  * `reviewActions.ts` just for this one formatter.
  */
-export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1): string {
+export function describeWorkAdmissionRefusalV1(
+  outcome: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1,
+  taskDisplayName?: string
+): string {
+  // The task is named in the sentence itself when the caller knows it, and
+  // never invented when it does not ("This task" / "this stage action").
+  const namedTask = taskDisplayName ? `"${taskDisplayName}"` : undefined;
+  const subject = namedTask ?? "This task";
   if (outcome.outcome === "writeFailed") {
-    return `Could not start this stage action: ${outcome.error.message}`;
+    return `Could not start this stage action${namedTask ? ` for ${namedTask}` : ""}: ${outcome.error.message}`;
   }
   // `ageMs` is the age of the marker's last RENEWAL, not of the claim: the
   // heartbeat touches the marker every couple of minutes (see `heartbeat`).
@@ -255,7 +263,7 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
   if (Number.isFinite(outcome.ageMs) && outcome.ageMs > 5 * WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) {
     const renewedMinutes = Math.round(outcome.ageMs / 60000);
     return (
-      `This task looks stuck rather than busy: nothing has renewed its claim for ~${renewedMinutes} min, ` +
+      `${subject} looks stuck rather than busy: nothing has renewed its claim for ~${renewedMinutes} min, ` +
       `and a running action renews every ${Math.round(WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 / 60000)}. ` +
       `The claim is ${ownerDetail}, ${runningFor}, at ${outcome.markerPath}. ` +
       "Nothing will resume it on its own, and reloading this window does not release it. If that window " +
@@ -265,7 +273,7 @@ export function describeWorkAdmissionRefusalV1(outcome: WorkAdmissionBusyV1 | Wo
   }
   const renewedAgo = Number.isFinite(outcome.ageMs) ? `~${renewedSeconds}s ago` : "at an unknown time";
   return (
-    `This task already has a stage action in progress (${ownerDetail}, ${runningFor}, last renewed ` +
+    `${subject} already has a stage action in progress (${ownerDetail}, ${runningFor}, last renewed ` +
     `${renewedAgo} at ${outcome.markerPath})${
       outcome.likelyStale
         ? " — this looks stale. A determinately dead owner is reclaimed automatically on the next sweep; " +
@@ -287,6 +295,21 @@ const processStartTimeV1 = Date.now() - Math.floor(process.uptime() * 1000);
  * the synchronous half of `hasLiveWorkAdmissionBestEffortV1`. Also backs
  * `acquireOrAdoptWorkAdmissionV1`'s same-process handoff below. */
 const localHandlesV1 = new Map<string, WorkAdmissionHandleV1>();
+
+/**
+ * The claim id of the `admission` lock this window currently holds for
+ * `taskFolderPath`, or `undefined` when it holds none (or only a `pauseCommit`
+ * claim, which never runs a provider CLI). Lets the V1 CLI transport record a
+ * process it spawns next to the lock it runs under (`roundProcessContextV1.ts`).
+ * An adopted view shares its base handle's claim id, so it resolves the same.
+ */
+export function heldAdmissionClaimIdForTaskV1(taskFolderPath: string): string | undefined {
+  const direct = localHandlesV1.get(taskFolderPath);
+  const held =
+    direct ??
+    [...localHandlesV1.entries()].find(([key]) => path.resolve(key) === path.resolve(taskFolderPath))?.[1];
+  return held !== undefined && held.purpose === "admission" ? held.claimId : undefined;
+}
 
 /**
  * Same-process PRE-genesis intent, keyed by task folder path to the set of
@@ -1421,9 +1444,12 @@ export async function endTargetResolutionV1(handle?: TargetResolutionHandleV1): 
  * the handle via `endTargetResolutionV1`) rather than proceed into setup —
  * see `TargetResolutionHandleV1.writeFailedRootPaths`'s doc comment.
  */
-export function describeTargetResolutionWriteFailureV1(handle: TargetResolutionHandleV1): string {
+export function describeTargetResolutionWriteFailureV1(
+  handle: TargetResolutionHandleV1,
+  taskDisplayName?: string
+): string {
   const [firstRoot] = handle.writeFailedRootPaths;
-  return `Could not start this stage action: failed to write task-admission bookkeeping for "${firstRoot}".`;
+  return `Could not start this stage action${taskDisplayName ? ` for "${taskDisplayName}"` : ""}: failed to write task-admission bookkeeping for "${firstRoot}".`;
 }
 
 /**
@@ -1433,10 +1459,13 @@ export function describeTargetResolutionWriteFailureV1(handle: TargetResolutionH
  * `endTargetResolutionV1`) rather than proceed into setup with no durable
  * cross-window protection at all.
  */
-export function describeTargetResolutionUnprotectedRootsV1(handle: TargetResolutionHandleV1): string {
+export function describeTargetResolutionUnprotectedRootsV1(
+  handle: TargetResolutionHandleV1,
+  taskDisplayName?: string
+): string {
   const [firstRoot] = handle.unprotectedRootPaths;
   return (
-    `Could not start this stage action: task-root admission for "${firstRoot}" is currently contended and no ` +
+    `Could not start this stage action${taskDisplayName ? ` for "${taskDisplayName}"` : ""}: task-root admission for "${firstRoot}" is currently contended and no ` +
     "durable protection could be confirmed. Please try again."
   );
 }
@@ -3452,8 +3481,36 @@ export type WorkAdmissionAutomaticReclamationOutcomeV1 =
       readonly markerPath: string;
       readonly ageMs: number;
     }
+  /**
+   * 1.0 RC1 Part B: the owner is dead, but a provider CLI recorded against
+   * its lock is still running (or could not be proven gone). The lock stays
+   * held — releasing it would let a second process edit the working tree
+   * alongside the survivor. A later sweep re-checks, so ending the process by
+   * hand clears it.
+   */
+  | {
+      readonly outcome: "cliSurvivors";
+      readonly owner: WorkAdmissionClaimInfoV1;
+      readonly survivors: readonly SurvivingRecordedProcessV1[];
+      readonly markerPath: string;
+      readonly ageMs: number;
+    }
   | { readonly outcome: "raced" }
   | { readonly outcome: "writeFailed"; readonly error: Error };
+
+/**
+ * Supplied by a caller that can stop the provider CLIs recorded against a
+ * dead owner's lock (`recordedCliStopV1.ts`). Resolves to the CLIs that could
+ * not be confirmed gone; an empty list means the lock may be released.
+ *
+ * Passing it also lets a FRESH dead-owner `admission` marker be reclaimed
+ * without waiting out the heartbeat-staleness threshold — never without it, so
+ * a caller with no way to stop the recorded CLIs keeps the old "wait until
+ * stale" behaviour.
+ */
+export type WorkAdmissionDeadOwnerGateV1 = (
+  owner: WorkAdmissionClaimInfoV1
+) => Promise<readonly SurvivingRecordedProcessV1[]>;
 
 /**
  * v1 fixes item 1, Part 1c step 15/18 — attempt automatic reclamation of
@@ -3490,7 +3547,8 @@ export type WorkAdmissionAutomaticReclamationOutcomeV1 =
  */
 export async function attemptAutomaticWorkAdmissionReclamationV1(
   taskFolderPath: string,
-  now: number = Date.now()
+  now: number = Date.now(),
+  deadOwnerGate?: WorkAdmissionDeadOwnerGateV1
 ): Promise<WorkAdmissionAutomaticReclamationOutcomeV1> {
   const dir = admissionDirV1(taskFolderPath);
   let markers: readonly { readonly filePath: string; readonly basename: string }[];
@@ -3536,12 +3594,31 @@ export async function attemptAutomaticWorkAdmissionReclamationV1(
     // Vanished between the list above and this stat.
     return { outcome: "raced" };
   }
+  let liveness: WorkAdmissionOwnerLivenessV1 | undefined;
   if (ageMs <= likelyStaleThresholdForPurposeV1(owner.purpose)) {
-    return { outcome: "notStale" };
+    // A dead owner's lock is not waited out (1.0 RC1 Part B) — but only for a
+    // caller that can also stop the CLIs recorded against it, and only for a
+    // stage-action (`admission`) lock. Everything else keeps waiting for
+    // staleness, and a live/unknown owner is never touched.
+    if (deadOwnerGate === undefined || owner.purpose !== "admission") {
+      return { outcome: "notStale" };
+    }
+    liveness = await probeWorkAdmissionOwnerLivenessV1(owner);
+    if (liveness.kind !== "sameHostDead") {
+      return { outcome: "notStale" };
+    }
   }
-  const liveness = await probeWorkAdmissionOwnerLivenessV1(owner);
+  liveness ??= await probeWorkAdmissionOwnerLivenessV1(owner);
   if (liveness.kind !== "sameHostDead") {
     return { outcome: "notDead", liveness, owner, markerPath: target.filePath, ageMs };
+  }
+
+  if (deadOwnerGate !== undefined && owner.purpose === "admission") {
+    // Safety rule: never release while a recorded provider CLI may still run.
+    const survivors = await deadOwnerGate(owner);
+    if (survivors.length > 0) {
+      return { outcome: "cliSurvivors", owner, survivors, markerPath: target.filePath, ageMs };
+    }
   }
 
   if (owner.purpose === "pauseCommit") {
@@ -3645,7 +3722,8 @@ export async function takeOverStaleWorkAdmissionMarkerV1(
   taskFolderPath: string,
   expectedMarkerPath: string,
   expectedClaimId: string | undefined,
-  now: number = Date.now()
+  now: number = Date.now(),
+  deadOwnerGate?: WorkAdmissionDeadOwnerGateV1
 ): Promise<WorkAdmissionTakeoverOutcomeV1> {
   const dir = admissionDirV1(taskFolderPath);
   let markers: readonly { readonly filePath: string; readonly basename: string }[];
@@ -3701,7 +3779,7 @@ export async function takeOverStaleWorkAdmissionMarkerV1(
       // automatic path is strictly safer (it re-validates everything from
       // scratch) and already routes `pauseCommit` through 1b's barrier, so
       // defer to it wholesale rather than re-implement any of that here.
-      const auto = await attemptAutomaticWorkAdmissionReclamationV1(taskFolderPath, now);
+      const auto = await attemptAutomaticWorkAdmissionReclamationV1(taskFolderPath, now, deadOwnerGate);
       if (auto.outcome === "reclaimed") {
         return { outcome: "reclaimedAsDead", purpose: auto.purpose, displacedOwner: auto.reclaimedOwner };
       }

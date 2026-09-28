@@ -90,48 +90,61 @@ const FAILURE_REASONS: readonly {
   { reason: "unexpectedError", level: "error" },
 ];
 
+// 1.0 RC1 Part E (item 11, "every notification names its task"): every
+// presented message must be prefixed with the task's own label.
+const TEST_TASK_LABEL = '"Test Task"';
+
 void describe("commitPushRowV1 — presentCommitPushCoreResultV1 (coordinator-owned presentation)", () => {
-  void it("presents completed with its own detail text at information level, exactly once", () => {
+  void it("presents completed with its own detail text at information level, exactly once, naming the task", () => {
     const surface = withRecordingSurface((s) => {
-      presentCommitPushCoreResultV1({ kind: "completed", detail: "Successfully committed and pushed task_1 to origin/main" });
+      presentCommitPushCoreResultV1(
+        { kind: "completed", detail: "Successfully committed and pushed task_1 to origin/main" },
+        TEST_TASK_LABEL
+      );
       void s;
     });
     assert.equal(surface.entries.length, 1);
     assert.equal(surface.entries[0]!.level, "info");
-    assert.equal(surface.entries[0]!.message, "Successfully committed and pushed task_1 to origin/main");
+    assert.equal(
+      surface.entries[0]!.message,
+      `${TEST_TASK_LABEL}: Successfully committed and pushed task_1 to origin/main`
+    );
   });
 
-  void it("presents completed with no detail using the default success text, exactly once", () => {
+  void it("presents completed with no detail using the default success text, exactly once, naming the task", () => {
     const surface = withRecordingSurface(() => {
-      presentCommitPushCoreResultV1({ kind: "completed" });
+      presentCommitPushCoreResultV1({ kind: "completed" }, TEST_TASK_LABEL);
     });
     assert.equal(surface.entries.length, 1);
     assert.equal(surface.entries[0]!.level, "info");
-    assert.equal(surface.entries[0]!.message, "Committed and pushed successfully.");
+    assert.equal(surface.entries[0]!.message, `${TEST_TASK_LABEL}: committed and pushed successfully.`);
   });
 
-  void it("presents noChanges at information level, exactly once", () => {
+  void it("presents noChanges at information level, exactly once, naming the task", () => {
     const surface = withRecordingSurface(() => {
-      presentCommitPushCoreResultV1({ kind: "noChanges" });
+      presentCommitPushCoreResultV1({ kind: "noChanges" }, TEST_TASK_LABEL);
     });
     assert.equal(surface.entries.length, 1);
     assert.equal(surface.entries[0]!.level, "info");
-    assert.equal(surface.entries[0]!.message, "No changes to commit — the repository is clean.");
+    assert.equal(surface.entries[0]!.message, `${TEST_TASK_LABEL}: no changes to commit — the repository is clean.`);
   });
 
   void it("presents nothing for questionsPosted — the question already reached Chat With AI from inside the metadata step", () => {
     const surface = withRecordingSurface(() => {
-      presentCommitPushCoreResultV1({
-        kind: "questionsPosted",
-        interactionId: "interaction-1",
-        correlation: {
-          actionKey: "commitPushMetadata.v1",
-          operationId: "op-1",
-          attemptId: "attempt-1",
-          taskBindingId: "task-binding-1",
-          chatDocumentId: "chat-doc-1",
+      presentCommitPushCoreResultV1(
+        {
+          kind: "questionsPosted",
+          interactionId: "interaction-1",
+          correlation: {
+            actionKey: "commitPushMetadata.v1",
+            operationId: "op-1",
+            attemptId: "attempt-1",
+            taskBindingId: "task-binding-1",
+            chatDocumentId: "chat-doc-1",
+          },
         },
-      });
+        TEST_TASK_LABEL
+      );
     });
     assert.equal(surface.entries.length, 0);
   });
@@ -139,36 +152,40 @@ void describe("commitPushRowV1 — presentCommitPushCoreResultV1 (coordinator-ow
   void it(`presents every declined-prompt reason (${DECLINED_REASONS.length} total) at information level, exactly once`, () => {
     for (const reason of DECLINED_REASONS) {
       const surface = withRecordingSurface(() => {
-        presentCommitPushCoreResultV1({ kind: "notCompleted", reason });
+        presentCommitPushCoreResultV1({ kind: "notCompleted", reason }, TEST_TASK_LABEL);
       });
       assert.equal(surface.entries.length, 1, `reason ${reason} must present exactly one entry`);
       assert.equal(surface.entries[0]!.level, "info", `reason ${reason} must present at information level`);
     }
   });
 
-  void it(`presents every remaining notCompleted reason (${FAILURE_REASONS.length} total) at its fixed level, exactly once, using detail when supplied`, () => {
+  void it(`presents every remaining notCompleted reason (${FAILURE_REASONS.length} total) at its fixed level, exactly once, using detail when supplied, naming the task`, () => {
     for (const { reason, level } of FAILURE_REASONS) {
       // No detail: falls back to the fixed default text for this reason.
       const withoutDetail = withRecordingSurface(() => {
-        presentCommitPushCoreResultV1({ kind: "notCompleted", reason });
+        presentCommitPushCoreResultV1({ kind: "notCompleted", reason }, TEST_TASK_LABEL);
       });
       assert.equal(withoutDetail.entries.length, 1, `reason ${reason} (no detail) must present exactly one entry`);
       assert.equal(withoutDetail.entries[0]!.level, level, `reason ${reason} must present at ${level} level`);
+      assert.ok(
+        withoutDetail.entries[0]!.message.startsWith(`${TEST_TASK_LABEL}: `),
+        `reason ${reason} must name the task`
+      );
 
       // With detail: the caller-supplied text wins over the fixed default.
       const detailText = `dynamic detail for ${reason}`;
       const withDetail = withRecordingSurface(() => {
-        presentCommitPushCoreResultV1({ kind: "notCompleted", reason, detail: detailText });
+        presentCommitPushCoreResultV1({ kind: "notCompleted", reason, detail: detailText }, TEST_TASK_LABEL);
       });
       assert.equal(withDetail.entries.length, 1, `reason ${reason} (with detail) must present exactly one entry`);
       assert.equal(withDetail.entries[0]!.level, level);
-      assert.equal(withDetail.entries[0]!.message, detailText);
+      assert.equal(withDetail.entries[0]!.message, `${TEST_TASK_LABEL}: ${detailText}`);
     }
   });
 
   void it("presents userCancelled at information level, exactly once", () => {
     const surface = withRecordingSurface(() => {
-      presentCommitPushCoreResultV1({ kind: "notCompleted", reason: "userCancelled" });
+      presentCommitPushCoreResultV1({ kind: "notCompleted", reason: "userCancelled" }, TEST_TASK_LABEL);
     });
     assert.equal(surface.entries.length, 1);
     assert.equal(surface.entries[0]!.level, "info");

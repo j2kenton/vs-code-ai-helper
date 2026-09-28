@@ -42,6 +42,7 @@ import { ProviderChainExhaustionV1 } from "../types/taskActionOutcomeV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { describeModelWithProviderV1 } from "../runners/providers";
 
 function fakeCompletedCorrelation(): ActionCorrelationV1 {
   return {
@@ -284,6 +285,23 @@ void describe("provider chain exhaustion (stage owner)", () => {
       "2026-01-01T00:00:00.000Z",
       "updatedAt must be bumped so the task stops presenting as freshly active"
     );
+  });
+
+  void it("names every model the chain tried, why each failed, and where to change the list in one message", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_names_each_model");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", MULTI_QUOTA_EXHAUSTION, "candidatesExhausted");
+    });
+
+    const reason = readProgress(folderPath).pausedReason ?? "";
+    for (const candidate of MULTI_QUOTA_EXHAUSTION.candidates) {
+      assert.ok(
+        reason.includes(`${describeModelWithProviderV1(candidate.storedModelId)} — ${candidate.reason}`),
+        `the message must name ${candidate.storedModelId} and its reason`
+      );
+    }
+    assert.match(reason, /open Ensemble Settings and edit the model and backup models for/);
+    assert.doesNotMatch(reason, /See the run log/);
   });
 
   void it("records a durable quotaParkRecord when a candidate's reason was a quota block", async () => {

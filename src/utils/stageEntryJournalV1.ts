@@ -371,6 +371,11 @@ export type StageEntryJournalRecoveryOutcomeV1 =
       readonly kind: "committed";
       readonly transitionId: string;
       readonly deferredAdoption?: PlanRevisionAdoptionV1;
+      /** The journal's own stages and start instant, so a late Phase B replay can retire the LEFT stage's decisions
+       * (raised at or before `startedAt` only) — RC1 item 9. */
+      readonly from: TaskStage;
+      readonly to: TaskStage;
+      readonly startedAt: string;
     }
   /** The transition did not commit. The journal has been deleted; `action`
    * describes what (if anything) was done to the artifact. */
@@ -488,7 +493,14 @@ async function recoverStageEntryJournalPhaseAV1(
       logLine =
         `Recovered a stage-entry journal (${journal.transitionId}, ${journal.from} -> ${journal.to}): ` +
         "the transition had already committed; replaying its post-commit payload (Phase B) before cleanup (Phase C).";
-      return { kind: "committed", transitionId: journal.transitionId, deferredAdoption: journal.deferredAdoption };
+      return {
+        kind: "committed",
+        transitionId: journal.transitionId,
+        deferredAdoption: journal.deferredAdoption,
+        from: journal.from,
+        to: journal.to,
+        startedAt: journal.startedAt,
+      };
     }
 
     const action = await rollbackJournaledArtifactV1(taskFolderUri, journal);
@@ -535,11 +547,15 @@ async function recoverStageEntryJournalPhaseAV1(
 async function recoverAndReplayCommittedJournalV1(
   taskFolderUri: vscode.Uri,
   transitionId: string,
-  deferredAdoption: PlanRevisionAdoptionV1 | undefined
+  deferredAdoption: PlanRevisionAdoptionV1 | undefined,
+  departed?: { readonly from: TaskStage; readonly to: TaskStage; readonly startedAt: string }
 ): Promise<void> {
   await runStageEntryPostCommitV1(taskFolderUri, {
     deferredPlanRevisionAdoption: deferredAdoption,
     journalTransitionId: transitionId,
+    ...(departed && departed.from !== departed.to
+      ? { departedStage: departed.from, departedStageRetireBefore: departed.startedAt }
+      : {}),
   });
 }
 
@@ -563,7 +579,7 @@ export async function recoverStageEntryJournalV1(
 ): Promise<StageEntryJournalRecoveryOutcomeV1> {
   const outcome = await recoverStageEntryJournalPhaseAV1(taskFolderUri);
   if (outcome.kind === "committed") {
-    await recoverAndReplayCommittedJournalV1(taskFolderUri, outcome.transitionId, outcome.deferredAdoption);
+    await recoverAndReplayCommittedJournalV1(taskFolderUri, outcome.transitionId, outcome.deferredAdoption, outcome);
   }
   return outcome;
 }

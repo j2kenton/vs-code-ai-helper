@@ -40,10 +40,11 @@ Then structure your review as:
 - New review-confidence blockers (if any).
 - Non-blocking suggestions (if any).
 
-Record which commit you reviewed. End your response with this marker on its own line, using the exact value shown below (copy it — do not compute or guess a SHA yourself):
+Record which commit you reviewed. End your response with these markers on their own lines, using the exact values shown below (copy them — do not compute or guess a SHA or a fingerprint yourself):
 
 ```
 <!-- reviewed-commit: {{reviewedCommitSha}} -->
+<!-- reviewed-tree-fingerprint: {{reviewedTreeFingerprint}} -->
 <!-- review-pass: {{reviewPass}} -->
 ```
 

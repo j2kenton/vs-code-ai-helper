@@ -923,19 +923,21 @@ void describe("headings without a summary under them are not a summary", () => {
 });
 
 void describe("a plan with a checklist requires the round to echo it", () => {
-  void it("rejects a summary that drops the checklist when the plan has one", () => {
+  void it("accepts a summary that drops the checklist, ticking nothing (RC2 #10)", () => {
+    // A missing echo is no longer a rejection: the round's changed files still
+    // go to review, and it simply ticks nothing.
     const issue = describeImplementationSummaryShapeIssue(WELL_FORMED_SUMMARY, {
       planChecklist: CHECKLIST_PLAN_OF_RECORD,
     });
-    assert.ok(issue, "without the echo, plan progress can never advance");
-    assert.match(issue, /checklist/);
+    assert.equal(issue, undefined);
+    assert.notEqual(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, WELL_FORMED_SUMMARY).kind, "merged");
   });
 
   void it("accepts the same summary when the plan carries no checklist", () => {
     assert.equal(describeImplementationSummaryShapeIssue(WELL_FORMED_SUMMARY, {}), undefined);
   });
 
-  void it("is not satisfied by the checkboxes in a `## Verification` section", () => {
+  void it("never ticks anything from the checkboxes in a `## Verification` section", () => {
     // The prompts specify `## Verification` as "a short checklist", so a
     // compliant summary routinely has checkboxes that are NOT the plan echo.
     // Accepting any checkbox line let that pass the gate while the merge
@@ -953,9 +955,9 @@ void describe("a plan with a checklist requires the round to echo it", () => {
     const issue = describeImplementationSummaryShapeIssue(verificationOnly, {
       planChecklist: CHECKLIST_PLAN_OF_RECORD,
     });
-    assert.ok(issue, "verification checkboxes are not the plan's checklist");
-    assert.match(issue, /checklist/);
-    // Proves the gate and the merge now agree: neither finds anything.
+    // No longer rejected (RC2 #10), and still ticks nothing: the merge reads
+    // only the echo and the round's own claims, never `## Verification`.
+    assert.equal(issue, undefined);
     assert.equal(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, verificationOnly).kind, "no-report");
   });
 
@@ -1563,7 +1565,7 @@ void describe("the echoed checklist is separated from the summary's own sections
     );
   });
 
-  void it("a verification box alone cannot satisfy the echo requirement", () => {
+  void it("a verification box alone ticks nothing", () => {
     const noEcho = [
       "## Files Changed",
       "",
@@ -1576,8 +1578,10 @@ void describe("the echoed checklist is separated from the summary's own sections
     const issue = describeImplementationSummaryShapeIssue(noEcho, {
       planChecklist: PLAN_WITH_DUPES,
     });
-    assert.ok(issue, "a matching verification box is not the plan echo");
-    assert.match(issue, /checklist/);
+    // Accepted (RC2 #10), but a matching verification box is not the plan
+    // echo and ticks nothing.
+    assert.equal(issue, undefined);
+    assert.equal(mergeChecklistProgressV1(PLAN_WITH_DUPES, noEcho).kind, "no-report");
   });
 
   void it("splits a response into the echo and the run's own sections", () => {
@@ -2797,13 +2801,41 @@ void describe("hasContradictoryNoChecklistChangeClaimV1", () => {
     }
   });
 
-  void it("describeImplementationSummaryShapeIssue rejects the round-013 shape with an actionable message", () => {
+  void it("accepts the round-013 shape but ticks nothing from its paraphrased claim (RC2 #10)", () => {
+    // Formerly rejected as self-contradictory. The marker is no longer
+    // decisive; the claim goes through the merge, and a claim naming no real
+    // plan item ticks nothing.
     const issue = describeImplementationSummaryShapeIssue(ROUND_013_SHAPED_RESPONSE, {
       planChecklist: CHECKLIST_PLAN_OF_RECORD,
     });
-    assert.ok(issue, "a contradictory response must be rejected");
-    assert.match(issue, /no-checklist-change/);
-    assert.match(issue, /already ticked in the plan of record/);
+    assert.equal(issue, undefined);
+    assert.notEqual(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, ROUND_013_SHAPED_RESPONSE).kind, "merged");
+  });
+
+  void it("accepts the marker plus an exact, evidenced claim, and ticks that item (RC2 #10)", () => {
+    const plan = ["<!-- ensemble:implementation-checklist -->", "", `- [ ] ${PLAN_ITEM}`].join("\n");
+    const response = [
+      NO_CHECKLIST_CHANGE_MARKER_V1,
+      "This round fixed a review blocker; the item below was already built.",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/foo.ts` — fixed the null check",
+      "",
+      "## Plan Item Checklist",
+      "",
+      `- ${PLAN_ITEM} — done ${RETROACTIVE_TICK_MARKER_V1} — src/views/settingsView.ts:672-675`,
+      "",
+      "## Verification",
+      "",
+      "- ran the unit tests",
+    ].join("\n");
+    assert.equal(describeImplementationSummaryShapeIssue(response, { planChecklist: plan }), undefined);
+    const result = mergeChecklistProgressV1(plan, response);
+    assert.equal(result.kind, "merged");
+    if (result.kind === "merged") {
+      assert.ok(result.content.includes(`- [x] ${PLAN_ITEM}`));
+    }
   });
 
   void it("does not flag a response with neither marker nor claims", () => {
@@ -2910,11 +2942,14 @@ void describe("hasContradictoryNoChecklistChangeClaimV1", () => {
     );
   });
 
-  void it("describeImplementationSummaryShapeIssue rejects the unannotated-done shape", () => {
+  void it("accepts the unannotated-done shape without ticking anything new (RC2 #10)", () => {
     const issue = describeImplementationSummaryShapeIssue(RESPONSE_WITH_UNANNOTATED_DONE_CLAIM, {
       planChecklist: PLAN_WITH_CHECKED_ITEM,
     });
-    assert.match(issue ?? "", /no-checklist-change/);
+    // This fixture has no `## Verification`, which is still required; what
+    // changed is that the marker/claim combination is no longer a rejection.
+    assert.doesNotMatch(issue ?? "", /no-checklist-change/);
+    assert.notEqual(mergeChecklistProgressV1(PLAN_WITH_CHECKED_ITEM, RESPONSE_WITH_UNANNOTATED_DONE_CLAIM).kind, "merged");
   });
 
   const RESPONSE_WITH_ANNOTATED_BUT_EMPTY_EVIDENCE = [
@@ -3017,11 +3052,14 @@ void describe("hasContradictoryNoChecklistChangeClaimV1", () => {
     );
   });
 
-  void it("describeImplementationSummaryShapeIssue rejects the item-text-quotes-the-marker bypass shape", () => {
+  void it("accepts the item-text-quotes-the-marker shape without ticking the unevidenced claim (RC2 #10)", () => {
     const issue = describeImplementationSummaryShapeIssue(RESPONSE_CLAIMING_STEP_21_ITEM_UNANNOTATED, {
       planChecklist: PLAN_WITH_STEP_21_ITEM,
     });
-    assert.match(issue ?? "", /no-checklist-change/);
+    // This fixture has no `## Verification`, which is still required; what
+    // changed is that the marker/claim combination is no longer a rejection.
+    assert.doesNotMatch(issue ?? "", /no-checklist-change/);
+    assert.notEqual(mergeChecklistProgressV1(PLAN_WITH_STEP_21_ITEM, RESPONSE_CLAIMING_STEP_21_ITEM_UNANNOTATED).kind, "merged");
   });
 });
 
@@ -3137,6 +3175,27 @@ void describe("describeIncompleteImplementationRoundV1", () => {
     ].join("\n");
     assert.equal(
       describeIncompleteImplementationRoundV1(complete, { roundChangedFiles: true }),
+      undefined
+    );
+  });
+
+  void it("accepts a complete summary with an incidental phrase match and no checklist echo (RC2 #10)", () => {
+    // Both required sections are present, so the missing echo alone must not
+    // turn an incidental deferral phrase into a deferred round.
+    const complete = [
+      "## Files Changed",
+      "",
+      "- `src/a.ts` — resolver update",
+      "",
+      "## Verification",
+      "",
+      "- run `pnpm test` and check it completes cleanly",
+    ].join("\n");
+    assert.equal(
+      describeIncompleteImplementationRoundV1(complete, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+        roundChangedFiles: true,
+      }),
       undefined
     );
   });

@@ -28,6 +28,7 @@ import {
 } from "../utils/taskOperations";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
+import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import {
   computePublishScopeId,
   invalidatePublishChecksFreshnessStampOnDiskV1,
@@ -381,7 +382,12 @@ export async function runPublishChecks(
       handoffToken: extractAdmissionHandoffTokenV1(explicitArg),
     });
     if (late.outcome !== "acquired") {
-      NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+      NotificationRouter.showWarning(
+        describeWorkAdmissionRefusalV1(
+          late,
+          notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
+        )
+      );
       return dispatched;
     }
     handle = late.handle;
@@ -408,14 +414,14 @@ export async function runPublishChecks(
     publishReconcileOutcome.outcome === "unreadable"
   ) {
     NotificationRouter.showWarning(
-      "Publish checks are only available for tasks that are not paused. Resume the task first."
+      `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)}: Publish checks are only available for tasks that are not paused. Resume the task first.`
     );
     return dispatched;
   }
 
   if (resolvedTask.progress.currentStage !== "publish") {
     NotificationRouter.showWarning(
-      "Publish checks are only available for tasks at the Publish stage."
+      `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)}: Publish checks are only available for tasks at the Publish stage.`
     );
     return dispatched;
   }
@@ -427,7 +433,7 @@ export async function runPublishChecks(
   // too: with no Publish model configured — or its provider disabled —
   // warn and open AI Models instead of running checks whose plan
   // verification would silently be recorded as unavailable.
-  if (!(await ensureStageModelConfigured(taskFolderUri, "publish"))) {
+  if (!(await ensureStageModelConfigured(taskFolderUri, "publish", resolvedTask.progress.displayName))) {
     return dispatched;
   }
 

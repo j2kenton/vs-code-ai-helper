@@ -1,4 +1,8 @@
 import { spawn } from "child_process";
+import { createHash } from "crypto";
+import { promises as fsPromises } from "fs";
+import * as path from "path";
+import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
 
 /**
  * Run a git command with safe argument passing (no shell interpolation).
@@ -70,6 +74,150 @@ export async function resolveHeadCommitSha(folderPath: string): Promise<string |
   try {
     const { stdout } = await runGitCommand(repoRoot, "rev-parse", ["HEAD"]);
     return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** One `git status --porcelain=v2 -z` change record, repo-root-relative paths. */
+interface WorkingTreeStatusEntryV1 {
+  readonly status: string;
+  readonly path: string;
+  readonly origPath?: string;
+}
+
+/**
+ * Parse `git status --porcelain=v2 -z` output. NUL-delimited, so no path
+ * quoting edge case needs handling; a rename/copy record's original path is
+ * the NUL-separated field that follows it (porcelain v2's own convention —
+ * see `git status` docs, "Porcelain Format Version 2").
+ */
+function parseWorkingTreeStatusV2Z(output: string): WorkingTreeStatusEntryV1[] {
+  const tokens = output.split("\0").filter((token) => token.length > 0);
+  const entries: WorkingTreeStatusEntryV1[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i]!;
+    i++;
+    if (token.startsWith("1 ")) {
+      const fields = token.split(" ");
+      const filePath = fields.slice(8).join(" ");
+      if (filePath) {
+        entries.push({ status: fields[1] ?? "", path: filePath });
+      }
+    } else if (token.startsWith("2 ")) {
+      const fields = token.split(" ");
+      const filePath = fields.slice(9).join(" ");
+      const origPath = i < tokens.length ? tokens[i] : undefined;
+      if (origPath !== undefined) {
+        i++;
+      }
+      if (filePath) {
+        entries.push({ status: fields[1] ?? "", path: filePath, origPath });
+      }
+    } else if (token.startsWith("u ")) {
+      const fields = token.split(" ");
+      const filePath = fields.slice(10).join(" ");
+      if (filePath) {
+        entries.push({ status: fields[1] ?? "", path: filePath });
+      }
+    } else if (token.startsWith("? ")) {
+      entries.push({ status: "??", path: token.slice(2) });
+    }
+    // "! " (ignored) entries never appear here: called without `--ignored`.
+  }
+  return entries;
+}
+
+/**
+ * Fingerprint the UNCOMMITTED working tree: `git status --porcelain=v2` (which
+ * non-workflow-control paths changed, and how) plus the diff content of every
+ * tracked path it lists and the raw content of every untracked path. Two
+ * calls return the same digest iff the non-workflow-control working tree is
+ * byte-identical — independent of git HEAD, which never moves while a task's
+ * edits stay uncommitted.
+ *
+ * Exists because `resolveHeadCommitSha` alone cannot see this case (RC1 item
+ * 3): a task's work is uncommitted for its whole lifetime, so a review-dispatch
+ * guard that only compares HEAD SHAs reads a workspace that changed twenty
+ * times since the last review as "unchanged" every time.
+ *
+ * Reuses `classifyWorkflowPathV1` — the same exclusion every other
+ * change-set consumer applies (`sanitizeChangeSetV1`) — so Ensemble's own
+ * bookkeeping (locks, round-progress.md, journals) can never move the
+ * fingerprint on its own.
+ *
+ * `options.excludeAbsolutePaths` additionally drops specific files a caller
+ * knows are OUTPUTS of the very thing being fingerprinted, not inputs to it —
+ * e.g. a review guard must exclude the review artifact it is about to write,
+ * or every dispatch would see its own previous write as "the tree changed"
+ * and could never report "unchanged" even when nothing else did.
+ *
+ * Returns undefined when there is no repo, or git/the filesystem is
+ * unavailable (fail-open, the same convention `resolveHeadCommitSha` uses):
+ * callers must treat undefined as "cannot determine," never as "unchanged."
+ */
+export async function computeWorkingTreeFingerprintV1(
+  folderPath: string,
+  options: { readonly excludeAbsolutePaths?: readonly string[] } = {}
+): Promise<string | undefined> {
+  const repoRoot = await resolveGitRepo(folderPath);
+  if (!repoRoot) {
+    return undefined;
+  }
+  try {
+    const { stdout: statusOut } = await runGitCommand(repoRoot, "status", [
+      "--porcelain=v2",
+      "-z",
+      "--untracked-files=all",
+    ]);
+    const excludedRelative = new Set(
+      (options.excludeAbsolutePaths ?? []).map((absPath) =>
+        path.relative(repoRoot, absPath).replace(/\\/g, "/")
+      )
+    );
+    const entries = parseWorkingTreeStatusV2Z(statusOut)
+      .filter(
+        (entry) =>
+          classifyWorkflowPathV1(entry.path) !== "workflowControl" &&
+          !excludedRelative.has(entry.path) &&
+          (entry.origPath === undefined ||
+            (classifyWorkflowPathV1(entry.origPath) !== "workflowControl" &&
+              !excludedRelative.has(entry.origPath)))
+      )
+      .slice()
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    const hash = createHash("sha256");
+    hash.update(
+      entries.map((entry) => `${entry.status} ${entry.origPath ?? ""} -> ${entry.path}`).join("\n")
+    );
+
+    for (const entry of entries) {
+      if (entry.status === "??") {
+        hash.update(`\n--untracked:${entry.path}--\n`);
+        try {
+          hash.update(await fsPromises.readFile(path.join(repoRoot, entry.path)));
+        } catch {
+          // Deleted/unreadable between status and read: the status line
+          // above already moved the digest, nothing further to fold in.
+        }
+      } else {
+        hash.update(`\n--diff:${entry.path}--\n`);
+        try {
+          const { stdout: diffOut } = await runGitCommand(repoRoot, "diff", [
+            "HEAD",
+            "--",
+            entry.path,
+          ]);
+          hash.update(diffOut);
+        } catch {
+          // No HEAD yet (fresh repo), or a path git diff can't resolve: the
+          // status line above already recorded the change.
+        }
+      }
+    }
+    return hash.digest("hex");
   } catch {
     return undefined;
   }

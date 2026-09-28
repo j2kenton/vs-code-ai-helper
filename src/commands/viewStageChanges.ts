@@ -6,6 +6,7 @@ import { previousVersionUri, hasPreviousVersion } from "../utils/artifactBackups
 import { performJournaledRevertSwap, RevertArtifactMutatedError, revertJournalUri } from "../utils/artifactRevertJournal";
 import { resolveCurrentPlanUri, withPlanFileWriteLockV1, markOwnSaveInFlightV1, clearOwnSaveInFlightV1 } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
 import {
   readRedoSidecar,
@@ -43,6 +44,7 @@ async function artifactFor(node: StageNode): Promise<vscode.Uri | undefined> {
  */
 async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind): Promise<void> {
   if (!node) return;
+  return runWithNotificationTaskContextV1(node.task.progress?.displayName, node.task.folderUri.fsPath, async () => {
   const artifact = await artifactFor(node);
   if (!artifact || !(await hasPreviousVersion(artifact))) {
     NotificationRouter.showInformation(
@@ -324,20 +326,23 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
       });
     }
   );
+  });
 }
 
 export function registerViewStageChangesCommands(context: vscode.ExtensionContext, _inventory: TaskInventory): void {
   context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.viewStageChanges", async (node?: StageNode) => {
     if (!node) return;
-    const artifact = await artifactFor(node);
-    if (!artifact || !(await hasPreviousVersion(artifact))) {
-      NotificationRouter.showInformation(
-        "No previous version is available for this stage yet.",
-        artifact?.fsPath
-      );
-      return;
-    }
-    await vscode.commands.executeCommand("vscode.diff", previousVersionUri(artifact), artifact, `${artifact.path.split("/").pop()} — previous ↔ current`);
+    await runWithNotificationTaskContextV1(node.task.progress?.displayName, node.task.folderUri.fsPath, async () => {
+      const artifact = await artifactFor(node);
+      if (!artifact || !(await hasPreviousVersion(artifact))) {
+        NotificationRouter.showInformation(
+          "No previous version is available for this stage yet.",
+          artifact?.fsPath
+        );
+        return;
+      }
+      await vscode.commands.executeCommand("vscode.diff", previousVersionUri(artifact), artifact, `${artifact.path.split("/").pop()} — previous ↔ current`);
+    });
   }));
   context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.revertStageChanges", async (node?: StageNode) => {
     await performStageSwap(node, "revert");
@@ -347,29 +352,31 @@ export function registerViewStageChangesCommands(context: vscode.ExtensionContex
   }));
   context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.deleteStageBackup", async (node?: StageNode) => {
     if (!node) return;
-    const artifact = await artifactFor(node);
-    if (!artifact || !(await hasPreviousVersion(artifact))) {
-      NotificationRouter.showInformation("No previous version is available to delete.", artifact?.fsPath);
-      return;
-    }
-    // Tracked so it is serialized against a concurrent revert of the same
-    // backup, and so the operation-end event refreshes the tree (clearing
-    // the row's has-backup context token).
-    await runTrackedOperation(
-      node.task.folderUri.fsPath,
-      {
-        label: "Delete Previous Version",
-        stage: node.stage,
-        taskName: resolveWorkflowRootTaskName(
-          node.task.progress?.displayName ?? node.task.folderName,
-          node.task.folderUri.fsPath
-        ),
-      },
-      async () => {
-        await vscode.workspace.fs.delete(previousVersionUri(artifact), { useTrash: true });
-        await deleteRedoSidecar(artifact);
-        NotificationRouter.showInformation("Previous version deleted.", artifact.fsPath);
+    await runWithNotificationTaskContextV1(node.task.progress?.displayName, node.task.folderUri.fsPath, async () => {
+      const artifact = await artifactFor(node);
+      if (!artifact || !(await hasPreviousVersion(artifact))) {
+        NotificationRouter.showInformation("No previous version is available to delete.", artifact?.fsPath);
+        return;
       }
-    );
+      // Tracked so it is serialized against a concurrent revert of the same
+      // backup, and so the operation-end event refreshes the tree (clearing
+      // the row's has-backup context token).
+      await runTrackedOperation(
+        node.task.folderUri.fsPath,
+        {
+          label: "Delete Previous Version",
+          stage: node.stage,
+          taskName: resolveWorkflowRootTaskName(
+            node.task.progress?.displayName ?? node.task.folderName,
+            node.task.folderUri.fsPath
+          ),
+        },
+        async () => {
+          await vscode.workspace.fs.delete(previousVersionUri(artifact), { useTrash: true });
+          await deleteRedoSidecar(artifact);
+          NotificationRouter.showInformation("Previous version deleted.", artifact.fsPath);
+        }
+      );
+    });
   }));
 }

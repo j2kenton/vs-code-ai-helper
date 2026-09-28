@@ -3,7 +3,7 @@
  * Parts 3 and 16 ("make the stage chat a record of work", item 18). Written
  * beside a round's run log: which template rendered it, each named
  * variable's byte size and sha256, the total dispatched-prompt byte size, the
- * total CANONICAL byte size (the same measure the 256 KB transaction limit —
+ * total CANONICAL byte size (the same measure the 512 KB transaction limit —
  * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` — will be enforced against once
  * Part 16 lands `measureCanonicalInputBytesV1`), and whether the
  * plan-of-record content fed into it carried the two sections a review is
@@ -191,7 +191,7 @@ export interface PromptManifestV1 {
    * old figure silently excluded it). Computed with the SAME encoder
    * (`canonicalJsonByteLengthV1`, `structuredQuestionV1.ts`) that determines
    * whether a chat transaction's `inputSnapshot` exceeds
-   * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` (256 KB; item 9's transport
+   * `MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1` (512 KB; item 9's transport
    * limit). Distinct from `totalPromptBytes` only in encoding (this is
    * canonical-JSON-wrapped, that is the raw UTF-8 length): both now measure
    * the same underlying text. Computed via this module's own

@@ -2375,6 +2375,19 @@ export interface ParsedModelSelection {
 }
 
 /**
+ * A stored model id in words: the provider is named, never implied by an id
+ * prefix (RC1 item 12) — `copilot:gpt-5` / bare `gpt-5` → "gpt-5 (GitHub
+ * Copilot)", `codex-cli:gpt-5` → "gpt-5 (<Codex label>)". A provider's default
+ * model (no native name) reads "default model".
+ */
+export function describeModelWithProviderV1(modelId: string | undefined): string {
+  const parsed = parseModelSelection(modelId);
+  const providerName =
+    parsed.provider === "copilot" ? "GitHub Copilot" : (getCliProvider(parsed.provider)?.label ?? parsed.provider);
+  return `${parsed.model ?? "default model"} (${providerName})`;
+}
+
+/**
  * Parse a stored stage model ID into provider + native model name.
  * Bare IDs (no recognized provider prefix) are Copilot model IDs — the
  * pre-provider storage format.

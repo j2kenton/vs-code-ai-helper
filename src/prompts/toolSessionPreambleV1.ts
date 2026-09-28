@@ -139,6 +139,18 @@ function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
       "(use `ensemble_textSearch` and line-range reads to reach it in a large file),",
       "and say in the plan's reasoning what is left of that item.",
       "",
+      // Observed 2026-09-25 (rc1, run 057): a clean review, the next item a
+      // multi-file lock change, and an empty plan justified by the task's own
+      // "keep changes small; this part is risky" wording plus a spent search
+      // budget. Caution about risk is an argument for a small, tested slice,
+      // never for landing nothing.
+      "**A task that says to keep changes small, or calls a part risky, is asking",
+      "for small careful slices, not for no slice.** The careful move on a risky",
+      "item is one well-tested piece of it (a type, a helper and its tests, one",
+      "call site), landed now and reviewed. If you have already verified that the",
+      "earliest unbuilt item is done, say so with file:line evidence in the plan's",
+      "reasoning and build the next unbuilt item instead.",
+      "",
       "An empty `operations` array is therefore only honest when BOTH hold: no",
       "fixable blocker remains, AND no plan step remains unbuilt. An empty plan",
       "while steps remain stalls the task: the next review reports the same",

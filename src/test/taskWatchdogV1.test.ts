@@ -98,6 +98,19 @@ void describe("isImpossibleActiveStateV1 — the watchdog predicate's determinis
     );
   });
 
+  void it("does not flag a task idle at Publish with failed completion checks and nothing owed (RC1 item 9)", () => {
+    const publish = baseProgress({
+      currentStage: "publish",
+      completionChecks: { status: "failed" },
+    } as Partial<TaskProgress>);
+    assert.equal(isImpossibleActiveStateV1({ progress: publish, taskCanonicalId: "task-a", now: Date.parse("2026-06-01T00:00:00.000Z") }), false);
+    // An explicit "automation" claim with nothing behind it is still caught.
+    assert.equal(
+      isImpossibleActiveStateV1({ progress: { ...publish, nextActor: "automation" }, taskCanonicalId: "task-a", now: Date.parse("2026-06-01T00:00:00.000Z") }),
+      true
+    );
+  });
+
   void it("is false for a non-active status, regardless of everything else", () => {
     for (const status of ["paused", "completed", "creating"] as const) {
       assert.equal(

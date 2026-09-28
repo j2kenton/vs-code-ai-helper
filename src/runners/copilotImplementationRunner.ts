@@ -33,6 +33,7 @@ import { looksLikeGeneratedImplementationSummary } from "../utils/implementation
 import { getMaxImplementationIterations } from "../config/settings";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { awaitWorkflowDecisionAnswerV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { TaskStage } from "../types/taskProgress";
@@ -521,8 +522,9 @@ export async function resolveRoundLimitDecisionV1(options: {
   // Genuinely blocking: the loop cannot resume without this choice, so it
   // gets the "can't proceed" error rather than the softer "waiting for
   // feedback" warning used for non-blocking questions.
+  const folderName = (taskFolderUri ?? workspaceUri).fsPath;
   NotificationRouter.showError(
-    `Can't proceed without your input — ${nodePath.basename(workspaceUri.fsPath)}: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
+    `${formatNotificationTaskLabelV1(undefined, folderName)} — Can't proceed without your input: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
   );
   let choice: "Continue" | "Cancel" | undefined;
   if (taskFolderUri && stage) {
@@ -748,6 +750,22 @@ export async function runImplementationWithCopilot(options: {
 
   const filesChanged = new Set<string>();
 
+  // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): clear any stale
+  // in-round bookkeeping a PREVIOUS round left behind (rejected, crashed, or
+  // one that never got this far) before THIS round starts. Without this, the
+  // display-only best-effort merge in effectiveReviewProgress.ts could keep
+  // showing ticks from a round whose report was never accepted, appearing as
+  // live progress on work that was not actually verified (implementation
+  // review blocker, 2026-09-26). Best-effort: a delete failure must never
+  // block dispatch — the file is bookkeeping only, never load-bearing.
+  if (taskFolderUri) {
+    try {
+      await deletePath(vscode.Uri.joinPath(taskFolderUri, "round-progress.md"));
+    } catch {
+      // best-effort — see comment above.
+    }
+  }
+
   // Select model
   let models: vscode.LanguageModelChat[];
   try {
@@ -785,7 +803,7 @@ export async function runImplementationWithCopilot(options: {
   }
   const { model, parsedModel } = resolved;
 
-  onProgress(`Using model: ${model.name}`);
+  onProgress(`Using model: ${model.name} (GitHub Copilot)`);
 
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(prompt),

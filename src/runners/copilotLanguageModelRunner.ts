@@ -62,7 +62,13 @@ export function createCopilotLmTextTransportV1(options: {
       }
       const resolved = resolveCopilotModel(models, options.model);
       if (!resolved.ok) {
-        return { kind: "transportFailure", code: "copilotModelUnresolved" };
+        // Carries the resolver's message (requested model + available ones).
+        const detail = boundedTransportDetailV1(resolved.errorMessage, 600);
+        return {
+          kind: "transportFailure",
+          code: "copilotModelUnresolved",
+          ...(detail !== undefined ? { detail } : {}),
+        };
       }
       const messages = [vscode.LanguageModelChatMessage.User(request.prompt)];
       const requestOptions = buildCopilotRequestOptions(resolved.parsedModel);

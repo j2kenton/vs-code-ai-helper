@@ -35,8 +35,10 @@ import {
   shouldOfferRunImplementationForUnusableSummaryV1,
 } from "../utils/implementationArtifactResolver";
 import { previousVersionUri } from "../utils/artifactBackups";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 
 const FOLDER = vscode.Uri.file("/tasks/2026-08-13_restore-rejected-round");
+const FOLDER_LABEL = formatNotificationTaskLabelV1(undefined, FOLDER.fsPath);
 const REVIEW_URI = vscode.Uri.joinPath(FOLDER, "impl-low-review.md");
 
 const STALE_PLACEHOLDER = [
@@ -449,8 +451,12 @@ void describe("restoreRejectedImplementationRoundV1", () => {
     assert.equal(mem.store.get(summaryUri.toString()), REAL_SUMMARY);
     assert.equal(mem.store.get(REVIEW_URI.toString()), REAL_REVIEW);
     assert.ok(
-      notifications.messages.some((m) => /Nothing to restore/.test(m)),
+      notifications.messages.some((m) => /nothing to restore/i.test(m)),
       "must tell the user there was nothing to restore"
+    );
+    assert.ok(
+      notifications.messages.some((m) => m.includes(FOLDER_LABEL) && /nothing to restore/i.test(m)),
+      "the message must name the task"
     );
   });
 

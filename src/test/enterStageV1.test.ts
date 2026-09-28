@@ -323,6 +323,47 @@ void describe("enterStageV1", () => {
     }
   });
 
+  // RC1 item 9: the departed stage travels on the result so
+  // runStageEntryPostCommitV1 can retire its pending decisions. Plan
+  // generation leaves `desc`; plan revision leaves a review stage for `plan`.
+  void it("reports the departed stage and a start-time cutoff when the stage changes (desc -> plan, review -> plan)", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    try {
+      for (const source of ["desc", "plan-low-review"] as const) {
+        const { folderUri } = makeTaskFolder({ currentStage: source });
+        const before = Date.now();
+        const result = await enterStageV1(folderUri, source, "plan", false, "jump", {
+          transform: (current) => ({ ...current, currentStage: "plan" }),
+        });
+        assert.equal(result.ready, true);
+        assert.ok(result.ready);
+        assert.equal(result.departedStage, source);
+        const cutoff = Date.parse(result.departedStageRetireBefore ?? "");
+        assert.ok(cutoff >= before - 1000 && cutoff <= Date.now() + 1000, "cutoff is this transition's own start time");
+      }
+    } finally {
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("reports no departed stage for a same-stage entry", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    try {
+      const { folderUri } = makeTaskFolder({ currentStage: "plan" });
+      const result = await enterStageV1(folderUri, "plan", "plan", false, "jump", {
+        transform: (current) => current,
+      });
+      assert.ok(result.ready);
+      assert.equal(result.departedStage, undefined);
+    } finally {
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
   // Review fix (2026-09-22, completion blocker): a same-stage transition
   // (sourceStage === destinationStage, e.g. a "Generate Plan" re-run that
   // lands back on "plan" when review mode is off) used to take a separate

@@ -19,6 +19,7 @@ import { recordActiveFallbackModel } from "../runners/runnerRegistry";
 import { runReviewForFolder } from "./reviewActions";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 
 export async function retryReviewWithBackupV1(
   extensionUri: vscode.Uri,
@@ -29,11 +30,12 @@ export async function retryReviewWithBackupV1(
     readonly modelId: string;
   }
 ): Promise<void> {
+  const taskLabel = formatNotificationTaskLabelV1(undefined, input.taskFolderPath);
   const folderUri = vscode.Uri.file(input.taskFolderPath);
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderUri);
   if (!workspaceFolder) {
     NotificationRouter.showWarning(
-      "Could not retry with a different model: this task's workspace is not currently open."
+      `${taskLabel}: could not retry with a different model — this task's workspace is not currently open.`
     );
     return;
   }
@@ -45,13 +47,13 @@ export async function retryReviewWithBackupV1(
     expectedTaskFolder: path.basename(input.taskFolderPath),
   });
   if (!read.ok) {
-    NotificationRouter.showWarning("Could not retry with a different model: the task's progress could not be read.");
+    NotificationRouter.showWarning(`${taskLabel}: could not retry with a different model — the task's progress could not be read.`);
     return;
   }
   const currentStage = read.decoded.progress.currentStage;
   if (REVIEW_TARGETS[currentStage] !== input.stage) {
     NotificationRouter.showWarning(
-      "Could not retry with a different model: the task has since moved past the stage this retry was for."
+      `${formatNotificationTaskLabelV1(read.decoded.progress.displayName, input.taskFolderPath)}: could not retry with a different model — the task has since moved past the stage this retry was for.`
     );
     return;
   }

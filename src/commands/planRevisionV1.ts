@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskStage } from "../types/taskProgress";
@@ -11,7 +12,7 @@ import { applyPlanRevisionPolicyV1 } from "../services/taskProgressFieldPolicyV1
 import { markChecklistChangeProposalDiscardedV1 } from "../utils/taskProgressTransforms";
 import { snapshotPlanForRevisionV1 } from "../utils/implementationArtifactResolver";
 import { enterStageV1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
-import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1, type PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 
 /**
@@ -61,27 +62,31 @@ export type ChecklistChangeProposedDecisionPostResultV1 =
  * "option the system already knows does nothing" item 10 of this same
  * workflow-defects investigation forbids.
  */
-export async function postChecklistChangeProposedDecisionV1(
+export function buildChecklistChangeProposedDecisionInputV1(
   canonicalId: string,
   taskFolderPath: string,
   stage: TaskStage,
-  proposal: ChecklistChangeProposalSummaryV1,
-  displayName?: string
-): Promise<ChecklistChangeProposedDecisionPostResultV1> {
-  const target: ChatTarget = { canonicalId, taskFolderPath, stage, taskName: displayName };
-  const verb = proposal.kind === "added" ? "add to" : proposal.kind === "removed" ? "remove from" : "renumber";
+  proposal: ChecklistChangeProposalSummaryV1
+): PostWorkflowDecisionInputV1 {
+  const added = proposal.proposedItems.length;
+  const dropped = proposal.removedItems.length;
+  const change =
+    proposal.kind === "added"
+      ? `adding ${added} item${added === 1 ? "" : "s"}`
+      : proposal.kind === "removed"
+        ? `removing ${dropped} item${dropped === 1 ? "" : "s"}`
+        : "renumbering the items";
   const whatHappened =
-    `A round tried to ${verb} plan-final.md's checklist item set — a round never mutates the checklist, so the ` +
-    "item set was reverted to what it read at the start of the round." +
-    (proposal.proposedItems.length > 0
-      ? `\n\nProposed additions (discarded):\n${proposal.proposedItems.map((item) => `- ${item}`).join("\n")}`
+    `A round tried to change plan-final.md's checklist by ${change}. A round never changes the checklist, so ` +
+    "the checklist was put back exactly as it read at the start of the round; the plan on disk is unchanged." +
+    (added > 0
+      ? `\n\nItems the round wanted to add (not in the plan):\n${proposal.proposedItems.map((item) => `- ${item}`).join("\n")}`
       : "") +
-    (proposal.removedItems.length > 0
-      ? `\n\nDropped items (restored):\n${proposal.removedItems.map((item) => `- ${item}`).join("\n")}`
+    (dropped > 0
+      ? `\n\nItems the round dropped (put back):\n${proposal.removedItems.map((item) => `- ${item}`).join("\n")}`
       : "");
 
-  const decision = await postWorkflowDecisionV1(
-    {
+  return {
       decisionKey: "checklistChangeProposed",
       taskCanonicalId: canonicalId,
       stage,
@@ -99,8 +104,9 @@ export async function postChecklistChangeProposedDecisionV1(
           // process rather than merely unpausing.
           resumeKind: "continue",
           consequence:
-            "Moves the task back to Plan carrying this proposal — plan generation and both plan reviews run " +
-            "again before Implementation resumes. Existing ticks are preserved; nothing already done is lost.",
+            "Moves the task back to Plan carrying this change: plan generation and both plan reviews run again " +
+            "(several AI rounds) before Implementation resumes, so nothing is built until they finish. Existing " +
+            "ticks are preserved; nothing already done is lost.",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.reviseChecklistChangeProposalConfirmed",
@@ -109,9 +115,11 @@ export async function postChecklistChangeProposedDecisionV1(
         },
         {
           optionId: "discard",
-          label: "Discard the proposal",
+          label: "Keep the plan as it is",
           resumeKind: "unpause",
-          consequence: "Leaves plan-final.md exactly as it reads now. The proposal is dropped and nothing changes.",
+          consequence:
+            "Leaves plan-final.md exactly as it reads now and drops this proposal. Implementation carries on " +
+            "with the current checklist; no extra rounds run.",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.discardChecklistChangeProposalConfirmed",
@@ -120,10 +128,12 @@ export async function postChecklistChangeProposedDecisionV1(
         },
       ],
       recommendation: {
-        kind: "none",
+        kind: "option",
+        optionId: "discard",
         reasoning:
-          "Whether discovered work belongs in the plan of record versus a later task is a scoping call the " +
-          "system has no basis to make for you.",
+          "Keeping the plan costs nothing and loses nothing: the work continues against the checklist you " +
+          "already approved. Choose Revise the plan only if the discovered work must be part of this task — " +
+          "it costs a full re-plan and two plan reviews.",
       },
       gating: {
         holdsTaskPaused: false,
@@ -132,7 +142,19 @@ export async function postChecklistChangeProposedDecisionV1(
           "This does not pause or resume the task. Implementation continues against the reverted checklist " +
           "either way while this is pending.",
       },
-    },
+  };
+}
+
+export async function postChecklistChangeProposedDecisionV1(
+  canonicalId: string,
+  taskFolderPath: string,
+  stage: TaskStage,
+  proposal: ChecklistChangeProposalSummaryV1,
+  displayName?: string
+): Promise<ChecklistChangeProposedDecisionPostResultV1> {
+  const target: ChatTarget = { canonicalId, taskFolderPath, stage, taskName: displayName };
+  const decision = await postWorkflowDecisionV1(
+    buildChecklistChangeProposedDecisionInputV1(canonicalId, taskFolderPath, stage, proposal),
     target
   );
   return decision ? { kind: "posted" } : { kind: "noContext" };
@@ -190,9 +212,10 @@ export async function reviseChecklistChangeProposalConfirmedV1(
     );
     return;
   }
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const proposalAt = normalized?.proposalAt;
   if (!proposalAt) {
-    NotificationRouter.showError("Revise the plan: missing the proposal this decision resolves.");
+    NotificationRouter.showError(`${taskLabel}: revise the plan: missing the proposal this decision resolves.`);
     return;
   }
 
@@ -202,7 +225,7 @@ export async function reviseChecklistChangeProposalConfirmedV1(
     journaledPlanRef = await snapshotPlanForRevisionV1(folderUri);
   } catch (error) {
     NotificationRouter.showError(
-      `Revise the plan could not run: the pre-revision plan-final.md could not be journaled (${
+      `${taskLabel}: revise the plan could not run: the pre-revision plan-final.md could not be journaled (${
         error instanceof Error ? error.message : String(error)
       }).`
     );
@@ -218,7 +241,7 @@ export async function reviseChecklistChangeProposalConfirmedV1(
   // extra `precondition` is needed beyond the built-in stale-source-stage CAS.
   const preflightProgress = await readTaskProgressStrictV1(folderUri);
   if (!preflightProgress.ok) {
-    NotificationRouter.showError("Revise the plan failed: task-progress.json could not be read.");
+    NotificationRouter.showError(`${taskLabel}: revise the plan failed: task-progress.json could not be read.`);
     return;
   }
   const sourceStage = preflightProgress.decoded.progress.currentStage;
@@ -271,12 +294,12 @@ export async function reviseChecklistChangeProposalConfirmedV1(
     if (entryResult.cause instanceof PlanRevisionPolicyFailureError) {
       NotificationRouter.showWarning(
         entryResult.cause.code === "checklistChangeProposalNotPending"
-          ? "This proposal was already resolved — nothing to revise."
-          : `Revise the plan could not run: ${entryResult.cause.message}`
+          ? `${taskLabel}: this proposal was already resolved — nothing to revise.`
+          : `${taskLabel}: revise the plan could not run: ${entryResult.cause.message}`
       );
       return;
     }
-    NotificationRouter.showError(`Revise the plan failed: ${entryResult.reason}`);
+    NotificationRouter.showError(`${taskLabel}: revise the plan failed: ${entryResult.reason}`);
     return;
   }
 
@@ -290,7 +313,7 @@ export async function reviseChecklistChangeProposalConfirmedV1(
   // task-progress.json fresh, so it needs nothing carried over from this
   // transition beyond the folder path.
   NotificationRouter.showInformation(
-    "Moved to Plan for revision. Generating the plan again to incorporate the discovered change — " +
+    `${taskLabel}: moved to Plan for revision. Generating the plan again to incorporate the discovered change — ` +
       "Implementation and later reviews will re-run once the revised plan is finalized."
   );
   await vscode.commands.executeCommand("vs-code-ai-helper.generatePlanWithAI", {
@@ -325,9 +348,10 @@ export async function discardChecklistChangeProposalConfirmedV1(
     );
     return;
   }
+  const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const proposalAt = normalized?.proposalAt;
   if (!proposalAt) {
-    NotificationRouter.showError("Discard the proposal: missing the proposal this decision resolves.");
+    NotificationRouter.showError(`${taskLabel}: discard the proposal: missing the proposal this decision resolves.`);
     return;
   }
 
@@ -343,7 +367,7 @@ export async function discardChecklistChangeProposalConfirmedV1(
     "checklistChangeProposed",
     "this checklist-change proposal has already been revised or discarded"
   );
-  NotificationRouter.showInformation("Discarded the proposed checklist change. plan-final.md is unchanged.");
+  NotificationRouter.showInformation(`${taskLabel}: discarded the proposed checklist change. plan-final.md is unchanged.`);
 }
 
 export function registerPlanRevisionCommandsV1(

@@ -2223,7 +2223,7 @@ void describe("describeOwedContinuationRowIndicatorV1", () => {
       0
     );
     assert.ok(indicator);
-    assert.match(indicator.description, /Continuation owed — next attempt \d{1,2}:\d{2}/);
+    assert.match(indicator.description, /Continuation owed — will retry after \d{1,2}:\d{2}/);
   });
 
   void it("reports budget-exhausted distinctly, with no fabricated next-attempt time", () => {
@@ -2233,7 +2233,7 @@ void describe("describeOwedContinuationRowIndicatorV1", () => {
     );
     assert.ok(indicator);
     assert.match(indicator.description, /budget exhausted, needs your input/);
-    assert.doesNotMatch(indicator.description, /next attempt/);
+    assert.doesNotMatch(indicator.description, /will retry after/);
   });
 });
 

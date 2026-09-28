@@ -28,6 +28,7 @@ import {
 import {
   cliDisplayLabel,
   CliProviderDefinition,
+  describeModelWithProviderV1,
   getCliProvider,
   getProviderAccountEntry,
   normalizeQualifiedModelId,
@@ -137,7 +138,7 @@ export function resolveEffectiveProvider(
       if (isModelProviderDisabled(modelId)) {
         const account = getProviderAccountEntry(providerAccountIdForModelId(modelId));
         throw new Error(
-          `The selected model ("${modelId}") belongs to ${account?.label ?? def.label}, which is disabled in Provider Selection. ` +
+          `The selected model (${describeModelWithProviderV1(modelId)}) belongs to ${account?.label ?? def.label}, which is disabled in Provider Selection. ` +
             "Enable the provider or choose another model in AI Models."
         );
       }
@@ -161,7 +162,7 @@ export function resolveEffectiveProvider(
     if (isModelProviderDisabled(modelId)) {
       const account = getProviderAccountEntry(providerAccountIdForModelId(modelId));
       throw new Error(
-        `The selected model ("${modelId}") belongs to ${account?.label ?? "Copilot"}, which is disabled in Provider Selection. ` +
+        `The selected model (${describeModelWithProviderV1(modelId)}) belongs to ${account?.label ?? "Copilot"}, which is disabled in Provider Selection. ` +
           "Enable the provider or choose another model in AI Models."
       );
     }

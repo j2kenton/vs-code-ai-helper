@@ -11,6 +11,11 @@ import {
 } from "../config/settings";
 import { NotificationRouter } from "./notificationRouter";
 import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattendedExecutionV1";
+import {
+  describeAutomationDefaultV1,
+  isAutomationDispatchContextV1,
+} from "../state/automationDispatchContextV1";
+import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -46,17 +51,27 @@ import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattende
 export async function checkAndConfirmPromptSize(
   prompt: string,
   providerLabel: string,
-  backupProviderCount = 0
+  backupProviderCount = 0,
+  /**
+   * The task this prompt belongs to, when the caller has one — every call
+   * site but the Global Assistant's does. Used only to name the task in the
+   * notifications below; never affects the size check itself.
+   */
+  task?: { displayName?: string; folderPath: string }
 ): Promise<"ok" | "confirmed" | "declined" | "abort"> {
   const bytes = measurePromptBytes(prompt);
+  const taskLabel = task ? formatNotificationTaskLabelV1(task.displayName, task.folderPath) : undefined;
+  const withTaskLabel = (message: string): string => (taskLabel ? `${taskLabel} — ${message}` : message);
 
   // Hard ceiling — no override
   if (bytes > PROMPT_TOTAL_MAX_BYTES) {
     const kb = Math.round(bytes / 1024);
     const ceiling = Math.round(PROMPT_TOTAL_MAX_BYTES / 1024);
     NotificationRouter.showError(
-      `⛔ Prompt is too large to send (${kb} KB). The hard limit is ${ceiling} KB. ` +
-        `Reduce the number of open editors, close large files, or shorten your task description.`
+      withTaskLabel(
+        `⛔ Prompt is too large to send (${kb} KB). The hard limit is ${ceiling} KB. ` +
+          `Reduce the number of open editors, close large files, or shorten your task description.`
+      )
     );
     return "abort";
   }
@@ -76,8 +91,25 @@ export async function checkAndConfirmPromptSize(
       // quota — and the relay reports the reason instead of hanging.
       const kb = Math.round(bytes / 1024);
       NotificationRouter.showWarning(
-        unattendedRefusalV1(`Sending a ~${kb} KB prompt to ${providerLabel}`) +
-          " (turn off the large-request warning in Ensemble Settings to send prompts this size without asking.)"
+        withTaskLabel(
+          unattendedRefusalV1(`Sending a ~${kb} KB prompt to ${providerLabel}`) +
+            " (turn off the large-request warning in Ensemble Settings to send prompts this size without asking.)"
+        )
+      );
+      return "declined";
+    }
+    if (isAutomationDispatchContextV1()) {
+      // Automation-driven round: no human can answer the modal below. Decline
+      // (the safe answer — it is the user's quota), say so, and name the
+      // setting that lets prompts this size through unattended.
+      const kbAuto = Math.round(bytes / 1024);
+      console.log(describeAutomationDefaultV1(`Sending a ~${kbAuto} KB prompt to ${providerLabel}`, "declined"));
+      NotificationRouter.showWarning(
+        withTaskLabel(
+          `An automated round did not send a ~${kbAuto} KB prompt to ${providerLabel}: large prompts need a confirmation ` +
+            "and no one was attached to give it. Turn off the large-request warning in Ensemble Settings to let " +
+            "automated rounds send prompts this size, then run the action again."
+        )
       );
       return "declined";
     }
@@ -90,8 +122,10 @@ export async function checkAndConfirmPromptSize(
         `${backupProviderCount} configured backup model${backupProviderCount === 1 ? "" : "s"}.`
       : "";
     const choice = await vscode.window.showWarningMessage(
-      `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` +
-        `This may use significant quota.${backupNote} Continue?`,
+      withTaskLabel(
+        `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` +
+          `This may use significant quota.${backupNote} Continue?`
+      ),
       { modal: true },
       PROCEED,
       PROCEED_DONT_ASK

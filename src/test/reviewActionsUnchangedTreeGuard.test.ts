@@ -23,6 +23,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewActions";
+import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,
@@ -89,7 +90,7 @@ after(() => {
  * `REVIEW_TARGETS["impl"] === "impl-high-review"`, so this is the MAPPED
  * SOURCE STAGE case the review flagged as still bypassing the guard.
  */
-function makeUnchangedTreeTaskFolder(name: string): { folderPath: string } {
+async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: string }> {
   const folderPath = path.join(REAL_ROOT, "plans", name);
   fs.mkdirSync(folderPath, { recursive: true });
   const progress: TaskProgress = {
@@ -110,9 +111,26 @@ function makeUnchangedTreeTaskFolder(name: string): { folderPath: string } {
   fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
   fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
   fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+  // The review guard now requires BOTH markers to match (RC1 item 3): the
+  // commit AND a digest of the uncommitted working tree at the moment this
+  // fixture is considered "already reviewed". Computed here, against the
+  // exact same REAL_ROOT the guard will check against, right after every
+  // other fixture file above is in place and before the guard runs — so it
+  // is the true live fingerprint, not a hand-picked stand-in. The target
+  // artifact itself (about to be written below) is excluded, mirroring the
+  // production guard's own exclusion of its self-referential output.
+  const reviewPath = path.join(folderPath, "impl-high-review.md");
+  const fingerprint =
+    (await computeWorkingTreeFingerprintV1(REAL_ROOT, {
+      excludeAbsolutePaths: [
+        reviewPath,
+        previousVersionUri(vscode.Uri.file(reviewPath)).fsPath,
+      ],
+    })) ?? "unknown";
   fs.writeFileSync(
-    path.join(folderPath, "impl-high-review.md"),
-    `Readiness: 7/10\n\n- Looks fine.\n\n<!-- reviewed-commit: ${REAL_ROOT_HEAD_SHA} -->\n`,
+    reviewPath,
+    `Readiness: 7/10\n\n- Looks fine.\n\n<!-- reviewed-commit: ${REAL_ROOT_HEAD_SHA} -->\n` +
+      `<!-- reviewed-tree-fingerprint: ${fingerprint} -->\n`,
     "utf8"
   );
   return { folderPath };
@@ -377,7 +395,7 @@ function makeFastForwardExtensionContext(): vscode.ExtensionContext {
 
 void describe("runReviewForFolder — unchanged-tree guard at the command boundary (A1 1.0.0 gate, Part C Step 5)", () => {
   void it("silently refuses an AUTOMATION dispatch against an unchanged tree from a MAPPED SOURCE STAGE, and never touches model resolution or the provider", async () => {
-    const { folderPath } = makeUnchangedTreeTaskFolder(`auto-unchanged-${Math.floor(Math.random() * 1e9)}`);
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`auto-unchanged-${Math.floor(Math.random() * 1e9)}`);
     const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
@@ -434,7 +452,7 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
   });
 
   void it("shows a cancellable modal for an INTERACTIVE dispatch against an unchanged tree from a MAPPED SOURCE STAGE, and refuses on cancel without touching model resolution", async () => {
-    const { folderPath } = makeUnchangedTreeTaskFolder(`interactive-unchanged-${Math.floor(Math.random() * 1e9)}`);
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`interactive-unchanged-${Math.floor(Math.random() * 1e9)}`);
     const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
@@ -499,7 +517,17 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
   });
 
   void it("proceeds with a real dispatch when the interactive bypass is chosen, even though the tree is unchanged", async () => {
-    const { folderPath } = makeUnchangedTreeTaskFolder(`interactive-bypass-${Math.floor(Math.random() * 1e9)}`);
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`interactive-bypass-${Math.floor(Math.random() * 1e9)}`);
+    // A review with zero changed files now refuses on its own (RC1 item 5).
+    // The task tracks one changed file, so the interactive bypass of the
+    // unchanged-tree guard is what decides whether the dispatch runs.
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const trackedProgress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify({ ...trackedProgress, implReviewFiles: ["src/a.ts"] }, null, 2),
+      "utf8"
+    );
     const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
@@ -535,7 +563,8 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       const artifactAfter = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
       assert.ok(
         artifactAfter.includes("Readiness: 3/10"),
-        `bypassing the guard must let a real re-review overwrite the artifact; got: ${artifactAfter}`
+        `bypassing the guard must let a real re-review overwrite the artifact; got: ${artifactAfter}; ` +
+          `notifications: ${JSON.stringify(recorder.notifications)}`
       );
     } finally {
       windowTarget.showWarningMessage = origShowWarning;
@@ -741,6 +770,69 @@ void describe("fastForwardReviewWithAI — offers Restore Last Usable Summary wh
         fs.existsSync(path.join(folderPath, "impl-high-review.md")),
         false,
         "no review artifact must be written when both refusals fire before any provider work"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+/**
+ * RC1 item 9 (f3 Part 9): pressing Fast Forward right after the task moved onto
+ * a review stage — before any review artifact exists for it — must START with
+ * the review, never refuse with "No review found" (that wording belongs to
+ * Apply Review, which genuinely needs an existing review). The stage here is
+ * the review stage itself (`impl-high-review`), the post-transition shape; the
+ * describe block above covers the pre-review source stage (`impl`).
+ */
+void describe("fastForwardReviewWithAI — a review stage with no review artifact yet runs the initial review (RC1 item 9)", () => {
+  void it("reaches the initial-review branch and never reports 'No review found'", async () => {
+    const { folderPath } = makeUnusableSummaryTaskFolder(`ff-post-transition-${Math.floor(Math.random() * 1e9)}`);
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify({ ...progress, currentStage: "impl-high-review" as TaskStage }, null, 2),
+      "utf8"
+    );
+    assert.equal(
+      fs.existsSync(path.join(folderPath, "impl-high-review.md")),
+      false,
+      "fixture must have no review artifact"
+    );
+
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    ];
+
+    try {
+      await fastForwardReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+
+      assert.equal(
+        recorder.notifications.some((n) => /No review found/i.test(n.message)),
+        false,
+        `Fast Forward must not refuse for a missing review; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      // The initial review was dispatched and refused by the unusable
+      // implementation summary — Fast Forward's OWN wording proves the
+      // "no review yet" branch ran the review rather than stopping earlier.
+      assert.ok(
+        recorder.notifications.some((n) => n.message.includes("nothing to fast-forward from")),
+        `expected the initial-review branch to have run; got: ${JSON.stringify(recorder.notifications)}`
       );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }

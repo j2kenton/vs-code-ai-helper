@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { isViewerHostV1 } from "../state/hostRoleV1";
@@ -21,6 +22,8 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
 import {
   readTextIfExists,
@@ -603,7 +606,12 @@ export async function chatWithStage(
       });
       if (late.outcome !== "acquired") {
         await endTargetResolutionOnceV1();
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        NotificationRouter.showWarning(
+          describeWorkAdmissionRefusalV1(
+            late,
+            notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)
+          )
+        );
         return;
       }
       handle = late.handle;
@@ -625,9 +633,7 @@ export async function chatWithStage(
     // completeCommitAndPushTask already do.
     const chatReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
     if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
-      NotificationRouter.showWarning(
-        "Chat send is only available for tasks that are not paused. Resume the task first."
-      );
+      showPausedTaskRefusalV1("sending a message", task.taskFolderPath, task.progress.displayName);
       return;
     }
 
@@ -783,7 +789,10 @@ async function chatWithStageSendV1(
     );
     const prompt = buildStageResponsePrompt(STAGE_DISPLAY_NAMES[targetStage], task.folderName, taskArtifacts,
       await generateContextPack(taskFolderUri, workspaceFolder.uri), message, conversation);
-    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+      displayName: task.progress.displayName,
+      folderPath: task.taskFolderPath,
+    });
     if (sizeCheck === "abort" || sizeCheck === "declined") return;
 
     const validatedInput: ChatSendActionInputV1 = {
@@ -800,6 +809,8 @@ async function chatWithStageSendV1(
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceFolder.uri.fsPath,
       resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+      taskDisplayName: task.progress.displayName,
+      taskFolderPath: task.taskFolderPath,
     });
 
     // Admission (plan §5.4/AC-CHAT-TX-02): eligibility, input validation,
@@ -895,7 +906,9 @@ async function chatWithStageSendV1(
       // Nothing was ever written to chat-v1.json for this send, so report
       // the failure as a notification rather than an assistant reply with
       // no visible user message to answer.
-      NotificationRouter.showError(`Unable to send: ${text}`);
+      NotificationRouter.showError(
+        `${notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)}: unable to send: ${text}`
+      );
     }
     return;
   }
@@ -1031,8 +1044,9 @@ export async function dispatchProposedBlockerSupersessionEditV1(
     );
     return;
   }
+  const folderName = path.basename(taskFolderPath);
   const choice = await vscode.window.showWarningMessage(
-    `Apply the drafted update to "${proposedEdit.relPath}"?\n\nThis would resolve the blocker:\n"${proposedEdit.blockerDescription}"\n\n` +
+    `${folderName}: apply the drafted update to "${proposedEdit.relPath}"?\n\nThis would resolve the blocker:\n"${proposedEdit.blockerDescription}"\n\n` +
       "A fresh review is the stronger confirmation, but is not required for this write to land.",
     { modal: true },
     "Apply Update"
@@ -1115,6 +1129,8 @@ export async function resumeChatSendInteractionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: ownedTask.progress.currentStage }),
+    taskDisplayName: ownedTask.progress.displayName,
+    taskFolderPath: ownedTask.taskFolderPath,
   });
   const orchestrator = getProductionActionConversationOrchestratorV1();
 

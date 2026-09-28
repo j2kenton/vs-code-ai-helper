@@ -8,6 +8,7 @@ import { notificationFallbackUri } from "../utils/notificationContentProvider";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { REVIEW_TARGETS } from "../utils/reviewReadiness";
+import { describeModelWithProviderV1 } from "../runners/providers";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -396,7 +397,12 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         element.detail ?? element.activity ?? (element.waitingForUser ? "waiting for you" : "running");
       const elapsedOrigin = element.activityStartedAt ?? element.startedAt;
       const elapsedSegment = formatElapsedForDisplay(elapsedOrigin);
-      item.description = [stageLabel, activitySegment, element.modelId, elapsedSegment]
+      item.description = [
+        stageLabel,
+        activitySegment,
+        element.modelId ? describeModelWithProviderV1(element.modelId) : undefined,
+        elapsedSegment,
+      ]
         .filter((segment): segment is string => segment !== undefined && segment.length > 0)
         .join(" · ");
 

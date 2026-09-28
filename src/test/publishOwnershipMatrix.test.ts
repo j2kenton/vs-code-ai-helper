@@ -44,6 +44,7 @@ import {
   getImplementationSummaryUri,
 } from "../utils/implementationArtifactResolver";
 import { previousVersionUri } from "../utils/artifactBackups";
+import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
@@ -1655,8 +1656,9 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "impl-low-review");
       const gate = provider
         .getEntries()
-        .find((entry) => entry.message === "Code reviews passed — advance to Publish when you're ready.");
+        .find((entry) => entry.message.endsWith("Code reviews passed — advance to Publish when you're ready."));
       assert.ok(gate, "expected the plain gate message");
+      assert.match(gate.message, /\(Low-Level Code Review\)/, "expected the task/stage attribution prefix");
       assert.equal(gate?.actionCommand?.command, "vs-code-ai-helper.nextStage");
       assert.equal(dispatches.length, 0, "the gate message must not advance anything by itself");
     } finally {
@@ -2624,7 +2626,7 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
  * `automationDispatch: true` caller with nobody attached to answer a modal.
  */
 void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the command boundary (A1 1.0.0-gate Part C, Step 5)", () => {
-  function existingReviewAgainstHead(headSha: string, readiness = 7): string {
+  function existingReviewAgainstHead(headSha: string, fingerprint: string, readiness = 7): string {
     return [
       "Readiness: " + readiness + "/10",
       "",
@@ -2636,6 +2638,7 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
       "<!-- blockers:end -->",
       "",
       `<!-- reviewed-commit: ${headSha} -->`,
+      `<!-- reviewed-tree-fingerprint: ${fingerprint} -->`,
       "",
       "<!-- progress: 5/5 -->",
       "",
@@ -2648,13 +2651,24 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
     options: { automationDispatch?: boolean; showWarningResult?: string | undefined }
   ): Promise<{ invokeCount: number; folderPath: string }> {
     const { folderPath } = makeTaskFolder(name, "impl-low-review");
-    fs.writeFileSync(
-      path.join(folderPath, "impl-low-review.md"),
-      existingReviewAgainstHead(reviewMarkerSha),
-      "utf8"
-    );
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
+    // Fingerprint computed AFTER every other fixture file (including
+    // context-pack.md above) is in place and BEFORE the review artifact
+    // itself is written — the guard excludes that artifact (and its backup)
+    // from its own fingerprint, mirroring the production exclusion in
+    // runReviewForFolder, so this is the exact value the guard will recompute
+    // and compare against moments later.
+    const reviewUri = vscode.Uri.file(path.join(folderPath, "impl-low-review.md"));
+    const fingerprint =
+      (await computeWorkingTreeFingerprintV1(REAL_ROOT, {
+        excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
+      })) ?? "unknown";
+    fs.writeFileSync(
+      reviewUri.fsPath,
+      existingReviewAgainstHead(reviewMarkerSha, fingerprint),
+      "utf8"
+    );
 
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);

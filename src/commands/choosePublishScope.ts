@@ -117,10 +117,11 @@ export async function promptAndPersistPublishScope(
   taskFolderUri: vscode.Uri,
   options?: { title?: string; currentRelPath?: string }
 ): Promise<string | undefined> {
+  const folderName = path.basename(taskFolderUri.fsPath);
   const base = await resolvePickerRoot(taskFolderUri);
   if (base.kind === "stale-binding") {
     NotificationRouter.showWarning(
-      `The task's recorded project root ("${base.projectRoot}") no longer exists, so there ` +
+      `${folderName}: the task's recorded project root ("${base.projectRoot}") no longer exists, so there ` +
         "is no valid folder to offer as a Publish verification scope. Re-bind the task to " +
         "its project and try again."
     );
@@ -128,7 +129,7 @@ export async function promptAndPersistPublishScope(
   }
   if (base.kind === "unbound") {
     NotificationRouter.showWarning(
-      "The task is not inside an open workspace folder and has no project binding to verify against."
+      `${folderName}: the task is not inside an open workspace folder and has no project binding to verify against.`
     );
     return undefined;
   }
@@ -212,7 +213,7 @@ export async function choosePublishScope(
   // external-metadata-root tasks too.
   const stored = await readTaskProgressStrictV1(taskFolderUri);
   NotificationRouter.showInformation(
-    `Publish verification scope set to ${
+    `${resolved.folderName}: Publish verification scope set to ${
       (stored.ok ? stored.decoded.progress.publishScopePath : undefined) ?? "the project root"
     }.`
   );

@@ -18,7 +18,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 
-import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import {
+  computeWorkingTreeFingerprintV1,
+  countCommitsSinceSha,
+  resolveHeadCommitSha,
+} from "../utils/gitRepoInfo";
 import { parseReviewedCommitSha } from "../utils/reviewReadiness";
 import { selectReconciliationInstruction } from "../commands/reviewActions";
 import { STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD } from "../utils/reviewRouting";
@@ -84,6 +88,111 @@ void describe("gitRepoInfo: resolveHeadCommitSha / countCommitsSinceSha (2i)", (
     try {
       const count = await countCommitsSinceSha(repoRoot, "0000000000000000000000000000000000dead");
       assert.strictEqual(count, undefined);
+    } finally {
+      safeRemoveDir(repoRoot);
+    }
+  });
+});
+
+/**
+ * RC1 item 3: `computeWorkingTreeFingerprintV1` fingerprints the UNCOMMITTED
+ * working tree, since HEAD alone never moves while a task's edits stay
+ * uncommitted — the exact case that let the unchanged-tree review guard read
+ * a genuinely-edited tree as "unchanged" (reviewFreshness.test.ts covers the
+ * guard predicate itself; this covers the fingerprint it now depends on).
+ */
+void describe("gitRepoInfo: computeWorkingTreeFingerprintV1 (RC1 item 3)", () => {
+  void it("returns undefined outside a git repo", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-tree-fingerprint-nogit-"));
+    try {
+      assert.strictEqual(await computeWorkingTreeFingerprintV1(dir), undefined);
+    } finally {
+      safeRemoveDir(dir);
+    }
+  });
+
+  void it("is stable across repeated calls when nothing changed", async () => {
+    const { repoRoot } = makeRepoWithCommits(1);
+    try {
+      fs.writeFileSync(path.join(repoRoot, "untracked.txt"), "hello");
+      const first = await computeWorkingTreeFingerprintV1(repoRoot);
+      const second = await computeWorkingTreeFingerprintV1(repoRoot);
+      assert.ok(first, "expected a real digest, not undefined");
+      assert.strictEqual(first, second);
+    } finally {
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("changes when an untracked file's content changes — HEAD never moves for uncommitted edits", async () => {
+    const { repoRoot } = makeRepoWithCommits(1);
+    try {
+      fs.writeFileSync(path.join(repoRoot, "untracked.txt"), "version-1");
+      const before = await computeWorkingTreeFingerprintV1(repoRoot);
+      fs.writeFileSync(path.join(repoRoot, "untracked.txt"), "version-2");
+      const after = await computeWorkingTreeFingerprintV1(repoRoot);
+      assert.notStrictEqual(before, after);
+    } finally {
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("changes when a TRACKED file is edited without committing", async () => {
+    const { repoRoot } = makeRepoWithCommits(1);
+    try {
+      const before = await computeWorkingTreeFingerprintV1(repoRoot);
+      fs.writeFileSync(path.join(repoRoot, "file.txt"), "edited-but-uncommitted");
+      const after = await computeWorkingTreeFingerprintV1(repoRoot);
+      assert.notStrictEqual(before, after);
+    } finally {
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("ignores a workflow-control path (e.g. task-progress.json), reusing the shared exclusion list", async () => {
+    const { repoRoot } = makeRepoWithCommits(1);
+    try {
+      const before = await computeWorkingTreeFingerprintV1(repoRoot);
+      fs.writeFileSync(
+        path.join(repoRoot, "task-progress.json"),
+        JSON.stringify({ some: "state" })
+      );
+      const after = await computeWorkingTreeFingerprintV1(repoRoot);
+      assert.strictEqual(
+        before,
+        after,
+        "Ensemble's own bookkeeping must never move the fingerprint on its own"
+      );
+    } finally {
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("excludes a caller-named path via excludeAbsolutePaths — a review guard's own output must not fingerprint itself", async () => {
+    const { repoRoot } = makeRepoWithCommits(1);
+    try {
+      const excluded = path.join(repoRoot, "review-output.md");
+      const beforeExcluded = await computeWorkingTreeFingerprintV1(repoRoot, {
+        excludeAbsolutePaths: [excluded],
+      });
+      const beforePlain = await computeWorkingTreeFingerprintV1(repoRoot);
+
+      fs.writeFileSync(excluded, "a review artifact rewritten every dispatch");
+
+      const afterExcluded = await computeWorkingTreeFingerprintV1(repoRoot, {
+        excludeAbsolutePaths: [excluded],
+      });
+      assert.strictEqual(
+        beforeExcluded,
+        afterExcluded,
+        "an excluded path's own changes must never move the fingerprint"
+      );
+
+      // Sanity: the same edit, WITHOUT the exclusion, does move the fingerprint —
+      // proving the equality above comes from the exclusion, not from the write
+      // failing to register at all.
+      const afterPlain = await computeWorkingTreeFingerprintV1(repoRoot);
+      assert.notStrictEqual(beforePlain, afterPlain);
     } finally {
       safeRemoveDir(repoRoot);
     }

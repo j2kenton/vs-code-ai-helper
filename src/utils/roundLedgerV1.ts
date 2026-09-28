@@ -507,7 +507,7 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
     if (outcome.taskMdSizeBand) {
       const kb = Math.round(outcome.taskMdSizeBand.taskMdBytes / 1024);
       parts.push(
-        `task.md is ${kb} KB — ${outcome.taskMdSizeBand.percentOfLimit}% of the review-input limit; this task may want splitting`
+        `task.md is ${kb} KB — ${outcome.taskMdSizeBand.percentOfLimit}% of the review-input limit; shorten task.md (once a plan exists, reviews only receive its first part)`
       );
     }
   }

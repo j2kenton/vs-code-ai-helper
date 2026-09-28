@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
@@ -316,7 +317,7 @@ async function reviewCommitMessage(
     }
     if (result.kind === "questionsPosted") {
       NotificationRouter.showWarning(
-        "Commit and Push needs more information before it can generate a commit message. " +
+        `${formatNotificationTaskLabelV1(taskName, taskFolderUri.fsPath)} — Commit and Push needs more information before it can generate a commit message. ` +
           "Answer the question in Chat With AI, then start Commit and Push again."
       );
     }
@@ -330,6 +331,7 @@ async function reviewCommitMessage(
   let message = generated.text;
   for (;;) {
     const confirmText =
+      `${formatNotificationTaskLabelV1(taskName, taskFolderUri.fsPath)}\n\n` +
       `Commit message:\n\n${message}\n\n` +
       `Files (${scopedFiles.length} total):\n${fileList}${moreNote}\n\n` +
       `Destination: ${pushDestination}`;
@@ -424,6 +426,8 @@ async function buildCommitMessage(
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceUri.fsPath,
       resolveStagePrimaryModel: () => ({ modelId, stage: "publish" }),
+      taskDisplayName: taskName,
+      taskFolderPath: taskFolderUri.fsPath,
     });
 
     const targetLocator = { rootId, relativePath: `runs/commit-metadata-${Date.now()}.json` };
@@ -533,6 +537,8 @@ async function resumeCommitMessage(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "publish" }),
+    taskDisplayName: taskName,
+    taskFolderPath: taskFolderUri.fsPath,
   });
   const orchestrator = getProductionActionConversationOrchestratorV1();
 
@@ -1075,6 +1081,11 @@ function extractFirstH1(content: string): string | undefined {
 // still as its H1, it must never surface as if it were a real task title.
 const TASK_DESCRIPTION_PLACEHOLDER =
   /^describe the work you want to do here/i;
+
+/** The normalized, display-name-first task label for Commit and Push text. */
+function commitPushTaskLabel(resolvedTask: ResolvedTaskContext): string {
+  return formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
+}
 
 /**
  * Resolve a human-readable task title for user-facing text (e.g. the
@@ -1795,7 +1806,7 @@ export async function runCommitPushCompletionChecksV1(
   while (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
     const choice = await vscode.window.showWarningMessage(
-      `Completion checks failed for "${resolvedTask.folderName}"${summary}.\n\n` +
+      `${commitPushTaskLabel(resolvedTask)}: completion checks failed${summary}.\n\n` +
         "Publish Anyway records the failing checks in the Publish review. " +
         "Fix with AI applies automatic and AI fixes using the failing check output, then re-runs the checks.",
       { modal: true },
@@ -1937,12 +1948,12 @@ export async function resolveCommitPushStagingScopeV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushScopeResultV1> => {
       NotificationRouter.emitProgressSummary(
-        `Committing and pushing ${resolvedTask.folderName}...`,
+        `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
         taskOperations.rootOperationIdFor(resolvedTask.taskFolderPath)
       );
       try {
@@ -1973,7 +1984,7 @@ export async function resolveCommitPushStagingScopeV1(
             unstagedOutput.trim().length > 0 || untrackedOutput.trim().length > 0;
           if (hasUnstagedChanges) {
             const choice = await vscode.window.showWarningMessage(
-              `This repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
+              `${commitPushTaskLabel(resolvedTask)} — this repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
                 "Commit everything together (staged and unstaged changes in one commit), " +
                 "or cancel to handle the existing staged changes manually first.",
               { modal: true },
@@ -2007,7 +2018,7 @@ export async function resolveCommitPushStagingScopeV1(
           }
 
           const choice = await vscode.window.showInformationMessage(
-            "No source code changes found outside the task folder.\n\n" +
+            `${commitPushTaskLabel(resolvedTask)} — no source code changes found outside the task folder.\n\n` +
               "Only the task's planning files (in the task folder) have changed. " +
               "Include the task folder in this commit instead?",
             { modal: true },
@@ -2023,7 +2034,7 @@ export async function resolveCommitPushStagingScopeV1(
           if (scopedFiles.length === 0) {
             // All task-folder changes were run artifacts
             const artifactChoice = await vscode.window.showWarningMessage(
-              "The only changes in the task folder are run artifacts " +
+              `${commitPushTaskLabel(resolvedTask)} — the only changes in the task folder are run artifacts ` +
                 "(runs/, context-pack.md). " +
                 "These are excluded from the default staged set because they " +
                 "contain AI prompts and file contents.\n\n" +
@@ -2097,7 +2108,7 @@ export async function confirmCommitPushScopeV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (): Promise<CommitPushConfirmResultV1> => {
@@ -2173,7 +2184,7 @@ export async function confirmCommitPushScopeV1(
             : "";
 
         const confirmMessage =
-          `⚠️ Commit and push — please review carefully\n\n` +
+          `⚠️ Commit and push ${commitPushTaskLabel(resolvedTask)} — please review carefully\n\n` +
           `Scope: ${scopeLabel}\n` +
           `Branch: ${currentBranch}\n` +
           `Destination: ${pushDestination}\n\n` +
@@ -2296,12 +2307,12 @@ export async function saveCommitPushDocumentsV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushSaveResultV1> => {
       NotificationRouter.emitProgressSummary(
-        `Committing and pushing ${resolvedTask.folderName}...`,
+        `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
         taskOperations.rootOperationIdFor(resolvedTask.taskFolderPath)
       );
       try {
@@ -2359,7 +2370,7 @@ export async function generateCommitPushPrDescriptionV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushPrDescriptionResultV1> => {
@@ -2453,7 +2464,7 @@ export async function reviewCommitPushMessageV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushMessageReviewResultV1> => {
@@ -2542,7 +2553,7 @@ export async function stageAndCommitCommitPushV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushStageAndCommitResultV1> => {
@@ -2628,7 +2639,7 @@ export async function pushCommitPushV1(
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      title: `Committing and pushing ${commitPushTaskLabel(resolvedTask)}...`,
       cancellable: false,
     },
     async (progress): Promise<CommitPushPushResultV1> => {
@@ -2645,7 +2656,7 @@ export async function pushCommitPushV1(
         }
         return {
           kind: "completed",
-          detail: `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`,
+          detail: `Successfully committed and pushed ${commitPushTaskLabel(resolvedTask)} to ${pushDestination}`,
         };
       } catch (error) {
         // Push failed after commit was created — keep the local commit.
@@ -2690,7 +2701,7 @@ export async function invokeCommitPushRowV1(
   const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
   if (!derivedBinding.ok) {
     NotificationRouter.showError(
-      `Commit and push failed: this task's ownership binding could not be verified. ` +
+      `${commitPushTaskLabel(resolvedTask)} — commit and push failed: this task's ownership binding could not be verified. ` +
         `The task's progress file needs recovery.`
     );
     return;
@@ -2704,6 +2715,7 @@ export async function invokeCommitPushRowV1(
     taskStatus: resolvedTask.progress.status ?? "active",
     taskStage: resolvedTask.progress.currentStage,
     rawInput: { taskFolderPath: resolvedTask.taskFolderPath },
+    taskDisplayName: resolvedTask.progress.displayName,
     // The row's `execute` (commitPushRowV1.ts) must act on this EXACT
     // resolved/bound task, never re-resolve one from mutable current-task
     // state — see the coordinator-native step functions' header comments
@@ -2745,7 +2757,7 @@ export async function invokeCommitPushRowV1(
     // their own now-redundant (but still present, defense-in-depth) stage
     // check.
     NotificationRouter.showWarning(
-      `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
+      `${commitPushTaskLabel(resolvedTask)} — task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
     return;
   }
@@ -2753,7 +2765,7 @@ export async function invokeCommitPushRowV1(
   // action already holding this task's lease) — nothing has told the user
   // anything yet.
   const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
-  NotificationRouter.showError(`Commit and push could not start: ${detail}.`);
+  NotificationRouter.showError(`${commitPushTaskLabel(resolvedTask)} — commit and push could not start: ${detail}.`);
 }
 
 /**
@@ -2921,7 +2933,12 @@ export async function commitAndPushTask(
         commandId: "commitAndPushTask",
       });
       if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        NotificationRouter.showWarning(
+          describeWorkAdmissionRefusalV1(
+            late,
+            notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
+          )
+        );
         return;
       }
       handle = late.handle;
@@ -2942,7 +2959,7 @@ export async function commitAndPushTask(
       commitPushReconcileOutcome.outcome === "unreadable"
     ) {
       NotificationRouter.showWarning(
-        "Commit and Push is only available for tasks that are not paused. Resume the task first."
+        `${commitPushTaskLabel(resolvedTask)} — Commit and Push is only available for tasks that are not paused. Resume the task first.`
       );
       return;
     }
@@ -3183,7 +3200,12 @@ export async function completeCommitAndPushTask(
         commandId: "completeCommitAndPushTask",
       });
       if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        NotificationRouter.showWarning(
+          describeWorkAdmissionRefusalV1(
+            late,
+            notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
+          )
+        );
         return;
       }
       handle = late.handle;
@@ -3223,7 +3245,7 @@ export async function completeCommitAndPushTask(
         return;
       }
       NotificationRouter.showWarning(
-        `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
+        `${commitPushTaskLabel(resolvedTask)} — "Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
       );
       return;
     }
@@ -3232,6 +3254,7 @@ export async function completeCommitAndPushTask(
     // next-task selection, and the commit/push itself (registered below as a
     // child of this root, so it never contends for the lock this root holds).
     const lockKey = resolvedTask.taskFolderPath;
+    const completeTaskLabel = commitPushTaskLabel(resolvedTask);
     await runTrackedOperation(
       lockKey,
       { label: "Complete, Commit and Push", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "complete-commit-push" },
@@ -3255,7 +3278,7 @@ export async function completeCommitAndPushTask(
       const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
       if (!derivedBinding.ok) {
         NotificationRouter.showError(
-          `Could not complete ${resolvedTask.folderName}: its ownership binding could not be verified. ` +
+          `${completeTaskLabel}: could not complete — its ownership binding could not be verified. ` +
             `The task's progress file needs recovery.`
         );
         return;
@@ -3294,11 +3317,12 @@ export async function completeCommitAndPushTask(
           expectedSourceStage: "impl-low-review",
           targetStage: "publish",
         },
+        taskDisplayName: resolvedTask.progress.displayName,
       });
       if (stageOutcome.kind !== "completed") {
         const detail = stageOutcome.kind === "failed" ? stageOutcome.code : stageOutcome.kind;
         NotificationRouter.showWarning(
-          `Could not persist completion for ${resolvedTask.folderName}: ${detail}.`
+          `${completeTaskLabel}: could not persist completion (${detail}).`
         );
         return;
       }
@@ -3319,11 +3343,12 @@ export async function completeCommitAndPushTask(
         taskStatus: "active",
         taskStage: "publish",
         rawInput: { taskFolderPath: resolvedTask.taskFolderPath },
+        taskDisplayName: resolvedTask.progress.displayName,
       });
       if (doneOutcome.kind !== "completed") {
         const detail = doneOutcome.kind === "failed" ? doneOutcome.code : doneOutcome.kind;
         NotificationRouter.showError(
-          `Could not persist completion for ${resolvedTask.folderName}: ${detail}. Please try again.`
+          `${completeTaskLabel}: could not persist completion (${detail}). Please try again.`
         );
         return;
       }

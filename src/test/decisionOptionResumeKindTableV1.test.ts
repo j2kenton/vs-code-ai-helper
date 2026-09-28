@@ -166,6 +166,7 @@ const INVENTORY: readonly InventoryRow[] = [
   // src/commands/handoffChecksV1.ts
   { file: "commands/handoffChecksV1.ts", optionId: "tick-${index}", occurrence: 0, resumeKind: "continue", dispatchProof: "handoffChecksV1 tick options re-post the successor card or dispatch the stage action" },
   { file: "commands/handoffChecksV1.ts", optionId: "acceptRest", occurrence: 0, resumeKind: "continue", dispatchProof: "handoffChecksV1 acceptRest dispatches the stage action once nothing remains" },
+  { file: "commands/handoffChecksV1.ts", optionId: "advance", occurrence: 0, resumeKind: "continue", dispatchProof: "settleChecklistItemV1.test.ts: advance runs completeStageAnywayV1 (the registered force-advance command) for the task folder" },
   { file: "commands/handoffChecksV1.ts", optionId: "notYet", occurrence: 0, resumeKind: "unpause", dispatchProof: "handoffChecksV1 notYet dispatches nothing" },
 
   // src/runners/copilotImplementationRunner.ts
@@ -436,6 +437,15 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
     kind: "runtime-test",
     proofFiles: ["handoffOnlyStopV1.test.ts"],
     extraAnchors: ["dispatchStageAction"],
+  }],
+  // advance: a `continue` option whose effect is the registered force-advance
+  // command (completeStageAnywayV1 → nextStage(..., true)) for the task
+  // folder; settleChecklistItemV1.test.ts asserts the card's effect, and
+  // nextStageBlockerGateV1.test.ts executes the real registered handler
+  // (`completeStageAnywayV1`) and asserts the task's persisted stage moves.
+  [rowKey("commands/handoffChecksV1.ts", "advance", 0), {
+    kind: "runtime-test",
+    proofFiles: ["settleChecklistItemV1.test.ts", "nextStageBlockerGateV1.test.ts"],
   }],
   // notYet: NOT doNothing (a decision must resolve to some effect when
   // chosen — handoffChecksV1.ts:119-120's own comment). Its command

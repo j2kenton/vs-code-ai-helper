@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { enterStageV1 } from "../utils/stageTransition";
+import { enterStageV1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
 import { formatPlanRevisionProposalVariableV1, listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readNonEmptyText } from "../utils/fileUtils";
@@ -25,6 +25,8 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
+import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
@@ -369,7 +371,9 @@ export async function generatePlanWithAI(
         handoffToken: extractAdmissionHandoffTokenV1(arg),
       });
       if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(late));
+        NotificationRouter.showWarning(
+          describeWorkAdmissionRefusalV1(late, notificationTaskDisplayNameV1(undefined, taskFolderUri.fsPath))
+        );
         return;
       }
       handle = late.handle;
@@ -387,11 +391,13 @@ export async function generatePlanWithAI(
     // task a human has paused, so it gates here too.
     const reconciled = await reconcileWatchdogPauseAgainstAdmissionV1(taskFolderUri);
     if (reconciled.outcome === "unreadable") {
-      NotificationRouter.showError(`Could not read task progress for ${taskFolderUri.fsPath}.`);
+      NotificationRouter.showError(
+        `Could not read task progress for ${notificationTaskDisplayNameV1(undefined, taskFolderUri.fsPath)}.`
+      );
       return;
     }
     if (reconciled.outcome === "userPaused") {
-      NotificationRouter.showInformation("This task is paused. Resume it before generating a plan.");
+      showPausedTaskRefusalV1("generating a plan", taskFolderUri.fsPath);
       return;
     }
 
@@ -430,7 +436,7 @@ export async function generatePlanWithAI(
     }
     if (!resolvedForDisplay) {
       NotificationRouter.showError(
-        `Task at "${lockKey}" could not be resolved. It may have been deleted or moved.`
+        `Task ${notificationTaskDisplayNameV1(undefined, lockKey)} could not be resolved. It may have been deleted or moved.`
       );
       return;
     }
@@ -541,7 +547,8 @@ type ResolveGeneratePlanCoordinatorFailureV1 =
  */
 async function resolveGeneratePlanCoordinatorV1(
   taskFolderUri: vscode.Uri,
-  workspaceFolderUri: vscode.Uri
+  workspaceFolderUri: vscode.Uri,
+  taskDisplayName?: string
 ): Promise<
   | { readonly ok: true; readonly value: ResolvedGeneratePlanCoordinatorV1 }
   | { readonly ok: false; readonly failure: ResolveGeneratePlanCoordinatorFailureV1 }
@@ -564,6 +571,8 @@ async function resolveGeneratePlanCoordinatorV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "plan" as TaskStage }),
+    taskDisplayName,
+    taskFolderPath: taskFolderUri.fsPath,
   });
   return { ok: true, value: { coordinator, providerLabel, modelLabel: nativeModelId, modelId } };
 }
@@ -612,6 +621,7 @@ export async function handleGeneratePlanOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: GeneratePlanOutcomeContextV1
 ): Promise<GeneratePlanOutcomeResultV1> {
+  return runWithNotificationTaskContextV1(ctx.taskRef.taskName, ctx.taskRef.taskFolderPath, async () => {
   const taskFolderUri = vscode.Uri.file(ctx.taskRef.taskFolderPath);
   const planFileUri = vscode.Uri.joinPath(taskFolderUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
 
@@ -677,6 +687,12 @@ export async function handleGeneratePlanOutcomeV1(
     if (entryResult?.ready) {
       succeeded = true;
       triggerAutoReview = ctx.effectiveReviewMode !== "off";
+      // RC1 item 9: retire a decision left pending on the stage just left
+      // (e.g. a `desc`-stage card). Best-effort inside; never blocks the
+      // auto-review this path still triggers.
+      await runStageEntryPostCommitV1(taskFolderUri, entryResult).catch((postCommitError: unknown) => {
+        console.error("generatePlanWithAI: stage-entry post-commit work failed", postCommitError);
+      });
       await safeOpenTextDocument(planFileUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
       NotificationRouter.showInformation(`${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} generated.`);
     } else {
@@ -767,6 +783,7 @@ export async function handleGeneratePlanOutcomeV1(
   );
 
   return { succeeded, triggerAutoReview, runLogUri };
+  });
 }
 
 async function generatePlanWithAIForResolvedTask(
@@ -784,6 +801,7 @@ async function generatePlanWithAIForResolvedTask(
    */
   effectiveReviewMode: AutoTriggerMode
 ): Promise<GeneratePlanResult> {
+  return runWithNotificationTaskContextV1(undefined, taskFolderUri.fsPath, async () => {
   // A direct URI is not an ownership proof. Require the live inventory to
   // resolve it so this command cannot write into an unrelated workspace.
   const ownedTask = inventory.getTaskByPath(taskFolderUri.fsPath);
@@ -798,7 +816,7 @@ async function generatePlanWithAIForResolvedTask(
     return { succeeded: false, triggerAutoReview: false };
   }
 
-  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri);
+  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri, ownedTask.progress.displayName);
   if (!resolved.ok) {
     if (resolved.failure.kind === "noModel") {
       NotificationRouter.showWarning(
@@ -884,7 +902,10 @@ async function generatePlanWithAIForResolvedTask(
   );
 
   // ── Prompt-size gate (BEFORE any artifact is written) ────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
+    displayName: revisionProgress.ok ? revisionProgress.decoded.progress.displayName : undefined,
+    folderPath: taskFolderUri.fsPath,
+  });
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return { succeeded: false, triggerAutoReview: false };
   }
@@ -1002,6 +1023,7 @@ async function generatePlanWithAIForResolvedTask(
       }
     );
   return { succeeded, triggerAutoReview, taskFolderPath: taskFolderUri.fsPath };
+  });
 }
 
 /**
@@ -1031,7 +1053,7 @@ export async function resumeGeneratePlanInteractionV1(
     return { ok: false, reason: "the task has no owning workspace" };
   }
 
-  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri);
+  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri, ownedTask.progress.displayName);
   if (!resolved.ok) {
     return {
       ok: false,

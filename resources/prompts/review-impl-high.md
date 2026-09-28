@@ -15,7 +15,9 @@ Plans built across multiple implementation rounds. A plan larger than one implem
 
 Plan progress — this marker binds EXACTLY to the plan of record's own checklist; you never invent your own unit of "step." When the Implementation Notes below carry a generated checklist (it opens with `<!-- ensemble:implementation-checklist -->`), the denominator is that checklist's TOTAL top-level item count and the numerator is however many of those top-level items are settled — ticked `- [x]`, PLUS any item whose line ENDS WITH the literal marker `<!-- ensemble:excluded -->` (closed WITHOUT doing the work: descoped, superseded, or a branch not taken). The marker only counts as an exclusion when it is appended to the end of the item's own line, exactly as production applies it (`trimEnd().endsWith(...)`) — an item whose text merely mentions or quotes that marker string elsewhere in its sentence (for example, an unbuilt step that describes adding the marker to OTHER items) is not excluded and stays outstanding. Count directly from the checklist exactly as written on disk; do not re-group, re-derive, or narrow it from prose, and do not count an indented child line nested under a top-level item — those are discovered sub-work the implementation records outside this denominator (see below) and never move it.
 
-End your response with this marker on its own line:
+Ensemble has already counted this checklist for you: **{{checklistProgress}}** (settled/total). That is the figure to report, and the figure the task view shows regardless of what you write — report exactly it. If it reads `unknown`, Ensemble could not read the checklist; count it as described above. If you believe the on-disk checklist itself is wrong (an item ticked but not done, or the reverse), say so as a blocker or a `## Verified Complete` entry — never by reporting a different number.
+
+End your response with this marker on its own line (the numbers below are an example only):
 
 ```
 <!-- progress: 6/18 -->
@@ -63,10 +65,11 @@ Readiness: N/10
 - Review-confidence blockers (if any).
 - Non-blocking suggestions (if any).
 
-Record which commit you reviewed. End your response with this marker on its own line, using the exact value shown below (copy it — do not compute or guess a SHA yourself):
+Record which commit you reviewed. End your response with these markers on their own lines, using the exact values shown below (copy them — do not compute or guess a SHA or a fingerprint yourself):
 
 ```
 <!-- reviewed-commit: {{reviewedCommitSha}} -->
+<!-- reviewed-tree-fingerprint: {{reviewedTreeFingerprint}} -->
 <!-- review-pass: {{reviewPass}} -->
 ```
 

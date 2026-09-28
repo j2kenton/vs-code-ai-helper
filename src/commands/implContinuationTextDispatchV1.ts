@@ -124,6 +124,8 @@ export interface SummaryOnlyContinuationOptionsV1 {
   readonly taskStage: TaskStage;
   readonly token: vscode.CancellationToken;
   readonly onProgress: (message: string) => void;
+  /** The task's display name, for notification labels. */
+  readonly taskDisplayName?: string;
 }
 
 /**
@@ -197,6 +199,8 @@ export async function runSummaryOnlyContinuationV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: options.workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: options.modelId, stage: "impl" }),
+    taskDisplayName: options.taskDisplayName,
+    taskFolderPath: options.taskFolderUri.fsPath,
     // The no-edit-AND-honoured-response-contract premise this dispatch exists
     // to enforce must hold for whichever candidate actually runs, not only
     // the one probed at selection time (review blocker, 2026-08-14): a
@@ -346,6 +350,8 @@ export interface SealedEditReportOptionsV1 {
   readonly taskStage: TaskStage;
   readonly token: vscode.CancellationToken;
   readonly onProgress: (message: string) => void;
+  /** The task's display name, for notification labels. */
+  readonly taskDisplayName?: string;
 }
 
 /**
@@ -376,5 +382,6 @@ export async function runSealedEditContinuationReportV1(
     taskStage: options.taskStage,
     token: options.token,
     onProgress: options.onProgress,
+    taskDisplayName: options.taskDisplayName,
   });
 }

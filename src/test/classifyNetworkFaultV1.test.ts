@@ -50,6 +50,12 @@ void describe("classifyNetworkFaultV1", () => {
     assert.equal(classifyNetworkFaultV1(new Error("socket hang up")), true);
   });
 
+  void it("recognizes Copilot's server-side request cancellation (rc1 run 072)", () => {
+    assert.equal(classifyNetworkFaultV1(new Error("canceled by server")), true);
+    assert.equal(classifyNetworkFaultV1(new Error("Request Failed: Canceled by server")), true);
+    assert.equal(classifyNetworkFaultV1(new Error("cancelled by server")), true);
+  });
+
   void it("does not classify an upstream inference/model fault as a network fault", () => {
     // item 14's Fireworks NaN-in-generation case: a structured 400 from the
     // inference host, not a transport-level drop. It is already

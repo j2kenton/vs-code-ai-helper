@@ -553,6 +553,33 @@ export function parseReviewedCommitSha(content: string): string | undefined {
 }
 
 /**
+ * Global (not first-match), same reason as {@link REVIEWED_COMMIT_RE}: the
+ * instruction that asks for this marker shows a worked example, and the LAST
+ * occurrence is the one a reviewer was told to end its response with. Matches
+ * a sha256 hex digest or the literal `unknown` fallback
+ * ({@link computeWorkingTreeFingerprintV1} returning undefined, e.g. no repo).
+ */
+const REVIEWED_TREE_FINGERPRINT_RE =
+  /<!--\s*reviewed-tree-fingerprint:\s*([0-9a-f]{64}|unknown)\s*-->/gi;
+
+/**
+ * Parse the machine-readable `<!-- reviewed-tree-fingerprint: HASH -->`
+ * marker an implementation/publish review is asked to emit alongside
+ * `reviewed-commit` (RC1 item 3): a digest of the UNCOMMITTED working tree at
+ * dispatch time (see `computeWorkingTreeFingerprintV1`, gitRepoInfo.ts),
+ * which `reviewed-commit` alone cannot capture because HEAD never moves while
+ * a task's edits stay uncommitted. Returns undefined when absent (older
+ * artifact, or a provider that ignored the instruction) or when the recorded
+ * value is the `unknown` fallback — callers must treat both the same as
+ * "cannot determine," never as "definitely unchanged."
+ */
+export function parseReviewedTreeFingerprintV1(content: string): string | undefined {
+  const match = [...content.matchAll(REVIEWED_TREE_FINGERPRINT_RE)].at(-1);
+  const value = match?.[1];
+  return value === "unknown" ? undefined : value;
+}
+
+/**
  * Global (not first-match), matching {@link REVIEWED_COMMIT_RE}'s own reason:
  * the instruction shows a worked example, and the LAST occurrence in the
  * reply is the authoritative one.
@@ -947,10 +974,23 @@ export function computeReviewFreshness(
  * review ran; treating it as "unchanged" would refuse (or silently skip,
  * under automation) the very re-review Apply Review depends on after every
  * implementation round.
+ *
+ * RC1 item 3: HEAD alone is not enough even without a banner miss — a task's
+ * edits stay uncommitted for its whole lifetime, so HEAD never moves and a
+ * commit-only comparison reads a tree that changed by hand (not through an
+ * implementation round, so no banner was ever written) as "unchanged" every
+ * time. `currentTreeFingerprint` (the live digest from
+ * `computeWorkingTreeFingerprintV1`) is compared against the artifact's own
+ * `reviewed-tree-fingerprint` marker; the two must both be known AND equal to
+ * report "unchanged" — an absent recorded marker (an artifact written before
+ * this check existed) or an unresolvable current fingerprint (git
+ * unavailable) is "cannot determine," which this function treats the same as
+ * every other unreadable signal here: it must never read as "unchanged."
  */
 export function isReviewDispatchAgainstUnchangedTreeV1(
   existingReviewContent: string | undefined,
-  headSha: string | undefined
+  headSha: string | undefined,
+  currentTreeFingerprint: string | undefined
 ): boolean {
   if (!existingReviewContent || !headSha) {
     return false;
@@ -959,7 +999,14 @@ export function isReviewDispatchAgainstUnchangedTreeV1(
     return false;
   }
   const freshness = computeReviewFreshness(existingReviewContent, headSha);
-  return freshness.reviewedSha !== undefined && !freshness.behindHead;
+  if (freshness.reviewedSha === undefined || freshness.behindHead) {
+    return false;
+  }
+  if (currentTreeFingerprint === undefined) {
+    return false;
+  }
+  const recordedFingerprint = parseReviewedTreeFingerprintV1(existingReviewContent);
+  return recordedFingerprint !== undefined && recordedFingerprint === currentTreeFingerprint;
 }
 
 /**

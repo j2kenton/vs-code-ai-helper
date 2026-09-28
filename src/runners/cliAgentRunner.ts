@@ -40,7 +40,13 @@ import {
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
 import { readPackageScripts } from "../utils/completionLint";
-import { beginRoundProcessRecordingV1, recordRoundProcessV1 } from "../state/roundProcessRecordV1";
+import {
+  abandonProcessSpawnAttemptV1,
+  beginProcessSpawnAttemptV1,
+  beginRoundProcessRecordingV1,
+  recordRoundProcessV1,
+} from "../state/roundProcessRecordV1";
+import { currentRoundProcessRecordingTargetV1 } from "../state/roundProcessContextV1";
 import { readOtherProcessStartEpochMsV1 } from "../state/processStartTimeProbeV1";
 
 /**
@@ -2102,6 +2108,9 @@ export function createCliTextTransportV1(options: {
     options.diagnosisTailMaxBytes ?? MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1;
   return {
     runnerId: def.id,
+    // Cancel and every watchdog settle only after the child is confirmed gone
+    // (`terminateThenFinish`), so the broker must not settle ahead of it.
+    confirmsProcessExitBeforeSettling: true,
     invoke(
       request: AgentExecutionRequestV1,
       output: BoundedResultWriterV1
@@ -2214,6 +2223,33 @@ export function createCliTextTransportV1(options: {
           };
         }
 
+        // Record every CLI this transport spawns next to the admission lock
+        // the calling operation holds (roundProcessContextV1.ts), so a dead-
+        // owner cleanup after a crash can find and stop it. The same hard
+        // pre-spawn condition as execCliAgent's: a CLI that could never be
+        // proven gone later is not started. No lock context (a call path that
+        // holds no admission) skips recording, unchanged from before.
+        const recordingTarget = currentRoundProcessRecordingTargetV1();
+        if (recordingTarget !== undefined) {
+          const began = await beginRoundProcessRecordingV1(recordingTarget.taskFolderPath, recordingTarget.claimId);
+          if (!began) {
+            cleanupPromptFile();
+            return {
+              kind: "transportFailure",
+              code: "cliProcessRecordUnavailable",
+              detail:
+                `could not record this round's process bookkeeping before starting ${def.label}, so it was not started; ` +
+                "retrying should succeed once the workspace state store is writable again",
+            };
+          }
+        }
+        // Display-only argv for the record; the argv transport's full prompt
+        // is never persisted (same redaction as execCliAgent).
+        const commandForRecord = [
+          resolvedCommand,
+          ...(promptTransport === "argv" ? [...args.slice(0, -1), "<prompt omitted>"] : args),
+        ].join(" ");
+
         const capture = createCliStdoutResultCaptureV1(output);
         // Structured-event CLIs buffer raw stdout for post-exit extraction
         // (see the function doc comment); opaque-text CLIs stream directly.
@@ -2246,6 +2282,13 @@ export function createCliTextTransportV1(options: {
           new Promise<CliTextAttemptResultV1>((resolve) => {
             let settled = false;
             let cancelled = false;
+            // Mirrors the legacy execCliAgent path's `recordingPromise`: every
+            // settle path below (finishTerminal/finishTextCompleted) awaits
+            // this before actually resolving, so the caller's admission lock
+            // is never released while a post-spawn process-record write (or
+            // its abandonment fallback, below) is still in flight. Starts
+            // resolved — a run with no recording target/pid never delays.
+            let pendingRecordSettlement: Promise<void> = Promise.resolve();
             const rawEventChunks: Buffer[] = [];
             let rawEventBytes = 0;
             // 2026-09-15 post-freeze findings, item 4: maintained alongside
@@ -2275,17 +2318,49 @@ export function createCliTextTransportV1(options: {
                 detached: process.platform !== "win32",
               });
             } catch (error) {
+              // cp.spawn threw: no OS process was ever created, so the
+              // spawn-attempt increment taken before this call (below, at
+              // the call site) must be proven abandoned — otherwise it would
+              // permanently look like an unconfirmed, possibly-still-running
+              // CLI to a later dead-owner cleanup. Assigned into
+              // pendingRecordSettlement (rather than fired with `void`) and
+              // awaited before resolving, so a crash between resolve() and
+              // the abandonment write landing can never leave the claim
+              // looking unconfirmed.
+              if (recordingTarget !== undefined) {
+                pendingRecordSettlement = abandonProcessSpawnAttemptV1(
+                  recordingTarget.taskFolderPath,
+                  recordingTarget.claimId
+                );
+              }
               const detail = boundedTransportDetailV1(error);
-              resolve({
-                kind: "terminal",
-                exit: {
-                  kind: "transportFailure",
-                  code: "cliSpawnFailed",
-                  ...(detail !== undefined ? { detail } : {}),
-                },
-              });
+              void pendingRecordSettlement.then(() =>
+                resolve({
+                  kind: "terminal",
+                  exit: {
+                    kind: "transportFailure",
+                    code: "cliSpawnFailed",
+                    ...(detail !== undefined ? { detail } : {}),
+                  },
+                })
+              );
               return;
             }
+
+            // Set once this transport has decided to stop the child itself
+            // (Cancel, a watchdog, an oversized stream, a failed process
+            // record). From then on `terminateThenFinish` owns settlement: the
+            // ordinary close/error/data handlers stand down, so nothing can
+            // settle this attempt before the child is CONFIRMED gone.
+            let terminating = false;
+            // Set by the child's own `close` event (Node's tracking of this
+            // exact child, immune to pid reuse); `childExitedPromise` lets the
+            // wait below react to it immediately instead of on a poll tick.
+            let childExited = false;
+            let resolveChildExited: (() => void) | undefined;
+            const childExitedPromise = new Promise<void>((resolveExit) => {
+              resolveChildExited = resolveExit;
+            });
 
             const finishTerminal = (exit: AgentTransportExitV1): void => {
               if (settled) {
@@ -2297,7 +2372,39 @@ export function createCliTextTransportV1(options: {
                 clearInterval(inactivityCheckHandle);
               }
               cancellationListener.dispose();
-              resolve({ kind: "terminal", exit });
+              // Awaits pendingRecordSettlement (a no-op when nothing is
+              // pending) before resolving, so a still-in-flight process
+              // record write — or its abandonment fallback — is always
+              // durable before the caller's admission lock can release.
+              void pendingRecordSettlement.then(() => resolve({ kind: "terminal", exit }));
+            };
+            // Stop the child and settle with `exit` only once it is confirmed
+            // gone. The caller's admission lock is released the moment this
+            // attempt settles, so settling on the kill signal being SENT would
+            // let the next action start while this CLI may still be running
+            // and editing the workspace (the same rule execCliAgent enforces).
+            // Re-signals on every unconfirmed wait; never settles on an
+            // unconfirmed pid — a CLI that will not die keeps the lock held,
+            // which the stale-lock takeover is the way out of.
+            const terminateThenFinish = (exit: AgentTransportExitV1): void => {
+              if (settled || terminating) {
+                return;
+              }
+              terminating = true;
+              void (async (): Promise<void> => {
+                const pid = child.pid;
+                let exited = childExited || pid === undefined;
+                while (!exited && !settled) {
+                  killProcessTree(child);
+                  exited =
+                    childExited ||
+                    (await Promise.race([
+                      childExitedPromise.then(() => true),
+                      waitForPidToExitV1(pid as number),
+                    ]));
+                }
+                finishTerminal(exit);
+              })();
             };
             const finishTextCompleted = (normalized: string): void => {
               if (settled) {
@@ -2309,18 +2416,19 @@ export function createCliTextTransportV1(options: {
                 clearInterval(inactivityCheckHandle);
               }
               cancellationListener.dispose();
-              resolve({ kind: "textCompleted", normalized });
+              // See finishTerminal's matching comment: waits for any pending
+              // process-record write/abandonment to become durable first.
+              void pendingRecordSettlement.then(() => resolve({ kind: "textCompleted", normalized }));
             };
 
             const timeoutHandle = setTimeout(() => {
-              killProcessTree(child);
               // stderr CONTENT is deliberately never retained (§2.2 — see
               // cliStdoutResultCaptureV1); the byte counts are the sanitized
               // summary its own doc marks safe to log, and they answer the
               // first question about any timeout: was the process saying
               // anything, or silently wedged?
               const stderr = capture.stderrSummary();
-              finishTerminal({
+              terminateThenFinish({
                 kind: "transportFailure",
                 code: "cliRunTimeout",
                 detail:
@@ -2343,9 +2451,8 @@ export function createCliTextTransportV1(options: {
                       return;
                     }
                     if (Date.now() - lastActivityAt >= inactivityLimitMs) {
-                      killProcessTree(child);
                       const stderr = capture.stderrSummary();
-                      finishTerminal({
+                      terminateThenFinish({
                         kind: "transportFailure",
                         code: "cliRunInactivityTimeout",
                         detail:
@@ -2358,26 +2465,102 @@ export function createCliTextTransportV1(options: {
                 : undefined;
 
             const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
+              if (terminating) {
+                return;
+              }
               cancelled = true;
-              killProcessTree(child);
-              finishTerminal({ kind: "callerCancelled" });
+              // Cancel ends the operation: the attempt settles (and the
+              // caller's lock is released) only once the child is confirmed gone.
+              terminateThenFinish({ kind: "callerCancelled" });
             });
 
+            // Record the just-spawned child next to the lock as soon as its pid
+            // is known. Not fire-and-forget on failure: a CLI whose process
+            // could not be recorded is stopped and the attempt fails, rather
+            // than left running invisibly to a later dead-owner cleanup.
+            // Stored in pendingRecordSettlement (not `void`-discarded):
+            // finishTerminal/finishTextCompleted both await it before
+            // resolving, so a child that exits before this write (or its
+            // abandonment fallback below) is durable never lets the caller's
+            // admission lock release ahead of that write.
+            if (recordingTarget !== undefined && child.pid !== undefined) {
+              pendingRecordSettlement = recordSpawnedCliProcessV1(
+                recordingTarget.taskFolderPath,
+                recordingTarget.claimId,
+                def,
+                child.pid,
+                commandForRecord
+              ).then((recorded) => {
+                if (recorded) {
+                  return;
+                }
+                if (settled || childExited) {
+                  // The child is already confirmed gone by the time this
+                  // write's failure is known (via settled/childExited, not
+                  // because this handler chose not to act) — so this spawn
+                  // attempt is proven to have left no live process behind
+                  // and must not permanently inflate
+                  // unconfirmedProcessSpawnCountV1 (recordedCliStopV1.ts),
+                  // which would otherwise block dead-owner lock reclamation
+                  // forever even though nothing is running. Returned (not
+                  // `void`) so pendingRecordSettlement — and therefore
+                  // finishTerminal/finishTextCompleted — waits for this
+                  // write to be durable before the attempt settles.
+                  if (recordingTarget !== undefined) {
+                    return abandonProcessSpawnAttemptV1(recordingTarget.taskFolderPath, recordingTarget.claimId);
+                  }
+                  return;
+                }
+                terminateThenFinish({
+                  kind: "transportFailure",
+                  code: "cliProcessRecordFailed",
+                  detail:
+                    `could not record ${def.label} (pid ${String(child.pid)}) next to this round's lock, ` +
+                    "so it was stopped before it could keep editing the workspace unrecorded",
+                });
+                return;
+              });
+            }
+
             child.on("error", (error) => {
+              if (terminating) {
+                return;
+              }
               // Was a bare arrow discarding the error: a spawn/runtime fault
               // (ENOENT, EACCES, EPIPE) reached the user as a bare code with
               // no way to tell which.
               const detail = boundedTransportDetailV1(error);
-              finishTerminal({
+              const failure: AgentTransportExitV1 = {
                 kind: "transportFailure",
                 code: "cliSpawnFailed",
                 ...(detail !== undefined ? { detail } : {}),
-              });
+              };
+              // A child that has a pid and has not exited is still running (an
+              // error can also come from a failed signal or IPC write): stop
+              // it before settling. A spawn that never produced a pid has
+              // nothing to stop.
+              if (child.pid !== undefined && !childExited) {
+                terminateThenFinish(failure);
+                return;
+              }
+              if (child.pid === undefined && recordingTarget !== undefined) {
+                // Node never assigned a pid: no OS process was ever created,
+                // so the spawn-attempt increment taken before cp.spawn must
+                // be proven abandoned, same reasoning as the synchronous
+                // throw case above. Stored in pendingRecordSettlement (not
+                // `void`-discarded) so finishTerminal below actually waits
+                // for this write to be durable before resolving.
+                pendingRecordSettlement = abandonProcessSpawnAttemptV1(
+                  recordingTarget.taskFolderPath,
+                  recordingTarget.claimId
+                );
+              }
+              finishTerminal(failure);
             });
 
             child.stdout?.on("data", (chunk: Buffer) => {
               lastActivityAt = Date.now();
-              if (settled) {
+              if (settled || terminating) {
                 return;
               }
               // Fed unconditionally (independent of the size guard below) so
@@ -2394,8 +2577,7 @@ export function createCliTextTransportV1(options: {
               rawEventBytes += chunk.length;
               if (rawEventBytes > maxEventStreamBytes) {
                 rawEventChunks.length = 0;
-                killProcessTree(child);
-                finishTerminal({
+                terminateThenFinish({
                   kind: "transportFailure",
                   code: "cliEventStreamTooLarge",
                   detail: `raw stdout stream exceeded ${maxEventStreamBytes} bytes (read ${rawEventBytes})`,
@@ -2410,6 +2592,13 @@ export function createCliTextTransportV1(options: {
             });
 
             child.on("close", (code) => {
+              // Recorded unconditionally: this is the authoritative exit
+              // signal `terminateThenFinish` waits on.
+              childExited = true;
+              resolveChildExited?.();
+              if (terminating) {
+                return;
+              }
               if (cancelled) {
                 finishTerminal({ kind: "callerCancelled" });
                 return;
@@ -2569,7 +2758,36 @@ export function createCliTextTransportV1(options: {
             child.stdin?.end();
           });
 
+        // Durably marks one spawn attempt begun, BEFORE cp.spawn runs inside
+        // runOneAttempt, closing the crash window `recordSpawnedCliProcessV1`
+        // alone leaves open (1.0 RC1 Part B item 2 defect blocker — see
+        // roundProcessRecordV1.ts's "NO-RECORD AMBIGUITY"). Returns a
+        // transportFailure to short-circuit the caller instead of spawning
+        // when the write cannot be confirmed durable — the same hard
+        // pre-spawn condition beginRoundProcessRecordingV1 already enforces
+        // once per round, applied per attempt (a retry is a second spawn).
+        const beginSpawnAttemptOrFailureV1 = async (): Promise<AgentTransportExitV1 | undefined> => {
+          if (recordingTarget === undefined) {
+            return undefined;
+          }
+          const began = await beginProcessSpawnAttemptV1(recordingTarget.taskFolderPath, recordingTarget.claimId);
+          if (began) {
+            return undefined;
+          }
+          return {
+            kind: "transportFailure",
+            code: "cliProcessRecordUnavailable",
+            detail:
+              `could not record this attempt's process bookkeeping before starting ${def.label}, so it was not started; ` +
+              "retrying should succeed once the workspace state store is writable again",
+          };
+        };
+
         try {
+          const spawnGuard1 = await beginSpawnAttemptOrFailureV1();
+          if (spawnGuard1 !== undefined) {
+            return spawnGuard1;
+          }
           const attempt1 = await runOneAttempt(request.prompt);
           if (attempt1.kind === "terminal") {
             return attempt1.exit;
@@ -2612,6 +2830,10 @@ export function createCliTextTransportV1(options: {
                   ...(detail !== undefined ? { detail } : {}),
                 };
               }
+            }
+            const spawnGuard2 = await beginSpawnAttemptOrFailureV1();
+            if (spawnGuard2 !== undefined) {
+              return spawnGuard2;
             }
             const attempt2 = await runOneAttempt(nudgedPrompt);
             if (attempt2.kind === "terminal") {
@@ -3217,6 +3439,22 @@ export async function execCliAgent(options: {
           "so it was not started. Retrying should succeed once the workspace state store is writable again.",
       });
     }
+    // Durably marks this spawn attempt begun, BEFORE cp.spawn runs below,
+    // closing the crash window the post-spawn record alone leaves open (1.0
+    // RC1 Part B item 2 defect blocker — see roundProcessRecordV1.ts's
+    // "NO-RECORD AMBIGUITY"). Same hard pre-spawn condition as
+    // beginRoundProcessRecordingV1 just above, at per-attempt granularity.
+    const spawnMarked = await beginProcessSpawnAttemptV1(taskFolderPath, roundProcessClaimId);
+    if (!spawnMarked) {
+      cleanupPromptFile();
+      return classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage:
+          `Could not record this attempt's process bookkeeping before starting the ${cliDisplayLabel(def)} CLI, ` +
+          "so it was not started. Retrying should succeed once the workspace state store is writable again.",
+      });
+    }
   }
 
   return new Promise<CliExecResult>((resolve) => {
@@ -3322,6 +3560,15 @@ export async function execCliAgent(options: {
         detached: process.platform !== "win32",
       });
     } catch (error) {
+      // cp.spawn threw: no OS process was ever created, so the spawn-attempt
+      // increment taken before this call must be proven abandoned — see the
+      // matching comment on the transport path's own catch block. Assigned
+      // into recordingPromise (rather than fired with `void`) and awaited
+      // before resolving, so a crash between resolve() and the abandonment
+      // write landing can never leave the claim looking unconfirmed.
+      if (taskFolderPath !== undefined && roundProcessClaimId !== undefined) {
+        recordingPromise = abandonProcessSpawnAttemptV1(taskFolderPath, roundProcessClaimId);
+      }
       const message =
         error instanceof Error ? error.message : String(error);
       const argvHint =
@@ -3329,11 +3576,12 @@ export async function execCliAgent(options: {
           ? " Reduce context or choose a provider that accepts stdin prompts."
           : "";
       cleanupPromptFile();
-      resolve(classifyCliFailure({
+      const spawnFailureResult = classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage: `Could not start the ${cliDisplayLabel(def)} CLI (${resolvedCommand}): ${message}.${argvHint} ${def.installHint}`.trim(),
-      }));
+      });
+      void Promise.resolve(recordingPromise).then(() => resolve(spawnFailureResult));
       return;
     }
 
@@ -3359,8 +3607,23 @@ export async function execCliAgent(options: {
         recordedPid,
         [resolvedCommand, ...argsForRoundProcessRecordV1].join(" ")
       ).then(async (recorded) => {
-        if (recorded || settled) {
+        if (recorded) {
           return;
+        }
+        if (settled || childExited) {
+          // Same reasoning as the transport path's mirror of this check:
+          // the child is already confirmed gone, so this spawn attempt left
+          // no live process behind and must not permanently inflate
+          // unconfirmedProcessSpawnCountV1 (recordedCliStopV1.ts), which
+          // would otherwise block dead-owner lock reclamation forever even
+          // though nothing is running. Returned (not `void`) so
+          // `recordingPromise` — and therefore `finishAfterRecordingSettles`,
+          // which every settle path below now goes through — does not
+          // resolve until this write is durable: settling first would let
+          // the caller's admission lock release while the abandonment is
+          // still in flight, leaving an unconfirmed count a crash in that
+          // window could never clear.
+          return abandonProcessSpawnAttemptV1(taskFolderPath, roundProcessClaimId);
         }
         // Own settlement from this point on: the ordinary child.on("close")
         // listener checks this flag and defers to us, so it can never win
@@ -3377,7 +3640,7 @@ export async function execCliAgent(options: {
         // polling (never settling `failed` on an unconfirmed pid) until
         // termination is actually confirmed, surfacing each retry through
         // onProgress so a long wait is never silent.
-        let exited = childExited;
+        let exited: boolean = childExited;
         while (!exited && !settled) {
           onProgress?.(
             `Waiting for pid ${recordedPid} to stop after a process-record failure...`.substring(0, 80)
@@ -3623,6 +3886,17 @@ export async function execCliAgent(options: {
       if (recordFailureRecovering || terminationInProgress) {
         return;
       }
+      if (child.pid === undefined && taskFolderPath !== undefined && roundProcessClaimId !== undefined) {
+        // Node never assigned a pid: no OS process was ever created (the
+        // recording block below never ran, so `recordingPromise` is still
+        // undefined), so the spawn-attempt increment must be proven
+        // abandoned. Assigned to `recordingPromise` (not `void`-discarded)
+        // so finishAfterRecordingSettles below actually waits for this
+        // write to be durable before resolving — otherwise it would call
+        // `finish()` immediately, since `recordingPromise` would still read
+        // as undefined.
+        recordingPromise = abandonProcessSpawnAttemptV1(taskFolderPath, roundProcessClaimId);
+      }
       finishAfterRecordingSettles(classifyCliFailure({
         status: "failed",
         output: "",
@@ -3683,7 +3957,7 @@ export async function execCliAgent(options: {
 
       if (code !== 0) {
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents);
-        finish(applyTransportTransience(
+        finishAfterRecordingSettles(applyTransportTransience(
           classifyCliFailure({
             status: "failed",
             output,
@@ -3728,7 +4002,7 @@ export async function execCliAgent(options: {
               : ""
         }`.trim();
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
-        finish(applyTransportTransience(
+        finishAfterRecordingSettles(applyTransportTransience(
           classifyCliFailure({
             status: "failed",
             output,
@@ -3744,7 +4018,14 @@ export async function execCliAgent(options: {
         return;
       }
 
-      finish({ status: "completed", output });
+      // Routed through finishAfterRecordingSettles, not finish() directly:
+      // an ordinary successful exit can still race a still-pending
+      // post-spawn process-record write (or its abandonment fallback above)
+      // to settlement. Settling here first would release the caller's
+      // admission lock before that write is durable — the exact crash
+      // window a review flagged (this close handler was the one settle
+      // path that bypassed the wrapper every other exit path already uses).
+      finishAfterRecordingSettles({ status: "completed", output });
     });
 
     if (promptTransport === "stdin") {

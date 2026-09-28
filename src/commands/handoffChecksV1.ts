@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
   classifyUncheckedChecklistItemsV1,
+  parseChecklistItemPriorityV1,
   tickHandoffChecksV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
@@ -26,6 +28,8 @@ import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "../utils/wo
 const TICK_COMMAND = "vs-code-ai-helper.tickHandoffCheck";
 const ACCEPT_COMMAND = "vs-code-ai-helper.acceptHandoffChecks";
 const KEEP_COMMAND = "vs-code-ai-helper.keepHandoffChecks";
+/** The explicit "Complete Anyway" advance — a user's own click on this card is the override. */
+const ADVANCE_COMMAND = "vs-code-ai-helper.completeStageAnywayV1";
 
 /**
  * One card option per check, up to this many. The rest are not hidden: the
@@ -65,6 +69,9 @@ export function buildHandoffChecksDecisionInputV1(input: {
 }): PostWorkflowDecisionInputV1 {
   const n = input.checks.length;
   const listed = input.checks.slice(0, MAX_TICK_OPTIONS);
+  // "Gating" = anything that does not declare itself Priority: LOW. Advance is
+  // offered only when every remaining check is LOW, i.e. none is gating.
+  const noneGating = n > 0 && input.checks.every((check) => parseChecklistItemPriorityV1(check) === "low");
   const carry = {
     stage: input.stage,
     ...(input.displayName ? { displayName: input.displayName } : {}),
@@ -111,6 +118,23 @@ export function buildHandoffChecksDecisionInputV1(input: {
           args: [{ taskFolderPath: input.taskFolderPath, itemTexts: input.checks, ...carry } satisfies HandoffChecksArgV1],
         },
       },
+      ...(noneGating
+        ? [
+            {
+              optionId: "advance",
+              resumeKind: "continue" as const,
+              label: "Advance to the next stage",
+              consequence:
+                `Moves the task on and leaves ${n === 1 ? "this check" : `these ${n} checks`} unticked. Every remaining ` +
+                "check declares Priority: LOW, so none of them holds the task back; you can still tick them afterwards.",
+              effect: {
+                kind: "command" as const,
+                command: ADVANCE_COMMAND,
+                args: [{ taskFolderPath: input.taskFolderPath }],
+              },
+            },
+          ]
+        : []),
       {
         optionId: "notYet",
         resumeKind: "unpause",
@@ -235,29 +259,30 @@ async function settleAndRepostV1(
   result: HandoffTickResultV1 | { readonly kind: "cancelled" },
   what: string
 ): Promise<boolean> {
+  const folderName = path.basename(arg.taskFolderPath);
   switch (result.kind) {
     case "ticked":
       await io.refresh();
-      NotificationRouter.showInformation(`${what}: ticked ${result.count} check${result.count === 1 ? "" : "s"} in plan-final.md.`);
+      NotificationRouter.showInformation(`${folderName} — ${what}: ticked ${result.count} check${result.count === 1 ? "" : "s"} in plan-final.md.`);
       break;
     case "cancelled":
-      NotificationRouter.showInformation("No check was ticked.");
+      NotificationRouter.showInformation(`${folderName}: no check was ticked.`);
       break;
     case "nothingToTick":
-      NotificationRouter.showInformation("Nothing to tick — those checks are already settled or plan-final.md has changed.");
+      NotificationRouter.showInformation(`${folderName}: nothing to tick — those checks are already settled or plan-final.md has changed.`);
       break;
     case "noPlan":
-      NotificationRouter.showWarning("plan-final.md could not be read, so no check was ticked.");
+      NotificationRouter.showWarning(`${folderName}: plan-final.md could not be read, so no check was ticked.`);
       break;
     case "changedUnderneath":
-      NotificationRouter.showWarning("plan-final.md changed while this was being applied — nothing was written. Try again.");
+      NotificationRouter.showWarning(`${folderName}: plan-final.md changed while this was being applied — nothing was written. Try again.`);
       break;
   }
   const remaining = await readRemainingV1(arg.taskFolderPath);
   if (remaining.length > 0) {
     await io.repost(arg, remaining);
   } else if (result.kind === "ticked") {
-    NotificationRouter.showInformation("Every hand-off check is settled — plan-final.md has nothing left for you to tick. Trying the stage's next action now.");
+    NotificationRouter.showInformation(`${folderName}: every hand-off check is settled — plan-final.md has nothing left for you to tick. Trying the stage's next action now.`);
     await io.dispatchStageAction(arg);
   }
   return result.kind === "ticked";

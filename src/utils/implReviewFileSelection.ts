@@ -583,3 +583,105 @@ export function applyContentCapsWithPagingV1(
     }
   );
 }
+
+/**
+ * Once a task has an approved plan, the plan is the contract and the review
+ * needs the task description only for its requirements — not the whole
+ * accumulated task.md, which on a long task (55 KB+ observed) crowds out the
+ * evidence the review exists to read and, with the plan itself also in the
+ * prompt, is the largest single duplicate in the input.
+ *
+ * Characters, not bytes: the same unit as `IMPL_REVIEW_MAX_TOTAL_CHARS`.
+ */
+export const REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1 = 12000;
+
+/**
+ * Bound `taskContent` for a review's context pack. Unchanged when the task
+ * has no plan yet or the text already fits; otherwise the head (cut at a line
+ * boundary) plus a note saying exactly how much was left out and where the
+ * rest lives, so the reviewer never mistakes the excerpt for the whole.
+ */
+export function boundTaskDescriptionForReviewV1(
+  taskContent: string,
+  planExists: boolean,
+  maxChars: number = REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1
+): string {
+  if (!planExists || taskContent.length <= maxChars) {
+    return taskContent;
+  }
+  const headRaw = taskContent.slice(0, maxChars);
+  const lastNewline = headRaw.lastIndexOf("\n");
+  // Cut at a line boundary unless that would throw away most of the budget.
+  const head = lastNewline > maxChars / 2 ? headRaw.slice(0, lastNewline) : headRaw;
+  const omitted = taskContent.length - head.length;
+  return (
+    `${head.trimEnd()}\n\n` +
+    `_Task description bounded for review: ${head.length} of ${taskContent.length} characters shown ` +
+    `(${omitted} omitted). The approved plan carries the requirements in full; the complete text is in task.md._`
+  );
+}
+
+/**
+ * The real remedy for a review input that cannot fit, replacing the old
+ * "Consider splitting the task": names the largest inputs, biggest first,
+ * with what to do about each one that the user can actually act on.
+ * `driverBytes` is every input the abort record lists.
+ */
+export function describeOversizedInputRemedyV1(
+  driverBytes: Readonly<Record<string, number>>,
+  limitBytes: number,
+  assembledBytes: number
+): string {
+  const remedies: Readonly<Record<string, string>> = {
+    "task.md": "shorten task.md (move finished detail out of it; once a plan exists the review only gets its first part)",
+    "plan.md": "trim plan.md (fold completed parts into a summary)",
+    "plan-final.md": "trim plan-final.md (completed items can be summarised)",
+    "previous review": "clear or shorten the previous review file",
+    "tracked file content (context pack)": "review fewer files in one round (commit finished work so it leaves the changed-file set)",
+  };
+  const ranked = Object.entries(driverBytes)
+    .filter(([, bytes]) => bytes > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+  const over = Math.max(0, assembledBytes - limitBytes);
+  const overKb = Math.ceil(over / 1024);
+  const parts = ranked.map(([name, bytes]) => {
+    const kb = Math.round(bytes / 1024);
+    return `${name} (${kb} KB) — ${remedies[name] ?? `shorten or remove it`}`;
+  });
+  return (
+    `To fit, cut at least ${overKb} KB. Largest inputs: ${parts.join("; ")}. ` +
+    "The full list with sizes is in the oversized-input record in this task's runs folder."
+  );
+}
+
+/**
+ * Whether a published implementation review should reset the task's shared
+ * changed-file set (`TaskProgress.implReviewFiles`). The set feeds BOTH
+ * implementation review stages, and `impl-low-review` runs AFTER
+ * `impl-high-review`: only a clean review of the LAST stage may clear it,
+ * otherwise a clean high-level review leaves the low-level review with no
+ * files to review (RC1 item 5).
+ */
+export function shouldClearImplReviewFilesAfterReviewV1(
+  targetStage: string,
+  taskFixableCount: number
+): boolean {
+  return targetStage === "impl-low-review" && taskFixableCount === 0;
+}
+
+/**
+ * Whether an implementation review would run on zero files. `trackedFileCount`
+ * is the length of `implReviewFiles` (undefined when the task has no tracked
+ * set, i.e. the pack fell back to open editors); the fallback counts what the
+ * pack actually embedded or listed as omitted.
+ */
+export function isImplReviewOnZeroFilesV1(input: {
+  trackedFileCount: number | undefined;
+  embeddedContentBytes: number;
+  omittedFileCount: number;
+}): boolean {
+  return input.trackedFileCount !== undefined
+    ? input.trackedFileCount === 0
+    : input.embeddedContentBytes === 0 && input.omittedFileCount === 0;
+}

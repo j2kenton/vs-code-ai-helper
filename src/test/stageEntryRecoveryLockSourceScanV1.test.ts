@@ -404,7 +404,7 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
         [
           {
             snippet:
-              "runStageEntryPostCommitV1(taskFolderUri, { deferredPlanRevisionAdoption: deferredAdoption, journalTransitionId: transitionId, })",
+              "runStageEntryPostCommitV1(taskFolderUri, { deferredPlanRevisionAdoption: deferredAdoption, journalTransitionId: transitionId,",
             reason:
               "recoverAndReplayCommittedJournalV1's Phase B/C delegation, reached only after Phase A's " +
               "own withTaskLock hold (recoverStageEntryJournalPhaseAV1) has already returned",
@@ -456,6 +456,17 @@ const ALLOWLIST: ReadonlyMap<string, ReadonlyMap<string, readonly AllowlistEntry
               "cancellation of the outgoing stage's operation is requested only via the post-commit " +
               "cancelRunningOperationsForTask call below, once enterStageV1 has already confirmed the " +
               "write landed.",
+          },
+        ],
+      ],
+      [
+        "commands/generatePlanWithAI.ts",
+        [
+          {
+            snippet: "runStageEntryPostCommitV1(taskFolderUri, entryResult)",
+            reason:
+              "handleGeneratePlanOutcomeV1's own outcome-handling body, run only after its enterStageV1 " +
+              "call has returned — plain command-handler code, no covering lock held anywhere earlier",
           },
         ],
       ],

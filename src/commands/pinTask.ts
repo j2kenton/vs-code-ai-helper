@@ -5,6 +5,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 type PinTaskArg =
@@ -48,7 +49,9 @@ export async function pinTask(
     return;
   }
   if (resolved.progress.pinnedAt) {
-    NotificationRouter.showInformation("Task is already pinned.");
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} is already pinned.`
+    );
     return;
   }
 
@@ -72,7 +75,7 @@ export async function pinTask(
         updatedAt: new Date().toISOString(),
       }));
       NotificationRouter.showInformation(
-        `Pin limit of ${MAX_PINNED_TASKS} reached — unpinned "${oldest.progress.displayName ?? oldest.folderName}".`
+        `${formatNotificationTaskLabelV1(oldest.progress.displayName, oldest.folderName)} was unpinned: the pin limit of ${MAX_PINNED_TASKS} was reached.`
       );
     }
   }
@@ -102,7 +105,9 @@ export async function unpinTask(
     return;
   }
   if (!resolved.progress.pinnedAt) {
-    NotificationRouter.showInformation("Task is not pinned.");
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} is not pinned.`
+    );
     return;
   }
   await patchTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath), (current) => ({

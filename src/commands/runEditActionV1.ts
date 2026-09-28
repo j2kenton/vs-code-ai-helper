@@ -32,6 +32,7 @@ import {
   getProductionActionConversationOrchestratorV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
+import { describeModelWithProviderV1 } from "../runners/providers";
 import {
   isSummaryOnlyDispatchAvailableV1,
   runSealedEditContinuationReportV1,
@@ -70,6 +71,7 @@ import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../util
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
   describeWorkAdmissionRefusalV1,
@@ -523,6 +525,8 @@ export interface RunTwoPhaseEditOptionsV1 {
    */
   readonly taskFolderUri?: vscode.Uri;
   readonly roundId?: string;
+  /** The task's display name, for notification labels — see `taskFolderUri`. */
+  readonly taskDisplayName?: string;
 }
 
 /** SHA-256 the plan must echo (§7.3): digest of the exact prompt bytes. */
@@ -549,6 +553,8 @@ export async function runTwoPhaseEditActionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: options.workspaceCwd,
     resolveStagePrimaryModel: options.resolveStagePrimaryModel,
+    taskDisplayName: options.taskDisplayName,
+    taskFolderPath: options.taskFolderUri?.fsPath,
   });
 
   const preflightInput: EditPreflightActionInputV1 = {
@@ -899,6 +905,8 @@ export interface RunSealedImplementationOptionsV1 {
   /** See execCliAgent's own doc (`cliAgentRunner.ts`) — forwarded to the CLI
    * edit path so this round's process is recorded next to its lock. */
   readonly roundProcessClaimId?: string;
+  /** The task's display name, for notification labels — see `taskFolderUri`. */
+  readonly taskDisplayName?: string;
 }
 
 /**
@@ -1061,6 +1069,7 @@ export async function runSealedImplementationV1(
     cancellationToken: options.token,
     taskFolderUri: options.taskFolderUri,
     roundId: options.roundId,
+    taskDisplayName: options.taskDisplayName,
   });
 
   const runnerId = "copilot-lm";
@@ -1091,6 +1100,7 @@ export async function runSealedImplementationV1(
               taskStage: options.taskStage ?? stage,
               token: options.token,
               onProgress: options.onProgress,
+              taskDisplayName: options.taskDisplayName,
             })
           : undefined;
       const completionResult = resolveSealedEditCompletionResultV1(
@@ -1288,7 +1298,7 @@ export function describeEditActionOutcomeFailureV1(
   }
   if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
     const candidateList = exhaustion.candidates
-      .map((c) => `${c.storedModelId} (${c.providerLabel}) — ${c.reason}`)
+      .map((c) => `${describeModelWithProviderV1(c.storedModelId)} — ${c.reason}`)
       .join("; ");
     // workflow 3 continuation, third item: `candidatesExhausted` (every
     // candidate was reserved, invoked, and failed) and `providerModeUnavailable`
@@ -1826,6 +1836,8 @@ export async function resumeEditPreflightInteractionV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: model.modelId, stage: modelStage }),
+    taskDisplayName: ownedTask.progress.displayName,
+    taskFolderPath: taskFolderUri.fsPath,
   });
 
   const outcome = await coordinator.resumeAction({
@@ -1872,7 +1884,8 @@ export async function resumeEditPreflightInteractionV1(
     // account of why is worth the most.
     const resumedPlanReasoning = takePreflightPlanReasoningV1(outcome.correlation.operationId);
     NotificationRouter.showInformation(
-      "Resumed edit preflight produced an empty plan — no changes were needed." +
+      `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — ` +
+        "Resumed edit preflight produced an empty plan — no changes were needed." +
         (resumedPlanReasoning !== undefined ? ` The model's account: ${resumedPlanReasoning}` : "")
     );
   } else if (outcome.kind === "completed") {
@@ -1901,7 +1914,8 @@ export async function resumeEditPreflightInteractionV1(
     const logUri = await writeRunLog(taskFolderUri, "copilot-lm", modelStage, logContent);
     if (execution.kind === "completed") {
       NotificationRouter.showInformation(
-        `Resumed ${actionKey}: applied ${execution.appliedReceiptIds.length} sealed edit step(s) ` +
+        `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — ` +
+          `Resumed ${actionKey}: applied ${execution.appliedReceiptIds.length} sealed edit step(s) ` +
           `(${execution.changedPaths.length} file(s) changed).`
       );
     } else {
@@ -1911,17 +1925,23 @@ export async function resumeEditPreflightInteractionV1(
           : execution.kind === "failed" && execution.outcome.kind === "cancelled"
             ? "the edit session was cancelled"
             : "the edit session did not complete";
-      NotificationRouter.showWarning(`Resumed ${actionKey} did not apply cleanly: ${reason}`);
+      NotificationRouter.showWarning(
+        `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — ` +
+          `Resumed ${actionKey} did not apply cleanly: ${reason}`
+      );
       await vscode.window.showTextDocument(logUri, { preview: true }).then(
         () => undefined,
         () => undefined
       );
     }
   } else if (outcome.kind === "cancelled") {
-    NotificationRouter.showInformation("Resumed edit preflight was cancelled.");
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — Resumed edit preflight was cancelled.`
+    );
   } else {
     NotificationRouter.showWarning(
-      `Resumed edit preflight failed (${outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind}).`
+      `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — ` +
+        `Resumed edit preflight failed (${outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind}).`
     );
   }
 

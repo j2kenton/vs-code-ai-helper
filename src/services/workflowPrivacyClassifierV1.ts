@@ -88,8 +88,13 @@ export const CREATION_SENTINEL_FILENAME_V1 = ".ensemble-creation-sentinel-v1.jso
  * (utils/metaResourcesMigration.ts MIGRATION_JOURNAL_FILENAME),
  * stage-entry-journal.json — the stage-entry crash-recovery journal
  * (utils/stageEntryJournalV1.ts STAGE_ENTRY_JOURNAL_FILENAME; pre-1.0.0 fixes
- * register, Part 2). The classifier unit test pins each literal against its
- * owning module's export where one exists, so the two cannot drift silently.
+ * register, Part 2). round-progress.md — the in-round, best-effort progress
+ * bookkeeping file a round appends to (Ensemble 1.0 RC1, item 6); it is
+ * never written to plan-final.md nor read by the gate reader, only by the
+ * display readers, so it must stay out of filesChanged/pendingImplReviewFiles
+ * like every other control file here. The classifier unit test pins each
+ * literal against its owning module's export where one exists, so the two
+ * cannot drift silently.
  */
 const WORKFLOW_CONTROL_BASENAMES = new Set<string>([
   TASK_PROGRESS_FILENAME.toLowerCase(),
@@ -99,6 +104,7 @@ const WORKFLOW_CONTROL_BASENAMES = new Set<string>([
   ".ensemble-migration.json",
   CREATION_SENTINEL_FILENAME_V1.toLowerCase(),
   "stage-entry-journal.json",
+  "round-progress.md",
 ]);
 
 /**
