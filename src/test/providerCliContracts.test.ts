@@ -11,6 +11,7 @@ import {
   CODEX_MODEL_CAPABILITIES,
   getCliProvider,
   getProviderAccountEntry,
+  OPENCODE_MODEL_VARIANTS,
   parseClineModelSelection,
   parseCopilotModelSelection,
   parseCodexModelSelection,
@@ -307,6 +308,53 @@ void describe("provider CLI contracts", () => {
     const parsedStored = parseModelSelection("opencode-cli:opencode/deepseek-v4-flash@high");
     assert.strictEqual(parsedStored.provider, "opencode-cli");
     assert.strictEqual(parsedStored.model, "opencode/deepseek-v4-flash@high");
+
+    // Opus 5.5 and GPT-6 reach the CLI as their exact Zen id plus variant.
+    // Every level of every added entry, not a sample: the ladder table is the
+    // contract, so each pair must reach the CLI as the exact id plus variant.
+    for (const [model, ladder] of Object.entries(OPENCODE_MODEL_VARIANTS)) {
+      for (const variant of ladder) {
+        const newArgs = opencode.buildArgs("edit", `${model}@${variant}`);
+        const at = newArgs.indexOf("--model");
+        assert.deepStrictEqual(newArgs.slice(at, at + 4), ["--model", model, "--variant", variant]);
+      }
+    }
+  });
+
+  void it("OpenCode rejects a variant outside a known model's ladder instead of letting the CLI drop it", () => {
+    const opencode = getCliProvider("opencode-cli");
+    assert.ok(opencode);
+    // astra has no "none"; luna/sol do. "ultra" is a Codex-only level.
+    for (const bad of [
+      "opencode/gpt-6-astra@none",
+      "opencode/gpt-6-astra@ultra",
+      "opencode/claude-opus-5-5@none",
+      "opencode/gpt-6-luna@bogus",
+      "opencode/gpt-6-sol@ultra",
+    ]) {
+      assert.throws(() => parseOpencodeModelSelection(bad), /Unsupported variant/, bad);
+      assert.throws(() => opencode.buildArgs("edit", bad), /Unsupported variant/, bad);
+    }
+    // No suffix is fine, and ids outside the table keep the pass-through contract.
+    assert.deepStrictEqual(parseOpencodeModelSelection("opencode/gpt-6-astra"), {
+      model: "opencode/gpt-6-astra",
+      variant: undefined,
+    });
+    assert.deepStrictEqual(parseOpencodeModelSelection("opencode/deepseek-v4-flash@high"), {
+      model: "opencode/deepseek-v4-flash",
+      variant: "high",
+    });
+  });
+
+  void it("OPENCODE_MODEL_VARIANTS matches the seeded OpenCode catalog for every added entry", () => {
+    const seeded = (getSeededCatalogForAudit().seeded["opencode-cli"] ?? []).map((m) => m.model);
+    for (const [base, ladder] of Object.entries(OPENCODE_MODEL_VARIANTS)) {
+      assert.ok(seeded.includes(base), `${base} must be seeded`);
+      const seededVariants = seeded
+        .filter((id) => id.startsWith(`${base}@`))
+        .map((id) => id.slice(id.lastIndexOf("@") + 1));
+      assert.deepStrictEqual(seededVariants, [...ladder], `${base} ladder drifted from the seed`);
+    }
   });
 
   void it("separates OpenCode Zen and Go account controls while keeping one CLI adapter", () => {
@@ -687,12 +735,10 @@ void describe("provider CLI contracts", () => {
   });
 
   void it("parseCodexModelSelection holds table models to their ladder and fast support", () => {
-    // Effort outside the model's ladder: the whole string stays the model id.
-    assert.deepStrictEqual(parseCodexModelSelection("gpt-5.5@ultra"), {
-      model: "gpt-5.5@ultra",
-      reasoningEffort: undefined,
-      serviceTier: undefined,
-    });
+    // Effort outside the model's ladder: reject closed by throwing — never
+    // a literal "id@badeffort" string passed on to the CLI, and never a
+    // silent fall-through to the CLI's own default model either.
+    assert.throws(() => parseCodexModelSelection("gpt-5.5@ultra"));
     // Stale +fast on a non-fast model: effort kept, tier dropped, one log line.
     const originalWarn = console.warn;
     const warnings: string[] = [];
@@ -709,15 +755,26 @@ void describe("provider CLI contracts", () => {
       console.warn = originalWarn;
     }
     assert.strictEqual(warnings.length, 1);
-    // An effort outside the flat set still leaves the whole string as the model id.
-    assert.deepStrictEqual(parseCodexModelSelection("gpt-5.5@turbo"), {
-      model: "gpt-5.5@turbo",
-      reasoningEffort: undefined,
-      serviceTier: undefined,
-    });
+    // gpt-5.5 IS in the capability table, so an out-of-ladder suffix must
+    // reject closed by throwing (same contract as gpt-6-astra below), never
+    // fall through to the permissive flat-set behaviour that only applies
+    // to base ids OUTSIDE the table.
+    assert.throws(() => parseCodexModelSelection("gpt-5.5@turbo"));
     // Unknown base id keeps the permissive flat-set behaviour.
     assert.deepStrictEqual(parseCodexModelSelection("gpt-9-future@ultra+fast"), {
       model: "gpt-9-future",
+      reasoningEffort: "ultra",
+      serviceTier: "priority",
+    });
+    // GPT-6-Astra is in the capability table (low/medium/high/xhigh/max/ultra):
+    // an effort outside its ladder must reject closed by throwing, rather
+    // than silently downgrading to an older GPT model, passing a bogus
+    // literal id to the CLI, or silently falling back to the CLI's default.
+    assert.throws(() => parseCodexModelSelection("gpt-6-astra@turbo"));
+    // A valid GPT-6-Astra effort must resolve to GPT-6-Astra itself, never to
+    // gpt-5.5 or any other seeded base id.
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-6-astra@ultra+fast"), {
+      model: "gpt-6-astra",
       reasoningEffort: "ultra",
       serviceTier: "priority",
     });
@@ -820,6 +877,30 @@ void describe("provider CLI contracts", () => {
       "--max-thinking-tokens",
       "8192",
     ]);
+
+    // Claude Opus 5.5 must route through the same id/thinking-budget path as
+    // every other seeded Claude model, with no silent fallback to Opus 5.
+    const opus55Args = claude.buildArgs("text", "claude-opus-5-5@xhigh");
+    assert.deepStrictEqual(opus55Args, [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--permission-mode",
+      "plan",
+      "--append-system-prompt",
+      CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
+      "--model",
+      "claude-opus-5-5",
+      "--max-thinking-tokens",
+      "16384",
+    ]);
+
+    // An unrecognized Opus 5.5 suffix must reject closed by throwing —
+    // never leak into --model as a literal "id@badsuffix" string, and never
+    // silently fall back to the base model's own default thinking budget
+    // (an unnoticed downgrade from the requested reasoning level).
+    assert.throws(() => claude.buildArgs("text", "claude-opus-5-5@turbo"));
 
     assert.strictEqual(claude.structuredEventStream, "claude");
   });

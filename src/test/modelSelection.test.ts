@@ -13,7 +13,16 @@ import {
   getModelDisplayName,
   describeModelSource,
 } from "../utils/modelSelection";
-import { describeModelWithProviderV1 } from "../runners/providers";
+import { parseOpencodeModelsOutput } from "../utils/cliModelDiscovery";
+import {
+  CODEX_MODEL_CAPABILITIES,
+  OPENCODE_MODEL_VARIANTS,
+  describeModelWithProviderV1,
+  getCliProvider,
+  parseCodexModelSelection,
+  parseModelSelection,
+  parseOpencodeModelSelection,
+} from "../runners/providers";
 
 /** Mirrors runnerRegistry.test.ts's own `installModelSettings` helper. */
 function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
@@ -629,6 +638,22 @@ void describe("getAvailableModels", () => {
             ]
           ),
           {
+            id: "claude-cli:claude-opus-5-5",
+            name: "Opus 5.5",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "claude-opus-5-5",
+            "Opus 5.5",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
             id: "claude-cli:haiku",
             name: "Haiku 4.5",
             providerLabel: "Claude Code (subscription CLI)",
@@ -639,6 +664,19 @@ void describe("getAvailableModels", () => {
         providerModels(models, "OpenAI Codex (subscription CLI)"),
         [
           codexVariant("codex-cli:default", "Codex (CLI default)"),
+          ...codexVariants(
+            "gpt-6-astra",
+            "GPT-6-Astra",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+              ["ultra", "Ultra"],
+            ],
+            true
+          ),
           ...codexVariants(
             "gpt-5.5",
             "GPT-5.5",
@@ -1110,6 +1148,25 @@ void describe("getAvailableModels", () => {
         zenModels.some((m) => m.id === "opencode-cli:opencode/north-mini-code-free@none"),
         "expected north-mini-code-free's @none variant entry"
       );
+      // Opus 5.5 and the GPT-6 family, each with exactly the variants the
+      // 2026-09-27 `opencode models --verbose` capture lists for it.
+      const zenLadder = (base: string): string[] =>
+        zenModels
+          .map((m) => m.id)
+          .filter((id) => id.startsWith(`opencode-cli:opencode/${base}@`))
+          .map((id) => id.slice(id.lastIndexOf("@") + 1));
+      for (const [base, ladder] of [
+        ["claude-opus-5-5", ["low", "medium", "high", "xhigh", "max"]],
+        ["gpt-6-astra", ["low", "medium", "high", "xhigh", "max"]],
+        ["gpt-6-luna", ["none", "low", "medium", "high", "xhigh", "max"]],
+        ["gpt-6-sol", ["none", "low", "medium", "high", "xhigh", "max"]],
+      ] as const) {
+        assert.ok(
+          zenModels.some((m) => m.id === `opencode-cli:opencode/${base}`),
+          `expected the base ${base} entry`
+        );
+        assert.deepStrictEqual(zenLadder(base), [...ladder], `${base} variants`);
+      }
       assert.ok(
         goModels.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash"),
         "expected the opencode-go tier's deepseek-v4-flash entry"
@@ -1591,6 +1648,167 @@ void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€
       assert.equal(concrete?.name, "GPT-5.6 Sol");
     } finally {
       stub.restore();
+    }
+  });
+});
+
+void describe("GPT-6 / Opus 5.5 listed entries validate against the provider ladders", () => {
+  async function seededPickerIds(command: string): Promise<string[]> {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(name) {
+        return Promise.resolve(name === command);
+      },
+    });
+    try {
+      return (await getAvailableModels()).map((m) => m.id);
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  }
+
+  const ladderOf = (ids: readonly string[], prefix: string): string[] =>
+    ids.filter((id) => id.startsWith(`${prefix}@`)).map((id) => id.slice(id.lastIndexOf("@") + 1));
+
+  void it("lists Codex gpt-6-astra with exactly its evidenced ladder, every listed id resolving to gpt-6-astra", async () => {
+    const ids = await seededPickerIds("codex");
+    // The Codex seed emits only effort-qualified and fast-qualified entries, never a bare model id.
+    assert.ok(
+      ids.some((id) => id.startsWith("codex-cli:gpt-6-astra@")),
+      "expected effort-qualified gpt-6-astra entries"
+    );
+    const evidenced = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    assert.deepStrictEqual(
+      CODEX_MODEL_CAPABILITIES["gpt-6-astra"]?.efforts.map(([effort]) => effort),
+      evidenced
+    );
+    // Fast variants are listed for the same ladder (Codex lists the fast tier for gpt-6-astra).
+    const listed = ids.filter((id) => id.startsWith("codex-cli:gpt-6-astra@"));
+    assert.deepStrictEqual(
+      listed.map((id) => id.slice("codex-cli:gpt-6-astra@".length)).sort(),
+      [...evidenced, ...evidenced.map((e) => `${e}+fast`)].sort()
+    );
+    for (const id of listed) {
+      const parsed = parseCodexModelSelection(parseModelSelection(id).model);
+      assert.strictEqual(parsed.model, "gpt-6-astra", `${id} must not resolve to an older GPT model`);
+      assert.ok(evidenced.includes(parsed.reasoningEffort ?? ""), id);
+    }
+  });
+
+  void it("rejects Codex gpt-6-astra levels outside its ladder instead of falling back", () => {
+    for (const bad of ["none", "minimal", "turbo", "Ultra"]) {
+      assert.throws(() => parseCodexModelSelection(`gpt-6-astra@${bad}`), Error, bad);
+    }
+    // There is no plain gpt-6 / gpt-6-sol / gpt-6-luna in Codex's catalogue.
+    for (const absent of ["gpt-6", "gpt-6-sol", "gpt-6-luna"]) {
+      assert.ok(!(absent in CODEX_MODEL_CAPABILITIES), `${absent} must not be a Codex capability`);
+    }
+  });
+
+  void it("lists Claude Opus 5.5 with exactly low..max and routes each level to claude-opus-5-5", async () => {
+    const ids = await seededPickerIds("claude");
+    assert.ok(ids.includes("claude-cli:claude-opus-5-5"), "expected the base Opus 5.5 entry");
+    const ladder = ["low", "medium", "high", "xhigh", "max"];
+    assert.deepStrictEqual(ladderOf(ids, "claude-cli:claude-opus-5-5"), ladder);
+    const claude = getCliProvider("claude-cli");
+    assert.ok(claude, "expected the claude-cli provider");
+    for (const level of ladder) {
+      const args = claude.buildArgs("text", `claude-opus-5-5@${level}`);
+      assert.strictEqual(args[args.indexOf("--model") + 1], "claude-opus-5-5", level);
+      assert.ok(args.includes("--max-thinking-tokens"), `${level} must set a thinking budget`);
+    }
+    // Unsupported levels reject; the id is never aliased onto the older `opus` (Opus 5) entry.
+    for (const bad of ["none", "ultra", "minimal", "turbo"]) {
+      assert.throws(() => claude.buildArgs("text", `claude-opus-5-5@${bad}`), Error, bad);
+    }
+    const baseArgs = claude.buildArgs("text", "claude-opus-5-5");
+    assert.strictEqual(baseArgs[baseArgs.indexOf("--model") + 1], "claude-opus-5-5");
+  });
+
+  void it("validates OpenCode Zen Opus 5.5 / GPT-6 variants against each model's own ladder", async () => {
+    const ids = await seededPickerIds("opencode");
+    for (const base of ["claude-opus-5-5", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"]) {
+      const zenBase = `opencode/${base}`;
+      const ladder = OPENCODE_MODEL_VARIANTS[zenBase];
+      assert.ok(ladder, `${zenBase} needs a known ladder`);
+      assert.deepStrictEqual(ladderOf(ids, `opencode-cli:${zenBase}`), [...ladder], zenBase);
+      for (const level of ladder) {
+        assert.deepStrictEqual(parseOpencodeModelSelection(`${zenBase}@${level}`), {
+          model: zenBase,
+          variant: level,
+        });
+      }
+      assert.throws(() => parseOpencodeModelSelection(`${zenBase}@bogus`), Error, zenBase);
+    }
+    // Ladders differ per model: astra and Opus 5.5 have no "none"; "ultra" is Codex-only.
+    assert.throws(() => parseOpencodeModelSelection("opencode/gpt-6-astra@none"));
+    assert.throws(() => parseOpencodeModelSelection("opencode/gpt-6-sol@ultra"));
+    assert.deepStrictEqual(parseOpencodeModelSelection("opencode/gpt-6-sol@none"), {
+      model: "opencode/gpt-6-sol",
+      variant: "none",
+    });
+  });
+
+  void it("offers no GPT-6 or Opus 5.5 entry under the paths recorded as not-added", async () => {
+    for (const [command, prefix] of [
+      ["kiro-cli", "kiro-cli:"],
+      ["cline", "cline-cli:"],
+      ["agy", "antigravity-cli:"],
+    ] as const) {
+      const ids = (await seededPickerIds(command)).filter((id) => id.startsWith(prefix));
+      assert.ok(!ids.some((id) => /gpt-6|opus-5[-.]5/.test(id)), `${prefix} seeds must not carry the new models`);
+    }
+    const openCodeIds = await seededPickerIds("opencode");
+    const goIds = openCodeIds.filter((id) => id.startsWith("opencode-cli:opencode-go/"));
+    assert.ok(!goIds.some((id) => /gpt-6|opus-5[-.]5/.test(id)), "the Go tier must not carry the new models");
+    assert.ok(
+      !openCodeIds.some((id) => id.startsWith("opencode-cli:openai/")),
+      "non-picker openai/* seeds must never be offered"
+    );
+  });
+
+  void it("validates the levels of a live-discovered GPT-6 / Opus 5.5 model the same way as a seeded one", () => {
+    // The shape of `opencode models --verbose`: discovery replaces the seed wholesale, and the
+    // discovered variant ids must still pass the runner's per-model ladder check.
+    const capture = [
+      "opencode/gpt-6-luna",
+      JSON.stringify({
+        id: "gpt-6-luna",
+        providerID: "opencode",
+        name: "GPT-6 Luna",
+        variants: { none: {}, low: {}, medium: {}, high: {}, xhigh: {}, max: {} },
+      }),
+      "opencode/claude-opus-5-5",
+      JSON.stringify({
+        id: "claude-opus-5-5",
+        providerID: "opencode",
+        name: "Claude Opus 5.5",
+        variants: { low: {}, medium: {}, high: {}, xhigh: {}, max: {} },
+      }),
+    ].join("\n");
+    const discovered = parseOpencodeModelsOutput(capture).map((m) => m.model);
+    assert.deepStrictEqual(discovered, [
+      "opencode/gpt-6-luna",
+      "opencode/gpt-6-luna@none",
+      "opencode/gpt-6-luna@low",
+      "opencode/gpt-6-luna@medium",
+      "opencode/gpt-6-luna@high",
+      "opencode/gpt-6-luna@xhigh",
+      "opencode/gpt-6-luna@max",
+      "opencode/claude-opus-5-5",
+      "opencode/claude-opus-5-5@low",
+      "opencode/claude-opus-5-5@medium",
+      "opencode/claude-opus-5-5@high",
+      "opencode/claude-opus-5-5@xhigh",
+      "opencode/claude-opus-5-5@max",
+    ]);
+    for (const id of discovered) {
+      assert.doesNotThrow(() => parseOpencodeModelSelection(id), id);
     }
   });
 });

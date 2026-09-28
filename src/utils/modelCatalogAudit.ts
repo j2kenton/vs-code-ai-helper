@@ -168,6 +168,50 @@ export interface AuditWaiver {
   decision: string;
 }
 
+/**
+ * Per-path outcome for a model family that a task set out to add. `added`: an
+ * entry with positive evidence is seeded. `available-via-discovery`: a live
+ * capture confirms the path already surfaces the model, so no seed is needed.
+ * `not-added`: the policy's "Rule for adding" (or a non-picker / redundant-seed
+ * case) supports leaving it out. `unverified`: no positive evidence yet; an
+ * interim state that keeps the task open.
+ */
+export const AUDIT_PATH_DISPOSITION_STATUSES = [
+  "added",
+  "available-via-discovery",
+  "not-added",
+  "unverified",
+] as const;
+export type AuditPathDispositionStatus = (typeof AUDIT_PATH_DISPOSITION_STATUSES)[number];
+
+/** The model families of the GPT-6 / Opus 5.5 task. */
+export const AUDIT_TARGET_FAMILIES = ["gpt-6", "opus-5.5"] as const;
+export type AuditTargetFamily = (typeof AUDIT_TARGET_FAMILIES)[number];
+
+export interface AuditPathDisposition {
+  provider: AuditProviderId;
+  block: string;
+  family: AuditTargetFamily;
+  status: AuditPathDispositionStatus;
+  checkedAt?: string;
+  /** The capture or document the disposition rests on. */
+  source?: string;
+  /** Why the path is `not-added`, or what is still missing for `unverified`. */
+  reason?: string;
+  /** `added`: provider-local ids of the `added` entries in the path's record. */
+  entryIds?: string[];
+}
+
+/** Fields every path disposition of a given status must carry. */
+export const AUDIT_REQUIRED_PATH_DISPOSITION_FIELDS: Readonly<
+  Record<AuditPathDispositionStatus, readonly (keyof AuditPathDisposition)[]>
+> = {
+  added: ["checkedAt", "source", "entryIds"],
+  "available-via-discovery": ["checkedAt", "source"],
+  "not-added": ["reason"],
+  unverified: ["reason"],
+};
+
 export interface AuditManifest {
   version: number;
   auditDate: string;
@@ -175,6 +219,8 @@ export interface AuditManifest {
   providerContext: Partial<Record<AuditProviderId, AuditProviderContext>>;
   humanScopeWaivers: AuditWaiver[];
   records: AuditProviderRecord[];
+  /** Optional: only the manifest of a task that adds a model family carries it. */
+  pathDispositions?: AuditPathDisposition[];
   notes?: string;
 }
 
@@ -425,6 +471,9 @@ export function validateAuditManifest(
     }
   }
 
+  const pathDispositions =
+    raw.pathDispositions === undefined ? undefined : validatePathDispositions(raw.pathDispositions, records);
+
   return {
     version: raw.version,
     auditDate: raw.auditDate,
@@ -432,8 +481,100 @@ export function validateAuditManifest(
     providerContext,
     humanScopeWaivers,
     records,
+    ...(pathDispositions ? { pathDispositions } : {}),
     ...(typeof raw.notes === "string" ? { notes: raw.notes } : {}),
   };
+}
+
+/** Every non-Copilot picker path (provider + block) a family task must resolve; Copilot loads its models automatically. */
+export function listInScopeAuditPaths(): { provider: AuditProviderId; block: string }[] {
+  return AUDIT_PROVIDER_IDS.filter((provider) => provider !== "copilot").flatMap((provider) =>
+    AUDIT_BLOCKS[provider]
+      .filter((def) => def.scope === "picker")
+      .map((def) => ({ provider, block: def.block }))
+  );
+}
+
+function validatePathDispositions(raw: unknown, records: readonly AuditProviderRecord[]): AuditPathDisposition[] {
+  if (!Array.isArray(raw)) {
+    throw new Error('Audit manifest field "pathDispositions" must be an array');
+  }
+  const seen = new Set<string>();
+  return raw.map((item, index) => {
+    const where = `pathDispositions[${index}]`;
+    if (!isRecord(item)) {
+      throw new Error(`${where} must be an object`);
+    }
+    const { provider, block, family, status } = item;
+    if (!isAuditProviderId(provider) || provider === "copilot") {
+      throw new Error(`${where} has unknown or out-of-scope provider ${JSON.stringify(provider)}`);
+    }
+    const blockDef = AUDIT_BLOCKS[provider].find((def) => def.block === block);
+    if (!blockDef || blockDef.scope !== "picker") {
+      throw new Error(`${where} names ${provider} block ${JSON.stringify(block)}, which is not a picker block`);
+    }
+    if (!(AUDIT_TARGET_FAMILIES as readonly unknown[]).includes(family)) {
+      throw new Error(`${where} has unknown family ${JSON.stringify(family)}`);
+    }
+    if (!(AUDIT_PATH_DISPOSITION_STATUSES as readonly unknown[]).includes(status)) {
+      throw new Error(`${where} has unknown status ${JSON.stringify(status)}`);
+    }
+    const typedStatus = status as AuditPathDispositionStatus;
+    const key = `${provider}/${blockDef.block}/${family as string}`;
+    if (seen.has(key)) {
+      throw new Error(`${where} duplicates the disposition for ${key}`);
+    }
+    seen.add(key);
+    for (const field of AUDIT_REQUIRED_PATH_DISPOSITION_FIELDS[typedStatus]) {
+      const value = item[field];
+      if (value === undefined || value === "" || (Array.isArray(value) && value.length === 0)) {
+        throw new Error(`${where} (${key}, ${typedStatus}) is missing required field "${field}"`);
+      }
+    }
+    for (const field of ["checkedAt", "source", "reason"] as const) {
+      if (item[field] !== undefined && !isNonEmptyString(item[field])) {
+        throw new Error(`${where} field "${field}" must be a non-empty string`);
+      }
+    }
+    const disposition: AuditPathDisposition = {
+      provider,
+      block: blockDef.block,
+      family: family as AuditTargetFamily,
+      status: typedStatus,
+      ...(typeof item.checkedAt === "string" ? { checkedAt: item.checkedAt } : {}),
+      ...(typeof item.source === "string" ? { source: item.source } : {}),
+      ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
+    };
+    if (item.entryIds !== undefined) {
+      if (!Array.isArray(item.entryIds) || !item.entryIds.every(isNonEmptyString)) {
+        throw new Error(`${where} field "entryIds" must be an array of non-empty strings`);
+      }
+      disposition.entryIds = [...item.entryIds];
+    }
+    if (typedStatus === "added") {
+      // An `added` path must point at entries that the record itself marks `added`.
+      const record = records.find((r) => r.provider === provider && r.block === blockDef.block);
+      for (const id of disposition.entryIds ?? []) {
+        if (record?.entries?.find((e) => e.id === id)?.status !== "added") {
+          throw new Error(`${where} (${key}) names entry "${id}", which is not an added entry of that record`);
+        }
+      }
+    }
+    return disposition;
+  });
+}
+
+/** In-scope (path, family) pairs the manifest has no disposition for. Empty when `pathDispositions` covers them all. */
+export function findMissingPathDispositions(manifest: AuditManifest): string[] {
+  const have = new Set((manifest.pathDispositions ?? []).map((d) => `${d.provider}/${d.block}/${d.family}`));
+  return listInScopeAuditPaths().flatMap(({ provider, block }) =>
+    AUDIT_TARGET_FAMILIES.map((family) => `${provider}/${block}/${family}`).filter((key) => !have.has(key))
+  );
+}
+
+/** Path dispositions still `unverified`: each keeps the task open until evidence or a human decision resolves it. */
+export function findUnresolvedPathDispositions(manifest: AuditManifest): AuditPathDisposition[] {
+  return (manifest.pathDispositions ?? []).filter((d) => d.status === "unverified");
 }
 
 function validateProviderContext(raw: unknown): AuditManifest["providerContext"] {

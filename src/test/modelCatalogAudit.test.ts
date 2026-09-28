@@ -14,8 +14,11 @@ import {
   dispositionsFromManifest,
   findFreeAllowlistViolations,
   findFreeLabelViolations,
+  findMissingPathDispositions,
   findStatusSeedDisagreements,
+  findUnresolvedPathDispositions,
   hasFreeMarker,
+  listInScopeAuditPaths,
   loadAuditManifest,
   partitionSeedByBlock,
   resolveAuditManifestPath,
@@ -23,6 +26,7 @@ import {
   stripFreeMarker,
   toBaseSelectionId,
   validateAuditManifest,
+  type AuditPathDisposition,
   type AuditProviderId,
 } from "../utils/modelCatalogAudit";
 import { VERIFIED_FREE_MODEL_IDS, getSeededCatalogForAudit } from "../utils/modelSelection";
@@ -554,6 +558,23 @@ void describe("checked-in manifest against the real seed", () => {
     );
   });
 
+  void it("records Opus 5.5 and GPT-6 as added, with evidence, on every path that seeds them", () => {
+    for (const [provider, block, id] of [
+      ["claude-cli", "default", "claude-opus-5-5"],
+      ["codex-cli", "default", "gpt-6-astra"],
+      ["opencode-cli", "opencode", "opencode/claude-opus-5-5"],
+      ["opencode-cli", "opencode", "opencode/gpt-6-astra"],
+      ["opencode-cli", "opencode", "opencode/gpt-6-luna"],
+      ["opencode-cli", "opencode", "opencode/gpt-6-sol"],
+    ] as const) {
+      const record = manifest.records.find((r) => r.provider === provider && r.block === block);
+      const entry = record?.entries?.find((e) => e.id === id);
+      assert.equal(entry?.status, "added", `${provider}:${id}`);
+      assert.equal(entry?.checkedAt, "2026-09-27", `${provider}:${id}`);
+      assert.ok(seedIndex.get(provider)?.has(id), `${provider}:${id} is not seeded`);
+    }
+  });
+
   void it("only offers Claude efforts the runner turns into a thinking budget", () => {
     const claude = getCliProvider("claude-cli");
     assert.ok(claude, "expected claude-cli provider definition");
@@ -579,6 +600,168 @@ void describe("checked-in manifest against the real seed", () => {
     const external = manifest.records.find((r) => r.provider === "opencode-cli" && r.block === "external");
     assert.equal(external?.scope, "non-picker");
     assert.ok(external?.reason);
+    assert.match(external?.reason ?? "", /not-added/, "the GPT-6 / Opus 5.5 task records the non-picker block as not-added");
     assert.equal(external?.entries, undefined);
+  });
+});
+
+void describe("path dispositions for the GPT-6 / Opus 5.5 task", () => {
+  const manifest = loadAuditManifest(AUDIT_MANIFEST_PATH, { freeAllowlist: VERIFIED_FREE_MODEL_IDS });
+  const seedIndex = buildSeedBaseIdIndex(getSeededCatalogForAudit().seeded);
+  const disposition = (provider: string, block: string, family: string): AuditPathDisposition | undefined =>
+    manifest.pathDispositions?.find((d) => d.provider === provider && d.block === block && d.family === family);
+
+  void it("lists every non-Copilot picker path, with opencode as two blocks and no external block", () => {
+    const keys = listInScopeAuditPaths().map((p) => `${p.provider}/${p.block}`);
+    assert.deepEqual(keys.sort(), [
+      "antigravity-cli/default",
+      "claude-cli/default",
+      "cline-cli/default",
+      "codex-cli/default",
+      "devpass-cli/default",
+      "gemini-cli/default",
+      "kimi-cli/default",
+      "kiro-cli/default",
+      "opencode-cli/opencode",
+      "opencode-cli/opencode-go",
+    ]);
+  });
+
+  void it("has a disposition for every in-scope path and both families", () => {
+    assert.deepEqual(findMissingPathDispositions(manifest), []);
+    assert.ok(!(manifest.pathDispositions ?? []).some((d) => d.provider === "copilot"), "Copilot is out of scope");
+  });
+
+  void it("backs every added disposition with seeded, added entries and evidence", () => {
+    for (const d of manifest.pathDispositions ?? []) {
+      if (d.status !== "added") {
+        continue;
+      }
+      assert.ok(d.checkedAt && d.source, `${d.provider}/${d.block}/${d.family} needs evidence`);
+      for (const id of d.entryIds ?? []) {
+        assert.ok(seedIndex.get(d.provider)?.has(id), `${d.provider}:${id} is not seeded`);
+      }
+    }
+    assert.deepEqual(disposition("codex-cli", "default", "gpt-6")?.entryIds, ["gpt-6-astra"]);
+    assert.deepEqual(disposition("claude-cli", "default", "opus-5.5")?.entryIds, ["claude-opus-5-5"]);
+    assert.deepEqual(disposition("opencode-cli", "opencode", "gpt-6")?.entryIds, [
+      "opencode/gpt-6-astra",
+      "opencode/gpt-6-luna",
+      "opencode/gpt-6-sol",
+    ]);
+  });
+
+  void it("gives not-added dispositions only where nothing is seeded for the family", () => {
+    for (const d of manifest.pathDispositions ?? []) {
+      if (d.status !== "not-added") {
+        continue;
+      }
+      // Scope to the disposition's own block: opencode's Zen seeds must not count against the Go block.
+      const seeded = [...(seedIndex.get(d.provider) ?? [])].filter(
+        (id) => blockForSeedId(d.provider, id).block === d.block
+      );
+      const pattern = d.family === "gpt-6" ? /gpt-6/ : /opus-5[-.]5/;
+      assert.ok(!seeded.some((id) => pattern.test(id)), `${d.provider}/${d.block}/${d.family} is not-added but seeded`);
+    }
+  });
+
+  void it("leaves no in-scope path unverified", () => {
+    assert.deepEqual(findUnresolvedPathDispositions(manifest), []);
+  });
+
+  void it("records the no-evidence paths as not-added under the owner's 2026-09-27 decision", () => {
+    // Providers with no evidence either way are policy-supported `not-added`; discovery-backed
+    // paths also say discovery will surface the model once the provider offers it.
+    const noEvidence: [string, string, boolean][] = [
+      ["opencode-cli", "opencode-go", false],
+      ["antigravity-cli", "default", true],
+      ["kiro-cli", "default", true],
+      ["cline-cli", "default", false],
+      ["devpass-cli", "default", true],
+    ];
+    for (const [provider, block, discovers] of noEvidence) {
+      for (const family of ["gpt-6", "opus-5.5"] as const) {
+        const d = disposition(provider, block, family);
+        const label = `${provider}/${block}/${family}`;
+        assert.equal(d?.status, "not-added", label);
+        assert.match(d?.reason ?? "", /No evidence the provider offers GPT-6 or Opus 5\.5/, label);
+        if (discovers) {
+          assert.match(d?.reason ?? "", /Discovery is wired for this path and will surface such a model/, label);
+        }
+      }
+    }
+  });
+
+  void it("rejects malformed path dispositions", () => {
+    const base = { provider: "codex-cli", block: "default", family: "gpt-6" };
+    const cases: [string, Json, RegExp][] = [
+      ["a Copilot path", { ...base, provider: "copilot", status: "not-added", reason: "x" }, /out-of-scope provider/],
+      [
+        "a non-picker block",
+        { provider: "opencode-cli", block: "external", family: "gpt-6", status: "not-added", reason: "x" },
+        /not a picker block/,
+      ],
+      ["an unknown family", { ...base, family: "gpt-7", status: "not-added", reason: "x" }, /unknown family/],
+      ["an unknown status", { ...base, status: "maybe" }, /unknown status/],
+      ["not-added without a reason", { ...base, status: "not-added" }, /missing required field "reason"/],
+      ["unverified without a reason", { ...base, status: "unverified" }, /missing required field "reason"/],
+      [
+        "added without evidence",
+        { ...base, status: "added", entryIds: ["gpt-6-astra"] },
+        /missing required field "checkedAt"/,
+      ],
+      [
+        "added without entry ids",
+        { ...base, status: "added", checkedAt: "2026-09-27", source: "s", entryIds: [] },
+        /missing required field "entryIds"/,
+      ],
+      [
+        "added naming an entry the record lacks",
+        { ...base, status: "added", checkedAt: "2026-09-27", source: "s", entryIds: ["gpt-6-astra"] },
+        /not an added entry/,
+      ],
+      [
+        "available-via-discovery without a capture",
+        { ...base, status: "available-via-discovery" },
+        /missing required field "checkedAt"/,
+      ],
+    ];
+    for (const [label, d, message] of cases) {
+      assert.throws(() => validateAuditManifest(manifestWith([], { pathDispositions: [d] })), message, label);
+    }
+    assert.throws(
+      () =>
+        validateAuditManifest(
+          manifestWith([], {
+            pathDispositions: [
+              { ...base, status: "not-added", reason: "x" },
+              { ...base, status: "unverified", reason: "y" },
+            ],
+          })
+        ),
+      /duplicates the disposition/
+    );
+  });
+
+  void it("accepts available-via-discovery with a capture and reports missing pairs", () => {
+    const parsed = validateAuditManifest(
+      manifestWith([], {
+        pathDispositions: [
+          {
+            provider: "kiro-cli",
+            block: "default",
+            family: "opus-5.5",
+            status: "available-via-discovery",
+            checkedAt: "2026-09-27",
+            source: "fixture listing",
+          },
+        ],
+      })
+    );
+    assert.equal(parsed.pathDispositions?.[0]?.status, "available-via-discovery");
+    const missing = findMissingPathDispositions(parsed);
+    assert.ok(!missing.includes("kiro-cli/default/opus-5.5"));
+    assert.ok(missing.includes("kiro-cli/default/gpt-6"));
+    assert.equal(findUnresolvedPathDispositions(parsed).length, 0);
   });
 });

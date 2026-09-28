@@ -716,6 +716,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
+    { model: "claude-opus-5-5", name: "Opus 5.5" },
+    ...createVariants("claude-opus-5-5", "Opus 5.5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
     { model: "haiku", name: "Haiku 4.5" },
   ];
 }
@@ -839,7 +847,9 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * Raw `opencode models --verbose` catalog snapshot (opencode 1.18.4,
  * captured 2026-07-21, refreshed 2026-07-21 to add the "opencode-go" and
  * "github-copilot" provider tiers that appeared in the live catalog after
- * the first capture — the catalog is server-side and grows over time),
+ * the first capture — the catalog is server-side and grows over time; the
+ * opencode/claude-opus-5-5 and opencode/gpt-6-* lines were added 2026-09-27
+ * from an opencode 1.18.31 capture, without regenerating the rest),
  * compacted to one minified JSON object per line (only the fields
  * parseOpencodeModelsOutput reads: id, providerID, name, variants —
  * cost/limit/capabilities/etc. are dropped, they're irrelevant to model
@@ -871,6 +881,8 @@ opencode/claude-opus-4-8
 {"id":"claude-opus-4-8","providerID":"opencode","name":"Claude Opus 4.8","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/claude-opus-5
 {"id":"claude-opus-5","providerID":"opencode","name":"Claude Opus 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-opus-5-5
+{"id":"claude-opus-5-5","providerID":"opencode","name":"Claude Opus 5.5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/claude-sonnet-4
 {"id":"claude-sonnet-4","providerID":"opencode","name":"Claude Sonnet 4","variants":{"high":{},"max":{}}}
 opencode/claude-sonnet-4-5
@@ -937,6 +949,12 @@ opencode/gpt-5.6-sol
 {"id":"gpt-5.6-sol","providerID":"opencode","name":"GPT-5.6 Sol","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/gpt-5.6-terra
 {"id":"gpt-5.6-terra","providerID":"opencode","name":"GPT-5.6 Terra","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-6-astra
+{"id":"gpt-6-astra","providerID":"opencode","name":"GPT-6 Astra","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-6-luna
+{"id":"gpt-6-luna","providerID":"opencode","name":"GPT-6 Luna","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-6-sol
+{"id":"gpt-6-sol","providerID":"opencode","name":"GPT-6 Sol","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/grok-4.5
 {"id":"grok-4.5","providerID":"opencode","name":"Grok 4.5","variants":{"low":{},"medium":{},"high":{}}}
 opencode/grok-build-0.1
