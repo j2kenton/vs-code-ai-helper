@@ -642,7 +642,11 @@ void describe("path dispositions for the GPT-6 / Opus 5.5 task", () => {
         assert.ok(seedIndex.get(d.provider)?.has(id), `${d.provider}:${id} is not seeded`);
       }
     }
-    assert.deepEqual(disposition("codex-cli", "default", "gpt-6")?.entryIds, ["gpt-6-astra"]);
+    assert.deepEqual(disposition("codex-cli", "default", "gpt-6")?.entryIds, [
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
+    ]);
     assert.deepEqual(disposition("claude-cli", "default", "opus-5.5")?.entryIds, ["claude-opus-5-5"]);
     assert.deepEqual(disposition("opencode-cli", "opencode", "gpt-6")?.entryIds, [
       "opencode/gpt-6-astra",

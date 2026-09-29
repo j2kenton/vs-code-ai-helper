@@ -473,6 +473,20 @@ export const CODEX_MODEL_CAPABILITIES: Readonly<
     ],
     supportsFast: true,
   },
+  "gpt-6-sol": {
+    label: "GPT-6-Sol",
+    efforts: [
+      ...CODEX_EFFORT_LOW_TO_XHIGH,
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ],
+    supportsFast: true,
+  },
+  "gpt-6-luna": {
+    label: "GPT-6-Luna",
+    efforts: [...CODEX_EFFORT_LOW_TO_XHIGH, ["max", "Max"]],
+    supportsFast: true,
+  },
   "gpt-5.5": {
     label: "GPT-5.5",
     efforts: CODEX_EFFORT_LOW_TO_XHIGH,

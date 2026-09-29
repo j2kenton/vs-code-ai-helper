@@ -677,6 +677,31 @@ void describe("getAvailableModels", () => {
             true
           ),
           ...codexVariants(
+            "gpt-6-sol",
+            "GPT-6-Sol",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+              ["ultra", "Ultra"],
+            ],
+            true
+          ),
+          ...codexVariants(
+            "gpt-6-luna",
+            "GPT-6-Luna",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ],
+            true
+          ),
+          ...codexVariants(
             "gpt-5.5",
             "GPT-5.5",
             [
@@ -1702,9 +1727,65 @@ void describe("GPT-6 / Opus 5.5 listed entries validate against the provider lad
     for (const bad of ["none", "minimal", "turbo", "Ultra"]) {
       assert.throws(() => parseCodexModelSelection(`gpt-6-astra@${bad}`), Error, bad);
     }
-    // There is no plain gpt-6 / gpt-6-sol / gpt-6-luna in Codex's catalogue.
-    for (const absent of ["gpt-6", "gpt-6-sol", "gpt-6-luna"]) {
-      assert.ok(!(absent in CODEX_MODEL_CAPABILITIES), `${absent} must not be a Codex capability`);
+    // There is no plain gpt-6 in Codex's catalogue.
+    assert.ok(!("gpt-6" in CODEX_MODEL_CAPABILITIES), "gpt-6 must not be a Codex capability");
+  });
+
+  void it("lists Codex gpt-6-sol with exactly its evidenced ladder, every listed id resolving to gpt-6-sol", async () => {
+    const ids = await seededPickerIds("codex");
+    assert.ok(
+      ids.some((id) => id.startsWith("codex-cli:gpt-6-sol@")),
+      "expected effort-qualified gpt-6-sol entries"
+    );
+    const evidenced = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    assert.deepStrictEqual(
+      CODEX_MODEL_CAPABILITIES["gpt-6-sol"]?.efforts.map(([effort]) => effort),
+      evidenced
+    );
+    const listed = ids.filter((id) => id.startsWith("codex-cli:gpt-6-sol@"));
+    assert.deepStrictEqual(
+      listed.map((id) => id.slice("codex-cli:gpt-6-sol@".length)).sort(),
+      [...evidenced, ...evidenced.map((e) => `${e}+fast`)].sort()
+    );
+    for (const id of listed) {
+      const parsed = parseCodexModelSelection(parseModelSelection(id).model);
+      assert.strictEqual(parsed.model, "gpt-6-sol", `${id} must not resolve to a different model`);
+      assert.ok(evidenced.includes(parsed.reasoningEffort ?? ""), id);
+    }
+  });
+
+  void it("rejects Codex gpt-6-sol levels outside its ladder instead of falling back", () => {
+    for (const bad of ["none", "minimal", "turbo", "Ultra"]) {
+      assert.throws(() => parseCodexModelSelection(`gpt-6-sol@${bad}`), Error, bad);
+    }
+  });
+
+  void it("lists Codex gpt-6-luna with exactly its evidenced ladder, every listed id resolving to gpt-6-luna", async () => {
+    const ids = await seededPickerIds("codex");
+    assert.ok(
+      ids.some((id) => id.startsWith("codex-cli:gpt-6-luna@")),
+      "expected effort-qualified gpt-6-luna entries"
+    );
+    const evidenced = ["low", "medium", "high", "xhigh", "max"];
+    assert.deepStrictEqual(
+      CODEX_MODEL_CAPABILITIES["gpt-6-luna"]?.efforts.map(([effort]) => effort),
+      evidenced
+    );
+    const listed = ids.filter((id) => id.startsWith("codex-cli:gpt-6-luna@"));
+    assert.deepStrictEqual(
+      listed.map((id) => id.slice("codex-cli:gpt-6-luna@".length)).sort(),
+      [...evidenced, ...evidenced.map((e) => `${e}+fast`)].sort()
+    );
+    for (const id of listed) {
+      const parsed = parseCodexModelSelection(parseModelSelection(id).model);
+      assert.strictEqual(parsed.model, "gpt-6-luna", `${id} must not resolve to a different model`);
+      assert.ok(evidenced.includes(parsed.reasoningEffort ?? ""), id);
+    }
+  });
+
+  void it("rejects Codex gpt-6-luna levels outside its ladder instead of falling back", () => {
+    for (const bad of ["none", "minimal", "turbo", "ultra"]) {
+      assert.throws(() => parseCodexModelSelection(`gpt-6-luna@${bad}`), Error, bad);
     }
   });
 
