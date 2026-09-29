@@ -778,6 +778,55 @@ void describe("provider CLI contracts", () => {
       reasoningEffort: "ultra",
       serviceTier: "priority",
     });
+    // GPT-6-Sol follows the same low/medium/high/xhigh/max/ultra ladder as Astra.
+    assert.throws(() => parseCodexModelSelection("gpt-6-sol@turbo"));
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-6-sol@ultra+fast"), {
+      model: "gpt-6-sol",
+      reasoningEffort: "ultra",
+      serviceTier: "priority",
+    });
+    // GPT-6-Luna's ladder tops out at "max" — no "ultra" level.
+    assert.throws(() => parseCodexModelSelection("gpt-6-luna@ultra"));
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-6-luna@max+fast"), {
+      model: "gpt-6-luna",
+      reasoningEffort: "max",
+      serviceTier: "priority",
+    });
+
+    // Unqualified selection (no "@" suffix) must keep its existing
+    // semantics for the two new base ids too: the bare id passes through
+    // untouched, with no app-supplied effort or service tier, exactly like
+    // gpt-6-astra and every other capability-table entry — Sol's low and
+    // Luna's medium CLI defaults are not modeled by this app and must not
+    // be synthesized here.
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-6-sol"), {
+      model: "gpt-6-sol",
+      reasoningEffort: undefined,
+      serviceTier: undefined,
+    });
+    assert.deepStrictEqual(parseCodexModelSelection("gpt-6-luna"), {
+      model: "gpt-6-luna",
+      reasoningEffort: undefined,
+      serviceTier: undefined,
+    });
+
+    const codexForUnqualified = getCliProvider("codex-cli");
+    assert.ok(codexForUnqualified, "expected codex-cli provider definition");
+    for (const bareId of ["gpt-6-sol", "gpt-6-luna"]) {
+      const unqualifiedArgs = codexForUnqualified.buildArgs("text", bareId);
+      assert.ok(
+        unqualifiedArgs.includes(bareId),
+        `${bareId}: unqualified selection must still reach --model`
+      );
+      assert.ok(
+        !unqualifiedArgs.some((arg) => arg.includes("model_reasoning_effort")),
+        `${bareId}: unqualified selection must not supply a reasoning effort`
+      );
+      assert.ok(
+        !unqualifiedArgs.some((arg) => arg.includes("service_tier")),
+        `${bareId}: unqualified selection must not supply a service tier`
+      );
+    }
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {

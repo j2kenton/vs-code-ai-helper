@@ -114,20 +114,32 @@
       "defaultAuthPath": "ChatGPT sign-in (`codex login`)",
       "supportedPathClasses": ["chatgpt-signin", "api-key"],
       "evidence": {
-        "authContext": "ChatGPT sign-in via `codex login`; live CLI capture on the dev box (`codex debug models`) enumerates the GPT-6 family entry directly",
-        "cliVersion": "codex 0.154.0",
-        "source": "`codex debug models` output on the dev box, 2026-09-27: gpt-6-astra is the only GPT-6 model Codex offers (levels low, medium, high, xhigh, max, ultra; default low). There is no plain gpt-6, gpt-6-sol or gpt-6-luna in Codex's own catalogue.",
-        "date": "2026-09-27"
+        "authContext": "ChatGPT sign-in via `codex login`; live CLI capture on the dev box (`codex debug models`) enumerates the GPT-6 family entries directly",
+        "cliVersion": "codex 0.159.0",
+        "source": "`codex debug models` output on the dev box, 2026-09-29: codex 0.155.0 and later offers all three GPT-6 models: gpt-6-astra and gpt-6-sol (levels low, medium, high, xhigh, max, ultra; default low) and gpt-6-luna (levels low, medium, high, xhigh, max; default medium), all with the fast tier. The repository's prior \"gpt-6-astra is the only GPT-6 model\" record came from codex 0.154.0 and is superseded by this capture; the dev box's Codex is now 0.159.0. There is no plain gpt-6 in Codex's own catalogue.",
+        "date": "2026-09-29"
       },
       "coverage": "entries",
       "freeLabelsAudited": true,
-      "notes": "First manifest record for codex-cli. Adds gpt-6-astra with live-captured evidence; every other pre-existing seeded base id is recorded unverified pending a live `codex --model <id>` capture so no seeded id is left without a manifest entry.",
+      "notes": "First manifest record for codex-cli. Adds gpt-6-astra, gpt-6-sol and gpt-6-luna with live-captured evidence; every other pre-existing seeded base id is recorded unverified pending a live `codex --model <id>` capture so no seeded id is left without a manifest entry.",
       "entries": [
         {
           "id": "gpt-6-astra",
           "status": "added",
           "checkedAt": "2026-09-27",
           "source": "`codex debug models` output (codex 0.154.0) on the dev box, 2026-09-27: gpt-6-astra listed with default effort low and supported efforts low, medium, high, xhigh, max, ultra. The same output also lists `additional_speed_tiers: [\"fast\"]` for gpt-6-astra (service tier `priority`, named \"Fast\": 2x speed, increased usage), the same fast tier documented for gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna and gpt-5.5, which establishes supportsFast: true for gpt-6-astra in CODEX_MODEL_CAPABILITIES. Live run 2026-09-27: `codex exec --json -m gpt-6-astra -c model_reasoning_effort=\"low\"` completed and answered."
+        },
+        {
+          "id": "gpt-6-sol",
+          "status": "added",
+          "checkedAt": "2026-09-29",
+          "source": "`codex debug models` output (codex 0.159.0) on the dev box, 2026-09-29: gpt-6-sol listed with default effort low and supported efforts low, medium, high, xhigh, max, ultra, plus `additional_speed_tiers: [\"fast\"]` (service tier `priority`), the same ladder and fast tier as gpt-6-astra. Live run 2026-09-29: `codex exec` answered on gpt-6-sol."
+        },
+        {
+          "id": "gpt-6-luna",
+          "status": "added",
+          "checkedAt": "2026-09-29",
+          "source": "`codex debug models` output (codex 0.159.0) on the dev box, 2026-09-29: gpt-6-luna listed with default effort medium and supported efforts low, medium, high, xhigh, max, plus `additional_speed_tiers: [\"fast\"]` (service tier `priority`). Live run 2026-09-29: `codex exec` answered on gpt-6-luna."
         },
         {
           "id": "gpt-5.5",
@@ -259,9 +271,9 @@
       "block": "default",
       "family": "gpt-6",
       "status": "added",
-      "checkedAt": "2026-09-27",
-      "source": "`codex debug models` (codex 0.154.0) on the dev box, 2026-09-27; see the gpt-6-astra entry",
-      "entryIds": ["gpt-6-astra"]
+      "checkedAt": "2026-09-29",
+      "source": "`codex debug models` (codex 0.159.0) on the dev box, 2026-09-29; see the gpt-6-astra, gpt-6-sol and gpt-6-luna entries",
+      "entryIds": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
     },
     {
       "provider": "codex-cli",
