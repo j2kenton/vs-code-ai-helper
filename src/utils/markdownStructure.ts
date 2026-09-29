@@ -115,9 +115,9 @@ export function headingsV1(content: string): MarkdownHeadingV1[] {
  * Index of the LAST heading whose title matches `text`, or -1.
  *
  * Last, not first, because a response legitimately contains headings that are
- * not its own: the required checklist echo reproduces the plan of record,
- * which `create-implementation.md` makes end with a "Verification" section, so
- * the summary's own sections come after the echoed ones.
+ * not its own: an echoed checklist reproduces the plan of record, which
+ * `create-implementation.md` makes end with a "Verification" section, so the
+ * summary's own sections come after the echoed ones.
  */
 export function findLastHeadingV1(
   all: readonly MarkdownHeadingV1[],

@@ -116,6 +116,16 @@ export interface EngineChatTransactionStoreV1 {
    * progressed past `invocationPending` rejects.
    */
   discardPendingInvocation(operationId: string): Promise<EngineTransactionStoreResultV1>;
+  /**
+   * Settle a durable record explicitly as `timedOut`, `cancelled`, or
+   * `interrupted` instead of deleting it via `discardPendingInvocation` —
+   * see the extension-side store's matching doc comment. Legal from any
+   * unsettled state.
+   */
+  settleInvocation(
+    operationId: string,
+    settlement: "timedOut" | "cancelled" | "interrupted"
+  ): Promise<EngineTransactionStoreResultV1>;
   /** Load and strictly decode one operation's record. */
   load(operationId: string): Promise<EngineTransactionStoreResultV1>;
   /** Save a (possibly partial) answers draft; repeat saves rewrite in place. */
@@ -550,6 +560,13 @@ export function createEngineTransactionStoreV1(options: {
         backend.deleteRecord(operationId);
         return { kind: "ok", transaction: loaded.transaction };
       });
+    },
+
+    settleInvocation(
+      operationId: string,
+      settlement: "timedOut" | "cancelled" | "interrupted"
+    ): Promise<EngineTransactionStoreResultV1> {
+      return settleTerminal(operationId, settlement);
     },
 
     async load(operationId: string): Promise<EngineTransactionStoreResultV1> {

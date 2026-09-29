@@ -191,6 +191,18 @@ void test("stage prompt advertises the shared ACTION envelope and every action i
   }
 });
 
+// RC2 item 14, Step 9/10: this prompt IS the stage-chat runner's own request
+// builder — chatWithStage.ts sends it as the single initial User message to
+// the production coordinator (no separate message-building site of its own;
+// see the RC2 item 14 round summary's Step 9 inventory). Copilot's `auto`
+// router fails outright on an empty last-User-message text, so this build
+// must never produce empty text, even with an empty user message, empty
+// conversation history and no task artifacts.
+void test("stage prompt (the stage-chat runner's initial User message) is never empty, even with an empty user message (RC2 item 14)", () => {
+  const prompt = buildStageResponsePrompt("Plan", "my-task", "", "ctx", "", "");
+  assert.ok(prompt.length > 0, "the built prompt must carry non-empty text");
+});
+
 // wf10 item 19 / plan Step 28 (prompt-side prerequisite only — the full
 // confirmable-edit + durable supersession + stage-gate recognition flow
 // remains unbuilt, see the round summary): a jester task 4 live transcript

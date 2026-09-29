@@ -66,7 +66,14 @@ import {
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  createSafeAdmissionReleaseStateV1,
+  deriveAdmissionReleaseTriggerV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import {
   reconcileWatchdogPauseAgainstAdmissionV1,
   WorkAdmissionPauseReconciliationV1,
@@ -261,7 +268,9 @@ async function reviewCommitMessage(
   chatViewProvider?: ChatViewProvider,
   resumeInteraction?: CommitPushMetadataResumeRequestV1,
   /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
-  coordinatorOperationId?: OperationIdV1
+  coordinatorOperationId?: OperationIdV1,
+  /** See `buildCommitMessage`'s matching param — passed straight through to whichever of `buildCommitMessage`/`resumeCommitMessage` this call's `generate()` dispatches to. */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<CommitMessageReviewResultV1> {
   const MAX_PREVIEW_FILES = 15;
   const previewFiles = scopedFiles.slice(0, MAX_PREVIEW_FILES);
@@ -301,7 +310,8 @@ async function reviewCommitMessage(
         taskStatus,
         chatViewProvider,
         resumeInteraction,
-        coordinatorOperationId
+        coordinatorOperationId,
+        dispatchProbe
       );
     } else {
       result = await buildCommitMessage(
@@ -312,7 +322,8 @@ async function reviewCommitMessage(
         scopedFiles,
         cancellationToken,
         chatViewProvider,
-        coordinatorOperationId
+        coordinatorOperationId,
+        dispatchProbe
       );
     }
     if (result.kind === "questionsPosted") {
@@ -372,6 +383,34 @@ type CommitMessageResultV1 =
   | { kind: "message"; text: string }
   | { kind: "questionsPosted"; interactionId: InteractionIdV1; correlation: ActionCorrelationV1 };
 
+/**
+ * Item 2 / Step 57a completion fix (review, 2026-09-29): record a
+ * `commitPushMetadata.v1` invocation's outcome onto the shared `dispatchProbe`
+ * object `reviewCommitMessage`'s confirmation loop threads through every
+ * `generate()` call — the initial attempt AND every "Regenerate" click.
+ * STICKY once a timeout/cancellation trigger is recorded: a later,
+ * successful Regenerate attempt must never erase an EARLIER invocation's
+ * terminal trigger, because that earlier invocation's process may still be
+ * `stillRunning`/`unconfirmedSpawn` even though the user has since moved on
+ * to a fresh generation that happened to complete. Without this, the single
+ * mutable slot both call sites used to write unconditionally would let the
+ * last call's "completed" outcome mask an earlier deadline/cancellation,
+ * losing the `heldAfterTimeoutV1` trigger `invokeCommitPushRowV1`'s caller
+ * needs for safe admission release.
+ */
+function recordCommitMetadataDispatchProbeOutcomeV1(
+  dispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } | undefined,
+  outcome: TaskActionOutcomeV1
+): void {
+  if (!dispatchProbe) {
+    return;
+  }
+  if (dispatchProbe.coordinatorOutcome && deriveAdmissionReleaseTriggerV1(dispatchProbe.coordinatorOutcome)) {
+    return;
+  }
+  dispatchProbe.coordinatorOutcome = outcome;
+}
+
 async function buildCommitMessage(
   repoRoot: string,
   taskFolderUri: vscode.Uri,
@@ -381,7 +420,22 @@ async function buildCommitMessage(
   cancellationToken: vscode.CancellationToken,
   chatViewProvider?: ChatViewProvider,
   /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
-  coordinatorOperationId?: OperationIdV1
+  coordinatorOperationId?: OperationIdV1,
+  /**
+   * Item 2 / Step 57a (review fix, 2026-09-29): this CHILD `commitPushMetadata.v1`
+   * invocation's own outcome, read back so the top-level `invokeCommitPushRowV1`
+   * caller can tell a deadline/cancellation here apart from the row's own
+   * "completed" outcome — the `try`/`catch` below silently falls back to the
+   * deterministic `fallback` subject on ANY non-"completed"/"questions"
+   * outcome, including a timeout or cancellation whose process may still be
+   * running, so the top-level result alone can no longer be trusted for
+   * release safety once that happens. See `reviewCommitPushMessageV1`'s
+   * matching param. Recorded via `recordCommitMetadataDispatchProbeOutcomeV1`
+   * (sticky once a trigger is recorded), not written directly — this same
+   * object is shared across every "Regenerate" attempt in the caller's
+   * confirmation loop.
+   */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
 
@@ -448,6 +502,7 @@ async function buildCommitMessage(
       // commitPushRowV1.ts and TaskActionRequestV1.parentOperationId).
       parentOperationId: coordinatorOperationId,
     });
+    recordCommitMetadataDispatchProbeOutcomeV1(dispatchProbe, outcome);
 
     if (outcome.kind === "completed") {
       const fileStore = getWorkflowFileStoreV1();
@@ -523,7 +578,9 @@ async function resumeCommitMessage(
   chatViewProvider: ChatViewProvider | undefined,
   resumeInteraction: CommitPushMetadataResumeRequestV1,
   /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
-  coordinatorOperationId?: OperationIdV1
+  coordinatorOperationId?: OperationIdV1,
+  /** See `buildCommitMessage`'s matching param — this function's own CHILD `commitPushMetadata.v1` resume outcome. */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
   const { ref, resumeIdempotencyId, onSettled } = resumeInteraction;
@@ -563,6 +620,7 @@ async function resumeCommitMessage(
     // self-deadlocking against the lease this row's own execute holds.
     parentOperationId: coordinatorOperationId,
   });
+  recordCommitMetadataDispatchProbeOutcomeV1(dispatchProbe, outcome);
 
   if (outcome.kind === "questions" && chatViewProvider) {
     const record = await orchestrator.getRecord(interactionRef);
@@ -2459,7 +2517,9 @@ export async function reviewCommitPushMessageV1(
   // for a hypothetical caller outside the commitPush.v1 row (none exists in
   // production today), in which case the nested call falls back to a plain
   // top-level acquire — unchanged prior behavior.
-  coordinatorOperationId: OperationIdV1 | undefined
+  coordinatorOperationId: OperationIdV1 | undefined,
+  /** See `buildCommitMessage`'s matching param — passed straight through to `reviewCommitMessage`. */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<CommitPushMessageReviewResultV1> {
   return vscode.window.withProgress(
     {
@@ -2487,7 +2547,8 @@ export async function reviewCommitPushMessageV1(
           resolvedTask.progress.status,
           chatViewProvider,
           extractResumeInteraction(explicitArg),
-          coordinatorOperationId
+          coordinatorOperationId,
+          dispatchProbe
         );
         if (reviewResult.kind === "questionsPosted") {
           // No "cancelled" notification here — buildCommitMessage/
@@ -2696,7 +2757,27 @@ export async function pushCommitPushV1(
 /** @internal exported for testing */
 export async function invokeCommitPushRowV1(
   resolvedTask: ResolvedTaskContext,
-  services: Omit<CommitPushServicesV1, "resolvedTask">
+  services: Omit<CommitPushServicesV1, "resolvedTask">,
+  /**
+   * Item 2 / Step 57a completion fix (2026-09-29 review): an out-param the
+   * caller (commitAndPushTask/completeCommitAndPushTask, which manage their
+   * own admission release) can supply to read back this row's coordinator
+   * outcome once it settles, so it can be recorded via
+   * `recordAdmissionReleaseTriggerV1` before their terminal safe release —
+   * mirroring `runImplementationWithAI`'s own `dispatchProbe`. This is the
+   * TOP-level `commitPush.v1` row's own outcome (the admission-holding
+   * invocation). A nested `commitPushMetadata.v1` commit-message-generation
+   * call (`buildCommitMessage`/`resumeCommitMessage`) that itself times out
+   * or is cancelled is a separate, CHILD coordinator invocation under the
+   * same lease — `services.dispatchProbe` (Step 57a review fix, 2026-09-29)
+   * reads that child outcome back, and below, when the child was cut off by
+   * a deadline/cancellation, ITS outcome is what gets recorded here instead
+   * of the top-level row's own outcome: the row still falls back to a
+   * deterministic commit message and reports "completed" in that case, which
+   * would otherwise mask a provider process from the child invocation that
+   * may still be running.
+   */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<void> {
   const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
   if (!derivedBinding.ok) {
@@ -2706,6 +2787,7 @@ export async function invokeCommitPushRowV1(
     );
     return;
   }
+  const metadataDispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
   const outcome = await invokeLifecycleRowV1({
     actionKey: COMMIT_PUSH_ACTION_KEY_V1,
     taskFolderPath: resolvedTask.taskFolderPath,
@@ -2720,8 +2802,16 @@ export async function invokeCommitPushRowV1(
     // resolved/bound task, never re-resolve one from mutable current-task
     // state — see the coordinator-native step functions' header comments
     // above (saveCommitPushDocumentsV1 onward).
-    services: { ...services, resolvedTask },
+    services: { ...services, resolvedTask, dispatchProbe: metadataDispatchProbe },
   });
+  if (dispatchProbe) {
+    // The child's outcome is strictly the more urgent one for release
+    // safety when it was itself cut off by a deadline/cancellation — see
+    // this function's `dispatchProbe` param doc comment above.
+    const childOutcome = metadataDispatchProbe.coordinatorOutcome;
+    dispatchProbe.coordinatorOutcome =
+      childOutcome && deriveAdmissionReleaseTriggerV1(childOutcome) ? childOutcome : outcome;
+  }
   if (outcome.kind === "completed") {
     return;
   }
@@ -2858,7 +2948,15 @@ export async function commitAndPushTask(
     return;
   }
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let heartbeat = handle
+    ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  // Item 2 / Step 57: the pre-invocation candidate-switch releases below are
+  // unconditional and immediate — nothing could have been spawned yet under
+  // that claim. Only the TERMINAL release in the outer `finally` (after
+  // `invokeCommitPushRowV1`'s commit-message metadata provider invocation
+  // may have run) goes through the shared safe-release bookkeeping
+  // (`releaseAdmissionSafelyV1` below).
   const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
@@ -2870,6 +2968,33 @@ export async function commitAndPushTask(
       await toRelease.release();
     }
   };
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    handle = undefined;
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionSafelyV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a completion fix: read back by invokeCommitPushRowV1's
+  // own dispatchProbe param so this function's terminal
+  // recordAdmissionReleaseTriggerV1 call (right before its safe release) can
+  // settle the held marker's operationId/trigger against this round's ACTUAL
+  // coordinator outcome instead of leaving them unset.
+  const commitPushDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
   try {
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
@@ -2908,7 +3033,7 @@ export async function commitAndPushTask(
           });
           if (late.outcome === "acquired") {
             handle = late.handle;
-            heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+            heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
           }
         }
       };
@@ -2942,7 +3067,7 @@ export async function commitAndPushTask(
         return;
       }
       handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
     // 2026-09-10 review completion blocker (new): check the reconciliation
     // result rather than discarding it — a genuine `userPaused` or
@@ -2963,15 +3088,20 @@ export async function commitAndPushTask(
       );
       return;
     }
-    await invokeCommitPushRowV1(resolvedTask, {
-      inventory,
-      explicitArg,
-      parentOperation,
-      extensionContext,
-      chatViewProvider,
-    });
+    await invokeCommitPushRowV1(
+      resolvedTask,
+      {
+        inventory,
+        explicitArg,
+        parentOperation,
+        extensionContext,
+        chatViewProvider,
+      },
+      commitPushDispatchProbeV1
+    );
   } finally {
-    await releaseCurrentAdmissionV1();
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, commitPushDispatchProbeV1.coordinatorOutcome);
+    await releaseAdmissionSafelyV1();
     releaseCommitPushToken();
   }
 }
@@ -3070,7 +3200,15 @@ export async function completeCommitAndPushTask(
     return;
   }
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let heartbeat = handle
+    ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  // Item 2 / Step 57: the pre-invocation candidate-switch releases below are
+  // unconditional and immediate — nothing could have been spawned yet under
+  // that claim. Only the TERMINAL release in the outer `finally` (after
+  // `invokeCommitPushRowV1`'s commit-message metadata provider invocation
+  // may have run) goes through the shared safe-release bookkeeping
+  // (`releaseAdmissionSafelyV1` below).
   const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
@@ -3082,6 +3220,33 @@ export async function completeCommitAndPushTask(
       await toRelease.release();
     }
   };
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    handle = undefined;
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionSafelyV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a completion fix: shared by both invokeCommitPushRowV1
+  // call sites below (only one of which ever actually dispatches, per that
+  // branch's own control flow), read back so this function's terminal
+  // recordAdmissionReleaseTriggerV1 call settles the held marker's
+  // operationId/trigger against this round's ACTUAL coordinator outcome.
+  const commitPushDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
   try {
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
@@ -3127,7 +3292,7 @@ export async function completeCommitAndPushTask(
         });
         if (late.outcome === "acquired") {
           handle = late.handle;
-          heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+          heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
         }
       }
       if (handle) {
@@ -3209,7 +3374,7 @@ export async function completeCommitAndPushTask(
         return;
       }
       handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
     // 2026-09-10 review completion blocker (narrowed further): this second
     // reconciliation — run after the late re-acquisition above corrects a
@@ -3236,12 +3401,16 @@ export async function completeCommitAndPushTask(
       if (resolvedTask.progress.currentStage === "publish") {
         // Already completed: borrow the token this callback already holds
         // and route through the commitPush.v1 row directly.
-        await invokeCommitPushRowV1(resolvedTask, {
-          inventory,
-          explicitArg,
-          extensionContext,
-          chatViewProvider,
-        });
+        await invokeCommitPushRowV1(
+          resolvedTask,
+          {
+            inventory,
+            explicitArg,
+            extensionContext,
+            chatViewProvider,
+          },
+          commitPushDispatchProbeV1
+        );
         return;
       }
       NotificationRouter.showWarning(
@@ -3388,12 +3557,14 @@ export async function completeCommitAndPushTask(
           parentOperation: op,
           extensionContext,
           chatViewProvider,
-        }
+        },
+        commitPushDispatchProbeV1
       );
       }
     );
   } finally {
-    await releaseCurrentAdmissionV1();
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, commitPushDispatchProbeV1.coordinatorOutcome);
+    await releaseAdmissionSafelyV1();
     releaseCommitPushToken();
   }
 }

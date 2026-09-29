@@ -12,6 +12,7 @@ import {
   roundDeliverableContractV1,
   setInertTrailingObserverV1,
   setLegacyFrameEndObserverV1,
+  setRepairedFrameEndObserverV1,
   shouldNudgeForMissingResultFrameV1,
 } from "../types/aiResultEnvelope";
 
@@ -158,21 +159,22 @@ void describe("containsResultFrameV1 — parity with the parser", () => {
   const cases: ReadonlyArray<{ readonly name: string; readonly raw: string }> = [
     { name: "terminated frame", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}` },
     { name: "terminated frame, trailing newline", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\n` },
-    // The parser accepts this deliberately: a truncated CLI response whose
-    // JSON is byte-perfect but whose closing marker never arrived.
+    // Item 5's Step 4b (2026-09-29): a single complete JSON line with no
+    // closing marker at all is now accepted as a repair, so this IS a frame
+    // and must not be nudged.
     { name: "unterminated but complete", raw: `${FRAME_START_V1}\n${envelope}` },
     // The parser rejects this: the body must END with the terminator, so
     // narration after it is not a frame.
     { name: "terminated then narration", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\n\nNow I will explain.` },
-    // Unterminated AND not valid JSON: the parser reports `invalidFrame`
-    // (never `invalidJson` — see parseUnterminatedFrameV1), so this is NOT a
-    // frame and must still be nudged. Missing this case is what let a
-    // JSON-blind precheck forward a doomed response (2026-08-19 review).
+    // Unterminated AND not valid JSON: the parser reports `invalidFrame`, so
+    // this is NOT a frame and must still be nudged.
     { name: "unterminated, payload is not JSON", raw: `${FRAME_START_V1}\n{not json}` },
     { name: "unterminated, payload is a bare word", raw: `${FRAME_START_V1}\nthinking...` },
     { name: "unterminated, empty payload line", raw: `${FRAME_START_V1}\n` },
-    // Valid JSON but not an envelope: still a FRAME, so no nudge — the parser
-    // rejects it downstream with an accurate reason rather than silently.
+    // Valid JSON syntax but not a valid envelope (no version/correlation/
+    // kind), no closing marker: Step 4b only accepts a single line that
+    // decodes as a full, valid envelope, so this stays `invalidFrame` and
+    // must still be nudged.
     { name: "unterminated, JSON that is not an envelope", raw: `${FRAME_START_V1}\n{"a":1}` },
     // --- terminated framing: all of these are `invalidFrame` to the parser ---
     // (2026-08-19 review: the precheck accepted any body ending in a
@@ -184,6 +186,17 @@ void describe("containsResultFrameV1 — parity with the parser", () => {
     { name: "markers adjacent, no payload at all", raw: `${FRAME_START_V1}${FRAME_END_V1}` },
     // CRLF framing is legitimate and must NOT be nudged.
     { name: "terminated with CRLF throughout", raw: `${FRAME_START_V1}\r\n${envelope}\r\n${FRAME_END_V1}` },
+    // Item 5 (2026-09-28 field report): a lookalike Unicode character
+    // substituted for one letter of the end marker is still a frame.
+    {
+      name: "terminated, one-code-point lookalike end marker",
+      raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1.replace("E", "ᗩ")}`,
+    },
+    // Two code points differing must NOT be treated as a repaired marker.
+    {
+      name: "terminated, two-code-point lookalike end marker",
+      raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1.replace("E", "ᗩ").replace("M", "М")}`,
+    },
     // Correct framing, bad payload: `invalidJson`, not `invalidFrame` — a
     // frame WAS seen, so this must not be nudged either.
     { name: "terminated framing, payload not JSON", raw: `${FRAME_START_V1}\n{not json}\n${FRAME_END_V1}` },
@@ -1057,26 +1070,30 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
   /**
    * 2026-08-12 field report, item 1: a response whose JSON payload is
    * byte-perfect but whose closing `<<<END_ENSEMBLE_AI_RESULT_V1>>>` never
-   * arrived (the CLI stopped writing early) was previously LESS recoverable
-   * than a response with no frame at all, because the frameless fallback
-   * bails whenever the start marker appears anywhere. A single complete JSON
-   * line with no terminator is now accepted.
+   * arrived (the CLI stopped writing early) was once accepted by a dedicated
+   * unterminated-frame fallback. RC2 item 5's Step 1 (2026-09-28) then
+   * required a missing marker to stay rejected — only a marker differing by
+   * exactly one code point was repaired. Item 5's Step 4b (2026-09-29, G1
+   * run 4 field report) reopens exactly this shape: a single complete JSON
+   * line with no terminator at all is accepted again, this time as an
+   * observable repair (see "single-line frame shapes (item 5 Step 4b)"
+   * below), whenever that JSON line parses completely as a valid envelope.
    */
-  void it("accepts a complete unterminated frame: start marker, one JSON line, nothing else", () => {
+  void it("accepts an unterminated frame — start marker, one JSON line, nothing else — as a Step 4b repair", () => {
     const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
     const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n${payload}`;
     const result = parseAiResultEnvelopeV1(raw);
     assert.equal(result.kind, "cancelled");
   });
 
-  void it("accepts a complete unterminated frame with CRLF line ending", () => {
+  void it("accepts an unterminated frame with CRLF line ending, as a Step 4b repair", () => {
     const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
     const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\r\n${payload}`;
     const result = parseAiResultEnvelopeV1(raw);
     assert.equal(result.kind, "cancelled");
   });
 
-  void it("accepts an unterminated frame preceded by tolerated narration", () => {
+  void it("accepts an unterminated frame preceded by tolerated narration, as a Step 4b repair", () => {
     const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
     const raw = `Let me finish up.\n\n<<<ENSEMBLE_AI_RESULT_V1>>>\n${payload}`;
     const result = parseAiResultEnvelopeV1(raw);
@@ -1478,14 +1495,18 @@ void describe("parseAiResultEnvelopeV1 — legacy frame-end marker tolerance", (
     }
   });
 
-  void it("still rejects arbitrary near-miss markers, not just any END_* variant", () => {
+  void it("still rejects a near-miss marker that is not even shaped like an end marker", () => {
     const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
-    for (const badEnd of [
-      "<<<END_ENSEMBLE_AI_RESULT_V2>>>",
-      "<<<END-ENSEMBLE_AI_RESULT_V1>>>",
-      "<<<ENSEMBLE_AI_RESULT_V1_END>>>",
-      "<<<END_ENSEMBLE_RESULT>>>",
-    ]) {
+    // "<<<END_ENSEMBLE_AI_RESULT_V2>>>" and "<<<END-ENSEMBLE_AI_RESULT_V1>>>" are
+    // NOT in this list: each differs from FRAME_END_V1 by exactly one code
+    // point, so per item 5's plan (a single-code-point substitution, ASCII or
+    // not) they are now accepted and repaired — see the "item 5" describe
+    // block below, "accepts a same-length, single-ASCII-character near-miss
+    // marker". "<<<END_ENSEMBLE_RESULT>>>" is also NOT in this list any more:
+    // Step 4a (below, the "Step 4a" describe block) widens acceptance to any
+    // "<<<END...>>>"-shaped closing line, and this one qualifies. Only a
+    // closing line that does not even start with "<<<END" belongs here.
+    for (const badEnd of ["<<<ENSEMBLE_AI_RESULT_V1_END>>>"]) {
       const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(payload)}\n${badEnd}`;
       const result = parseAiResultEnvelopeV1(raw);
       assert.notEqual(
@@ -1494,6 +1515,324 @@ void describe("parseAiResultEnvelopeV1 — legacy frame-end marker tolerance", (
         `${badEnd} must not be treated as a valid terminator`
       );
     }
+  });
+});
+
+void describe("parseAiResultEnvelopeV1 — lookalike end-marker repair (item 5)", () => {
+  /**
+   * Field shape, not a hypothetical (2026-09-26 22:23 local, Low-Level
+   * Review (Plan), Copilot `gpt-6-luna`): a complete, valid review response
+   * ended with `<<<END_ENSᗩMBLE_AI_RESULT_V1>>>` — one letter ("E") swapped
+   * for the lookalike Unicode character U+15E9 — and was rejected as
+   * `invalidFrame`, discarding a finished answer.
+   */
+  const LOOKALIKE_END_V1 = FRAME_END_V1.replace("E", "ᗩ");
+
+  void it("accepts a one-code-point lookalike end marker and reports the repair", () => {
+    const seen: Array<{ expected: string; actual: string; index: number }> = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n${LOOKALIKE_END_V1}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled", "the repaired marker must still close the frame");
+      assert.equal(seen.length, 1, "the repair must be observable, never silent");
+      assert.deepEqual(seen[0], { expected: FRAME_END_V1, actual: LOOKALIKE_END_V1, index: 3 });
+      assert.deepEqual(
+        (result as { frameRepairV1?: unknown }).frameRepairV1,
+        { expected: FRAME_END_V1, actual: LOOKALIKE_END_V1, index: 3 },
+        "the successful result must carry the repair so the coordinator can log it"
+      );
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("does NOT report anything for the canonical terminator", () => {
+    const seen: unknown[] = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      const result = parseAiResultEnvelopeV1(frame(payload));
+      assert.equal(result.kind, "cancelled");
+      assert.deepEqual(seen, []);
+      assert.equal((result as { frameRepairV1?: unknown }).frameRepairV1, undefined);
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects trailing narration with no recognizable marker (not silently repaired)", () => {
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    // A final line that is neither the canonical marker, the legacy marker,
+    // nor a one-code-point near-miss of either: falls through to the
+    // unterminated path, which requires the payload to be the ONLY thing
+    // after the start marker. Appending unrelated trailing text makes that
+    // payload multi-line, so it is rejected — never silently repaired into
+    // acceptance.
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\nnot a marker at all, just narration`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("accepts a body with genuinely no end marker line at all, as a Step 4b repair (superseding the RC2 item 5 rejection)", () => {
+    // A response that is exactly `FRAME_START_V1` + one line-ending + one
+    // complete, valid JSON line and NOTHING else — no marker line of any
+    // kind, not even an unrecognized one. A pre-existing fallback
+    // (`parseUnterminatedFrameV1`, RC1 2026-08-12 field report item 1) used
+    // to accept this shape as a truncated-CLI recovery; RC2 item 5's Step 1
+    // then required a missing marker to stay rejected. Item 5's Step 4b
+    // (2026-09-29, G1 run 4 field report) explicitly reopens this: "no end
+    // marker at all after a single JSON line" is accepted again, this time
+    // observably (a reported repair), whenever the JSON line parses
+    // completely. This "item 1" is NOT RC2's own numbered "Item 1" from the
+    // current task description (the plan-review wrong-row progress bug,
+    // moved to workflow 12) — the two findings are unrelated and only share
+    // a numeral from different task rounds.
+    const seen: Array<{ expected: string; actual: string; index: number }> = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled");
+      assert.equal(seen.length, 1, "the repair must be observable, never silent");
+      assert.deepEqual(seen[0], { expected: FRAME_END_V1, actual: "", index: 0 });
+      assert.deepEqual((result as { frameRepairV1?: unknown }).frameRepairV1, seen[0]);
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects a truncated body (no line ending after the start marker)", () => {
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const raw = `${FRAME_START_V1}${JSON.stringify(payload)}${LOOKALIKE_END_V1}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still rejects a body that does not parse as JSON, even under a repaired marker", () => {
+    const raw = `${FRAME_START_V1}\n{not json}\n${LOOKALIKE_END_V1}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still falls through to rejection when two code points differ, not just one", () => {
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const twoCodePointDiff = FRAME_END_V1.replace("E", "ᗩ").replace("M", "М");
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n${twoCodePointDiff}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("accepts a near-miss marker of a different length as a Step 4a repair, not a rejection", () => {
+    // Superseded by Step 4a (2026-09-29): a closing line that is still
+    // clearly an end-marker attempt (starts "<<<END", ends ">>>") is no
+    // longer rejected just because it is a different length than
+    // FRAME_END_V1 — see the "Step 4a" describe block below for the full
+    // coverage (the G1 run 1 endings, and what still stays rejected).
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n<<<END_ENSEMBLE_AI_RESULT_V1_TOO_LONG>>>`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "cancelled");
+  });
+
+  void it("accepts a same-length, single-ASCII-character near-miss marker as a repair too", () => {
+    // Item 5's plan is unqualified: "differs in exactly one code point", with
+    // no carve-out for the differing character being plain ASCII rather than
+    // a Unicode lookalike. A deliberately different marker like V2 (or "_"
+    // swapped for "-") is one code point off, same length, so it is accepted
+    // and reported as a repair exactly like the U+15E9 case above. (Step 4a
+    // widens acceptance further, to any "<<<END...>>>"-shaped closing line —
+    // see the "Step 4a" describe block below.)
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    for (const asciiNearMiss of [
+      "<<<END_ENSEMBLE_AI_RESULT_V2>>>",
+      "<<<END-ENSEMBLE_AI_RESULT_V1>>>",
+    ]) {
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n${asciiNearMiss}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled", `${asciiNearMiss} must be repaired, not rejected`);
+    }
+  });
+});
+
+void describe("parseAiResultEnvelopeV1 — broader end-marker-attempt repair (item 5 Step 4a)", () => {
+  /**
+   * Field shapes, not hypotheticals (`release-gate-g1-2026-09-29.md`, run 1,
+   * 2026-09-29 09:08 local): three complete, valid Copilot `gpt-6-luna`
+   * responses were each rejected as `invalidFrame` because none of these
+   * closing lines is a one-code-point substitution of FRAME_END_V1 — they
+   * differ in length and in more than one place — yet each is still clearly
+   * an attempt at the end marker.
+   */
+  const G1_RUN_1_ENDINGS_V1 = [
+    "<<<END_OF ENSEMBLE_AI_RESULT_V1>>>",
+    "<<<END_OF_AI_RESULT_V1>>>",
+    "<<<END_OF_FINAL>>>",
+  ];
+
+  void it("accepts each of the three G1 run 1 endings and reports the repair", () => {
+    for (const ending of G1_RUN_1_ENDINGS_V1) {
+      const seen: Array<{ expected: string; actual: string; index: number }> = [];
+      setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+      try {
+        const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+        const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n${ending}`;
+        const result = parseAiResultEnvelopeV1(raw);
+        assert.equal(result.kind, "cancelled", `${ending} must be repaired, not rejected`);
+        assert.equal(seen.length, 1, "the repair must be observable, never silent");
+        assert.deepEqual(seen[0], { ...seen[0], expected: FRAME_END_V1, actual: ending });
+        assert.deepEqual((result as { frameRepairV1?: unknown }).frameRepairV1, seen[0]);
+      } finally {
+        setRepairedFrameEndObserverV1(undefined);
+      }
+    }
+  });
+
+  void it("containsResultFrameV1 agrees: true for each of the three G1 run 1 endings", () => {
+    for (const ending of G1_RUN_1_ENDINGS_V1) {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\n${ending}`;
+      assert.equal(containsResultFrameV1(raw), true, `${ending} must be seen as a frame`);
+    }
+  });
+
+  void it("a single-line body with no closing marker of any kind is a Step 4b repair, not a Step 4a case", () => {
+    // Superseded by Step 4b (2026-09-29, G1 run 4 field report): this shape
+    // — no closing marker line at all, not even an unrecognized one — no
+    // longer falls through to rejection here, because it is a single JSON
+    // line with nothing else in the body. See "single-line frame shapes
+    // (item 5 Step 4b)" below for the full coverage of this and the
+    // marker-jammed-on-the-JSON-line shape.
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "cancelled");
+  });
+
+  void it("still rejects a body that does not parse completely, even under a marker-attempt ending", () => {
+    const raw = `${FRAME_START_V1}\n{not json}\n<<<END_OF_FINAL>>>`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still rejects text after the body that is not itself the final line", () => {
+    // Narration between the JSON and the marker-attempt line makes the
+    // "JSON payload" span more than one line, which the strict single-line
+    // check rejects — the marker-attempt repair only ever consumes the
+    // body's final line, never text before it.
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\nnarration in between\n<<<END_OF_FINAL>>>`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still rejects a final line with no marker shape at all", () => {
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(payload)}\njust narration, not a marker`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+});
+
+void describe("parseAiResultEnvelopeV1 — single-line frame shapes (item 5 Step 4b)", () => {
+  /**
+   * Field shapes, not hypotheticals (`release-gate-g1-2026-09-29.md`, run 4,
+   * 2026-09-29 13:47–14:04 local, plan Apply Review, Copilot `auto` routed
+   * to `gpt-6-luna`): six replies rejected as `invalidFrame`. Five ended
+   * `…}}<<<END_ENSEMBLE_AI_RESULT_V1>>>` — the CORRECT end marker, but on the
+   * same line as a complete JSON body, with no line break before it — and
+   * were rejected with "mixed or missing line endings around the JSON
+   * payload". One had no end marker at all after a complete JSON body.
+   */
+  function envelopePayload(): { version: 1; correlation: ActionCorrelationV1; kind: "cancelled" } {
+    return { version: 1, correlation: correlation(), kind: "cancelled" };
+  }
+
+  void it("accepts the end marker jammed onto the same line as a complete JSON body, and reports the repair", () => {
+    const seen: Array<{ expected: string; actual: string; index: number }> = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())}${FRAME_END_V1}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled", "a complete JSON body with the marker jammed on must be repaired");
+      assert.equal(seen.length, 1, "the repair must be observable, never silent");
+      assert.deepEqual(seen[0], {
+        expected: FRAME_END_V1,
+        actual: FRAME_END_V1,
+        index: Array.from(FRAME_END_V1).length,
+      });
+      assert.deepEqual((result as { frameRepairV1?: unknown }).frameRepairV1, seen[0]);
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("containsResultFrameV1 agrees: true for the marker-jammed-on-same-line shape", () => {
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())}${FRAME_END_V1}`;
+    assert.equal(containsResultFrameV1(raw), true);
+  });
+
+  void it("accepts a complete JSON body with no end marker at all, and reports the repair", () => {
+    // Covered from a different angle above ("accepts a body with genuinely
+    // no end marker line at all") and in the "frame parsing" describe block
+    // ("accepts an unterminated frame …") — repeated here under Step 4b's
+    // own name for direct traceability to the G1 run 4 shape.
+    const seen: Array<{ expected: string; actual: string; index: number }> = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled");
+      assert.deepEqual(seen[0], { expected: FRAME_END_V1, actual: "", index: 0 });
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects a JSON line that does not parse, even jammed against the marker", () => {
+    const raw = `${FRAME_START_V1}\n{not json}${FRAME_END_V1}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still rejects a JSON line that does not parse, with no marker at all", () => {
+    const raw = `${FRAME_START_V1}\n{not json}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "invalidFrame");
+    }
+  });
+
+  void it("still rejects embedded line breaks (the ordinary multi-line shape takes priority)", () => {
+    // A well-formed multi-line frame (JSON line, newline, marker line) must
+    // never be reinterpreted through the single-line path — this pins that
+    // the two paths never overlap by checking a normal, valid multi-line
+    // frame is unaffected: it still needs no repair at all.
+    const seen: unknown[] = [];
+    setRepairedFrameEndObserverV1((repair) => seen.push(repair));
+    try {
+      const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())}\n${FRAME_END_V1}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled");
+      assert.deepEqual(seen, [], "a well-formed multi-line frame must not be reported as repaired");
+    } finally {
+      setRepairedFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects any other text after the JSON that is not the marker", () => {
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())} trailing junk`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+  });
+
+  void it("still rejects any other text after the JSON, even when it precedes the marker", () => {
+    const raw = `${FRAME_START_V1}\n${JSON.stringify(envelopePayload())} trailing junk${FRAME_END_V1}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
   });
 });
 

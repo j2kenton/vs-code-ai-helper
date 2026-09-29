@@ -89,7 +89,11 @@ import {
 } from "../utils/workflowDecisionDispatchV1";
 import { describeResumeOptionV1, loadResumeActionPlanV1, ResumeActionPlanV1 } from "../utils/resumeActionPlanV1";
 import { ChatTarget } from "../views/chatView";
-import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
+import {
+  WorkflowDecisionCommandResultV1,
+  WorkflowDecisionOptionV1,
+  WorkflowDecisionRecommendationV1,
+} from "../types/workflowDecisionV1";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -370,7 +374,15 @@ export function buildDelayedRetryDecisionV1(
 export function buildOwedContinuationDecisionV1(
   target: ChatTarget,
   dueAt: Date | undefined,
-  waitingOn: string
+  waitingOn: string,
+  /**
+   * v1 fixes RC2 item 9: when set, another attempt genuinely holds the
+   * continuation's claim until this time, so "Run now" cannot succeed before
+   * then — it is disabled and says exactly when it becomes possible, instead
+   * of being pressable only to hand back the same refusal (and, before item
+   * 8's fix, a duplicate card) every time.
+   */
+  claimedUntil?: Date
 ): PostWorkflowDecisionInputV1 {
   const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
   const nextAttempt = dueAt
@@ -405,6 +417,9 @@ export function buildOwedContinuationDecisionV1(
           command: "vs-code-ai-helper.runOwedContinuationNow",
           args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
         },
+        ...(claimedUntil
+          ? { disabled: true, disabledReason: `available after ${claimedUntil.toLocaleTimeString()}` }
+          : {}),
       },
     ],
     recommendation: {
@@ -450,6 +465,18 @@ type OwedDispatchResultV1 =
   | { kind: "dispatched" }
   | { kind: "notClaimed"; heldBy?: string }
   | { kind: "dropped"; reason: string };
+
+/**
+ * RC2 item 9: outcome of a "Run now" attempt on an owed continuation.
+ * `refused` carries `availableAt` when the refusal has a known end (a live
+ * lease) so the caller can say exactly when Run now becomes possible, rather
+ * than a bare refusal the user can only retry blindly.
+ */
+export type OwedContinuationRunNowResultV1 =
+  | { readonly kind: "started" }
+  | { readonly kind: "nothingOwed" }
+  | { readonly kind: "alreadyRunning" }
+  | { readonly kind: "refused"; readonly reason: string; readonly availableAt?: Date };
 
 /**
  * Persisted one-shot scheduler. A lease means only one VS Code window arms a
@@ -1329,11 +1356,13 @@ export class TaskActionScheduler implements vscode.Disposable {
         // wait until the lease expires — announce it, with Run now.
         const claimedAt = new Date(recovery.leaseUntil ?? 0).getTime() - LEASE_DURATION_MS;
         if (this.clock.now() - claimedAt > OWED_CONTINUATION_WAIT_ANNOUNCE_AFTER_MS_V1) {
+          const leaseExpiry = new Date(recovery.leaseUntil ?? 0);
           await this.announceOwedContinuationWaitV1(
             task,
             `lease:${recovery.leaseUntil ?? ""}`,
-            new Date(recovery.leaseUntil ?? 0),
-            "an earlier attempt claimed it and has not started a round"
+            leaseExpiry,
+            "an earlier attempt claimed it and has not started a round",
+            leaseExpiry
           );
         }
         continue;
@@ -1490,7 +1519,8 @@ export class TaskActionScheduler implements vscode.Disposable {
     task: { taskFolderPath: string; canonicalId?: string; progress: TaskProgress },
     waitKey: string,
     dueAt: Date | undefined,
-    waitingOn: string
+    waitingOn: string,
+    claimedUntil?: Date
   ): Promise<void> {
     if (this.owedRetryAnnounced.get(task.taskFolderPath) === waitKey) return;
     this.owedRetryAnnounced.set(task.taskFolderPath, waitKey);
@@ -1501,7 +1531,7 @@ export class TaskActionScheduler implements vscode.Disposable {
       taskName: task.progress.displayName,
     };
     try {
-      await postWorkflowDecisionV1(buildOwedContinuationDecisionV1(target, dueAt, waitingOn), target);
+      await postWorkflowDecisionV1(buildOwedContinuationDecisionV1(target, dueAt, waitingOn, claimedUntil), target);
     } catch (error) {
       console.error("announceOwedContinuationWaitV1: could not post the Run-now card", error);
     }
@@ -1530,22 +1560,17 @@ export class TaskActionScheduler implements vscode.Disposable {
    * second dispatch would double-run the continuation — so it is a refusal that
    * names the holder. The chain guard is not bypassed either.
    */
-  async runOwedContinuationNow(
-    taskFolderPath: string,
-    canonicalId?: string
-  ): Promise<"started" | "refused" | "nothingOwed" | "alreadyRunning"> {
+  async runOwedContinuationNow(taskFolderPath: string): Promise<OwedContinuationRunNowResultV1> {
     const current = await this.store.patch(vscode.Uri.file(taskFolderPath), (progress) => progress);
     const recovery = current?.implRecovery;
     if (!recovery) {
-      return "nothingOwed";
+      return { kind: "nothingOwed" };
     }
     if (recovery.dispatch !== "pending") {
-      return "alreadyRunning";
+      return { kind: "alreadyRunning" };
     }
     if (this.owedClaimsInFlight.has(taskFolderPath)) {
       return this.refuseOwedContinuationNowV1(
-        taskFolderPath,
-        canonicalId,
         "another attempt in this window (the recovery sweep or an earlier Run now) is dispatching it right now"
       );
     }
@@ -1553,7 +1578,7 @@ export class TaskActionScheduler implements vscode.Disposable {
     // here can neither clear nor release the lease this one takes.
     this.owedClaimsInFlight.add(taskFolderPath);
     try {
-      return await this.runOwedContinuationNowGuardedV1(taskFolderPath, canonicalId, recovery);
+      return await this.runOwedContinuationNowGuardedV1(taskFolderPath, recovery);
     } finally {
       this.owedClaimsInFlight.delete(taskFolderPath);
     }
@@ -1561,23 +1586,20 @@ export class TaskActionScheduler implements vscode.Disposable {
 
   private async runOwedContinuationNowGuardedV1(
     taskFolderPath: string,
-    canonicalId: string | undefined,
     recovery: NonNullable<TaskProgress["implRecovery"]>
-  ): Promise<"started" | "refused"> {
+  ): Promise<OwedContinuationRunNowResultV1> {
     const leaseLive =
       recovery.leaseUntil !== undefined && new Date(recovery.leaseUntil).getTime() > this.clock.now();
     if (leaseLive && recovery.leaseOwner !== this.owner) {
+      const availableAt = new Date(recovery.leaseUntil ?? 0);
       return this.refuseOwedContinuationNowV1(
-        taskFolderPath,
-        canonicalId,
         `another VS Code window (${recovery.leaseOwner ?? "unknown owner"}) holds its claim until ` +
-          `${new Date(recovery.leaseUntil ?? 0).toLocaleTimeString()}, and may be dispatching it right now`
+          `${availableAt.toLocaleTimeString()}, and may be dispatching it right now`,
+        availableAt
       );
     }
     if (isAutomationChainActive(taskFolderPath, IMPL_CONTINUATION_CHAIN_ID_V1, this.clock.now())) {
       return this.refuseOwedContinuationNowV1(
-        taskFolderPath,
-        canonicalId,
         "its automation chain guard is still held, so a continuation chain is genuinely in flight"
       );
     }
@@ -1600,34 +1622,25 @@ export class TaskActionScheduler implements vscode.Disposable {
     }
     const result = await this.claimAndDispatchOwedContinuationLockedV1(taskFolderPath);
     if (result.kind === "dispatched") {
-      return "started";
+      return { kind: "started" };
     }
     return this.refuseOwedContinuationNowV1(
-      taskFolderPath,
-      canonicalId,
       result.kind === "dropped"
         ? `the continuation chain was dropped (${result.reason})`
         : `another window claimed it first${result.heldBy ? ` (${result.heldBy})` : ""}`
     );
   }
 
-  /** A refused Run now: post the card naming why, and report `refused`. */
-  private async refuseOwedContinuationNowV1(
-    taskFolderPath: string,
-    canonicalId: string | undefined,
-    reason: string
-  ): Promise<"refused"> {
-    const task = this.inventory.getTasks().find((candidate) => candidate.taskFolderPath === taskFolderPath);
-    if (task) {
-      this.owedRetryAnnounced.delete(taskFolderPath);
-      await this.announceOwedContinuationWaitV1(
-        { ...task, canonicalId: canonicalId ?? task.canonicalId },
-        `refused:${this.clock.now()}`,
-        undefined,
-        reason
-      );
-    }
-    return "refused";
+  /**
+   * A refused Run now. RC2 item 9: this used to re-post the owed-continuation
+   * card (bypassing its own dedup) every single time, which — while the claim
+   * stayed live — handed back an identical-looking card on every press. It now
+   * only reports the refusal; the command layer renders it as a follow-up
+   * line under the SAME card via the structured command-result protocol
+   * (`WorkflowDecisionCommandResultV1`), and posts no card of its own.
+   */
+  private refuseOwedContinuationNowV1(reason: string, availableAt?: Date): OwedContinuationRunNowResultV1 {
+    return { kind: "refused", reason, availableAt };
   }
 
   /**
@@ -2353,13 +2366,24 @@ export function registerScheduleTaskResumeCommand(context: vscode.ExtensionConte
       if (!task) {
         return;
       }
-      const outcome = await scheduler.runOwedContinuationNow(task.taskFolderPath, task.canonicalId);
+      const outcome = await scheduler.runOwedContinuationNow(task.taskFolderPath);
       const taskLabel = notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath);
-      if (outcome === "nothingOwed") {
+      if (outcome.kind === "nothingOwed") {
         NotificationRouter.showInformation(`No continuation is owed for "${taskLabel}" any more, so there is nothing to run now.`);
-      } else if (outcome === "alreadyRunning") {
+        return;
+      } else if (outcome.kind === "alreadyRunning") {
         NotificationRouter.showInformation(`The owed continuation for "${taskLabel}" has already started.`);
+        return;
+      } else if (outcome.kind === "refused") {
+        // RC2 item 9: answer on the SAME card via the structured
+        // command-result protocol instead of the old re-posted duplicate.
+        const message = outcome.availableAt
+          ? `Still claimed until ${outcome.availableAt.toLocaleTimeString()}.`
+          : `Still refused: ${outcome.reason}.`;
+        const result: WorkflowDecisionCommandResultV1 = { outcome: "refused", message };
+        return result;
       }
+      return;
     })
   ));
   context.subscriptions.push(vscode.commands.registerCommand(

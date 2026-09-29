@@ -142,6 +142,7 @@ function makeSettleFailingStore(
     begin: notImplemented,
     beginInvocation: notImplemented,
     discardPendingInvocation: notImplemented,
+    settleInvocation: notImplemented,
     load: notImplemented,
     saveAnswersDraft: notImplemented,
     submitAnswers: notImplemented,

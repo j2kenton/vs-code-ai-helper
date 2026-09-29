@@ -30,6 +30,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { readyToAdvanceStage } from "../utils/reviewReadiness";
 import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
@@ -175,6 +176,35 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
         reviewText("5/5")
       );
       assert.deepEqual(progress, { complete: 2, total: 5 });
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  // RC2 item 3, Step 15: reviewActions.ts's automatic-advance block computes
+  // `meetsThreshold = readyToAdvanceStage(score, threshold, progress)` with
+  // `progress` fed by this exact function (strict policy) — this is the same
+  // composition, confirming a falsely-complete review marker at a perfect
+  // score still cannot pass the gate while the plan of record's checklist
+  // (what `readPlanChecklistProgressV1` reads) has open items.
+  void it("composes with readyToAdvanceStage exactly as the auto-advance gate does: a perfect score with a falsely-complete marker still does not advance while the checklist has open items", async () => {
+    const uri = makeTask("auto-advance-gate-composition", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("auto-advance-gate-composition"),
+    });
+    const fsStub = installRealFs();
+    try {
+      const progress = await effectiveReviewProgressV1(
+        uri,
+        "impl-high-review",
+        reviewText("5/5"),
+        "strict"
+      );
+      assert.strictEqual(
+        readyToAdvanceStage(10, 8, progress),
+        false,
+        "the checklist's real 2-of-5 must win over the review's falsely-complete 5/5 marker, so the stage cannot auto-advance"
+      );
     } finally {
       fsStub.restore();
     }

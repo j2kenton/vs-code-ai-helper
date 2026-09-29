@@ -11,9 +11,11 @@ import {
   readPlanOfRecordV1,
 } from "../utils/implementationArtifactResolver";
 import {
+  filterAlreadyCheckedPlanItemsV1,
   filterUncheckedPlanItemsV1,
   formatChecklistItemGlyphV1,
   mergeChecklistProgressV1,
+  normalizeChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
@@ -21,26 +23,55 @@ import { STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/tas
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { normalizePath } from "../utils/taskRoot";
+import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
 
 type ApplyArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string; reviewStage?: TaskStage };
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      reviewStage?: TaskStage;
+      /**
+       * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28,
+       * narrowed blocker `bbd42447-…-1`, re-narrowed 2026-09-28): the exact
+       * item texts THIS card offered to apply, captured at post time
+       * (`postApplyReviewerVerifiedTicksDecisionV1`'s own `applicable`).
+       * Threaded through so both what confirming this card actually APPLIES
+       * and the "already applied" count it reports are scoped to what this
+       * specific card promised — never the review file's current raw item
+       * set, which could include items unmatched to any real plan item,
+       * items already checked before this card ever existed, or items newly
+       * verified after this card was posted.
+       */
+      offeredItems?: readonly string[];
+    };
 
-function normalizeArg(
-  arg: ApplyArg | undefined
-): { canonicalId?: string; taskFolderPath?: string; reviewStage?: TaskStage } | undefined {
+function normalizeArg(arg: ApplyArg | undefined):
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      reviewStage?: TaskStage;
+      offeredItems?: readonly string[];
+    }
+  | undefined {
   if (!arg) {
     return undefined;
   }
   // Same shape tolerance as reconcilePlanChecklist's normalizer: explicit ids
   // first, and the tree-node branch guarded against a partial `task` that
   // carries only `progress` (no `folderUri`).
-  const explicit = arg as { canonicalId?: string; taskFolderPath?: string; reviewStage?: TaskStage };
+  const explicit = arg as {
+    canonicalId?: string;
+    taskFolderPath?: string;
+    reviewStage?: TaskStage;
+    offeredItems?: readonly string[];
+  };
   if (explicit.canonicalId || explicit.taskFolderPath) {
     return {
       canonicalId: explicit.canonicalId,
       taskFolderPath: explicit.taskFolderPath,
       reviewStage: explicit.reviewStage,
+      offeredItems: explicit.offeredItems,
     };
   }
   if ("task" in arg && arg.task?.folderUri) {
@@ -85,7 +116,19 @@ export interface VerifiedTicksDerivationV1 {
 
 export type DeriveVerifiedTicksResultV1 =
   | { readonly kind: "ok"; readonly derivation: VerifiedTicksDerivationV1 }
-  | { readonly kind: "blocked"; readonly message: string; readonly severity: "info" | "warning" };
+  | {
+      readonly kind: "blocked";
+      readonly message: string;
+      readonly severity: "info" | "warning";
+      /**
+       * RC2 item 8, Step 37: set only for the "already ticked" blocked case —
+       * the review named this many items verified complete, and every one is
+       * already checked in plan-final.md. Lets the confirmed-execution
+       * command report a precise, idempotent "Already done" result instead
+       * of a bare information message.
+       */
+      readonly alreadyAppliedCount?: number;
+    };
 
 /**
  * Re-derives, from disk, exactly which unchecked plan items the current
@@ -100,10 +143,26 @@ export type DeriveVerifiedTicksResultV1 =
  * there is anything to offer, reusing this rather than a second copy of the
  * matching logic (task: "reuse the text-matching tolerance… do not introduce
  * a second normaliser").
+ *
+ * `offeredItems` (RC2 item 8, Step 37 follow-up, narrowed blocker
+ * `bbd42447-…-1`, re-narrowed 2026-09-28: the first fix only scoped the
+ * "already applied" COUNT, leaving the actual apply operation itself
+ * unscoped — a card could still be confirmed into applying a DIFFERENT item
+ * than the one it offered, if the review file changed between post and
+ * confirm to newly verify something else while the original offered item
+ * became already-checked in the meantime). When a caller passes the specific
+ * candidates its own card offered, the applicable set itself is restricted to
+ * the intersection of "currently unchecked and verified" with "offered by
+ * this card" (matched by {@link normalizeChecklistItemTextV1}, tolerant of
+ * plan-text drift the same way every other matcher in this file is) — never
+ * a newly-surfaced item this card never promised. Only the "already applied"
+ * count falls back further, to `offeredItems` itself, once the intersection
+ * is empty.
  */
 export async function deriveApplicableVerifiedTicksV1(
   folderUri: vscode.Uri,
-  reviewStage: TaskStage
+  reviewStage: TaskStage,
+  offeredItems?: readonly string[]
 ): Promise<DeriveVerifiedTicksResultV1> {
   if (!isReviewStage(reviewStage)) {
     return {
@@ -138,12 +197,29 @@ export async function deriveApplicableVerifiedTicksV1(
     };
   }
 
-  const applicable = filterUncheckedPlanItemsV1(plan.text, verified.items);
+  const applicableFromReview = filterUncheckedPlanItemsV1(plan.text, verified.items);
+  // Scope to exactly what this card offered, when it offered anything: a
+  // review file that changed between post and confirm (newly verifying a
+  // DIFFERENT item, say) must never let a stale card apply something it
+  // never promised — see this function's doc comment.
+  const offeredKeys = offeredItems ? new Set(offeredItems.map(normalizeChecklistItemTextV1)) : undefined;
+  const applicable = offeredKeys
+    ? applicableFromReview.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
+    : applicableFromReview;
   if (applicable.length === 0) {
+    // `verified.items` is the review's raw named text: it can include
+    // entries that match no real plan item at all, which is never
+    // legitimate evidence of already-done work (same reasoning as
+    // `filterAlreadyCheckedPlanItemsV1`'s own doc comment). Scoping to
+    // `offeredItems` when a caller supplies them additionally excludes
+    // matched-and-checked items that this card never offered in the first
+    // place (e.g. checked before the card existed, unrelated to it).
+    const alreadyAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems ?? verified.items).length;
     return {
       kind: "blocked",
       severity: "info",
       message: "Every item this review named as verified complete is already ticked in plan-final.md.",
+      alreadyAppliedCount: alreadyAppliedCount > 0 ? alreadyAppliedCount : undefined,
     };
   }
 
@@ -201,7 +277,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
       options: [
         {
           optionId: "apply",
-          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"} and try again`,
+          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"} and resume the task`,
           resumeKind: "continue",
           consequence:
             `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}, then ` +
@@ -212,7 +288,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
-            args: [{ taskFolderPath, canonicalId, reviewStage }],
+            args: [{ taskFolderPath, canonicalId, reviewStage, offeredItems: applicable }],
           },
         },
         {
@@ -329,7 +405,7 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ApplyArg
-): Promise<void> {
+): Promise<WorkflowDecisionCommandResultV1 | void> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
   const normalized = normalizeArg(explicitArg);
   const resolved = await resolveTaskContext(
@@ -348,9 +424,20 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
-  const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage);
+  const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage, normalized?.offeredItems);
   if (derived.kind === "blocked") {
     NotificationRouter.showInformation(`${taskLabel}: ${derived.message}`);
+    // RC2 item 8, Step 37: idempotent re-press (e.g. via the reconcile
+    // card's duplicate option, or clicking Apply twice) reports structurally
+    // so the SAME card's thread says "Already done", not just a bare
+    // notification (Step 31's `WorkflowDecisionCommandResultV1` protocol).
+    if (derived.alreadyAppliedCount !== undefined) {
+      const n = derived.alreadyAppliedCount;
+      return {
+        outcome: "alreadyDone",
+        message: `Already done: the ${n} reviewer-verified tick${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} applied.`,
+      };
+    }
     return;
   }
   const { reviewStage: resolvedStage, reviewFilename, applicable } = derived.derivation;

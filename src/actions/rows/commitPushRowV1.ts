@@ -166,6 +166,16 @@ export interface CommitPushServicesV1 {
   readonly parentOperation?: TaskOperationHandle;
   readonly extensionContext?: vscode.ExtensionContext;
   readonly chatViewProvider?: ChatViewProvider;
+  /**
+   * Item 2 / Step 57a (review fix, 2026-09-29): an out-param `invokeCommitPushRowV1`
+   * (commitAndPushTask.ts) supplies so it can read back the nested CHILD
+   * `commitPushMetadata.v1` invocation's own outcome (from `reviewCommitPushMessageV1`'s
+   * `reviewCommitMessage` step) — see that param's own doc comment for why
+   * this row's own top-level "completed" outcome alone cannot be trusted for
+   * release safety once the child invocation times out or is cancelled but
+   * this row still falls back to a deterministic commit message.
+   */
+  readonly dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -605,7 +615,8 @@ export async function executeCommitPushV1(
                   // CHILD lease on the same binding instead of self-deadlocking
                   // against this lease as a false-positive duplicate
                   // (workflowLeaseStoreV1's acquireChild).
-                  context.operationId
+                  context.operationId,
+                  services.dispatchProbe
                 );
                 if (messageResult.kind === "questionsPosted") {
                   result = {

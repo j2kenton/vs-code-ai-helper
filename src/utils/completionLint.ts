@@ -1840,7 +1840,10 @@ function renderCommandsRunLines(result: CompletionLintResult): string[] {
     } else {
       for (const check of result.monorepoChecks) {
         const status = check.passed ? "passed" : "**FAILED**";
-        const retryNote = check.retryCount ? ` (passed on retry ${check.retryCount})` : "";
+        // RC2 item 15, Step 41: a check that failed on every attempt must
+        // never read "passed on retry N" — `retryCount` alone doesn't say
+        // the retry succeeded, only that one was attempted.
+        const retryNote = check.passed && check.retryCount ? ` (passed on retry ${check.retryCount})` : "";
         lines.push(`- **${check.packageDir}** — \`${check.command}\`: ${status}${retryNote}`);
       }
     }
@@ -1968,7 +1971,10 @@ export function buildVerifiedChecksSection(
   ];
   if (result.checkSet === "fast") {
     lines.push(
-      "Fast checks: lint, type-check — the test suite and build were NOT run for this review.",
+      "Fast checks: lint, type-check — the test suite and build were NOT run for this review. " +
+        "The test suite runs once, before Publish. A finding whose entire ask is \"show a passing " +
+        "test run\" is not a blocker at this review stage — this stage structurally cannot ever " +
+        "satisfy it, so do not file it as task-fixable (or any other blocker category).",
       ""
     );
   }

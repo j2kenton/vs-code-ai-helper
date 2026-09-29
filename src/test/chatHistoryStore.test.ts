@@ -40,6 +40,8 @@ import {
   appendChatMessageV1,
   chatHistoryFileExists,
   loadTranscriptWithMigration,
+  notifyChatHistoryChangedExternallyV1,
+  onDidChangeChatHistoryV1,
   readChatHistory,
   resetChatHistoryDiagnosticsChannelForTestV1,
   resetChatHistoryV1,
@@ -1032,6 +1034,64 @@ void describe("chatHistoryStore — strict task-folder vs. non-task storage boun
       assert.ok(root, "expected the assistant folder to be registered");
       assert.equal(getWorkflowPathRegistryV1().rootKind(root.rootId), "nonTaskStorage");
     } finally {
+      safeRemoveDir(folder);
+    }
+  });
+});
+
+void describe("chatHistoryStore — local-write vs. external-watcher dedup (RC2 item 11, Step 44)", () => {
+  void it("suppresses a file-watcher notification for the exact write persistDocument just made, but still fires for other documents", async () => {
+    const folder = makeTaskFolder();
+    const otherFolder = makeTaskFolder();
+    const received: Array<{ taskFolderPath: string; canonicalId: string }> = [];
+    const sub = onDidChangeChatHistoryV1((change) => received.push(change));
+    try {
+      await writeChatHistory(folder, [message("hello")]);
+      assert.equal(received.length, 1, "the local write's own in-process fire");
+
+      // extension.ts's chat-v1.json file watcher notices the very write this
+      // process just made a moment later — persistDocument already fired the
+      // in-process event for it, so this must not fire a second time.
+      await notifyChatHistoryChangedExternallyV1(folder, folder);
+      assert.equal(received.length, 1, "the watcher reporting our own just-made write must not add a second render");
+
+      // The dedup is keyed per document, not global: a watcher event for an
+      // unrelated document must still fire.
+      await notifyChatHistoryChangedExternallyV1(otherFolder, otherFolder);
+      assert.equal(received.length, 2, "a watcher event for a different document must still fire");
+    } finally {
+      sub.dispose();
+      safeRemoveDir(folder);
+      safeRemoveDir(otherFolder);
+    }
+  });
+
+  void it("still fires for a genuine external write to the SAME document, even moments after our own write (implementation review, 2026-09-28)", async () => {
+    const folder = makeTaskFolder();
+    const received: Array<{ taskFolderPath: string; canonicalId: string }> = [];
+    const sub = onDidChangeChatHistoryV1((change) => received.push(change));
+    try {
+      await writeChatHistory(folder, [message("hello")]);
+      assert.equal(received.length, 1, "the local write's own in-process fire");
+
+      // A genuinely different write landing on disk moments later — another
+      // extension host, a cloud runner — must not be mistaken for an echo of
+      // our own write just because it arrives inside the same short window a
+      // pure time-based dedup would use. Bypass this module's own writer so
+      // the on-disk bytes (and therefore revision) differ from what
+      // `persistDocument` last recorded, exactly like an independent writer.
+      const filePath = path.join(folder, CHAT_HISTORY_FILENAME);
+      const raw = fs.readFileSync(filePath, "utf8");
+      fs.writeFileSync(filePath, raw.replace('"hello"', '"hello from another extension host"'));
+
+      await notifyChatHistoryChangedExternallyV1(folder, folder);
+      assert.equal(
+        received.length,
+        2,
+        "a genuine external write to the same document, even inside the suppression window, must still fire"
+      );
+    } finally {
+      sub.dispose();
       safeRemoveDir(folder);
     }
   });

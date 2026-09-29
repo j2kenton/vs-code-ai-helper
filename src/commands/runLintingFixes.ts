@@ -41,10 +41,16 @@ import {
 } from "../utils/taskOperations";
 import {
   acquireWorkAdmissionV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 /**
@@ -184,20 +190,42 @@ export async function runLintingFixes(
   // returns, so a resolution failure, an unsupported stage, an already-passed
   // report, or a completed run all release admission exactly once.
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but only actually unlinks the marker
+  // once the round's recorded processes are all confirmed gone; until then
+  // the marker stays held (and the reason is written durably next to it so a
+  // different process's retry refusal can name it too) and the heartbeat
+  // keeps re-checking instead of blocking this command's `finally` on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a completion fix (2026-09-29 review): out-param the AI
+  // final-fixes dispatch below fills from its own runImplementationOrSealedV1
+  // call, read back here so the terminal recordAdmissionReleaseTriggerV1 call
+  // (right before this command's safe release) settles the held marker's
+  // operationId/trigger against this round's ACTUAL coordinator outcome
+  // instead of leaving them unset — mirrors runImplementationWithAI's own
+  // dispatchProbe wiring.
+  const lintDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
 
   try {
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
@@ -227,7 +255,7 @@ export async function runLintingFixes(
       return;
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   const taskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
@@ -439,6 +467,17 @@ export async function runLintingFixes(
             // Open each file with linting issues and apply fixes
             let fixedCount = 0;
             let failedCount = 0;
+            // RC2 item 15, Step 39: whether an ESLint auto-fix was actually
+            // attempted this run, and whether that specific attempt failed
+            // (e.g. the ESLint extension is not installed/activated) — the
+            // "install ESLint" hint below must only ever cite THIS, never
+            // fire merely because there was nothing to fix or because a
+            // later AI pass separately failed (RC1, 2026-09-28: the failing
+            // check was a unit test, ESLint had nothing to do, and the hint
+            // still told the owner to install an already-installed
+            // extension).
+            let eslintAutofixAttempted = false;
+            let eslintUnavailable = false;
 
             for (const [uri, diags] of lintingIssues) {
               const hasEslintIssues = diags.some((d) => d.source === "eslint");
@@ -449,8 +488,14 @@ export async function runLintingFixes(
                 await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
 
                 if (hasEslintIssues) {
-                  // Try to execute ESLint fix command
-                  await vscode.commands.executeCommand("eslint.executeAutofix");
+                  eslintAutofixAttempted = true;
+                  try {
+                    // Try to execute ESLint fix command
+                    await vscode.commands.executeCommand("eslint.executeAutofix");
+                  } catch (eslintError) {
+                    eslintUnavailable = true;
+                    throw eslintError;
+                  }
                   fixedCount++;
                 } else {
                   // Try format document for TypeScript issues
@@ -518,9 +563,22 @@ export async function runLintingFixes(
                   stage: "publish",
                 });
                 if (!editAvailability.ok) {
+                  // RC2 item 15 review fix: name the still-failing checks by
+                  // command (postFixLint.failedChecks is an array of check
+                  // objects, not strings), and only claim the deterministic
+                  // autofixes above did something when they actually ran
+                  // (fixedCount > 0) — a unit-test-only failure leaves
+                  // fixedCount at 0 and must not be told autofixes helped.
+                  const stillFailingNote =
+                    postFixLint.failedChecks.length > 0
+                      ? ` The failing checks are unchanged: ${postFixLint.failedChecks.map((check) => check.command).join(", ")}.`
+                      : "";
+                  const autofixNote =
+                    fixedCount > 0
+                      ? " The deterministic autofixes above were still applied."
+                      : "";
                   NotificationRouter.showWarning(
-                    `AI final fixes are unavailable: ${editAvailability.reason} ` +
-                      "The deterministic autofixes above were still applied."
+                    `AI final fixes are unavailable: ${editAvailability.reason}${autofixNote}${stillFailingNote}`
                   );
                   return;
                 }
@@ -620,6 +678,7 @@ export async function runLintingFixes(
                       taskFolderUri: taskFolderUri,
                       taskDisplayName: resolvedTask.progress.displayName,
                       roundProcessClaimId: handle?.claimId,
+                      dispatchProbe: lintDispatchProbeV1,
                       onProgress: (message) => aiProgress.report({ message }),
                       // Mirror structured preflight questions into task-local
                       // Chat so Answer/Resume work (plan §5.5).
@@ -662,14 +721,34 @@ export async function runLintingFixes(
                     await inventory.refresh();
                     NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
                   } else {
-                    await runCompletionLint(taskFolderUri, relevantFiles);
+                    // RC2 item 15, Step 40: this branch already ran the AI
+                    // pass and re-ran completion lint against its (possibly
+                    // absent) effect — the checks it reports here are the
+                    // real, current answer to "did this help?" and must be
+                    // the last word for this run, not silently overridden by
+                    // the unrelated deterministic-autofix-count message
+                    // below (see the `return` after this block).
+                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
-                    if (result?.errorMessage) {
-                      NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
+                    await inventory.refresh();
+                    const stillFailingNote =
+                      rerunLint.failedChecks.length > 0
+                        ? ` The failing checks are unchanged: ${rerunLint.failedChecks.map((check) => check.command).join(", ")}.`
+                        : "";
+                    // A `status: "failed"` result with an empty/missing
+                    // `errorMessage` must still be reported as a failure,
+                    // never mistaken for `"cancelled"` (Step 40).
+                    if (result?.status === "failed") {
+                      NotificationRouter.showWarning(
+                        `AI final fixes failed: ${result.errorMessage ?? "no reason was reported"}.${stillFailingNote}`
+                      );
                     } else {
-                      NotificationRouter.showWarning("AI final fixes were cancelled; completion lint was rerun.");
+                      NotificationRouter.showWarning(
+                        `AI final fixes were cancelled; completion lint was rerun.${stillFailingNote}`
+                      );
                     }
                   }
+                  return;
                 }
               }
             }
@@ -683,9 +762,20 @@ export async function runLintingFixes(
                 `Linting fixes applied to ${fixedCount} file(s) in the Publish scope!` +
                 (failedCount > 0 ? ` (${failedCount} file(s) could not be fixed automatically)` : "")
               );
-            } else {
+            } else if (eslintAutofixAttempted && eslintUnavailable) {
+              // RC2 item 15, Step 39: only reachable when an ESLint
+              // auto-fix was actually attempted and that specific attempt
+              // failed (extension not installed/activated) — see the flags
+              // set in the loop above.
               NotificationRouter.showWarning(
                 "Could not apply automatic fixes. Please install ESLint extension or fix issues manually."
+              );
+            } else {
+              const stillFailingChecks = postFixLint.failedChecks;
+              NotificationRouter.showWarning(
+                stillFailingChecks.length > 0
+                  ? `No automatic fixes were available. The failing checks are unchanged: ${stillFailingChecks.map((check) => check.command).join(", ")}.`
+                  : "No automatic fixes were available for the issues found in the Publish scope."
               );
             }
           } catch (error) {
@@ -707,6 +797,7 @@ export async function runLintingFixes(
     }
   );
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, lintDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
   }
 }

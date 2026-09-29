@@ -276,9 +276,13 @@ void describe("languageModelToolSessionV1", () => {
         const callIds = (message.content as Array<{ callId?: string; name?: string }>)
           .filter((part) => part.name !== undefined && part.callId !== undefined)
           .map((part) => part.callId);
-        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
-          (part) => part.callId
-        );
+        // RC2 item 14: the User message answering these tool calls now leads
+        // with a non-empty text part (so Copilot `auto` can route the
+        // request) alongside the tool-result parts; filter to the parts
+        // that actually carry a callId before comparing.
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? [])
+          .filter((part) => part.callId !== undefined)
+          .map((part) => part.callId);
         assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by the next message`);
       }
     } finally {
@@ -353,6 +357,58 @@ void describe("languageModelToolSessionV1", () => {
       assert.ok(handler.calls.length <= 3, `expected an early stop, got ${handler.calls.length} calls`);
     } finally {
       model.restore();
+    }
+  });
+
+  /**
+   * RC2 item 14, Step 10: Copilot's `auto` router resolves on the text of the
+   * LAST User message; if it joins to empty, `auto` fails outright. Every User
+   * message this transport ever sends the fake model — the initial prompt,
+   * every later tool-round answering message, and the round-1 message
+   * unmodified by any shedding — must carry non-empty text.
+   */
+  void it("every User message sent across a multi-round session carries non-empty text (RC2 item 14)", async () => {
+    const budgeted = installBudgetedModel(128_000, [
+      [toolCall("call-1")],
+      [toolCall("call-2")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "ok"),
+        maxRounds: 5,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "completed" });
+
+      const textOf = (message: { role: string; content: unknown }): string | undefined => {
+        if (typeof message.content === "string") {
+          return message.content;
+        }
+        if (!Array.isArray(message.content)) {
+          return undefined;
+        }
+        const textPart = (message.content as Array<{ value?: unknown }>).find(
+          (part) => typeof part.value === "string"
+        );
+        return textPart?.value as string | undefined;
+      };
+
+      for (const request of budgeted.sent) {
+        for (const message of request) {
+          if (message.role !== "user") {
+            continue;
+          }
+          const text = textOf(message);
+          assert.ok(
+            typeof text === "string" && text.length > 0,
+            `every User message must carry non-empty text, got: ${JSON.stringify(message)}`
+          );
+        }
+      }
+    } finally {
+      budgeted.restore();
     }
   });
 
@@ -452,10 +508,36 @@ void describe("languageModelToolSessionV1", () => {
         const callIds = (message.content as Array<{ callId?: string; name?: string }>)
           .filter((part) => part.name !== undefined && part.callId !== undefined)
           .map((part) => part.callId);
-        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? []).map(
-          (part) => part.callId
-        );
+        // RC2 item 14: the answering User message now leads with a
+        // non-empty text part (see the sibling assertion above); filter to
+        // the parts that actually carry a callId before comparing.
+        const answered = ((last[i + 1]?.content as Array<{ callId?: string }> | undefined) ?? [])
+          .filter((part) => part.callId !== undefined)
+          .map((part) => part.callId);
         assert.deepEqual(answered, callIds, `tool calls at message ${i} must be answered by message ${i + 1}`);
+      }
+
+      // RC2 item 14, Step 10: this shedding path rebuilds each result
+      // message in place (`rebuildResultMessage`) rather than constructing a
+      // fresh one, a different code path from the ordinary multi-round test
+      // above — checked directly here, not inferred from that sibling test.
+      // Every rebuilt User message (the "sent" copies at every shedding
+      // round, not just the final one) must still carry non-empty text.
+      for (const request of model.sent) {
+        for (const message of request) {
+          if (message.role !== "user") {
+            continue;
+          }
+          const content = message.content;
+          const textPart = Array.isArray(content)
+            ? (content as Array<{ value?: unknown }>).find((part) => typeof part.value === "string")
+            : undefined;
+          const text = typeof content === "string" ? content : (textPart?.value as string | undefined);
+          assert.ok(
+            typeof text === "string" && text.length > 0,
+            `every rebuilt User message must carry non-empty text, got: ${JSON.stringify(message)}`
+          );
+        }
       }
     } finally {
       model.restore();

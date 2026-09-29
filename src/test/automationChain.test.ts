@@ -669,18 +669,37 @@ void test("a declined (false-resolving) automation dispatch closes its round-led
       "the dispatched command declined to run and no round was started"
     );
 
+    // The round-ledger row above is already confirmed terminal, but the run
+    // log itself is written from a SEPARATE, fire-and-forget promise chain
+    // (`void writeRunLog(...)` in terminalizeGenericAutomationRoundBestEffortV1
+    // — deliberately not on the path `scheduleAutomationChain`'s own promise
+    // resolves through, so a slow/best-effort log write can never block or
+    // fail the dispatch decision). So this cannot just wait for the FILE to
+    // exist and read it once: under load (the full suite runs every test
+    // file as its own concurrent child process — see taskFolderFixture.ts's
+    // own doc comment on that), the directory entry can appear before the
+    // write that fills it has actually landed. Poll until the CONTENT itself
+    // is present, re-reading on each attempt, with a deadline generous
+    // enough to absorb that contention rather than one that only covers the
+    // uncontended case.
     const runsDir = path.join(fixture.folder, "runs");
-    const deadline = Date.now() + 2000;
+    const deadline = Date.now() + 10_000;
     let entries: string[] = [];
+    let logContent = "";
     for (;;) {
       entries = fs.existsSync(runsDir) ? fs.readdirSync(runsDir) : [];
-      if (entries.length > 0 || Date.now() > deadline) {
+      if (entries.length > 0) {
+        logContent = fs.readFileSync(path.join(runsDir, entries[0] as string), "utf8");
+        if (logContent.includes("Automation Round Not Started")) {
+          break;
+        }
+      }
+      if (Date.now() > deadline) {
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(entries.length, 1, "a run log must be written for the no-op round, best-effort");
-    const logContent = fs.readFileSync(path.join(runsDir, entries[0] as string), "utf8");
     assert.match(logContent, /Automation Round Not Started/);
     assert.match(logContent, /declined to run and no round was started/);
   } finally {

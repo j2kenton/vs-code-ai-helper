@@ -2029,7 +2029,12 @@ void describe("TaskTreeProvider — pending workflow decisions (task: hidden-but
     }
   });
 
-  void it("fires onDidChangeTreeData when a decision is posted or resolved on a store sharing the same Memento", async () => {
+  void it("fires onDidChangeTreeData when a decision is posted or resolved on a store sharing the same Memento", async (t) => {
+    // The tree's refresh is debounced (RC2 item 11, Step 46): the leading
+    // fire still happens immediately, but a second request arriving inside
+    // the same ~500ms window (resolve() right after post()) is deferred to
+    // one trailing fire instead of firing again immediately.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     const memento = new FakeMemento() as unknown as vscode.Memento;
     const store = new WorkflowDecisionStoreV1(memento);
     const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
@@ -2046,7 +2051,47 @@ void describe("TaskTreeProvider — pending workflow decisions (task: hidden-but
         if (posted.ok) {
           await store.resolve(posted.decision.decisionId, "restore");
         }
+        t.mock.timers.tick(500);
         assert.ok(fires > firedAfterPost, "resolving also refreshes the tree");
+      } finally {
+        sub.dispose();
+      }
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("debounces onDidChangeTreeData to one trailing fire per ~500ms burst, without dropping the change", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const provider = new TaskTreeProvider(makeSingleTaskInventory());
+    try {
+      let fires = 0;
+      const sub = provider.onDidChangeTreeData(() => { fires += 1; });
+      try {
+        // The first request in a quiet period fires immediately (leading
+        // edge) so a single isolated action is never delayed.
+        provider.setSearchQuery("alpha");
+        assert.equal(fires, 1, "the first refresh in a quiet period fires immediately");
+
+        // A burst of further requests inside the same debounce window
+        // collapses into exactly one trailing fire, not one per request.
+        provider.setSearchQuery("alph");
+        provider.setSearchQuery("al");
+        provider.setSearchQuery("a");
+        assert.equal(fires, 1, "requests inside the debounce window must not fire again immediately");
+
+        t.mock.timers.tick(500);
+        assert.equal(fires, 2, "exactly one trailing fire covers the whole burst");
+
+        // The trailing fire itself arms a fresh cooldown window (the same
+        // "no timer pending" leading-edge path it always takes), so a
+        // request landing immediately after it is deferred rather than
+        // firing a third time right away — the debounce enforces a hard cap
+        // of one fire per ~500ms, not just "collapse concurrent bursts".
+        provider.setSearchQuery("");
+        assert.equal(fires, 2, "a request right after the trailing fire lands in its own fresh cooldown window");
+        t.mock.timers.tick(500);
+        assert.equal(fires, 3, "it still fires once that fresh window elapses");
       } finally {
         sub.dispose();
       }

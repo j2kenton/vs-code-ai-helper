@@ -164,7 +164,9 @@ export type ChatInteractionSettlementV1 =
   | "cancelled"
   | "supersededByReplacementOperation"
   | "expired"
-  | "resetByChatRecovery";
+  | "resetByChatRecovery"
+  | "timedOut"
+  | "interrupted";
 
 /**
  * One journaled state transition. The first receipt of every record has
@@ -292,6 +294,8 @@ const SETTLEMENTS_V1: readonly ChatInteractionSettlementV1[] = [
   "supersededByReplacementOperation",
   "expired",
   "resetByChatRecovery",
+  "timedOut",
+  "interrupted",
 ];
 
 /**

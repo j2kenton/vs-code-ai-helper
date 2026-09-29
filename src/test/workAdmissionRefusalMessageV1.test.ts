@@ -137,6 +137,27 @@ void describe("describeWorkAdmissionRefusalV1", () => {
     );
   });
 
+  void it("names the outstanding reason when a terminal release is durably holding the marker (item 2 / Step 57)", () => {
+    const message = describeWorkAdmissionRefusalV1(
+      busy({ outstandingReason: "The provider process (pid 42) did not exit." })
+    );
+    assert.match(message, /already has a stage action in progress/);
+    assert.match(message, /It is being kept open because: The provider process \(pid 42\) did not exit\./);
+  });
+
+  void it("names the outstanding reason even when the claim also looks stuck (unrenewed)", () => {
+    const message = describeWorkAdmissionRefusalV1(
+      busy({ ageMs: 11 * 60_000, likelyStale: false, outstandingReason: "A provider process may still be starting and could not be confirmed stopped." })
+    );
+    assert.match(message, /looks stuck rather than busy/);
+    assert.match(message, /It is being kept open because: A provider process may still be starting and could not be confirmed stopped\./);
+  });
+
+  void it("omits the outstanding-reason sentence entirely for an ordinary busy marker", () => {
+    const message = describeWorkAdmissionRefusalV1(busy());
+    assert.doesNotMatch(message, /kept open because/);
+  });
+
   void it("target-resolution refusals take the same optional task name", () => {
     const handle = { writeFailedRootPaths: ["/w/.ensemble"], unprotectedRootPaths: ["/w/.ensemble"] } as unknown as Parameters<
       typeof describeTargetResolutionWriteFailureV1

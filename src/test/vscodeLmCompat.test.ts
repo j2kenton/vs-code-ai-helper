@@ -5,11 +5,13 @@ import {
   attachLmToolsV1,
   createLmTextPartV1,
   createLmToolResultPartV1,
+  createLmUserMessageWithPartsV1,
   isLmTextPartV1,
   isLmToolCallPartV1,
   iterateLmResponsePartsV1,
   probeLmToolCallingHostCapabilityV1,
   toNeutralToolCallV1,
+  TOOL_RESULTS_USER_TEXT_V1,
 } from "../services/vscodeLmCompat";
 
 /**
@@ -166,6 +168,39 @@ void describe("vscodeLmCompat", () => {
     const [content] = part.content;
     assert.ok(content instanceof lmClasses.LanguageModelTextPart);
     assert.equal(content.value, "the result");
+  });
+
+  void describe("createLmUserMessageWithPartsV1 (RC2 item 14: Copilot auto needs a non-empty text part)", () => {
+    void it("prepends TOOL_RESULTS_USER_TEXT_V1 when every supplied part is a tool-result part (no text part at all)", () => {
+      const toolResult = createLmToolResultPartV1(vscode, "call-1", "the result");
+      const message = createLmUserMessageWithPartsV1(vscode, [toolResult]);
+      const content = message.content as unknown as unknown[];
+      assert.equal(content.length, 2);
+      assert.ok(content[0] instanceof lmClasses.LanguageModelTextPart);
+      assert.equal((content[0] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
+      assert.equal(content[1], toolResult);
+    });
+
+    void it("prepends TOOL_RESULTS_USER_TEXT_V1 when a supplied text part is present but empty", () => {
+      const emptyText = createLmTextPartV1(vscode, "");
+      const toolResult = createLmToolResultPartV1(vscode, "call-2", "result");
+      const message = createLmUserMessageWithPartsV1(vscode, [emptyText, toolResult]);
+      const content = message.content as unknown as unknown[];
+      assert.equal(content.length, 3);
+      assert.equal((content[0] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
+      assert.equal(content[1], emptyText);
+      assert.equal(content[2], toolResult);
+    });
+
+    void it("does NOT prepend anything when a supplied part already has non-empty text", () => {
+      const text = createLmTextPartV1(vscode, "please continue");
+      const toolResult = createLmToolResultPartV1(vscode, "call-3", "result");
+      const message = createLmUserMessageWithPartsV1(vscode, [text, toolResult]);
+      const content = message.content as unknown as unknown[];
+      assert.equal(content.length, 2);
+      assert.equal(content[0], text);
+      assert.equal(content[1], toolResult);
+    });
   });
 
   void it("attachLmToolsV1 attaches tools to a neutral request-options object without dropping modelOptions", () => {

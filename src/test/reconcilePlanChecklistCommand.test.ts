@@ -682,6 +682,272 @@ void describe("applyReconciliationReviewVerifiedTicksV1 / applyReconciliationRev
       workspace.restore();
     }
   });
+
+  // RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28): this
+  // command is the reconcile card's own duplicate of
+  // `applyReviewerVerifiedTicksConfirmedV1` (Step 36) — when a review DOES
+  // name an item verified complete and that item is ALREADY ticked in
+  // plan-final.md (the race: applied via this card or the sibling one, then
+  // pressed again), that must report "Already done" with the real count.
+  // The previous revision of this test used a task with NO review evidence
+  // at all, which conflated that genuinely-empty case with this race — see
+  // the "reports 'noCandidates' …" test above for that (non-alreadyDone) case.
+  void it("reports 'alreadyDone' with the real count when the review's named item is already ticked (the sibling-card race)", async () => {
+    const name = "apply-recon-already-done";
+    const { folder, progress } = makeTask(name, { latched: true, plan: FULLY_CHECKED_PLAN });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      REVIEW_NAMING_VERIFIED_ITEM,
+      "utf8"
+    );
+    const canonicalId = `canonical-${name}`;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksConfirmedV1(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      assert.equal(result?.outcome, "alreadyDone");
+      assert.match(result?.message ?? "", /Already done: the 1 reviewer-verified tick is applied\./);
+      const after = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+      assert.equal(after, FULLY_CHECKED_PLAN, "no write happens when there is nothing to tick");
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  // RC2 item 8, Step 37 follow-up (implementation review, narrowed blocker
+  // `bbd42447-…-1`): the confirm-time "already ticked" count must be scoped
+  // to what THIS card actually offered (via its own `effect.args`), not a
+  // fresh global aggregate across every review stage — which can inflate the
+  // count with an item a DIFFERENT review names that was already checked
+  // before this card was ever posted, unrelated to what the card promised.
+  void it(
+    "counts only what the card offered as 'already ticked' — not an unrelated item an older review also names that was already checked",
+    async () => {
+      const name = "apply-recon-offered-scope";
+      const plan = [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Split the artifacts",
+        "- [ ] Wire the completeness gate",
+        "- [x] Add the retry button",
+        "",
+      ].join("\n");
+      const { folder, progress } = makeTask(name, { latched: false, plan });
+      progress.currentStage = "impl-high-review";
+      writeProgress(folder, progress);
+      // impl-high-review names the ONE item that is actually unticked — this
+      // is the only thing the card will ever offer.
+      nodeFs.writeFileSync(
+        nodePath.join(folder, "impl-high-review.md"),
+        REVIEW_NAMING_VERIFIED_ITEM,
+        "utf8"
+      );
+      // impl-low-review names a DIFFERENT item that was already ticked from
+      // the start — pre-existing evidence unrelated to this card.
+      nodeFs.writeFileSync(
+        nodePath.join(folder, "impl-low-review.md"),
+        [
+          "Readiness: 9/10",
+          "",
+          "<!-- verified-complete:start -->",
+          "- Add the retry button",
+          "<!-- verified-complete:end -->",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      const canonicalId = `canonical-${name}`;
+      const { inventory } = makeInventory(canonicalId, folder, progress);
+      const workspace = installWorkspaceFolders();
+      const fs = installRealFs();
+      const win = installWindowStub({});
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      try {
+        const posted = await postReconcilePlanChecklistDecisionV1(
+          vscode.Uri.file(folder),
+          canonicalId,
+          folder,
+          progress
+        );
+        assert.equal(posted.kind, "posted");
+        const store = new WorkflowDecisionStoreV1(context.workspaceState);
+        const decision = store
+          .listPending(canonicalId)
+          .find((d) => d.decisionKey === "reconcilePlanChecklist");
+        assert.ok(decision, "a decision must be posted");
+        const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
+        assert.ok(applyOption, "the applyVerifiedTicks option must be offered");
+        assert.match(applyOption.label, /Apply 1 Reviewer-Verified Tick/, "the card only ever offered 1 item");
+        assert.equal(applyOption.effect.kind, "command");
+        const realArgs =
+          applyOption.effect.kind === "command" ? (applyOption.effect.args?.[0] as never) : undefined;
+
+        // Race: something else ticks the ONE item the card offered before
+        // the operator confirms.
+        nodeFs.writeFileSync(
+          nodePath.join(folder, "plan-final.md"),
+          plan.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"),
+          "utf8"
+        );
+
+        const result = await applyReconciliationReviewVerifiedTicksConfirmedV1(
+          inventory,
+          makeStore(canonicalId),
+          realArgs
+        );
+        assert.equal(result?.outcome, "alreadyDone");
+        // Must be 1 (only what the card offered), never 2 (the raw global
+        // aggregate, which also swept in the unrelated pre-existing tick
+        // named by impl-low-review).
+        assert.match(result?.message ?? "", /Already done: the 1 reviewer-verified tick is applied\./);
+      } finally {
+        win.restore();
+        fs.restore();
+        workspace.restore();
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+  );
+
+  // RC2 item 8, Step 37, second narrowing (implementation review,
+  // 2026-09-28): the first fix scoped only the "already ticked" COUNT,
+  // leaving the actual apply operation unscoped — a card offering item A
+  // could still be confirmed into ticking a DIFFERENT item B across ANY
+  // review stage, if a fresher review landed between post and confirm that
+  // newly verifies B while A stays unticked (so the "nothing left to cover"
+  // branch never triggers and the confirm falls through to applying the
+  // CURRENT global union instead of what the card actually promised).
+  void it(
+    "applies only the item the card offered, never a different item a fresher review newly verifies before confirm",
+    async () => {
+      const name = "apply-recon-offered-scope-race";
+      const plan = [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [ ] Wire the completeness gate",
+        "- [ ] Add the retry button",
+        "",
+      ].join("\n");
+      const { folder, progress } = makeTask(name, { latched: false, plan });
+      progress.currentStage = "impl-high-review";
+      writeProgress(folder, progress);
+      // At post time, impl-high-review names only the one item the card will
+      // offer.
+      nodeFs.writeFileSync(
+        nodePath.join(folder, "impl-high-review.md"),
+        REVIEW_NAMING_VERIFIED_ITEM,
+        "utf8"
+      );
+      const canonicalId = `canonical-${name}`;
+      const { inventory } = makeInventory(canonicalId, folder, progress);
+      const workspace = installWorkspaceFolders();
+      const fs = installRealFs();
+      const win = installWindowStub({});
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      try {
+        const posted = await postReconcilePlanChecklistDecisionV1(
+          vscode.Uri.file(folder),
+          canonicalId,
+          folder,
+          progress
+        );
+        assert.equal(posted.kind, "posted");
+        const store = new WorkflowDecisionStoreV1(context.workspaceState);
+        const decision = store
+          .listPending(canonicalId)
+          .find((d) => d.decisionKey === "reconcilePlanChecklist");
+        assert.ok(decision, "a decision must be posted");
+        const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
+        assert.ok(applyOption, "the applyVerifiedTicks option must be offered");
+        assert.match(applyOption.label, /Apply 1 Reviewer-Verified Tick/, "the card only ever offered 1 item");
+        assert.equal(applyOption.effect.kind, "command");
+        const realArgs =
+          applyOption.effect.kind === "command" ? (applyOption.effect.args?.[0] as never) : undefined;
+
+        // A fresher review lands between posting and confirming, naming a
+        // DIFFERENT, still-unticked item verified complete. The card in hand
+        // never offered this item and must not apply it.
+        nodeFs.writeFileSync(
+          nodePath.join(folder, "impl-high-review.md"),
+          [
+            "Readiness: 9/10",
+            "",
+            "<!-- verified-complete:start -->",
+            "- Wire the completeness gate",
+            "- Add the retry button",
+            "<!-- verified-complete:end -->",
+            "",
+          ].join("\n"),
+          "utf8"
+        );
+
+        const result = await applyReconciliationReviewVerifiedTicksConfirmedV1(
+          inventory,
+          makeStore(canonicalId),
+          realArgs
+        );
+        assert.equal(result, undefined, "a normal apply, not an alreadyDone re-press");
+        const finalPlan = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+        assert.match(finalPlan, /- \[x\] Wire the completeness gate/);
+        // The newly-surfaced item must stay unticked: it was never offered
+        // by this card.
+        assert.match(finalPlan, /- \[ \] Add the retry button/);
+      } finally {
+        win.restore();
+        fs.restore();
+        workspace.restore();
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+  );
+
+  // The genuinely-empty case (no review names anything verified complete at
+  // all) must NOT claim "Already done" — nothing was ever offered to apply.
+  void it("reports plain 'no review names anything verified' — not 'alreadyDone' — when there is no review coverage at all", async () => {
+    const name = "apply-recon-no-coverage";
+    const { folder, progress } = makeTask(name, { latched: true });
+    const canonicalId = `canonical-${name}`;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksConfirmedV1(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      assert.equal(result, undefined, "no structured 'alreadyDone' result when nothing was ever offered");
+      assert.ok(
+        win.captured.some(
+          (m) =>
+            m.method === "info" &&
+            /No implementation review on file currently names an unticked plan item as verified complete/.test(
+              m.message
+            )
+        ),
+        "must report plainly that there is no review coverage, not claim 'Already done'"
+      );
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -781,6 +1047,104 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
       assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must be offered");
       assert.match(applyOption.label, /Apply 1 Reviewer-Verified Tick/);
+      assert.equal(applyOption.effect.kind, "command");
+      if (applyOption.effect.kind === "command") {
+        assert.equal(
+          applyOption.effect.command,
+          "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed"
+        );
+      }
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC2 item 8, Steps 35/36 (implementation-review follow-up, 2026-09-28):
+  // when an `applyReviewerVerifiedTicks` card is ALREADY pending for this
+  // task at post time, the reconcile card's own "applyVerifiedTicks" option
+  // is relabelled to point at it rather than restating the same action — but
+  // (Step 35) every `resumeKind: "continue"` option's label must say it
+  // resumes the task, including this relabelled one, which the previous
+  // revision left without that wording.
+  void it("relabels applyVerifiedTicks to point at an already-pending applyReviewerVerifiedTicks card, and still says it resumes the task", async () => {
+    const name = "evidence-pending-apply-ticks-card";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+    nodeFs.writeFileSync(nodePath.join(folder, "impl-high-review.md"), REVIEW_NAMING_VERIFIED_ITEM, "utf8");
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const posted = await store.post({
+        decisionId: "pending-apply-ticks-1",
+        decisionKey: "applyReviewerVerifiedTicks",
+        taskCanonicalId: canonicalId,
+        stage: "impl-high-review",
+        whatHappened: "impl-high-review.md named 1 plan item(s) as verified complete.",
+        whyUserNeeded: "Applying re-arms the completeness gate on the reviewer's own word.",
+        options: [
+          {
+            optionId: "apply",
+            label: "Apply 1 Reviewer-Verified Tick and resume the task",
+            resumeKind: "continue",
+            consequence: "Ticks this item, then dispatches this stage's next action.",
+            effect: {
+              kind: "command",
+              command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
+              args: [{ taskFolderPath: folder, canonicalId, reviewStage: "impl-high-review" }],
+            },
+          },
+        ],
+        recommendation: { kind: "option", optionId: "apply", reasoning: "The reviewer already verified this." },
+        gating: { holdsTaskPaused: false, unblocksProgress: true, detail: "Not the pause holder." },
+        createdAt: new Date().toISOString(),
+      });
+      assert.ok(posted.ok, "the applyReviewerVerifiedTicks card must post");
+
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
+      assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must still be offered");
+      assert.equal(
+        applyOption.label,
+        "Same as the reviewer-verified ticks card above — apply and resume the task"
+      );
+      assert.match(
+        applyOption.label,
+        /resume the task/,
+        "every resumeKind: 'continue' option's label must say it resumes the task, even when relabelled"
+      );
+      assert.match(
+        applyOption.consequence,
+        /same action offered on the pending reviewer-verified-ticks card above/
+      );
+      // The real, idempotent command effect must be unchanged by the relabel.
       assert.equal(applyOption.effect.kind, "command");
       if (applyOption.effect.kind === "command") {
         assert.equal(
@@ -1223,7 +1587,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       // once the human has actually done the checks and ticked the item,
       // clicking it is still the correct next step.
       assert.ok(
-        decision.options.some((o) => o.optionId === "reconcile" && o.label === "Mark reconciled and try again"),
+        decision.options.some((o) => o.optionId === "reconcile" && o.label === "Mark reconciled and resume the task"),
         "Mark reconciled must remain available as a non-recommended option"
       );
     } finally {
@@ -1667,7 +2031,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(decision, "a decision must be posted");
       const linkOption = decision.options.find((o) => o.optionId === "linkManualChecks");
       assert.ok(linkOption, "a Link Outstanding Checks option must be offered for the unconfirmed pooled case");
-      assert.match(linkOption.label, /Link 5 Outstanding Checks and try again/);
+      assert.match(linkOption.label, /Link 5 Outstanding Checks and resume the task/);
       assert.equal(linkOption.effect.kind, "command");
       if (linkOption.effect.kind !== "command") {
         throw new Error("unreachable — asserted above");

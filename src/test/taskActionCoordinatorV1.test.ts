@@ -101,7 +101,19 @@ import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
 } from "../services/workflowLeaseStoreV1";
+import { describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
+import { writeRunLog } from "../utils/runLog";
 import { safeRemoveDir } from "./testFsUtils";
+import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1";
+import {
+  acquireWorkAdmissionV1,
+  createSafeAdmissionReleaseStateV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+} from "../state/workAdmissionV1";
+import { beginProcessSpawnAttemptV1, beginRoundProcessRecordingV1 } from "../state/roundProcessRecordV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 
 const TEST_ACTION_KEY = "coordinatorTestAction.v1";
 const TEST_ROUTE = "vs-code-ai-helper.coordinatorTestRoute";
@@ -126,6 +138,30 @@ function makeOrchestrator(): ActionConversationOrchestratorV1 {
       privateRootId: "private-storage",
     }),
   });
+}
+
+/**
+ * Item 2 / Step 55: a second store instance pointed at the SAME durable
+ * root `makeOrchestrator` used, so a test can read back the exact record a
+ * harness action wrote — the coordinator's `deps.orchestrator` is opaque to
+ * the test, but the storage underneath it is real files on disk.
+ */
+function loadTransactionRecordDirectV1(
+  operationId: string
+): ReturnType<ReturnType<typeof createChatInteractionTransactionStoreV1>["load"]> {
+  const registry = createWorkflowPathRegistryV1();
+  registry.registerRoot({
+    rootId: "private-storage",
+    fsPath: orchestratorTmpRoot,
+    kind: "privateStorage",
+    trustedForMutation: true,
+  });
+  const store = createChatInteractionTransactionStoreV1({
+    registry,
+    fileStore: createWorkflowFileStoreV1(registry.registeredRoots()),
+    privateRootId: "private-storage",
+  });
+  return store.load(operationId);
 }
 
 function fakeToken(cancelled = false): vscode.CancellationToken {
@@ -260,7 +296,9 @@ function makeHarness(
   readTools?: {
     readonly toolSessions: TaskActionToolSessionsV1;
     readonly providerReadsWorkspaceNatively: boolean;
-  }
+  },
+  /** Item 2 / Step 55: lets a test wrap the durable orchestrator (e.g. to force a `settleInvocation` failure) instead of the plain file-backed one. */
+  orchestratorOverride?: ActionConversationOrchestratorV1
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -286,7 +324,7 @@ function makeHarness(
     ...rowOverrides,
   };
   const leaseStore = createWorkflowLeaseStoreV1();
-  const orchestrator = makeOrchestrator();
+  const orchestrator = orchestratorOverride ?? makeOrchestrator();
   const selection = stubSelectionOpener(
     transports,
     selectionExhaustion,
@@ -688,6 +726,73 @@ void describe("taskActionCoordinatorV1", () => {
       persisted.promptContract.promptInputSha256,
       expectedSha256,
       "the recorded prompt digest must describe the exact bytes the transport received"
+    );
+  });
+
+  void it("carries a repaired lookalike end marker onto the completed outcome (item 5)", async () => {
+    const expectedFrameEnd = "<<<END_ENSEMBLE_AI_RESULT_V1>>>";
+    // Field shape (2026-09-26 22:23 local): the model substituted the
+    // lookalike Unicode character U+15E9 for one letter of the end marker.
+    // `.replace` substitutes the FIRST "E" (index 3, in "END"), so the
+    // generated marker and the asserted repair below must agree on that
+    // exact position — a hand-typed literal at a different index would make
+    // this test internally inconsistent and it would never pass.
+    const repairedFrameEnd = expectedFrameEnd.replace("E", "ᗩ");
+    const harness = makeHarness([
+      envelopeTransport((correlation) => {
+        const payload = JSON.stringify({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# x" },
+        });
+        // The round must still complete, and the repair must be visible on
+        // the settled outcome, not just accepted silently.
+        return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${payload}\n${repairedFrameEnd}\n`;
+      }),
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    if (outcome.kind !== "completed") {
+      assert.fail("expected a completed outcome");
+    }
+    assert.deepEqual(outcome.frameRepairV1, {
+      expected: expectedFrameEnd,
+      actual: repairedFrameEnd,
+      index: 3,
+    });
+    assert.equal(harness.promoted.length, 1, "a repaired marker must still promote the content");
+    const logLine = describeTaskActionOutcomeForLogV1(outcome);
+    assert.match(logLine, /Frame: end marker repaired \(one substituted character at index 3\)/);
+
+    // Drive the same text through the real run-log writer (src/utils/runLog.ts)
+    // so this proves the repair line survives into the bytes written to disk,
+    // not just that the formatter returns it. `vscode.workspace.fs` is
+    // monkey-patched to capture the write, the pattern used throughout this
+    // suite for a fake `vscode` host (see runLogPrivacyGuard.test.ts).
+    const fsObj = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const origCreateDirectory = fsObj.createDirectory;
+    const origReadDirectory = fsObj.readDirectory;
+    const origWriteFile = fsObj.writeFile;
+    const written: Array<{ path: string; bytes: Uint8Array }> = [];
+    fsObj.createDirectory = (): Promise<void> => Promise.resolve();
+    fsObj.readDirectory = (): Promise<Array<[string, number]>> => Promise.resolve([]);
+    fsObj.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
+      written.push({ path: uri.fsPath, bytes });
+      return Promise.resolve();
+    };
+    try {
+      await writeRunLog(vscode.Uri.file("/ws/.ensemble/item5-test-task"), "scripted-transport", "plan", logLine);
+    } finally {
+      fsObj.createDirectory = origCreateDirectory;
+      fsObj.readDirectory = origReadDirectory;
+      fsObj.writeFile = origWriteFile;
+    }
+    assert.equal(written.length, 1, "the run log must actually be written");
+    assert.match(
+      Buffer.from(written[0]!.bytes).toString("utf8"),
+      /Frame: end marker repaired \(one substituted character at index 3\)/,
+      "the repair line must actually be written to the round's run file, not just returned by the formatter"
     );
   });
 
@@ -1227,6 +1332,215 @@ void describe("taskActionCoordinatorV1", () => {
   });
 
   /**
+   * Item 2 / Step 55: before this branch existed, a bounded invocation
+   * deadline (Step 54's broker outcome, `transportFailure` with code
+   * `invocationDeadlineExceeded` and no response started) fell into the same
+   * pre-response fallback path as an ordinary transport failure and could
+   * silently start a second, fully unrelated provider — exactly the
+   * candidate-fallback-after-timeout the plan requires never happens. This
+   * proves the terminal branch: only the first candidate is ever reserved or
+   * invoked, and the operation settles `failed`/`retryable: true` naming the
+   * deadline code.
+   */
+  void it("settles a bounded invocation deadline as a terminal failure and never starts a fallback candidate", async () => {
+    const seen: ActionCorrelationV1[] = [];
+    const timedOut: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: (request) => {
+        seen.push(request.correlation);
+        return Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "invocationDeadlineExceeded",
+          detail: "provider invocation exceeded 3600000ms",
+        });
+      },
+    };
+    const wouldSucceed = envelopeTransport(
+      (correlation) =>
+        frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+        }),
+      seen
+    );
+    const harness = makeHarness([timedOut, wouldSucceed]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind !== "failed") {
+      assert.fail("expected failed");
+    }
+    assert.equal(outcome.code, "invocationDeadlineExceeded");
+    assert.equal(outcome.retryable, true);
+    // Exactly one candidate was ever reserved or invoked — the second
+    // (would-succeed) transport is never reached.
+    assert.equal(seen.length, 1);
+    assert.equal(harness.selection.reserved, 1);
+  });
+
+  /**
+   * RC2 item 2 / Step 58 (review fix, 2026-09-29): the deadline case above
+   * (`invocationDeadlineExceeded`) already proves the terminal branch never
+   * starts a fallback candidate; this proves the SAME no-fallback guarantee
+   * for a provider-reported cancellation (`AgentTransportExitV1`'s
+   * `providerCancelled` kind, Step 55's other terminal trigger besides the
+   * deadline) — the previous coverage of `providerCancelled`
+   * (`item 2 / Step 55: cancellation terminal settlement`, below) only ever
+   * configured a single candidate, so it could not show that a second,
+   * fully unrelated provider is never reached the way the deadline test
+   * above already does for a timeout.
+   */
+  void it(
+    "settles a provider-cancelled invocation as a terminal failure and never starts a fallback candidate",
+    async () => {
+      const seen: ActionCorrelationV1[] = [];
+      const cancelled: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: (request): Promise<AgentTransportExitV1> => {
+          seen.push(request.correlation);
+          return Promise.resolve({ kind: "providerCancelled" as const });
+        },
+      };
+      const wouldSucceed = envelopeTransport(
+        (correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+          }),
+        seen
+      );
+      const harness = makeHarness([cancelled, wouldSucceed]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind !== "failed") {
+        assert.fail("expected failed");
+      }
+      assert.equal(outcome.code, "providerCancelled");
+      assert.equal(outcome.retryable, true);
+      // Exactly one candidate was ever reserved or invoked — the second
+      // (would-succeed) transport is never reached.
+      assert.equal(seen.length, 1);
+      assert.equal(harness.selection.reserved, 1);
+    }
+  );
+
+  /**
+   * Item 2 / Step 55: the row's admitted `invocationPending` chat-transaction
+   * record must not be silently deleted by the generic post-outcome
+   * `discardInvocation` cleanup — it settles explicitly as `timedOut`, so a
+   * reader of the durable record can tell a bounded deadline apart from an
+   * ordinary non-questions completion.
+   */
+  void it("settles the admitted chat-transaction record as timedOut on a bounded invocation deadline", async () => {
+    const seen: ActionCorrelationV1[] = [];
+    const timedOut: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: (request) => {
+        seen.push(request.correlation);
+        return Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "invocationDeadlineExceeded",
+          detail: "provider invocation exceeded 3600000ms",
+        });
+      },
+    };
+    const harness = makeHarness([timedOut]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "failed");
+    assert.equal(seen.length, 1);
+    const loaded = await loadTransactionRecordDirectV1(seen[0]!.operationId);
+    assert.equal(loaded.kind, "ok");
+    if (loaded.kind !== "ok") {
+      assert.fail("expected the admitted record to still exist, settled");
+    }
+    assert.equal(loaded.transaction.state, "settled");
+    assert.equal(loaded.transaction.settlement, "timedOut");
+  });
+
+  /**
+   * Item 2 / Step 55 completion blocker (review pass 51): `settleInvocation`
+   * used to be `Promise<void>`, so a non-throwing store failure (e.g.
+   * `storageFailure`) looked identical to success — and the generic
+   * post-outcome `discardInvocation` cleanup in `continueAdmittedAction`
+   * would then run unconditionally and actually DELETE the still-
+   * `invocationPending` record, erasing the only evidence this invocation
+   * ever ran. This proves that when the durable settle write does not land,
+   * the record survives untouched (still `invocationPending`, not deleted
+   * and not silently reported settled) rather than being discarded.
+   */
+  void it("does not discard the admitted record when settleInvocation fails to durably settle it", async () => {
+    const seen: ActionCorrelationV1[] = [];
+    const timedOut: AgentTransportV1 = {
+      runnerId: "scripted-transport",
+      invoke: (request) => {
+        seen.push(request.correlation);
+        return Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "invocationDeadlineExceeded",
+          detail: "provider invocation exceeded 3600000ms",
+        });
+      },
+    };
+    const realOrchestrator = makeOrchestrator();
+    let settleInvocationCalls = 0;
+    let discardInvocationCalls = 0;
+    // `admitAction` always discards+re-admits once at admission time (a
+    // no-op cleanup of any stale record at a fresh operationId, unrelated to
+    // this invocation's own outcome) — captured right after the settle call
+    // so the assertion below isolates ONLY a discard caused by the
+    // post-outcome cleanup this test exists to guard against.
+    let discardInvocationCallsAtSettleV1 = -1;
+    const flakySettleOrchestrator: ActionConversationOrchestratorV1 = {
+      ...realOrchestrator,
+      settleInvocation: (operationId, settlement) => {
+        settleInvocationCalls += 1;
+        // Force the "store write did not land" branch without actually
+        // touching storage, so the record is still exactly as
+        // `admitInvocation` left it: `invocationPending`.
+        void operationId;
+        void settlement;
+        discardInvocationCallsAtSettleV1 = discardInvocationCalls;
+        return Promise.resolve(false);
+      },
+      discardInvocation: async (operationId) => {
+        discardInvocationCalls += 1;
+        return realOrchestrator.discardInvocation(operationId);
+      },
+    };
+    const harness = makeHarness(
+      [timedOut],
+      {},
+      [],
+      undefined,
+      undefined,
+      undefined,
+      flakySettleOrchestrator
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "failed");
+    assert.equal(seen.length, 1);
+    assert.equal(settleInvocationCalls, 1, "settleInvocation must still be attempted");
+    assert.equal(
+      discardInvocationCalls,
+      discardInvocationCallsAtSettleV1,
+      "a failed settle must not fall through to the generic post-outcome discard cleanup"
+    );
+    const loaded = await loadTransactionRecordDirectV1(seen[0]!.operationId);
+    assert.equal(loaded.kind, "ok");
+    if (loaded.kind !== "ok") {
+      assert.fail("expected the admitted record to still exist, untouched");
+    }
+    assert.equal(
+      loaded.transaction.state,
+      "invocationPending",
+      "the record must survive a failed settle rather than being deleted or misreported as settled"
+    );
+  });
+
+  /**
    * 2026-08-12 field report, item 2: a malformed result used to be retried
    * only against the SAME resolved primary candidate
    * (`withMalformedResultRetryV1`) — a stage with four configured backups
@@ -1298,6 +1612,70 @@ void describe("taskActionCoordinatorV1", () => {
       }
       assert.equal(outcome.code, "invalidJson");
       assert.equal(harness.selection.reserved, 2);
+      // Item 6: the FIRST attempt's own rejection must still be on the
+      // outcome even though the SECOND attempt's outcome is what the
+      // exhaustion path returns.
+      assert.equal(outcome.priorRejectedAttemptsV1?.length, 1);
+      assert.equal(outcome.priorRejectedAttemptsV1?.[0]?.code, "invalidJson");
+      assert.notEqual(outcome.priorRejectedAttemptsV1?.[0]?.attemptId, outcome.correlation.attemptId);
+    });
+
+    /**
+     * Item 6, 2026-09-26 field report: two earlier attempts in the same
+     * round were each rejected for their OWN reason (a valid, correctly
+     * end-marked response each time), yet the run file and round ledger
+     * recorded only the final attempt's code — the earlier two were
+     * indistinguishable from having never happened. With three
+     * malformed-retry-eligible candidates configured, each failing a
+     * DIFFERENT way, the exhausted chain's outcome must carry every earlier
+     * attempt's own code/detail next to its own attemptId, not just the
+     * last one's.
+     */
+    void it("records every earlier attempt's own rejection reason when a malformed chain exhausts", async () => {
+      function invalidFrameTransport(): AgentTransportV1 {
+        return {
+          runnerId: "scripted-transport",
+          invoke: (_request, output): Promise<{ kind: "completed" }> => {
+            // A frame that starts but never closes: `invalidFrame`, not the
+            // "no frame at all" frameless-fallback path.
+            output.write('<<<ENSEMBLE_AI_RESULT_V1>>>\n{"incomplete": true\n');
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        };
+      }
+      function invalidEnvelopeTransport(): AgentTransportV1 {
+        return envelopeTransport((correlation) =>
+          frame({
+            version: 99,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# x" },
+          })
+        );
+      }
+      const harness = makeHarness([
+        invalidFrameTransport(),
+        malformedTransport(),
+        invalidEnvelopeTransport(),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(harness.selection.reserved, 3);
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult");
+      }
+      // The final (third) attempt's own reason is the outcome's own code/detail.
+      assert.equal(outcome.code, "invalidEnvelope");
+      assert.match(outcome.detail ?? "", /version/);
+      // The first two attempts' own, DIFFERENT reasons must both survive,
+      // each next to its own attemptId, oldest first.
+      const prior = outcome.priorRejectedAttemptsV1;
+      assert.equal(prior?.length, 2);
+      assert.equal(prior?.[0]?.code, "invalidFrame");
+      assert.match(prior?.[0]?.detail ?? "", /end with/);
+      assert.equal(prior?.[1]?.code, "invalidJson");
+      const attemptIds = new Set([prior?.[0]?.attemptId, prior?.[1]?.attemptId, outcome.correlation.attemptId]);
+      assert.equal(attemptIds.size, 3, "all three attempts must have distinct attemptIds");
     });
 
     void it("does not advance candidates for a resultCorrelationMismatch", async () => {
@@ -1707,6 +2085,70 @@ void describe("taskActionCoordinatorV1", () => {
           1,
           "a promotion/storage failure after content validation passed must not cascade to another candidate"
         );
+      }
+    );
+
+    void it(
+      "records every earlier attempt's own rejection reason when a content-contract chain exhausts " +
+        "(item 6 follow-up, 2026-09-28 implementation review: the field report's own earlier-rejected " +
+        "attempts had a VALID frame and VALID JSON, so they went through THIS branch, not the " +
+        "malformed-envelope one — a history scoped to only the latter would have missed them)",
+      async () => {
+        function requireMagicWithOwnReason(
+          content: CompletedContentV1
+        ): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+          if (content.contentType !== "markdown-artifact.v1") {
+            return { ok: false, reason: "expected markdown-artifact.v1" };
+          }
+          // Each candidate's own markdown text is folded into its own
+          // rejection reason, so three different candidates produce three
+          // distinguishable reasons — proving no later attempt's reason
+          // overwrites an earlier one's.
+          return content.markdown.includes(REQUIRED_MARKER)
+            ? { ok: true }
+            : { ok: false, reason: `missing required "${REQUIRED_MARKER}" marker (got: "${content.markdown}")` };
+        }
+        // Only 2 candidates: the content-contract branch's own
+        // `malformedInvocationCountV1++` on each advance (line ~2432,
+        // pre-existing, unrelated to this fix) is IN ADDITION to the
+        // unconditional per-invocation increment every candidate already
+        // gets — so a content-contract-only chain spends the shared
+        // 3-invocation budget twice as fast as a malformed-envelope chain
+        // and can only ever reach 2 invocations, never 3. That budget
+        // bookkeeping is out of this fix's scope; a 2-candidate chain is
+        // enough to prove the fix (an exhausted chain's EARLIER attempt's
+        // own reason must survive, which the pre-fix code lost entirely for
+        // this branch — see the bug this test guards below).
+        const harness = makeHarness(
+          [
+            markdownEnvelopeTransport("first candidate, no marker"),
+            markdownEnvelopeTransport("second candidate, still no marker"),
+          ],
+          { validateCompletedContent: requireMagicWithOwnReason }
+        );
+        const outcome = await harness.coordinator.executeAction(baseRequest());
+        assert.equal(harness.selection.reserved, 2);
+        assert.equal(outcome.kind, "failed");
+        if (outcome.kind !== "failed") {
+          assert.fail("expected failed");
+        }
+        assert.equal(outcome.code, "contentContractFailed");
+        // The final (second) attempt's own reason is the outcome's own
+        // detail, and its own attemptId is now recorded on the outcome
+        // itself.
+        assert.match(outcome.detail ?? "", /second candidate/);
+        assert.equal(outcome.attemptId, outcome.correlation?.attemptId);
+        // The first attempt's own reason — DIFFERENT from the second's —
+        // must survive next to its own attemptId. Before this fix, the
+        // content-contract branch never pushed to the shared attempt
+        // history at all and returned `contractOutcomeV1` directly, so this
+        // field was always absent for a content-contract chain even though
+        // the sibling malformed-envelope branch already recorded it.
+        const prior = outcome.priorRejectedAttemptsV1;
+        assert.equal(prior?.length, 1);
+        assert.equal(prior?.[0]?.code, "contentContractFailed");
+        assert.match(prior?.[0]?.detail ?? "", /first candidate/);
+        assert.notEqual(prior?.[0]?.attemptId, outcome.attemptId, "the two attempts must have distinct attemptIds");
       }
     );
   });
@@ -2476,11 +2918,17 @@ void describe("taskActionCoordinatorV1", () => {
 
     const outcome = await harness.coordinator.executeAction(baseRequest());
 
-    assert.equal(outcome.kind, "unavailable");
-    if (outcome.kind !== "unavailable") {
-      assert.fail("expected timed-out provider invocation to exhaust its provider chain");
+    // Item 2 / Step 55: a bounded invocation deadline is now a terminal
+    // `failed` outcome naming the deadline directly, not the generic
+    // "chain exhausted" wrapper it used to fall through to (which hid the
+    // real reason — a timeout, not every candidate being unavailable —
+    // behind the same message a genuinely exhausted chain would produce).
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind !== "failed") {
+      assert.fail("expected a bounded invocation deadline to settle as a terminal failure");
     }
-    assert.equal(outcome.code, "candidatesExhausted");
+    assert.equal(outcome.code, "invocationDeadlineExceeded");
+    assert.equal(outcome.retryable, true);
     assert.equal(harness.presentationEnded.value, true);
     assert.equal(harness.settlementRecords.length, 1);
     assert.equal(harness.leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
@@ -3931,4 +4379,463 @@ void describe("taskActionCoordinatorV1 — promotion failure codes", () => {
     assert.equal(code.length - prefix.length, 200);
     assert.ok(code.endsWith("…"), "a truncated message must be visibly elided");
   });
+});
+
+/**
+ * Item 2 / Step 54, review blocker "1b5f9e16-9d92-460b-b8ba-c745c4a9e73f-0":
+ * `AgentExecutionRequestV1.processIdentity` existed and the broker could
+ * classify it, but no PRODUCTION request assembly supplied it, so a
+ * timeout/cancellation outcome never actually carried `processState`. The
+ * fix resolves `processIdentity` in `runProviderRow` from
+ * `currentRoundProcessRecordingTargetV1()` — the SAME task-folder-path/
+ * claim-id pair the CLI transport itself already records processes against
+ * (`cliAgentRunner.ts`, covered by `cliTextTransportRoundProcessV1.test.ts`),
+ * resolved from the SAME `runWithRoundProcessTaskFolderV1` async-local
+ * context every `executeAction` call already runs inside via
+ * `runTrackedOperation` (`taskOperations.ts`) — requiring no change to any
+ * caller of `executeAction`.
+ */
+void describe("taskActionCoordinatorV1 — item 2 / Step 54: processIdentity wired from held admission", () => {
+  function installFakeExtensionContextForAdmissionV1(): () => void {
+    const values = new Map<string, unknown>();
+    const memento = {
+      get<T>(key: string, defaultValue: T): T {
+        return (values.has(key) ? values.get(key) : defaultValue) as T;
+      },
+      update(key: string, value: unknown): Promise<void> {
+        if (value === undefined) {
+          values.delete(key);
+        } else {
+          values.set(key, value);
+        }
+        return Promise.resolve();
+      },
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    return () => __extensionContextV1TestOnly.reset();
+  }
+
+  before(() => {
+    (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).add(TEST_ACTION_KEY);
+    orchestratorTmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-processidentity-"));
+  });
+  after(() => {
+    (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).delete(TEST_ACTION_KEY);
+    safeRemoveDir(orchestratorTmpRoot);
+  });
+
+  void it("a round run inside a held admission claim hands the broker request the SAME taskFolderPath/claimId", async () => {
+    const restoreContext = installFakeExtensionContextForAdmissionV1();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-processidentity-task-"));
+    try {
+      const taskFolderPath = path.join(root, "task");
+      fs.mkdirSync(taskFolderPath, { recursive: true });
+      writeOwnershipBackedTaskProgress(taskFolderPath);
+      const admission = await acquireWorkAdmissionV1({
+        taskFolderPath,
+        purpose: "admission",
+        commandId: "taskActionCoordinatorV1.test.processIdentity",
+      });
+      assert.equal(admission.outcome, "acquired");
+      if (admission.outcome !== "acquired") {
+        throw new Error("admission not acquired");
+      }
+      try {
+        const seen: { processIdentity?: { taskFolderPath: string; claimId: string } } = {};
+        const transport: AgentTransportV1 = {
+          runnerId: "scripted-transport",
+          invoke: (request, output) => {
+            seen.processIdentity = request.processIdentity;
+            output.write(
+              frame({
+                version: 1,
+                correlation: request.correlation,
+                kind: "completed",
+                content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+              })
+            );
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        };
+        const harness = makeHarness([transport]);
+        const outcome = await runWithRoundProcessTaskFolderV1(taskFolderPath, () =>
+          harness.coordinator.executeAction(baseRequest())
+        );
+        assert.equal(outcome.kind, "completed");
+        assert.deepEqual(seen.processIdentity, {
+          taskFolderPath,
+          claimId: admission.handle.claimId,
+        });
+      } finally {
+        await admission.handle.release();
+      }
+    } finally {
+      restoreContext();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  void it("a round run with no held admission for the task gets no processIdentity, exactly as before this field existed", async () => {
+    const restoreContext = installFakeExtensionContextForAdmissionV1();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-processidentity-noadmission-"));
+    try {
+      const taskFolderPath = path.join(root, "task");
+      fs.mkdirSync(taskFolderPath, { recursive: true });
+      const seen: { sawInvoke: boolean; processIdentity?: { taskFolderPath: string; claimId: string } } = {
+        sawInvoke: false,
+      };
+      const transport: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: (request, output) => {
+          seen.sawInvoke = true;
+          seen.processIdentity = request.processIdentity;
+          output.write(
+            frame({
+              version: 1,
+              correlation: request.correlation,
+              kind: "completed",
+              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+            })
+          );
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      };
+      const harness = makeHarness([transport]);
+      // No admission acquired for this task, and no `runWithRoundProcessTaskFolderV1`
+      // context at all — `executeAction` invoked directly, as a caller with no
+      // admission lock context does.
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "completed");
+      assert.ok(seen.sawInvoke);
+      assert.equal(seen.processIdentity, undefined);
+    } finally {
+      restoreContext();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  void it("a round run inside a held admission claim but with NO round-process-folder context still gets no processIdentity (the pre-fix Chat Resume topology, review 2026-09-28)", async () => {
+    const restoreContext = installFakeExtensionContextForAdmissionV1();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-processidentity-heldnocontext-"));
+    try {
+      const taskFolderPath = path.join(root, "task");
+      fs.mkdirSync(taskFolderPath, { recursive: true });
+      writeOwnershipBackedTaskProgress(taskFolderPath);
+      const admission = await acquireWorkAdmissionV1({
+        taskFolderPath,
+        purpose: "admission",
+        commandId: "taskActionCoordinatorV1.test.processIdentityHeldNoContext",
+      });
+      assert.equal(admission.outcome, "acquired");
+      if (admission.outcome !== "acquired") {
+        throw new Error("admission not acquired");
+      }
+      try {
+        const seen: { processIdentity?: { taskFolderPath: string; claimId: string } } = {};
+        const transport: AgentTransportV1 = {
+          runnerId: "scripted-transport",
+          invoke: (request, output) => {
+            seen.processIdentity = request.processIdentity;
+            output.write(
+              frame({
+                version: 1,
+                correlation: request.correlation,
+                kind: "completed",
+                content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+              })
+            );
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        };
+        const harness = makeHarness([transport]);
+        // The bug the review found: an admission-holding caller that invokes
+        // `executeAction`/`resumeAction` directly — as Chat Resume did before
+        // extension.ts's `dispatchResumeV1` was wrapped in
+        // `runWithRoundProcessTaskFolderV1` — establishes no async-local task
+        // context, so `currentRoundProcessRecordingTargetV1()` cannot see the
+        // held claim even though one exists.
+        const outcome = await harness.coordinator.executeAction(baseRequest());
+        assert.equal(outcome.kind, "completed");
+        assert.equal(seen.processIdentity, undefined);
+      } finally {
+        await admission.handle.release();
+      }
+    } finally {
+      restoreContext();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Item 2 / Step 55: the terminal branch for an invocation-boundary
+ * cancellation. A cancellation the CURRENT attempt never reached the
+ * provider for (`prepareAgentInvocationV1`'s pre-invocation check — the
+ * token was already cancelled before `invoke` was ever called) took no
+ * durable invocation claim and started no process, so it stays the ordinary
+ * `cancelled` outcome `admitAction` already reports for the same situation
+ * one step earlier. Every cancellation of an invocation that DID reach the
+ * provider is the "lost invocation" item 2 is about, regardless of what the
+ * process record says: it settles as `failed`, `retryable: true` — the same
+ * terminal shape `invocationDeadlineExceeded` already uses — instead of the
+ * plain `cancelled` shape a caller could otherwise read as an unremarkable,
+ * already-finished cancel and safely retry over.
+ */
+void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation terminal settlement", () => {
+  function installFakeExtensionContextForAdmissionV1(): () => void {
+    const values = new Map<string, unknown>();
+    const memento = {
+      get<T>(key: string, defaultValue: T): T {
+        return (values.has(key) ? values.get(key) : defaultValue) as T;
+      },
+      update(key: string, value: unknown): Promise<void> {
+        if (value === undefined) {
+          values.delete(key);
+        } else {
+          values.set(key, value);
+        }
+        return Promise.resolve();
+      },
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    return () => __extensionContextV1TestOnly.reset();
+  }
+
+  before(() => {
+    (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).add(TEST_ACTION_KEY);
+    orchestratorTmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-cancelsettle-"));
+  });
+  after(() => {
+    (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).delete(TEST_ACTION_KEY);
+    safeRemoveDir(orchestratorTmpRoot);
+  });
+
+  const cancelledExitTransport = (kind: "providerCancelled" | "callerCancelled"): AgentTransportV1 => ({
+    runnerId: "scripted-transport",
+    invoke: (): Promise<AgentTransportExitV1> => Promise.resolve({ kind }),
+  });
+
+  void it(
+    "a provider-invoked cancellation whose spawn was never confirmed settles failed/retryable, not cancelled",
+    async () => {
+      const restoreContext = installFakeExtensionContextForAdmissionV1();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-cancelsettle-unconfirmed-"));
+      try {
+        const taskFolderPath = path.join(root, "task");
+        fs.mkdirSync(taskFolderPath, { recursive: true });
+        writeOwnershipBackedTaskProgress(taskFolderPath);
+        const admission = await acquireWorkAdmissionV1({
+          taskFolderPath,
+          purpose: "admission",
+          commandId: "taskActionCoordinatorV1.test.cancelSettleUnconfirmed",
+        });
+        assert.equal(admission.outcome, "acquired");
+        if (admission.outcome !== "acquired") {
+          throw new Error("admission not acquired");
+        }
+        try {
+          await beginRoundProcessRecordingV1(taskFolderPath, admission.handle.claimId);
+          // A spawn attempt begun but never followed by a recorded process OR
+          // an abandonment — the "no pid to check, cannot be proven either
+          // way" state `RoundProcessStateV1`'s own doc comment describes.
+          await beginProcessSpawnAttemptV1(taskFolderPath, admission.handle.claimId);
+          const harness = makeHarness([cancelledExitTransport("providerCancelled")]);
+          const outcome = await runWithRoundProcessTaskFolderV1(taskFolderPath, () =>
+            harness.coordinator.executeAction(baseRequest())
+          );
+          assert.equal(outcome.kind, "failed");
+          if (outcome.kind !== "failed") {
+            throw new Error("expected failed");
+          }
+          assert.equal(outcome.code, "providerCancelled");
+          assert.equal(outcome.retryable, true);
+          assert.match(outcome.detail ?? "", /may still be starting/);
+        } finally {
+          await admission.handle.release();
+        }
+      } finally {
+        restoreContext();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  void it(
+    "a provider-invoked cancellation with no processes ever recorded for the claim still settles failed/retryable",
+    async () => {
+      const restoreContext = installFakeExtensionContextForAdmissionV1();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-cancelsettle-gone-"));
+      try {
+        const taskFolderPath = path.join(root, "task");
+        fs.mkdirSync(taskFolderPath, { recursive: true });
+        writeOwnershipBackedTaskProgress(taskFolderPath);
+        const admission = await acquireWorkAdmissionV1({
+          taskFolderPath,
+          purpose: "admission",
+          commandId: "taskActionCoordinatorV1.test.cancelSettleGone",
+        });
+        assert.equal(admission.outcome, "acquired");
+        if (admission.outcome !== "acquired") {
+          throw new Error("admission not acquired");
+        }
+        try {
+          await beginRoundProcessRecordingV1(taskFolderPath, admission.handle.claimId);
+          const harness = makeHarness([cancelledExitTransport("callerCancelled")]);
+          const outcome = await runWithRoundProcessTaskFolderV1(taskFolderPath, () =>
+            harness.coordinator.executeAction(baseRequest())
+          );
+          assert.equal(outcome.kind, "failed");
+          if (outcome.kind !== "failed") {
+            throw new Error("expected failed");
+          }
+          assert.equal(outcome.code, "callerCancelled");
+          assert.equal(outcome.retryable, true);
+          assert.match(outcome.detail ?? "", /cancelled after reaching the provider/);
+        } finally {
+          await admission.handle.release();
+        }
+      } finally {
+        restoreContext();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  void it(
+    "a cancellation before the provider was ever invoked stays 'cancelled' even with an unconfirmed spawn recorded for the claim",
+    async () => {
+      const restoreContext = installFakeExtensionContextForAdmissionV1();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-cancelsettle-preinvocation-"));
+      try {
+        const taskFolderPath = path.join(root, "task");
+        fs.mkdirSync(taskFolderPath, { recursive: true });
+        writeOwnershipBackedTaskProgress(taskFolderPath);
+        const admission = await acquireWorkAdmissionV1({
+          taskFolderPath,
+          purpose: "admission",
+          commandId: "taskActionCoordinatorV1.test.cancelSettlePreInvocation",
+        });
+        assert.equal(admission.outcome, "acquired");
+        if (admission.outcome !== "acquired") {
+          throw new Error("admission not acquired");
+        }
+        try {
+          await beginRoundProcessRecordingV1(taskFolderPath, admission.handle.claimId);
+          await beginProcessSpawnAttemptV1(taskFolderPath, admission.handle.claimId);
+          const harness = makeHarness([
+            {
+              runnerId: "scripted-transport",
+              invoke: (): Promise<AgentTransportExitV1> => {
+                throw new Error("provider must not be invoked once the token is already cancelled");
+              },
+            },
+          ]);
+          const outcome = await runWithRoundProcessTaskFolderV1(taskFolderPath, () =>
+            harness.coordinator.executeAction({ ...baseRequest(), cancellationToken: fakeToken(true) })
+          );
+          assert.equal(outcome.kind === "cancelled" && outcome.code, "userCancelled");
+        } finally {
+          await admission.handle.release();
+        }
+      } finally {
+        restoreContext();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  /**
+   * RC2 item 2 / Step 58 (review fix, 2026-09-29): "settles a never-resolving
+   * provider invocation instead of leaving its admitted ticket pending"
+   * (above, near the top of this file) only ever asserts against the
+   * coordinator's own in-memory lease store (`harness.leaseStore`) — it
+   * never touches a real, durable `acquireWorkAdmissionV1` marker, so it
+   * cannot show that a caller's OWN admission-release machinery
+   * (`recordAdmissionReleaseTriggerV1` + `requestSafeAdmissionReleaseV1`,
+   * exactly what every real command's terminal `finally` calls — see
+   * `reviewActions.ts`, `commitAndPushTask.ts`, etc.) actually releases the
+   * marker once the coordinator settles a deadline `timedOut`, or that a
+   * SECOND, genuinely independent `acquireWorkAdmissionV1` call for the
+   * same task is then admitted — the real end-to-end proof that "a lost
+   * provider invocation can permanently lock a task" (item 2's whole
+   * premise) is actually fixed for a real caller, not just internally to
+   * the coordinator.
+   */
+  void it(
+    "a never-resolving invocation releases a REAL work-admission marker through the ordinary release machinery, admitting a genuine retry",
+    async () => {
+      const restoreContext = installFakeExtensionContextForAdmissionV1();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-admission-retry-"));
+      try {
+        const taskFolderPath = path.join(root, "task");
+        fs.mkdirSync(taskFolderPath, { recursive: true });
+        writeOwnershipBackedTaskProgress(taskFolderPath);
+        const admission = await acquireWorkAdmissionV1({
+          taskFolderPath,
+          purpose: "admission",
+          commandId: "taskActionCoordinatorV1.test.admissionRetry",
+        });
+        assert.equal(admission.outcome, "acquired");
+        if (admission.outcome !== "acquired") {
+          throw new Error("admission not acquired");
+        }
+        // No `beginRoundProcessRecordingV1`/`beginProcessSpawnAttemptV1` call
+        // here: this is the in-host (no CLI ever spawned) shape, so release
+        // must be immediately safe once the coordinator settles terminal.
+        const harness = makeHarness(
+          [{ runnerId: "scripted-transport", invoke: () => new Promise<AgentTransportExitV1>(() => undefined) }],
+          {},
+          [],
+          { invocationTimeoutMs: 1 }
+        );
+        const outcome = await runWithRoundProcessTaskFolderV1(taskFolderPath, () =>
+          harness.coordinator.executeAction(baseRequest())
+        );
+        assert.equal(outcome.kind, "failed");
+        if (outcome.kind !== "failed") {
+          assert.fail("expected a bounded invocation deadline to settle as a terminal failure");
+        }
+        assert.equal(outcome.code, "invocationDeadlineExceeded");
+
+        // Mirrors a real command's terminal `finally` exactly: record the
+        // trigger from the coordinator's own outcome, then make the same
+        // safe-release request every admission-holding command makes —
+        // never a manual `admission.handle.release()`.
+        const releaseState = createSafeAdmissionReleaseStateV1();
+        recordAdmissionReleaseTriggerV1(releaseState, outcome);
+        let heldReason: string | undefined;
+        await requestSafeAdmissionReleaseV1(
+          releaseState,
+          admission.handle,
+          (_taskFolderPath, reason) => {
+            heldReason = reason;
+          },
+          () => undefined
+        );
+        assert.equal(
+          heldReason,
+          undefined,
+          "no process was ever recorded for this claim — release must be safe immediately"
+        );
+        assert.equal(releaseState.released, true);
+
+        // The marker is actually gone: a second, independent
+        // `acquireWorkAdmissionV1` call for the SAME task folder is
+        // admitted — the genuine retry-admission proof the internal-
+        // lease-only test above cannot give.
+        const retry = await acquireWorkAdmissionV1({
+          taskFolderPath,
+          purpose: "admission",
+          commandId: "taskActionCoordinatorV1.test.admissionRetry.retry",
+        });
+        assert.equal(retry.outcome, "acquired");
+        if (retry.outcome === "acquired") {
+          await retry.handle.release();
+        }
+      } finally {
+        restoreContext();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
 });

@@ -2797,6 +2797,24 @@ void test("the owed-continuation card offers Run now beside a default Wait, both
   });
   assert.equal(decision.gating?.unblocksProgress, false);
   assert.match(decision.whatHappened, /has not started a round/);
+  assert.notEqual(
+    decision.options.find((option) => option.optionId === "runNow")?.disabled,
+    true,
+    "with no claimedUntil, Run now is not disabled"
+  );
+});
+
+void test("RC2 item 9: while the continuation is claimed, the card disables Run now and names exactly when it becomes possible", () => {
+  const claimedUntil = new Date("2026-01-01T01:00:00.000Z");
+  const decision = buildOwedContinuationDecisionV1(
+    { canonicalId: "task-id", taskFolderPath: "C:\\tasks\\owed", stage: "impl", taskName: "Owed" },
+    claimedUntil,
+    "an earlier attempt claimed it and has not started a round",
+    claimedUntil
+  );
+  const runNow = decision.options.find((option) => option.optionId === "runNow");
+  assert.equal(runNow?.disabled, true, "Run now must be disabled while the claim is live");
+  assert.equal(runNow?.disabledReason, `available after ${claimedUntil.toLocaleTimeString()}`);
 });
 
 void test("Run now on an owed continuation never clears another window's live lease and names the holder (v1 fixes 2, item 22)", async () => {
@@ -2828,8 +2846,13 @@ void test("Run now on an owed continuation never clears another window's live le
   }) as typeof commands.executeCommand;
   resetAutomationChainGuards();
   try {
-    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id");
-    assert.equal(outcome, "refused");
+    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task");
+    assert.equal(outcome.kind, "refused");
+    assert.equal(
+      outcome.kind === "refused" ? outcome.availableAt?.toISOString() : undefined,
+      "2026-01-01T04:00:00.000Z",
+      "the refusal names exactly when the live claim expires"
+    );
     assert.equal(state.current().implRecovery?.leaseOwner, "other-window", "the other window's claim is left intact");
     assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z");
     await new Promise((resolve) => setTimeout(resolve, 60));
@@ -2872,8 +2895,8 @@ void test("Run now on an owed continuation ends this window's own lease wait and
   }) as typeof commands.executeCommand;
   resetAutomationChainGuards();
   try {
-    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id");
-    assert.equal(outcome, "started");
+    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task");
+    assert.equal(outcome.kind, "started");
     assert.equal(state.current().implRecovery?.leaseOwner, "test-owner", "this window re-claimed it, ending its own lease wait");
     assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z", "the old two-hour lease was replaced by a fresh one");
     for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {
@@ -2884,7 +2907,7 @@ void test("Run now on an owed continuation ends this window's own lease wait and
     // Nothing owed any more -> nothing to run.
     const cleared = memoryStore({ ...progress, implRecovery: undefined });
     const idle = new TaskActionScheduler(inventory, clock, cleared.store, "test-owner");
-    assert.equal(await idle.runOwedContinuationNow("C:\\tasks\\task", "task-id"), "nothingOwed");
+    assert.equal((await idle.runOwedContinuationNow("C:\\tasks\\task")).kind, "nothingOwed");
     idle.dispose();
   } finally {
     commands.executeCommand = originalExecute;
@@ -2923,10 +2946,10 @@ void test("two overlapping Run-now attempts in one window: the loser neither cle
   resetAutomationChainGuards();
   try {
     const [first, second] = await Promise.all([
-      scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id"),
-      scheduler.runOwedContinuationNow("C:\\tasks\\task", "task-id"),
+      scheduler.runOwedContinuationNow("C:\\tasks\\task"),
+      scheduler.runOwedContinuationNow("C:\\tasks\\task"),
     ]);
-    assert.deepEqual([first, second].sort(), ["refused", "started"], "exactly one attempt dispatches");
+    assert.deepEqual([first.kind, second.kind].sort(), ["refused", "started"], "exactly one attempt dispatches");
     assert.equal(state.current().implRecovery?.leaseOwner, "test-owner", "the winner's claim was not cleared by the loser");
     assert.equal(state.current().implRecovery?.leaseUntil, "2026-01-01T04:00:00.000Z");
     for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {

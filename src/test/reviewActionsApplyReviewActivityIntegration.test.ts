@@ -41,6 +41,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -448,6 +449,161 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       );
     } finally {
       endSub.dispose();
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("RC2 item 2 / Step 57a: hands the real coordinator outcome back through options.dispatchProbe.coordinatorOutcome, for the caller's own admission-release trigger recording", async () => {
+    const { folderPath } = makeTaskFolder(`applyreview-activity-probe-${Math.floor(Math.random() * 1e9)}`);
+    const contextPack = path.join(folderPath, "context-pack.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    let markInvoked: () => void = () => {};
+    const invoked = new Promise<void>((resolve) => { markInvoked = resolve; });
+    let settleReject: (err: Error) => void = () => {};
+    const rejectingTransport: AgentTransportV1 = {
+      runnerId: "stub-runner-reject-probe",
+      invoke: () => {
+        markInvoked();
+        return new Promise((_resolve, reject) => { settleReject = reject; });
+      },
+    };
+    const patches = [
+      ...installApplyReviewPatches(contextPack),
+      stubV1RunnerSelection([rejectingTransport]),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+      await runTrackedOperation(
+        folderPath,
+        {
+          label: "Apply Review",
+          stage: "plan-high-review",
+          taskName: "Apply Review Activity Probe Test",
+          kind: "apply-review",
+          cancellable: true,
+        },
+        async (op) => {
+          const dispatchPromise = applyReviewWithAI(
+            vscode.Uri.file(REAL_ROOT),
+            context,
+            { taskFolderPath: folderPath },
+            { parentOperation: op, dispatchProbe }
+          );
+          await invoked;
+          settleReject(new Error("simulated provider crash"));
+          await dispatchPromise;
+        }
+      );
+
+      assert.ok(
+        dispatchProbe.coordinatorOutcome,
+        "runApply must set dispatchProbe.coordinatorOutcome once its coordinator.executeAction call settles, so a composite caller (e.g. Fast Forward) can feed it to recordAdmissionReleaseTriggerV1"
+      );
+      assert.equal(
+        dispatchProbe.coordinatorOutcome?.kind,
+        "unavailable",
+        "a provider transport rejection with no further candidates classifies as an unavailable coordinator outcome"
+      );
+      assert.equal(
+        (dispatchProbe.coordinatorOutcome as { code?: string } | undefined)?.code,
+        "candidatesExhausted"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("RC2 item 2 / Step 57a: the chained re-review's own coordinator outcome is authoritative in dispatchProbe.coordinatorOutcome, not the earlier apply's", async () => {
+    const { folderPath } = makeTaskFolder(`applyreview-activity-rereview-probe-${Math.floor(Math.random() * 1e9)}`);
+    const contextPack = path.join(folderPath, "context-pack.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    // The apply dispatch itself succeeds outright (its own coordinator
+    // outcome settles "completed"); only the automatic inline re-review
+    // that applyReviewWithAI runs right after — a SECOND, later
+    // coordinator.executeAction call — fails. Before this fix, the
+    // re-review's own dispatchProbe was never wired, so
+    // coordinatorOutcomeForAdmissionV1 (and options.dispatchProbe) stayed
+    // on the apply's stale "completed" outcome, and a caller's `finally`
+    // would release admission as if nothing was still amiss, even though
+    // this later, terminal-failing invocation is the one release safety
+    // actually needs to see.
+    let markReReviewInvoked: () => void = () => {};
+    const reReviewInvoked = new Promise<void>((resolve) => { markReReviewInvoked = resolve; });
+    let settleReReviewReject: (err: Error) => void = () => {};
+    const reReviewRejectingTransport: AgentTransportV1 = {
+      runnerId: "stub-runner-reject-rereview",
+      invoke: () => {
+        markReReviewInvoked();
+        return new Promise((_resolve, reject) => { settleReReviewReject = reject; });
+      },
+    };
+    const patches = [
+      ...installApplyReviewPatches(contextPack),
+      stubV1RunnerSelection([
+        markdownTransportV1("# Plan\n\n1. Do the thing (revised).\n"),
+        reReviewRejectingTransport,
+      ]),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      const dispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+      await runTrackedOperation(
+        folderPath,
+        {
+          label: "Apply Review",
+          stage: "plan-high-review",
+          taskName: "Apply Review Activity Re-review Probe Test",
+          kind: "apply-review",
+          cancellable: true,
+        },
+        async (op) => {
+          const dispatchPromise = applyReviewWithAI(
+            vscode.Uri.file(REAL_ROOT),
+            context,
+            { taskFolderPath: folderPath },
+            { parentOperation: op, dispatchProbe }
+          );
+          await reReviewInvoked;
+          settleReReviewReject(new Error("simulated re-review provider crash"));
+          await dispatchPromise;
+        }
+      );
+
+      assert.ok(
+        dispatchProbe.coordinatorOutcome,
+        "the re-review's own coordinator.executeAction call must have set dispatchProbe.coordinatorOutcome"
+      );
+      assert.equal(
+        dispatchProbe.coordinatorOutcome?.kind,
+        "unavailable",
+        "the re-review's failing transport (no further candidates) must be what dispatchProbe reflects — not the earlier apply's 'completed' outcome"
+      );
+      assert.equal(
+        (dispatchProbe.coordinatorOutcome as { code?: string } | undefined)?.code,
+        "candidatesExhausted"
+      );
+    } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
       fsBridge.restore();

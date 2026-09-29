@@ -161,24 +161,40 @@ export type CompletedContentV1 =
   | PreflightPlanCompletedV1
   | EditExecutionCompletedV1;
 
+/**
+ * Reported when the frame's closing marker was accepted despite differing
+ * from {@link FRAME_END_V1} by exactly one code point (item 5, 2026-09-28
+ * field report: a Copilot model substituted a lookalike Unicode character for
+ * one letter). `index` is the code-point offset within the marker where the
+ * two differ.
+ */
+export interface FrameRepairV1 {
+  readonly expected: string;
+  readonly actual: string;
+  readonly index: number;
+}
+
 export type AiResultEnvelopeV1 =
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "completed";
       readonly content: CompletedContentV1;
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "questions";
       readonly questions: readonly StructuredQuestionV1[];
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "cancelled";
       readonly reason?: "provider" | "user";
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
@@ -187,6 +203,7 @@ export type AiResultEnvelopeV1 =
       readonly code: string;
       readonly message: string;
       readonly retryable: boolean;
+      readonly frameRepairV1?: FrameRepairV1;
     };
 
 export interface MalformedAiResultV1 {
@@ -316,6 +333,216 @@ function recordLegacyFrameEndV1(): void {
   } catch {
     // Observation is a side channel; parsing correctness cannot depend on it.
   }
+}
+
+/** Notified when a frame's end marker was repaired (item 5): see {@link FrameRepairV1}. */
+export type RepairedFrameEndObserverV1 = (repair: FrameRepairV1) => void;
+
+let repairedFrameEndObserverV1: RepairedFrameEndObserverV1 | undefined;
+
+/** Same seam as {@link setLegacyFrameEndObserverV1}, for the lookalike-marker repair. */
+export function setRepairedFrameEndObserverV1(observer: RepairedFrameEndObserverV1 | undefined): void {
+  repairedFrameEndObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change parse behaviour. */
+function recordRepairedFrameEndV1(repair: FrameRepairV1): void {
+  try {
+    repairedFrameEndObserverV1?.(repair);
+  } catch {
+    // Observation is a side channel; parsing correctness cannot depend on it.
+  }
+}
+
+/**
+ * Does `candidate` differ from `expected` in exactly one code point — the
+ * rest identical and the same code-point length? Compared by code point (not
+ * UTF-16 code unit) so a lookalike character outside the BMP cannot be
+ * miscounted as two units differing.
+ *
+ * Item 5's plan is unqualified: "differs in exactly one code point", with no
+ * carve-out for the differing point being plain ASCII. A deliberately
+ * different same-length ASCII marker (e.g. a hypothetical `V2` terminator)
+ * is therefore repaired the same as a Unicode lookalike; only a two-or-more
+ * code point difference, or a length mismatch, falls through to the
+ * unterminated-frame path.
+ *
+ * Returns the code-point index of the single difference, or `undefined` when
+ * the lengths differ, nothing differs, or more than one code point differs.
+ */
+function singleCodePointSubstitutionV1(candidate: string, expected: string): number | undefined {
+  const candidatePoints = Array.from(candidate);
+  const expectedPoints = Array.from(expected);
+  if (candidatePoints.length !== expectedPoints.length) {
+    return undefined;
+  }
+  let diffIndex: number | undefined;
+  for (let i = 0; i < expectedPoints.length; i++) {
+    if (candidatePoints[i] !== expectedPoints[i]) {
+      if (diffIndex !== undefined) {
+        return undefined;
+      }
+      diffIndex = i;
+    }
+  }
+  return diffIndex;
+}
+
+/**
+ * Is `candidate` clearly an attempt at an end marker — as opposed to trailing
+ * narration or anything else a model might put on the frame's last line?
+ * Item 5's Step 4a (2026-09-29, G1 run 1 field report): three separate
+ * responses each ended with a differently garbled marker
+ * (`<<<END_OF ENSEMBLE_AI_RESULT_V1>>>`, `<<<END_OF_AI_RESULT_V1>>>`,
+ * `<<<END_OF_FINAL>>>`), none a one-code-point substitution of
+ * {@link FRAME_END_V1}, so {@link singleCodePointSubstitutionV1} rejected all
+ * three. This is deliberately shape-only, not content-close: it does not
+ * require the candidate to resemble FRAME_END_V1 beyond this envelope, because
+ * everything else about the frame (single JSON line, strictly parseable, and
+ * nothing after this line — since it consumes the body's remainder verbatim)
+ * still has to check out for the repair to be accepted.
+ */
+function looksLikeEndMarkerAttemptV1(candidate: string): boolean {
+  return candidate.startsWith("<<<END") && candidate.endsWith(">>>");
+}
+
+/**
+ * Code-point index of the first place `a` and `b` diverge, or the shorter
+ * string's length when one is a prefix of the other. Used to give Step 4a's
+ * broader marker-attempt repair the same `{ expected, actual, index }` shape
+ * as the narrower single-code-point repair, even though the two markers may
+ * differ in length and in more than one place.
+ */
+function firstDivergingCodePointIndexV1(a: string, b: string): number {
+  const aPoints = Array.from(a);
+  const bPoints = Array.from(b);
+  const len = Math.min(aPoints.length, bPoints.length);
+  for (let i = 0; i < len; i++) {
+    if (aPoints[i] !== bPoints[i]) {
+      return i;
+    }
+  }
+  return len;
+}
+
+/**
+ * Structural detection only, for item 5's Step 4b (2026-09-29, G1 run 4
+ * field report): the model produced its whole reply as ONE line — the JSON
+ * and the end marker (exact, legacy, or omitted altogether) with no line
+ * break between them, instead of the frame's usual "start marker, newline,
+ * JSON line, newline, end marker" shape. Five of six rejected G1 run 4
+ * replies jammed the correct marker directly onto the JSON
+ * (`…}}<<<END_ENSEMBLE_AI_RESULT_V1>>>`); one had no marker at all after the
+ * JSON.
+ *
+ * Applies only when the content right after the start marker's own line
+ * ending has NO further line break at all: the ordinary multi-line shape
+ * (handled below in {@link parseAiResultEnvelopeV1} and by the lookalike/
+ * marker-attempt repairs above) always has at least one more line break
+ * before its end marker, so it is never mistaken for this one and always
+ * takes priority when it applies.
+ *
+ * Only the EXACT or legacy marker text, jammed on with nothing before it, is
+ * split off here — a garbled marker glued onto the same line is not one of
+ * the two reported shapes and is out of scope. Makes no claim about the JSON
+ * itself: callers still have to parse `jsonLine` and check it is complete.
+ */
+function trySingleLineFrameShapeV1(
+  body: string
+): { readonly jsonLine: string; readonly markerFound: string | undefined } | undefined {
+  const afterStart = body.slice(FRAME_START_V1.length);
+  const startEol = afterStart.startsWith("\r\n") ? "\r\n" : afterStart.startsWith("\n") ? "\n" : undefined;
+  if (startEol === undefined) {
+    return undefined;
+  }
+  const rest = afterStart.slice(startEol.length);
+  if (rest.length === 0 || rest.includes("\n") || rest.includes("\r")) {
+    return undefined;
+  }
+  let jsonLine = rest;
+  let markerFound: string | undefined;
+  if (rest.endsWith(FRAME_END_V1)) {
+    jsonLine = rest.slice(0, rest.length - FRAME_END_V1.length);
+    markerFound = FRAME_END_V1;
+  } else if (rest.endsWith(LEGACY_FRAME_END_V1)) {
+    jsonLine = rest.slice(0, rest.length - LEGACY_FRAME_END_V1.length);
+    markerFound = LEGACY_FRAME_END_V1;
+  }
+  if (jsonLine.length === 0) {
+    return undefined;
+  }
+  return { jsonLine, markerFound };
+}
+
+/**
+ * Side-effect-free decode for the single-line shape above: parses `jsonLine`
+ * as a complete JSON value and decodes the envelope, exactly like the normal
+ * multi-line path. Deliberately reports nothing and returns `undefined` on
+ * any failure — oversized, invalid JSON, or a JSON value that is not a valid
+ * envelope — so every established rejection message for this body shape (a
+ * single unterminated line, pre-dating Step 4b) is completely unchanged:
+ * only genuine SUCCESS is new here, matching the plan's own wording, "accept
+ * … only when that JSON line parses completely as the expected result" —
+ * i.e. a full, valid envelope, not merely syntactically valid JSON.
+ *
+ * Split from {@link trySingleLineFrameRepairV1} so `containsResultFrameV1`
+ * can ask "would this be accepted" without also recording a repair/
+ * inert-trailing observation — it is a precheck, possibly followed by the
+ * real parse moments later, and double-recording the same repair would be
+ * confusing log noise, not a second, distinct event.
+ */
+function decodeSingleLineFrameV1(
+  raw: string,
+  body: string,
+  expectedCorrelation: ActionCorrelationV1 | undefined
+): { readonly decoded: AiResultEnvelopeV1; readonly markerFound: string | undefined; readonly inertTrailing: string } | undefined {
+  const shape = trySingleLineFrameShapeV1(body);
+  if (shape === undefined) {
+    return undefined;
+  }
+  const { jsonLine, markerFound } = shape;
+  if (utf8ByteLength(jsonLine) > MAX_PREFLIGHT_BYTES_V1) {
+    return undefined;
+  }
+  const parsed = parseStrictJsonV1(jsonLine);
+  if (!parsed.ok) {
+    return undefined;
+  }
+  const decoded = decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  if (decoded.kind === "malformed") {
+    return undefined;
+  }
+  return { decoded, markerFound, inertTrailing: parsed.inertTrailing };
+}
+
+/**
+ * Full repair attempt for the single-line shape above: the caller
+ * (`parseAiResultEnvelopeV1`) uses this to both decide AND report — a real
+ * frame boundary had to be fixed (a missing line break before the marker, or
+ * a missing marker entirely), so this call site's success is always the one
+ * that gets logged (Step 2's mechanism), never `containsResultFrameV1`'s.
+ */
+function trySingleLineFrameRepairV1(
+  raw: string,
+  body: string,
+  expectedCorrelation: ActionCorrelationV1 | undefined
+): AiResultParseOutcomeV1 | undefined {
+  const result = decodeSingleLineFrameV1(raw, body, expectedCorrelation);
+  if (result === undefined) {
+    return undefined;
+  }
+  const { decoded, markerFound, inertTrailing } = result;
+  if (inertTrailing.length > 0) {
+    recordInertTrailingV1(inertTrailing);
+  }
+  const actual = markerFound ?? "";
+  const frameRepair: FrameRepairV1 = {
+    expected: FRAME_END_V1,
+    actual,
+    index: firstDivergingCodePointIndexV1(actual, FRAME_END_V1),
+  };
+  recordRepairedFrameEndV1(frameRepair);
+  return { ...decoded, frameRepairV1: frameRepair };
 }
 
 function utf8ByteLength(text: string): number {
@@ -1309,12 +1536,12 @@ function decodeEnvelopeV1(
  *
  * Lives here, beside the parser, because the two must agree. A separate
  * approximation in the transport disagreed in both directions (2026-08-19
- * review): it required a terminator, so it rejected the VALID unterminated
- * frames `parseUnterminatedFrameV1` deliberately accepts; and it searched for
- * the terminator anywhere, so it accepted terminated JSON followed by trailing
- * narration, which the parser rejects because the body must END with the
- * marker. Either way the caller's decision was made on different rules than
- * the decode that follows it.
+ * review): it required a terminator, so it rejected frames the parser's
+ * now-removed unterminated-payload fallback used to accept; and it searched
+ * for the terminator anywhere, so it accepted terminated JSON followed by
+ * trailing narration, which the parser rejects because the body must END with
+ * the marker. Either way the caller's decision was made on different rules
+ * than the decode that follows it.
  *
  * Frame-level only, by design: this answers "is there a frame here", never
  * "is it a valid envelope". Correlation echo, strict JSON, content schema and
@@ -1392,14 +1619,37 @@ export function containsResultFrameV1(response: string): boolean {
   }
   const body = trimmed.slice(frameStartIndex);
 
+  // Step 4b (2026-09-29): a single-line body — the JSON and the end marker
+  // (or nothing) with no line break between them — counts as a frame too,
+  // exactly when parseAiResultEnvelopeV1's matching repair would accept it
+  // (the same decode helper, so the two can never disagree): the shape
+  // applies AND the JSON line decodes as a complete, valid envelope. Uses
+  // the side-effect-free variant — this is only a precheck, and the real
+  // parse (if it happens) is what gets logged as the repair. Checked before
+  // the multi-line search below, which requires a further line break after
+  // the start marker's own, so the two paths never overlap.
+  if (decodeSingleLineFrameV1(trimmed, body, undefined) !== undefined) {
+    return true;
+  }
+
   // Terminated: the body must END with a terminator, exactly as the parser
   // requires — a terminator merely present somewhere is narration around a
-  // frame, not a frame.
+  // frame, not a frame. Mirrors parseAiResultEnvelopeV1's lookalike-marker
+  // repair (item 5): a final line differing from FRAME_END_V1 by exactly one
+  // code point counts as terminated too, and (Step 4a) so does a final line
+  // that is otherwise clearly an end-marker attempt (starts with "<<<END",
+  // ends with ">>>").
+  const lastNewlineIndex = body.lastIndexOf("\n");
+  const finalLine = lastNewlineIndex === -1 ? undefined : body.slice(lastNewlineIndex + 1);
   const frameEnd = body.endsWith(FRAME_END_V1)
     ? FRAME_END_V1
     : body.endsWith(LEGACY_FRAME_END_V1)
       ? LEGACY_FRAME_END_V1
-      : undefined;
+      : finalLine !== undefined && singleCodePointSubstitutionV1(finalLine, FRAME_END_V1) !== undefined
+        ? finalLine
+        : finalLine !== undefined && looksLikeEndMarkerAttemptV1(finalLine)
+          ? finalLine
+          : undefined;
   if (frameEnd !== undefined) {
     // The framing checks the parser then applies, all of which are
     // `invalidFrame`. Payload CONTENT is deliberately not checked here: an
@@ -1421,29 +1671,11 @@ export function containsResultFrameV1(response: string): boolean {
     return !jsonLine.includes("\n") && !jsonLine.includes("\r");
   }
 
-  // Unterminated: the parser accepts a complete payload whose closing marker
-  // never arrived, but only in the strict shape it defines. The checks below
-  // mirror `parseUnterminatedFrameV1` step for step, INCLUDING their order —
-  // an oversize payload is reported there as `resultLimitExceeded` (a frame
-  // was seen) while a payload that fails strict JSON is `invalidFrame` (none
-  // was), so checking size after JSON would disagree on a payload that is both.
-  const afterStart = body.slice(FRAME_START_V1.length);
-  const eol = afterStart.startsWith("\r\n") ? "\r\n" : afterStart.startsWith("\n") ? "\n" : undefined;
-  if (eol === undefined) {
-    return false;
-  }
-  const payload = afterStart.slice(eol.length);
-  if (payload.length === 0 || payload.includes("\n") || payload.includes("\r")) {
-    return false;
-  }
-  if (utf8ByteLength(payload) > MAX_PREFLIGHT_BYTES_V1) {
-    return true;
-  }
-  // The same strict parser the unterminated path itself uses. Omitting it let
-  // `FRAME_START_V1 + "\n{not json}"` read as a frame here while the parser
-  // called it `invalidFrame` — so the tool session skipped its nudge and
-  // forwarded a response that could only fail (2026-08-19 review).
-  return parseStrictJsonV1(payload).ok;
+  // No terminator matched (exact, legacy, one-code-point lookalike, or a
+  // Step 4a marker attempt): the parser rejects this as `invalidFrame` — RC2
+  // item 5 requires a missing marker to stay rejected rather than recovered
+  // — so this is not a frame either, regardless of what the body contains.
+  return false;
 }
 
 /**
@@ -1543,59 +1775,6 @@ export function isUninformedEmptyPreflightPlanV1(options: {
   );
 }
 
-/**
- * Accept a frame whose payload is complete but whose `FRAME_END_V1`
- * terminator never arrived — the shape a truncated agentic response leaves
- * behind (2026-08-12 field report, item 1): the model's JSON is byte-perfect
- * but the CLI stopped writing before the closing marker. `body` is
- * everything from `FRAME_START_V1` to the end of the (trailing-newline-
- * trimmed) response, and is known NOT to end with `FRAME_END_V1`.
- *
- * The bar for acceptance is deliberately as strict as the terminated path
- * minus the terminator itself: exactly one line ending immediately after the
- * start marker, then a single line with no embedded line breaks, then
- * nothing else, and that line must parse as strict JSON. Anything looser
- * (multiple lines, trailing bytes, a non-parsing payload) still reports
- * `invalidFrame` naming the missing terminator — never `invalidJson` — so a
- * genuinely malformed unterminated response is not misdiagnosed as "JSON
- * broke" when the real defect is "the frame never closed."
- */
-function parseUnterminatedFrameV1(
-  raw: string,
-  body: string,
-  expectedCorrelation?: ActionCorrelationV1
-): AiResultParseOutcomeV1 {
-  const missingTerminatorReason = `expected the frame to end with ${FRAME_END_V1}`;
-  const afterStart = body.slice(FRAME_START_V1.length);
-
-  let eol: "\n" | "\r\n";
-  if (afterStart.startsWith("\r\n")) {
-    eol = "\r\n";
-  } else if (afterStart.startsWith("\n")) {
-    eol = "\n";
-  } else {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-
-  const candidateLine = afterStart.slice(eol.length);
-  if (candidateLine.length === 0 || candidateLine.includes("\n") || candidateLine.includes("\r")) {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-  if (utf8ByteLength(candidateLine) > MAX_PREFLIGHT_BYTES_V1) {
-    return malformed("resultLimitExceeded", raw, `payload exceeds the absolute ${MAX_PREFLIGHT_BYTES_V1}-byte ceiling`);
-  }
-
-  const parsed = parseStrictJsonV1(candidateLine);
-  if (!parsed.ok) {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-  if (parsed.inertTrailing.length > 0) {
-    recordInertTrailingV1(parsed.inertTrailing);
-  }
-
-  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
-}
-
 export function parseAiResultEnvelopeV1(
   raw: string,
   expectedCorrelation?: ActionCorrelationV1
@@ -1624,13 +1803,61 @@ export function parseAiResultEnvelopeV1(
   }
   const body = trimmedForTrailingNewline.slice(frameStartIndex);
 
+  // Step 4b (2026-09-29): try the single-line shape before the ordinary
+  // multi-line marker search below — it only ever applies when there is no
+  // further line break after the start marker's own, so it can never steal
+  // a well-formed multi-line frame away from the checks that follow.
+  const singleLineResult = trySingleLineFrameRepairV1(raw, body, expectedCorrelation);
+  if (singleLineResult !== undefined) {
+    return singleLineResult;
+  }
+
   let frameEnd: string = FRAME_END_V1;
+  let frameRepair: FrameRepairV1 | undefined;
   if (!body.endsWith(FRAME_END_V1)) {
     if (body.endsWith(LEGACY_FRAME_END_V1)) {
       frameEnd = LEGACY_FRAME_END_V1;
       recordLegacyFrameEndV1();
     } else {
-      return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
+      // One more shape to try before giving up: the final line differs from
+      // FRAME_END_V1 by exactly one code point (a lookalike/substituted
+      // character) — item 5 (2026-09-28). Anything looser — no final line, a
+      // length mismatch, more than one differing code point, or no closing
+      // marker at all — is rejected as `invalidFrame`. This used to fall
+      // through to a separate unterminated-payload path that accepted a
+      // complete single-line JSON body with no closing marker at all (RC1
+      // 2026-08-12 field report, item 1); RC2 item 5 requires a missing
+      // marker to stay rejected rather than be recovered as if a terminator
+      // had arrived, so that fallback was removed. See the retired
+      // "pre-existing item 1 behaviour" test in aiResultEnvelope.test.ts,
+      // now updated to assert rejection, for the same point made in the
+      // test suite.
+      const lastNewlineIndex = body.lastIndexOf("\n");
+      const candidateLine = lastNewlineIndex === -1 ? undefined : body.slice(lastNewlineIndex + 1);
+      const diffIndex =
+        candidateLine !== undefined ? singleCodePointSubstitutionV1(candidateLine, FRAME_END_V1) : undefined;
+      if (candidateLine !== undefined && diffIndex !== undefined) {
+        frameEnd = candidateLine;
+        frameRepair = { expected: FRAME_END_V1, actual: candidateLine, index: diffIndex };
+      } else if (candidateLine !== undefined && looksLikeEndMarkerAttemptV1(candidateLine)) {
+        // Step 4a (2026-09-29, G1 run 1 field report): a closing line that is
+        // clearly an end-marker attempt — starts with "<<<END", ends with
+        // ">>>" — but is not a one-code-point substitution of FRAME_END_V1
+        // (different length, or more than one code point differs) is also
+        // accepted as a repair, PROVIDED everything else about the frame
+        // still checks out below: the line-ending, single-line and strict
+        // JSON checks that follow still reject a missing closing line, a
+        // body that does not parse completely, or any text after the body,
+        // exactly as they do for the narrower repair above.
+        frameEnd = candidateLine;
+        frameRepair = {
+          expected: FRAME_END_V1,
+          actual: candidateLine,
+          index: firstDivergingCodePointIndexV1(candidateLine, FRAME_END_V1),
+        };
+      } else {
+        return malformed("invalidFrame", raw, `expected the frame to end with ${FRAME_END_V1}`);
+      }
     }
   }
   if (body.length < FRAME_START_V1.length + frameEnd.length) {
@@ -1673,5 +1900,10 @@ export function parseAiResultEnvelopeV1(
     recordInertTrailingV1(parsed.inertTrailing);
   }
 
-  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  const decoded = decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  if (frameRepair && decoded.kind !== "malformed") {
+    recordRepairedFrameEndV1(frameRepair);
+    return { ...decoded, frameRepairV1: frameRepair };
+  }
+  return decoded;
 }

@@ -314,6 +314,189 @@ export function splitTaskFixableBlockersByOriginV1(
   };
 }
 
+/**
+ * RC2 item 4: since the fail-closed-parsing fix, an implementation review
+ * (impl-high-review / impl-low-review) only ever sees fast checks (lint,
+ * type-check) — the test suite runs once, before Publish (see
+ * `buildVerifiedChecksSection`'s "fast" branch, completionLint.ts). A blocker
+ * whose entire ask is "show a passing test run" therefore names a condition
+ * this stage's reviewer can never itself observe as satisfied: no
+ * implementation round can ever produce evidence this stage will accept, so
+ * counting it as `task-fixable` manufactures a permanent blocker with no
+ * escape — the exact failure observed on RC1 (`needs-toolchain`-shaped,
+ * declared `same` across rounds until a plateau card fired).
+ *
+ * Deliberately scoped to the two implementation review stages only: the
+ * equivalent finding at a Publish review is real and satisfiable there, since
+ * Publish does run the full suite.
+ *
+ * Mirrors `IMPL_REVIEW_STAGES_V1` (reviewRouting.ts) by value rather than
+ * importing it — reviewRouting.ts imports `BlockerResolver`/`ReviewBlocker`
+ * from this module, so importing back would create a cycle.
+ */
+const NEEDS_PASSING_TEST_RUN_RE =
+  /\bpassing\s+test\s+run\b|\btest\s+(?:suite|run)\s+(?:must|needs?\s+to|has\s+to|should)\s+pass\b/i;
+
+/**
+ * Review fix (2026-09-28, round 2): the plan's own requirement text ("A
+ * blocker that nothing at the current stage can satisfy is never counted as
+ * task-fixable work and never drives a plateau card on its own") does not
+ * key on `resolver` at all — an implementation review structurally cannot
+ * ever produce a passing test run regardless of which resolver label the
+ * reviewer attaches to that ask. Gating on a resolver allowlist (originally
+ * `task-fixable` + `needs-toolchain`, the two shapes RC1 happened to
+ * observe) left every other resolver value — `environmental`,
+ * `unverifiable`, `spec-defect` — still landing in `effectiveBlockers` for
+ * the exact same unsatisfiable ask, still capable of anchoring the
+ * "environmental/unverifiable/spec-defect blockers remain" escalation path
+ * (reviewRouting.ts) even though no round could ever clear it. The stage
+ * check (`isImplReviewStage`, below) and the entire-ask clause check
+ * (`isEntirelyAPassingTestRunAskV1`) already bound this narrowly enough — a
+ * resolver gate on top of them was redundant and, worse, incomplete.
+ */
+/**
+ * Clause boundaries strong enough to mark a SEPARATE, independent claim
+ * inside one blocker line — "and", "but", "also", "plus" as connectors, or a
+ * semicolon. Deliberately narrow: words like "before" or "since" often
+ * qualify the SAME ask ("...must pass before this is done") rather than
+ * introduce a second one, and splitting on those would wrongly treat a
+ * single-ask sentence as compound.
+ */
+const CLAUSE_BOUNDARY_RE = /,?\s+(?:and|but|also|plus)\s+|;\s*/i;
+
+/**
+ * Review fix (2026-09-28): the previous version did a plain substring test
+ * against the whole description, so a compound finding that named a real,
+ * distinct defect ALONGSIDE the test-run wording ("...still needs a passing
+ * test run, and the `foo()` helper throws on an empty array") was removed
+ * wholesale — manufacturing false success by silently discarding a genuine
+ * blocker. "Whose entire ask is a passing test run" means every independent
+ * clause of the description must be about that ask; a description split into
+ * more than one clause where any clause fails the phrase test names
+ * something else and is kept in full.
+ */
+function isEntirelyAPassingTestRunAskV1(description: string): boolean {
+  const clauses = description
+    .split(CLAUSE_BOUNDARY_RE)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+  if (clauses.length === 0) {
+    return false;
+  }
+  return clauses.every((clause) => NEEDS_PASSING_TEST_RUN_RE.test(clause));
+}
+
+export interface StageUnsatisfiableBlockerPartitionV1 {
+  /** Blockers still counted at this stage — everything not filtered out. */
+  effectiveBlockers: ReviewBlocker[];
+  /**
+   * Blockers this stage structurally cannot ever satisfy, removed from
+   * `effectiveBlockers`. Never task-fixable work and never, on their own,
+   * drives a plateau card — see `hasZeroTaskFixableEvidence`'s callers,
+   * which must consult `effectiveBlockers`, not the raw input.
+   */
+  unsatisfiableBlockers: ReviewBlocker[];
+}
+
+export function partitionStageUnsatisfiableBlockersV1(
+  blockers: readonly ReviewBlocker[],
+  stage: TaskStage
+): StageUnsatisfiableBlockerPartitionV1 {
+  const isImplReviewStage = stage === "impl-high-review" || stage === "impl-low-review";
+  if (!isImplReviewStage) {
+    return { effectiveBlockers: [...blockers], unsatisfiableBlockers: [] };
+  }
+  const effectiveBlockers: ReviewBlocker[] = [];
+  const unsatisfiableBlockers: ReviewBlocker[] = [];
+  for (const blocker of blockers) {
+    if (isEntirelyAPassingTestRunAskV1(blocker.description)) {
+      unsatisfiableBlockers.push(blocker);
+    } else {
+      effectiveBlockers.push(blocker);
+    }
+  }
+  return { effectiveBlockers, unsatisfiableBlockers };
+}
+
+/** Lowercases, strips Markdown emphasis/code marks, and collapses whitespace
+ * — enough to compare a reviewer's own wording against an implementer's
+ * quoted-but-retyped blocker text without the two needing to be byte-identical. */
+function normalizeForBlockerMatchV1(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[`*_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Below this normalized length, a declined-blocker entry must match a
+ * blocker's description exactly, never by substring containment — a short
+ * fragment ("fix it", "the setting") would otherwise match almost anything,
+ * silently reclassifying unrelated task-fixable work as environmental. */
+const MIN_DECLINED_BLOCKER_CONTAINMENT_MATCH_LENGTH_V1 = 20;
+
+function declinedBlockerMatchesV1(description: string, normalizedDeclined: readonly string[]): boolean {
+  const normalizedDescription = normalizeForBlockerMatchV1(description);
+  if (normalizedDescription.length === 0) {
+    return false;
+  }
+  return normalizedDeclined.some((declined) => {
+    if (declined.length === 0) {
+      return false;
+    }
+    if (declined.length < MIN_DECLINED_BLOCKER_CONTAINMENT_MATCH_LENGTH_V1) {
+      return declined === normalizedDescription;
+    }
+    return normalizedDescription.includes(declined) || declined.includes(normalizedDescription);
+  });
+}
+
+export interface DeclinedBlockerReclassificationV1 {
+  /** Every input blocker, with a matched `task-fixable` blocker's `resolver`
+   * replaced by `environmental` — same length and order as the input. */
+  effectiveBlockers: ReviewBlocker[];
+  /** The subset that was reclassified (their ORIGINAL, pre-reclassification
+   * form), for callers that want to report or log what changed. */
+  reclassifiedBlockers: ReviewBlocker[];
+}
+
+/**
+ * RC2 item 7: a reviewer's `task-fixable` blocker that matches an
+ * implementer round's own declined-removal entry (see
+ * {@link DeclinedBlockerV1} in implementationChecklist.ts — rule 7's
+ * contract) is reclassified `environmental` here, BEFORE counts, history and
+ * routing ever see it — the same shape as
+ * {@link partitionStageUnsatisfiableBlockersV1} for item 4, except the
+ * blocker stays visible (as `environmental`) rather than being removed,
+ * since it is still real, just not task-fixable without a human decision.
+ *
+ * Matching is deliberately conservative (see `declinedBlockerMatchesV1`): an
+ * unmatched blocker keeps its original classification rather than risk
+ * silently hiding a genuine task-fixable finding.
+ */
+export function reclassifyDeclinedBlockersV1(
+  blockers: readonly ReviewBlocker[],
+  declined: readonly { blockerText: string }[]
+): DeclinedBlockerReclassificationV1 {
+  const normalizedDeclined = declined
+    .map((entry) => normalizeForBlockerMatchV1(entry.blockerText))
+    .filter((text) => text.length > 0);
+  if (normalizedDeclined.length === 0) {
+    return { effectiveBlockers: [...blockers], reclassifiedBlockers: [] };
+  }
+  const effectiveBlockers: ReviewBlocker[] = [];
+  const reclassifiedBlockers: ReviewBlocker[] = [];
+  for (const blocker of blockers) {
+    if (blocker.resolver === "task-fixable" && declinedBlockerMatchesV1(blocker.description, normalizedDeclined)) {
+      reclassifiedBlockers.push(blocker);
+      effectiveBlockers.push({ ...blocker, resolver: "environmental" });
+    } else {
+      effectiveBlockers.push(blocker);
+    }
+  }
+  return { effectiveBlockers, reclassifiedBlockers };
+}
+
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
 
 /**

@@ -15,6 +15,7 @@ import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../u
 import {
   listUncheckedChecklistItemTextsV1,
   filterUncheckedPlanItemsV1,
+  filterAlreadyCheckedPlanItemsV1,
   normalizeChecklistItemTextV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
@@ -31,7 +32,11 @@ import {
 } from "../types/taskProgress";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { normalizePath } from "../utils/taskRoot";
-import { WorkflowDecisionEvidenceItemV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
+import {
+  WorkflowDecisionCommandResultV1,
+  WorkflowDecisionEvidenceItemV1,
+  WorkflowDecisionRecommendationV1,
+} from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { ChatTarget } from "../views/chatView";
@@ -59,23 +64,50 @@ const OPEN_ITEM_GLYPH = formatChecklistItemGlyphV1({ checked: false, excluded: f
 
 type ReconcileArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string; decisionId?: string };
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      decisionId?: string;
+      /**
+       * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28,
+       * narrowed blocker `bbd42447-…-1`, re-narrowed 2026-09-28): the exact
+       * item texts THIS card offered to apply, captured at post time
+       * (`postReconcilePlanChecklistDecisionV1`'s own `coveredItems`).
+       * Threaded through so both what confirming this card actually APPLIES
+       * and `applyReconciliationReviewVerifiedTicksV1`'s "already ticked"
+       * count are scoped to what this specific card promised, instead of a
+       * global aggregate across every review stage that can include items
+       * unrelated to this card or newly surfaced after it was posted.
+       */
+      offeredItems?: readonly string[];
+    };
 
-function normalizeArg(
-  arg: ReconcileArg | undefined
-): { canonicalId?: string; taskFolderPath?: string; decisionId?: string } | undefined {
+function normalizeArg(arg: ReconcileArg | undefined):
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      decisionId?: string;
+      offeredItems?: readonly string[];
+    }
+  | undefined {
   if (!arg) {
     return undefined;
   }
   // Explicit ids first, and the tree-node branch guarded: a dispatcher can
   // hand over a partial `task` carrying only `progress`, which an unguarded
   // `arg.task.folderUri.fsPath` turns into a TypeError.
-  const explicit = arg as { canonicalId?: string; taskFolderPath?: string; decisionId?: string };
+  const explicit = arg as {
+    canonicalId?: string;
+    taskFolderPath?: string;
+    decisionId?: string;
+    offeredItems?: readonly string[];
+  };
   if (explicit.canonicalId || explicit.taskFolderPath) {
     return {
       canonicalId: explicit.canonicalId,
       taskFolderPath: explicit.taskFolderPath,
       decisionId: explicit.decisionId,
+      offeredItems: explicit.offeredItems,
     };
   }
   if ("task" in arg && arg.task?.folderUri) {
@@ -160,6 +192,21 @@ async function computeReviewVerifiedCoverageV1(
   blockerSupersessions?: readonly BlockerSupersessionRecordV1[]
 ): Promise<{
   coveredItems: string[];
+  /**
+   * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28): the
+   * union (deduped) of every item ANY review names verified complete that
+   * ALSO resolves to an already-checked, non-excluded plan item
+   * (`filterAlreadyCheckedPlanItemsV1` — the mirror of `filterUncheckedPlanItemsV1`,
+   * which produces `coveredItems`). A caller that sees `coveredItems.length
+   * === 0` needs this to tell "no review names anything that is real, matched
+   * plan evidence" (`verifiedItemCount === 0`) apart from "every item a
+   * review named verified complete is already ticked in the plan"
+   * (`verifiedItemCount > 0`) — collapsing both into one "nothing to apply"
+   * state previously let `applyReconciliationReviewVerifiedTicksConfirmedV1`
+   * report a false "Already done" even when no review named anything at all,
+   * or named only text matching nothing in the plan.
+   */
+  verifiedItemCount: number;
   perStage: {
     stage: TaskStage;
     readiness?: string;
@@ -179,6 +226,7 @@ async function computeReviewVerifiedCoverageV1(
 }> {
   const coveredKeys = new Set<string>();
   const coveredItems: string[] = [];
+  const verifiedKeys = new Set<string>();
   const perStage: {
     stage: TaskStage;
     readiness?: string;
@@ -206,6 +254,9 @@ async function computeReviewVerifiedCoverageV1(
         coveredItems.push(item);
       }
     }
+    for (const item of filterAlreadyCheckedPlanItemsV1(planOfRecord, verified.items)) {
+      verifiedKeys.add(normalizeChecklistItemTextV1(item));
+    }
     // Review-flagged (2026-08-25, new architectural blocker): a supersession
     // only suppresses a blocker recorded against THIS specific, on-disk
     // artifact — bind the filter to the artifact's own mtime (`reviewAsOfMs`)
@@ -219,7 +270,7 @@ async function computeReviewVerifiedCoverageV1(
     );
     perStage.push({ stage, readiness: readiness.label, matches, hasArtifact: true, evidence, mtimeMs: stat?.mtime });
   }
-  return { coveredItems, perStage };
+  return { coveredItems, verifiedItemCount: verifiedKeys.size, perStage };
 }
 
 /**
@@ -327,6 +378,15 @@ async function gatherReconcileEvidenceV1(
   evidence: WorkflowDecisionEvidenceItemV1[];
   allUncheckedCovered: boolean;
   coveredItemsCount: number;
+  /**
+   * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28,
+   * narrowed blocker `bbd42447-…-1`): the actual item texts behind
+   * `coveredItemsCount`, so the card that offers "Apply N Reviewer-Verified
+   * Tick(s)" can carry exactly what it offered through to its confirm-time
+   * command, instead of the confirm path recomputing a fresh, unscoped
+   * aggregate that can disagree with what this card promised.
+   */
+  coveredItems: string[];
   /** Item 18: newest-per-stage blocker/progress evidence, so the caller can
    * decide whether the sole outstanding item coincides with the review's
    * sole remaining (environmental) blocker without a second file read. */
@@ -432,6 +492,7 @@ async function gatherReconcileEvidenceV1(
     evidence,
     allUncheckedCovered,
     coveredItemsCount: coveredItems.length,
+    coveredItems,
     perStage: perStage.map(({ stage, hasArtifact, evidence: stageEvidence, mtimeMs }) => ({
       stage,
       hasArtifact,
@@ -1431,7 +1492,7 @@ export async function postReconcilePlanChecklistDecisionV1(
     return { kind: "noChecklist" };
   }
 
-  const { evidence, allUncheckedCovered, coveredItemsCount, perStage } = await gatherReconcileEvidenceV1(
+  const { evidence, allUncheckedCovered, coveredItemsCount, coveredItems, perStage } = await gatherReconcileEvidenceV1(
     folderUri,
     plan.text,
     progress.pendingImplReviewFiles,
@@ -1636,6 +1697,25 @@ export async function postReconcilePlanChecklistDecisionV1(
   // caching the plan's CONTENT into args — only the reference travels.
   const decisionId = crypto.randomUUID();
 
+  // RC2 item 8, Step 36: when an `applyReviewerVerifiedTicks` card is
+  // already pending for this task, this card's own "applyVerifiedTicks"
+  // option offers the exact same effect under a different label — that is
+  // what let one card's Apply silently withdraw the other's plateau card
+  // while the duplicate on THIS card kept doing nothing when pressed
+  // afterward (RC1, 2026-09-26). The v1 fix (deliberately limited — merging
+  // or removing the duplicate is workflow 12's): point the label at the
+  // other card instead of restating it, while keeping this option's real,
+  // idempotent command effect untouched.
+  const pendingApplyTicksCardV1 = ((): boolean => {
+    const context = getExtensionContextV1();
+    if (!context) {
+      return false;
+    }
+    return new WorkflowDecisionStoreV1(context.workspaceState)
+      .listPending(canonicalId)
+      .some((d) => d.decisionKey === "applyReviewerVerifiedTicks");
+  })();
+
   const decision = await postWorkflowDecisionV1(
     {
       decisionId,
@@ -1686,9 +1766,15 @@ export async function postReconcilePlanChecklistDecisionV1(
           ? [
               {
                 optionId: "applyVerifiedTicks",
-                label: `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"} and try again`,
+                label: pendingApplyTicksCardV1
+                  ? "Same as the reviewer-verified ticks card above — apply and resume the task"
+                  : `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"} and resume the task`,
                 resumeKind: "continue" as const,
                 consequence:
+                  (pendingApplyTicksCardV1
+                    ? "This is the same action offered on the pending reviewer-verified-ticks card above — " +
+                      "choosing either one has the same effect. "
+                    : "") +
                   `Ticks ${coveredItemsCount} item(s) in plan-final.md that an implementation review already ` +
                   "on file names verified complete, then dispatches this stage's next action. Does not by " +
                   "itself clear the unreliable-checklist flag — mark reconciled directly once every outstanding " +
@@ -1696,7 +1782,7 @@ export async function postReconcilePlanChecklistDecisionV1(
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
-                  args: [{ taskFolderPath, canonicalId }],
+                  args: [{ taskFolderPath, canonicalId, offeredItems: coveredItems }],
                 },
               },
             ]
@@ -1705,7 +1791,7 @@ export async function postReconcilePlanChecklistDecisionV1(
           ? [
               {
                 optionId: "linkManualChecks",
-                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} and try again`,
+                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} and resume the task`,
                 resumeKind: "continue" as const,
                 consequence:
                   `Records a durable "Covers: Step ${soleItemStepNumberForLink}" note on each of the ` +
@@ -1736,7 +1822,7 @@ export async function postReconcilePlanChecklistDecisionV1(
           : []),
         {
           optionId: "reconcile",
-          label: "Mark reconciled and try again",
+          label: "Mark reconciled and resume the task",
           resumeKind: "continue",
           consequence:
             "Clears the unreliable-checklist flag, then dispatches this stage's next action. Plan completeness " +
@@ -1953,6 +2039,14 @@ export async function reconcilePlanChecklistConfirmedV1(
 export type ApplyReconciliationTicksResultV1 =
   | { readonly kind: "applied"; readonly count: number }
   | { readonly kind: "noCandidates" }
+  /**
+   * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28):
+   * distinct from `noCandidates` — every item a review named verified
+   * complete IS already ticked in the plan (`verifiedItemCount > 0`), rather
+   * than there being no matching review evidence at all. Only this kind may
+   * legitimately report "Already done" with a real count.
+   */
+  | { readonly kind: "alreadyTicked"; readonly count: number }
   | { readonly kind: "noChecklist" }
   | { readonly kind: "changedUnderneath" };
 
@@ -1992,17 +2086,48 @@ export type ApplyReconciliationTicksResultV1 =
  * concurrent writer or editor save landing between the read above and this
  * write is detected and refused rather than silently overwritten, exactly
  * like `linkManualChecksToBlockerConfirmedV1`'s Guard 3.
+ *
+ * `offeredItems` (RC2 item 8, Step 37 follow-up, narrowed blocker
+ * `bbd42447-…-1`, re-narrowed 2026-09-28: the first fix only scoped the
+ * "already ticked" COUNT, leaving the actual apply operation unscoped — a
+ * stale card could still be confirmed into applying a DIFFERENT item across
+ * ANY review stage than the one(s) it offered, if the union of verified
+ * coverage changed between post and confirm). When a caller supplies the
+ * specific candidates its own card offered, `coveredItems` itself is
+ * restricted to the intersection of "currently covered" with "offered by
+ * this card" (matched by {@link normalizeChecklistItemTextV1}) before
+ * anything is applied — never a newly-surfaced item this card never
+ * promised. Only the "already ticked" count falls back further, to
+ * `offeredItems` itself, once that intersection is empty.
  */
 export async function applyReconciliationReviewVerifiedTicksV1(
-  folderUri: vscode.Uri
+  folderUri: vscode.Uri,
+  offeredItems?: readonly string[]
 ): Promise<ApplyReconciliationTicksResultV1> {
   const plan = await readPlanOfRecordV1(folderUri);
   if (!plan.hasChecklist || plan.text === undefined) {
     return { kind: "noChecklist" };
   }
-  const { coveredItems } = await computeReviewVerifiedCoverageV1(folderUri, plan.text);
+  const { coveredItems: coveredItemsFromReviews, verifiedItemCount } = await computeReviewVerifiedCoverageV1(
+    folderUri,
+    plan.text
+  );
+  // Scope to exactly what this card offered, when it offered anything — see
+  // this function's doc comment for the race this closes.
+  const offeredKeys = offeredItems ? new Set(offeredItems.map(normalizeChecklistItemTextV1)) : undefined;
+  const coveredItems = offeredKeys
+    ? coveredItemsFromReviews.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
+    : coveredItemsFromReviews;
   if (coveredItems.length === 0) {
-    return { kind: "noCandidates" };
+    if (offeredItems !== undefined) {
+      const stillAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems).length;
+      return stillAppliedCount > 0
+        ? { kind: "alreadyTicked", count: stillAppliedCount }
+        : { kind: "noCandidates" };
+    }
+    return verifiedItemCount > 0
+      ? { kind: "alreadyTicked", count: verifiedItemCount }
+      : { kind: "noCandidates" };
   }
   const evidence =
     "verified complete by an implementation review already on file — applied via explicit operator " +
@@ -2035,11 +2160,12 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ReconcileArg
-): Promise<void> {
+): Promise<WorkflowDecisionCommandResultV1 | void> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
+  const normalized = normalizeArg(explicitArg);
   const resolved = await resolveTaskContext(
     inventory,
-    normalizeArg(explicitArg),
+    normalized,
     { allowPaused: true },
     currentTaskStore
   );
@@ -2051,14 +2177,38 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   }
 
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
-  const result = await applyReconciliationReviewVerifiedTicksV1(folderUri);
+  const result = await applyReconciliationReviewVerifiedTicksV1(folderUri, normalized?.offeredItems);
   if (result.kind === "noChecklist") {
     NotificationRouter.showWarning(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md has no implementation checklist to tick, so there is nothing to apply.`
     );
     return;
   }
+  if (result.kind === "alreadyTicked") {
+    // RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28): this
+    // is the card's OWN duplicate of `applyReviewerVerifiedTicksConfirmedV1`
+    // (Step 36) — by the time this runs with `verifiedItemCount > 0` but
+    // nothing left unticked, the ticks a review named WERE already applied
+    // (through this card or the other one). Reported structurally
+    // (`WorkflowDecisionCommandResultV1`, Step 31's protocol) with the real
+    // count so it renders "Already done: …" on this card's own thread
+    // instead of the bare information message that used to look like
+    // nothing happened (RC1, 2026-09-26) — and unlike the prior revision of
+    // this branch, this is only reached when there is real evidence
+    // (`verifiedItemCount`) that the claimed ticks actually exist, never for
+    // a task with no review coverage at all (see `noCandidates` below).
+    const n = result.count;
+    const message = `Already done: the ${n} reviewer-verified tick${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} applied.`;
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — ${message}`
+    );
+    return { outcome: "alreadyDone", message };
+  }
   if (result.kind === "noCandidates") {
+    // No review currently names anything verified complete that also
+    // matches a real plan item — never claim "Already done" here, since
+    // nothing was ever offered to apply (see `alreadyTicked` above for the
+    // genuinely-already-applied case).
     NotificationRouter.showInformation(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — No implementation review on file currently names an unticked plan item as verified complete.`
     );

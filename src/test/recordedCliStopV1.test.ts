@@ -16,24 +16,39 @@ import {
   type RecordedProviderProcessV1,
 } from "../state/roundProcessRecordV1";
 import type { ProcessLivenessClassificationV1 } from "../state/processLivenessClassifierV1";
-import { describeSurvivingRecordedProcessV1, stopRecordedCliProcessesV1 } from "../state/recordedCliStopV1";
+import {
+  classifyRoundProcessStateV1,
+  decideAdmissionReleaseSafetyV1,
+  describeSurvivingRecordedProcessV1,
+  stopRecordedCliProcessesV1,
+} from "../state/recordedCliStopV1";
 
-function installFakeExtensionContextV1(): () => void {
-  const values = new Map<string, unknown>();
-  const memento = {
+/** Backed by a plain `Map`, standing in for ONE VS Code window's in-memory
+ * `workspaceState` cache — see `roundProcessRecordV1.test.ts`'s cross-window
+ * test for why this distinction matters (2026-09-29 review, RC2 item 2 /
+ * Step 57a). */
+function makeFakeMementoV1(backing: Map<string, unknown>): import("vscode").Memento {
+  return {
     get<T>(key: string, defaultValue: T): T {
-      return (values.has(key) ? values.get(key) : defaultValue) as T;
+      return (backing.has(key) ? backing.get(key) : defaultValue) as T;
     },
     update(key: string, value: unknown): Promise<void> {
       if (value === undefined) {
-        values.delete(key);
+        backing.delete(key);
       } else {
-        values.set(key, value);
+        backing.set(key, value);
       }
       return Promise.resolve();
     },
+    keys(): readonly string[] {
+      return [...backing.keys()];
+    },
   } as unknown as import("vscode").Memento;
-  __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as import("vscode").ExtensionContext);
+}
+
+function installFakeExtensionContextV1(): () => void {
+  const values = new Map<string, unknown>();
+  __extensionContextV1TestOnly.set({ workspaceState: makeFakeMementoV1(values) } as unknown as import("vscode").ExtensionContext);
   return () => __extensionContextV1TestOnly.reset();
 }
 
@@ -77,7 +92,7 @@ void test("a recorded CLI whose pid was reused (classified gone) is never signal
     });
     assert.deepEqual(outcome, { outcome: "allGone" });
     assert.deepEqual(signalled, [], "a pid proven reused is not Ensemble's process and must never be signalled");
-    assert.deepEqual(listRoundProcessesV1(TASK), [], "the record is cleared once every process is confirmed gone");
+    assert.deepEqual(listRoundProcessesV1(TASK, CLAIM), [], "the record is cleared once every process is confirmed gone");
   });
 });
 
@@ -92,7 +107,7 @@ void test("a verified-alive recorded CLI is signalled once, re-checked, and the 
     });
     assert.deepEqual(outcome, { outcome: "allGone" });
     assert.deepEqual(signalled, [222]);
-    assert.deepEqual(listRoundProcessesV1(TASK), []);
+    assert.deepEqual(listRoundProcessesV1(TASK, CLAIM), []);
   });
 });
 
@@ -111,7 +126,7 @@ void test("a recorded CLI whose identity is unreadable (inconclusive) is not sig
       assert.equal(outcome.survivors[0]!.classification, "inconclusive");
     }
     assert.deepEqual(signalled, [], "an unverifiable pid must never be signalled");
-    assert.equal(listRoundProcessesV1(TASK).length, 1, "the record must survive so a later sweep can re-check");
+    assert.equal(listRoundProcessesV1(TASK, CLAIM).length, 1, "the record must survive so a later sweep can re-check");
   });
 });
 
@@ -129,7 +144,7 @@ void test("a verified-alive CLI that outlives the signal is reported as a surviv
       assert.equal(outcome.survivors[0]!.classification, "alive");
     }
     assert.deepEqual(signalled, [444], "signalled exactly once, not on every re-check");
-    assert.equal(listRoundProcessesV1(TASK).length, 1);
+    assert.equal(listRoundProcessesV1(TASK, CLAIM).length, 1);
   });
 });
 
@@ -156,6 +171,95 @@ void test("a mix of gone, alive and inconclusive: only the alive one is signalle
       );
     }
   });
+});
+
+void test("a successor claim's record, written WHILE stopRecordedCliProcessesV1 is still stopping the stale claim's process, survives the stale claim's final clear (2026-09-29 review, RC2 item 2 / Step 57a: the successor-claim race)", async () => {
+  await withRecordedProcesses([makeProcess(222)], async () => {
+    const SUCCESSOR_CLAIM = "claim-2";
+    let checks = 0;
+    const outcome = await stopRecordedCliProcessesV1(TASK, CLAIM, {
+      classify: () => Promise.resolve<ProcessLivenessClassificationV1>(++checks === 1 ? "alive" : "gone"),
+      signal: () => undefined,
+      sleep: async () => {
+        // Simulates a successor claim's marker being released and
+        // reacquired, and starting its OWN process recording, while THIS
+        // stale claim is still mid-flight stopping and confirming its own
+        // recorded process (the real-world gap: signalling, waiting,
+        // re-classifying all await across turns). Before the fix, the
+        // unconditional, task-wide clear this function calls once ITS OWN
+        // process is confirmed gone would erase the successor's
+        // just-written record too.
+        await beginRoundProcessRecordingV1(TASK, SUCCESSOR_CLAIM);
+        await recordRoundProcessV1(TASK, SUCCESSOR_CLAIM, makeProcess(999));
+      },
+    });
+    assert.deepEqual(outcome, { outcome: "allGone" }, "the stale claim's own recorded process is confirmed gone");
+    assert.equal(
+      listRoundProcessesV1(TASK, SUCCESSOR_CLAIM).length,
+      1,
+      "the successor claim's record must survive the stale claim's clear, not be wiped by it"
+    );
+    assert.equal(listRoundProcessesV1(TASK, SUCCESSOR_CLAIM)[0]!.pid, 999);
+  });
+});
+
+void test("cross-window: stopRecordedCliProcessesV1 stopping the stale claim in window A never erases a successor claim recorded through window B's OWN, independent workspaceState cache (2026-09-29 review — the review's own ask: 'a test using independent host/storage views')", async () => {
+  // Two independent Mementos, each backed by its OWN Map — never a shared
+  // object — modeling two separate VS Code windows/extension-host processes
+  // on the same workspace. Window B's disk starts as a snapshot of window
+  // A's disk at the moment window B "opens" (mid-test, inside the injected
+  // `sleep`), exactly like a fresh window reading the shared storage file at
+  // startup; after that, neither window's Memento is pushed the other's
+  // writes — the same "another VS Code process cannot read the raising
+  // window's workspaceState" limitation `hostDecisionMirrorV1.ts` documents.
+  const windowADisk = new Map<string, unknown>();
+  __extensionContextV1TestOnly.set({ workspaceState: makeFakeMementoV1(windowADisk) } as unknown as import("vscode").ExtensionContext);
+  await beginRoundProcessRecordingV1(TASK, CLAIM);
+  await recordRoundProcessV1(TASK, CLAIM, makeProcess(222));
+
+  const SUCCESSOR_CLAIM = "claim-cross-window";
+  let windowBDisk: Map<string, unknown> | undefined;
+  let checks = 0;
+  const outcome = await stopRecordedCliProcessesV1(TASK, CLAIM, {
+    classify: () => Promise.resolve<ProcessLivenessClassificationV1>(++checks === 1 ? "alive" : "gone"),
+    signal: () => undefined,
+    sleep: async () => {
+      // Window B opens (its cache starts as a snapshot of window A's disk
+      // right now) and records its OWN successor claim — e.g. the owner
+      // reopened the task in a different window after A's marker was
+      // released as stale, while window A (this call) is still mid-flight
+      // stopping and confirming its own recorded process.
+      windowBDisk = new Map<string, unknown>(windowADisk);
+      __extensionContextV1TestOnly.set({ workspaceState: makeFakeMementoV1(windowBDisk) } as unknown as import("vscode").ExtensionContext);
+      await beginRoundProcessRecordingV1(TASK, SUCCESSOR_CLAIM);
+      await recordRoundProcessV1(TASK, SUCCESSOR_CLAIM, makeProcess(999));
+      // Window A resumes. Its own cache is untouched by window B's writes —
+      // deliberately NOT resynced here, since a live, already-running window
+      // never sees another window's concurrent update in the real product.
+      __extensionContextV1TestOnly.set({ workspaceState: makeFakeMementoV1(windowADisk) } as unknown as import("vscode").ExtensionContext);
+    },
+  });
+  try {
+    assert.deepEqual(outcome, { outcome: "allGone" }, "window A's own recorded process is confirmed gone");
+    // Window A's own disk is all its clear could ever have touched — confirm
+    // the successor's key was never written there, so there was nothing for
+    // the clear to hit even accidentally.
+    assert.equal(
+      [...windowADisk.keys()].some((key) => key.includes(SUCCESSOR_CLAIM)),
+      false,
+      "window A's own disk never even received the successor's write — nothing for its clear to have hit"
+    );
+    // Window B's disk (the real, current truth, written directly by B) must
+    // still hold its own claim's record intact after A's clear ran.
+    __extensionContextV1TestOnly.set({ workspaceState: makeFakeMementoV1(windowBDisk!) } as unknown as import("vscode").ExtensionContext);
+    assert.deepEqual(
+      listRoundProcessesV1(TASK, SUCCESSOR_CLAIM).map((p) => p.pid),
+      [999],
+      "the successor claim's record, on the window that actually wrote it, must survive the stale window's clear"
+    );
+  } finally {
+    __extensionContextV1TestOnly.reset();
+  }
 });
 
 void test("a record that belongs to a different lock generation is not this lock's: nothing is classified or signalled", async () => {
@@ -186,7 +290,7 @@ void test("a spawn attempt begun but never confirmed recorded (the crash-window 
     // running and editing the workspace.
     await beginRoundProcessRecordingV1(TASK, CLAIM);
     await beginProcessSpawnAttemptV1(TASK, CLAIM);
-    assert.deepEqual(listRoundProcessesV1(TASK), []);
+    assert.deepEqual(listRoundProcessesV1(TASK, CLAIM), []);
 
     let classified = 0;
     const outcome = await stopRecordedCliProcessesV1(TASK, CLAIM, {
@@ -267,4 +371,194 @@ void test("the survivor description names the pid, provider, command and start t
   });
   assert.ok(unknownStart.includes("start time unknown"));
   assert.ok(unknownStart.includes("still running after being asked to stop"));
+});
+
+void test("classifyRoundProcessStateV1: no record for this claim reports confirmedGone", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    assert.equal(await classifyRoundProcessStateV1(TASK, CLAIM), "confirmedGone");
+  } finally {
+    restore();
+  }
+});
+
+void test("classifyRoundProcessStateV1: a record for a different claim generation reports confirmedGone", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK, "a-stale-claim");
+    await recordRoundProcessV1(TASK, "a-stale-claim", makeProcess(101));
+    assert.equal(await classifyRoundProcessStateV1(TASK, CLAIM), "confirmedGone");
+  } finally {
+    restore();
+  }
+});
+
+void test("classifyRoundProcessStateV1: recording begun with zero processes reports confirmedGone", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK, CLAIM);
+    assert.equal(await classifyRoundProcessStateV1(TASK, CLAIM), "confirmedGone");
+  } finally {
+    restore();
+  }
+});
+
+void test(
+  "classifyRoundProcessStateV1: a spawn attempt with no durably recorded outcome reports unconfirmedSpawn",
+  async () => {
+    const restore = installFakeExtensionContextV1();
+    try {
+      await beginRoundProcessRecordingV1(TASK, CLAIM);
+      await beginProcessSpawnAttemptV1(TASK, CLAIM);
+      assert.equal(await classifyRoundProcessStateV1(TASK, CLAIM), "unconfirmedSpawn");
+    } finally {
+      restore();
+    }
+  }
+);
+
+void test("classifyRoundProcessStateV1: every recorded process classified gone reports confirmedGone", async () => {
+  await withRecordedProcesses([makeProcess(201), makeProcess(202)], async () => {
+    const classifications = new Map<number, ProcessLivenessClassificationV1>([
+      [201, "gone"],
+      [202, "gone"],
+    ]);
+    const state = await classifyRoundProcessStateV1(TASK, CLAIM, {
+      classify: (entry) => Promise.resolve(classifications.get(entry.pid) ?? "gone"),
+    });
+    assert.equal(state, "confirmedGone");
+  });
+});
+
+void test("classifyRoundProcessStateV1: one recorded process classified alive reports stillRunning", async () => {
+  await withRecordedProcesses([makeProcess(301), makeProcess(302)], async () => {
+    const classifications = new Map<number, ProcessLivenessClassificationV1>([
+      [301, "gone"],
+      [302, "alive"],
+    ]);
+    const state = await classifyRoundProcessStateV1(TASK, CLAIM, {
+      classify: (entry) => Promise.resolve(classifications.get(entry.pid) ?? "gone"),
+    });
+    assert.equal(state, "stillRunning");
+  });
+});
+
+void test(
+  "classifyRoundProcessStateV1: an inconclusive classification fails open to stillRunning, never confirmedGone",
+  async () => {
+    await withRecordedProcesses([makeProcess(401)], async () => {
+      const state = await classifyRoundProcessStateV1(TASK, CLAIM, {
+        classify: () => Promise.resolve("inconclusive"),
+      });
+      assert.equal(state, "stillRunning");
+    });
+  }
+);
+
+// item 2 / Step 57: decideAdmissionReleaseSafetyV1 is the read-only gate a
+// command's `finally` block asks before unlinking its admission marker.
+
+void test("decideAdmissionReleaseSafetyV1: no recorded processes for this claim is safe to release", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM);
+    assert.deepEqual(decision, { processState: "confirmedGone", safe: true, pids: [] });
+  } finally {
+    restore();
+  }
+});
+
+void test("decideAdmissionReleaseSafetyV1: every recorded process confirmed gone is safe to release", async () => {
+  await withRecordedProcesses([makeProcess(501), makeProcess(502)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: () => Promise.resolve("gone"),
+    });
+    assert.deepEqual(decision, { processState: "confirmedGone", safe: true, pids: [] });
+  });
+});
+
+void test("decideAdmissionReleaseSafetyV1: a still-running recorded process refuses release and names its pid", async () => {
+  await withRecordedProcesses([makeProcess(503)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: () => Promise.resolve("alive"),
+    });
+    assert.equal(decision.safe, false);
+    assert.equal(decision.processState, "stillRunning");
+    assert.match(decision.outstandingReason ?? "", /pid 503/);
+    assert.match(decision.outstandingReason ?? "", /did not exit/);
+    assert.deepEqual(decision.pids, [503]);
+  });
+});
+
+void test("decideAdmissionReleaseSafetyV1: with one gone and one still-alive recorded process, only the alive pid is named outstanding", async () => {
+  await withRecordedProcesses([makeProcess(506), makeProcess(507)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: (entry) => Promise.resolve(entry.pid === 506 ? "gone" : "alive"),
+    });
+    assert.equal(decision.safe, false);
+    assert.equal(decision.processState, "stillRunning");
+    assert.match(decision.outstandingReason ?? "", /pid 507/);
+    assert.doesNotMatch(decision.outstandingReason ?? "", /506/);
+  });
+});
+
+void test("decideAdmissionReleaseSafetyV1: an inconclusive classification refuses release (fails open, like classifyRoundProcessStateV1)", async () => {
+  await withRecordedProcesses([makeProcess(504)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: () => Promise.resolve("inconclusive"),
+    });
+    assert.equal(decision.safe, false);
+    assert.equal(decision.processState, "stillRunning");
+  });
+});
+
+void test("decideAdmissionReleaseSafetyV1: an unconfirmed spawn refuses release with the starting-process wording, never confirmedGone", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK, CLAIM);
+    await beginProcessSpawnAttemptV1(TASK, CLAIM);
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: () => assert.fail("nothing was durably recorded to classify"),
+    });
+    assert.equal(decision.safe, false);
+    assert.equal(decision.processState, "unconfirmedSpawn");
+    assert.match(decision.outstandingReason ?? "", /may still be starting/);
+    assert.deepEqual(decision.pids, []);
+  } finally {
+    restore();
+  }
+});
+
+void test("decideAdmissionReleaseSafetyV1: an unconfirmed spawn carries the recorded provider and command (Step 57a: the held-marker card names them since there is no pid)", async () => {
+  const restore = installFakeExtensionContextV1();
+  try {
+    await beginRoundProcessRecordingV1(TASK, CLAIM);
+    await beginProcessSpawnAttemptV1(TASK, CLAIM, "Codex CLI", "codex exec --json <prompt omitted>");
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, {
+      classify: () => assert.fail("nothing was durably recorded to classify"),
+    });
+    assert.equal(decision.processState, "unconfirmedSpawn");
+    assert.equal(decision.providerLabel, "Codex CLI");
+    assert.equal(decision.command, "codex exec --json <prompt omitted>");
+  } finally {
+    restore();
+  }
+});
+
+void test("decideAdmissionReleaseSafetyV1: a still-running decision never carries providerLabel/command (that identity comes from pids instead)", async () => {
+  await withRecordedProcesses([makeProcess(506)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, CLAIM, { classify: () => Promise.resolve("alive") });
+    assert.equal(decision.processState, "stillRunning");
+    assert.equal(decision.providerLabel, undefined);
+    assert.equal(decision.command, undefined);
+  });
+});
+
+void test("decideAdmissionReleaseSafetyV1: a different lock generation's record is not this claim's — safe to release", async () => {
+  await withRecordedProcesses([makeProcess(505)], async () => {
+    const decision = await decideAdmissionReleaseSafetyV1(TASK, "some-other-claim", {
+      classify: () => assert.fail("must not classify another generation's process"),
+    });
+    assert.deepEqual(decision, { processState: "confirmedGone", safe: true, pids: [] });
+  });
 });

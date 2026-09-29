@@ -4,12 +4,14 @@ import {
   type ProcessLivenessClassificationV1,
 } from "./processLivenessClassifierV1";
 import {
-  clearRoundProcessesV1,
+  clearRoundProcessesForClaimV1,
+  hasRoundProcessRecordV1,
   listRoundProcessesV1,
-  recordedClaimIdForTaskV1,
+  pendingSpawnInfoV1,
   unconfirmedProcessSpawnCountV1,
   type RecordedProviderProcessV1,
 } from "./roundProcessRecordV1";
+import type { RoundProcessStateV1 } from "../types/agentExecutionV1";
 
 /**
  * Stop-then-confirm for the provider CLIs a dead lock owner left behind (1.0
@@ -104,6 +106,161 @@ export function describeSurvivingRecordedProcessV1(survivor: SurvivingRecordedPr
   return `${survivor.providerLabel} (pid ${survivor.pid}, ${started}, ${survivor.command}): ${identity}`;
 }
 
+/** Per-entry result behind a {@link RoundProcessStateV1}, so a caller that
+ * needs to name which recorded processes are actually outstanding (not just
+ * the aggregate state) does not have to re-classify. */
+interface RoundProcessClassificationV1 {
+  readonly processState: RoundProcessStateV1;
+  readonly entries: readonly {
+    readonly entry: RecordedProviderProcessV1;
+    readonly classification: ProcessLivenessClassificationV1;
+  }[];
+  /** Set only for `processState === "unconfirmedSpawn"` — see
+   * `pendingSpawnInfoV1`'s doc comment for why `stillRunning`/`confirmedGone`
+   * never need this (they have `entries`/`RecordedProviderProcessV1` instead). */
+  readonly pendingSpawnLabel?: string;
+  readonly pendingSpawnCommand?: string;
+}
+
+/**
+ * Read-only classification of `taskFolderPath`'s recorded processes for lock
+ * generation `claimId` (item 2 / Step 54) — never signals or stops anything,
+ * unlike {@link stopRecordedCliProcessesV1}. Shared by
+ * {@link classifyRoundProcessStateV1} (the aggregate state) and
+ * {@link decideAdmissionReleaseSafetyV1} (which also needs to know which
+ * individual recorded processes are not yet confirmed gone).
+ *
+ * `unconfirmedSpawn` takes precedence over any classified process: a spawn
+ * attempt with no durably recorded outcome cannot be proven either way, so it
+ * is reported distinctly rather than folded into `stillRunning`, matching
+ * `stopRecordedCliProcessesV1`'s own treatment of the same gap.
+ */
+async function classifyRoundProcessesV1(
+  taskFolderPath: string,
+  claimId: string,
+  deps: { readonly classify?: (recorded: RecordedProviderProcessV1) => Promise<ProcessLivenessClassificationV1> } = {}
+): Promise<RoundProcessClassificationV1> {
+  if (!hasRoundProcessRecordV1(taskFolderPath, claimId)) {
+    // No record for this claim generation: this claim never began recording,
+    // so it started no CLI of its own.
+    return { processState: "confirmedGone", entries: [] };
+  }
+  if (unconfirmedProcessSpawnCountV1(taskFolderPath, claimId) > 0) {
+    const pending = pendingSpawnInfoV1(taskFolderPath, claimId);
+    return {
+      processState: "unconfirmedSpawn",
+      entries: [],
+      pendingSpawnLabel: pending.providerLabel,
+      pendingSpawnCommand: pending.command,
+    };
+  }
+  const recorded = listRoundProcessesV1(taskFolderPath, claimId);
+  if (recorded.length === 0) {
+    return { processState: "confirmedGone", entries: [] };
+  }
+  const classify =
+    deps.classify ??
+    ((entry: RecordedProviderProcessV1): Promise<ProcessLivenessClassificationV1> => classifyRecordedProcessV1(entry));
+  const entries = await Promise.all(recorded.map(async (entry) => ({ entry, classification: await classify(entry) })));
+  // Fail open: "inconclusive" (like "alive") counts as still running — never
+  // treated as proof of exit.
+  const processState: RoundProcessStateV1 = entries.every((e) => e.classification === "gone") ? "confirmedGone" : "stillRunning";
+  return { processState, entries };
+}
+
+/**
+ * Read-only classification of `taskFolderPath`'s recorded processes for lock
+ * generation `claimId` (item 2 / Step 54) — never signals or stops anything,
+ * unlike {@link stopRecordedCliProcessesV1}. Used by the broker to attach a
+ * `RoundProcessStateV1` to a timeout or cancellation outcome so a caller can
+ * tell "definitely safe to release" apart from "a CLI may still be running"
+ * without itself reaching into the process record.
+ */
+export async function classifyRoundProcessStateV1(
+  taskFolderPath: string,
+  claimId: string,
+  deps: { readonly classify?: (recorded: RecordedProviderProcessV1) => Promise<ProcessLivenessClassificationV1> } = {}
+): Promise<RoundProcessStateV1> {
+  return (await classifyRoundProcessesV1(taskFolderPath, claimId, deps)).processState;
+}
+
+/** The outcome of {@link decideAdmissionReleaseSafetyV1}: whether a command's
+ * `finally` block may release its admission marker right now (item 2 / Step
+ * 57). */
+export interface AdmissionReleaseSafetyDecisionV1 {
+  readonly processState: RoundProcessStateV1;
+  readonly safe: boolean;
+  /** Set only when `safe` is `false` — names exactly what is outstanding, per
+   * the plan's wording ("The provider process <pid> did not exit" / "A
+   * provider process may still be starting and could not be confirmed
+   * stopped"), for a refused-retry message or the held-marker card. */
+  readonly outstandingReason?: string;
+  /** The recorded pids not yet confirmed gone (Step 57a's `heldAfterTimeoutV1.pids`
+   * on the held-marker card) — always `[]` for `confirmedGone` and
+   * `unconfirmedSpawn` (an unconfirmed spawn has no recorded pid to name), and
+   * populated only for `stillRunning`. */
+  readonly pids: readonly number[];
+  /** Set only for `processState === "unconfirmedSpawn"` — the provider and
+   * display-only command line the held-marker card names for the owner to
+   * check, since there is no recorded pid to identify the process by (Step
+   * 57a: "lists the provider and command shown in the record"). */
+  readonly providerLabel?: string;
+  readonly command?: string;
+}
+
+/**
+ * Decide whether it is safe to release `taskFolderPath`'s admission marker
+ * for lock generation `claimId` right now (item 2 / Step 57): only when the
+ * round's recorded processes are ALL confirmed gone. `stillRunning` and
+ * `unconfirmedSpawn` both refuse release — an unconfirmed spawn is treated
+ * exactly like a confirmed-running process, never like "nothing was
+ * spawned", because it cannot be told apart from a real, un-recorded CLI.
+ *
+ * A caller that gets `safe: false` back must keep the marker held (never
+ * unlink it) and re-check later, once at the next heartbeat interval — this
+ * function is read-only and stops nothing itself, matching
+ * {@link classifyRoundProcessStateV1}'s own contract.
+ */
+export async function decideAdmissionReleaseSafetyV1(
+  taskFolderPath: string,
+  claimId: string,
+  deps: { readonly classify?: (recorded: RecordedProviderProcessV1) => Promise<ProcessLivenessClassificationV1> } = {}
+): Promise<AdmissionReleaseSafetyDecisionV1> {
+  const { processState, entries, pendingSpawnLabel, pendingSpawnCommand } = await classifyRoundProcessesV1(
+    taskFolderPath,
+    claimId,
+    deps
+  );
+  if (processState === "confirmedGone") {
+    return { processState, safe: true, pids: [] };
+  }
+  if (processState === "unconfirmedSpawn") {
+    return {
+      processState,
+      safe: false,
+      pids: [],
+      outstandingReason: "A provider process may still be starting and could not be confirmed stopped.",
+      providerLabel: pendingSpawnLabel,
+      command: pendingSpawnCommand,
+    };
+  }
+  // stillRunning: name only the recorded pid(s) not yet confirmed gone (a
+  // "gone" entry already exited and must not be reported as outstanding),
+  // so the refusal is specific rather than generic (Step 57's own wording
+  // names a pid).
+  const pids = entries.filter((e) => e.classification !== "gone").map((e) => e.entry.pid);
+  const pidText = pids.length === 1 ? `pid ${pids[0]}` : `pids ${pids.join(", ")}`;
+  return {
+    processState,
+    safe: false,
+    pids,
+    outstandingReason:
+      pids.length > 0
+        ? `The provider process (${pidText}) did not exit.`
+        : "A provider process did not exit.",
+  };
+}
+
 /**
  * Stops and confirms every provider CLI recorded for `taskFolderPath`'s lock
  * generation `claimId`. Clears the record when all are confirmed gone.
@@ -113,7 +270,7 @@ export async function stopRecordedCliProcessesV1(
   claimId: string,
   deps: RecordedCliStopDepsV1 = {}
 ): Promise<RecordedCliStopOutcomeV1> {
-  if (recordedClaimIdForTaskV1(taskFolderPath) !== claimId) {
+  if (!hasRoundProcessRecordV1(taskFolderPath, claimId)) {
     return { outcome: "allGone" };
   }
   const classify = deps.classify ?? ((recorded: RecordedProviderProcessV1) => classifyRecordedProcessV1(recorded));
@@ -121,7 +278,7 @@ export async function stopRecordedCliProcessesV1(
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const waitMs = deps.waitMs ?? RECORDED_CLI_STOP_WAIT_MS_V1;
 
-  const recorded = listRoundProcessesV1(taskFolderPath);
+  const recorded = listRoundProcessesV1(taskFolderPath, claimId);
   const first = await Promise.all(recorded.map(async (entry) => ({ entry, classification: await classify(entry) })));
   const toSignal = first.filter((item) => item.classification === "alive");
   for (const item of toSignal) {
@@ -179,6 +336,14 @@ export async function stopRecordedCliProcessesV1(
   if (survivors.length > 0) {
     return { outcome: "survivors", survivors };
   }
-  await clearRoundProcessesV1(taskFolderPath);
+  // Claim-scoped, not the task-wide `clearRoundProcessesV1`: everything above
+  // (signalling, polling, re-classifying) awaits across multiple turns, long
+  // enough for this claim's marker to be released and a successor claim to
+  // start recording its own processes before this call lands. `claimId` has
+  // its own storage key (`roundProcessRecordV1.ts`), so this delete can only
+  // ever hit that one key — a successor's record, at a different key, is
+  // structurally unreachable, not merely re-checked (2026-09-29 review, RC2
+  // item 2 / Step 57a).
+  await clearRoundProcessesForClaimV1(taskFolderPath, claimId);
   return { outcome: "allGone" };
 }

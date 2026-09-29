@@ -19,7 +19,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { commitAndPushTask, resumeCommitPushMetadataInteractionV1 } from "../commands/commitAndPushTask";
+import {
+  commitAndPushTask,
+  invokeCommitPushRowV1,
+  resumeCommitPushMetadataInteractionV1,
+} from "../commands/commitAndPushTask";
+import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import {
@@ -79,6 +85,13 @@ const runnerRegistryModule = require("../runners/runnerRegistry") as {
   resolveRunnerForModel: (...args: unknown[]) => unknown;
   checkRunnerAvailabilityForModel: (...args: unknown[]) => Promise<unknown>;
   createV1RunnerSelectionOpener: (...args: unknown[]) => unknown;
+};
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const productionRuntimeModule = require("../actions/productionTaskActionRuntimeV1") as {
+  createProductionTaskActionCoordinatorV1: (options: unknown) => {
+    executeAction: (request: unknown) => Promise<TaskActionOutcomeV1>;
+    resumeAction: (request: unknown) => Promise<TaskActionOutcomeV1>;
+  };
 };
 
 /**
@@ -735,6 +748,167 @@ void describe("resumeCommitPushMetadataInteractionV1 — production Resume deleg
       }
     } finally {
       execCapture.restore();
+      harness.restore();
+    }
+  });
+});
+
+/**
+ * Item 2 / Step 57a completion fix (review, 2026-09-29): the shared
+ * `dispatchProbe` object `reviewCommitMessage`'s confirmation loop threads
+ * through EVERY commit-metadata generation attempt (the initial one, plus
+ * every "Regenerate" click) used to be overwritten unconditionally on each
+ * call. So an EARLIER attempt that timed out/was cancelled (its process may
+ * still be running) had its trigger silently erased by a LATER attempt that
+ * happened to complete after the user clicked Regenerate — losing exactly
+ * the signal `invokeCommitPushRowV1`'s caller needs to hold the admission
+ * marker (`heldAfterTimeoutV1`) rather than releasing it beside a possibly
+ * still-running provider process. This proves the fix: the probe now stays
+ * pinned to the first trigger-bearing outcome across the whole Regenerate
+ * loop.
+ */
+void describe("commit-message review — dispatchProbe sticky across Regenerate", () => {
+  void it("keeps the FIRST timed-out metadata outcome even after a later Regenerate completes", async () => {
+    let modalCalls = 0;
+    const harness = installHarness(() => {
+      modalCalls += 1;
+      // First generation attempt times out, so buildCommitMessage falls back
+      // to its deterministic subject and the review dialog still opens with
+      // that fallback text — the user regenerates once, and the second
+      // attempt succeeds (also via the fallback path here, since no real
+      // provider file is written by the fake coordinator below; only the
+      // OUTCOME, not the generated text, matters for this test).
+      return modalCalls === 1 ? "Regenerate" : "Commit & Push";
+    });
+
+    const originalCreateCoordinator = productionRuntimeModule.createProductionTaskActionCoordinatorV1;
+    let coordinatorCalls = 0;
+    const timedOutOutcome: TaskActionOutcomeV1 = {
+      kind: "failed",
+      code: "invocationDeadlineExceeded",
+      retryable: true,
+      correlation: {
+        actionKey: "commitPushMetadata.v1",
+        operationId: allocateHex128IdV1(),
+        attemptId: allocateHex128IdV1(),
+        taskBindingId: "metadata-task-binding",
+        chatDocumentId: "metadata-chat-doc",
+      },
+    };
+    productionRuntimeModule.createProductionTaskActionCoordinatorV1 = () => ({
+      executeAction: (): Promise<TaskActionOutcomeV1> => {
+        coordinatorCalls += 1;
+        if (coordinatorCalls === 1) {
+          return Promise.resolve(timedOutOutcome);
+        }
+        return Promise.resolve({
+          kind: "completed",
+          code: "completed",
+          correlation: {
+            actionKey: "commitPushMetadata.v1",
+            operationId: allocateHex128IdV1(),
+            attemptId: allocateHex128IdV1(),
+            taskBindingId: "metadata-task-binding",
+            chatDocumentId: "metadata-chat-doc",
+          },
+        });
+      },
+      resumeAction: (): Promise<TaskActionOutcomeV1> => {
+        throw new Error("resumeAction must not be called in this test — no resumeInteraction is supplied");
+      },
+    });
+
+    try {
+      const resolvedTask = await resolveTaskContext(
+        harness.inventory,
+        { canonicalId: harness.taskFolderPath },
+        { allowPaused: true }
+      );
+      assert.ok(resolvedTask, "the fixture task must resolve");
+
+      const dispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+      await invokeCommitPushRowV1(resolvedTask, { inventory: harness.inventory }, dispatchProbe);
+
+      assert.equal(coordinatorCalls, 2, "both the initial attempt and the Regenerate attempt must have dispatched");
+      assert.equal(modalCalls, 2, "Regenerate must have re-shown the review dialog once");
+      assert.equal(
+        git(harness.repoRoot, ["rev-list", "--count", "HEAD"]).trim(),
+        "2",
+        "the eventual confirm must still commit, proving the sticky probe does not block the normal flow"
+      );
+
+      assert.equal(
+        dispatchProbe.coordinatorOutcome?.kind,
+        "failed",
+        "the probe must stay pinned to the FIRST (timed-out) metadata outcome, not the later completed one"
+      );
+      assert.equal(
+        dispatchProbe.coordinatorOutcome && "code" in dispatchProbe.coordinatorOutcome
+          ? dispatchProbe.coordinatorOutcome.code
+          : undefined,
+        "invocationDeadlineExceeded"
+      );
+    } finally {
+      productionRuntimeModule.createProductionTaskActionCoordinatorV1 = originalCreateCoordinator;
+      harness.restore();
+    }
+  });
+
+  void it("falls through to the row's own outcome when the metadata attempt never times out or cancels", async () => {
+    // This fixture's remote ("https://example.invalid/repo.git") can never
+    // actually be pushed to, so the ROW's own `commitPush.v1` outcome is
+    // always "failed"/"commitPush.pushFailed" here regardless of the
+    // metadata step — exactly like every other test in this file (none of
+    // which inspect the row outcome, only that the commit itself landed).
+    // With no trigger-bearing metadata outcome to pin, invokeCommitPushRowV1
+    // falls back to that row outcome (see its own dispatchProbe doc comment
+    // above `metadataDispatchProbe`) — this proves the sticky fix does not
+    // change that pre-existing fallback for the ordinary "everything
+    // completed" case.
+    const harness = installHarness(() => "Commit & Push");
+    const originalCreateCoordinator = productionRuntimeModule.createProductionTaskActionCoordinatorV1;
+    productionRuntimeModule.createProductionTaskActionCoordinatorV1 = () => ({
+      executeAction: (): Promise<TaskActionOutcomeV1> =>
+        Promise.resolve({
+          kind: "completed",
+          code: "completed",
+          correlation: {
+            actionKey: "commitPushMetadata.v1",
+            operationId: allocateHex128IdV1(),
+            attemptId: allocateHex128IdV1(),
+            taskBindingId: "metadata-task-binding",
+            chatDocumentId: "metadata-chat-doc",
+          },
+        }),
+      resumeAction: (): Promise<TaskActionOutcomeV1> => {
+        throw new Error("resumeAction must not be called in this test — no resumeInteraction is supplied");
+      },
+    });
+
+    try {
+      const resolvedTask = await resolveTaskContext(
+        harness.inventory,
+        { canonicalId: harness.taskFolderPath },
+        { allowPaused: true }
+      );
+      assert.ok(resolvedTask, "the fixture task must resolve");
+
+      const dispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+      await invokeCommitPushRowV1(resolvedTask, { inventory: harness.inventory }, dispatchProbe);
+
+      assert.equal(
+        dispatchProbe.coordinatorOutcome?.kind,
+        "failed",
+        "with no trigger-bearing metadata outcome, the probe must reflect the row's own outcome"
+      );
+      assert.equal(
+        dispatchProbe.coordinatorOutcome && "code" in dispatchProbe.coordinatorOutcome
+          ? dispatchProbe.coordinatorOutcome.code
+          : undefined,
+        "commitPush.pushFailed"
+      );
+    } finally {
+      productionRuntimeModule.createProductionTaskActionCoordinatorV1 = originalCreateCoordinator;
       harness.restore();
     }
   });

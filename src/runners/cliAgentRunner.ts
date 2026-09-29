@@ -2770,7 +2770,12 @@ export function createCliTextTransportV1(options: {
           if (recordingTarget === undefined) {
             return undefined;
           }
-          const began = await beginProcessSpawnAttemptV1(recordingTarget.taskFolderPath, recordingTarget.claimId);
+          const began = await beginProcessSpawnAttemptV1(
+            recordingTarget.taskFolderPath,
+            recordingTarget.claimId,
+            def.label,
+            commandForRecord
+          );
           if (began) {
             return undefined;
           }
@@ -3444,7 +3449,12 @@ export async function execCliAgent(options: {
     // RC1 Part B item 2 defect blocker — see roundProcessRecordV1.ts's
     // "NO-RECORD AMBIGUITY"). Same hard pre-spawn condition as
     // beginRoundProcessRecordingV1 just above, at per-attempt granularity.
-    const spawnMarked = await beginProcessSpawnAttemptV1(taskFolderPath, roundProcessClaimId);
+    const spawnMarked = await beginProcessSpawnAttemptV1(
+      taskFolderPath,
+      roundProcessClaimId,
+      def.label,
+      [resolvedCommand, ...argsForRoundProcessRecordV1].join(" ")
+    );
     if (!spawnMarked) {
       cleanupPromptFile();
       return classifyCliFailure({

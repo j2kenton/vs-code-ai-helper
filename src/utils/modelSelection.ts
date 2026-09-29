@@ -564,7 +564,14 @@ export function resolveConfiguredReviewStages(
   return Promise.resolve(configured);
 }
 
-function isAutoModel(model: vscode.LanguageModelChat): boolean {
+/**
+ * RC2 item 14, Step 11: no longer called from this file now that "auto" is
+ * listed and labelled like any other Copilot model (see
+ * `normalizeCopilotModelName` and `getAvailableCopilotModels`). Exported,
+ * not deleted, so the label and the splice-to-end reordering this replaced
+ * are a one-line revert each if gate G1 finds a stage "auto" still fails.
+ */
+export function isAutoModel(model: vscode.LanguageModelChat): boolean {
   return model.id.toLowerCase() === "auto" || model.name.toLowerCase() === "auto";
 }
 
@@ -603,11 +610,15 @@ function pushSelectableModel(
 }
 
 function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
-  // "auto" delegates to whichever model VS Code picks for the request, so it
-  // is the choice least likely to honour an output contract (workflow 3
-  // continuation, sixth item) — label it explicitly rather than let it read
-  // as just another named model.
-  return isAutoModel(model) ? `${model.name} (provider-chosen)` : model.name;
+  // RC2 item 14: "auto" used to be labelled "(provider-chosen)" and moved to
+  // the end of the list (workflow 3 continuation, sixth item: a Copilot draft
+  // on "auto" produced a contentSchemaMismatch on its first attempt). The
+  // cause is now fixed at the request-building boundary
+  // (`createLmUserMessageWithPartsV1`, `TOOL_RESULTS_USER_TEXT_V1`), so "auto"
+  // is listed like any other Copilot model once G1 confirms it works at every
+  // stage. `isAutoModel` stays defined so this is a one-line revert if G1
+  // finds a remaining gap.
+  return model.name;
 }
 
 // v1 fixes 2, item 19: Copilot models are offered by base id only. Copilot's
@@ -1777,25 +1788,13 @@ export async function warmCliModelCache(): Promise<void> {
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]
 > {
-  const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
-  const autoIndex = models.findIndex(isAutoModel);
-  if (autoIndex < 0) {
-    return models;
-  }
-
-  // "auto" delegates to whichever concrete model VS Code picks for the
-  // request, so it is the choice least likely to honour Ensemble's output
-  // contract (workflow 3 continuation, sixth item — a Copilot draft on
-  // "auto" produced a contentSchemaMismatch on the FIRST attempt). List
-  // concrete models first so a new user's default pick is one Ensemble has
-  // actually exercised; "auto" stays available (labeled, see
-  // normalizeCopilotModelName) rather than being removed or hidden.
-  const reordered = [...models];
-  // autoIndex >= 0 guarantees splice returns the removed element.
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const [autoModel] = reordered.splice(autoIndex, 1) as [vscode.LanguageModelChat];
-  reordered.push(autoModel);
-  return reordered;
+  // RC2 item 14: "auto" used to be moved to the end of the list (workflow 3
+  // continuation, sixth item — a Copilot draft on "auto" produced a
+  // contentSchemaMismatch on the FIRST attempt). The cause — every User
+  // message Copilot's `auto` router reads must carry non-empty text — is now
+  // fixed at the request-building boundary, so "auto" is listed in whatever
+  // order the provider returns it, like any other Copilot model.
+  return vscode.lm.selectChatModels({ vendor: "copilot" });
 }
 
 /** Label a CLI model by the service that will actually authorize and bill it. */

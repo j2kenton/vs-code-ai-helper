@@ -204,6 +204,10 @@ interface FakeRunResult {
   storedModelId?: string;
   typeCheckFailed?: boolean;
   typeCheckOutput?: string;
+  /** See `ImplementationRunResult.errorMessage` — set on a `"failed"` result. */
+  errorMessage?: string;
+  /** See `ImplementationRunResult.timedOut` — leave unset to drive an ordinary (non-watchdog) failure. */
+  timedOut?: boolean;
   /**
    * The sealed pipeline's own per-step receipts (2026-08-21 review round —
    * required to drive `runAutomaticChecklistReconciliationV1`'s tier 2
@@ -2061,7 +2065,7 @@ void describe("contradictory no-checklist-change + retroactive claims (Part 3, e
  * nothing else would ever revisit the claim; the latch must catch it too.
  */
 void describe("checklistProgressUnreliable latch fires on claimed-but-unmerged progress (Part 3)", () => {
-  /** Echoes the plan verbatim (unchecked — satisfies the echo requirement)
+  /** Echoes the plan verbatim (unchecked — not required, but well-formed)
    * but claims a DIFFERENT, unmatched item retroactively, so the merge
    * returns "no-match" even though the round is otherwise well-formed and
    * accepted. */
@@ -2909,7 +2913,7 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
     // `## Plan Item Checklist` claim (`checklistClaimedButUnmerged`) is
     // deliberately excluded from that gate — see the sibling note in "zero-
     // change streak counts checklist progress" above.
-    await runHarnessed(folderPath, progress, {
+    const run = await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: [],
       filesChangedUnknown: false,
@@ -2936,6 +2940,19 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
       persisted?.roundOutcomes?.at(-1)?.classification,
       "provider-failure-empty",
       "an unverified claimed-but-unmerged round with real work remaining must not read as a justified no-op"
+    );
+    // Implementation review round 2 (review commit c66cbc9, "wrong-round
+    // posting"): with no review history, `decidePostReviewActionV1` also
+    // resolves to `"implementation"` here (no review yet, unticked items
+    // remain) — the exact shape that used to reach RC2 item 13's new
+    // "nothing more to build" card BEFORE this round's own dedicated
+    // `checklistClaimedButUnmergedWithoutClearingReview` refusal (below, same
+    // round) ran. That card must never be posted for a round this round is
+    // about to refuse outright as a provider failure.
+    assert.equal(
+      run.pendingDecisions?.some((d) => d.decisionKey === "openPlanItemsNeedDecision"),
+      false,
+      "a claimed-but-unmerged round with no clearing review must reach its own dedicated refusal, not the open-items card"
     );
   });
 
@@ -3244,17 +3261,182 @@ void describe("a zero-change round with unticked plan items is refused without a
 
     const persisted = readProgress(folderPath);
     assert.equal(
-      run.notifications.some((n) => /plan checklist still has/.test(n.message)),
+      run.notifications.some((n) => /unticked item\(s\) and no review has cleared this stage yet/.test(n.message)),
       false,
-      "a clearing review must stand the new gate down, not just the pre-existing latch"
+      "a clearing review must stand the OLD refusal gate down, not just the pre-existing latch"
     );
-    // Standing down routes into the pre-existing under-recording latch this
-    // exact evidence already drives (checklistUnderrecordingConfirmedByReview),
-    // proving the two conditions are complementary rather than fighting.
+    // Standing down still latches the persisted flag (other gates elsewhere
+    // depend on it) even though — see below — the reconcile CARD itself is
+    // now superseded for this round.
     assert.equal(
       persisted?.checklistProgressUnreliable,
       true,
       "the round proceeded far enough to reach the under-recording latch"
+    );
+    // RC2 item 13, Step 50: the round found no task-fixable blockers but the
+    // plan still has unticked items and this round changed no files — the
+    // "nothing more to build" decision card is raised instead of silently
+    // routing onward with no way for the owner to settle the open items.
+    const openItemsDecision = run.pendingDecisions?.find((d) => d.decisionKey === "openPlanItemsNeedDecision");
+    assert.ok(openItemsDecision, "a clean review with unticked items and zero file changes must raise the card");
+    // Implementation review round 2 (review commit c66cbc9, "more than one
+    // surface"): `checklistUnderrecordingConfirmedByReview`'s own
+    // preconditions (zero files, unticked items, a review that clears the
+    // stage) are exactly what also makes the open-items card eligible here —
+    // the two are not independent, they fire on the SAME round. Before this
+    // fix, BOTH cards were posted for this identical shape, contradicting the
+    // "one decision card instead of the two warnings" requirement. The
+    // reconcile-checklist card now stands itself down in favor of this
+    // newer, strictly more actionable one (Step 51's per-item decisions)
+    // whenever both would otherwise fire together.
+    const reconcileDecision = run.pendingDecisions?.find((d) => d.decisionKey === "reconcilePlanChecklist");
+    assert.equal(
+      reconcileDecision,
+      undefined,
+      "the reconcile card must defer to the open-items card raised for this exact round — only one card, ever"
+    );
+  });
+
+  // RC2 item 13, Step 53: the card's items must carry the ROUND's own stated
+  // reasons (owner hand-offs named in its `## Plan Item Checklist`), not just
+  // "no reason given" — this is the end-to-end wiring of
+  // `collectPlanItemReasonsV1` (already unit-tested against a summary
+  // directly) into the raise site in reviewActions.ts, which only the
+  // reason-less `NOTHING_TO_FIX_SUMMARY`/`STERILE_ECHO_NO_CLAIM_SUMMARY`
+  // fixtures above exercised until now.
+  const ROUND_REASONS_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — both remaining items are owner hand-offs this round cannot do",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Add the resolver — deferred — needs an owner deployment step",
+    "- Wire the decoder — not reached — needs a hardware fixture only the owner has",
+  ].join("\n");
+
+  void it("carries the round's own reasons for each open item onto the card, not 'no reason given'", async () => {
+    const { folderPath, progress } = makeTaskFolder("item13_card_lists_round_reasons", {
+      reviewScoreHistory: qualifyingHistory,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: ROUND_REASONS_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const openItemsDecision = run.pendingDecisions?.find((d) => d.decisionKey === "openPlanItemsNeedDecision");
+    assert.ok(openItemsDecision, "a clean review with unticked items and zero file changes must raise the card");
+    assert.match(openItemsDecision.whatHappened, /Add the resolver — needs an owner deployment step/);
+    assert.match(
+      openItemsDecision.whatHappened,
+      /Wire the decoder — needs a hardware fixture only the owner has/
+    );
+    assert.doesNotMatch(
+      openItemsDecision.whatHappened,
+      /no reason given/,
+      "both items had a stated reason — neither should fall back to the no-reason placeholder"
+    );
+    const decideOption = openItemsDecision.options.find((o) => o.optionId === "decideItemByItem");
+    assert.equal(decideOption?.effect.kind, "command");
+    if (decideOption?.effect.kind === "command") {
+      assert.deepEqual(decideOption.effect.args?.[0], {
+        taskFolderPath: folderPath,
+        displayName: progress.displayName,
+        items: [
+          { itemText: "Add the resolver", reason: "needs an owner deployment step" },
+          { itemText: "Wire the decoder", reason: "needs a hardware fixture only the owner has" },
+        ],
+        stage: openItemsDecision.stage,
+      });
+    }
+  });
+
+  // Implementation review round 3 (RC2 item 13, Step 53 completion gap): every
+  // prior test in this block drives `status: "completed"` with zero files —
+  // the open-items card's own raise site sits entirely inside the function's
+  // `if (result.status === "completed")` branch (reviewActions.ts), so a
+  // round that never reaches that branch at all must never reach the card
+  // either. This is a genuine provider failure — a real `"failed"` result,
+  // not a completed-but-unproductive one — reported the same way an ordinary
+  // provider error (a request that errored out, not a watchdog kill) is: it
+  // falls straight to the function's final `else` branch, which shows a
+  // failure notification and returns without ever computing `planChecklist`,
+  // `checklistMergeResult`, or `sterileRoundDecision` at all.
+  void it("a genuine provider failure (not a completed zero-file round) never raises the open-items card", async () => {
+    const { folderPath, progress } = makeTaskFolder("item13_no_card_on_provider_failure", {
+      reviewScoreHistory: qualifyingHistory,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "failed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      errorMessage: "The provider request failed: connection reset",
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    assert.equal(
+      run.pendingDecisions?.some((d) => d.decisionKey === "openPlanItemsNeedDecision"),
+      false,
+      "a round that failed outright must never raise the 'nothing more to build' card"
+    );
+    assert.equal(
+      run.notifications.some((n) =>
+        /Implementation failed: The provider request failed: connection reset/.test(n.message)
+      ),
+      true,
+      "the operator must still be told the round failed, through the ordinary failure notification"
+    );
+  });
+
+  // Same completion gap, the other named shape: a malformed-result outcome.
+  // At this boundary `runImplementationOrSealedV1`'s own
+  // `describeEditActionOutcomeFailureV1` collapses a coordinator
+  // `malformedResult` outcome into this exact `status: "failed"` shape — an
+  // `errorMessage` of "...did not complete (malformedResult)...— see that
+  // function's `code`/`declaredDetail`/`outcome=` assembly. Driving that
+  // literal shape here proves the open-items card's exclusion covers the
+  // malformed-result path specifically, not merely "some failed status".
+  void it("a malformed-result outcome (collapsed to a failed round) never raises the open-items card", async () => {
+    const { folderPath, progress } = makeTaskFolder("item13_no_card_on_malformed_result", {
+      reviewScoreHistory: qualifyingHistory,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "failed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      errorMessage:
+        "The edit action did not complete (malformedResult). The response was missing the required end " +
+        "marker. outcome=malformedResult, no chain evidence attached.",
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    assert.equal(
+      run.pendingDecisions?.some((d) => d.decisionKey === "openPlanItemsNeedDecision"),
+      false,
+      "a malformed-result round must never raise the 'nothing more to build' card either"
+    );
+    assert.equal(
+      run.notifications.some((n) => /did not complete \(malformedResult\)/.test(n.message)),
+      true,
+      "the operator must still see the malformed-result failure reported"
     );
   });
 });
@@ -3335,18 +3517,32 @@ void describe("checklistProgressUnreliable latches on a review-confirmed sterile
     assert.equal(
       persisted.checklistProgressUnreliable,
       true,
-      "a qualifying zero-blocker full-marks review proves the checklist counts are under-recording"
+      "a qualifying zero-blocker full-marks review proves the checklist counts are under-recording — " +
+        "the underlying latch is still set even though the surfaced card changes below"
+    );
+    // Implementation review round 2 (review commit c66cbc9, "more than one
+    // surface"): this exact shape (zero files, unticked items, a qualifying
+    // review) is ALSO exactly what RC2 item 13's "nothing more to build" card
+    // fires on — the two diagnoses are not independent. Before this fix, both
+    // the reconcile card AND the open-items card were posted for one round;
+    // now the operator sees only the newer, strictly more actionable
+    // open-items card (Step 51's per-item decisions), and the reconcile
+    // card/run-log note stand themselves down in its favor.
+    const openItemsDecision = run.pendingDecisions?.find((d) => d.decisionKey === "openPlanItemsNeedDecision");
+    assert.ok(
+      openItemsDecision,
+      "the operator must be told what happened, not just that nothing happened"
     );
     const reconcileDecision = run.pendingDecisions?.find((d) => d.decisionKey === "reconcilePlanChecklist");
-    assert.ok(
+    assert.equal(
       reconcileDecision,
-      "the operator must be told the counts are being stood down, not just that nothing happened"
+      undefined,
+      "only one card is ever pending for this shape — the open-items card supersedes the reconcile card"
     );
-    assert.match(reconcileDecision.whatHappened, /unreliable/);
     const logs = readRunLogs(folderPath);
     assert.ok(
-      logs.some((log) => /## Checklist counts stood down \(under-recording\)/.test(log)),
-      "the run log must record why the gate stood itself down"
+      !logs.some((log) => /## Checklist counts stood down \(under-recording\)/.test(log)),
+      "the superseded reconcile note is not written either, for the same one-narrative-per-round reason"
     );
   });
 

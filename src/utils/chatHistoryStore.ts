@@ -17,7 +17,7 @@ import {
   getWorkflowPathRegistryV1,
   getWorkflowPrivateStorageRootIdV1,
 } from "../services/workflowRuntimeServicesV1";
-import { WorkflowFileLocatorV1 } from "../services/workflowFileStoreV1";
+import { WorkflowFileLocatorV1, WorkflowFileRevisionV1 } from "../services/workflowFileStoreV1";
 import { ChatInteractionTransactionV1 } from "../types/chatInteractionTransactionV1";
 import {
   decodeStructuredAnswersArrayV1,
@@ -196,12 +196,63 @@ export const onDidChangeChatHistoryV1: vscode.Event<{
 }> = chatHistoryChangeEmitterV1.event;
 
 /**
+ * `persistDocument`'s most recent successful write per document (RC2 item
+ * 11, Step 44). `notifyChatHistoryChangedExternallyV1` below compares this
+ * against the file's CURRENT on-disk revision when the watcher fires: a
+ * watcher event is this host's own echo of `persistDocument`'s in-process
+ * fire only when the file still holds EXACTLY the bytes recorded here — a
+ * mere time window is not enough (implementation review, 2026-09-28: a
+ * genuine external write landing inside the same few seconds is
+ * indistinguishable from an echo by time alone, and would be silently
+ * dropped). The `at` timestamp is cleanup-only, bounding how long a
+ * document's entry survives once nothing has written to it since — it does
+ * not gate the suppression decision.
+ */
+const recentLocalWritesV1 = new Map<string, { readonly at: number; readonly revision: WorkflowFileRevisionV1 }>();
+const RECENT_LOCAL_WRITE_PRUNE_WINDOW_MS_V1 = 60_000;
+
+function chatHistoryDocumentKeyV1(taskFolderPath: string, canonicalId: string): string {
+  return `${taskFolderPath}\u0000${canonicalId}`;
+}
+
+function pruneRecentLocalWritesV1(now: number): void {
+  for (const [key, entry] of recentLocalWritesV1) {
+    if (now - entry.at >= RECENT_LOCAL_WRITE_PRUNE_WINDOW_MS_V1) {
+      recentLocalWritesV1.delete(key);
+    }
+  }
+}
+
+/**
  * A chat document changed on disk by ANOTHER extension host — the cloud
  * runner writing questions and replies that a viewer window shows
  * (hostRoleV1.ts). The in-process emitter above only sees this host's own
- * writes; extension.ts's `chat-v1.json` file watcher fires this instead.
+ * writes; extension.ts's `chat-v1.json` file watcher fires this instead. A
+ * watcher event is skipped only when the file's CURRENT on-disk revision
+ * still exactly matches this host's last recorded write for that document
+ * (see `recentLocalWritesV1` above) — `persistDocument` already fired this
+ * exact change in-process, so firing again here would render the same write
+ * twice. Any other on-disk revision — a genuinely different write, from this
+ * host or another, however soon after the recorded one — still fires
+ * normally, as does a document this host has never written (no recorded
+ * revision to compare against) or a `stat` that fails or is inconclusive:
+ * suppression only ever happens on a confirmed exact match, never by default.
  */
-export function notifyChatHistoryChangedExternallyV1(taskFolderPath: string, canonicalId: string): void {
+export async function notifyChatHistoryChangedExternallyV1(
+  taskFolderPath: string,
+  canonicalId: string
+): Promise<void> {
+  const now = Date.now();
+  pruneRecentLocalWritesV1(now);
+  const key = chatHistoryDocumentKeyV1(taskFolderPath, canonicalId);
+  const lastLocalWrite = recentLocalWritesV1.get(key);
+  if (lastLocalWrite !== undefined) {
+    const locator = historyLocator(taskFolderPath, canonicalId);
+    const stat = await getWorkflowFileStoreV1().stat(locator);
+    if (stat.kind === "ok" && stat.value.kind === "file" && stat.value.revision === lastLocalWrite.revision) {
+      return;
+    }
+  }
   chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
 }
 
@@ -1279,6 +1330,10 @@ async function persistDocument(
       ? await fileStore.replaceFileExact(locator, bytes, expectedRevision)
       : await fileStore.createFileExclusive(locator, bytes);
   if (result.kind === "ok") {
+    recentLocalWritesV1.set(chatHistoryDocumentKeyV1(taskFolderPath, canonicalId), {
+      at: Date.now(),
+      revision: result.value.revision,
+    });
     chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
     return;
   }
@@ -1810,6 +1865,16 @@ function mapTransactionStateToMirrorV1(
 ): ChatDocumentInteractionStateV1 | undefined {
   if (transaction.state !== "settled" || transaction.settlement === undefined) {
     return undefined;
+  }
+  // Item 2 / Step 55's `timedOut`/`interrupted` settlements apply only to a
+  // record settled BEFORE it was ever posted as questions (see
+  // `settleTerminalInvocationV1`'s doc comment in taskActionCoordinatorV1.ts)
+  // — such a record has no mirror interaction to reconcile here at all. This
+  // mapping exists only so the display-state union stays exhaustive; render
+  // either as `cancelled`, the closest existing "ended without completing"
+  // mirror state, should one ever reach a posted interaction.
+  if (transaction.settlement === "timedOut" || transaction.settlement === "interrupted") {
+    return "cancelled";
   }
   return transaction.settlement;
 }

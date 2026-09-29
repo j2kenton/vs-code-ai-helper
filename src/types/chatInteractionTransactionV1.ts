@@ -186,13 +186,24 @@ export type ChatInteractionTransactionStateV1 =
   | "resumeScheduled"
   | "settled";
 
-/** §5.5's terminal settlements, verbatim. */
+/**
+ * §5.5's terminal settlements, plus two RC2 item 2 additions: `timedOut`
+ * (the broker's bounded invocation deadline elapsed) and `interrupted` (an
+ * orphaned round the extension host lost track of, reconciled after the
+ * fact). Both settle a durable `invocationPending` record explicitly instead
+ * of letting `discardInvocation` silently delete it — the record's
+ * transitions then show WHY the invocation never became a real interaction,
+ * instead of vanishing indistinguishably from an ordinary non-questions
+ * completion.
+ */
 export type ChatInteractionSettlementV1 =
   | "resumed"
   | "cancelled"
   | "supersededByReplacementOperation"
   | "expired"
-  | "resetByChatRecovery";
+  | "resetByChatRecovery"
+  | "timedOut"
+  | "interrupted";
 
 /**
  * One journaled state transition. The first receipt of every record has
@@ -320,6 +331,8 @@ const SETTLEMENTS_V1: readonly ChatInteractionSettlementV1[] = [
   "supersededByReplacementOperation",
   "expired",
   "resetByChatRecovery",
+  "timedOut",
+  "interrupted",
 ];
 
 /**

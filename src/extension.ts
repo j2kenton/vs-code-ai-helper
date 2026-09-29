@@ -1,9 +1,14 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
+import type { TaskActionOutcomeV1 } from "./types/taskActionOutcomeV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
 import { consumeSendAcceptedV1 } from "./commands/chatWithStage";
-import { releaseStuckAdmissionMarkers } from "./commands/releaseStuckAdmissionMarkers";
+import {
+  createAdmissionHeldNotifierV1,
+  releaseStuckAdmissionMarkers,
+  registerHeldAdmissionMarkerCommandsV1,
+} from "./commands/releaseStuckAdmissionMarkers";
 import {
   configureViewerCommandForwarderV1,
   decodeRelayedCommandArgV1,
@@ -43,9 +48,13 @@ import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./u
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
+  trySafeAdmissionReleaseV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  recordAdmissionReleaseTriggerV1,
 } from "./state/workAdmissionV1";
 import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
 import {
@@ -85,6 +94,7 @@ import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
 import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
+import { registerDecideOpenPlanItemsCommandV1 } from "./commands/decideOpenPlanItemsV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -171,6 +181,7 @@ import { installOperationNotificationBridge } from "./utils/operationNotificatio
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
+import { runWithRoundProcessTaskFolderV1 } from "./state/roundProcessContextV1";
 import type { OperationKind } from "./utils/operationTaxonomy";
 import { STAGE_DISPLAY_NAMES, type TaskStage } from "./types/taskProgress";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
@@ -186,7 +197,7 @@ import {
   configureWorkflowDecisionStateV1,
   dismissOrphanedAwaitedDecisionsV1,
 } from "./utils/workflowDecisionDispatchV1";
-import { setInertTrailingObserverV1 } from "./types/aiResultEnvelope";
+import { setInertTrailingObserverV1, setRepairedFrameEndObserverV1 } from "./types/aiResultEnvelope";
 import { setLmToolSessionObserverV1, setLmToolSessionRequestIssuedObserverV1 } from "./services/languageModelToolSessionV1";
 import { setReadToolCallObserverV1 } from "./services/readToolSessionHandlerV1";
 
@@ -272,6 +283,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Real bytes, not .length: the inert set's `\s` matches Unicode
       // whitespace, whose code-unit and UTF-8 lengths differ.
       JSON.stringify({ inertTrailing, byteLength: Buffer.byteLength(inertTrailing, "utf8") })
+    );
+  });
+
+  // Same tolerance-must-be-visible rule for the lookalike-marker repair
+  // (item 5, 2026-09-28 field report): a frame whose end marker differs from
+  // FRAME_END_V1 by exactly one code point is accepted, but never silently.
+  setRepairedFrameEndObserverV1((repair) => {
+    console.warn(
+      "[ensemble:aiResult] repaired a frame end marker with one substituted code point",
+      JSON.stringify(repair)
     );
   });
 
@@ -438,120 +459,135 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return validated.ok ? { ok: true } : { ok: false, reason: validated.reason };
     },
     resume: async (ref, resumeIdempotencyId, admissionHandoffTokenV1) => {
-      const loaded = await chatConversationOrchestrator.loadInteraction(ref);
-      if (loaded.kind !== "ok") {
-        return {
-          ok: false,
-          reason: loaded.kind === "storageUnavailable" ? "workflow storage is unavailable" : loaded.reason,
-        };
-      }
-      const actionKey = loaded.record.correlation.actionKey;
-      const cancellation = new vscode.CancellationTokenSource();
-      try {
-        if (actionKey === GENERATE_PLAN_ACTION_KEY_V1) {
-          return await resumeGeneratePlanInteractionV1(
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
+      const dispatchResumeV1 = async (): Promise<ChatInteractionResumeResultV1> => {
+        const loaded = await chatConversationOrchestrator.loadInteraction(ref);
+        if (loaded.kind !== "ok") {
+          return {
+            ok: false,
+            reason: loaded.kind === "storageUnavailable" ? "workflow storage is unavailable" : loaded.reason,
+          };
         }
-        if (actionKey === DRAFT_ACTION_KEY_V1) {
-          return await resumeDraftInteractionV1(
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
+        const actionKey = loaded.record.correlation.actionKey;
+        const cancellation = new vscode.CancellationTokenSource();
+        try {
+          if (actionKey === GENERATE_PLAN_ACTION_KEY_V1) {
+            return await resumeGeneratePlanInteractionV1(
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === DRAFT_ACTION_KEY_V1) {
+            return await resumeDraftInteractionV1(
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === GENERATE_IMPLEMENTATION_ACTION_KEY_V1) {
+            return await resumeGenerateImplementationInteractionV1(
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === REVIEW_ACTION_KEY_V1) {
+            return await resumeReviewInteractionV1(
+              context.extensionUri,
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === APPLY_REVIEW_ACTION_KEY_V1) {
+            return await resumeApplyReviewInteractionV1(
+              context.extensionUri,
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === CHAT_SEND_ACTION_KEY_V1) {
+            return await resumeChatSendInteractionV1(
+              context,
+              inventory,
+              currentTaskStore,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              cancellation.token
+            );
+          }
+          if (actionKey === COMMIT_PUSH_METADATA_ACTION_KEY_V1) {
+            // Not threaded through `cancellation.token`: Resume here starts a
+            // fresh, linked public Commit and Push operation (plan §10.2
+            // point 5), which owns its own tracked-operation cancellation
+            // token rather than reusing this Chat-scoped one.
+            return await resumeCommitPushMetadataInteractionV1(
+              inventory,
+              chatViewProvider,
+              ref,
+              resumeIdempotencyId,
+              currentTaskStore,
+              context
+            );
+          }
+          if (isEditPreflightActionKeyV1(actionKey)) {
+            // The four edit-capable preflight actions (implementation.v1,
+            // fastForward.v1, applyReviewEdit.v1, lint.v1) share sameOperation
+            // Resume semantics: a fresh preflight attempt with a fresh
+            // observation baseline, continuing into the sealed edit session
+            // when a plan seals (plan §7.3 / AC-PREFLIGHT-04).
+            //
+            // `admissionHandoffTokenV1` (2026-09-09 review completion blocker):
+            // forwarded from chatView.ts's resumeInteraction, which acquired
+            // durable work admission for this task before ITS OWN first
+            // await — i.e. before the `loadInteraction` call just above too.
+            // Threading it through lets this handler adopt that SAME marker
+            // instead of racing its own genesis, closing the setup-phase
+            // watchdog-pause race across the whole chatView.ts → extension.ts →
+            // handler boundary, not just inside the handler itself.
+            return await resumeEditPreflightInteractionV1(
+              inventory,
+              chatViewProvider,
+              ref,
+              actionKey,
+              resumeIdempotencyId,
+              cancellation.token,
+              admissionHandoffTokenV1
+            );
+          }
+          return {
+            ok: false,
+            reason: "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
+          };
+        } finally {
+          cancellation.dispose();
         }
-        if (actionKey === GENERATE_IMPLEMENTATION_ACTION_KEY_V1) {
-          return await resumeGenerateImplementationInteractionV1(
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
-        }
-        if (actionKey === REVIEW_ACTION_KEY_V1) {
-          return await resumeReviewInteractionV1(
-            context.extensionUri,
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
-        }
-        if (actionKey === APPLY_REVIEW_ACTION_KEY_V1) {
-          return await resumeApplyReviewInteractionV1(
-            context.extensionUri,
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
-        }
-        if (actionKey === CHAT_SEND_ACTION_KEY_V1) {
-          return await resumeChatSendInteractionV1(
-            context,
-            inventory,
-            currentTaskStore,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            cancellation.token
-          );
-        }
-        if (actionKey === COMMIT_PUSH_METADATA_ACTION_KEY_V1) {
-          // Not threaded through `cancellation.token`: Resume here starts a
-          // fresh, linked public Commit and Push operation (plan §10.2
-          // point 5), which owns its own tracked-operation cancellation
-          // token rather than reusing this Chat-scoped one.
-          return await resumeCommitPushMetadataInteractionV1(
-            inventory,
-            chatViewProvider,
-            ref,
-            resumeIdempotencyId,
-            currentTaskStore,
-            context
-          );
-        }
-        if (isEditPreflightActionKeyV1(actionKey)) {
-          // The four edit-capable preflight actions (implementation.v1,
-          // fastForward.v1, applyReviewEdit.v1, lint.v1) share sameOperation
-          // Resume semantics: a fresh preflight attempt with a fresh
-          // observation baseline, continuing into the sealed edit session
-          // when a plan seals (plan §7.3 / AC-PREFLIGHT-04).
-          //
-          // `admissionHandoffTokenV1` (2026-09-09 review completion blocker):
-          // forwarded from chatView.ts's resumeInteraction, which acquired
-          // durable work admission for this task before ITS OWN first
-          // await — i.e. before the `loadInteraction` call just above too.
-          // Threading it through lets this handler adopt that SAME marker
-          // instead of racing its own genesis, closing the setup-phase
-          // watchdog-pause race across the whole chatView.ts → extension.ts →
-          // handler boundary, not just inside the handler itself.
-          return await resumeEditPreflightInteractionV1(
-            inventory,
-            chatViewProvider,
-            ref,
-            actionKey,
-            resumeIdempotencyId,
-            cancellation.token,
-            admissionHandoffTokenV1
-          );
-        }
-        return {
-          ok: false,
-          reason: "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
-        };
-      } finally {
-        cancellation.dispose();
-      }
+      };
+      // Establishes the same async-local task-folder context `runTrackedOperation`
+      // gives ordinary tracked actions (item 2 / Step 54): a provider CLI this
+      // resumed round spawns is then recorded against the admission claim the
+      // caller already acquired for this task (chatView.ts's `resumeInteraction`
+      // or extension.ts's `relayedResume`, both before this dispatch), so a
+      // timeout or cancellation on a resumed round can identify and settle its
+      // process the same way a fresh tracked operation's can. Falls through
+      // unwrapped, exactly as before, when the binding does not resolve to a
+      // known task.
+      const taskFolderPath = inventory.getTaskByBindingId(ref.taskBindingId)?.taskFolderPath;
+      return taskFolderPath !== undefined
+        ? runWithRoundProcessTaskFolderV1(taskFolderPath, dispatchResumeV1)
+        : dispatchResumeV1();
     },
   };
 
@@ -773,18 +809,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ),
         };
       }
-      const heartbeat = setInterval(() => void admission.handle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`),
+      // same as reviewActions.ts's admission-wired commands — release is
+      // requested at most once, but only actually unlinks the marker once the
+      // round's recorded processes are all confirmed gone; until then the
+      // marker stays held (and the reason is written durably next to it so a
+      // different process's retry refusal can name it too) and the heartbeat
+      // keeps re-checking instead of blocking this `finally` on the process
+      // actually exiting.
+      const relayHandle = admission.handle;
+      const relaySafeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+      const onRelayAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+      const heartbeat = setInterval(() => void relayHeartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      const onRelayAdmissionReleasedV1 = (): void => clearInterval(heartbeat);
+      async function relayHeartbeatTickV1(): Promise<void> {
+        await relayHandle.heartbeat();
+        if (relaySafeReleaseStateV1.releaseRequested && !relaySafeReleaseStateV1.released) {
+          await trySafeAdmissionReleaseV1(relaySafeReleaseStateV1, relayHandle, onRelayAdmissionHeldV1, onRelayAdmissionReleasedV1);
+        }
+      }
       const handoffToken = authorizeWorkAdmissionHandoffV1(task.taskFolderPath);
+      // Step 57a: hoisted above the `try` (a `let` inside `try { }` is not
+      // visible from its paired `finally { }`) so the `finally` below can
+      // classify a deadline/cancellation settlement before the safe release.
+      let relayResumeCoordinatorOutcomeV1: TaskActionOutcomeV1 | undefined;
       try {
         const result = await runnerInteractionServices.resume!(request.ref, request.idempotencyId, handoffToken);
+        relayResumeCoordinatorOutcomeV1 = result.coordinatorOutcome;
         if (result.ok) {
           await settleChatInteraction(task.taskFolderPath, task.canonicalId, request.ref.interactionId, result.settlement);
         }
         return result;
       } finally {
         revokeWorkAdmissionHandoffV1(task.taskFolderPath);
-        clearInterval(heartbeat);
-        await admission.handle.release();
+        recordAdmissionReleaseTriggerV1(relaySafeReleaseStateV1, relayResumeCoordinatorOutcomeV1);
+        await requestSafeAdmissionReleaseV1(relaySafeReleaseStateV1, relayHandle, onRelayAdmissionHeldV1, onRelayAdmissionReleasedV1);
       }
     };
     const runRelayed = async (request: HostRelayRequestV1): Promise<unknown> => {
@@ -992,7 +1051,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const chatWatcher = vscode.workspace.createFileSystemWatcher(`**/${CHAT_HISTORY_FILENAME}`);
   const onChatFileChange = (uri: vscode.Uri): void => {
     const taskFolderPath = normalizePath(path.dirname(uri.fsPath));
-    notifyChatHistoryChangedExternallyV1(taskFolderPath, taskFolderPath);
+    void notifyChatHistoryChangedExternallyV1(taskFolderPath, taskFolderPath);
   };
   chatWatcher.onDidCreate(onChatFileChange);
   chatWatcher.onDidChange(onChatFileChange);
@@ -1261,6 +1320,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerViewArtifactCommands(context);
   registerOpenRetainedPromptCommand(context);
   registerOpenPlanNonGoalsCommand(context);
+  registerDecideOpenPlanItemsCommandV1(context);
+  registerHeldAdmissionMarkerCommandsV1(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerGoToReviewAndApplyCommandV1(context);
@@ -1924,11 +1985,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await taskActionScheduler.armAll();
     }
   };
+  // Debounced (RC2 item 11, Step 46), same trailing-debounce shape as
+  // implChecklistWatcher below: task-progress.json is rewritten on every
+  // activity tick of every running round, and each write is its own
+  // filesystem event — without this, a full `inventory.refresh()` (which
+  // re-discovers every task and re-reads every task's progress file from
+  // disk) ran once per tick instead of once per burst of ticks.
+  let progressRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   const onProgressChange = (): void => {
-    void startupGateReady.then(() => inventory.refresh()).then(async () => {
-      await armSchedulesUnlessViewer();
-      taskTreeProvider.refresh();
-    });
+    if (progressRefreshTimer !== undefined) {
+      clearTimeout(progressRefreshTimer);
+    }
+    progressRefreshTimer = setTimeout(() => {
+      progressRefreshTimer = undefined;
+      void startupGateReady.then(() => inventory.refresh()).then(async () => {
+        await armSchedulesUnlessViewer();
+        taskTreeProvider.refresh();
+      });
+    }, 500);
   };
   progressWatcher.onDidCreate(onProgressChange);
   progressWatcher.onDidChange(onProgressChange);
@@ -2069,6 +2143,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (implChecklistTimer !== undefined) clearTimeout(implChecklistTimer);
       },
     },
+    { dispose: () => { if (progressRefreshTimer !== undefined) clearTimeout(progressRefreshTimer); } },
     { dispose: () => { if (schedulerRecoveryTimer !== undefined) clearInterval(schedulerRecoveryTimer); } },
     configListener,
     currentTaskListener,

@@ -158,6 +158,90 @@ void describe("describeTaskActionOutcomeForLogV1", () => {
       "Status: malformed result (invalidFrame) [OpenAI Codex (gpt-5.6-sol@high)]"
     );
   });
+
+  void it("records a repaired frame end marker (item 5) on the round's run-log line", () => {
+    const repaired: TaskActionOutcomeV1 = {
+      kind: "completed",
+      correlation: CORRELATION,
+      code: "completed",
+      frameRepairV1: { expected: "<<<END_ENSEMBLE_AI_RESULT_V1>>>", actual: "<<<END_ENSᗩMBLE_AI_RESULT_V1>>>", index: 10 },
+    };
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(repaired),
+      "Status: completed (completed)\nFrame: end marker repaired (one substituted character at index 10)"
+    );
+    // Absent on every ordinary completed outcome (no repair happened).
+    assert.doesNotMatch(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[0]!), /Frame: end marker repaired/);
+  });
+
+  void it("records every earlier attempt's own rejection reason on the round's run-log line (item 6)", () => {
+    const exhausted: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "invalidEnvelope",
+      detail: 'unsupported envelope "version": 99',
+      priorRejectedAttemptsV1: [
+        { attemptId: "attempt-1", code: "invalidFrame", detail: "expected the frame to end with <<<END...>>>" },
+        { attemptId: "attempt-2", code: "invalidJson", detail: "the JSON payload is empty" },
+      ],
+    };
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(exhausted),
+      "Status: malformed result (invalidEnvelope: unsupported envelope \"version\": 99)\n" +
+        "Attempt attempt-1 rejected (invalidFrame: expected the frame to end with <<<END...>>>)\n" +
+        "Attempt attempt-2 rejected (invalidJson: the JSON payload is empty)"
+    );
+    // No prior attempts (the ordinary, non-chained case) renders exactly as before.
+    assert.doesNotMatch(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[4]!), /Attempt .* rejected/);
+  });
+
+  void it(
+    "names the FINAL attempt's own id next to the status line, for both malformedResult and " +
+      "failed/contentContractFailed chains (2026-09-28 implementation-review follow-up to item 6: " +
+      "every prior attempt got its id on its own line, but the chain's own final attempt — the one " +
+      "the status line itself reports — had no id anywhere in the run file)",
+    () => {
+      const exhaustedMalformed: TaskActionOutcomeV1 = {
+        kind: "malformedResult",
+        correlation: CORRELATION,
+        code: "invalidEnvelope",
+        detail: 'unsupported envelope "version": 99',
+        attemptId: "attempt-3",
+        priorRejectedAttemptsV1: [
+          { attemptId: "attempt-1", code: "invalidFrame" },
+          { attemptId: "attempt-2", code: "invalidJson" },
+        ],
+      };
+      assert.equal(
+        describeTaskActionOutcomeForLogV1(exhaustedMalformed),
+        "Status: malformed result (invalidEnvelope: unsupported envelope \"version\": 99) [attempt=attempt-3]\n" +
+          "Attempt attempt-1 rejected (invalidFrame)\n" +
+          "Attempt attempt-2 rejected (invalidJson)"
+      );
+      const exhaustedContentContract: TaskActionOutcomeV1 = {
+        kind: "failed",
+        correlation: CORRELATION,
+        code: "contentContractFailed",
+        retryable: false,
+        detail: 'missing required "MAGIC" marker (got: "third candidate")',
+        attemptId: "attempt-3",
+        priorRejectedAttemptsV1: [
+          { attemptId: "attempt-1", code: "contentContractFailed", detail: "missing required \"MAGIC\" marker (got: \"first candidate\")" },
+          { attemptId: "attempt-2", code: "contentContractFailed", detail: "missing required \"MAGIC\" marker (got: \"second candidate\")" },
+        ],
+      };
+      assert.equal(
+        describeTaskActionOutcomeForLogV1(exhaustedContentContract),
+        "Status: failed (code=contentContractFailed: missing required \"MAGIC\" marker (got: \"third candidate\"), " +
+          "retryable=false) [attempt=attempt-3]\n" +
+          "Attempt attempt-1 rejected (contentContractFailed: missing required \"MAGIC\" marker (got: \"first candidate\"))\n" +
+          "Attempt attempt-2 rejected (contentContractFailed: missing required \"MAGIC\" marker (got: \"second candidate\"))"
+      );
+      // No attemptId set (every pre-existing outcome) renders exactly as before.
+      assert.doesNotMatch(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[3]!), /\[attempt=/);
+      assert.doesNotMatch(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[4]!), /\[attempt=/);
+    }
+  );
 });
 
 void describe("describeTaskActionFailureV1", () => {
@@ -192,6 +276,114 @@ void describe("describeTaskActionFailureV1", () => {
       describeTaskActionFailureV1(withDetail),
       "the model's response was malformed (contentSchemaMismatch: received content type \"chat-message.v1\", expected \"markdown-artifact.v1\")"
     );
+  });
+
+  void it("summarizes every attempt's own reason, not only the last, when a malformed chain exhausted (item 6)", () => {
+    const exhausted: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "invalidEnvelope",
+      detail: 'unsupported envelope "version": 99',
+      priorRejectedAttemptsV1: [
+        { attemptId: "attempt-1", code: "invalidFrame" },
+        { attemptId: "attempt-2", code: "invalidJson", detail: "the JSON payload is empty" },
+      ],
+    };
+    assert.strictEqual(
+      describeTaskActionFailureV1(exhausted),
+      "the model's response was malformed (attempt 1: invalidFrame; " +
+        "attempt 2: invalidJson: the JSON payload is empty; " +
+        'final attempt: invalidEnvelope: unsupported envelope "version": 99)'
+    );
+  });
+
+  void it(
+    "summarizes every attempt's own reason, not only the last, when a content-contract " +
+      "(failed/contentContractFailed) chain exhausted (2026-09-28 implementation-review follow-up to " +
+      "item 6: this chain kind shares the same history shape as malformedResult but was not wired up)",
+    () => {
+      const exhausted: TaskActionOutcomeV1 = {
+        kind: "failed",
+        correlation: CORRELATION,
+        code: "contentContractFailed",
+        retryable: false,
+        detail: 'missing required "MAGIC" marker (got: "third")',
+        priorRejectedAttemptsV1: [
+          { attemptId: "attempt-1", code: "contentContractFailed", detail: 'missing required "MAGIC" marker (got: "first")' },
+          { attemptId: "attempt-2", code: "contentContractFailed", detail: 'missing required "MAGIC" marker (got: "second")' },
+        ],
+      };
+      assert.strictEqual(
+        describeTaskActionFailureV1(exhausted),
+        'attempt 1: contentContractFailed: missing required "MAGIC" marker (got: "first"); ' +
+          'attempt 2: contentContractFailed: missing required "MAGIC" marker (got: "second"); ' +
+          'final attempt: contentContractFailed: missing required "MAGIC" marker (got: "third")'
+      );
+      // No prior attempts (the ordinary, non-chained case) renders exactly as before.
+      assert.strictEqual(
+        describeTaskActionFailureV1(ALL_OUTCOMES[3]!),
+        "providerExploded (retryable)"
+      );
+    }
+  );
+
+  void it("renders an invocationDeadlineExceeded failure as 'timed out after N minutes' (item 2 / Step 55)", () => {
+    const timedOut: TaskActionOutcomeV1 = {
+      kind: "failed",
+      correlation: CORRELATION,
+      code: "invocationDeadlineExceeded",
+      retryable: true,
+      detail: "provider invocation exceeded 3600000ms",
+    };
+    assert.strictEqual(
+      describeTaskActionFailureV1(timedOut),
+      "timed out after 60 minutes (retryable)"
+    );
+  });
+
+  void it("falls back to 'timed out' for an invocationDeadlineExceeded failure with no parseable detail", () => {
+    const timedOut: TaskActionOutcomeV1 = {
+      kind: "failed",
+      correlation: CORRELATION,
+      code: "invocationDeadlineExceeded",
+      retryable: true,
+    };
+    assert.strictEqual(describeTaskActionFailureV1(timedOut), "timed out (retryable)");
+  });
+
+  void it("renders a callerCancelled/providerCancelled failure as 'cancelled — <detail>' (item 2 / Step 55)", () => {
+    const stillRunning: TaskActionOutcomeV1 = {
+      kind: "failed",
+      correlation: CORRELATION,
+      code: "providerCancelled",
+      retryable: true,
+      detail: "a provider process may still be running and was not confirmed stopped",
+    };
+    assert.strictEqual(
+      describeTaskActionFailureV1(stillRunning),
+      "cancelled — a provider process may still be running and was not confirmed stopped (retryable)"
+    );
+    const unconfirmedSpawn: TaskActionOutcomeV1 = {
+      kind: "failed",
+      correlation: CORRELATION,
+      code: "callerCancelled",
+      retryable: true,
+      detail: "a provider process may still be starting and could not be confirmed stopped",
+    };
+    assert.strictEqual(
+      describeTaskActionFailureV1(unconfirmedSpawn),
+      "cancelled — a provider process may still be starting and could not be confirmed stopped (retryable)"
+    );
+  });
+
+  void it("falls back to plain 'cancelled' for a callerCancelled/providerCancelled failure with no detail", () => {
+    const noDetail: TaskActionOutcomeV1 = {
+      kind: "failed",
+      correlation: CORRELATION,
+      code: "providerCancelled",
+      retryable: true,
+    };
+    assert.strictEqual(describeTaskActionFailureV1(noDetail), "cancelled (retryable)");
   });
 });
 

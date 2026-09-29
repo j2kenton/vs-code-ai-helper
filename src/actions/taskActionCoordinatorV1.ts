@@ -144,6 +144,7 @@ import {
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { currentRoundProcessRecordingTargetV1 } from "../state/roundProcessContextV1";
 import { classifyFailure, parseQuotaResetV1 } from "../utils/quota";
 import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import {
@@ -154,6 +155,7 @@ import {
   parseAiResultEnvelopeV1,
 } from "../types/aiResultEnvelope";
 import {
+  MalformedResultAttemptRecordV1,
   ProviderChainCandidateStatusV1,
   ProviderChainExhaustionV1,
   TaskActionOutcomeV1,
@@ -1251,6 +1253,36 @@ function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1, detail?: st
  * candidate's single entry, reporting the LAST (most informative — e.g. the
  * retry's own failure, not the original's) outcome.
  */
+
+/**
+ * Fold a rejection-chain's full attempt history onto its final terminal
+ * outcome (item 6, 2026-09-26 field report, and its 2026-09-28
+ * implementation-review follow-up): before this, an exhausted chain returned
+ * only its LAST attempt's outcome — every earlier attempt's own rejection
+ * reason was recorded nowhere once a later attempt's outcome overwrote it in
+ * memory, and the LAST attempt's own id was never recorded anywhere either.
+ * `history` is ordered oldest first and always ends with the attempt
+ * `outcome` itself reports, so everything before the last entry is "prior"
+ * to it. Covers BOTH chain kinds that share this attempt-advancement loop —
+ * `malformedResult` (a bad envelope/frame) and `failed`/`contentContractFailed`
+ * (a schema-valid envelope that fails the row's own content rule) — since
+ * the follow-up review found the original fix only wired the first.
+ */
+function attachPriorRejectedAttemptsV1(
+  outcome: TaskActionOutcomeV1,
+  history: readonly MalformedResultAttemptRecordV1[]
+): TaskActionOutcomeV1 {
+  if ((outcome.kind !== "malformedResult" && outcome.kind !== "failed") || history.length === 0) {
+    return outcome;
+  }
+  const finalAttempt = history[history.length - 1]!;
+  const prior = history.slice(0, -1);
+  return {
+    ...outcome,
+    attemptId: finalAttempt.attemptId,
+    ...(prior.length > 0 ? { priorRejectedAttemptsV1: prior } : {}),
+  };
+}
 function enrichChainExhaustionWithAttemptOutcomesV1(
   exhaustion: ProviderChainExhaustionV1,
   session: ProviderSelectionSessionV1,
@@ -1659,8 +1691,21 @@ export function createTaskActionCoordinatorV1(
     operationId?: OperationIdV1,
     /** See `TaskActionRequestV1.onAttemptAllocated`. */
     onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"],
-    taskBinding?: TaskBindingRefV1
+    taskBinding?: TaskBindingRefV1,
+    /**
+     * Item 2 / Step 55 out-parameter: set `attempted = true` when a terminal
+     * `settleInvocation` call is made for this invocation (deadline or
+     * cancellation). `continueAdmittedAction` reads this after the call to
+     * decide whether its generic post-outcome `discardInvocation` cleanup
+     * may run — it must not, on either a settle success (already a safe
+     * no-op once the record is no longer `invocationPending`) or a settle
+     * failure (where running discard anyway would delete the record instead
+     * of leaving it for reconciliation, silently losing the only evidence
+     * this invocation ever ran).
+     */
+    settlementSignalOutV1?: { attempted: boolean }
   ): Promise<TaskActionOutcomeV1> {
+    const terminalSettlementAttemptedV1 = settlementSignalOutV1 ?? { attempted: false };
     const attachmentFailureOutcomeV1 = (
       attemptId: string,
       failureKind: string,
@@ -1689,6 +1734,49 @@ export function createTaskActionCoordinatorV1(
       retryable: false,
       detail: formatIdentityAttachmentFailureDetailV1(failureKind, detail),
     });
+    /**
+     * Item 2 / Step 55: settle this operation's admitted `invocationPending`
+     * chat-transaction record as `timedOut` or `cancelled` instead of
+     * letting the ordinary post-outcome `discardInvocation` in
+     * `continueAdmittedAction` silently delete it, so the record's history
+     * shows what happened rather than reading identically to an ordinary
+     * non-questions completion. Gated on `row.permittedResultKinds`
+     * including `"questions"` — the only rows that ever admit one (see
+     * `admitAction` and `questionCapableInvocation` below) — not on whether
+     * THIS iteration itself admitted it: `admitAction` frequently admits the
+     * FIRST attempt's record before `runProviderRow` is ever called (Item 9
+     * fix), so a per-iteration gate would silently miss the common case. A
+     * settle call is always safe here: `settleTerminal` is legal from any
+     * unsettled state (`cancel`/`expire` already rely on the same
+     * guarantee), a spread of the existing record so no other field —
+     * including any in-progress Resume-claim bookkeeping — is disturbed,
+     * and a no-op (rejected, silently swallowed) once the record is already
+     * settled or was never admitted at all.
+     */
+    const settleTerminalInvocationV1 = async (
+      opId: string,
+      settlement: "timedOut" | "cancelled"
+    ): Promise<void> => {
+      if (!row.permittedResultKinds.includes("questions")) {
+        return;
+      }
+      terminalSettlementAttemptedV1.attempted = true;
+      const settled = await deps.orchestrator.settleInvocation(opId, settlement);
+      if (!settled) {
+        // The store write did not durably land — the record may still be
+        // `invocationPending`. Do NOT let this look like success: log it so
+        // it is diagnosable, and leave `terminalSettlementAttemptedV1` set so
+        // `continueAdmittedAction`'s post-outcome cleanup below does not run
+        // `discardInvocation` on it. A failed settle attempt must leave the
+        // record either durably terminal or untouched (`invocationPending`
+        // for later reconciliation) — never silently deleted, which would
+        // erase the only evidence this invocation ever ran.
+        console.error(
+          `settleInvocation(${opId}, ${settlement}) did not durably settle the chat-transaction ` +
+            "record; leaving it as-is rather than discarding it."
+        );
+      }
+    };
     /** See `classifyAttemptAllocationFailureV1`'s own doc comment for the
      * fail-open/fail-closed split this applies. */
     type AttemptAllocationReportV1 =
@@ -1783,6 +1871,15 @@ export function createTaskActionCoordinatorV1(
       row.providerMode === "text" && row.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1;
     let malformedInvocationCountV1 = malformedInvocationsAlreadyUsedV1 ?? 0;
     let lastMalformedOutcomeV1: TaskActionOutcomeV1 | undefined;
+    // Every attempt this operation's malformed-envelope-parse branch AND its
+    // content-contract-check branch below have rejected so far, oldest
+    // first — see `attachPriorRejectedAttemptsV1`. Shared across both
+    // branches (2026-09-28 implementation-review follow-up to item 6): the
+    // field report's own earlier-rejected attempts had a valid frame and
+    // valid JSON, so they went through the content-contract branch, not the
+    // malformed-envelope-parse branch — a history scoped to only the latter
+    // would have missed exactly the attempts the report was about.
+    const malformedAttemptHistoryV1: MalformedResultAttemptRecordV1[] = [];
     // Armed once a malformed result has been seen for this row — either in
     // this operation or a prior fresh operation whose count was seeded in
     // via `malformedInvocationsAlreadyUsedV1` (only ever stamped for
@@ -1878,7 +1975,7 @@ export function createTaskActionCoordinatorV1(
           // owner that dispatched the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
           if (lastMalformedOutcomeV1 !== undefined) {
-            return lastMalformedOutcomeV1;
+            return attachPriorRejectedAttemptsV1(lastMalformedOutcomeV1, malformedAttemptHistoryV1);
           }
           const enrichedChain =
             next.chainExhaustion !== undefined
@@ -1999,6 +2096,18 @@ export function createTaskActionCoordinatorV1(
         await preInvocationHook();
       }
 
+      // `processIdentity` (item 2 / Step 54, review blocker
+      // "1b5f9e16-9d92-460b-b8ba-c745c4a9e73f-0"): resolved here, not
+      // threaded through `TaskActionRequestV1`, because
+      // `currentRoundProcessRecordingTargetV1()` already resolves the SAME
+      // task-folder-path/claim-id pair the CLI transport itself records
+      // processes against (`cliAgentRunner.ts`), from the SAME
+      // `runWithRoundProcessTaskFolderV1` async-local context every
+      // `executeAction` call already runs inside
+      // (`runTrackedOperation`/`taskOperations.ts`). No caller of
+      // `executeAction` needs to change to supply this; it is `undefined`
+      // only when this call path holds no admission lock, exactly like the
+      // CLI transport's own recording skip.
       const executionRequest: AgentExecutionRequestV1 = {
         correlation,
         reservationId: reserved.handle.reservationId,
@@ -2006,6 +2115,7 @@ export function createTaskActionCoordinatorV1(
         prompt,
         maxResponseBytes: row.maxResponseBytes,
         cancellationToken,
+        processIdentity: currentRoundProcessRecordingTargetV1(),
       };
 
       // PRE-INVOCATION SETUP (plan §3.1 / AC-RUNNER-03; module header,
@@ -2074,21 +2184,49 @@ export function createTaskActionCoordinatorV1(
 
       switch (raw.kind) {
         case "callerCancelled":
-          session.reportAttemptOutcome(attemptId, "callerCancelled");
+        case "providerCancelled": {
+          session.reportAttemptOutcome(attemptId, raw.kind);
+          await settleTerminalInvocationV1(correlation.operationId, "cancelled");
+          // Item 2 / Step 55: a cancellation this attempt never reached the
+          // provider for (`prepared.kind === "preInvocationOutcome"` — the
+          // token was already cancelled before `invoke` was ever called, so
+          // no durable invocation claim was taken and no process could have
+          // started) is the same harmless, instant cancel `admitAction`
+          // already reports before admission ever begins, so it stays the
+          // plain `cancelled` outcome. Every cancellation of an invocation
+          // that DID reach the provider (`prepared.kind === "prepared"`) is
+          // reported as a terminal, retryable failure instead — never
+          // falling back to another candidate — regardless of whether the
+          // process record says the process is confirmed gone, still
+          // running, or unconfirmed: the plan's contract is that a
+          // provider-invoked cancellation always settles `failed`,
+          // `retryable: true`, the same shape `invocationDeadlineExceeded`
+          // already uses, so it flows through the same generic
+          // failed-outcome handling every stage caller already has rather
+          // than reading as an unremarkable cancel a caller could retry over
+          // without knowing whether a provider process is still running.
+          if (prepared.kind !== "prepared") {
+            return {
+              kind: "cancelled",
+              correlation,
+              code: raw.kind === "callerCancelled" ? "userCancelled" : "providerCancelled",
+              provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
+            };
+          }
           return {
-            kind: "cancelled",
+            kind: "failed",
             correlation,
-            code: "userCancelled",
+            code: raw.kind,
+            retryable: true,
+            detail:
+              raw.processState === "unconfirmedSpawn"
+                ? "a provider process may still be starting and could not be confirmed stopped"
+                : raw.processState === "stillRunning"
+                  ? "a provider process may still be running and was not confirmed stopped"
+                  : "the invocation was cancelled after reaching the provider",
             provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
           };
-        case "providerCancelled":
-          session.reportAttemptOutcome(attemptId, "providerCancelled");
-          return {
-            kind: "cancelled",
-            correlation,
-            code: "providerCancelled",
-            provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
-          };
+        }
         case "overflow":
           session.reportAttemptOutcome(attemptId, "overflow");
           return {
@@ -2132,6 +2270,28 @@ export function createTaskActionCoordinatorV1(
             };
           }
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", transportEvidence);
+          // Item 2 / Step 55: a wall-clock invocation deadline is a terminal
+          // outcome for this operation, never a signal to try another
+          // candidate. Step 54 bounds every deadline/cancellation trigger so
+          // the broker always returns within deadline+grace instead of
+          // hanging, but without this branch that bounded return fell
+          // straight into the ordinary pre-response fallback below and could
+          // silently start a fresh candidate after the operation had already
+          // given up on an unresponsive provider — exactly the "no further
+          // candidate attempted" the plan requires this NOT do. Reported
+          // `retryable: true` (a human/task-level retry may reissue the whole
+          // operation) but never automatically advanced within this drive.
+          if (raw.code === "invocationDeadlineExceeded") {
+            await settleTerminalInvocationV1(correlation.operationId, "timedOut");
+            return {
+              kind: "failed",
+              correlation,
+              code: raw.code,
+              retryable: true,
+              ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+              ...(context.provider ? { provider: context.provider } : {}),
+            };
+          }
           // Item 14: a transport-flagged network fault (dropped connection,
           // DNS failure, TLS handshake failure, HTTP/2 protocol error) is a
           // property of the pipe, not the model, and is usually resolved by
@@ -2261,20 +2421,24 @@ export function createTaskActionCoordinatorV1(
           parsed.code !== "resultCorrelationMismatch" &&
           malformedRetryEligibleV1 &&
           malformedInvocationCountV1 < MAX_MALFORMED_RESULT_INVOCATIONS_V1;
+        // parsed.reason is our own parser's structural diagnostic (e.g.
+        // "expected the frame to start with <<<...>>>") — never parsed.raw,
+        // which can carry the model's full free-text reply and must never
+        // reach a settled outcome (§2.2). See detail's own doc comment for
+        // the live failure this makes diagnosable. Computed before the
+        // report call (item 6) so this attempt's own reason is recorded in
+        // the session's per-attempt accounting, not only on the outcome this
+        // iteration happens to return.
+        const reasonDetail = boundedDiagnosticDetailV1(parsed.reason);
         session.reportAttemptOutcome(
           attemptId,
           parsed.code === "resultCorrelationMismatch"
             ? "resultCorrelationMismatch"
             : willAdvanceV1
               ? "malformedResultPreFallback"
-              : "malformedResult"
+              : "malformedResult",
+          reasonDetail
         );
-        // parsed.reason is our own parser's structural diagnostic (e.g.
-        // "expected the frame to start with <<<...>>>") — never parsed.raw,
-        // which can carry the model's full free-text reply and must never
-        // reach a settled outcome (§2.2). See detail's own doc comment for
-        // the live failure this makes diagnosable.
-        const reasonDetail = boundedDiagnosticDetailV1(parsed.reason);
         // The received text was correctly unsealed — only the output-format
         // contract in front of it is what failed — so it is preserved
         // (best-effort, 24h) before being discarded. See that function's own
@@ -2304,6 +2468,11 @@ export function createTaskActionCoordinatorV1(
           // `taskActionOutcomeV1.ts`.
           ...(malformedRetryEligibleV1 ? { malformedInvocationsUsedV1: malformedInvocationCountV1 } : {}),
         };
+        malformedAttemptHistoryV1.push({
+          attemptId,
+          code: parsed.code,
+          ...(reasonDetail !== undefined ? { detail: reasonDetail } : {}),
+        });
         // Advance to the next ranked candidate instead of surfacing this
         // outcome immediately — see the budget/eligibility doc comment
         // above the `for (;;)` loop.
@@ -2311,7 +2480,7 @@ export function createTaskActionCoordinatorV1(
           lastMalformedOutcomeV1 = malformedOutcomeV1;
           continue;
         }
-        return malformedOutcomeV1;
+        return attachPriorRejectedAttemptsV1(malformedOutcomeV1, malformedAttemptHistoryV1);
       }
 
       // Candidate-scoped content-contract check (2026-08-16 field report,
@@ -2339,9 +2508,18 @@ export function createTaskActionCoordinatorV1(
             maxInvocations: MAX_MALFORMED_RESULT_INVOCATIONS_V1,
           });
           const willAdvanceContractV1 = disposition === "advanceCandidate";
+          // Computed before the report call, and pushed to the shared
+          // per-attempt history below, for the same reason as the
+          // malformed-envelope branch's identical comment (item 6): this
+          // attempt's own reason must be recorded in the session's
+          // accounting and the operation's history regardless of whether a
+          // later candidate's outcome ends up overwriting `contractOutcomeV1`
+          // in `lastMalformedOutcomeV1`.
+          const reasonDetail = boundedDiagnosticDetailV1(contentValidation.reason);
           session.reportAttemptOutcome(
             attemptId,
-            willAdvanceContractV1 ? "contentContractFailurePreFallback" : "contentContractFailure"
+            willAdvanceContractV1 ? "contentContractFailurePreFallback" : "contentContractFailure",
+            reasonDetail
           );
           const preservationResult = await preserveRejectedResultForRecoveryV1(
             unsealed.text,
@@ -2355,20 +2533,27 @@ export function createTaskActionCoordinatorV1(
             correlation,
             code: "contentContractFailed",
             retryable: false,
-            detail: [
-              boundedDiagnosticDetailV1(contentValidation.reason),
-              preservationDetailFragmentV1(preservationResult),
-            ]
+            detail: [reasonDetail, preservationDetailFragmentV1(preservationResult)]
               .filter((part): part is string => part !== undefined)
               .join("; "),
             ...(context.provider ? { provider: context.provider } : {}),
           };
+          // Item 6 follow-up: fold this attempt into the SAME shared history
+          // the malformed-envelope branch uses, so a content-contract chain's
+          // earlier attempts are not lost either — the field report's own
+          // earlier-rejected attempts (valid frame, valid JSON) went through
+          // this branch, not the malformed-envelope one.
+          malformedAttemptHistoryV1.push({
+            attemptId,
+            code: "contentContractFailed",
+            ...(reasonDetail !== undefined ? { detail: reasonDetail } : {}),
+          });
           if (willAdvanceContractV1) {
             malformedInvocationCountV1++;
             lastMalformedOutcomeV1 = contractOutcomeV1;
             continue;
           }
-          return contractOutcomeV1;
+          return attachPriorRejectedAttemptsV1(contractOutcomeV1, malformedAttemptHistoryV1);
         }
       }
 
@@ -2393,7 +2578,6 @@ export function createTaskActionCoordinatorV1(
   ): Promise<TaskActionOutcomeV1> {
     const correlation = context.correlation;
     if (!row.permittedResultKinds.includes(envelope.kind)) {
-      session.reportAttemptOutcome(attemptId, "malformedResult");
       const preservationResult = await preserveRejectedResultForRecoveryV1(
         unsealedResponse.text,
         correlation,
@@ -2401,20 +2585,21 @@ export function createTaskActionCoordinatorV1(
         deps.brokerOptions,
         { providerLabel: unsealedResponse.providerLabel, storedModelId: unsealedResponse.storedModelId }
       );
+      const schemaMismatchDetail =
+        `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}; ` +
+        preservationDetailFragmentV1(preservationResult);
+      session.reportAttemptOutcome(attemptId, "malformedResult", schemaMismatchDetail);
       return {
         kind: "malformedResult",
         correlation,
         code: "contentSchemaMismatch",
-        detail:
-          `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}; ` +
-          preservationDetailFragmentV1(preservationResult),
+        detail: schemaMismatchDetail,
         ...(context.provider ? { provider: context.provider } : {}),
       };
     }
     switch (envelope.kind) {
       case "completed": {
         if (envelope.content.contentType !== row.completedContentType) {
-          session.reportAttemptOutcome(attemptId, "malformedResult");
           const preservationResult = await preserveRejectedResultForRecoveryV1(
             unsealedResponse.text,
             correlation,
@@ -2422,13 +2607,15 @@ export function createTaskActionCoordinatorV1(
             deps.brokerOptions,
             { providerLabel: unsealedResponse.providerLabel, storedModelId: unsealedResponse.storedModelId }
           );
+          const contentTypeMismatchDetail =
+            `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"; ` +
+            preservationDetailFragmentV1(preservationResult);
+          session.reportAttemptOutcome(attemptId, "malformedResult", contentTypeMismatchDetail);
           return {
             kind: "malformedResult",
             correlation,
             code: "contentSchemaMismatch",
-            detail:
-              `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"; ` +
-              preservationDetailFragmentV1(preservationResult),
+            detail: contentTypeMismatchDetail,
             ...(context.provider ? { provider: context.provider } : {}),
           };
         }
@@ -2446,7 +2633,13 @@ export function createTaskActionCoordinatorV1(
         }
         try {
           const code = await row.promoteCompletedContent(envelope.content, context);
-          return { kind: "completed", correlation, code, ...(context.provider ? { provider: context.provider } : {}) };
+          return {
+            kind: "completed",
+            correlation,
+            code,
+            ...(context.provider ? { provider: context.provider } : {}),
+            ...(envelope.frameRepairV1 ? { frameRepairV1: envelope.frameRepairV1 } : {}),
+          };
         } catch (error) {
           return {
             kind: "failed",
@@ -2946,6 +3139,11 @@ export function createTaskActionCoordinatorV1(
     ticket: AdmittedProviderActionTicketV1
   ): Promise<TaskActionOutcomeV1> {
     claimTicketForRetirement(ticket, "continueAdmittedAction");
+    // Item 2 / Step 55: mutated by `runProviderRow`'s `settleTerminalInvocationV1`
+    // when a terminal settle was attempted for this invocation — see that
+    // out-parameter's doc comment for why the discard cleanup below must
+    // never run in that case, success or failure.
+    const terminalSettlementAttemptedV1 = { attempted: false };
     try {
       let outcome: TaskActionOutcomeV1;
       try {
@@ -2967,7 +3165,8 @@ export function createTaskActionCoordinatorV1(
           ticket.request.onPromptAssembled,
           ticket.operationId,
           ticket.request.onAttemptAllocated,
-          ticket.request.taskBinding
+          ticket.request.taskBinding,
+          terminalSettlementAttemptedV1
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);
@@ -2984,7 +3183,11 @@ export function createTaskActionCoordinatorV1(
           retryable: true,
         };
       }
-      if (outcome.kind !== "questions" && ticket.row.permittedResultKinds.includes("questions")) {
+      if (
+        outcome.kind !== "questions" &&
+        ticket.row.permittedResultKinds.includes("questions") &&
+        !terminalSettlementAttemptedV1.attempted
+      ) {
         await deps.orchestrator.discardInvocation(ticket.operationId);
       }
       return finalizeOutcome(ticket.row, ticket.request, ticket.operationId, outcome, ticket.metrics);

@@ -37,6 +37,28 @@ export type WorkflowDecisionOptionEffectV1 =
   | { readonly kind: "doNothing" };
 
 /**
+ * RC2 item 9/8: a decision option's `command` effect may resolve with this
+ * structured shape instead of a bare `boolean`. `resolveWorkflowDecision`
+ * (`chatView.ts`) renders `message` as a follow-up line under the SAME card
+ * for `refused` and `alreadyDone` — never a new card — and reserves the
+ * generic "did not complete" line for a plain `false` return. Commands that
+ * predate this protocol keep returning `boolean` (or `undefined` for
+ * success); both are handled by the caller.
+ */
+export interface WorkflowDecisionCommandResultV1 {
+  readonly outcome: "done" | "refused" | "alreadyDone";
+  readonly message?: string;
+}
+
+export function isWorkflowDecisionCommandResultV1(value: unknown): value is WorkflowDecisionCommandResultV1 {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const outcome = (value as { outcome?: unknown }).outcome;
+  return outcome === "done" || outcome === "refused" || outcome === "alreadyDone";
+}
+
+/**
  * Pre-1.0.0 fixes register, items 14 and 22: whether choosing this option
  * merely unpauses the task (dispatches nothing) or continues whatever
  * process was interrupted (a Fast Forward run, or the current stage's own

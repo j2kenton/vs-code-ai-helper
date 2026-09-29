@@ -192,6 +192,15 @@ void describe("review scoring rubric", () => {
       assert.match(rubricText, /`needs-toolchain`/);
       assert.match(rubricText, /build, codegen, or other toolchain step/);
     });
+
+    void it("tells a reviewer to classify a declined removal as environmental, not task-fixable (RC2 item 7)", () => {
+      // Otherwise the reviewer keeps re-raising the SAME removal the
+      // implementer already declined under rule 7, and neither side can
+      // ever resolve it (RC2 item 7's reported defect).
+      assert.match(rubricText, /declined: needs a human decision/);
+      assert.match(rubricText, /is `environmental` here too, not `task-fixable`/);
+      assert.match(rubricText, /## Task Description/);
+    });
   });
 
   void describe("staged-plan scoring exception mirrored into low-level review (4a)", () => {
@@ -229,6 +238,24 @@ void describe("review scoring rubric", () => {
         const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
         assert.match(raw, /## Plan Item Checklist/);
         assert.match(raw, /done \/ deferred \/ not reached/);
+      });
+    }
+  });
+
+  // RC2 item 7, Step 27/30: a removal named in the owner's own `## Task
+  // Description` (not the AI-drafted sections, and not the plan) is the
+  // owner's approval; a plan step or review alone is not. Both templates must
+  // say so, and must tell a declining round how to record it so the next
+  // review can recognize the decline instead of re-raising it as task-fixable.
+  void describe("owner-approved removals (RC2 item 7)", () => {
+    for (const templateFile of ["run-implementation.md", "apply-impl-review-code.md"]) {
+      void it(`${templateFile} treats the owner's Task Description as approval for a named removal, and a plan step alone as not`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /## Task Description/);
+        assert.match(raw, /IS the owner's approval/);
+        assert.match(raw, /is NOT approval on its own/);
+        assert.match(raw, /declined: needs a human decision/);
+        assert.match(raw, /## Remaining Blockers/);
       });
     }
   });

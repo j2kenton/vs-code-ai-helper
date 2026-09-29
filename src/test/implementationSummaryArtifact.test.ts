@@ -44,8 +44,11 @@ import {
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
 import {
+  AcceptedNonGoalItemV1,
+  appendAcceptedNonGoalV1,
   collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
+  collectPlanItemReasonsV1,
   collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
   detectChecklistItemSetMutationV1,
@@ -72,6 +75,7 @@ import {
   readyToAdvanceStage,
   reconcileProgressWithChecklistV1,
 } from "../utils/reviewReadiness";
+import { parseAcceptedNonGoalsV1 } from "../utils/reviewEvidenceNormalizerV1";
 import {
   IMPLEMENTATION_FILENAME,
   IMPLEMENTATION_SUMMARY_FILENAME,
@@ -922,7 +926,7 @@ void describe("headings without a summary under them are not a summary", () => {
   });
 });
 
-void describe("a plan with a checklist requires the round to echo it", () => {
+void describe("a plan with a checklist does not require the round to echo it (RC2 #10)", () => {
   void it("accepts a summary that drops the checklist, ticking nothing (RC2 #10)", () => {
     // A missing echo is no longer a rejection: the round's changed files still
     // go to review, and it simply ticks nothing.
@@ -1125,6 +1129,192 @@ void describe("a plan with a checklist requires the round to echo it", () => {
       remaining: 5,
       excluded: 0,
     });
+  });
+});
+
+void describe("collectPlanItemReasonsV1 — a round's own reasons for open items (RC2 #13)", () => {
+  void it("returns every non-done entry with its status and reason", () => {
+    const summary = [
+      "## Files Changed",
+      "",
+      "- none this round",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- Step 12: measure the thing — deferred — needs an owner measurement",
+      "- Step 13: run the full suite — not reached — runs at Publish",
+      "- Step 14: already built — done — src/a.ts:1",
+    ].join("\n");
+    const reasons = collectPlanItemReasonsV1(summary);
+    assert.deepEqual(reasons, [
+      {
+        itemText: "Step 12: measure the thing",
+        status: "deferred",
+        reason: "needs an owner measurement",
+      },
+      {
+        itemText: "Step 13: run the full suite",
+        status: "not reached",
+        reason: "runs at Publish",
+      },
+    ]);
+  });
+
+  void it("returns an empty list when the section is absent or every item is done", () => {
+    assert.deepEqual(collectPlanItemReasonsV1("## Files Changed\n\n- none"), []);
+    const allDone = [
+      "## Plan Item Checklist",
+      "",
+      "- Step 1: build it — done — src/a.ts:1",
+    ].join("\n");
+    assert.deepEqual(collectPlanItemReasonsV1(allDone), []);
+  });
+
+  void it("skips a PART-level claim line rather than misreading it as an item", () => {
+    const summary = [
+      "## Plan Item Checklist",
+      "",
+      "- Part 7 — done this round (6/6), evidence: see tests above",
+      "- Step 20: hand-off to owner — deferred — owner hand-off",
+    ].join("\n");
+    assert.deepEqual(collectPlanItemReasonsV1(summary), [
+      {
+        itemText: "Step 20: hand-off to owner",
+        status: "deferred",
+        reason: "owner hand-off",
+      },
+    ]);
+  });
+
+  void it("reports an entry with no stated reason as an empty reason string", () => {
+    const summary = [
+      "## Plan Item Checklist",
+      "",
+      "- Step 5: something open — not reached",
+    ].join("\n");
+    assert.deepEqual(collectPlanItemReasonsV1(summary), [
+      { itemText: "Step 5: something open", status: "not reached", reason: "" },
+    ]);
+  });
+
+  void it("keeps an item's own em dash intact when planItemKeys is supplied", () => {
+    const itemText = "Item 5 — a step with its own dash in the title";
+    const summary = [
+      "## Plan Item Checklist",
+      "",
+      `- ${itemText} — deferred — see notes`,
+    ].join("\n");
+    const planItemKeys = new Set([normalizeChecklistItemTextV1(itemText)]);
+    assert.deepEqual(collectPlanItemReasonsV1(summary, planItemKeys), [
+      { itemText, status: "deferred", reason: "see notes" },
+    ]);
+  });
+});
+
+void describe("appendAcceptedNonGoalV1 — the owner-decision card's plan write (RC2 #13, Step 52)", () => {
+  const items: readonly AcceptedNonGoalItemV1[] = [
+    { itemText: "Step 50: manual measurement", reason: "owner hand-off" },
+    { itemText: "Step 51: runs at Publish", reason: "runs at Publish" },
+  ];
+
+  void it("is a no-op when there is nothing to settle", () => {
+    const plan = "## Accepted Non-Goals\n\nExisting entry.\n";
+    assert.equal(appendAcceptedNonGoalV1(plan, [], "2026-09-28"), plan);
+  });
+
+  void it("adds a parseable, dated sub-heading under an existing section", () => {
+    const plan = ["## Goal", "", "Some plan.", "", "## Accepted Non-Goals", "", "### Prior entry", "", "Old text."].join(
+      "\n"
+    );
+    const updated = appendAcceptedNonGoalV1(plan, items, "2026-09-28");
+    const entries = parseAcceptedNonGoalsV1(updated);
+    const newEntry = entries.find((e) => e.heading.includes("2026-09-28"));
+    assert.ok(newEntry, "expected a new dated entry to be parseable back out");
+    assert.match(newEntry.heading, /Open items settled by the owner \(owner decision, 2026-09-28\)/);
+    assert.match(newEntry.bodyText, /Step 50: manual measurement — owner hand-off/);
+    assert.match(newEntry.bodyText, /Step 51: runs at Publish — runs at Publish/);
+    // The pre-existing entry must survive untouched.
+    assert.ok(entries.some((e) => e.heading === "Prior entry" && e.bodyText === "Old text."));
+  });
+
+  void it("creates the section when the plan has none yet", () => {
+    const plan = ["## Goal", "", "Some plan with no non-goals section."].join("\n");
+    const updated = appendAcceptedNonGoalV1(plan, items, "2026-09-28");
+    const entries = parseAcceptedNonGoalsV1(updated);
+    assert.equal(entries.length, 1);
+    assert.match(entries[0]!.heading, /Open items settled by the owner \(owner decision, 2026-09-28\)/);
+    assert.match(entries[0]!.bodyText, /Step 50: manual measurement — owner hand-off/);
+  });
+
+  void it("preserves a pre-existing FLAT (no sub-heading) entry as its own entry, instead of folding it into the new dated one", () => {
+    // Regression: RC2 #13 Round 3.2 review — a flat write-up (the common
+    // case: most plans predate this feature and were never given a
+    // sub-heading of their own) sat directly under `## Accepted Non-Goals`
+    // with no `###` of its own. Inserting the new dated sub-heading right
+    // after the section heading pushed that flat text after it with nothing
+    // to bound it, so parseAcceptedNonGoalsV1 read the old text back as part
+    // of the NEW entry — misattributing an older, unrelated non-goal to this
+    // owner decision.
+    const plan = [
+      "## Goal",
+      "",
+      "Some plan.",
+      "",
+      "## Accepted Non-Goals",
+      "",
+      "An older non-goal write-up with no sub-heading of its own.",
+    ].join("\n");
+    const updated = appendAcceptedNonGoalV1(plan, items, "2026-09-28");
+    const entries = parseAcceptedNonGoalsV1(updated);
+    const newEntry = entries.find((e) => e.heading.includes("2026-09-28"));
+    assert.ok(newEntry, "expected a new dated entry to be parseable back out");
+    assert.match(newEntry.bodyText, /Step 50: manual measurement — owner hand-off/);
+    // The old flat text must NOT have been folded into the new entry...
+    assert.doesNotMatch(newEntry.bodyText, /An older non-goal write-up/);
+    // ...and must still be recoverable as its own, distinct entry.
+    const oldEntry = entries.find((e) => e !== newEntry);
+    assert.ok(oldEntry, "expected the pre-existing flat entry to survive as its own entry");
+    assert.match(oldEntry.bodyText, /An older non-goal write-up with no sub-heading of its own\./);
+  });
+
+  void it("preserves a pre-existing MIXED section (flat prose followed by an existing sub-heading) without folding the flat prose into the new entry", () => {
+    // Regression: RC2 #13 Round 3.2 review, narrowed blocker — a section
+    // predating this feature can hold flat introductory prose directly under
+    // `## Accepted Non-Goals`, followed by a LATER non-goal that did get its
+    // own `###` sub-heading. `hasSubHeading` alone used to route this into
+    // the "insert right after the section heading" branch, which pushed the
+    // leading flat prose after the new dated entry with nothing to bound it
+    // — parseAcceptedNonGoalsV1 then read that flat prose back as part of the
+    // NEW entry, and also lost it from the old sub-headed entry it actually
+    // belonged near.
+    const plan = [
+      "## Goal",
+      "",
+      "Some plan.",
+      "",
+      "## Accepted Non-Goals",
+      "",
+      "An older non-goal write-up with no sub-heading of its own.",
+      "",
+      "### Existing dated entry",
+      "",
+      "A separately headed non-goal.",
+    ].join("\n");
+    const updated = appendAcceptedNonGoalV1(plan, items, "2026-09-28");
+    const entries = parseAcceptedNonGoalsV1(updated);
+    const newEntry = entries.find((e) => e.heading.includes("2026-09-28"));
+    assert.ok(newEntry, "expected a new dated entry to be parseable back out");
+    assert.match(newEntry.bodyText, /Step 50: manual measurement — owner hand-off/);
+    // The leading flat prose must NOT have been folded into the new entry...
+    assert.doesNotMatch(newEntry.bodyText, /An older non-goal write-up/);
+    // ...must still be recoverable as its own, distinct entry...
+    const priorEntry = entries.find((e) => e.heading === "Prior entries");
+    assert.ok(priorEntry, "expected the leading flat prose to survive as its own entry");
+    assert.match(priorEntry.bodyText, /An older non-goal write-up with no sub-heading of its own\./);
+    // ...and the pre-existing sub-headed entry must survive untouched too.
+    const existingEntry = entries.find((e) => e.heading === "Existing dated entry");
+    assert.ok(existingEntry, "expected the pre-existing sub-headed entry to survive");
+    assert.match(existingEntry.bodyText, /A separately headed non-goal\./);
   });
 });
 
@@ -2410,7 +2600,7 @@ void describe("Part 4: asserted completions land without a file diff", () => {
     "- ran the full unit suite",
   ].join("\n");
 
-  void it("a prose-only Plan Item Checklist claim (no checkbox echo at all) satisfies the shape gate's echo requirement on its own", () => {
+  void it("a prose-only Plan Item Checklist claim (no checkbox echo at all) is accepted by the shape gate on its own (RC2 #10: no echo is required)", () => {
     const issue = describeImplementationSummaryShapeIssue(ROUND_073_SHAPE_WITH_VERIFICATION, {
       planChecklist: PLAN_WITH_PART_7,
     });
@@ -2484,6 +2674,59 @@ void describe("Part 4: asserted completions land without a file diff", () => {
     const result = mergeChecklistProgressV1(plan, claim);
     assert.equal(result.kind, "no-match");
   });
+
+  void it(
+    "RC2 #10: a round that changed files and names one completed item, plus one item the plan " +
+      "does not have, is accepted end to end — the real item ticks, the unreal claim is refused " +
+      "without rejecting the round or blocking the real tick, and no continuation is owed",
+    () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [ ] Add the resolver",
+        "- [ ] Wire the decoder",
+      ].join("\n");
+      const response = [
+        "## Files Changed",
+        "",
+        "- `src/utils/resolver.ts` — added the resolver",
+        "",
+        "## Plan Item Checklist",
+        "",
+        "- Add the resolver — done — `src/utils/resolver.ts:12`",
+        "- An item the plan never mentions — done — built and verified",
+        "",
+        "## Verification",
+        "",
+        "- `pnpm exec tsc` passes",
+      ].join("\n");
+      const expectations = { planChecklist: plan, roundChangedFiles: true };
+
+      assert.equal(
+        describeImplementationSummaryShapeIssue(response, expectations),
+        undefined,
+        "a completed, well-shaped response with a real evidenced claim must not be rejected by the shape gate"
+      );
+      assert.equal(
+        describeIncompleteImplementationRoundV1(response, expectations),
+        undefined,
+        "the round reported durable state (a real, evidenced claim), so no continuation is owed for it"
+      );
+
+      const merged = mergeChecklistProgressV1(plan, response);
+      assert.equal(merged.kind, "merged");
+      if (merged.kind === "merged") {
+        assert.ok(
+          merged.content.includes("- [x] Add the resolver"),
+          "the real, evidenced claim must tick its own item"
+        );
+        assert.ok(
+          merged.content.includes("- [ ] Wire the decoder"),
+          "the unreal claim must not tick an unrelated item"
+        );
+      }
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------

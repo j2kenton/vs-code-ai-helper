@@ -38,33 +38,65 @@ import type { RecordedProcessIdentityV1 } from "./processLivenessClassifierV1";
  * out from under a still-live lock, making dead-owner cleanup read "no
  * processes recorded" and treat an unrecorded, possibly still-running CLI as
  * already gone. A record now lives exactly as long as the lock's own
- * bookkeeping keeps it: cleared only by an explicit `clearRoundProcessesV1`
- * call (made by the cleanup/release path once every recorded process is
- * CONFIRMED gone — never on a timer) or implicitly superseded the next time
- * a caller records against the same `taskFolderPath` with a different
- * `claimId` (a fresh acquisition of the lock; see below).
+ * bookkeeping keeps it: cleared only by an explicit
+ * `clearRoundProcessesForClaimV1` call, made by the cleanup/release path once
+ * every recorded process for that exact claim is CONFIRMED gone — never on a
+ * timer, and never implicitly superseded by a fresh acquisition recording
+ * under a new `claimId` (see the "PER-(TASK, CLAIM) STORAGE KEY" section
+ * below for why a new claim no longer touches an old one's record at all).
  *
- * PER-TASK STORAGE KEY, not one shared map. A prior revision stored every
- * task's record in a single `workspaceState` entry (one JSON blob keyed by
- * `taskFolderPath`) with writes serialized only per `taskFolderPath`. A
- * review caught that this does NOT prevent cross-task data loss: two
- * DIFFERENT tasks' queues can each read the same shared blob, compute their
- * own key's update against what they read, and write back — and because
- * `Memento.update` is asynchronous, task B's read can happen before task A's
- * concurrent write has landed, so task B's write-back silently reverts task
- * A's change. Giving every task its own `workspaceState` key
- * (`${ROUND_PROCESS_RECORD_KEY}:${taskFolderPath}`) removes the shared
- * mutable object entirely — there is no longer any blob for two different
- * tasks' writes to race over, matching this module's own reviewed
- * reasoning for why per-task queues should not make unrelated tasks wait on
- * each other. Same persistence choice as `roundLeaseV1.ts` and for the same
- * reason: `context.workspaceState`, shared on disk across every window open
+ * PER-(TASK, CLAIM) STORAGE KEY, not one shared task-level blob. A prior
+ * revision stored every task's record in a single `workspaceState` entry
+ * (one JSON blob keyed by `taskFolderPath` alone, holding whichever
+ * `claimId` last wrote to it) with writes serialized only per
+ * `taskFolderPath`. A review caught the cross-task version of this bug (two
+ * DIFFERENT tasks racing a shared blob); giving every task its own key fixed
+ * that. A SECOND review (2026-09-29, RC2 item 2 / Step 57a) caught the same
+ * class of bug one level down, WITHIN a single task: a caller that read
+ * "the record on file belongs to claim A" and only later — after awaiting
+ * signalling, polling and re-classifying a process, all of which cross
+ * multiple turns — cleared "whatever is on file for this task" could lose a
+ * race to a SUCCESSOR claim (B) that began recording its own processes in
+ * the gap, wiping B's just-written record instead of A's stale one. That
+ * gap exists for ANY caller who checks-then-acts across an await, in ANY
+ * process — including, worse, a caller running in a DIFFERENT VS Code window
+ * than the one that recorded the successor's data, which cannot even see a
+ * live update to the other window's in-memory `workspaceState` cache (the
+ * same limitation `hostDecisionMirrorV1.ts` documents for pending
+ * decisions): no in-process check, however carefully sequenced, can close
+ * that gap, because the read and the write are two separate `Memento`
+ * operations with no compare-and-swap between them.
+ *
+ * The fix removes the shared key a stale claim's write could ever hit:
+ * every `claimId` gets its OWN `workspaceState` key
+ * (`${ROUND_PROCESS_RECORD_KEY_PREFIX}${taskFolderPath}\0${claimId}`, see
+ * `storageKeyForClaimV1`). A caller clearing claim A's key can therefore
+ * never touch claim B's key, REGARDLESS of which process performs the clear,
+ * how stale its cache is, or how long it awaited before calling — there is
+ * no read involved in choosing what to delete, so there is nothing for a
+ * stale read to get wrong. This is strictly stronger than the per-task
+ * partitioning above: recording under a new `claimId` no longer needs to
+ * "replace" a prior generation's record either (Step 8's surviving
+ * `beginRoundProcessRecordingV1`/`recordRoundProcessV1` behavior lived at the
+ * old task-level key; there is no such shared slot to replace or supersede
+ * any more). A stale claim's now-orphaned key is harmless bookkeeping left
+ * behind until it is itself cleared (normally by its own
+ * `clearRoundProcessesForClaimV1` call once its processes are confirmed
+ * gone) — never a hazard to any other claim's data.
+ *
+ * Same underlying persistence choice as `roundLeaseV1.ts`:
+ * `context.workspaceState`, backed by a file shared across every window open
  * on this workspace, so a NEW window opened after a crash can still see what
- * a crashed window's round had recorded. Writes for a given `taskFolderPath`
- * are still serialized through an in-process queue (mirroring
- * `workAdmissionV1.ts`'s own owner-local queue) so two processes recorded in
- * quick succession for the SAME task cannot race a read-modify-write and
- * silently drop one another.
+ * a crashed window's round had recorded (a currently-running window's own
+ * in-memory cache of a DIFFERENT window's concurrent writes is a separate
+ * question — see above — and this module's cross-claim key partitioning
+ * does not depend on that cache ever being fresh). Writes for a given
+ * `(taskFolderPath, claimId)` pair are still serialized through an
+ * in-process queue (mirroring `workAdmissionV1.ts`'s own owner-local queue)
+ * so two writes recorded in quick succession for the SAME claim cannot race
+ * a read-modify-write and silently drop one another; writes for DIFFERENT
+ * claims (even under the same task) now touch disjoint keys and queues, so
+ * they never need to wait on each other either.
  *
  * NO-RECORD AMBIGUITY. `listRoundProcessesV1` returning `[]` is ambiguous on
  * its own between "this claim genuinely started no provider CLI" and "a
@@ -108,8 +140,16 @@ import type { RecordedProcessIdentityV1 } from "./processLivenessClassifierV1";
 
 const ROUND_PROCESS_RECORD_KEY_PREFIX = "ensemble.roundProcessRecordV1:";
 
-function storageKeyForTaskV1(taskFolderPath: string): string {
-  return `${ROUND_PROCESS_RECORD_KEY_PREFIX}${taskFolderPath}`;
+/** `\0` cannot appear in either `taskFolderPath` or `claimId` (a filesystem
+ * path and a generated id, respectively), so this is an unambiguous composite
+ * key — no escaping needed, and no risk of two distinct (task, claim) pairs
+ * ever colliding on the same key. */
+function storageKeyForClaimV1(taskFolderPath: string, claimId: string): string {
+  return `${ROUND_PROCESS_RECORD_KEY_PREFIX}${taskFolderPath}\0${claimId}`;
+}
+
+function taskKeyPrefixV1(taskFolderPath: string): string {
+  return `${ROUND_PROCESS_RECORD_KEY_PREFIX}${taskFolderPath}\0`;
 }
 
 export interface RecordedProviderProcessV1 extends RecordedProcessIdentityV1 {
@@ -143,32 +183,48 @@ interface RoundProcessRecordEntryV1 {
    */
   readonly spawnsStarted: number;
   readonly spawnsAbandoned: number;
+  /**
+   * Provider label and display-only command line for the MOST RECENT spawn
+   * attempt `beginProcessSpawnAttemptV1` began — the same fields
+   * `RecordedProviderProcessV1` carries once a pid is confirmed, recorded one
+   * step earlier so they survive the exact crash window `unconfirmedSpawn`
+   * exists for. Step 57a's "Provider process may still be running" card needs
+   * these to name the provider and command for an `unconfirmedSpawn` hold,
+   * which otherwise has no `RecordedProviderProcessV1` entry to read them
+   * from at all. Best-effort and display-only, like the rest of this record;
+   * `undefined` for a record written before this field existed, or a caller
+   * that omitted them.
+   */
+  readonly pendingSpawnLabel?: string;
+  readonly pendingSpawnCommand?: string;
 }
 
-function readRecordV1(taskFolderPath: string): RoundProcessRecordEntryV1 | undefined {
+function readRecordV1(taskFolderPath: string, claimId: string): RoundProcessRecordEntryV1 | undefined {
   const state = getExtensionContextV1()?.workspaceState;
   if (!state) {
     return undefined;
   }
-  return state.get<RoundProcessRecordEntryV1 | undefined>(storageKeyForTaskV1(taskFolderPath), undefined);
+  return state.get<RoundProcessRecordEntryV1 | undefined>(storageKeyForClaimV1(taskFolderPath, claimId), undefined);
 }
 
-// Per-`taskFolderPath` write queue so a read-modify-write cycle for one task
-// cannot race a concurrent call for the SAME task and silently lose one of
-// the two updates. Mirrors `workAdmissionV1.ts`'s `localSerializersV1`
-// pattern. Deliberately NOT a single global queue: with each task now on its
-// own `workspaceState` key (see the module doc comment), writes for unrelated
-// tasks touch disjoint storage and never need to wait on each other.
+// Per-(taskFolderPath, claimId) write queue so a read-modify-write cycle for
+// one claim cannot race a concurrent call for the SAME claim and silently
+// lose one of the two updates. Mirrors `workAdmissionV1.ts`'s
+// `localSerializersV1` pattern. Deliberately NOT a single global queue, nor
+// even a per-task queue: with each (task, claim) pair now on its own
+// `workspaceState` key (see the module doc comment), writes for a different
+// claim — even under the same task — touch disjoint storage and never need
+// to wait on each other.
 const writeQueuesV1 = new Map<string, Promise<unknown>>();
 
-function enqueueWriteV1<T>(taskFolderPath: string, run: () => Promise<T>): Promise<T> {
-  const prior = writeQueuesV1.get(taskFolderPath) ?? Promise.resolve();
+function enqueueWriteV1<T>(queueKey: string, run: () => Promise<T>): Promise<T> {
+  const prior = writeQueuesV1.get(queueKey) ?? Promise.resolve();
   const settled = prior.then(run, run);
   // Keep the queue alive on failure (so the NEXT write still waits its
   // turn) without propagating a rejection through the chain other callers
   // are also awaiting.
   writeQueuesV1.set(
-    taskFolderPath,
+    queueKey,
     settled.then(
       () => undefined,
       () => undefined
@@ -177,35 +233,39 @@ function enqueueWriteV1<T>(taskFolderPath: string, run: () => Promise<T>): Promi
   return settled;
 }
 
-/** Persist `entry` for `taskFolderPath`, replacing whatever was previously
- * stored under its own key. Never throws; returns whether the write actually
- * landed. */
-async function writeRecordV1(taskFolderPath: string, entry: RoundProcessRecordEntryV1): Promise<boolean> {
+/** Persist `entry` (or clear it, for `undefined`) for `(taskFolderPath,
+ * claimId)`, replacing whatever was previously stored under its own key.
+ * Never throws; returns whether the write actually landed. */
+async function writeRecordV1(
+  taskFolderPath: string,
+  claimId: string,
+  entry: RoundProcessRecordEntryV1 | undefined
+): Promise<boolean> {
   const state = getExtensionContextV1()?.workspaceState;
   if (!state) {
     return false;
   }
   try {
-    await state.update(storageKeyForTaskV1(taskFolderPath), entry);
+    await state.update(storageKeyForClaimV1(taskFolderPath, claimId), entry);
     return true;
   } catch {
     return false;
   }
 }
 
-/** Mark `claimId` as the current lock generation recording processes against
- * `taskFolderPath`, before any process has been spawned under it. Call once,
- * as early as possible after acquiring the admission lock and before
- * spawning the round's first provider CLI — see the module doc comment's
- * "NO-RECORD AMBIGUITY" section for why this call matters: it is what turns
- * "no record for this claim" into a meaningful "this claim started no CLI"
- * rather than an ambiguous "recording may never have begun".
+/** Mark `claimId` as recording processes against `taskFolderPath`, before any
+ * process has been spawned under it. Call once, as early as possible after
+ * acquiring the admission lock and before spawning the round's first
+ * provider CLI — see the module doc comment's "NO-RECORD AMBIGUITY" section
+ * for why this call matters: it is what turns "no record for this claim"
+ * into a meaningful "this claim started no CLI" rather than an ambiguous
+ * "recording may never have begun".
  *
- * Idempotent for the same `claimId`: if a record already exists for this
- * exact `claimId` (e.g. a retried call, or processes already recorded), it
- * is left untouched rather than truncated back to zero processes. A record
- * for a DIFFERENT `claimId` (a stale prior generation) is replaced, matching
- * `recordRoundProcessV1`'s own replace-on-new-claim behavior.
+ * Idempotent: if a record already exists for this exact `claimId` (e.g. a
+ * retried call, or processes already recorded), it is left untouched rather
+ * than truncated back to zero processes. A DIFFERENT `claimId` (a stale
+ * prior generation, or a fresh successor) lives at its own key entirely (see
+ * the module doc comment) and is never read or touched by this call.
  *
  * Never throws. Returns whether the (possibly no-op) state is durably
  * persisted — `false` means a caller has no evidence this claim's process
@@ -214,12 +274,12 @@ export async function beginRoundProcessRecordingV1(taskFolderPath: string, claim
   if (!getExtensionContextV1()?.workspaceState) {
     return false;
   }
-  return enqueueWriteV1(taskFolderPath, async () => {
-    const existing = readRecordV1(taskFolderPath);
-    if (existing && existing.claimId === claimId) {
+  return enqueueWriteV1(storageKeyForClaimV1(taskFolderPath, claimId), async () => {
+    const existing = readRecordV1(taskFolderPath, claimId);
+    if (existing) {
       return true;
     }
-    return writeRecordV1(taskFolderPath, {
+    return writeRecordV1(taskFolderPath, claimId, {
       taskFolderPath,
       claimId,
       processes: [],
@@ -236,13 +296,12 @@ export async function beginRoundProcessRecordingV1(taskFolderPath: string, claim
  * underlying `workspaceState.update` rejected) — see the module doc comment
  * for why a caller must not treat `false` as "safe to ignore."
  *
- * If the record already held for `taskFolderPath` belongs to a DIFFERENT
- * `claimId`, it is replaced rather than appended to — that is a previous
- * lock generation's now-stale bookkeeping (its own hold has ended, since a
- * different `claimId` can only mean a fresh, later acquisition), not more
- * processes for the generation currently recording. Callers should normally
- * call `beginRoundProcessRecordingV1` first so this replacement is the rare
- * case rather than the common one. */
+ * `claimId` has its own storage key (see the module doc comment), so this
+ * only ever appends to THIS claim's own record; a different claim's record —
+ * whether an older generation or a newer one — lives at a different key and
+ * is never read or overwritten by this call. Callers should normally call
+ * `beginRoundProcessRecordingV1` first so a fresh claim's record starts as an
+ * explicit empty list rather than being created implicitly here. */
 export async function recordRoundProcessV1(
   taskFolderPath: string,
   claimId: string,
@@ -251,17 +310,14 @@ export async function recordRoundProcessV1(
   if (!getExtensionContextV1()?.workspaceState) {
     return false;
   }
-  return enqueueWriteV1(taskFolderPath, async () => {
-    const existing = readRecordV1(taskFolderPath);
-    const carriedProcesses = existing && existing.claimId === claimId ? existing.processes : [];
-    const carriedStarted = existing && existing.claimId === claimId ? existing.spawnsStarted : 0;
-    const carriedAbandoned = existing && existing.claimId === claimId ? existing.spawnsAbandoned : 0;
-    return writeRecordV1(taskFolderPath, {
+  return enqueueWriteV1(storageKeyForClaimV1(taskFolderPath, claimId), async () => {
+    const existing = readRecordV1(taskFolderPath, claimId);
+    return writeRecordV1(taskFolderPath, claimId, {
       taskFolderPath,
       claimId,
-      processes: [...carriedProcesses, process],
-      spawnsStarted: carriedStarted,
-      spawnsAbandoned: carriedAbandoned,
+      processes: [...(existing?.processes ?? []), process],
+      spawnsStarted: existing?.spawnsStarted ?? 0,
+      spawnsAbandoned: existing?.spawnsAbandoned ?? 0,
     });
   });
 }
@@ -282,22 +338,34 @@ export async function recordRoundProcessV1(
  * Never throws. Idempotent is NOT meaningful here (unlike
  * `beginRoundProcessRecordingV1`): every call is a distinct attempt and
  * always increments.
+ *
+ * `providerLabel`/`command` (Step 57a) are the same display-only values
+ * `recordRoundProcessV1` would record once the pid is confirmed — recorded
+ * here too, one step earlier, so an attempt that never reaches that point
+ * (an `unconfirmedSpawn`) still leaves something for the held-marker card to
+ * show. Overwrites any prior attempt's values: only the MOST RECENT attempt's
+ * provider/command is kept, which is the one an outstanding
+ * `unconfirmedProcessSpawnCountV1` can actually be about.
  */
-export async function beginProcessSpawnAttemptV1(taskFolderPath: string, claimId: string): Promise<boolean> {
+export async function beginProcessSpawnAttemptV1(
+  taskFolderPath: string,
+  claimId: string,
+  providerLabel?: string,
+  command?: string
+): Promise<boolean> {
   if (!getExtensionContextV1()?.workspaceState) {
     return false;
   }
-  return enqueueWriteV1(taskFolderPath, async () => {
-    const existing = readRecordV1(taskFolderPath);
-    const carriedProcesses = existing && existing.claimId === claimId ? existing.processes : [];
-    const carriedStarted = existing && existing.claimId === claimId ? existing.spawnsStarted : 0;
-    const carriedAbandoned = existing && existing.claimId === claimId ? existing.spawnsAbandoned : 0;
-    return writeRecordV1(taskFolderPath, {
+  return enqueueWriteV1(storageKeyForClaimV1(taskFolderPath, claimId), async () => {
+    const existing = readRecordV1(taskFolderPath, claimId);
+    return writeRecordV1(taskFolderPath, claimId, {
       taskFolderPath,
       claimId,
-      processes: carriedProcesses,
-      spawnsStarted: carriedStarted + 1,
-      spawnsAbandoned: carriedAbandoned,
+      processes: existing?.processes ?? [],
+      spawnsStarted: (existing?.spawnsStarted ?? 0) + 1,
+      spawnsAbandoned: existing?.spawnsAbandoned ?? 0,
+      ...(providerLabel !== undefined ? { pendingSpawnLabel: providerLabel } : {}),
+      ...(command !== undefined ? { pendingSpawnCommand: command } : {}),
     });
   });
 }
@@ -313,21 +381,21 @@ export async function beginProcessSpawnAttemptV1(taskFolderPath: string, claimId
  * confirmation back has no further action to take (the attempt already
  * produced no process either way), and per the module's fail-open-to-blocked
  * rule, a write that does not land here only leaves the lock held slightly
- * more conservatively than necessary — never less. A record belonging to a
- * different `claimId` is not this claim's to abandon against; a silent no-op.
+ * more conservatively than necessary — never less. No record at all for this
+ * exact `claimId` (nothing to abandon against) is a silent no-op.
  */
 export async function abandonProcessSpawnAttemptV1(taskFolderPath: string, claimId: string): Promise<void> {
   const state = getExtensionContextV1()?.workspaceState;
   if (!state) {
     return;
   }
-  await enqueueWriteV1(taskFolderPath, async () => {
-    const existing = readRecordV1(taskFolderPath);
-    if (!existing || existing.claimId !== claimId) {
+  await enqueueWriteV1(storageKeyForClaimV1(taskFolderPath, claimId), async () => {
+    const existing = readRecordV1(taskFolderPath, claimId);
+    if (!existing) {
       return;
     }
     try {
-      await state.update(storageKeyForTaskV1(taskFolderPath), {
+      await state.update(storageKeyForClaimV1(taskFolderPath, claimId), {
         ...existing,
         spawnsAbandoned: existing.spawnsAbandoned + 1,
       });
@@ -343,51 +411,116 @@ export async function abandonProcessSpawnAttemptV1(taskFolderPath: string, claim
  * could have erased before it was durably recorded. `0` is the ordinary
  * case; a caller such as `stopRecordedCliProcessesV1` must treat anything
  * greater as "cannot prove this claim started no CLI beyond what
- * `processes` shows" and refuse to report `allGone` on that basis alone. A
- * record belonging to a different `claimId` (or no record at all) counts as
- * `0` — matching `listRoundProcessesV1`'s own "nothing recorded" contract. */
+ * `processes` shows" and refuse to report `allGone` on that basis alone. No
+ * record at all for this exact `claimId` counts as `0` — matching
+ * `listRoundProcessesV1`'s own "nothing recorded" contract. */
 export function unconfirmedProcessSpawnCountV1(taskFolderPath: string, claimId: string): number {
-  const existing = readRecordV1(taskFolderPath);
-  if (!existing || existing.claimId !== claimId) {
+  const existing = readRecordV1(taskFolderPath, claimId);
+  if (!existing) {
     return 0;
   }
   return Math.max(0, existing.spawnsStarted - existing.spawnsAbandoned - existing.processes.length);
 }
 
-/** Every process recorded for `taskFolderPath`'s current lock, oldest first,
- * or an empty list if none are recorded (no claim has begun recording, or
+/**
+ * The provider label and display-only command line `beginProcessSpawnAttemptV1`
+ * most recently recorded for `claimId` (Step 57a) — what the "Provider
+ * process may still be running" card shows for an `unconfirmedSpawn` hold,
+ * since that state has no `RecordedProviderProcessV1` entry to read them
+ * from. `undefined` fields when no record exists, or the record predates
+ * this field, or the caller that began the attempt omitted them.
+ */
+export function pendingSpawnInfoV1(
+  taskFolderPath: string,
+  claimId: string
+): { readonly providerLabel: string | undefined; readonly command: string | undefined } {
+  const existing = readRecordV1(taskFolderPath, claimId);
+  return { providerLabel: existing?.pendingSpawnLabel, command: existing?.pendingSpawnCommand };
+}
+
+/** Every process recorded for `taskFolderPath`'s `claimId`, oldest first, or
+ * an empty list if none are recorded (this claim never began recording, or
  * the store is unreadable) — a caller must treat "nothing recorded" the same
- * as "no processes to check", never as an error, and must not treat it as
- * PROOF no process was ever spawned unless it has also confirmed (via
- * {@link recordedClaimIdForTaskV1}) that the record on file belongs to the
- * `claimId` it is checking (see the module doc comment's "NO-RECORD
- * AMBIGUITY" section). */
-export function listRoundProcessesV1(taskFolderPath: string): readonly RecordedProviderProcessV1[] {
-  return readRecordV1(taskFolderPath)?.processes ?? [];
+ * as "no processes to check", never as an error. Because storage is keyed by
+ * `(taskFolderPath, claimId)` together (see the module doc comment), an empty
+ * result here is already scoped to exactly this claim — there is no separate
+ * "does the record on file belong to this claim" check to make first, unlike
+ * the old task-only-keyed design. */
+export function listRoundProcessesV1(taskFolderPath: string, claimId: string): readonly RecordedProviderProcessV1[] {
+  return readRecordV1(taskFolderPath, claimId)?.processes ?? [];
 }
 
-/** The `claimId` currently recording against `taskFolderPath`, if any — lets
- * a caller confirm the record it is about to act on belongs to the lock
- * generation (`WorkAdmissionHandleV1.claimId`) it thinks it does, rather than
- * a stale prior generation or no recording at all. */
-export function recordedClaimIdForTaskV1(taskFolderPath: string): string | undefined {
-  return readRecordV1(taskFolderPath)?.claimId;
+/** Whether ANY record — even an empty one from `beginRoundProcessRecordingV1`
+ * alone — is on file for exactly `(taskFolderPath, claimId)`. Replaces the
+ * pre-2026-09-29 `recordedClaimIdForTaskV1(taskFolderPath) === claimId`
+ * pattern: that comparison assumed one "current" claim per task lived at a
+ * single shared key, which is exactly the assumption the review found unsafe
+ * (see the module doc comment). With per-claim keys there is nothing to
+ * compare — a caller with its own `claimId` in hand just asks whether ITS OWN
+ * key has an entry. */
+export function hasRoundProcessRecordV1(taskFolderPath: string, claimId: string): boolean {
+  return readRecordV1(taskFolderPath, claimId) !== undefined;
 }
 
-/** Clear `taskFolderPath`'s recorded processes once every one of them is
- * confirmed gone (or the round never started one). Call from the same
- * cleanup site that releases the task's lock, never before that
- * confirmation — see the module doc comment's safety rule. Best-effort,
- * matching `clearRoundLiveV1`; serialized through the same per-task queue as
- * `recordRoundProcessV1` so it cannot race a late-arriving record write. */
+/** Clear EVERY claim's recorded processes for `taskFolderPath`, regardless of
+ * `claimId` — a broader operation than any production caller needs (every
+ * production release path holds one specific `claimId` and must use
+ * {@link clearRoundProcessesForClaimV1} instead, which cannot ever touch a
+ * different claim's key). Kept for a caller that genuinely means "clear
+ * every trace of this task's round-process bookkeeping" (e.g. tests
+ * exercising the record shape directly, or a future whole-task teardown).
+ * Enumerates `workspaceState.keys()` for this task's key prefix, so it never
+ * needs to know which claims exist in advance; each claim's key is cleared
+ * through its OWN queue (see `enqueueWriteV1`), so this cannot race a
+ * concurrent per-claim write any more than clearing them one at a time by
+ * hand would. Best-effort, matching every other write in this module. */
 export async function clearRoundProcessesV1(taskFolderPath: string): Promise<void> {
   const state = getExtensionContextV1()?.workspaceState;
   if (!state) {
     return;
   }
-  await enqueueWriteV1(taskFolderPath, async () => {
+  const prefix = taskKeyPrefixV1(taskFolderPath);
+  const keys = state.keys().filter((key) => key.startsWith(prefix));
+  await Promise.all(
+    keys.map((key) =>
+      enqueueWriteV1(key, async () => {
+        try {
+          await state.update(key, undefined);
+        } catch {
+          // Best-effort, same reasoning as recordRoundProcessV1.
+        }
+      })
+    )
+  );
+}
+
+/**
+ * Clear `taskFolderPath`'s recorded processes for lock generation `claimId`
+ * ONLY. Before 2026-09-29 this re-read "the" task-level record and compared
+ * its `claimId` inside the same queued write as the clear — safe against a
+ * race WITHIN one process's queue, but not against a successor claim's
+ * record written through a DIFFERENT process's own `workspaceState` cache
+ * (2026-09-29 review, RC2 item 2 / Step 57a: a currently-running window
+ * cannot see a live update to another window's in-memory cache — the same
+ * limitation `hostDecisionMirrorV1.ts` documents for pending decisions — so
+ * no in-process re-check, however carefully sequenced, can close that gap).
+ *
+ * Now unconditional and NEEDS no such check: `claimId` has always identified
+ * its own storage key (see the module doc comment), so this can only ever
+ * delete that one key. A different claim's record — older or newer, recorded
+ * by this process or any other — lives at a different key and is
+ * structurally unreachable from here, regardless of what any caller's cache
+ * believes is "current". ENOENT-shaped "nothing there" (ordinary
+ * `Memento.update` with no prior value) is not an error.
+ */
+export async function clearRoundProcessesForClaimV1(taskFolderPath: string, claimId: string): Promise<void> {
+  const state = getExtensionContextV1()?.workspaceState;
+  if (!state) {
+    return;
+  }
+  await enqueueWriteV1(storageKeyForClaimV1(taskFolderPath, claimId), async () => {
     try {
-      await state.update(storageKeyForTaskV1(taskFolderPath), undefined);
+      await state.update(storageKeyForClaimV1(taskFolderPath, claimId), undefined);
     } catch {
       // Best-effort, same reasoning as recordRoundProcessV1.
     }

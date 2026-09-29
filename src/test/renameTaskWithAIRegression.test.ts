@@ -171,6 +171,56 @@ function transportFailureFactory(
   };
 }
 
+/**
+ * A transport that fails with a Step 55 terminal invocation-boundary code
+ * (`invocationDeadlineExceeded`/`callerCancelled`/`providerCancelled`) —
+ * `taskActionCoordinatorV1`'s terminal branch turns this into a `failed`
+ * outcome carrying that exact code, before any candidate fallback. Used to
+ * prove the 2026-09-29 implementation-review fix: this must end the command's
+ * invocation cycle right there, never fall into the bounded name-quality
+ * re-prompt (which would be a second `coordinator.executeAction` call before
+ * the first invocation's admission has been safely released).
+ */
+function terminalTransportFailureFactory(
+  code: "invocationDeadlineExceeded" | "callerCancelled" | "providerCancelled"
+): (
+  _replies: string[],
+  onCreate: () => void
+) => (options: { model?: string }) => {
+  runnerId: string;
+  invoke: (
+    request: unknown,
+    output: { write: (chunk: string) => boolean }
+  ) => Promise<
+    | { kind: "transportFailure"; code: string; detail: string }
+    | { kind: "callerCancelled" }
+    | { kind: "providerCancelled" }
+  >;
+} {
+  return (_replies: string[], onCreate: () => void) => () => {
+    onCreate();
+    return {
+      runnerId: "copilot-lm",
+      invoke: (): Promise<
+        | { kind: "transportFailure"; code: string; detail: string }
+        | { kind: "callerCancelled" }
+        | { kind: "providerCancelled" }
+      > =>
+        // `invocationDeadlineExceeded` arrives as a `transportFailure` code
+        // (taskActionCoordinatorV1.ts's dedicated deadline branch), while
+        // `callerCancelled`/`providerCancelled` are their own raw exit kinds
+        // (the transport reports the cancellation directly) — mirroring
+        // exactly how taskActionCoordinatorV1.test.ts's own fakes distinguish
+        // the two shapes.
+        Promise.resolve(
+          code === "invocationDeadlineExceeded"
+            ? { kind: "transportFailure", code, detail: `stub ${code}` }
+            : { kind: code }
+        ),
+    };
+  };
+}
+
 function setUpTaskActionRuntimeForTestV1(): { tearDown: () => void } {
   resetWorkflowRuntimeServicesForTestV1();
   resetProductionTaskActionRegistryForTestV1();
@@ -480,6 +530,41 @@ void describe("renameTaskWithAI (command-level, real coordinator + fake transpor
       { transportFactory: transportFailureFactory }
     );
   });
+
+  for (const code of ["invocationDeadlineExceeded", "callerCancelled", "providerCancelled"] as const) {
+    void it(`does not retry after a terminal ${code} settlement — exactly one provider call, name unchanged`, async () => {
+      // 2026-09-29 implementation review (Step 57 / RC2 item 2): the old code
+      // treated every non-"ok" first attempt alike and unconditionally fired
+      // the bounded re-prompt, so a terminal deadline/cancellation settlement
+      // — which must end the invocation cycle and flow straight to safe
+      // release — instead started a SECOND coordinator invocation, which
+      // could race a first invocation whose provider process had not
+      // necessarily exited yet.
+      await withRenameHarness(
+        "Users need to export large datasets without freezing the UI.",
+        ["irrelevant — this transport never frames a result"],
+        async ({ folderPath, inventory, context, warnings, transportCallCount }) => {
+          await renameTaskWithAI(context, inventory, { canonicalId: folderPath });
+          const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+          assert.strictEqual(persisted?.displayName, "original task name");
+          assert.strictEqual(
+            transportCallCount(),
+            1,
+            `a terminal ${code} settlement must never trigger the bounded re-prompt`
+          );
+          assert.ok(
+            !warnings.some((w) => /did not produce a valid task summary/.test(w)),
+            `must not blame the model for a terminal settlement; got: ${JSON.stringify(warnings)}`
+          );
+          assert.ok(
+            warnings.some((w) => w.includes(code)),
+            `expected the warning to name the terminal code (${code}); got: ${JSON.stringify(warnings)}`
+          );
+        },
+        { transportFactory: terminalTransportFailureFactory(code) }
+      );
+    });
+  }
 
   void it("rejects a leading-substring reply (the reported regression) and does not apply it even on the bounded retry", async () => {
     const description = "Add a discard changes control to the provider settings section for parity with models.";

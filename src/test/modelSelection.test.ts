@@ -294,7 +294,7 @@ void describe("getAvailableModels", () => {
     try {
       const models = await getAvailableModels();
       const expected: SelectableModel[] = [
-        copilotModel("auto", "Auto (provider-chosen)"),
+        copilotModel("auto", "Auto"),
         copilotModel("copilot-gpt-5.6-sol", "GPT-5.6 Sol"),
         ...copilotReasoningAndContextVariants(
           "copilot-gpt-5.6-sol",
@@ -1571,7 +1571,7 @@ void describe("resolveConfiguredReviewStages (auto-advance General Model fallbac
   });
 });
 
-void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€” 'auto' no longer leads)", () => {
+void describe("getAvailableCopilotModels (RC2 item 14 â€” 'auto' listed normally)", () => {
   function installCopilotModels(
     models: readonly { id: string; name: string }[]
   ): { restore: () => void } {
@@ -1588,7 +1588,11 @@ void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€
     };
   }
 
-  void it("moves 'auto' to the END of the list instead of floating it to the front", async () => {
+  void it("leaves 'auto' in the provider's own order instead of moving it to the end", async () => {
+    // The cause of the workflow-3 "auto" failure (a Copilot draft producing
+    // contentSchemaMismatch on its first attempt) is now fixed at the
+    // request-building boundary (RC2 item 14, Step 8), so "auto" no longer
+    // needs to be pushed out of the way.
     const stub = installCopilotModels([
       { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
       { id: "auto", name: "Auto" },
@@ -1598,7 +1602,7 @@ void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€
       const models = await getAvailableCopilotModels();
       assert.deepEqual(
         models.map((m) => m.id),
-        ["gpt-5.6-sol", "claude-sonnet-4.6", "auto"]
+        ["gpt-5.6-sol", "auto", "claude-sonnet-4.6"]
       );
     } finally {
       stub.restore();
@@ -1634,7 +1638,7 @@ void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€
     }
   });
 
-  void it("labels 'auto' as provider-chosen in the selectable-model list surfaced to the settings UI, and leaves concrete Copilot model names untouched", async () => {
+  void it("no longer labels 'auto' as provider-chosen in the selectable-model list, and leaves concrete Copilot model names untouched", async () => {
     const stub = installCopilotModels([
       { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
       { id: "auto", name: "Auto" },
@@ -1644,7 +1648,7 @@ void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item â€
       const copilotModels = providerModels(models, "GitHub Copilot");
       const auto = copilotModels.find((m) => m.id === "auto");
       const concrete = copilotModels.find((m) => m.id === "gpt-5.6-sol");
-      assert.equal(auto?.name, "Auto (provider-chosen)");
+      assert.equal(auto?.name, "Auto");
       assert.equal(concrete?.name, "GPT-5.6 Sol");
     } finally {
       stub.restore();

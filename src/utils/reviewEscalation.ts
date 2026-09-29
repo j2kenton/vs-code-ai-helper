@@ -3,6 +3,7 @@ import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
   ImplementationDispatchModeV1,
+  isPlanReviewStage,
   PLAN_FILENAME,
   RoundOutcomeEntryV1,
   STAGE_ARTIFACT_FILENAMES,
@@ -16,11 +17,11 @@ import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
 import { isAutoAdvanceEnabled } from "../config/settings";
 import { normalizePath } from "./taskRoot";
-import { isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
+import { getFastForwardRunStateV1, isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
-import { effectiveReviewProgressV1 } from "./effectiveReviewProgress";
+import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import {
   WorkflowDecisionOptionEffectV1,
@@ -86,6 +87,18 @@ export interface ReviewPlateauEvidenceV1 {
   readonly content: string;
   readonly blockers: readonly ReviewBlocker[];
   readonly taskFixableCount: number;
+  /**
+   * RC2 item 7: how many of `blockers` were reclassified `environmental` this
+   * round because they match a removal a prior implementer round declined
+   * for lack of owner approval (`reclassifyDeclinedBlockersV1`,
+   * reviewReadiness.ts). A positive count here, together with
+   * `taskFixableCount === 0`, means EVERY task-fixable blocker was declined
+   * rather than genuinely resolved — the plateau card must recommend
+   * "Change the plan instead", not "Keep iterating", since iterating again
+   * only re-runs the same declined round. Defaults to 0 for call sites that
+   * predate this field (no behavior change there).
+   */
+  readonly declinedBlockerCount?: number;
   /**
    * `TaskProgress.roundOutcomes` for THIS stage, oldest-first, exactly as
    * recorded (item 17's `RoundOutcomeEntryV1.dispatchMode`) — not yet reduced
@@ -245,11 +258,28 @@ export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
  * — per the same "do the whole thing" resolution `keepIterating` already
  * uses — this resumes first.
  */
+/**
+ * RC2 item 3: the sentence naming how many plan-of-record checklist items
+ * are still open and that they will not be built at the destination stage —
+ * appended to every "Advance" option's consequence whenever `planItemsOpen`
+ * is positive, so the option can stay on the card (per the requirement,
+ * "Advance may stay on the card as an option") without reading as though the
+ * plan were finished. Empty string when there is nothing open to name.
+ */
+function describeOpenPlanItemsNoteV1(planItemsOpen: number | undefined, nextStageName: string): string {
+  if (!planItemsOpen || planItemsOpen <= 0) {
+    return "";
+  }
+  const plural = planItemsOpen === 1 ? "item is" : "items are";
+  return ` ${planItemsOpen} plan ${plural} still open and will not be built at ${nextStageName}.`;
+}
+
 function buildAdvanceOptionV1(
   nextStage: TaskStage,
   taskFolderPath: string,
   consequence: string,
-  expectedSourceStage: TaskStage
+  expectedSourceStage: TaskStage,
+  planItemsOpen?: number
 ): WorkflowDecisionOptionV1 {
   // Item 14 / Part 3 Step 3: captured NOW, at card-build time, not re-derived
   // when the option is later chosen — by then the Fast Forward call stack
@@ -278,12 +308,14 @@ function buildAdvanceOptionV1(
     `${consequence} Then dispatches ${nextStageName}'s own next action automatically — starting its review, or ` +
     "applying an existing review's findings — unless that stage's next step is yours, in which case nothing is " +
     "dispatched and it simply waits there for you.";
+  const openItemsNote = describeOpenPlanItemsNoteV1(planItemsOpen, nextStageName);
   return {
     optionId: "advance",
     label: `Advance to ${nextStageName}`,
-    consequence: resumeFastForward
-      ? `${consequence} Continues fast-forwarding at ${nextStageName}.`
-      : ordinaryConsequence,
+    consequence:
+      (resumeFastForward
+        ? `${consequence} Continues fast-forwarding at ${nextStageName}.`
+        : ordinaryConsequence) + openItemsNote,
     // Item 14: chosen during an interrupted Fast Forward run, this continues
     // fast-forwarding at the new stage rather than merely moving the field.
     resumeKind: "continue",
@@ -299,6 +331,43 @@ function buildAdvanceOptionV1(
       // legitimate jump — `resumeAndSetTaskStageV1` uses this to refuse a
       // stale click rather than moving the task backward to `nextStage`.
       args: [{ taskFolderPath, stage: nextStage, resumeFastForward, expectedSourceStage }],
+    },
+  };
+}
+
+/**
+ * RC2 item 3: the option a plateau or environmental-advance card offers
+ * INSTEAD of Advance while the plan of record still has open checklist
+ * items and nothing here is task-fixable — the requirement's "recommend the
+ * action that builds the next items instead (Implementation, or Fast
+ * Forward)". Always moves to Implementation (`impl`), regardless of the
+ * stage the card was raised from: an impl-review plateau with open items
+ * means the checklist still needs building, and Implementation is where
+ * that happens. Reuses `resumeAndSetTaskStageV1`'s existing
+ * `resumeFastForward` handling exactly like {@link buildAdvanceOptionV1} —
+ * captured now, at card-build time, for the same reason.
+ */
+function buildBuildRemainingOptionV1(
+  taskFolderPath: string,
+  planItemsOpen: number,
+  expectedSourceStage: TaskStage
+): WorkflowDecisionOptionV1 {
+  const resumeFastForward = isFastForwardRunActiveV1(taskFolderPath);
+  const plural = planItemsOpen === 1 ? "item" : "items";
+  const verb = planItemsOpen === 1 ? "is" : "are";
+  return {
+    optionId: "buildRemaining",
+    label: `Build the ${planItemsOpen} open plan ${plural}`,
+    resumeKind: "continue",
+    consequence: resumeFastForward
+      ? `Resumes the task, moves it to Implementation, and continues fast-forwarding there — ${planItemsOpen} ` +
+        `plan ${plural} ${verb} still open.`
+      : `Resumes the task, moves it to Implementation, and dispatches its next action there — ${planItemsOpen} ` +
+        `plan ${plural} ${verb} still open.`,
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.resumeAndSetTaskStage",
+      args: [{ taskFolderPath, stage: "impl" as TaskStage, resumeFastForward, expectedSourceStage }],
     },
   };
 }
@@ -324,6 +393,89 @@ function buildReconsiderRequirementOptionV1(
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.openPlanNonGoals",
+      args: [{ taskFolderPath }],
+    },
+  };
+}
+
+/**
+ * RC2 item 12: the plateau card's own "Keep iterating" option — pulled out
+ * of {@link buildEscalationDecisionV1}'s plateau branch because it now has
+ * two genuinely different shapes rather than one label ternary. When this
+ * plateau interrupted a genuinely still-running Fast Forward loop (queried
+ * live, at card-build time, exactly like {@link buildAdvanceOptionV1}'s own
+ * `resumeFastForward` check — see `activeFastForwardRunsV1.ts`'s doc comment
+ * for why this can't be re-derived later), the option resumes FAST FORWARD
+ * itself from Apply Review, carrying the run's own live iteration counters
+ * so the resumed loop continues the SAME attempt budget instead of starting
+ * a fresh one. Outside Fast Forward, this is unchanged from before: a single
+ * Apply Review + re-review cycle, now saying so explicitly in its own
+ * consequence text per the requirement ("say in the option's text that it
+ * runs one Apply Review and one re-review").
+ */
+function buildPlateauKeepIteratingOptionV1(
+  taskFolderPath: string,
+  stageName: string,
+  taskFixableCount: number,
+  blockersCount: number
+): WorkflowDecisionOptionV1 {
+  const fastForwardState = getFastForwardRunStateV1(taskFolderPath);
+  if (fastForwardState) {
+    return {
+      optionId: "keepIterating",
+      resumeKind: "continue",
+      label:
+        `Keep iterating: resume Fast Forward (iteration ${fastForwardState.attemptNumber} of ` +
+        `${fastForwardState.maxAttempts}) from Apply Review`,
+      consequence:
+        `Resumes the task and continues Fast Forward from Apply Review, at iteration ` +
+        `${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps iterating through the ` +
+        "remaining attempt budget this run already committed to, rather than running just one more round.",
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        args: [
+          {
+            taskFolderPath,
+            resumeFastForwardV1: {
+              attemptNumber: fastForwardState.attemptNumber,
+              maxAttempts: fastForwardState.maxAttempts,
+            },
+          },
+        ],
+      },
+    };
+  }
+  return {
+    optionId: "keepIterating",
+    // Resumes and dispatches Apply Review: continues the process.
+    resumeKind: "continue",
+    // v1 fixes 2, item 25: name the action, not just "Keep iterating".
+    label:
+      taskFixableCount > 0
+        ? `Keep iterating: run Apply Review on the ${taskFixableCount} task-fixable ` +
+          `${taskFixableCount === 1 ? "blocker" : "blockers"}`
+        : "Keep iterating: run Apply Review",
+    consequence:
+      taskFixableCount > 0
+        ? `Resumes the task and runs Apply Review against the ${taskFixableCount} task-fixable ` +
+          `${taskFixableCount === 1 ? "blocker" : "blockers"} — it edits the workspace to address ` +
+          `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict. This runs ` +
+          "one Apply Review and one re-review; if the review is out of date it re-runs the review first instead."
+        : `Resumes the task and runs Apply Review — nothing to act on: 0 of the ${blockersCount} ` +
+          "remaining blocker(s) are task-fixable, so this will most likely reproduce the same verdict. This runs " +
+          "one Apply Review and one re-review.",
+    // A1 (1.0.0 gate, Part C): NOT resumeAndRerunReviewV1 — a prior
+    // revision of this option re-ran the REVIEW, which against an
+    // unchanged tree reproduces the identical verdict by construction, so
+    // "another round has real work to act on" (this option's own
+    // rationale) was never actually true. resumeAndApplyCurrentStageActionV1
+    // resumes AND dispatches Apply Review (edits the workspace against
+    // these blockers, then re-reviews inline) — genuine work before the
+    // next verdict, matching the text above.
+    effect: {
+      kind: "command" as const,
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
       args: [{ taskFolderPath }],
     },
   };
@@ -356,6 +508,16 @@ export interface EscalationPlateauContextV1 {
   readonly taskFixableCount: number;
   readonly hasSpecDefect: boolean;
   /**
+   * RC2 item 7, Step 29: true when EVERY task-fixable blocker this round had
+   * was reclassified `environmental` because it matches a removal a prior
+   * implementer round already declined (see
+   * `ReviewPlateauEvidenceV1.declinedBlockerCount`). Overrides the
+   * recommendation to "Change the plan instead" ahead of the normal
+   * `taskFixableCount > 0` check — recommending "Keep iterating" would only
+   * dispatch the same round that already declined this exact blocker.
+   */
+  readonly hasDeclinedBlocker: boolean;
+  /**
    * 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
    * `escalate` route (reviewRouting.ts's `onlyNonFixableRemain`, or a
    * plateau that still carries a non-task-fixable blocker) can pause the
@@ -369,6 +531,15 @@ export interface EscalationPlateauContextV1 {
   readonly nextStageHasRun: boolean;
   readonly clearingNote: string;
   readonly dispatchModeEvidence: readonly { label: string; detail: string }[];
+  /**
+   * RC2 item 3: how many plan-of-record checklist items are still open,
+   * from the same checklist-reconciled `effectiveReviewProgressV1` value
+   * `progressNote` above is already rendered from — never the review's own
+   * raw, self-chosen denominator. A plateau with real work still open must
+   * never recommend (or let the user casually pick) "Advance" as though the
+   * plan were finished; see `buildEscalationDecisionV1`'s plateau branch.
+   */
+  readonly planItemsOpen: number;
 }
 
 /**
@@ -402,7 +573,15 @@ export function buildEscalationDecisionV1(
   stage: TaskStage,
   reason: string,
   target: { canonicalId: string; taskFolderPath: string; taskName?: string },
-  plateauContext?: EscalationPlateauContextV1
+  plateauContext?: EscalationPlateauContextV1,
+  /**
+   * RC2 item 3: the generic (no `plateauContext`) card's own plan-open-items
+   * count, for its "Advance" option's consequence note — this branch never
+   * recommends Advance already (its recommendation is always
+   * switchStageModel/reconsiderRequirement/keepIterating), so only the
+   * consequence text needs the open-items note, not a routing change.
+   */
+  genericPlanItemsOpen?: number
 ): PostWorkflowDecisionInputV1 {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStage = nextStageInOrderV1(stage);
@@ -417,10 +596,12 @@ export function buildEscalationDecisionV1(
       progressNote,
       taskFixableCount,
       hasSpecDefect,
+      hasDeclinedBlocker,
       hasNonFixableBlocker,
       nextStageHasRun,
       clearingNote,
       dispatchModeEvidence,
+      planItemsOpen,
     } = plateauContext;
     const options: WorkflowDecisionOptionV1[] = [
       ...(nextStage
@@ -433,42 +614,17 @@ export function buildEscalationDecisionV1(
                   "current state as good enough to proceed rather than re-reviewing it here."
                 : `Moves the task to ${nextStageName}, which hasn't run yet and covers different ground — it will ` +
                   `not necessarily re-find this same blocker the way another ${stageName} round would.`,
-              stage
+              stage,
+              planItemsOpen
             ),
           ]
         : []),
-      {
-        optionId: "keepIterating",
-        // Resumes and dispatches Apply Review: continues the process.
-        resumeKind: "continue",
-        // v1 fixes 2, item 25: name the action, not just "Keep iterating".
-        label:
-          taskFixableCount > 0
-            ? `Keep iterating: run Apply Review on the ${taskFixableCount} task-fixable ` +
-              `${taskFixableCount === 1 ? "blocker" : "blockers"}`
-            : "Keep iterating: run Apply Review",
-        consequence:
-          taskFixableCount > 0
-            ? `Resumes the task and runs Apply Review against the ${taskFixableCount} task-fixable ` +
-              `${taskFixableCount === 1 ? "blocker" : "blockers"} — it edits the workspace to address ` +
-              `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict. ` +
-              "If the review is out of date it re-runs the review first instead."
-            : `Resumes the task and runs Apply Review — nothing to act on: 0 of the ${blockersCount} ` +
-              "remaining blocker(s) are task-fixable, so this will most likely reproduce the same verdict.",
-        // A1 (1.0.0 gate, Part C): NOT resumeAndRerunReviewV1 — a prior
-        // revision of this option re-ran the REVIEW, which against an
-        // unchanged tree reproduces the identical verdict by construction, so
-        // "another round has real work to act on" (this option's own
-        // rationale) was never actually true. resumeAndApplyCurrentStageActionV1
-        // resumes AND dispatches Apply Review (edits the workspace against
-        // these blockers, then re-reviews inline) — genuine work before the
-        // next verdict, matching the text above.
-        effect: {
-          kind: "command" as const,
-          command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-          args: [{ taskFolderPath: target.taskFolderPath }],
-        },
-      },
+      // RC2 item 3: offered whenever the plan of record still has open
+      // checklist items, regardless of whether anything remaining is
+      // task-fixable — this is the "build the next items" alternative to
+      // Advance the requirement calls for.
+      ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
+      buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount),
       {
         optionId: "handleMyself",
         label: "Leave it paused — I'll fix it",
@@ -519,13 +675,41 @@ export function buildEscalationDecisionV1(
             "A remaining blocker this round is classified spec-defect — that is exactly the shape where the " +
             "requirement, not the implementation, is what needs to change.",
         }
-      : taskFixableCount > 0
+      : // RC2 item 7, Step 29: every task-fixable blocker this round had was
+        // already declined by a prior implementer round for lack of owner
+        // approval — "Keep iterating" would only dispatch the same round
+        // that already refused it. This is checked ahead of `planItemsOpen`
+        // too: a declined removal needs a human decision regardless of how
+        // much of the plan is otherwise open.
+        hasDeclinedBlocker
+        ? {
+            kind: "option",
+            optionId: "reconsiderRequirement",
+            reasoning:
+              "The remaining blocker here matches a removal the last implementation round already declined, " +
+              "citing rule 7 — no owner approval is recorded in the task's own Task Description. Another round " +
+              "will decline it again; this needs a human decision, not more automated iteration.",
+          }
+        : taskFixableCount > 0
         ? {
             kind: "option",
             optionId: "keepIterating",
             reasoning: `${taskFixableCountLabel} are still task-fixable, so another round has real work to do.`,
           }
-        : nextStage && !nextStageHasRun
+        : // RC2 item 3: with open plan items and nothing task-fixable here,
+          // recommend building them rather than Advance or "leave it paused" —
+          // advancing (or merely waiting) would leave those items unbuilt
+          // behind a stage that treats implementation as done.
+          planItemsOpen > 0
+          ? {
+              kind: "option",
+              optionId: "buildRemaining",
+              reasoning:
+                `Every remaining blocker is non-task-fixable, but ${planItemsOpen} plan ` +
+                `${planItemsOpen === 1 ? "item is" : "items are"} still open — advancing would leave ` +
+                `${planItemsOpen === 1 ? "it" : "them"} unbuilt behind a stage that treats implementation as done.`,
+            }
+          : nextStage && !nextStageHasRun
           ? {
               kind: "option",
               optionId: "advance",
@@ -565,6 +749,11 @@ export function buildEscalationDecisionV1(
         (hasNonFixableBlocker
           ? " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
             "later, until it clears or you choose \"I'll publish over it\" below to override it there."
+          : "") +
+        (hasDeclinedBlocker
+          ? " The last implementation round already declined this same removal as needing a human decision — " +
+            "no owner approval is recorded in the task's own Task Description, so another round will decline it " +
+            "again."
           : ""),
       options,
       recommendation,
@@ -644,7 +833,8 @@ export function buildEscalationDecisionV1(
             nextStage,
             target.taskFolderPath,
             `Accepts the current state and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}.`,
-            stage
+            stage,
+            genericPlanItemsOpen
           ),
         ]
       : []),
@@ -786,6 +976,7 @@ function buildPublishAnywayOptionV1(taskFolderPath: string): WorkflowDecisionOpt
 }
 
 export async function postEnvironmentalAdvanceNoticeV1(
+  folderUri: vscode.Uri,
   stage: TaskStage,
   blockers: readonly ReviewBlocker[],
   target: { canonicalId: string; taskFolderPath: string; taskName?: string }
@@ -797,6 +988,22 @@ export async function postEnvironmentalAdvanceNoticeV1(
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStage = nextStageInOrderV1(stage);
   const nextStageName = nextStage ? STAGE_DISPLAY_NAMES[nextStage] : undefined;
+  // RC2 item 3: same rule as the plateau card — never recommend Advance (or
+  // let it read as though the plan were finished) while the plan of record
+  // still has open checklist items. Review fix (2026-09-28, completion
+  // blocker): a plan-review-stage task is NOT guaranteed to have no
+  // checklist yet — a task rolled back from Implementation to a plan review
+  // keeps its half-finished plan-final.md on disk (see the matching guard
+  // and comment on `postReviewPlateauDecisionV1`'s own `planItemsOpen`,
+  // above, and the identical rationale in reviewActions.ts beside
+  // `effectiveReviewProgressV1`'s call). Without this guard, that stale
+  // checklist could recommend "Build the N open plan items", whose effect
+  // jumps straight to `impl` — skipping an ordered review stage (e.g. Plan
+  // Low-Level Review) between here and there. A plan-review stage's checklist
+  // count is therefore always read as 0, exactly like the plateau branch.
+  const planItemsOpen = isPlanReviewStage(stage)
+    ? 0
+    : ((await readDisplayPlanChecklistProgressV1(folderUri))?.counts.remaining ?? 0);
   // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
   // non-fixable blocker verbatim, not just the first with "(and N more of
   // the same kind)" — a summarized count is not the "command, file,
@@ -820,11 +1027,13 @@ export async function postEnvironmentalAdvanceNoticeV1(
       optionId: "acknowledgeAdvance",
       label: "Continue — advance anyway",
       resumeKind: "continue",
-      consequence: nextStage
-        ? `${stageName} met its score threshold. Choosing this closes the notice, advances the task to ` +
-          `${nextStageName}, and then tries to keep it moving by running ${nextStageName}'s own next action.`
-        : `${stageName} met its score threshold, but there is no later stage to advance to. Choosing this ` +
-          `closes the notice and tries to keep the task moving by running ${stageName}'s own next action now.`,
+      consequence:
+        (nextStage
+          ? `${stageName} met its score threshold. Choosing this closes the notice, advances the task to ` +
+            `${nextStageName}, and then tries to keep it moving by running ${nextStageName}'s own next action.`
+          : `${stageName} met its score threshold, but there is no later stage to advance to. Choosing this ` +
+            `closes the notice and tries to keep the task moving by running ${stageName}'s own next action now.`) +
+        describeOpenPlanItemsNoteV1(planItemsOpen, nextStageName ?? stageName),
       effect: nextStage
         ? {
             kind: "command",
@@ -848,6 +1057,10 @@ export async function postEnvironmentalAdvanceNoticeV1(
             args: [{ taskFolderPath: target.taskFolderPath }],
           },
     },
+    // RC2 item 3: offered whenever the plan of record still has open
+    // checklist items, so the user has a "build the rest" exit alongside
+    // "advance anyway" instead of only being told the count in prose.
+    ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
     {
       optionId: "handleMyself",
       label: "Fix it yourself first",
@@ -873,7 +1086,18 @@ export async function postEnvironmentalAdvanceNoticeV1(
   // that happens (see the withdrawal beside the auto-advance transition in
   // reviewActions.ts), so the two texts below only need to be honest about
   // the possibility, not track the outcome themselves.
-  const autoAdvanceMayPreempt = isAutoAdvanceEnabled() && nextStage !== undefined;
+  //
+  // Review fix (2026-09-28, completion blocker): at an implementation-side
+  // stage (not a plan review), that same re-derivation reconciles its score
+  // against the checklist (`effectiveReviewProgressV1`'s "checklist-reconciled
+  // otherwise" branch — see reviewActions.ts beside its own `progress`/
+  // `meetsThreshold` derivation), so with `planItemsOpen > 0` the real gate
+  // cannot fire no matter what auto-advance is set to. Saying "may move on
+  // its own" there was false reassurance directly contradicting the
+  // `buildRemaining` recommendation just above. Harmless at a plan-review
+  // stage, where `planItemsOpen` is always 0 (see above) and the real gate
+  // never reconciles against this stale checklist anyway.
+  const autoAdvanceMayPreempt = isAutoAdvanceEnabled() && nextStage !== undefined && planItemsOpen === 0;
   const decisionInput: PostWorkflowDecisionInputV1 = {
     decisionKey: "environmentalAdvanceNotice",
     taskCanonicalId: target.canonicalId,
@@ -890,14 +1114,26 @@ export async function postEnvironmentalAdvanceNoticeV1(
         "outstanding, which will block Publish later, until it clears or you override it there — this is the " +
         "moment to see the exits, not a surprise at publish time.",
     options,
-    recommendation: {
-      kind: "option",
-      optionId: "acknowledgeAdvance",
-      reasoning:
-        `${stageName} already met its score threshold; the remaining blocker(s) are outside automation's ` +
-        "control, so advancing now and dealing with Publish's own audited override later is the same choice " +
-        "you would otherwise face at that gate.",
-    },
+    // RC2 item 3: never recommend Advance while the plan has open items —
+    // recommend building them instead.
+    recommendation:
+      planItemsOpen > 0
+        ? {
+            kind: "option",
+            optionId: "buildRemaining",
+            reasoning:
+              `${stageName} already met its score threshold, but ${planItemsOpen} plan ` +
+              `${planItemsOpen === 1 ? "item is" : "items are"} still open — advancing would leave ` +
+              `${planItemsOpen === 1 ? "it" : "them"} unbuilt behind a stage that treats implementation as done.`,
+          }
+        : {
+            kind: "option",
+            optionId: "acknowledgeAdvance",
+            reasoning:
+              `${stageName} already met its score threshold; the remaining blocker(s) are outside automation's ` +
+              "control, so advancing now and dealing with Publish's own audited override later is the same choice " +
+              "you would otherwise face at that gate.",
+          },
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: false,
@@ -1219,6 +1455,15 @@ async function postReviewPlateauDecisionV1(
     effectiveProgress !== null
       ? `${effectiveProgress.complete} of ${effectiveProgress.total} plan steps verified.`
       : "No plan-progress marker was reported for this round.";
+  // RC2 item 3: only meaningful for a checklist-reconciled stage —
+  // `effectiveReviewProgressV1` passes a plan-review stage's raw,
+  // self-reported marker through unreconciled (see that function's doc
+  // comment), which is not the implementation plan's checklist and must
+  // never be read as "N implementation items still open".
+  const planItemsOpen =
+    !isPlanReviewStage(stage) && effectiveProgress !== null
+      ? Math.max(0, effectiveProgress.total - effectiveProgress.complete)
+      : 0;
 
   const nextStage = nextStageInOrderV1(stage);
   let nextStageHasRun = false;
@@ -1230,6 +1475,16 @@ async function postReviewPlateauDecisionV1(
     }
   }
   const hasSpecDefect = normalized.blockers.some((b) => b.resolver === "spec-defect");
+  // RC2 item 7, Step 29: every task-fixable blocker this round had was
+  // reclassified because it matches a removal a prior implementer round
+  // declined — recommending "Keep iterating" here would just re-run the
+  // exact round that already declined it. `evidence.declinedBlockerCount`
+  // only ever counts blockers reclassified OUT of task-fixable, so this can
+  // be true only when `taskFixableCount === 0` — a genuinely separate
+  // task-fixable blocker (unrelated to any decline) keeps `taskFixableCount`
+  // positive and the normal "Keep iterating" recommendation applies instead.
+  const hasDeclinedBlocker =
+    evidence.taskFixableCount === 0 && (evidence.declinedBlockerCount ?? 0) > 0;
   // 1.0.0 gate, Part 4 / Step 14 (B4): same "non-task-fixable" definition
   // `postEnvironmentalAdvanceNoticeV1` uses (everything but `task-fixable` —
   // environmental, unverifiable, spec-defect, needs-toolchain), so the
@@ -1309,10 +1564,12 @@ async function postReviewPlateauDecisionV1(
       progressNote,
       taskFixableCount: evidence.taskFixableCount,
       hasSpecDefect,
+      hasDeclinedBlocker,
       hasNonFixableBlocker,
       nextStageHasRun,
       clearingNote,
       dispatchModeEvidence,
+      planItemsOpen,
     }),
     target
   );
@@ -1479,11 +1736,26 @@ export async function escalateReviewToHuman(
     // inside the postWorkflowDecisionV1 call) so the no-context fallback
     // below can reuse the SAME options/labels rather than re-deriving a
     // second, potentially drifting enumeration of the same four choices.
-    const genericDecisionInput = buildEscalationDecisionV1(kind, stage, reason, {
-      canonicalId: normalizePath(folderUri.fsPath),
-      taskFolderPath: folderUri.fsPath,
-      taskName: progressHint?.displayName,
-    });
+    // RC2 item 3: same "never recommend Advance while the plan has unsettled
+    // items" rule, applied to this generic card's Advance option — lenient
+    // and lightweight (a display-only read, never throws) since this whole
+    // function is a best-effort notification path that must never fail the
+    // review round that triggered it.
+    const genericPlanItemsOpen = !isPlanReviewStage(stage)
+      ? ((await readDisplayPlanChecklistProgressV1(folderUri))?.counts.remaining ?? 0)
+      : 0;
+    const genericDecisionInput = buildEscalationDecisionV1(
+      kind,
+      stage,
+      reason,
+      {
+        canonicalId: normalizePath(folderUri.fsPath),
+        taskFolderPath: folderUri.fsPath,
+        taskName: progressHint?.displayName,
+      },
+      undefined,
+      genericPlanItemsOpen
+    );
     const genericDecision = await postWorkflowDecisionV1(genericDecisionInput, {
       canonicalId: normalizePath(folderUri.fsPath),
       taskFolderPath: folderUri.fsPath,

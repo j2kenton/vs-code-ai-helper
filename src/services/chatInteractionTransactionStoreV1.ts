@@ -230,6 +230,20 @@ export interface ChatInteractionTransactionStoreV1 {
    * no-op success.
    */
   discardPendingInvocation(operationId: string): Promise<ChatTransactionStoreResultV1>;
+  /**
+   * Item 2 / Step 55: settle a durable record explicitly as `timedOut` or
+   * `interrupted` (or `cancelled`, reusing the existing settlement) instead
+   * of deleting it via `discardPendingInvocation` — the two are for the SAME
+   * moment (an invocation that never became a real interaction), but this
+   * one leaves a terminal-state record proving what happened, for a
+   * bounded-deadline or lost-round outcome that must not read as an
+   * ordinary silent completion. Legal from any unsettled state, exactly like
+   * `cancel`/`expire`.
+   */
+  settleInvocation(
+    operationId: string,
+    settlement: "timedOut" | "cancelled" | "interrupted"
+  ): Promise<ChatTransactionStoreResultV1>;
   /** Load and strictly decode one operation's record. */
   load(operationId: string): Promise<ChatTransactionStoreResultV1>;
   /** Save a (possibly partial) answers draft; repeat saves rewrite in place. */
@@ -818,6 +832,13 @@ export function createChatInteractionTransactionStoreV1(options: {
         );
         return { kind: "ok", transaction: loaded.transaction };
       });
+    },
+
+    settleInvocation(
+      operationId: string,
+      settlement: "timedOut" | "cancelled" | "interrupted"
+    ): Promise<ChatTransactionStoreResultV1> {
+      return settleTerminal(operationId, settlement);
     },
 
     async load(operationId: string): Promise<ChatTransactionStoreResultV1> {

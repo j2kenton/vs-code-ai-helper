@@ -197,6 +197,16 @@ export interface EngineConversationOrchestratorV1 {
    */
   discardInvocation(operationId: string): Promise<void>;
   /**
+   * Settle an admitted `invocationPending` record explicitly as `timedOut`,
+   * `cancelled`, or `interrupted` instead of deleting it via
+   * `discardInvocation` — see the extension-side orchestrator's matching doc
+   * comment. Returns whether the durable write actually succeeded; a caller
+   * that ignores a `false` result and still runs `discardInvocation`
+   * afterward would delete the still-`invocationPending` record instead of
+   * leaving it for later reconciliation. Never throws.
+   */
+  settleInvocation(operationId: string, settlement: "timedOut" | "cancelled" | "interrupted"): Promise<boolean>;
+  /**
    * Record a `questions` result as a new unresolved interaction backed by
    * exactly one durable transaction, written through before this resolves.
    */
@@ -420,6 +430,18 @@ export function createEngineConversationOrchestratorV1(options: {
         await store.discardPendingInvocation(operationId);
       } catch {
         // Best-effort cleanup: a leftover pending record is harmless.
+      }
+    },
+
+    async settleInvocation(
+      operationId: string,
+      settlement: "timedOut" | "cancelled" | "interrupted"
+    ): Promise<boolean> {
+      try {
+        const settled = await store.settleInvocation(operationId, settlement);
+        return settled.kind === "ok";
+      } catch {
+        return false;
       }
     },
 

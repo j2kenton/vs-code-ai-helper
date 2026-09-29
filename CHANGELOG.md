@@ -2,6 +2,30 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [Unreleased] — Copilot `auto` everywhere, a watchdog for hung providers, and fewer stuck-task loops
+
+### Added
+
+- **Copilot's `auto` model works at every stage.** Every message Ensemble sends a Copilot model now carries non-empty text, including the tool-results message a tool session sends back (previously text-only, which is how `auto`'s router picks a model) — so draft, plan, both plan reviews, implementation, Apply Review, both code reviews, Publish review, "Fix Linting & Code Errors" and stage chat all work with `auto`. It's listed normally in every model picker again, no longer pinned last and labelled "(provider-chosen)".
+- **A stuck provider invocation can no longer lock a task forever.** Every provider call — plan generation, implementation, review, Apply Review — now runs under a bounded watchdog. When the deadline, a cancellation, or the extension host ends an invocation, its transaction settles to an explicit terminal outcome (timed out / cancelled / interrupted) instead of sitting at "pending" indefinitely, and the task's admission is released once no provider process can still be running, so a retry is safely admitted. If a process's status can't be confirmed, a "Provider process may still be running" card lets you stop it or confirm it's gone yourself.
+- **A no-change implementation or Apply Review round with open plan items now raises one decision card** listing each open item and the round's own reason for leaving it, instead of two generic warnings that just suggest re-running the same round. You can exclude items (with a reason), tick ones you already did, or leave them open — no manual `plan-final.md` editing needed.
+
+### Changed
+
+- **A plateau card never recommends Advance, and nothing auto-advances, while the plan still has open items.** It recommends building the remaining items instead; Advance stays available, but its consequence now says how many items are still open and that they won't be built at the next stage.
+- **"Keep iterating" on a Fast Forward plateau resumes Fast Forward itself** (from Apply Review, keeping its iteration count), instead of running one Apply Review cycle and then silently stopping. Outside Fast Forward, the option still says plainly that it runs one Apply Review and one re-review.
+- **A removal named in the owner's own Task Description is now recognized as the owner's approval** to make it; a plan step or review alone still isn't. When an implementer declines a blocker for needing a human decision, the next review classifies it the same way instead of re-raising it as task-fixable, and a plateau card no longer recommends "Keep iterating" when that's the only blocker left.
+- **Answering one decision card now names any other pending card it closes**, and every option that resumes the task says so in its own label. Pressing an action that's already been applied says "already done" instead of a generic failure message.
+- **"Run now" on an owed continuation that's still claimed says exactly when it becomes available**, instead of re-announcing an identical new card on every press.
+- **"Fix Linting & Code Errors" reports the AI failure by name and says which checks are still failing**, instead of suggesting the ESLint extension is missing when it was never the problem. A check that failed on every attempt no longer reads "passed on retry".
+
+### Fixed
+
+- **A Copilot response with a malformed or misplaced end marker is no longer discarded.** When the JSON body parses completely and only the closing marker is wrong — a single substituted character, a same-shaped end-marker attempt with a garbled name, the correct marker jammed onto the same line as the JSON with no line break, or no end marker at all — the result is accepted and the repair is logged, instead of failing the whole stage.
+- **A rejected AI attempt now records why it was rejected**, next to its attempt id in the round's run file, and the stage's failure message summarises every attempt's reason instead of only the last one.
+- **"The targeted stall regressions still need a passing test run" can no longer become a permanent blocker at an implementation review.** Implementation reviews only run fast checks (lint, type-check); a finding that only asks for a passing test run is no longer counted as blocking work at that stage.
+- **The chat panel no longer re-renders, and the Tasks progress bar no longer restarts its sweep, on every unrelated progress tick.** The panel re-renders only when something it actually shows has changed for the task you're viewing, and per-tick memory growth during long Fast Forward runs is now bounded.
+
 ## [Unreleased] — Readable helper text, copyable choice cards, live implementation percentage, pane search
 
 ### Added

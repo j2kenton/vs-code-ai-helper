@@ -59,6 +59,8 @@ import {
   claimReviewAttempt,
   claimReviewAttemptWithLiveLeaseV1,
   handleReviewRoutingOutcome,
+  ReviewOutcomeContextV1,
+  terminalizeUnclosedReviewRoundV1,
   terminalStateForUnclosedReviewOutcomeV1,
 } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
@@ -2508,6 +2510,141 @@ void describe("terminalStateForUnclosedReviewOutcomeV1 (item 18 / Part 4 safety 
         "failed",
         `outcome kind "${kind}" must map to a terminal "failed" ledger state`
       );
+    }
+  });
+});
+
+// Item 2 / Step 55 (2026-09-28 review follow-up, "the required 'timed out
+// after N minutes' text is not yet stored on those round-ledger rows"): a
+// review round's safety-net closer must carry the same failure text into the
+// ledger's own rejectionReason that the user-facing notification already
+// shows, not close the row with no explanation at all.
+void describe("terminalizeUnclosedReviewRoundV1 rejectionReason (item 2 / Step 55)", () => {
+  function makeReviewCtx(folderPath: string, reviewAttemptId: string): ReviewOutcomeContextV1 {
+    const folderUri = vscode.Uri.file(folderPath);
+    return {
+      extensionUri: folderUri,
+      folderUri,
+      workspaceUri: folderUri,
+      currentStage: "impl-high-review",
+      targetStage: "impl-high-review",
+      reviewUri: folderUri,
+      variables: {},
+      reviewAttemptId,
+    };
+  }
+
+  void it("stores 'timed out after N minutes' as rejectionReason for an invocationDeadlineExceeded failure", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    initNotificationRouter({ addEntry: (): void => {} });
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "review_timeout_rejection_reason");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "review_timeout_rejection_reason",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+        roundLedger: [
+          {
+            roundId: "attempt-review-timeout",
+            attemptIds: ["attempt-review-timeout"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            state: "open",
+          },
+        ],
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+
+      const outcome: TaskActionOutcomeV1 = {
+        kind: "failed",
+        code: "invocationDeadlineExceeded",
+        detail: "deadline exceeded after 3600000ms",
+        retryable: true,
+      };
+      await terminalizeUnclosedReviewRoundV1(outcome, makeReviewCtx(folderPath, "attempt-review-timeout"));
+
+      const raw = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+      const ledgerRow = raw.roundLedger?.find((r) => r.roundId === "attempt-review-timeout");
+      assert.equal(ledgerRow?.state, "failed");
+      assert.match(ledgerRow?.outcome?.rejectionReason ?? "", /timed out after \d+ minutes?/);
+    } finally {
+      deactivateNotificationRouter();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("does not set a free-text rejectionReason for a 'completed' close", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    initNotificationRouter({ addEntry: (): void => {} });
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "review_completed_no_rejection_reason");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "review_completed_no_rejection_reason",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+        roundLedger: [
+          {
+            roundId: "attempt-review-completed-safetynet",
+            attemptIds: ["attempt-review-completed-safetynet"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            state: "open",
+          },
+        ],
+      };
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(progress, null, 2),
+        "utf8"
+      );
+
+      const outcome = { kind: "completed" } as unknown as TaskActionOutcomeV1;
+      await terminalizeUnclosedReviewRoundV1(
+        outcome,
+        makeReviewCtx(folderPath, "attempt-review-completed-safetynet")
+      );
+
+      const raw = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+      const ledgerRow = raw.roundLedger?.find((r) => r.roundId === "attempt-review-completed-safetynet");
+      assert.equal(ledgerRow?.state, "completed");
+      assert.equal(ledgerRow?.outcome?.rejectionReason, undefined);
+    } finally {
+      deactivateNotificationRouter();
+      wsStub.restore();
+      fsBridge.restore();
     }
   });
 });

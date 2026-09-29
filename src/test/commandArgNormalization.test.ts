@@ -873,6 +873,10 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { setExtensionContextV1 } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
+import type { CreateWorkflowDecisionInputV1 } from "../types/workflowDecisionV1";
 
 void describe("pauseTask integration (full command path)", () => {
   void it("TaskNode-shaped arg pauses the exact named task", async () => {
@@ -1188,6 +1192,123 @@ void describe("resumePausedTask integration (full command path)", () => {
       );
     } finally {
       msgs.restore();
+    }
+  });
+
+  /**
+   * RC2 item 8, Step 34 (implementation-review follow-up, 2026-09-28): the
+   * chat confirmation's "this also resumes the task, which closes: …" note
+   * (chatView.ts) is only true for pending decisions `resumePausedTask`
+   * actually withdraws — every `ESCALATION_DECISION_KEYS_V1` key — NOT every
+   * decision with `gating.holdsTaskPaused: true` (a broader set that also
+   * includes non-escalation decisions like `quotaExhaustedDuringRun` and
+   * `providerChainExhausted`, which hold the pause a different way and are
+   * never withdrawn here). This drives `resumePausedTask` through its real
+   * production path (not a mock) against a real `WorkflowDecisionStoreV1`
+   * over the exact `context.workspaceState` Memento `withdrawWorkflowDecisionsByKeyV1`
+   * reads, and asserts the real withdrawal boundary: an escalation-keyed
+   * decision is gone afterward, a `holdsTaskPaused: true` decision under a
+   * non-escalation key survives.
+   */
+  void it("actually withdraws only ESCALATION_DECISION_KEYS_V1 decisions on real resume, leaving other holdsTaskPaused decisions pending", async () => {
+    const store = new Map<string, string>();
+    const fs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const memento = (values: Map<string, unknown>): vscode.Memento =>
+      ({
+        get: <T>(key: string, fallback?: T): T => (values.has(key) ? (values.get(key) as T) : (fallback as T)),
+        update: (key: string, value: unknown): Promise<void> => {
+          values.set(key, value);
+          return Promise.resolve();
+        },
+        keys: () => [...values.keys()],
+      }) as unknown as vscode.Memento;
+    const workspaceStateValues = new Map<string, unknown>();
+    const context = {
+      globalState: memento(new Map()),
+      workspaceState: memento(workspaceStateValues),
+      subscriptions: [],
+    } as unknown as vscode.ExtensionContext;
+    setExtensionContextV1(context);
+    try {
+      const folderUri = makeTaskFolderUri("resume-withdrawal-boundary");
+      const folderPath = folderUri.fsPath;
+      const canonicalId = folderPath;
+      const progress: TaskProgress = {
+        taskFolder: "resume-withdrawal-boundary",
+        currentStage: "impl",
+        status: "paused",
+        createdAt: "2026-07-08T00:00:00.000Z",
+        updatedAt: "2026-07-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const baseInput = (
+        overrides: Partial<CreateWorkflowDecisionInputV1>
+      ): CreateWorkflowDecisionInputV1 => ({
+        decisionId: overrides.decisionId ?? "decision",
+        decisionKey: "reviewPlateauEscalation",
+        taskCanonicalId: canonicalId,
+        stage: "impl",
+        whatHappened: "placeholder",
+        whyUserNeeded: "placeholder",
+        options: [
+          {
+            optionId: "opt",
+            label: "Option",
+            consequence: "Does something.",
+            resumeKind: "continue",
+            effect: { kind: "doNothing" },
+          },
+        ],
+        recommendation: { kind: "option", optionId: "opt", reasoning: "reasoning" },
+        createdAt: new Date().toISOString(),
+        ...overrides,
+      });
+
+      assert.ok(
+        ESCALATION_DECISION_KEYS_V1.includes("reviewPlateauEscalation"),
+        "fixture assumption: reviewPlateauEscalation is one of the withdrawn keys"
+      );
+      const escalationPosted = await decisionStore.post(
+        baseInput({ decisionId: "escalation-1", decisionKey: "reviewPlateauEscalation" })
+      );
+      assert.ok(escalationPosted.ok, "escalation decision must post");
+      const nonEscalationPosted = await decisionStore.post(
+        baseInput({ decisionId: "quota-1", decisionKey: "quotaExhaustedDuringRun" })
+      );
+      assert.ok(nonEscalationPosted.ok, "non-escalation decision must post");
+
+      assert.equal(
+        decisionStore.listPending(canonicalId).length,
+        2,
+        "both decisions are pending before resume"
+      );
+
+      const inv = makeInventoryStub(canonicalId, folderPath, "paused");
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+      await resumePausedTask(inv, currentStore, { taskFolderPath: folderPath });
+
+      const stored = await readStoredProgress(store, folderUri);
+      assert.strictEqual(stored!.status, "active", "resume must have actually run");
+
+      const stillPending = decisionStore.listPending(canonicalId);
+      assert.ok(
+        !stillPending.some((d) => d.decisionKey === "reviewPlateauEscalation"),
+        "the ESCALATION_DECISION_KEYS_V1 decision must be withdrawn by the real resume path"
+      );
+      assert.ok(
+        stillPending.some((d) => d.decisionKey === "quotaExhaustedDuringRun"),
+        "a non-escalation decision (even with holdsTaskPaused semantics) must NOT be withdrawn by resume — " +
+          "chatView.ts's 'this also resumes the task, which closes: …' note must not name it"
+      );
+    } finally {
+      setExtensionContextV1(undefined as unknown as vscode.ExtensionContext);
+      msgs.restore();
+      fs.restore();
+      wsFolders.restore();
     }
   });
 });
@@ -2482,6 +2603,81 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
       wsFolders.restore();
     }
   });
+
+  // RC2 item 12, Step 25: when the plateau card's "Keep iterating" option
+  // carries `resumeFastForwardV1` (built by
+  // `reviewEscalation.ts`'s `buildPlateauKeepIteratingOptionV1` while a Fast
+  // Forward run is genuinely mid-run), this must dispatch
+  // `fastForwardReviewWithAI` itself — carrying the SAME counters onward as
+  // `resumeFromAttemptV1` — instead of the single applyCurrentStageAction /
+  // runReviewWithAI cycle the tests above cover.
+  void it(
+    "dispatches fastForwardReviewWithAI with resumeFromAttemptV1 when resumeFastForwardV1 is present, " +
+      "bypassing the single-cycle plan resolution entirely",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      try {
+        const folderUri = makeTaskFolderUri("resume-and-apply-ff-keep-iterating");
+        const folderPath = folderUri.fsPath;
+        const progress: TaskProgress = {
+          taskFolder: "resume-and-apply-ff-keep-iterating",
+          currentStage: "impl-high-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+        // Deliberately NOT seeding any review artifact — the plan-resolution
+        // path (loadResumeActionPlanV1) would need one to decide run-review
+        // vs applyCurrentStageAction; the Fast-Forward-resume branch must
+        // never reach that logic at all, so its absence here is itself part
+        // of the proof.
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          resumeFastForwardV1: { attemptNumber: 7, maxAttempts: 10 },
+        });
+
+        const stored = await readStoredProgress(store, folderUri);
+        assert.strictEqual(stored!.status, "active", "the task must actually be resumed");
+
+        const dispatch = execCmd.captured.find(
+          (e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"
+        );
+        assert.ok(
+          dispatch !== undefined,
+          "must dispatch vs-code-ai-helper.fastForwardReviewWithAI, not applyCurrentStageAction/runReviewWithAI"
+        );
+        assert.equal(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+          false,
+          "the single-cycle plan action must never also be dispatched"
+        );
+        const dispatchArg = dispatch.arg as
+          | {
+              taskFolderPath?: string;
+              admissionHandoffTokenV1?: string;
+              resumeFromAttemptV1?: { attemptNumber: number; maxAttempts: number };
+            }
+          | undefined;
+        assert.equal(dispatchArg?.taskFolderPath, folderPath);
+        assert.equal(typeof dispatchArg?.admissionHandoffTokenV1, "string");
+        assert.deepEqual(dispatchArg?.resumeFromAttemptV1, { attemptNumber: 7, maxAttempts: 10 });
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
 
   // Items 14 + 25: a stale review arranges Review, never an Apply Review the
   // product already knows would be refused.

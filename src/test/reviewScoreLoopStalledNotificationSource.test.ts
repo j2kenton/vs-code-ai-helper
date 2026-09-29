@@ -24,7 +24,11 @@ const source = fs.readFileSync(
 
 void describe("reviewActions.ts Fast Forward stalled-stop notification wording", () => {
   void it("renders the count of stalled build rounds from outcome.buildRoundsWithoutProgress instead of a blanket claim", () => {
-    const stalledBranch = source.indexOf("else if (outcome.stalled) {");
+    // RC2 item 13, Step 50: the branch condition grew a second clause
+    // (`&& !consumeOpenItemsCardPostedSinceV1(...)`) so the literal
+    // single-line `else if (outcome.stalled) {` no longer appears — anchor
+    // on the still-stable `outcome.stalled &&` clause opener instead.
+    const stalledBranch = source.indexOf("outcome.stalled &&");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 2000);
 
@@ -43,7 +47,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
   });
 
   void it("derives the rendered stalled-round count from outcome.buildRoundsWithoutProgress, not a hardcoded or unrelated value", () => {
-    const stalledBranch = source.indexOf("else if (outcome.stalled) {");
+    const stalledBranch = source.indexOf("outcome.stalled &&");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 2000);
 

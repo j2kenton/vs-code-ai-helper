@@ -108,4 +108,60 @@ void describe("ViewProgressBinder", () => {
       registry.dispose();
     }
   });
+
+  // RC2 item 11, Step 45: the same running work must not restart the sweep —
+  // only a running/idle transition may start or end it, including when
+  // `setMirroredOperations` replaces the whole mirrored map underneath a
+  // still-running operation.
+  void it("does not restart the progress bar while the same work is still running", async () => {
+    const registry = new TaskOperationRegistry();
+    const binder = new ViewProgressBinder(registry, 5);
+    const calls: Array<{ options: { location?: { viewId?: string } } }> = [];
+    const windowWithCalls = vscode.window as typeof vscode.window & {
+      _withProgressCalls?: typeof calls;
+    };
+    windowWithCalls._withProgressCalls = calls;
+
+    try {
+      const operation = registry.begin("/dev/progress-binder-steady", { label: "Implementation", stage: "impl" });
+      assert.equal(operation !== null, true);
+      await waitUntil(() => calls.length > 0, 500, "expected an initial withProgress call");
+      assert.equal(calls.length, 1, "one withProgress call after the initial show");
+
+      // Repeated activity ticks on the still-running operation (what a round
+      // does on every progress update) must not spawn additional bar calls.
+      for (let i = 0; i < 5; i++) {
+        operation!.reportActivity(`step ${i}`);
+        await sleep(5);
+      }
+      assert.equal(calls.length, 1, "activity ticks on the same running operation must not restart the bar");
+
+      // A viewer mirroring another window's operations replaces the whole
+      // mirrored map on every update (setMirroredOperations) while this
+      // window's own operation is still running — still must not restart it.
+      registry.setMirroredOperations([
+        {
+          id: "mirror-op-1",
+          key: "/dev/progress-binder-steady-mirror",
+          label: "Review",
+          taskName: "mirrored-task",
+          startedAt: Date.now(),
+          exclusive: true,
+          cancellable: false,
+          state: "running",
+          waitingForUser: false,
+        },
+      ]);
+      await sleep(10);
+      assert.equal(calls.length, 1, "setMirroredOperations must not restart the bar while local work is still running");
+
+      registry.end(operation);
+      await sleep(10);
+      assert.equal(calls.length, 1, "ending the only running operation must not add a second bar call");
+    } finally {
+      delete windowWithCalls._withProgressCalls;
+      binder.dispose();
+      registry.dispose();
+    }
+  });
 });

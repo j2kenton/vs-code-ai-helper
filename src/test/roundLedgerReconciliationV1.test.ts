@@ -21,8 +21,55 @@ import {
   repairMissingRoundOutcomeMessagesV1,
   synthesizeLegacyRoundLedgerRowsV1,
 } from "../utils/roundLedgerReconciliationV1";
-import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getChatInteractionTransactionStoreV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
 import { appendChatMessageV1, readChatHistory } from "../utils/chatHistoryStore";
+import {
+  ChatInteractionTransactionStoreV1,
+  ChatTransactionStoreResultV1,
+} from "../services/chatInteractionTransactionStoreV1";
+
+/**
+ * A store double that records every `settleInvocation` call and returns a
+ * caller-controlled result; every other member is unused by orphan
+ * reconciliation (item 2 / Step 55).
+ */
+function makeSettleInvocationSpyStoreV1(
+  result: (operationId: string, settlement: "timedOut" | "cancelled" | "interrupted") => ChatTransactionStoreResultV1
+): {
+  readonly store: ChatInteractionTransactionStoreV1;
+  readonly calls: Array<{ operationId: string; settlement: "timedOut" | "cancelled" | "interrupted" }>;
+} {
+  const calls: Array<{ operationId: string; settlement: "timedOut" | "cancelled" | "interrupted" }> = [];
+  const notImplemented = (): never => {
+    throw new Error("not implemented in this test double");
+  };
+  const store: ChatInteractionTransactionStoreV1 = {
+    begin: notImplemented,
+    beginInvocation: notImplemented,
+    discardPendingInvocation: notImplemented,
+    settleInvocation: (operationId, settlement) => {
+      calls.push({ operationId, settlement });
+      return Promise.resolve(result(operationId, settlement));
+    },
+    load: notImplemented,
+    saveAnswersDraft: notImplemented,
+    submitAnswers: notImplemented,
+    scheduleResume: notImplemented,
+    settleResumed: notImplemented,
+    claimResumeInvocation: notImplemented,
+    recordResumeInvocationOutcome: notImplemented,
+    cancel: notImplemented,
+    expire: notImplemented,
+    settleByChatRecovery: notImplemented,
+    listUnresolvedForChatDocument: () => Promise.resolve([]),
+    sweepExpired: () => Promise.resolve({ expired: 0, removed: 0 }),
+  };
+  return { store, calls };
+}
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-reconcile-"));
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-reconcile-private-"));
@@ -305,6 +352,165 @@ void describe("reconcileOrphanedRoundLedgerRowsV1 (Part 4 step 14, pass (a))", (
       const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
       assert.equal(raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-dead")?.state, "interrupted");
     } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("settles the matching chat-transaction record as interrupted when an operationId-carrying row closes as orphaned (item 2 / Step 55)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const priorStore = getChatInteractionTransactionStoreV1();
+    const { store: spyStore, calls } = makeSettleInvocationSpyStoreV1(() => ({ kind: "missing" }));
+    setChatInteractionTransactionStoreV1(spyStore);
+    try {
+      const { folderUri } = makeTaskFolder("orphan_settles_transaction", [
+        {
+          roundId: "manual-review-attempt-lost",
+          attemptIds: ["manual-review-attempt-lost"],
+          operationId: "op-with-a-pending-invocation",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+      });
+      assert.deepEqual(result.closed, ["manual-review-attempt-lost"]);
+      assert.deepEqual(calls, [{ operationId: "op-with-a-pending-invocation", settlement: "interrupted" }]);
+    } finally {
+      setChatInteractionTransactionStoreV1(priorStore as ChatInteractionTransactionStoreV1);
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("leaves the ledger row open for retry when settleInvocation throws, instead of closing it unsettled", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const priorStore = getChatInteractionTransactionStoreV1();
+    const { store: spyStore } = makeSettleInvocationSpyStoreV1(() => {
+      throw new Error("simulated storage failure");
+    });
+    setChatInteractionTransactionStoreV1(spyStore);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_settle_failure_retried", [
+        {
+          roundId: "manual-review-attempt-throws",
+          attemptIds: ["manual-review-attempt-throws"],
+          operationId: "op-whose-settle-throws",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+      });
+      // A settlement that throws is retryable, not best-effort-ignored: the
+      // row must NOT close, or the now-orphaned chat-transaction record would
+      // be stranded `invocationPending` forever with no eligible row left to
+      // retry it (2026-09-28 review, "New completion blockers").
+      assert.deepEqual(result.closed, []);
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-throws")?.state, "open");
+    } finally {
+      setChatInteractionTransactionStoreV1(priorStore as ChatInteractionTransactionStoreV1);
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("leaves the ledger row open for retry when settleInvocation returns a non-terminal storage failure", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const priorStore = getChatInteractionTransactionStoreV1();
+    const { store: spyStore, calls } = makeSettleInvocationSpyStoreV1(() => ({ kind: "storageFailure" }));
+    setChatInteractionTransactionStoreV1(spyStore);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_settle_storage_failure_retried", [
+        {
+          roundId: "manual-review-attempt-storage-failure",
+          attemptIds: ["manual-review-attempt-storage-failure"],
+          operationId: "op-whose-settle-fails-storage",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+      });
+      assert.deepEqual(result.closed, []);
+      assert.equal(calls.length, 1);
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(
+        raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-storage-failure")?.state,
+        "open"
+      );
+    } finally {
+      setChatInteractionTransactionStoreV1(priorStore as ChatInteractionTransactionStoreV1);
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes the ledger row when settleInvocation reports the record was already terminal (rejected)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const priorStore = getChatInteractionTransactionStoreV1();
+    const { store: spyStore } = makeSettleInvocationSpyStoreV1(() => ({
+      kind: "rejected",
+      reason: "transaction already settled",
+    }));
+    setChatInteractionTransactionStoreV1(spyStore);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("orphan_settle_already_terminal", [
+        {
+          roundId: "manual-review-attempt-already-settled",
+          attemptIds: ["manual-review-attempt-already-settled"],
+          operationId: "op-already-settled-by-a-live-path",
+          stage: "impl-high-review",
+          mode: "review",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          state: "open",
+        },
+      ]);
+
+      const result = await reconcileOrphanedRoundLedgerRowsV1({
+        taskFolderUri: folderUri,
+        hasLiveOperation: false,
+        hasLiveSchedulingIntent: false,
+        liveOperationIds: [],
+        liveSchedulingIntentIds: [],
+      });
+      assert.deepEqual(result.closed, ["manual-review-attempt-already-settled"]);
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(
+        raw.roundLedger?.find((r) => r.roundId === "manual-review-attempt-already-settled")?.state,
+        "interrupted"
+      );
+    } finally {
+      setChatInteractionTransactionStoreV1(priorStore as ChatInteractionTransactionStoreV1);
       wsStub.restore();
       fsBridge.restore();
     }

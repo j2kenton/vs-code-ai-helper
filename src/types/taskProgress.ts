@@ -984,6 +984,31 @@ export interface ReviewScoreHistoryEntry {
    */
   supersededBlockers?: ReviewBlockerIdentity[];
   /**
+   * Stable identities of blockers this round reported that were EXCLUDED
+   * from `blockerCount`/`taskFixableCount`/`blockers` because this stage
+   * structurally cannot ever satisfy them (RC2 item 4,
+   * `partitionStageUnsatisfiableBlockersV1`, reviewReadiness.ts) — for
+   * example, a "needs a passing test run" finding at an implementation
+   * review, which only ever sees fast checks. Absent when nothing was
+   * excluded this round. Kept separate from `blockers` for the same reason
+   * as `supersededBlockers`: a reader should see both what this round
+   * measured AND what was set aside, not a number that silently shrank.
+   */
+  stageUnsatisfiableBlockers?: ReviewBlockerIdentity[];
+  /**
+   * Stable identities of blockers this round reclassified from `task-fixable`
+   * to `environmental` because they match a removal a prior implementer round
+   * declined for lack of owner approval (RC2 item 7, `reclassifyDeclinedBlockersV1`,
+   * reviewReadiness.ts — rule 7 of `apply-impl-review-code.md`/
+   * `run-implementation.md`). Unlike `stageUnsatisfiableBlockers`, these are
+   * NOT excluded from `blockers`/`blockerCount` — they remain, just with a
+   * different `resolver` — so this list exists purely so a reader (and the
+   * plateau card, see `EscalationPlateauContextV1.hasDeclinedBlocker`) can
+   * tell "reclassified because declined" apart from "the reviewer itself
+   * called it environmental". Absent when nothing was reclassified this round.
+   */
+  declinedBlockerReclassifications?: ReviewBlockerIdentity[];
+  /**
    * Every blocker this round re-raised that matches an Accepted Non-Goals
    * entry — see `ReviewerChallengedNonGoalV1`'s doc comment. Absent when
    * nothing matched. A NON-EMPTY value here does not mean the reviewer was

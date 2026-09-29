@@ -1420,6 +1420,37 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private readonly schedulingIntentStore?: SchedulingIntentStoreV1;
   private readonly schedulingIntentSub?: vscode.Disposable;
 
+  /**
+   * Debounces `_onDidChangeTreeData.fire()` to at most one actual fire per
+   * ~500ms window (RC2 item 11, Step 46): `inventory`, `taskOperations`, the
+   * decision store and the scheduling-intent store each fire independently,
+   * and `taskOperations` alone fires on every activity tick of every running
+   * round — without this, VS Code re-rendered (and visibly restarted the
+   * progress sweep of) the whole tree on every one of those ticks. The first
+   * request in a quiet period still fires immediately (leading edge), so a
+   * single user action (collapse all, a filter change) is never delayed;
+   * only a burst within the window collapses into one trailing fire.
+   */
+  private treeRefreshTimerV1: NodeJS.Timeout | undefined;
+  private treeRefreshPendingV1 = false;
+  private static readonly TREE_REFRESH_DEBOUNCE_MS_V1 = 500;
+
+  private scheduleTreeRefreshV1(): void {
+    if (this.treeRefreshTimerV1) {
+      this.treeRefreshPendingV1 = true;
+      return;
+    }
+    this._onDidChangeTreeData.fire();
+    this.treeRefreshTimerV1 = setTimeout(() => {
+      this.treeRefreshTimerV1 = undefined;
+      if (this.treeRefreshPendingV1) {
+        this.treeRefreshPendingV1 = false;
+        this.scheduleTreeRefreshV1();
+      }
+    }, TaskTreeProvider.TREE_REFRESH_DEBOUNCE_MS_V1);
+    (this.treeRefreshTimerV1 as unknown as { unref?: () => void }).unref?.();
+  }
+
   constructor(
     private readonly inventory: TaskInventory,
     private readonly currentTaskStore?: CurrentTaskStore,
@@ -1448,16 +1479,16 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       this.selectedStatuses = new Set(this.defaultStatuses());
     }
     // When the shared inventory changes, refresh the tree automatically
-    this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
+    this.inventory.onDidChange(() => this.scheduleTreeRefreshV1());
 
     // Subscribe to current-task changes and refresh the tree
     if (currentTaskStore) {
-      currentTaskStore.onDidChange(() => this._onDidChangeTreeData.fire());
+      currentTaskStore.onDidChange(() => this.scheduleTreeRefreshV1());
     }
 
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose or it will fire into a dead emitter.
-    this.operationsSub = taskOperations.onDidChange(() => this._onDidChangeTreeData.fire());
+    this.operationsSub = taskOperations.onDidChange(() => this.scheduleTreeRefreshV1());
 
     if (state) {
       this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
@@ -1465,9 +1496,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // sharing this Memento) must clear or add the tree's tooltip line
       // without waiting for an unrelated refresh (AC-06: "visible until
       // resolved", not "visible until the next coincidental refresh").
-      this.workflowDecisionSub = this.workflowDecisionStore.onDidChange(() => this._onDidChangeTreeData.fire());
+      this.workflowDecisionSub = this.workflowDecisionStore.onDidChange(() => this.scheduleTreeRefreshV1());
       this.schedulingIntentStore = new SchedulingIntentStoreV1(state);
-      this.schedulingIntentSub = this.schedulingIntentStore.onDidChange(() => this._onDidChangeTreeData.fire());
+      this.schedulingIntentSub = this.schedulingIntentStore.onDidChange(() => this.scheduleTreeRefreshV1());
     }
   }
 
@@ -1475,6 +1506,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this.operationsSub.dispose();
     this.workflowDecisionSub?.dispose();
     this.schedulingIntentSub?.dispose();
+    if (this.treeRefreshTimerV1) {
+      clearTimeout(this.treeRefreshTimerV1);
+      this.treeRefreshTimerV1 = undefined;
+    }
   }
 
   /**
@@ -1532,7 +1567,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
    * tasks are visible immediately.
    */
   refresh(): void {
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
     this.loadTasks();
   }
 
@@ -1566,7 +1601,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this.selectedStatuses = new Set(picked.map(item => item.label.toLowerCase()));
     await this.state?.update(this.filterKey, [...this.selectedStatuses]);
     await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
   }
 
   /**
@@ -1583,7 +1618,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
 
   setSearchQuery(query: string): void {
     this.searchQuery = query.trim();
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
   }
 
   clearSearch(): void {
@@ -1612,7 +1647,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this.selectedStatuses = new Set(this.defaultStatuses());
     await this.state?.update(this.filterKey, [...this.selectedStatuses]);
     await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
   }
 
   /** Expand all task rows by switching to all-expanded mode */
@@ -1620,7 +1655,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     this.mode = 'allExpanded';
     this.explicitlyExpanded.clear();
     this.explicitlyCollapsed.clear();
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
 
     // Force reveal all nodes to ensure they are expanded
     const nodes = await this.getTaskNodes();
@@ -1649,7 +1684,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // every node's id so the widget treats them as new items and applies the
     // freshly computed (collapsed) state instead of the memorized one.
     this.collapseEpoch += 1;
-    this._onDidChangeTreeData.fire();
+    this.scheduleTreeRefreshV1();
   }
 
   /** Whether the tree is currently in all-expanded mode (for context-key sync) */

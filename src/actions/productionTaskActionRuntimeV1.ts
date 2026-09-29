@@ -175,6 +175,7 @@ function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrc
   return {
     admitInvocation: (input) => resolve().admitInvocation(input),
     discardInvocation: (operationId) => resolve().discardInvocation(operationId),
+    settleInvocation: (operationId, settlement) => resolve().settleInvocation(operationId, settlement),
     postQuestions: (input) => resolve().postQuestions(input),
     submitAnswers: (ref, rawAnswers, answerIdempotencyId) =>
       resolve().submitAnswers(ref, rawAnswers, answerIdempotencyId),

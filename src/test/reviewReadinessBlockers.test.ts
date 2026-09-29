@@ -10,7 +10,11 @@ import {
   meetsAutoAdvanceThreshold,
   readyToAdvanceStage,
   detectSiblingReviewDisagreement,
+  partitionStageUnsatisfiableBlockersV1,
+  reclassifyDeclinedBlockersV1,
+  ReviewBlocker,
 } from "../utils/reviewReadiness";
+import { parseDeclinedBlockersV1 } from "../utils/implementationChecklist";
 
 void describe("parseReviewBlockers", () => {
   void it("returns an empty array when no blockers block is present", () => {
@@ -643,5 +647,259 @@ void describe("detectSiblingReviewDisagreement (2k)", () => {
       undefined
     );
     assert.strictEqual(result, null);
+  });
+});
+
+void describe("partitionStageUnsatisfiableBlockersV1 (RC2 item 4)", () => {
+  const testRunBlocker: ReviewBlocker = {
+    category: "completion",
+    resolver: "task-fixable",
+    description: "The targeted stall regressions still need a passing test run",
+    origin: "reviewer",
+  };
+  const realBlocker: ReviewBlocker = {
+    category: "completion",
+    resolver: "task-fixable",
+    description: "The `foo()` helper in src/utils/foo.ts throws on an empty array",
+    origin: "reviewer",
+  };
+
+  void it("strips a 'needs a passing test run' blocker at impl-high-review", () => {
+    const result = partitionStageUnsatisfiableBlockersV1([testRunBlocker], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [testRunBlocker]);
+  });
+
+  void it("strips a 'needs a passing test run' blocker at impl-low-review", () => {
+    const result = partitionStageUnsatisfiableBlockersV1([testRunBlocker], "impl-low-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [testRunBlocker]);
+  });
+
+  void it("keeps a real task-fixable blocker in the same review", () => {
+    const result = partitionStageUnsatisfiableBlockersV1([testRunBlocker, realBlocker], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, [realBlocker]);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [testRunBlocker]);
+  });
+
+  void it("does not strip the same wording at a Publish review, where the suite really does run", () => {
+    const result = partitionStageUnsatisfiableBlockersV1([testRunBlocker], "publish");
+    assert.deepStrictEqual(result.effectiveBlockers, [testRunBlocker]);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, []);
+  });
+
+  void it("strips a passing-test-run ask regardless of resolver label (environmental)", () => {
+    const environmentalTestRun: ReviewBlocker = {
+      ...testRunBlocker,
+      resolver: "environmental",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([environmentalTestRun], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [environmentalTestRun]);
+  });
+
+  void it("strips a passing-test-run ask regardless of resolver label (unverifiable)", () => {
+    const unverifiableTestRun: ReviewBlocker = {
+      ...testRunBlocker,
+      resolver: "unverifiable",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([unverifiableTestRun], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [unverifiableTestRun]);
+  });
+
+  void it("strips a passing-test-run ask regardless of resolver label (spec-defect)", () => {
+    const specDefectTestRun: ReviewBlocker = {
+      ...testRunBlocker,
+      resolver: "spec-defect",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([specDefectTestRun], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [specDefectTestRun]);
+  });
+
+  void it("strips the exact RC1 shape: a needs-toolchain 'passing test run' ask, not just task-fixable", () => {
+    const needsToolchainTestRun: ReviewBlocker = {
+      ...testRunBlocker,
+      resolver: "needs-toolchain",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([needsToolchainTestRun], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [needsToolchainTestRun]);
+  });
+
+  void it("keeps a mixed finding whole when a real defect is named alongside the test-run wording", () => {
+    const mixedBlocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description:
+        "The targeted stall regressions still need a passing test run, and the `foo()` helper in src/utils/foo.ts throws on an empty array",
+      origin: "reviewer",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([mixedBlocker], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, [mixedBlocker]);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, []);
+  });
+
+  void it("does not strip a blocker that merely mentions tests without asking for a test run", () => {
+    const missingTestBlocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "No unit test exists for the new retry path in src/utils/retry.ts",
+      origin: "reviewer",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([missingTestBlocker], "impl-high-review");
+    assert.deepStrictEqual(result.effectiveBlockers, [missingTestBlocker]);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, []);
+  });
+
+  void it("recognizes the 'test suite must pass' phrasing too", () => {
+    const suiteBlocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "The full test suite must pass before this can be considered done",
+      origin: "reviewer",
+    };
+    const result = partitionStageUnsatisfiableBlockersV1([suiteBlocker], "impl-low-review");
+    assert.deepStrictEqual(result.effectiveBlockers, []);
+    assert.deepStrictEqual(result.unsatisfiableBlockers, [suiteBlocker]);
+  });
+});
+
+void describe("parseDeclinedBlockersV1 (RC2 item 7, Step 28)", () => {
+  void it("parses a single declined entry from ## Remaining Blockers", () => {
+    const summary =
+      "## Files Changed\n\n- src/foo.ts — did a thing\n\n" +
+      "## Remaining Blockers\n\n" +
+      "- Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting — declined: needs a human decision — " +
+      "only the plan asks for this, not the owner's Task Description\n\n" +
+      "## Verification\n\n- ran the tests\n";
+    const result = parseDeclinedBlockersV1(summary);
+    assert.deepStrictEqual(result, [
+      {
+        blockerText: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting",
+        reason: "only the plan asks for this, not the owner's Task Description",
+      },
+    ]);
+  });
+
+  void it("returns an empty list when there is no Remaining Blockers section", () => {
+    const summary = "## Files Changed\n\n- src/foo.ts — did a thing\n";
+    assert.deepStrictEqual(parseDeclinedBlockersV1(summary), []);
+  });
+
+  void it("ignores a Remaining Blockers entry that is not in the declined shape", () => {
+    const summary =
+      "## Remaining Blockers\n\n- The `foo()` helper still throws on an empty array; could not fix in time.\n";
+    assert.deepStrictEqual(parseDeclinedBlockersV1(summary), []);
+  });
+
+  void it("parses multiple declined entries and stops at the next heading", () => {
+    const summary =
+      "## Remaining Blockers\n\n" +
+      "- Remove the legacy `foo` command — declined: needs a human decision — plan-only, not in Task Description\n" +
+      "- Remove the legacy `bar` command — declined: needs a human decision — plan-only, not in Task Description\n\n" +
+      "## Verification\n\n- Remove the legacy `baz` command — declined: needs a human decision — must not be picked up\n";
+    const result = parseDeclinedBlockersV1(summary);
+    assert.strictEqual(result.length, 2);
+    assert.strictEqual(result[0]?.blockerText, "Remove the legacy `foo` command");
+    assert.strictEqual(result[1]?.blockerText, "Remove the legacy `bar` command");
+  });
+
+  void it("only reads the LAST Remaining Blockers heading, matching findLastHeadingV1's echo rationale", () => {
+    const summary =
+      "## Remaining Blockers\n\n- stale entry — declined: needs a human decision — from an echoed prior response\n\n" +
+      "## Remaining Blockers\n\n- Remove the legacy `foo` command — declined: needs a human decision — this round's own entry\n";
+    const result = parseDeclinedBlockersV1(summary);
+    assert.deepStrictEqual(result, [
+      { blockerText: "Remove the legacy `foo` command", reason: "this round's own entry" },
+    ]);
+  });
+});
+
+void describe("reclassifyDeclinedBlockersV1 (RC2 item 7, Step 28)", () => {
+  const declinedRemoval = {
+    blockerText: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting",
+  };
+
+  void it("reclassifies a task-fixable blocker matching a declined entry as environmental", () => {
+    const blocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting from package.json",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([blocker], [declinedRemoval]);
+    assert.strictEqual(result.effectiveBlockers.length, 1);
+    assert.strictEqual(result.effectiveBlockers[0]?.resolver, "environmental");
+    // Everything else about the blocker (description, category, origin) is preserved.
+    assert.strictEqual(result.effectiveBlockers[0]?.description, blocker.description);
+    assert.deepStrictEqual(result.reclassifiedBlockers, [blocker]);
+  });
+
+  void it("leaves an unmatched task-fixable blocker exactly as it was", () => {
+    const unrelated: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "The `foo()` helper in src/utils/foo.ts throws on an empty array",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([unrelated], [declinedRemoval]);
+    assert.deepStrictEqual(result.effectiveBlockers, [unrelated]);
+    assert.deepStrictEqual(result.reclassifiedBlockers, []);
+  });
+
+  void it("never reclassifies a blocker that is already non-task-fixable", () => {
+    const alreadyEnvironmental: ReviewBlocker = {
+      category: "completion",
+      resolver: "environmental",
+      description: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting from package.json",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([alreadyEnvironmental], [declinedRemoval]);
+    assert.deepStrictEqual(result.effectiveBlockers, [alreadyEnvironmental]);
+    assert.deepStrictEqual(result.reclassifiedBlockers, []);
+  });
+
+  void it("with no declined entries, returns the input blockers unchanged", () => {
+    const blocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([blocker], []);
+    assert.deepStrictEqual(result.effectiveBlockers, [blocker]);
+    assert.deepStrictEqual(result.reclassifiedBlockers, []);
+  });
+
+  void it("does not match on a short, generic declined fragment (conservative containment floor)", () => {
+    // A 6-character normalized declined entry must match EXACTLY, never by
+    // containment — otherwise it would match almost any blocker mentioning
+    // the same short word.
+    const blocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description: "The settings page has a rendering glitch on narrow windows",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([blocker], [{ blockerText: "the fix" }]);
+    assert.deepStrictEqual(result.effectiveBlockers, [blocker]);
+    assert.deepStrictEqual(result.reclassifiedBlockers, []);
+  });
+
+  void it("matches even when the reviewer's wording and the declined entry are not byte-identical", () => {
+    // The implementer quotes the blocker back when declining, but a
+    // subsequent review round can reword its own restatement slightly —
+    // matching must tolerate that, not require exact equality.
+    const blocker: ReviewBlocker = {
+      category: "completion",
+      resolver: "task-fixable",
+      description:
+        "**Task-fixable:** Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting, which is still present in package.json.",
+      origin: "reviewer",
+    };
+    const result = reclassifyDeclinedBlockersV1([blocker], [declinedRemoval]);
+    assert.strictEqual(result.effectiveBlockers[0]?.resolver, "environmental");
   });
 });

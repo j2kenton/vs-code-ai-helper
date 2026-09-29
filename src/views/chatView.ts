@@ -5,6 +5,7 @@ import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwarding
 import * as path from "path";
 import { normalizePath } from "../utils/taskRoot";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
+import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
@@ -38,7 +39,11 @@ import {
   StructuredQuestionV1,
   validateStructuredAnswersV1,
 } from "../types/structuredQuestionV1";
-import { WorkflowDecisionOptionEffectV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import {
+  WorkflowDecisionOptionEffectV1,
+  WorkflowDecisionV1,
+  isWorkflowDecisionCommandResultV1,
+} from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import {
   acquireWorkAdmissionV1,
@@ -47,14 +52,20 @@ import {
   revokeWorkAdmissionHandoffV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
   WorkAdmissionHandleV1,
+  createSafeAdmissionReleaseStateV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
+  recordAdmissionReleaseTriggerV1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "../commands/releaseStuckAdmissionMarkers";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
+import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import {
   readEffectivePlanChecklistProgressForDisplayV1,
   readEffectivePlanChecklistProgressV1,
 } from "../utils/effectiveReviewProgress";
-import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
+import { formatChecklistPercentV1, truncateChecklistItemTextV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
 import {
@@ -107,8 +118,21 @@ export type ChatInteractionServiceResultV1 =
   | { readonly ok: false; readonly reason: string };
 
 export type ChatInteractionResumeResultV1 =
-  | { readonly ok: true; readonly settlement: "resumed" | "supersededByReplacementOperation" }
-  | { readonly ok: false; readonly reason: string };
+  | {
+      readonly ok: true;
+      readonly settlement: "resumed" | "supersededByReplacementOperation";
+      /**
+       * Step 57a: the raw coordinator outcome from this Resume's dispatch,
+       * when one was made — carried back so the caller's terminal
+       * `recordAdmissionReleaseTriggerV1` call (right before its safe
+       * release) can classify a deadline/cancellation settlement. `undefined`
+       * on a Resume handler that never called `coordinator.resumeAction`
+       * (e.g. Commit and Push's metadata resume, which settles through its
+       * own callback).
+       */
+      readonly coordinatorOutcome?: TaskActionOutcomeV1;
+    }
+  | { readonly ok: false; readonly reason: string; readonly coordinatorOutcome?: TaskActionOutcomeV1 };
 
 /**
  * The production Chat interaction transaction/coordinator surface Chat With
@@ -721,6 +745,143 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private isRemoteDecisionV1: ((decisionId: string) => boolean) | undefined;
 
+  /**
+   * The last `taskOperations` signature this panel rendered for its current
+   * target (RC2 item 11, Step 43) — everything `render()` actually reads off
+   * `taskOperations.getTaskOperations(target.canonicalId)` to compute `busy`,
+   * `busyDetail`, `busyText` and `waitingForUser`. `taskOperations.onDidChange`
+   * fires for every task's every activity tick with no payload identifying
+   * which task changed, so without this the panel re-ran its full render
+   * pipeline (transcript read, interaction read, webview repaint) on every
+   * tick of every OTHER task's round too. Comparing this signature lets a
+   * change that does not affect what this panel shows — another task's
+   * operation, or this task's operation reporting the same activity twice —
+   * skip the render entirely, while any real change (new/ended operation,
+   * a different `detail`/`waitingForUser`) still repaints immediately.
+   */
+  private lastOperationsSignatureV1: string | undefined;
+  /**
+   * Coalesces renders requested by the four reactive subscriptions below
+   * (RC2 item 11, Step 44): if one of these events fires while a render it
+   * triggered is still in flight (the transcript/interactions read is async),
+   * a second full render pipeline no longer starts concurrently — it is
+   * folded into a single follow-up render once the in-flight one finishes,
+   * so a burst of events during a round costs at most one render "in
+   * progress" plus one "queued", never one per event.
+   *
+   * A write THIS instance makes itself (append/ask/answerQuestion/etc., all
+   * going through `persistAppend`/`appendChatMessageV1`) fires
+   * `chatHistorySub` synchronously as part of settling — which schedules a
+   * reactive render through this same mechanism — before the writing method
+   * gets a chance to render directly afterward. `renderAfterOwnWriteV1` below
+   * is what those call sites use instead of a bare `await this.render()`: it
+   * folds into that already-scheduled reactive render rather than starting a
+   * second, fully redundant render pass for the exact write that triggered
+   * it. When no reactive render was triggered by the write (e.g. it failed
+   * before reaching `persistDocument`, or this instance isn't showing the
+   * write's target), this falls back to a plain direct render, exactly as
+   * before.
+   *
+   * Checking `reactiveRenderInFlightV1` alone is not enough: if the reactive
+   * render this write's synchronous event scheduled has ALREADY fully
+   * settled by the time the writing method reaches this helper (a real gap
+   * on a path like `resolveWorkflowDecision`, which awaits further appends
+   * and a dispatched command between its own write and this call), the flag
+   * reads false and the naive check would start a second, fully redundant
+   * render for data a render already reflects (implementation review,
+   * 2026-09-28 — narrowed Step 44 blocker). Fixed with a generation counter:
+   * every `scheduleReactiveRenderV1()` call — from ANY source, not only this
+   * write — bumps `reactiveRenderRequestGenerationV1`, and each loop
+   * iteration records that counter's value as of when IT STARTED into
+   * `reactiveRenderCompletedGenerationV1` once it finishes; the loop only
+   * exits once nothing more was requested during its own run, so by the time
+   * `reactiveRenderInFlightV1` flips back to false, completed always equals
+   * requested. Each call site therefore captures the counter's value
+   * immediately before its own write (`ownWriteGenerationV1`/
+   * `sinceGenerationV1` below) and passes it to `renderAfterOwnWriteV1`,
+   * which compares it against the CURRENT counter: unchanged means this
+   * write's synchronous fire never happened (the fallback case — force a
+   * direct render), changed means it did, and waits only until the
+   * completed generation catches up to what was current right after the
+   * fire — correct no matter how long the caller takes to get here, and
+   * never blocked on an unrelated later event that happens to still be
+   * in flight.
+   */
+  private reactiveRenderInFlightV1 = false;
+  private reactiveRenderQueuedV1 = false;
+  private reactiveRenderSettledV1: Promise<void> = Promise.resolve();
+  /** Bumped by every `scheduleReactiveRenderV1()` call — see the doc comment above. */
+  private reactiveRenderRequestGenerationV1 = 0;
+  /** The highest request generation a completed render (reactive or direct) reflects. */
+  private reactiveRenderCompletedGenerationV1 = 0;
+
+  private scheduleReactiveRenderV1(): void {
+    this.reactiveRenderRequestGenerationV1++;
+    if (this.reactiveRenderInFlightV1) {
+      this.reactiveRenderQueuedV1 = true;
+      return;
+    }
+    this.reactiveRenderInFlightV1 = true;
+    this.reactiveRenderSettledV1 = (async (): Promise<void> => {
+      for (;;) {
+        const targetGenerationV1 = this.reactiveRenderRequestGenerationV1;
+        await this.render().catch(() => undefined);
+        this.reactiveRenderCompletedGenerationV1 = targetGenerationV1;
+        if (!this.reactiveRenderQueuedV1) break;
+        this.reactiveRenderQueuedV1 = false;
+      }
+      this.reactiveRenderInFlightV1 = false;
+    })();
+  }
+
+  /**
+   * See `reactiveRenderInFlightV1`'s doc comment. `sinceGenerationV1` is the
+   * request-generation counter's value captured by the caller immediately
+   * before its own write (synchronously, before any other await) — the
+   * write's own `chatHistorySub` fire, if it happens at all, always bumps
+   * the counter past this snapshot.
+   */
+  private async renderAfterOwnWriteV1(sinceGenerationV1: number): Promise<void> {
+    if (this.reactiveRenderRequestGenerationV1 === sinceGenerationV1) {
+      // This write's own event never fired (it failed before reaching
+      // `persistDocument`, or this instance isn't showing its target) — no
+      // render is queued or in flight on its behalf, so fall back to a
+      // plain direct render exactly as before Step 44's coalescing.
+      await this.render();
+      this.reactiveRenderCompletedGenerationV1 = Math.max(
+        this.reactiveRenderCompletedGenerationV1,
+        this.reactiveRenderRequestGenerationV1
+      );
+      return;
+    }
+    const targetGenerationV1 = this.reactiveRenderRequestGenerationV1;
+    for (;;) {
+      if (this.reactiveRenderCompletedGenerationV1 >= targetGenerationV1) {
+        return;
+      }
+      if (this.reactiveRenderInFlightV1) {
+        await this.reactiveRenderSettledV1;
+        continue;
+      }
+      await this.render();
+      this.reactiveRenderCompletedGenerationV1 = this.reactiveRenderRequestGenerationV1;
+      return;
+    }
+  }
+
+  /** The signature `operationsSub` compares against, scoped to `this.target`. */
+  private computeOperationsSignatureV1(): string {
+    if (!this.target) { return ""; }
+    const ops = taskOperations.getTaskOperations(this.target.canonicalId);
+    // Exactly the fields render() derives busy/busyDetail/busyText/
+    // waitingForUser from (see the block below starting at `targetOps =`).
+    // `startedAt` distinguishes a genuinely new operation reusing a timing
+    // slot; it never changes for an existing one, so it costs nothing here.
+    return JSON.stringify(
+      ops.map((op) => [op.id, op.state, op.waitingForUser, op.detail, op.modelId, op.label, op.stage, op.startedAt])
+    );
+  }
+
   constructor(private readonly state: vscode.Memento) {
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
     this.schedulingIntentStore = new SchedulingIntentStoreV1(state);
@@ -730,14 +891,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // "what happens next" line.
     this.schedulingIntentSub = this.schedulingIntentStore.onDidChange(() => {
       if (!this.target || !this.view) return;
-      void this.render().catch(() => undefined);
+      this.scheduleReactiveRenderV1();
     });
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose. Only re-render when there is a
     // target to render — operations on other tasks must not rebuild this view.
+    // The registry fires this for EVERY task's every activity tick with no
+    // indication of which task changed, so the signature check below (RC2
+    // item 11, Step 43) is what actually excludes other tasks' operations
+    // (and repeat ticks that report the same activity) from triggering a
+    // full render here.
     this.operationsSub = taskOperations.onDidChange(() => {
       if (!this.target || !this.view) return;
-      void this.render().catch(() => undefined);
+      const signature = this.computeOperationsSignatureV1();
+      if (signature === this.lastOperationsSignatureV1) return;
+      this.lastOperationsSignatureV1 = signature;
+      this.scheduleReactiveRenderV1();
     });
     // A decision resolved (or posted) from anywhere else — another window,
     // an automated dispatch, a different provider instance sharing this same
@@ -746,7 +915,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // derived from persisted state, re-derived whenever the store changes).
     this.decisionsSub = this.workflowDecisionStore.onDidChange(() => {
       if (!this.target || !this.view) return;
-      void this.render().catch(() => undefined);
+      this.scheduleReactiveRenderV1();
     });
     // The persisted chat store's own change signal (Part 4.1's other half):
     // `actions/rows/chatSendRowV1.ts` and `globalAssistantSendRowV1.ts` write
@@ -760,7 +929,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.chatHistorySub = onDidChangeChatHistoryV1((change) => {
       if (!this.target || !this.view) return;
       if (!sameIdentity(this.target, change)) return;
-      void this.render().catch(() => undefined);
+      this.scheduleReactiveRenderV1();
     });
   }
 
@@ -958,6 +1127,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   async open(target: ChatTarget): Promise<void> {
     this.target = target;
+    // A fresh target's first operationsSub event must compare against ITS
+    // OWN current signature, not the previous target's (or `undefined`,
+    // which would never equal a real signature and so treat the very next
+    // operations event — for ANY task — as a change worth rendering again,
+    // even though `open()` below already renders unconditionally).
+    this.lastOperationsSignatureV1 = this.computeOperationsSignatureV1();
     // Best-effort: a Memento write failing must never block opening the chat.
     try {
       await this.state.update(LAST_CHAT_TARGET_KEY, target);
@@ -1013,6 +1188,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (confirmed !== "Reset Chat History") {
       return;
     }
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     await this.runQueued(identity.taskFolderPath, async () => {
       try {
         const result = await resetChatHistoryV1(identity.taskFolderPath, identity.canonicalId);
@@ -1026,7 +1202,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     });
     if (sameIdentity(this.target, identity)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
   }
 
@@ -1113,6 +1289,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (forceOpen || !this.target || sameIdentity(this.target, question)) {
       await this.open(question);
     }
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     await this.runQueued(question.taskFolderPath, async () => {
       let binding = question.binding;
       if (!binding) {
@@ -1132,7 +1309,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       });
     });
     if (sameIdentity(this.target, question)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
     notifyDesktop(
       "Ensemble — question",
@@ -1201,10 +1378,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // `ChatMessage.id`) — every other role has no reply channel to bind.
       ...(role === "question" ? { id: crypto.randomBytes(16).toString("hex") } : {}),
     };
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
 
     if (sameIdentity(this.target, identity)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
   }
 
@@ -1236,6 +1414,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const trimmed = text.trim();
     if (!trimmed) return;
 
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     const outcome = await this.runQueued(identity.taskFolderPath, async () => {
       const transcript = await loadTranscriptWithMigration(
         identity.taskFolderPath,
@@ -1268,7 +1447,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
 
     if (sameIdentity(this.target, identity)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
   }
 
@@ -1406,6 +1585,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.append("assistant", message, identity.stage, identity);
       return false;
     }
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     const result = await this.runQueued(identity.taskFolderPath, () =>
       this.doSubmitInteractionAnswers(identity, clientRef, decoded.answers)
     );
@@ -1428,7 +1608,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     if (sameIdentity(this.target, identity)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
     return result.ok;
   }
@@ -1589,6 +1769,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
     let cancelled = false;
     let declineMessage: string | undefined;
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     await this.runQueued(identity.taskFolderPath, async () => {
       try {
         const interactions = await readChatInteractions(identity.taskFolderPath, identity.canonicalId);
@@ -1633,7 +1814,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.append("assistant", declineMessage, identity.stage, identity);
     }
     if (sameIdentity(this.target, identity)) {
-      await this.render();
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
   }
 
@@ -1708,17 +1889,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
       )}`;
       NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+      const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
       await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
       if (sameIdentity(this.target, unavailableIdentity)) {
-        await this.render();
+        await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
       }
       return;
     }
     const admissionHandle: WorkAdmissionHandleV1 | undefined =
       admission?.outcome === "acquired" ? admission.handle : undefined;
-    const admissionHeartbeat = admissionHandle
-      ? setInterval(() => void admissionHandle.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    // Item 2 / Step 57: this Resume dispatch can drive a real provider
+    // invocation (`resume()` below), so the terminal release in the outer
+    // `finally` must go through the shared safe-release bookkeeping instead
+    // of unconditionally unlinking the marker — see `workAdmissionV1.ts`'s
+    // `trySafeAdmissionReleaseV1` doc comment.
+    const admissionSafeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+    let admissionHeartbeat = admissionHandle
+      ? setInterval(() => void admissionHeartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
       : undefined;
+    const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+    const onAdmissionReleasedV1 = (): void => {
+      if (admissionHeartbeat) {
+        clearInterval(admissionHeartbeat);
+        admissionHeartbeat = undefined;
+      }
+    };
+    async function admissionHeartbeatTickV1(): Promise<void> {
+      if (!admissionHandle) {
+        return;
+      }
+      await admissionHandle.heartbeat();
+      if (admissionSafeReleaseStateV1.releaseRequested && !admissionSafeReleaseStateV1.released) {
+        await trySafeAdmissionReleaseV1(admissionSafeReleaseStateV1, admissionHandle, onAdmissionHeldV1, onAdmissionReleasedV1);
+      }
+    }
+    // Step 57a: captured from `resume`'s result (whichever branch it takes)
+    // so the outer `finally`'s `recordAdmissionReleaseTriggerV1` call below
+    // can classify a deadline/cancellation settlement before the safe
+    // release. Left `undefined` when `resume` never reached a coordinator
+    // dispatch (an early decline below, or a Resume handler like Commit and
+    // Push's that settles through its own callback). Declared here, above
+    // the `try`, since a `let` inside `try { }` is not visible from its
+    // paired `finally { }`.
+    let coordinatorOutcomeV1: TaskActionOutcomeV1 | undefined;
     try {
       const interactions = await readChatInteractions(unavailableIdentity.taskFolderPath, unavailableIdentity.canonicalId);
       const localRecord = interactions.find(
@@ -1751,6 +1964,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ): Promise<ChatInteractionResumeResultV1> => services.resume!(r, id, admissionHandoffTokenV1);
       let resumed = false;
       let declineMessage: string | undefined;
+      const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
       await this.runQueued(identity.taskFolderPath, async () => {
         try {
           const ref = await this.resolveInteractionRef(identity, clientRef);
@@ -1769,6 +1983,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             : undefined;
           try {
             const result = await resume(ref, crypto.randomBytes(16).toString("hex"), admissionHandoffTokenV1);
+            coordinatorOutcomeV1 = result.coordinatorOutcome;
             if (!result.ok) {
               declineMessage = `Could not resume: ${result.reason}`;
               NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
@@ -1802,15 +2017,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.append("assistant", declineMessage, identity.stage, identity);
       }
       if (sameIdentity(this.target, identity)) {
-        await this.render();
+        await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
       }
     } finally {
-      if (admissionHeartbeat) {
-        clearInterval(admissionHeartbeat);
-      }
-      if (admissionHandle) {
-        await admissionHandle.release();
-      }
+      recordAdmissionReleaseTriggerV1(admissionSafeReleaseStateV1, coordinatorOutcomeV1);
+      await requestSafeAdmissionReleaseV1(admissionSafeReleaseStateV1, admissionHandle, onAdmissionHeldV1, onAdmissionReleasedV1);
     }
   }
 
@@ -2177,6 +2388,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // belongs in the conversation the decision was raised in.
     const knownDecision = this.workflowDecisionStore.get(decisionId);
     const refusalStage = knownDecision?.stage ?? panelTarget?.stage;
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
     const clickTaskLabel = clickIdentity
       ? formatNotificationTaskLabelV1(
@@ -2219,11 +2431,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const { decision, option } = result;
       outcome = { ok: true, transitioned: true };
       const identity = this.identityForDecision(decision, ctx);
+      // RC2 item 8: an option whose resumeKind is "continue" resumes the task
+      // through resumePausedTask (the resumeAndXxxV1 family in
+      // resumeTask.ts), which withdraws every OTHER pending card whose
+      // decisionKey is one of ESCALATION_DECISION_KEYS_V1 — NOT every card
+      // with `gating.holdsTaskPaused: true` (several non-escalation decisions,
+      // e.g. "quotaExhaustedDuringRun" and "providerChainExhausted", also set
+      // that flag but are never withdrawn by resumePausedTask, since they
+      // hold the pause a different way and are settled by their own answer).
+      // Filtering by `holdsTaskPaused` alone let this confirmation claim a
+      // closure that would not actually happen (implementation review,
+      // 2026-09-28). Compute the real set now, before dispatching — the store
+      // still lists them pending — so this SAME confirmation line names what
+      // else it closed, rather than leaving the only trace a separate
+      // "Withdrawn: …" line on the closed card's own thread (observed, RC1
+      // 2026-09-26: one card's Apply silently made an unrelated plateau card
+      // vanish).
+      const closedByResumeV1: readonly WorkflowDecisionV1[] =
+        option.resumeKind === "continue"
+          ? this.workflowDecisionStore
+              .listPending(decision.taskCanonicalId)
+              .filter(
+                (d) => d.decisionId !== decisionId && ESCALATION_DECISION_KEYS_V1.includes(d.decisionKey)
+              )
+          : [];
       if (identity) {
+        const closedNote =
+          closedByResumeV1.length > 0
+            ? ` This also resumes the task, which closes: ${closedByResumeV1
+                .map((d) => `"${truncateChecklistItemTextV1(d.whatHappened, 80)}"`)
+                .join(", ")}.`
+            : "";
         const ackText =
           option.effect.kind === "doNothing"
             ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
-            : `Recorded: "${option.label}" — applying now. ${option.consequence}`;
+            : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
         await this.append("assistant", ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
@@ -2248,6 +2490,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               decision.stage,
               identity
             );
+          } else if (isWorkflowDecisionCommandResultV1(result) && identity) {
+            // `refused`/`alreadyDone` render on THIS card's own thread — never
+            // a new card — via the structured result protocol
+            // (`WorkflowDecisionCommandResultV1`, RC2 items 8/9).
+            if (result.outcome !== "done" && result.message) {
+              await this.append("assistant", result.message, decision.stage, identity);
+            }
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -2267,7 +2516,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
       }
     }
-    await this.render();
+    await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     return outcome;
   }
 

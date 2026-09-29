@@ -32,11 +32,16 @@ import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGa
 import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
+  trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 import {
@@ -299,19 +304,33 @@ export async function generatePlanWithAI(
   // task — holding ours through that await would make the follow-up see
   // this run as still busy.
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but only actually unlinks the marker
+  // once the round's recorded processes are all confirmed gone; until then
+  // the marker stays held (and the reason is written durably next to it so a
+  // different process's retry refusal can name it too) and the heartbeat
+  // keeps re-checking instead of blocking this command's `finally` on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
+      heartbeat = undefined;
     }
-    if (handle) {
-      await handle.release();
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
     }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
   };
 
   let result: GeneratePlanResult | undefined;
@@ -377,7 +396,7 @@ export async function generatePlanWithAI(
         return;
       }
       handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
 
     // Admission is now guaranteed live for this exact target — reverse a
@@ -471,6 +490,7 @@ export async function generatePlanWithAI(
       return;
     }
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, result?.coordinatorOutcome);
     await releaseAdmissionV1();
   }
 
@@ -514,6 +534,13 @@ interface GeneratePlanResult {
   succeeded: boolean;
   triggerAutoReview: boolean;
   taskFolderPath?: string;
+  /** Step 57a: the raw coordinator outcome from this invocation, when one was
+   * dispatched — carried back so the caller's terminal
+   * `recordAdmissionReleaseTriggerV1` call (right before its safe release)
+   * can classify a deadline/cancellation settlement, exactly like the doc
+   * comment on that function describes. `undefined` on every early return
+   * before `coordinator.executeAction` ran (no model, unowned task, ...). */
+  coordinatorOutcome?: TaskActionOutcomeV1;
 }
 
 /** A resolved provider/coordinator pair for one generatePlan.v1 invocation. */
@@ -967,6 +994,7 @@ async function generatePlanWithAIForResolvedTask(
 
   let succeeded = false;
   let triggerAutoReview = false;
+  let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
 
   // No overwrite confirmation — user has deliberately triggered regeneration
   await vscode.window.withProgress(
@@ -1001,6 +1029,7 @@ async function generatePlanWithAIForResolvedTask(
         } finally {
           linked.dispose();
         }
+        coordinatorOutcomeForAdmissionV1 = outcome;
 
         const handled = await handleGeneratePlanOutcomeV1(outcome, {
           taskRef: {
@@ -1022,7 +1051,7 @@ async function generatePlanWithAIForResolvedTask(
         }
       }
     );
-  return { succeeded, triggerAutoReview, taskFolderPath: taskFolderUri.fsPath };
+  return { succeeded, triggerAutoReview, taskFolderPath: taskFolderUri.fsPath, coordinatorOutcome: coordinatorOutcomeForAdmissionV1 };
   });
 }
 
@@ -1173,9 +1202,9 @@ export async function resumeGeneratePlanInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome), coordinatorOutcome: outcome };
   }
-  return { ok: true, settlement };
+  return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 /**

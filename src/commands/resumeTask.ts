@@ -11,10 +11,16 @@ import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispa
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
+  trySafeAdmissionReleaseV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
@@ -152,7 +158,16 @@ export function resumeTaskArgHasExplicitTask(
  *   invocation and dispatch a duplicate action for its resume.
  */
 export type ResumePausedTaskOutcomeV1 =
-  | { readonly outcome: "resumed"; readonly release: (() => Promise<void>) | undefined }
+  | {
+      readonly outcome: "resumed";
+      // Item 2 / Step 57a: accepts the caller's dispatch outcome (when one
+      // is available) so it can be recorded via `recordAdmissionReleaseTriggerV1`
+      // before this holder's own release attempt, exactly like the
+      // admission-wired commands' own `finally` blocks do for their own
+      // handle. `undefined` (or an argument-less call) is always safe — it is
+      // what every pre-dispatch early release already does.
+      readonly release: ((coordinatorOutcome?: TaskActionOutcomeV1) => Promise<void>) | undefined;
+    }
   | { readonly outcome: "busy" }
   | { readonly outcome: "superseded" }
   | { readonly outcome: "notPaused" }
@@ -282,18 +297,26 @@ export async function resumePausedTask(
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(admission, taskLabel));
     return { outcome: "busy" };
   }
-  let admissionReleased = false;
-  const admissionHeartbeat = setInterval(
-    () => void admission.handle.heartbeat(),
-    WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1
-  );
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (admissionReleased) {
-      return;
+  // Item 2 / Step 57: same safe-release gate as reviewActions.ts's
+  // admission-wired commands. This handle can outlive `resumePausedTask`
+  // itself — when `holdAdmissionForCaller` is set, `releaseAdmissionV1` below
+  // is returned to the caller (`resumeThenDispatchV1`) and only actually
+  // called once its own dispatch has finished — so the gate matters here too,
+  // not only where this command releases its own handle immediately.
+  const resumeHandle = admission.handle;
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const admissionHeartbeat = setInterval(() => void admissionHeartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+  const onAdmissionReleasedV1 = (): void => clearInterval(admissionHeartbeat);
+  async function admissionHeartbeatTickV1(): Promise<void> {
+    await resumeHandle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, resumeHandle, onAdmissionHeldV1, onAdmissionReleasedV1);
     }
-    admissionReleased = true;
-    clearInterval(admissionHeartbeat);
-    await admission.handle.release();
+  }
+  const releaseAdmissionV1 = async (coordinatorOutcome?: TaskActionOutcomeV1): Promise<void> => {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, coordinatorOutcome);
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, resumeHandle, onAdmissionHeldV1, onAdmissionReleasedV1);
   };
 
   // 2026-09-08 review, narrowed completion blocker: `resolvedTask.progress`
@@ -683,17 +706,35 @@ async function resumeThenDispatchV1<T>(
     if (fresh.outcome !== "acquired") {
       return undefined;
     }
-    const freshHeartbeat = setInterval(
-      () => void fresh.handle.heartbeat(),
-      WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1
-    );
-    release = async () => {
-      clearInterval(freshHeartbeat);
-      await fresh.handle.release();
+    // Item 2 / Step 57: same safe-release gate as `resumePausedTask` above —
+    // `release()` here runs AFTER `dispatch(handoffToken)` below, the actual
+    // invocation boundary, so it must not unlink the marker while a recorded
+    // provider process could still be running. The heartbeat this function
+    // already keeps running is reused to retry the release once `release()`
+    // has been called and found it unsafe the first time.
+    const freshHandle = fresh.handle;
+    const freshSafeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+    const onFreshAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+    const freshHeartbeat = setInterval(() => {
+      void (async (): Promise<void> => {
+        await freshHandle.heartbeat();
+        if (freshSafeReleaseStateV1.releaseRequested && !freshSafeReleaseStateV1.released) {
+          await trySafeAdmissionReleaseV1(freshSafeReleaseStateV1, freshHandle, onFreshAdmissionHeldV1, onFreshAdmissionReleasedV1);
+        }
+      })();
+    }, WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    const onFreshAdmissionReleasedV1 = (): void => clearInterval(freshHeartbeat);
+    release = async (coordinatorOutcome?: TaskActionOutcomeV1) => {
+      recordAdmissionReleaseTriggerV1(freshSafeReleaseStateV1, coordinatorOutcome);
+      await requestSafeAdmissionReleaseV1(freshSafeReleaseStateV1, freshHandle, onFreshAdmissionHeldV1, onFreshAdmissionReleasedV1);
     };
   }
 
   const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
+  // Item 2 / Step 57a: hoisted above `try` (not `const`-scoped inside it) so
+  // the `finally` below can read it, mirroring `runReviewWithAI`'s
+  // `dispatchProbe`/`applyReviewWithAI`'s `coordinatorOutcomeForAdmissionV1`.
+  let result: T | undefined;
   try {
     if (dispatchesAutomationWork) {
       // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch): written
@@ -702,7 +743,7 @@ async function resumeThenDispatchV1<T>(
       // genuinely becomes the next actor for this per-target dispatch.
       await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (p) => setNextActorV1(p, "automation"));
     }
-    const result = await dispatch(handoffToken);
+    result = await dispatch(handoffToken);
     // 2026-09-17 review completion blocker: the stamp above is written BEFORE
     // `dispatch` runs, on the assumption that it is about to start a round —
     // but a dispatched command can itself refuse without arranging anything
@@ -737,7 +778,18 @@ async function resumeThenDispatchV1<T>(
     return result;
   } finally {
     revokeWorkAdmissionHandoffV1(taskFolderPath);
-    await release();
+    // Duck-typed: most `dispatch` closures resolve `boolean`/`void`, which
+    // carry no `coordinatorOutcome` field, so this is `undefined` and
+    // `release()` below is an ordinary release — exactly like calling it with
+    // no argument. The Resume handlers' own result objects (`GeneratePlanResult`,
+    // `ChatSendDispatchV1`, ...) DO carry it, in which case this is the same
+    // outcome their own direct callers already record with, so a marker this
+    // function's own holder ends up releasing still gets it.
+    await release(
+      result && typeof result === "object" && "coordinatorOutcome" in result
+        ? (result as { coordinatorOutcome?: TaskActionOutcomeV1 }).coordinatorOutcome
+        : undefined
+    );
   }
 }
 
@@ -1019,7 +1071,25 @@ export async function resumeAndDispatchImplementationV1(
 export async function resumeAndApplyCurrentStageActionV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
-  explicitArg?: ResumeTaskArg
+  explicitArg?: ResumeTaskArg & {
+    /**
+     * RC2 item 12: set ONLY by the plateau card's Fast-Forward-aware "Keep
+     * iterating" option (`reviewEscalation.ts`'s
+     * `buildPlateauKeepIteratingOptionV1`), captured at card-build time from
+     * `activeFastForwardRunsV1.ts`'s live counters — never by any other
+     * caller. When present, this resumes the task and dispatches
+     * `fastForwardReviewWithAI` itself (carrying the same counters onward as
+     * `resumeFromAttemptV1`, so the resumed loop continues the interrupted
+     * run's own attempt budget) INSTEAD of the single Apply-Review-then-
+     * re-review cycle below — mirrors `resumeAndSetTaskStageV1`'s own
+     * `resumeFastForward` branch, which bypasses the ordinary
+     * `loadResumeActionPlanV1` resolution the exact same way, for the exact
+     * same reason: Fast Forward's own eligibility/resolution logic (inside
+     * `fastForwardReviewWithAI` itself) is what actually governs this
+     * dispatch, not the single-cycle plan below.
+     */
+    resumeFastForwardV1?: { attemptNumber: number; maxAttempts: number };
+  }
 ): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
   const target = await resolveTaskContext(
@@ -1029,6 +1099,30 @@ export async function resumeAndApplyCurrentStageActionV1(
     currentTaskStore
   );
   if (!target) {
+    return;
+  }
+  const resumeFastForward = explicitArg?.resumeFastForwardV1;
+  if (resumeFastForward) {
+    const ffTaskName = target.progress.displayName ?? target.folderName;
+    const dispatchedFf = await resumeThenDispatchV1(
+      inventory,
+      currentTaskStore,
+      explicitArg,
+      target.taskFolderPath,
+      async (admissionHandoffToken) => {
+        await vscode.commands.executeCommand("vs-code-ai-helper.fastForwardReviewWithAI", {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+          resumeFromAttemptV1: resumeFastForward,
+        });
+        return true;
+      }
+    );
+    if (dispatchedFf === false) {
+      NotificationRouter.showWarning(
+        `"Keep iterating" resumed "${ffTaskName}" but Fast Forward could not be restarted — see the message above for the cause.`
+      );
+    }
     return;
   }
   // arrangeStageDispatch: false — this function dispatches
@@ -1499,7 +1593,7 @@ export function registerResumeTaskCommand(
   // something to offer in the command palette.
   const resumeAndApplyCurrentStageAction = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-    (arg?: ResumeTaskArg) =>
+    (arg?: ResumeTaskArg & { resumeFastForwardV1?: { attemptNumber: number; maxAttempts: number } }) =>
       resumeAndApplyCurrentStageActionV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndApplyCurrentStageAction);

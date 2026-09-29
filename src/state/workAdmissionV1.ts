@@ -7,7 +7,9 @@ import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
-import type { SurvivingRecordedProcessV1 } from "./recordedCliStopV1";
+import { decideAdmissionReleaseSafetyV1, stopRecordedCliProcessesV1, type SurvivingRecordedProcessV1 } from "./recordedCliStopV1";
+import { clearRoundProcessesForClaimV1 } from "./roundProcessRecordV1";
+import type { RoundProcessStateV1 } from "../types/agentExecutionV1";
 
 /**
  * Work admission (v1 fixes item 1, Part 1a — 1.0.0 gate).
@@ -166,6 +168,20 @@ export interface WorkAdmissionBusyV1 {
    * whether its owner is still alive. v1a never acts on this — it is
    * diagnostic only (see interim policy above). */
   readonly likelyStale: boolean;
+  /**
+   * Item 2 / Step 57: set when the owner's `trySafeAdmissionReleaseV1` is
+   * durably holding this exact marker open past its own terminal release —
+   * "The provider process <pid> did not exit." or "A provider process may
+   * still be starting and could not be confirmed stopped." — read back from
+   * the held-reason sidecar {@link readHeldAdmissionReasonAtPathSyncV1} writes
+   * next to the marker. `undefined` for an ordinary, not-yet-released marker
+   * (most `busy` diagnostics), never fabricated from `likelyStale` alone.
+   */
+  readonly outstandingReason?: string;
+  /** ISO timestamp of when `outstandingReason` was FIRST observed for this
+   * marker (not each retry) — lets a refusal say how long the process has
+   * been outstanding, not only that it is. */
+  readonly outstandingReasonSince?: string;
 }
 
 export interface WorkAdmissionWriteFailedV1 {
@@ -174,6 +190,647 @@ export interface WorkAdmissionWriteFailedV1 {
 }
 
 export type WorkAdmissionResultV1 = WorkAdmissionAcquiredV1 | WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1;
+
+/**
+ * Durable sidecar recording WHY `trySafeAdmissionReleaseV1` is holding a
+ * marker open past its owner's terminal release (item 2 / Step 57 — "a retry
+ * is refused as busy with that reason"). The marker file itself is never
+ * rewritten (`heartbeat()` only renames it), so this is the one durable place
+ * a later `describeMarkerAsBlockerV1` diagnostic — read from a DIFFERENT
+ * process attempting a fresh acquisition — can recover the same reason
+ * `decideAdmissionReleaseSafetyV1` computed live in the releasing process.
+ * Named by `claimId` (stable across every heartbeat generation of one
+ * acquisition), so it survives the marker's generation renames and is looked
+ * up correctly regardless of which generation is current when read.
+ */
+/**
+ * Step 57a's `heldAfterTimeoutV1.trigger` — which of the two bounded
+ * stop-and-settle triggers (Step 54/55) ended the invocation whose terminal
+ * release found this hold: the wall-clock deadline, or a caller/provider
+ * cancellation. Diagnostic only, exactly like `processState`/`pids` below —
+ * nothing in the release-safety decision itself branches on it.
+ */
+export type AdmissionReleaseTriggerV1 = "timedOut" | "cancelled";
+
+interface HeldAdmissionReasonRecordV1 {
+  readonly claimId: string;
+  readonly outstandingReason: string;
+  /** ISO timestamp of when this reason was first observed (not each retry). */
+  readonly since: string;
+  /**
+   * Step 57a's `heldAfterTimeoutV1.operationId` and `.trigger` — the
+   * coordinator operation (Step 55's terminal branch) whose settlement
+   * triggered this release attempt, when the caller knows it (derived from
+   * the coordinator outcome via {@link deriveAdmissionReleaseTriggerV1}).
+   * Optional for the same reason `processState`/`pids` below are: an older
+   * sidecar, or a caller that never recorded a trigger (e.g. a pre-invocation
+   * candidate-switch release, or a call site not yet wired to report it),
+   * simply omits them — a reader falls back to `outstandingReason` alone.
+   */
+  readonly operationId?: string;
+  readonly trigger?: AdmissionReleaseTriggerV1;
+  /**
+   * Step 57a's `heldAfterTimeoutV1.state` and `.pids` — carried on the same
+   * sidecar so a DIFFERENT process (the "Provider process may still be
+   * running" card, or "Release Stuck Admission Markers") can tell a
+   * `stillRunning` hold (offer "Stop it and release the task") apart from an
+   * `unconfirmedSpawn` hold (no pid to stop; only an explicit owner
+   * confirmation can release it) without recomputing `decideAdmissionReleaseSafetyV1`
+   * itself. Optional so an older sidecar written before this field existed
+   * (or written by a legacy reader in a mixed-version rollout) still parses;
+   * a reader that needs the structured state treats its absence as unknown
+   * and falls back to the same conservative "may still be running" handling
+   * `outstandingReason` alone already gives.
+   */
+  readonly processState?: RoundProcessStateV1;
+  readonly pids?: readonly number[];
+  /** Step 57a: the provider and display-only command line for an
+   * `unconfirmedSpawn` hold — see `AdmissionReleaseSafetyDecisionV1`'s doc
+   * comment for why only that state carries them (there is no recorded pid
+   * to identify the process by instead). Optional for the same reason
+   * `processState`/`pids` are: an older sidecar, or a `stillRunning`/
+   * `confirmedGone` decision, never sets them. */
+  readonly providerLabel?: string;
+  readonly command?: string;
+}
+
+function heldReasonBasenameV1(claimId: string): string {
+  return `admission-held.${claimId}.json`;
+}
+
+/** Best-effort write — a failure here must never affect the release decision
+ * itself (which already happened), only the detail a later refusal can show. */
+async function writeHeldAdmissionReasonV1(
+  taskFolderPath: string,
+  claimId: string,
+  outstandingReason: string,
+  since: string,
+  processState?: RoundProcessStateV1,
+  pids?: readonly number[],
+  providerLabel?: string,
+  command?: string,
+  operationId?: string,
+  trigger?: AdmissionReleaseTriggerV1
+): Promise<void> {
+  const record: HeldAdmissionReasonRecordV1 = {
+    claimId,
+    outstandingReason,
+    since,
+    ...(processState !== undefined ? { processState } : {}),
+    ...(pids !== undefined ? { pids } : {}),
+    ...(providerLabel !== undefined ? { providerLabel } : {}),
+    ...(command !== undefined ? { command } : {}),
+    ...(operationId !== undefined ? { operationId } : {}),
+    ...(trigger !== undefined ? { trigger } : {}),
+  };
+  try {
+    await fs.promises.writeFile(
+      path.join(admissionDirV1(taskFolderPath), heldReasonBasenameV1(claimId)),
+      JSON.stringify(record)
+    );
+  } catch {
+    // Diagnostic only — see doc comment above.
+  }
+}
+
+/** Best-effort cleanup once release actually proceeds. ENOENT (never
+ * written, or already cleared) is not an error. */
+async function clearHeldAdmissionReasonV1(taskFolderPath: string, claimId: string): Promise<void> {
+  try {
+    await fs.promises.unlink(path.join(admissionDirV1(taskFolderPath), heldReasonBasenameV1(claimId)));
+  } catch {
+    // Diagnostic only — see doc comment above.
+  }
+}
+
+/** Reads a held-reason sidecar at an already-resolved `filePath`, accepting it
+ * only when it is well-formed and recorded for the exact `claimId` asked
+ * about — a stale sidecar left over from a since-superseded claim generation
+ * must never be attributed to a DIFFERENT, current claim. */
+const VALID_ROUND_PROCESS_STATES_V1: readonly RoundProcessStateV1[] = ["confirmedGone", "stillRunning", "unconfirmedSpawn"];
+
+/** A bounded, all-finite-number array — the same "corrupt/hand-edited record
+ * degrades to unknown, never trusted verbatim" posture as
+ * `isBoundedClaimInfoStringV1` applies to every other field on this sidecar. */
+function isBoundedPidArrayV1(value: unknown): value is readonly number[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= 32 &&
+    value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
+  );
+}
+
+function readHeldAdmissionReasonAtPathSyncV1(filePath: string, claimId: string): HeldAdmissionReasonRecordV1 | undefined {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<HeldAdmissionReasonRecordV1>;
+    if (
+      isBoundedClaimInfoStringV1(parsed.claimId) &&
+      isBoundedClaimInfoStringV1(parsed.outstandingReason) &&
+      isBoundedClaimInfoStringV1(parsed.since) &&
+      parsed.claimId === claimId
+    ) {
+      // The structured `processState`/`pids` fields are newer than the
+      // mandatory ones above and best-effort: a malformed or absent value on
+      // either is dropped rather than failing the whole read, since a caller
+      // needing them already falls back to the (still valid) free-text
+      // `outstandingReason` when they are `undefined` (doc comment above).
+      const processState =
+        typeof parsed.processState === "string" && (VALID_ROUND_PROCESS_STATES_V1 as readonly string[]).includes(parsed.processState)
+          ? (parsed.processState as RoundProcessStateV1)
+          : undefined;
+      const pids = isBoundedPidArrayV1(parsed.pids) ? parsed.pids : undefined;
+      const providerLabel = isBoundedClaimInfoStringV1(parsed.providerLabel) ? parsed.providerLabel : undefined;
+      const command = isBoundedClaimInfoStringV1(parsed.command) ? parsed.command : undefined;
+      const operationId = isBoundedClaimInfoStringV1(parsed.operationId) ? parsed.operationId : undefined;
+      const trigger =
+        parsed.trigger === "timedOut" || parsed.trigger === "cancelled" ? parsed.trigger : undefined;
+      return {
+        claimId: parsed.claimId,
+        outstandingReason: parsed.outstandingReason,
+        since: parsed.since,
+        ...(processState !== undefined ? { processState } : {}),
+        ...(pids !== undefined ? { pids } : {}),
+        ...(providerLabel !== undefined ? { providerLabel } : {}),
+        ...(command !== undefined ? { command } : {}),
+        ...(operationId !== undefined ? { operationId } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+      };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Shared bookkeeping for a command's TERMINAL admission release (item 2 /
+ * Step 57): the release must go through `decideAdmissionReleaseSafetyV1` and,
+ * when a recorded provider process is not yet confirmed gone, keep the
+ * marker held, warn once, and retry at the next heartbeat tick instead of
+ * unlinking it. Factored out so the several
+ * call sites that need this (`reviewActions.ts`, `generatePlanWithAI.ts`,
+ * `runEditActionV1.ts`, `runLintingFixes.ts`, `resumeTask.ts`, and — via
+ * this helper — `draftTaskWithAI.ts`, `renameTask.ts`,
+ * `commitAndPushTask.ts`, `chatView.ts`) share one implementation for any
+ * caller written against this helper, rather than each reimplementing the
+ * decide-and-retry loop inline.
+ */
+export interface SafeAdmissionReleaseStateV1 {
+  released: boolean;
+  releaseRequested: boolean;
+  releaseHeldWarned: boolean;
+  /** ISO timestamp of the FIRST held detection — set once, reused on every
+   * later retry's sidecar rewrite so `outstandingReasonSince` reflects when
+   * the hold began, not when it was last re-checked. */
+  heldSince?: string;
+  /**
+   * Step 57a's `heldAfterTimeoutV1.operationId`/`.trigger` — set by
+   * {@link recordAdmissionReleaseTriggerV1} right after the caller's own
+   * coordinator call returns, BEFORE the terminal release is requested, so a
+   * later held sidecar write in {@link trySafeAdmissionReleaseV1} can carry
+   * it. Left `undefined` at a call site that never calls that setter (most
+   * outcomes are not a Step 55 deadline/cancellation terminal settlement), in
+   * which case the sidecar simply omits these two optional fields.
+   */
+  heldOperationId?: string;
+  heldTrigger?: AdmissionReleaseTriggerV1;
+}
+
+export function createSafeAdmissionReleaseStateV1(): SafeAdmissionReleaseStateV1 {
+  return { released: false, releaseRequested: false, releaseHeldWarned: false };
+}
+
+/**
+ * Step 57a: derive `{ operationId, trigger }` from a coordinator outcome,
+ * when it is one of the two terminal shapes Step 55's `runProviderRow`
+ * terminal branch produces for a wall-clock deadline or a cancellation that
+ * reached the provider (`taskActionCoordinatorV1.ts`'s `invocationDeadlineExceeded`
+ * / `callerCancelled` / `providerCancelled` codes on a `failed` outcome).
+ * Every other outcome kind or code (a successful round, a malformed result, an
+ * ordinary pre-response transport failure, ...) yields `undefined` — there is
+ * nothing to record, and a later ordinary hold found on some unrelated
+ * release attempt must never be mislabeled with a stale trigger from a
+ * previous, unrelated call. Typed loosely (a structural subset of
+ * `TaskActionOutcomeV1`) so this module does not need to import the full
+ * coordinator outcome union.
+ */
+export function deriveAdmissionReleaseTriggerV1(outcome: {
+  readonly kind: string;
+  readonly code?: string;
+  readonly correlation?: { readonly operationId?: string };
+}): { readonly operationId?: string; readonly trigger: AdmissionReleaseTriggerV1 } | undefined {
+  if (outcome.kind !== "failed") {
+    return undefined;
+  }
+  if (outcome.code === "invocationDeadlineExceeded") {
+    return { operationId: outcome.correlation?.operationId, trigger: "timedOut" };
+  }
+  if (outcome.code === "callerCancelled" || outcome.code === "providerCancelled") {
+    return { operationId: outcome.correlation?.operationId, trigger: "cancelled" };
+  }
+  return undefined;
+}
+
+/**
+ * Records Step 57a's trigger metadata onto `state` from a coordinator
+ * outcome, when {@link deriveAdmissionReleaseTriggerV1} recognizes it. A
+ * no-op for `undefined` (a call site with no outcome in scope, e.g. a
+ * pre-invocation early return) or an outcome that is not a deadline/
+ * cancellation terminal settlement — `state.heldOperationId`/`.heldTrigger`
+ * are left as whatever they already were rather than cleared, since a call
+ * site invokes this once per round outcome and only a genuinely terminal one
+ * should ever set them.
+ */
+export function recordAdmissionReleaseTriggerV1(
+  state: SafeAdmissionReleaseStateV1,
+  outcome:
+    | {
+        readonly kind: string;
+        readonly code?: string;
+        readonly correlation?: { readonly operationId?: string };
+      }
+    | undefined
+): void {
+  if (!outcome) {
+    return;
+  }
+  const derived = deriveAdmissionReleaseTriggerV1(outcome);
+  if (derived) {
+    state.heldOperationId = derived.operationId;
+    state.heldTrigger = derived.trigger;
+  }
+}
+
+/**
+ * Make one safe-release attempt right now: unlinks `handle`'s marker (via
+ * `handle.release()`) and calls `onReleased()` only once
+ * `decideAdmissionReleaseSafetyV1` reports it is safe (including when
+ * `handle`'s claim never recorded a provider process at all — e.g. a
+ * pre-invocation candidate-switch release, always safe). Otherwise the
+ * marker stays held, `onHeld` is called once with the outstanding reason,
+ * that same reason is written durably next to the marker (item 2 / Step 57 —
+ * see {@link writeHeldAdmissionReasonV1}) so a DIFFERENT process's retry
+ * refusal can name it too, and `state.released` stays `false` so a later
+ * heartbeat tick can retry via {@link requestSafeAdmissionReleaseV1}. A no-op
+ * once `state.released` is `true` or `handle` is `undefined`.
+ */
+export async function trySafeAdmissionReleaseV1(
+  state: SafeAdmissionReleaseStateV1,
+  handle: WorkAdmissionHandleV1 | undefined,
+  onHeld: (taskFolderPath: string, outstandingReason: string) => void,
+  onReleased: () => void,
+  /** Test-only: forwarded verbatim to `decideAdmissionReleaseSafetyV1` so a
+   * test can inject a deterministic classification, exactly like that
+   * function's own `deps.classify` seam. Omitted in production. */
+  deps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]
+): Promise<void> {
+  if (state.released || !handle) {
+    return;
+  }
+  const decision = await decideAdmissionReleaseSafetyV1(handle.taskFolderPath, handle.claimId, deps);
+  if (!decision.safe) {
+    const reason = decision.outstandingReason ?? "A provider process may still be running.";
+    // 2026-09-29 review (RC2 item 2, Step 57a): `onHeld` used to fire BEFORE
+    // this write, so a card-posting `onHeld` (`postHeldAdmissionMarkerCardV1`)
+    // read the sidecar synchronously and found nothing there yet, and the
+    // proactive card silently never appeared on the ordinary first hold.
+    // `onHeld` must only run once the sidecar it reads back is durable.
+    const firstHold = !state.releaseHeldWarned;
+    if (firstHold) {
+      state.releaseHeldWarned = true;
+      state.heldSince = new Date().toISOString();
+    }
+    await writeHeldAdmissionReasonV1(
+      handle.taskFolderPath,
+      handle.claimId,
+      reason,
+      state.heldSince ?? new Date().toISOString(),
+      decision.processState,
+      decision.pids,
+      decision.providerLabel,
+      decision.command,
+      state.heldOperationId,
+      state.heldTrigger
+    );
+    if (firstHold) {
+      onHeld(handle.taskFolderPath, reason);
+    }
+    return;
+  }
+  state.released = true;
+  onReleased();
+  await clearHeldAdmissionReasonV1(handle.taskFolderPath, handle.claimId);
+  await handle.release();
+}
+
+/**
+ * Request the terminal release: idempotent (a second call is a no-op) and
+ * makes one immediate safe-release attempt. Call again from the heartbeat
+ * tick, guarded by `state.releaseRequested && !state.released`, to retry
+ * once a held marker becomes safe to release.
+ */
+export async function requestSafeAdmissionReleaseV1(
+  state: SafeAdmissionReleaseStateV1,
+  handle: WorkAdmissionHandleV1 | undefined,
+  onHeld: (taskFolderPath: string, outstandingReason: string) => void,
+  onReleased: () => void,
+  deps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]
+): Promise<void> {
+  if (state.released || state.releaseRequested) {
+    return;
+  }
+  state.releaseRequested = true;
+  if (!handle) {
+    state.released = true;
+    return;
+  }
+  await trySafeAdmissionReleaseV1(state, handle, onHeld, onReleased, deps);
+}
+
+/**
+ * Step 57a's `heldAfterTimeoutV1` marker data, read back from disk for the
+ * CURRENT `admission`-purpose marker under `admissionDirPath` — the shape a
+ * "Provider process may still be running" card, or "Release Stuck Admission
+ * Markers", needs to decide which options to offer, without itself
+ * recomputing `decideAdmissionReleaseSafetyV1` (that already ran once, in the
+ * owning process, when `trySafeAdmissionReleaseV1` first wrote this sidecar).
+ * `undefined` when there is no current marker, or the marker's owner has not
+ * (yet, or ever) been held past a terminal release attempt.
+ */
+export interface HeldAdmissionMarkerInfoV1 {
+  readonly filePath: string;
+  readonly claimId: string;
+  readonly outstandingReason: string;
+  readonly since: string;
+  /** `undefined` only for a sidecar written before Step 57a's structured
+   * fields existed — see `HeldAdmissionReasonRecordV1`'s doc comment. A
+   * reader that must choose between "Stop it" and "I have checked" treats
+   * that as `stillRunning` (the same fail-open direction `outstandingReason`
+   * alone already implies), since offering "I have checked" for a recorded,
+   * signalable pid would skip a safer, fully automatic option. */
+  readonly processState?: RoundProcessStateV1;
+  readonly pids: readonly number[];
+  /** Step 57a: the provider and display-only command line for an
+   * `unconfirmedSpawn` hold, for the card to name since there is no pid to
+   * identify the process by. `undefined` when not recorded (older sidecar,
+   * or a `stillRunning`/`confirmedGone` decision, which never sets them). */
+  readonly providerLabel?: string;
+  readonly command?: string;
+  /** Step 57a: the coordinator operation and trigger (deadline vs
+   * cancellation) whose terminal settlement led to this hold, when the
+   * releasing call site recorded it (`recordAdmissionReleaseTriggerV1`).
+   * `undefined` for a sidecar written before these fields existed, or by a
+   * call site not yet wired to report them. */
+  readonly operationId?: string;
+  readonly trigger?: AdmissionReleaseTriggerV1;
+}
+
+function readHeldAdmissionMarkerAtDirSyncV1(admissionDirPath: string): HeldAdmissionMarkerInfoV1 | undefined {
+  for (const marker of listMarkersSyncV1(admissionDirPath)) {
+    const owner = readClaimInfoSyncV1(marker.filePath);
+    if (!owner || owner.purpose !== "admission") {
+      continue;
+    }
+    const sidecarPath = path.join(admissionDirPath, heldReasonBasenameV1(owner.claimId));
+    const record = readHeldAdmissionReasonAtPathSyncV1(sidecarPath, owner.claimId);
+    if (record) {
+      return {
+        filePath: marker.filePath,
+        claimId: record.claimId,
+        outstandingReason: record.outstandingReason,
+        since: record.since,
+        processState: record.processState,
+        pids: record.pids ?? [],
+        providerLabel: record.providerLabel,
+        command: record.command,
+        operationId: record.operationId,
+        trigger: record.trigger,
+      };
+    }
+  }
+  return undefined;
+}
+
+/** Same lookup as {@link readHeldAdmissionMarkerAtDirSyncV1}, addressed by
+ * task folder path (this module's normal call convention) rather than an
+ * already-resolved admission directory. */
+export function readHeldAdmissionMarkerForTaskV1(taskFolderPath: string): HeldAdmissionMarkerInfoV1 | undefined {
+  return readHeldAdmissionMarkerAtDirSyncV1(admissionDirV1(taskFolderPath));
+}
+
+/** Bounded — see {@link unlinkCurrentMarkerForClaimV1}'s doc comment for why
+ * more than a couple of iterations should never actually be needed. */
+const UNLINK_CURRENT_MARKER_MAX_ATTEMPTS_V1 = 5;
+
+/**
+ * Removes the CURRENT marker matching `claimId`, re-resolved fresh on every
+ * attempt (never a caller's possibly-stale `filePath`) because the owning
+ * process may still be heartbeat-renewing the marker to a new
+ * generation/epoch (`WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1`, 2 minutes)
+ * while this release proceeds.
+ *
+ * 2026-09-29 review (RC2 item 2, Step 57a): the previous implementation did
+ * `fs.promises.unlink(marker.filePath)` on the path it had just listed and
+ * treated an `ENOENT` from that unlink as "already gone" — success. But a
+ * heartbeat rename lands between the sync list and the async unlink often
+ * enough to matter: the OLD generation's path genuinely is gone (renamed
+ * away, not deleted), the unlink throws `ENOENT`, and the function reported
+ * `true` while the NEW generation's marker — same claim, still live — sat on
+ * disk untouched. A caller acting on that false "removed" (e.g. Step 57a's
+ * owner-confirmed release) would tell the owner the task was freed while a
+ * marker for the same claim remained.
+ *
+ * Fixed the same way this module already resolves an identical race
+ * elsewhere ({@link takeOverStaleWorkAdmissionMarkerV1}'s tombstone step): a
+ * plain `unlink` can never distinguish "I removed it" from "something else
+ * already moved it out from under me," but a `rename` to a caller-unique
+ * destination can — only the rename that actually lands proves this call
+ * owns the file it is about to delete. Each attempt: find the current marker
+ * for `claimId`; rename it to a unique tombstone path; confirm THIS call's
+ * own tombstone path exists and still reads back as `claimId` (never trust
+ * "the rename call did not throw" alone — see that function's own comment on
+ * why); only then unlink the (now safely isolated) tombstone. A lost race at
+ * any step (source vanished before rename, tombstone unreadable, or a
+ * different claim landed there) means someone else's rename or heartbeat won
+ * this instant — re-resolve and try again rather than guess.
+ *
+ * Bounded at {@link UNLINK_CURRENT_MARKER_MAX_ATTEMPTS_V1} attempts: a
+ * heartbeat only renames once per 2 minutes, so a same-process retry loop
+ * that runs in microseconds converges on its first or second attempt in
+ * every realistic case. If every attempt is somehow lost, the final fresh
+ * check below is the honest answer either way — a marker for `claimId` still
+ * present means this call genuinely could not remove it, which is
+ * DISTINCT from "no marker for this claim was ever found" (both used to
+ * collapse to a single `boolean`, `false`, which is what let a caller
+ * report "already released" while a marker for the claim actually
+ * survived — see the 2026-09-29 review note on
+ * {@link UnlinkCurrentMarkerOutcomeV1}). A marker no longer present means
+ * whatever won those races left nothing for this call to do.
+ */
+export type UnlinkCurrentMarkerOutcomeV1 =
+  /** This call (or a race it lost to, like a concurrent release) removed
+   * the marker; none remains for `claimId`. */
+  | "removed"
+  /** No marker for `claimId` was found on the very first lookup — there was
+   * nothing to remove. */
+  | "absent"
+  /** Every bounded attempt lost its race (a heartbeat or another release
+   * kept renaming the marker out from under this call), and a marker for
+   * `claimId` is STILL present on disk. The caller must not report this as
+   * released or as gone — the sidecar and the marker both survive, and a
+   * retry (the caller pressing the same action again) is expected to
+   * eventually win the race, exactly as it would against a live heartbeat. */
+  | "stillPresent";
+
+async function unlinkCurrentMarkerForClaimV1(taskFolderPath: string, claimId: string): Promise<UnlinkCurrentMarkerOutcomeV1> {
+  const dir = admissionDirV1(taskFolderPath);
+  const findCurrent = (): { readonly filePath: string } | undefined =>
+    listMarkersSyncV1(dir).find((marker) => readClaimInfoSyncV1(marker.filePath)?.claimId === claimId);
+
+  for (let attempt = 0; attempt < UNLINK_CURRENT_MARKER_MAX_ATTEMPTS_V1; attempt++) {
+    const marker = findCurrent();
+    if (!marker) {
+      return "absent";
+    }
+    // Reuses `RECLAIMED_TOMBSTONE_SUFFIX_V1` (not a bespoke suffix) so that if
+    // this process dies between the rename and the final unlink below, the
+    // orphaned tombstone is still picked up and cleaned by the existing
+    // `garbageCollectStaleWorkAdmissionTombstonesV1` sweep rather than
+    // leaking forever under a name nothing else recognizes.
+    const tombstonePath = `${marker.filePath}.${crypto.randomUUID()}${RECLAIMED_TOMBSTONE_SUFFIX_V1}`;
+    try {
+      await fs.promises.rename(marker.filePath, tombstonePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // Raced a heartbeat rename (or a concurrent release) that already
+        // moved this exact generation away — re-resolve the CURRENT marker
+        // for this claim on the next attempt rather than assume success.
+        continue;
+      }
+      throw error;
+    }
+    let wonThisPath: boolean;
+    try {
+      wonThisPath = fs.statSync(tombstonePath).isFile();
+    } catch {
+      wonThisPath = false;
+    }
+    const movedInfo = wonThisPath ? readClaimInfoSyncV1(tombstonePath) : undefined;
+    if (!wonThisPath || movedInfo?.claimId !== claimId) {
+      // Did not actually win this exact rename (see the doc comment on why
+      // "the call did not throw" is not proof), or the file read back at our
+      // own unique destination is not the claim we expected — put it back
+      // when possible and retry.
+      if (wonThisPath) {
+        try {
+          await fs.promises.rename(tombstonePath, marker.filePath);
+        } catch {
+          // Nothing more this function can safely do — same fallback as
+          // takeOverStaleWorkAdmissionMarkerV1's identical case.
+        }
+      }
+      continue;
+    }
+    await fs.promises.unlink(tombstonePath);
+    return "removed";
+  }
+  return findCurrent() === undefined ? "absent" : "stillPresent";
+}
+
+export type HeldAdmissionReleaseOutcomeV1 =
+  | { readonly outcome: "released" }
+  | { readonly outcome: "stillRunning"; readonly survivors: readonly SurvivingRecordedProcessV1[] }
+  | { readonly outcome: "markerGone" }
+  /** 2026-09-29 review (RC2 item 2, Step 57a): every bounded attempt to
+   * unlink the marker lost its race against a concurrent heartbeat rename or
+   * release, and the marker for this claim is STILL present. Distinct from
+   * `markerGone` on purpose — the caller must not tell the owner the task
+   * was freed while a marker for the same claim remains on disk. The
+   * sidecar (`heldAfterTimeoutV1`) is deliberately left in place so the
+   * card's next "Stop it" / "I have checked" press retries against the same
+   * held state rather than silently vanishing. */
+  | { readonly outcome: "stillHeld" };
+
+/**
+ * Step 57a's "Stop it and release the task": stops every recorded provider
+ * process for `claimId` (`stopRecordedCliProcessesV1` — the SAME stop-then-
+ * confirm primitive the round-cleanup path already uses) and, only once every
+ * one of them is confirmed gone, unlinks the held marker and clears its
+ * sidecar. Never used for `unconfirmedSpawn` — there is no recorded pid to
+ * stop, and the card's `unconfirmedSpawn` branch never offers this option
+ * (module doc comment on `HeldAdmissionMarkerInfoV1`).
+ */
+export async function stopHeldAdmissionMarkerAndReleaseV1(
+  taskFolderPath: string,
+  claimId: string,
+  deps?: Parameters<typeof stopRecordedCliProcessesV1>[2]
+): Promise<HeldAdmissionReleaseOutcomeV1> {
+  const stopOutcome = await stopRecordedCliProcessesV1(taskFolderPath, claimId, deps);
+  if (stopOutcome.outcome === "survivors") {
+    return { outcome: "stillRunning", survivors: stopOutcome.survivors };
+  }
+  const unlinkOutcome = await unlinkCurrentMarkerForClaimV1(taskFolderPath, claimId);
+  if (unlinkOutcome === "stillPresent") {
+    return { outcome: "stillHeld" };
+  }
+  await clearHeldAdmissionReasonV1(taskFolderPath, claimId);
+  return unlinkOutcome === "removed" ? { outcome: "released" } : { outcome: "markerGone" };
+}
+
+/**
+ * Step 57a's owner-confirmed release for `unconfirmedSpawn`: there is no
+ * recorded pid to identify or stop (module doc comment on
+ * `SurvivingRecordedProcessV1`, the `pid === undefined` case), so the ONLY
+ * release path is an explicit "I have checked: no provider process for this
+ * task is running" confirmation — never an automatic stop. Clears the round's
+ * process record (so a future retry does not immediately re-observe the same
+ * unconfirmed spawn), unlinks the marker and clears the sidecar. Because the
+ * ticket was already retired and the writer already sealed when this hold
+ * began (Steps 54/56), nothing the old invocation does afterward can write to
+ * this task once the marker is gone — a late write from it finds no admission
+ * to write under, which is this function's actual fencing effect (the
+ * plan's "bumps the admission epoch": the next acquisition always mints a
+ * fresh marker with a fresh owner token, never reuses this one).
+ */
+export async function confirmNoProcessAndReleaseHeldAdmissionMarkerV1(
+  taskFolderPath: string,
+  claimId: string
+): Promise<HeldAdmissionReleaseOutcomeV1> {
+  // 2026-09-29 review (RC2 item 2, Step 57a): this used to call the
+  // task-wide `clearRoundProcessesV1` unconditionally, gated only by a
+  // check-then-clear against the record's own `claimId` right before it. A
+  // stale confirmation (the card pressed minutes after the SAME task's
+  // marker was already released and reacquired by a fresh invocation) could
+  // still erase that NEWER claim's own recorded provider process in the gap
+  // between the check and the clear actually landing — worse, that gap could
+  // never be closed purely by re-checking in-process, because a stale
+  // confirmation pressed from a DIFFERENT VS Code window than the one
+  // recording the newer claim's processes cannot see that window's
+  // `workspaceState` writes at all (`hostDecisionMirrorV1.ts` documents the
+  // same limitation for pending decisions) — so if that newer invocation
+  // later timed out, Step 57's safety check would find "no record" and could
+  // release the marker beside its still-running CLI.
+  // `roundProcessRecordV1.ts` now gives every `claimId` its OWN storage key,
+  // so `clearRoundProcessesForClaimV1` below can only ever delete THIS
+  // claim's key — a successor's record lives at a different key and is
+  // structurally unreachable, regardless of which process or how stale its
+  // cache is. The marker check below still catches an entirely superseded
+  // claim before any of this runs.
+  const dir = admissionDirV1(taskFolderPath);
+  const stillCurrent = listMarkersSyncV1(dir).some((marker) => readClaimInfoSyncV1(marker.filePath)?.claimId === claimId);
+  if (!stillCurrent) {
+    await clearHeldAdmissionReasonV1(taskFolderPath, claimId);
+    return { outcome: "markerGone" };
+  }
+  await clearRoundProcessesForClaimV1(taskFolderPath, claimId);
+  const unlinkOutcome = await unlinkCurrentMarkerForClaimV1(taskFolderPath, claimId);
+  if (unlinkOutcome === "stillPresent") {
+    return { outcome: "stillHeld" };
+  }
+  await clearHeldAdmissionReasonV1(taskFolderPath, claimId);
+  return unlinkOutcome === "removed" ? { outcome: "released" } : { outcome: "markerGone" };
+}
 
 /** Diagnostic-only threshold for `likelyStale` — not used for reclamation
  * anywhere in v1a. Generous, so a slow-but-alive owner is never flagged.
@@ -248,6 +905,15 @@ export function describeWorkAdmissionRefusalV1(
   const ownerDetail = outcome.owner
     ? `held by ${outcome.owner.commandId} (pid ${outcome.owner.pid} on ${outcome.owner.hostId})`
     : "held by an unreadable record";
+  // Item 2 / Step 57: the owner's own action already finished (or was
+  // timed out / cancelled) and is durably keeping this marker open only
+  // because a recorded provider process is not yet confirmed gone — named
+  // here so a refused retry says exactly that, not merely "already has a
+  // stage action in progress", which reads as still-running work rather
+  // than a wind-down the owner cannot yet confirm is complete.
+  const heldReasonSentence = outcome.outstandingReason
+    ? ` It is being kept open because: ${outcome.outstandingReason}`
+    : "";
   // Past FIVE missed heartbeats the owner is not renewing, whatever the
   // 20-minute `likelyStale` threshold says. Saying so in plain words matters
   // because the raw "last renewed ~347s ago" only means something to a reader
@@ -265,7 +931,7 @@ export function describeWorkAdmissionRefusalV1(
     return (
       `${subject} looks stuck rather than busy: nothing has renewed its claim for ~${renewedMinutes} min, ` +
       `and a running action renews every ${Math.round(WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 / 60000)}. ` +
-      `The claim is ${ownerDetail}, ${runningFor}, at ${outcome.markerPath}. ` +
+      `The claim is ${ownerDetail}, ${runningFor}, at ${outcome.markerPath}.${heldReasonSentence} ` +
       "Nothing will resume it on its own, and reloading this window does not release it. If that window " +
       "or machine is gone, the claim is reclaimed — or offered for one-click takeover in the Notifications " +
       "panel — once it has been unrenewed long enough to be sure, which can take up to about half an hour."
@@ -280,7 +946,7 @@ export function describeWorkAdmissionRefusalV1(
           "a live-but-unresponsive, foreign-machine, or unreadable owner that stays stale will offer a " +
           "one-click takeover in the Notifications panel."
         : ""
-    }.`
+    }.${heldReasonSentence}`
   );
 }
 
@@ -1511,7 +2177,14 @@ export function resetTargetResolutionForTestV1(): void {
  * `describeWorkAdmissionBlockerV1`'s claim-before-marker priority. Used where
  * the caller already positively knows the REAL blocker is a marker (not its
  * own claim) — see that function's own doc comment for why conflating the
- * two there would be wrong. */
+ * two there would be wrong.
+ *
+ * Item 2 / Step 57: also recovers this marker owner's durable held-reason
+ * sidecar (written by `trySafeAdmissionReleaseV1` in the OWNING process, read
+ * back here possibly by a completely different process attempting a fresh
+ * acquisition), so a retry against a marker that is being kept open past a
+ * completed round names why, instead of only "already has a stage action in
+ * progress". Absent for an ordinary, not-yet-released marker. */
 function describeMarkerAsBlockerV1(markerFilePath: string, now: number): WorkAdmissionBusyV1 {
   let ageMs = 0;
   try {
@@ -1520,12 +2193,20 @@ function describeMarkerAsBlockerV1(markerFilePath: string, now: number): WorkAdm
     ageMs = Number.POSITIVE_INFINITY;
   }
   const owner = readClaimInfoSyncV1(markerFilePath);
+  const held = owner
+    ? readHeldAdmissionReasonAtPathSyncV1(
+        path.join(path.dirname(markerFilePath), heldReasonBasenameV1(owner.claimId)),
+        owner.claimId
+      )
+    : undefined;
   return {
     outcome: "busy",
     owner,
     markerPath: markerFilePath,
     ageMs,
     likelyStale: ageMs > likelyStaleThresholdForPurposeV1(owner?.purpose),
+    outstandingReason: held?.outstandingReason,
+    outstandingReasonSince: held?.since,
   };
 }
 

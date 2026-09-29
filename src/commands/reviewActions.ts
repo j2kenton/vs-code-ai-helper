@@ -26,11 +26,16 @@ import {
 import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
+  trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import {
   EffectivePauseSnapshotV1,
@@ -93,7 +98,12 @@ import {
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
-import { markFastForwardRunActiveV1, clearFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
+import {
+  markFastForwardRunActiveV1,
+  clearFastForwardRunActiveV1,
+  updateFastForwardRunStateV1,
+  getFastForwardRunStateV1,
+} from "../utils/activeFastForwardRunsV1";
 import {
   deriveCurrentDispatchModeV1,
   deriveNextRecoverySourceV1,
@@ -177,6 +187,7 @@ import {
 import {
   ChecklistProgressV1,
   classifyUncheckedChecklistItemsV1,
+  collectPlanItemReasonsV1,
   detectChecklistItemSetMutationV1,
   formatChecklistItemGlyphV1,
   formatChecklistProgressForReviewerV1,
@@ -184,8 +195,11 @@ import {
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
+  normalizeChecklistItemTextV1,
+  parseDeclinedBlockersV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import { buildOpenPlanItemsNeedDecisionCardInputV1 } from "./decideOpenPlanItemsV1";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
@@ -326,6 +340,8 @@ import {
   reviewPredatesLatestImplementationRoundV1,
   ReviewBlocker,
   splitTaskFixableBlockersByOriginV1,
+  partitionStageUnsatisfiableBlockersV1,
+  reclassifyDeclinedBlockersV1,
 } from "../utils/reviewReadiness";
 import {
   refreshStaleReviewBannerForArtifactV1,
@@ -880,6 +896,17 @@ type ReviewCommandArg =
        * marker exactly like any unrelated caller.
        */
       admissionHandoffTokenV1?: string;
+      /**
+       * RC2 item 12: set ONLY by `resumeAndApplyCurrentStageActionV1`'s own
+       * Fast-Forward-resume branch — never by a UI surface. Carries the live
+       * iteration counters a plateau card's "Keep iterating" option captured
+       * at card-build time (`reviewEscalation.ts`'s
+       * `buildPlateauKeepIteratingOptionV1`) from `activeFastForwardRunsV1.ts`,
+       * so THIS resumed run continues the SAME attempt budget the
+       * interrupted run already committed to, rather than starting a fresh
+       * `maxAttempts`-sized budget from attempt 1.
+       */
+      resumeFromAttemptV1?: { attemptNumber: number; maxAttempts: number };
     }
   | undefined;
 
@@ -936,6 +963,20 @@ interface ApplyReviewOptions {
   parentOperation?: TaskOperationHandle;
   /** Routes `applyReview.v1` structured questions into Chat With AI. */
   chatViewProvider?: ChatViewProvider;
+  /**
+   * Item 2 / Step 57a: an out-param a composite caller (Fast Forward) can
+   * supply to read back this call's coordinator outcome once it settles —
+   * `applyReviewWithAI` sets `.coordinatorOutcome` right after its own
+   * `coordinator.executeAction` call, mirroring `runReviewForFolder`'s
+   * `dispatchProbe`. `applyReviewEditWithAI`'s edit branch now also sets it
+   * (2026-09-29 review completion fix): it is forwarded through
+   * `applyImplementationReviewWithAI` → `executeImplementationRun` →
+   * `runImplementationOrSealedV1` → the sealed pipeline's own
+   * `RunTwoPhaseEditOptionsV1.dispatchProbe`, and set there from the
+   * preflight/edit-execution `coordinator.executeAction` calls. Still unset
+   * after a CLI-resolved dispatch, which never reaches the coordinator.
+   */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
 }
 
 interface ExecuteImplementationRunOptions {
@@ -1022,6 +1063,17 @@ interface ExecuteImplementationRunOptions {
    * 2, `roundProcessRecordV1.ts`). Absent for a caller with no lock in
    * scope; recording is then simply skipped, unchanged from today. */
   roundProcessClaimId?: string;
+  /**
+   * Item 2 / Step 57a completion fix (2026-09-29 review): an out-param a
+   * caller that manages its own admission release (`runImplementationWithAI`,
+   * `applyImplementationReviewWithAI`) can supply to read back this run's
+   * coordinator outcome once it settles, so it can be recorded via
+   * `recordAdmissionReleaseTriggerV1` before that caller's terminal safe
+   * release — mirroring `runReviewForFolder`'s and `applyReviewWithAI`'s own
+   * `dispatchProbe`. Forwarded into `runImplementationOrSealedV1`; left unset
+   * after a CLI-resolved dispatch, which never reaches the coordinator.
+   */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
 }
 
 /**
@@ -2688,6 +2740,50 @@ function getMechanicalBlockersForStage(folderUri: vscode.Uri, targetStage: TaskS
 }
 
 /**
+ * RC2 item 13, Step 50: correlates two genuinely independent call stacks —
+ * `fastForwardReviewWithAI`'s own `improveReviewScore` loop (which detects
+ * "stalled" synchronously, from apply()/review() results it awaits directly)
+ * and `executeImplementationRun`'s zero-file "nothing more to build" open-
+ * items card (raised from an Implementation round dispatched through the
+ * detached `scheduleAutomaticImplementationAfterReview` -> `void
+ * scheduleAutomationChain(...)` fire-and-forget chain, never awaited by
+ * Fast Forward). There is no return value or promise linking the two, so a
+ * task-keyed, timestamped, in-memory marker is the only way for Fast
+ * Forward's own stalled-warning branch to learn "the open-items card already
+ * told this exact task's story a moment ago" and stand its own warning down,
+ * per the plan's "one surface, not several competing warnings" requirement
+ * (RC2 item 13). In-memory, per-session, never persisted — matches
+ * `mechanicalBlockersByTaskStage` above. Consumed (deleted) on read so a
+ * stale marker from a run that already finished can never suppress a LATER,
+ * unrelated Fast Forward stall.
+ *
+ * @internal exported for testing
+ */
+export const openItemsCardPostedAtByTaskV1 = new Map<string, number>();
+
+/** @internal exported for testing */
+export function markOpenItemsCardPostedV1(taskFolderPath: string): void {
+  openItemsCardPostedAtByTaskV1.set(normalizePath(taskFolderPath), Date.now());
+}
+
+/**
+ * True (and consumes the marker) only when the open-items card was posted
+ * for this task at or after `sinceMs` — i.e. during the currently-running
+ * Fast Forward attempt, not left over from some earlier, unrelated run.
+ *
+ * @internal exported for testing
+ */
+export function consumeOpenItemsCardPostedSinceV1(taskFolderPath: string, sinceMs: number): boolean {
+  const key = normalizePath(taskFolderPath);
+  const postedAt = openItemsCardPostedAtByTaskV1.get(key);
+  if (postedAt === undefined || postedAt < sinceMs) {
+    return false;
+  }
+  openItemsCardPostedAtByTaskV1.delete(key);
+  return true;
+}
+
+/**
  * The shared "clean round" veto: a mechanically-synthesized task-fixable
  * blocker (an unquarantined failed Verified Check — see
  * `synthesizeMechanicalBlockers`) always overrides the reviewer's own
@@ -2967,7 +3063,49 @@ export async function handleReviewRoutingOutcome(options: {
         // from recording its review normally with the unfiltered blockers.
       }
     }
-    const blockers = planNonGoalResult?.effectiveBlockers ?? parsedBlockers;
+    const blockersBeforeStagePartition = planNonGoalResult?.effectiveBlockers ?? parsedBlockers;
+    // RC2 item 4: a "needs a passing test run" blocker can never be satisfied
+    // at an implementation review — those reviews only see fast checks (see
+    // buildVerifiedChecksSection's "fast" branch), so it would otherwise
+    // become a permanent task-fixable blocker no implementation round can
+    // ever clear. Strip it the same way a plan-non-goal supersession is
+    // stripped above, and keep the excluded identities so they are still
+    // visible in the durable record rather than a count that silently
+    // shrank.
+    const stageUnsatisfiablePartition = partitionStageUnsatisfiableBlockersV1(
+      blockersBeforeStagePartition,
+      targetStage
+    );
+    let blockers = stageUnsatisfiablePartition.effectiveBlockers;
+    // RC2 item 7: a reviewer's `task-fixable` blocker that matches a removal
+    // this task's OWN most recent implementer round declined (rule 7 of
+    // apply-impl-review-code.md / run-implementation.md — no owner approval
+    // recorded in `## Task Description`) is reclassified `environmental`
+    // here, BEFORE counts, history and routing ever see it. Without this, the
+    // implementer keeps refusing the same removal and the reviewer keeps
+    // re-raising it as task-fixable, and neither side can ever resolve it
+    // (RC2 item 7's reported defect). Scoped to impl review stages — the only
+    // stages `apply-impl-review-code.md` targets, and the only place a
+    // declined-removal entry can originate. The reclassified blockers'
+    // ORIGINAL (pre-reclassification) form is kept so their identity can be
+    // recorded on the history entry below, alongside `blockers` itself —
+    // see `declinedBlockerReclassifications` on `ReviewScoreHistoryEntry`.
+    let declinedReclassifiedBlockers: ReviewBlocker[] = [];
+    if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      try {
+        const implSummaryContent = await readTextIfExists(getImplementationSummaryUri(folderUri));
+        const declined = implSummaryContent ? parseDeclinedBlockersV1(implSummaryContent) : [];
+        if (declined.length > 0) {
+          const reclassification = reclassifyDeclinedBlockersV1(blockers, declined);
+          blockers = reclassification.effectiveBlockers;
+          declinedReclassifiedBlockers = reclassification.reclassifiedBlockers;
+        }
+      } catch {
+        // Best-effort only, like the plan-non-goal read above — a read
+        // failure here must never block the round from recording its review
+        // normally with the unreclassified blockers.
+      }
+    }
     // 2d: a round with no parseable `Readiness: N/10` line is a failure
     // wearing a review's clothes — a provider error, truncation, or
     // degenerate output. It must NOT be appended to reviewScoreHistory:
@@ -3181,11 +3319,32 @@ export async function handleReviewRoutingOutcome(options: {
     const priorBlockersAndSuperseded = [
       ...(priorEntryForStage?.blockers ?? []),
       ...(priorEntryForStage?.supersededBlockers ?? []),
+      ...(priorEntryForStage?.stageUnsatisfiableBlockers ?? []),
+      ...(priorEntryForStage?.declinedBlockerReclassifications ?? []),
     ];
     const challengedIdentities = resolveBlockerLineageV1(
       challengedMatches.map((match) => match.blocker),
       priorBlockersAndSuperseded,
       `${reviewAttemptId}-ng`
+    );
+    // RC2 item 4: identities for blockers this round excluded because this
+    // stage structurally can never satisfy them (see
+    // `stageUnsatisfiablePartition` above) — recorded the same way a
+    // plan-non-goal supersession is, so the exclusion is visible in the
+    // durable record rather than a count that silently shrank.
+    const stageUnsatisfiableIdentities = resolveBlockerLineageV1(
+      stageUnsatisfiablePartition.unsatisfiableBlockers,
+      priorBlockersAndSuperseded,
+      `${reviewAttemptId}-tr`
+    );
+    // RC2 item 7: identities for blockers reclassified `environmental` above
+    // because they match a declined removal — kept separate from `blockers`'
+    // own identities so a reader (and the plateau card) can tell this apart
+    // from a blocker the reviewer itself called environmental.
+    const declinedBlockerIdentities = resolveBlockerLineageV1(
+      declinedReclassifiedBlockers,
+      priorBlockersAndSuperseded,
+      `${reviewAttemptId}-db`
     );
     const historyEntry = {
       stage: targetStage,
@@ -3209,6 +3368,12 @@ export async function handleReviewRoutingOutcome(options: {
           : {}),
       ...(reviewer ? { reviewer } : {}), ...(reviewScope ? { scope: reviewScope } : {}),
       ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
+      ...(stageUnsatisfiableIdentities.length > 0
+        ? { stageUnsatisfiableBlockers: stageUnsatisfiableIdentities }
+        : {}),
+      ...(declinedBlockerIdentities.length > 0
+        ? { declinedBlockerReclassifications: declinedBlockerIdentities }
+        : {}),
       ...(challengedMatches.length > 0
         ? {
             reviewerChallengedNonGoal: challengedMatches.map((match, index) => ({
@@ -3414,7 +3579,13 @@ export async function handleReviewRoutingOutcome(options: {
         updated,
         false,
         undefined,
-        { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
+        {
+          content,
+          blockers,
+          taskFixableCount: historyEntry.taskFixableCount,
+          declinedBlockerCount: declinedReclassifiedBlockers.length,
+          stageRoundOutcomes: updated.roundOutcomes,
+        }
       );
       return { escalated };
     }
@@ -3458,7 +3629,7 @@ export async function handleReviewRoutingOutcome(options: {
       // postEnvironmentalAdvanceNoticeV1's doc comment. Falls back to the
       // toast when no extension context is available to post a decision
       // (unit tests, or an unusual host), so this notice is never dropped.
-      const posted = await postEnvironmentalAdvanceNoticeV1(targetStage, blockers, {
+      const posted = await postEnvironmentalAdvanceNoticeV1(folderUri, targetStage, blockers, {
         canonicalId: normalizePath(folderUri.fsPath),
         taskFolderPath: folderUri.fsPath,
         taskName: updated.displayName,
@@ -3486,7 +3657,13 @@ export async function handleReviewRoutingOutcome(options: {
         updated,
         true,
         undefined,
-        { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
+        {
+          content,
+          blockers,
+          taskFixableCount: historyEntry.taskFixableCount,
+          declinedBlockerCount: declinedReclassifiedBlockers.length,
+          stageRoundOutcomes: updated.roundOutcomes,
+        }
       );
       return { escalated };
     }
@@ -3500,7 +3677,13 @@ export async function handleReviewRoutingOutcome(options: {
       updated,
       false,
       undefined,
-      { content, blockers, taskFixableCount: historyEntry.taskFixableCount, stageRoundOutcomes: updated.roundOutcomes }
+      {
+        content,
+        blockers,
+        taskFixableCount: historyEntry.taskFixableCount,
+        declinedBlockerCount: declinedReclassifiedBlockers.length,
+        stageRoundOutcomes: updated.roundOutcomes,
+      }
     );
     return { escalated };
   } catch (error) {
@@ -3679,21 +3862,33 @@ export async function handleReviewOutcomeV1(
  * `writeReviewRunLogV1` beside it — a failure here must never mask the
  * review's own already-surfaced outcome.
  */
-async function terminalizeUnclosedReviewRoundV1(
+/** @internal exported for testing (item 2 / Step 55: the rejectionReason a
+ * "failed" close now carries) */
+export async function terminalizeUnclosedReviewRoundV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
 ): Promise<void> {
   try {
     const correlation = outcomeCorrelationV1(outcome);
+    const terminalState = terminalStateForUnclosedReviewOutcomeV1(outcome);
+    // Item 2 / Step 55 (2026-09-28 review follow-up): a "failed" close here
+    // (a timeout, a cancellation, or any other unresolvable provider
+    // outcome) previously carried no `rejectionReason` at all, so the
+    // "timed out after N minutes" wording `describeTaskActionFailureV1`
+    // already produces for the user-facing notification never reached this
+    // row's own ledger record. Only the "failed" terminal state gets one:
+    // "completed"/"cancelled" have their own structured outcome data and a
+    // free-text reason here would misrepresent them.
     const unclosedOutcomePatch = {
       ...(ctx.taskMdSizeBand ? { taskMdSizeBand: ctx.taskMdSizeBand } : {}),
       ...(ctx.identityAttachmentDegraded
         ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
         : {}),
+      ...(terminalState === "failed" ? { rejectionReason: describeTaskActionFailureV1(outcome) } : {}),
     };
     await terminalizeRoundV1(
       ctx.reviewAttemptId,
-      terminalStateForUnclosedReviewOutcomeV1(outcome),
+      terminalState,
       Object.keys(unclosedOutcomePatch).length > 0 ? unclosedOutcomePatch : undefined,
       {
         taskFolderUri: ctx.folderUri,
@@ -5175,8 +5370,14 @@ export async function runReviewForFolder(
      * was actually dispatched rather than refused on a guard clause. The
      * caller's tracked operation reads it to end as `refused`, never
      * `completed`, when the review never started (v1 fixes 2, item 32/33).
+     *
+     * Item 2 / Step 57a: `coordinatorOutcome` is set right after the one
+     * `coordinator.executeAction` call below settles, so the caller's own
+     * `finally` can feed it to `recordAdmissionReleaseTriggerV1` before
+     * releasing admission — mirroring how the Resume handlers hand their
+     * outcome back via `coordinatorOutcome` on their own result objects.
      */
-    dispatchProbe?: { dispatched: boolean };
+    dispatchProbe?: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 };
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -6199,6 +6400,9 @@ export async function runReviewForFolder(
         observedCoordinatorAttemptIds.push(info.attemptId);
       },
     });
+    if (options.dispatchProbe) {
+      options.dispatchProbe.coordinatorOutcome = outcome;
+    }
     // "completed" is the only outcome that overwrites reviewUri with fresh
     // content (via the coordinator's own write) — every other kind
     // (questions, cancelled, failed, unavailable, ...) leaves the in-progress
@@ -6734,6 +6938,70 @@ function extractAdmissionHandoffTokenV1(arg: ReviewCommandArg): string | undefin
 }
 
 /**
+ * Extract `resumeFromAttemptV1` from `arg`, when present (RC2 item 12) —
+ * mirrors {@link extractAdmissionHandoffTokenV1} exactly: only the
+ * `{ taskFolderPath }` arg variant can ever carry it, so a UI-originated
+ * invocation (tree-row buttons, the `{ task }` shape) can never accidentally
+ * resume mid-budget.
+ */
+function extractResumeFromAttemptV1(
+  arg: ReviewCommandArg
+): { attemptNumber: number; maxAttempts: number } | undefined {
+  if (!arg || typeof arg !== "object" || !("resumeFromAttemptV1" in arg)) {
+    return undefined;
+  }
+  const value = (arg as { resumeFromAttemptV1?: unknown }).resumeFromAttemptV1;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    typeof (value as { attemptNumber?: unknown }).attemptNumber !== "number" ||
+    typeof (value as { maxAttempts?: unknown }).maxAttempts !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    attemptNumber: (value as { attemptNumber: number }).attemptNumber,
+    maxAttempts: (value as { maxAttempts: number }).maxAttempts,
+  };
+}
+
+/**
+ * RC2 item 12, Step 25: the pure arithmetic behind "the loop starts there
+ * with the remaining budget" — pulled out of `fastForwardReviewWithAI` so it
+ * can be unit-tested directly without driving the whole command through a
+ * real (or faked) multi-round provider loop.
+ *
+ * `maxAttempts` is the ORIGINAL total budget the interrupted run already
+ * committed to (or, absent a resume, the currently configured setting) —
+ * every "Attempt N of maxAttempts" progress message must keep naming this
+ * same total, not a smaller one, or a resumed run would appear to have a
+ * shrunk budget mid-flight. `improveReviewScoreMaxAttempts` is the REMAINING
+ * budget, i.e. the original total minus the attempts the interrupted run
+ * already spent, floored at 1 ONLY so it stays a valid input for
+ * `improveReviewScore` (whose own internal loop floors its `maxAttempts` at 1
+ * regardless of what is passed in) — it must never be read as "at least one
+ * attempt is owed". `remainingBudgetExhausted` is the real signal for that: a
+ * plateau can be raised on the run's own final allowed attempt (attemptNumber
+ * === maxAttempts) or, via manual retries of an interrupted run, past it, and
+ * in either case NO further apply/re-review cycle may run — the caller must
+ * check this FIRST and skip invoking `improveReviewScore` entirely when it is
+ * true, rather than trusting the floored `improveReviewScoreMaxAttempts` to
+ * mean "one attempt remains".
+ */
+export function computeFastForwardResumeBudgetV1(
+  resumeFromAttempt: { attemptNumber: number; maxAttempts: number } | undefined,
+  getConfiguredMaxIterations: () => number
+): { maxAttempts: number; improveReviewScoreMaxAttempts: number; remainingBudgetExhausted: boolean } {
+  const maxAttempts = resumeFromAttempt?.maxAttempts ?? getConfiguredMaxIterations();
+  const remaining = resumeFromAttempt ? maxAttempts - resumeFromAttempt.attemptNumber : maxAttempts;
+  return {
+    maxAttempts,
+    improveReviewScoreMaxAttempts: Math.max(1, remaining),
+    remainingBudgetExhausted: resumeFromAttempt !== undefined && remaining <= 0,
+  };
+}
+
+/**
  * Run (or re-run) the review for the task's current position in the
  * workflow. Labeled "Review" in the UI.
  *
@@ -6826,20 +7094,42 @@ export async function runReviewWithAI(
   // reconciles status only once admission is confirmed live for the resolved
   // target.
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but may not be SAFE the first time it
+  // is tried — a deadline/cancellation outcome can leave a recorded provider
+  // process mid-exit. Releasing anyway would let a retry be admitted beside a
+  // process that might still touch the workspace. The shared helper checks
+  // the round's recorded processes for this handle's claim, only unlinks the
+  // marker once every one of them is confirmed gone, and durably records the
+  // outstanding reason next to the marker so a different process's retry
+  // refusal can name it too; until then the marker stays held and this
+  // re-checks on every heartbeat tick instead of blocking the caller on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a: hoisted above `try` (not `let`-scoped inside it) so
+  // the `finally` below can read whatever `runReviewForFolder` last set on
+  // it before `recordAdmissionReleaseTriggerV1` runs.
+  const dispatchProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = { dispatched: false };
 
   try {
     // ── Consent gate ───────────────────────────────────────────────────────
@@ -6882,7 +7172,7 @@ export async function runReviewWithAI(
         return;
       }
       handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
 
     // 2026-09-08 review (blocker `…-0`): reread and reconcile
@@ -6938,7 +7228,6 @@ export async function runReviewWithAI(
         refusedWhenFalse: true,
       },
       async (op) => {
-        const dispatchProbe = { dispatched: false };
         await runReviewForFolder(
           extensionUri,
           resolved.folderUri,
@@ -6964,6 +7253,7 @@ export async function runReviewWithAI(
     // `true` only when a review round genuinely started.
     return dispatchedReview === true;
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, dispatchProbe.coordinatorOutcome);
     await releaseAdmissionV1();
   }
 }
@@ -7050,20 +7340,42 @@ export async function applyReviewWithAI(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but may not be SAFE the first time it
+  // is tried — a deadline/cancellation outcome can leave a recorded provider
+  // process mid-exit. Releasing anyway would let a retry be admitted beside a
+  // process that might still touch the workspace. The shared helper checks
+  // the round's recorded processes for this handle's claim, only unlinks the
+  // marker once every one of them is confirmed gone, and durably records the
+  // outstanding reason next to the marker so a different process's retry
+  // refusal can name it too; until then the marker stays held and this
+  // re-checks on every heartbeat tick instead of blocking the caller on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a: hoisted above `try` so the `finally` below can read
+  // whatever `runApply` last set on it before `recordAdmissionReleaseTriggerV1`
+  // runs, mirroring `runReviewWithAI`'s `dispatchProbe.coordinatorOutcome`.
+  let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
 
   try {
   const node = normalizeReviewArg(arg);
@@ -7114,7 +7426,7 @@ export async function applyReviewWithAI(
       return false;
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   // Admission is now guaranteed live for this exact target (or the caller's
@@ -7272,6 +7584,10 @@ export async function applyReviewWithAI(
       rawInput: validatedInput,
       cancellationToken: op.token!,
     });
+    coordinatorOutcomeForAdmissionV1 = outcome;
+    if (options.dispatchProbe) {
+      options.dispatchProbe.coordinatorOutcome = outcome;
+    }
 
     if (outcome.kind === "completed") {
       if (reviewUri) {
@@ -7279,6 +7595,18 @@ export async function applyReviewWithAI(
       }
       await safeOpenTextDocument(vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME), PLAN_FILENAME);
       // Re-review after applying (no confirmation, no stage change)
+      // Item 2 / Step 57a: this chained re-review runs its own
+      // `coordinator.executeAction` inside `runReviewForFolder` — a second
+      // invocation after the apply above. Without its own dispatchProbe, a
+      // timeout/cancellation here would settle after `coordinatorOutcomeForAdmissionV1`
+      // was already set from the apply step, and the `finally` below would
+      // release admission against the stale "apply succeeded" outcome while
+      // this later invocation's process could still be running. The
+      // re-review's outcome is authoritative for release once it dispatches:
+      // it is strictly the later of the two invocations this call makes.
+      const reReviewDispatchProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+        dispatched: false,
+      };
       await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
@@ -7299,6 +7627,7 @@ export async function applyReviewWithAI(
               operation: op,
               operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
+              dispatchProbe: reReviewDispatchProbe,
               // Chained continuation of the apply-review edit just above, not
               // a fresh human click. See runReviewForFolder's own doc comment
               // on `automationDispatch`.
@@ -7306,6 +7635,17 @@ export async function applyReviewWithAI(
             }
           )
       );
+      // The re-review's own coordinator.executeAction call is strictly the
+      // later of this function's two invocations; when it dispatched, its
+      // outcome (not the earlier apply's) is what `finally` below must feed
+      // to recordAdmissionReleaseTriggerV1 so a timeout/cancellation here is
+      // not masked by the apply step's already-settled "completed" outcome.
+      if (reReviewDispatchProbe.dispatched) {
+        coordinatorOutcomeForAdmissionV1 = reReviewDispatchProbe.coordinatorOutcome;
+        if (options.dispatchProbe) {
+          options.dispatchProbe.coordinatorOutcome = reReviewDispatchProbe.coordinatorOutcome;
+        }
+      }
     } else if (outcome.kind === "questions") {
       if (options.chatViewProvider) {
         const orchestrator = getProductionActionConversationOrchestratorV1();
@@ -7361,6 +7701,7 @@ export async function applyReviewWithAI(
   }
   return dispatchedV1;
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, coordinatorOutcomeForAdmissionV1);
     await releaseAdmissionV1();
   }
 }
@@ -7488,6 +7829,12 @@ export async function fastForwardReviewWithAI(
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
 
+  // RC2 item 13, Step 50: captured before anything else so the stalled-
+  // warning branch far below can tell "the open-items card fired during
+  // THIS run" from a stale marker left by some earlier, unrelated run — see
+  // `consumeOpenItemsCardPostedSinceV1`'s doc comment.
+  const ffRunStartedAtV1 = Date.now();
+
   // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
   // 2026-09-08 review (blocker `…-4`, new): moved to run BEFORE the §7.5
   // provider-path gate and its `{ taskFolderPath }` peek below. Both are
@@ -7535,19 +7882,33 @@ export async function fastForwardReviewWithAI(
   }
 
   let ffHandle: WorkAdmissionHandleV1 | undefined = ffEarly?.outcome === "acquired" ? ffEarly.handle : undefined;
-  let ffHeartbeat = ffHandle ? setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let ffReleased = false;
-  const releaseFfAdmissionV1 = async (): Promise<void> => {
-    if (ffReleased) {
-      return;
-    }
-    ffReleased = true;
+  let ffHeartbeat = ffHandle ? setInterval(() => void ffHeartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`), same as
+  // `runReviewWithAI`/`applyReviewWithAI`/`runImplementationWithAI`/
+  // `applyReviewEditWithAI` above — a release is requested at most once, but
+  // only actually unlinks the marker once the round's recorded processes are
+  // all confirmed gone; until then the marker stays held (and the reason is
+  // written durably next to it so a different process's retry refusal can
+  // name it too) and the heartbeat keeps re-checking.
+  const ffSafeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onFfAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onFfAdmissionReleasedV1 = (): void => {
     if (ffHeartbeat) {
       clearInterval(ffHeartbeat);
+      ffHeartbeat = undefined;
     }
-    if (ffHandle) {
-      await ffHandle.release();
+  };
+  async function ffHeartbeatTickV1(): Promise<void> {
+    if (!ffHandle) {
+      return;
     }
+    await ffHandle.heartbeat();
+    if (ffSafeReleaseStateV1.releaseRequested && !ffSafeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(ffSafeReleaseStateV1, ffHandle, onFfAdmissionHeldV1, onFfAdmissionReleasedV1);
+    }
+  }
+  const releaseFfAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(ffSafeReleaseStateV1, ffHandle, onFfAdmissionHeldV1, onFfAdmissionReleasedV1);
   };
   // Part 3, Step 3: marks this task folder as "under an active Fast Forward
   // run" for the whole of this call's own try/finally, so an escalation
@@ -7556,6 +7917,12 @@ export async function fastForwardReviewWithAI(
   // see activeFastForwardRunsV1.ts's doc comment for why this must be
   // captured now rather than re-derived when a human later answers the card.
   let ffActiveFolderPath: string | undefined;
+  // Item 2 / Step 57a: hoisted above `try` so the `finally` below can read
+  // the most recent attempt's coordinator outcome before releasing this
+  // run's own admission — updated from the initial review's dispatchProbe
+  // and each loop attempt's dispatchProbe (plan-review branch only; the
+  // impl-review edit branch cannot supply one yet, see `ApplyReviewOptions`).
+  let ffCoordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
 
   try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
@@ -7660,7 +8027,16 @@ export async function fastForwardReviewWithAI(
     return;
   }
   ffActiveFolderPath = resolved.folderUri.fsPath;
-  markFastForwardRunActiveV1(ffActiveFolderPath);
+  // RC2 item 12: a resumed run seeds the map with the SAME budget/offset the
+  // interrupting plateau card captured, so `isFastForwardRunActiveV1`/
+  // `getFastForwardRunStateV1` read the right iteration immediately, even if
+  // ANOTHER plateau fires before the `apply()` callback below runs its first
+  // `updateFastForwardRunStateV1` call.
+  const resumeFromAttempt = extractResumeFromAttemptV1(arg);
+  markFastForwardRunActiveV1(ffActiveFolderPath, {
+    attemptNumber: resumeFromAttempt?.attemptNumber ?? 0,
+    maxAttempts: resumeFromAttempt?.maxAttempts ?? getFastForwardMaxIterations(),
+  });
 
   if (!ffHandle) {
     // No-arg QuickPick path: nothing was known to protect until resolution
@@ -7686,7 +8062,7 @@ export async function fastForwardReviewWithAI(
       return;
     }
     ffHandle = ffLate.handle;
-    ffHeartbeat = setInterval(() => void ffHandle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    ffHeartbeat = setInterval(() => void ffHeartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   // 2026-09-08 review (blocker `…-4`): reread and reconcile UNCONDITIONALLY,
@@ -7827,6 +8203,9 @@ export async function fastForwardReviewWithAI(
       );
       return;
     }
+    const ffInitialReviewProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+      dispatched: false,
+    };
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
@@ -7845,8 +8224,10 @@ export async function fastForwardReviewWithAI(
           // Carries the caller's automation marker (also held by the scoped
           // context) so a would-be modal in the initial review never opens.
           automationDispatch: isAutomationDispatchV1(arg),
+          dispatchProbe: ffInitialReviewProbe,
         })
     );
+    ffCoordinatorOutcomeForAdmissionV1 = ffInitialReviewProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
     initialContent = await readNonEmptyText(reviewUri);
     // Same unusable check as the pre-dispatch read above (line ~3209) — the
     // review just dispatched by runReviewForFolder can be refused outright
@@ -7957,7 +8338,45 @@ export async function fastForwardReviewWithAI(
     targetStage,
     resolved.progress
   );
-  const maxAttempts = getFastForwardMaxIterations();
+  // RC2 item 12, Step 25: a resumed run keeps the ORIGINAL total budget (for
+  // display — "iteration n of m" must keep naming the same m the interrupted
+  // run already committed to), while `improveReviewScoreMaxAttempts` below is
+  // the REMAINING budget actually handed to `improveReviewScore`'s own loop —
+  // see `computeFastForwardResumeBudgetV1`'s own doc comment.
+  const { maxAttempts, improveReviewScoreMaxAttempts, remainingBudgetExhausted } = computeFastForwardResumeBudgetV1(
+    resumeFromAttempt,
+    getFastForwardMaxIterations
+  );
+  // RC2 item 12 completion blocker (2026-09-28 review): a plateau can be
+  // raised on the interrupted run's own FINAL allowed attempt (attemptNumber
+  // === maxAttempts), or an owner can press "Run now" on an already-spent
+  // continuation — either way, the captured offset already meets or exceeds
+  // the original budget. `improveReviewScoreMaxAttempts` floors at 1 only so
+  // it stays a valid `improveReviewScore` input; running it here would silently
+  // grant one MORE attempt than the interrupted run's own budget promised.
+  // Stop before any apply/re-review cycle runs, exactly like the initialScore
+  // guard above — no work is done, so there is nothing for the outer
+  // try/finally to unwind beyond the admission + active-run bookkeeping it
+  // already releases on every early return.
+  if (remainingBudgetExhausted) {
+    NotificationRouter.showWarning(
+      `Fast Forward Review: the interrupted run already used all ${maxAttempts} attempt(s) ` +
+        `(best score so far ${baselineScore}/10) — resuming it would exceed its own budget, so no further ` +
+        "automatic attempt was made. Start a new Fast Forward run for a fresh budget." +
+        (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
+      undefined,
+      undefined,
+      undefined,
+      targetStage === "publish"
+        ? {
+            command: "vs-code-ai-helper.openWorkflowDecision",
+            title: "Open in Chat",
+            args: [{ canonicalId: resolved.folderUri.fsPath, taskFolderPath: resolved.folderUri.fsPath, stage: targetStage } satisfies ChatTarget],
+          }
+        : undefined
+    );
+    return;
+  }
   // The acceptance-threshold option uses the user's configured acceptance
   // threshold; it is not synonymous with a perfect 10/10 score.
   const configuredStopLevel = usesAcceptanceThresholdForFastForward()
@@ -7985,7 +8404,11 @@ export async function fastForwardReviewWithAI(
   };
 
   let previousContent = initialContent;
-  let attemptNumber = 0;
+  // RC2 item 12: seeded from the resumed run's own offset so the displayed
+  // "attempt N of maxAttempts" (and the state this callback reports via
+  // `updateFastForwardRunStateV1` below) continues the interrupted run's own
+  // numbering rather than restarting at 1.
+  let attemptNumber = resumeFromAttempt?.attemptNumber ?? 0;
   const resilience = getResilienceSettings();
 
   // Set once isPaused has ridden through this run's own escalation (2a):
@@ -8053,11 +8476,17 @@ export async function fastForwardReviewWithAI(
           context,
           stage: targetStage,
           baselineScore,
-          maxAttempts,
+          maxAttempts: improveReviewScoreMaxAttempts,
           stopAtScore: configuredStopLevel,
           token: linked.token,
           apply: async () => {
             attemptNumber += 1;
+            // RC2 item 12: keeps the map's live counters current so a
+            // plateau raised on THIS attempt (which may pause the task deep
+            // inside this very call) captures the right iteration to resume
+            // from next, rather than the stale 0/0 (or resumed-offset)
+            // seeded before the loop's first attempt ran.
+            updateFastForwardRunStateV1(resolved.folderUri.fsPath, { attemptNumber, maxAttempts });
             progress.report({
               message: `Attempt ${attemptNumber} of ${maxAttempts}...`,
             });
@@ -8079,12 +8508,17 @@ export async function fastForwardReviewWithAI(
             const applyForTarget = IMPL_REVIEW_STAGES.includes(targetStage)
               ? applyReviewEditWithAI
               : applyReviewWithAI;
-            await applyForTarget(
-              extensionUri,
-              context,
-              concreteArg,
-              buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider)
-            );
+            // Item 2 / Step 57a: a fresh probe per attempt — `applyReviewWithAI`
+            // (plan-review branch) fills in `.coordinatorOutcome`;
+            // `applyReviewEditWithAI` (impl-review edit branch) cannot yet
+            // (see `ApplyReviewOptions`'s doc comment), so it stays `undefined`
+            // and this attempt's contribution is simply skipped below.
+            const ffAttemptProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+            await applyForTarget(extensionUri, context, concreteArg, {
+              ...buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider),
+              dispatchProbe: ffAttemptProbe,
+            });
+            ffCoordinatorOutcomeForAdmissionV1 = ffAttemptProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
           },
           // Escalation (see handleReviewRoutingOutcome) can now fire inside
           // Fast Forward and pause the task mid-loop. Without this check,
@@ -8504,7 +8938,16 @@ export async function fastForwardReviewWithAI(
           }
         : undefined
     );
-  } else if (outcome.stalled) {
+  } else if (
+    outcome.stalled &&
+    // RC2 item 13, Step 50: a detached Implementation round already posted
+    // the "nothing more to build" open-items card for this exact task
+    // during this Fast Forward run — that card already lists every open
+    // item and its reason, so this generic stalled warning would be a
+    // second, less actionable surface for the SAME observation ("plan work
+    // remains, nothing landed"). See `consumeOpenItemsCardPostedSinceV1`.
+    !consumeOpenItemsCardPostedSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1)
+  ) {
     const buildRoundsStalled = outcome.buildRoundsWithoutProgress ?? 0;
     const stalledDetail =
       buildRoundsStalled > 0
@@ -8527,7 +8970,7 @@ export async function fastForwardReviewWithAI(
           }
         : undefined
     );
-  } else {
+  } else if (!outcome.stalled) {
     // A best score already at or below the rubric's blocker cap, while the
     // configured stop level asks for something higher, means "attempts
     // exhausted" is not the real story: the rubric asks reviewers to keep
@@ -8574,6 +9017,7 @@ export async function fastForwardReviewWithAI(
     if (ffActiveFolderPath) {
       clearFastForwardRunActiveV1(ffActiveFolderPath);
     }
+    recordAdmissionReleaseTriggerV1(ffSafeReleaseStateV1, ffCoordinatorOutcomeForAdmissionV1);
     await releaseFfAdmissionV1();
   }
 }
@@ -10280,9 +10724,9 @@ export async function resumeGenerateImplementationInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome), coordinatorOutcome: outcome };
   }
-  return { ok: true, settlement };
+  return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 /**
@@ -10688,6 +11132,12 @@ async function executeImplementationRun(
         // same as a review round — see `RunSealedImplementationOptionsV1.roundId`.
         roundId: implRoundId,
         roundProcessClaimId: options.roundProcessClaimId,
+        // Item 2 / Step 57a completion fix: forwarded so a caller that
+        // supplied its own out-param (runImplementationWithAI,
+        // applyImplementationReviewWithAI) reads back this dispatch's
+        // coordinator outcome once it settles — see this option's own doc
+        // comment on ExecuteImplementationRunOptions.
+        dispatchProbe: options.dispatchProbe,
         // Structured preflight questions get their full Chat lifecycle
         // (mirror → Answer → Resume via extension.ts's dispatcher).
         onQuestions: async (questionsOutcome) => {
@@ -11341,6 +11791,16 @@ async function executeImplementationRun(
     // the promotion that clears the recovery record.
     const acceptedSummaryOnlyReport =
       !summaryIssue && claimedRecovery.record?.mode === "summary-only";
+    // Implementation review round 2 (review commit c66cbc9, "more than one
+    // surface"): set inside the zero-file branch below when RC2 item 13's
+    // "nothing more to build" card already told this round's story, so the
+    // UNCONDITIONAL `persistedAfterRun?.checklistProgressUnreliable` re-
+    // announcement further below (which runs for every round, not only this
+    // one's zero-file branch, and would otherwise post its own competing
+    // `reconcilePlanChecklist` card regardless of what fired here) can stand
+    // itself down for this one round instead of posting a second surface for
+    // the exact same observation.
+    let openItemsCardOwnedThisRoundV1 = false;
     if (
       !summaryIssue &&
       !acceptedSummaryOnlyReport &&
@@ -11719,7 +12179,40 @@ async function executeImplementationRun(
           return false;
         }
       }
-      if (newlyLatchingChecklistUnreliable) {
+      // Hoisted above the `newlyLatchingChecklistUnreliable` block below
+      // (implementation review round 2, review commit c66cbc9, "more than
+      // one surface"): `checklistUnderrecordingConfirmedByReview`'s own
+      // preconditions (`!checklistAdvanced`, `remaining > 0`,
+      // `latestReviewClearsStage`) are — whenever they hold — also exactly
+      // what makes `decidePostReviewActionV1` resolve to `"implementation"`
+      // here (a zero-taskFixableCount review, real unticked items): `blockerCount
+      // === 0` is a superset condition of `taskFixableCount === 0`, so a
+      // review that clears the stage always has `taskFixableCount === 0` too.
+      // The two "something changed nothing, but the plan still shows open
+      // items" diagnoses are therefore not independent — they fire on the
+      // SAME round, almost always together — and RC2 item 13's whole point is
+      // that ONE card, not several competing warnings, is shown for this
+      // shape. Computed here (before the reconcile block) so that block can
+      // stand its OWN card down in favor of the newer, more specific one
+      // (Step 51's "decide item by item" is strictly more actionable than
+      // "go tick things in plan-final.md by hand") — while still leaving the
+      // underlying `checklistProgressUnreliable` latch (set moments ago, in
+      // `zeroChangeTerminalization`'s `extraPatch`, unconditionally) exactly
+      // as it was, since other gates still depend on that persisted flag.
+      const sterileRoundDecision = decidePostReviewActionV1({
+        history: priorProgress?.reviewScoreHistory,
+        stages: IMPL_REVIEW_STAGES_V1,
+        hasUntickedChecklistItems: (remainingChecklistProgress?.remaining ?? 0) > 0,
+        continuationOwed: (persistedRounds ?? priorProgress)?.implRecovery !== undefined,
+        pendingImplReviewFilesCount:
+          (persistedRounds ?? priorProgress)?.pendingImplReviewFiles?.length ?? 0,
+      });
+      const openItemsCardWillOwnThisRoundV1 =
+        sterileRoundDecision.action === "implementation" &&
+        planChecklist !== undefined &&
+        !checklistClaimedButUnmergedWithoutClearingReview;
+      openItemsCardOwnedThisRoundV1 = openItemsCardWillOwnThisRoundV1;
+      if (newlyLatchingChecklistUnreliable && !openItemsCardWillOwnThisRoundV1) {
         const outstandingList = describeOutstandingChecklistItemsV1(planChecklist);
         const reconcileNote =
           "\n\n## Checklist counts stood down (under-recording)\n\n" +
@@ -11785,14 +12278,9 @@ async function executeImplementationRun(
       // require the latest review to MEET the auto-advance threshold — a
       // 5/10 review carrying blockers qualifies for neither — so the stall
       // runs until the churn ceiling fires on the review side, rounds later.
-      const sterileRoundDecision = decidePostReviewActionV1({
-        history: priorProgress?.reviewScoreHistory,
-        stages: IMPL_REVIEW_STAGES_V1,
-        hasUntickedChecklistItems: (remainingChecklistProgress?.remaining ?? 0) > 0,
-        continuationOwed: (persistedRounds ?? priorProgress)?.implRecovery !== undefined,
-        pendingImplReviewFilesCount:
-          (persistedRounds ?? priorProgress)?.pendingImplReviewFiles?.length ?? 0,
-      });
+      // (`sterileRoundDecision` itself is now computed earlier, above the
+      // `newlyLatchingChecklistUnreliable` block, so that block can consult
+      // it too — see that computation's own comment.)
       if (sterileRoundDecision.action === "apply-review" || sterileRoundDecision.action === "both") {
         // Migrated off the single-action-button `NotificationRouter.showWarning`
         // notification onto a `WorkflowDecisionV1` record (task "Actionable
@@ -11893,6 +12381,84 @@ async function executeImplementationRun(
                 ? "The plan checklist still has unticked items, so running Implementation again is also " +
                   "valid — but Go to Review & Apply can fix what the newest review reports right now."
                 : "Running Implementation again will give the same result — use Go to Review & Apply instead.")
+          );
+        }
+      } else if (openItemsCardWillOwnThisRoundV1 && planChecklist !== undefined) {
+        // Implementation review round 2 (review commit c66cbc9, "wrong-round
+        // posting"): `openItemsCardWillOwnThisRoundV1` (computed above,
+        // before `newlyLatchingChecklistUnreliable`'s own block) already
+        // excludes `checklistClaimedButUnmergedWithoutClearingReview` — a
+        // claimed-but-unmerged round with real unticked work and no clearing
+        // review is a provider-failure/unproductive-round classification,
+        // refused at its own dedicated block further below (:12267), not a
+        // genuine "nothing left to build" completion — this card must never
+        // reach it first. `newlyLatchingChecklistUnreliable`'s block, for its
+        // part, already deferred ITS OWN card to this one when this flag is
+        // true (see that block's comment) — the two blocks are symmetric
+        // halves of the same "exactly one card" decision, computed once and
+        // shared, so they can never disagree about which of them fires.
+        // RC2 item 13, Step 50: no task-fixable blockers remain (the newest
+        // review is clean), but the plan checklist still has unticked items
+        // and THIS round changed no files and named none of them done —
+        // another automatic Implementation round is not guaranteed to do
+        // anything different, since it already just ran and reported nothing
+        // to build. The generic "already satisfies the plan" message below
+        // is false whenever items remain, and simply re-suggesting
+        // Implementation repeats the same empty round (the observed RC1
+        // stall: 130/135 items settled, a clean 9/10 review, two warnings
+        // that both pointed back at re-running Implementation or Fast
+        // Forward). Ask the owner to settle each open item instead.
+        //
+        // Marked here — before the card is even built — because Fast
+        // Forward's own "stalled" warning (fastForwardReviewWithAI, a
+        // completely separate, unawaited call stack from this detached
+        // Implementation round) must stand down whether or not the card
+        // itself successfully posts (a missing extension context still
+        // falls back to an equivalent notification below); either way this
+        // round's story was already told once.
+        markOpenItemsCardPostedV1(folderUri.fsPath);
+        const openItemsStage = priorProgress?.currentStage ?? postRunReviewStage;
+        const openItemsTarget: ChatTarget = {
+          canonicalId: folderUri.fsPath,
+          taskFolderPath: folderUri.fsPath,
+          stage: openItemsStage,
+          taskName: priorProgress?.displayName,
+        };
+        const openItemTexts = listUncheckedChecklistItemTextsV1(planChecklist, Number.MAX_SAFE_INTEGER).items;
+        const roundReasonsByKey = new Map(
+          collectPlanItemReasonsV1(summary).map((entry) => [
+            normalizeChecklistItemTextV1(entry.itemText),
+            entry.reason,
+          ])
+        );
+        const openItemsCardInput = buildOpenPlanItemsNeedDecisionCardInputV1({
+          taskFolderPath: folderUri.fsPath,
+          taskCanonicalId: folderUri.fsPath,
+          stage: openItemsStage,
+          displayName: priorProgress?.displayName,
+          items: openItemTexts.map((itemText) => ({
+            itemText,
+            reason: roundReasonsByKey.get(normalizeChecklistItemTextV1(itemText)) ?? "",
+          })),
+          createdAt: new Date().toISOString(),
+          // RC2 item 13, Step 52: captured NOW, at card-build time, for the
+          // same reason `buildAdvanceOptionV1`/`buildPlateauKeepIteratingOptionV1`
+          // capture it — by the time the owner answers the "Decide item by
+          // item" QuickPick flow (seconds or days later), the Fast Forward
+          // call stack that may have raised this very card is long gone. When
+          // set, applying the owner's decisions resumes Fast Forward from
+          // Apply Review with these live counters instead of dispatching a
+          // single ordinary continuing action.
+          resumeFastForwardV1: getFastForwardRunStateV1(folderUri.fsPath),
+        });
+        const openItemsCardPosted = await postWorkflowDecisionV1(openItemsCardInput, openItemsTarget);
+        if (!openItemsCardPosted) {
+          // No decision was persisted (missing extension context) — same
+          // fallback shape as the sibling branch above.
+          NotificationRouter.showWarning(
+            `Implementation changed no files. The plan checklist still has ${openItemTexts.length} open ` +
+              "item(s) this round could not build. Decide each one (exclude with a reason, tick it because " +
+              "it is already done, or leave it open) in plan-final.md."
           );
         }
       } else {
@@ -12558,7 +13124,19 @@ async function executeImplementationRun(
     // repair is deliberately a human confirmation (reconcilePlanChecklist).
     // Without this, the only standing trace was the task tooltip — invisible
     // while rounds appear to be progressing normally.
-    if (persistedAfterRun?.checklistProgressUnreliable) {
+    //
+    // `!openItemsCardOwnedThisRoundV1` (implementation review round 2, review
+    // commit c66cbc9, "more than one surface"): this block is otherwise
+    // UNCONDITIONAL — it runs for every round while the latch is set,
+    // regardless of branch — so without this guard it re-posted its own
+    // `reconcilePlanChecklist` card even on the exact round whose zero-file
+    // branch above already raised RC2 item 13's more specific, more
+    // actionable open-items card for this identical observation. The latch
+    // itself (`checklistProgressUnreliable`) stays set either way — only the
+    // SECOND, competing decision surface for THIS round is skipped; a LATER
+    // round that changes files (or fails to raise the open-items card again)
+    // while the latch is still set reaches this block normally.
+    if (persistedAfterRun?.checklistProgressUnreliable && !openItemsCardOwnedThisRoundV1) {
       // Reads the checklist text AS IT STANDS after this round's own
       // merge-write (if any) — never the round-stale `planChecklist` — so a
       // round that both landed a merge AND still completes under an
@@ -13049,20 +13627,47 @@ export async function runImplementationWithAI(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but may not be SAFE the first time it
+  // is tried — a deadline/cancellation outcome can leave a recorded provider
+  // process mid-exit. Releasing anyway would let a retry be admitted beside a
+  // process that might still touch the workspace. The shared helper checks
+  // the round's recorded processes for this handle's claim, only unlinks the
+  // marker once every one of them is confirmed gone, and durably records the
+  // outstanding reason next to the marker so a different process's retry
+  // refusal can name it too; until then the marker stays held and this
+  // re-checks on every heartbeat tick instead of blocking the caller on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a completion fix (2026-09-29 review): out-param read back
+  // by `executeImplementationRun`'s own `dispatchProbe` option so this
+  // function's terminal `recordAdmissionReleaseTriggerV1` call (right before
+  // its safe release below) can settle the held marker's operationId/trigger
+  // against this round's ACTUAL coordinator outcome instead of leaving them
+  // unset — see `ApplyReviewOptions.dispatchProbe`'s doc comment. Declared
+  // here, OUTSIDE the try block below (not beside `providerInvokedThisRound`
+  // inside it), so it is still visible from the try's own `finally`.
+  const runImplementationDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
 
   try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): first
@@ -13134,7 +13739,7 @@ export async function runImplementationWithAI(
       return false;
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   // Admission is now guaranteed live for this exact target — reconcile a
@@ -13907,6 +14512,7 @@ export async function runImplementationWithAI(
         roundProcessClaimId: handle?.claimId,
         templateName: dispatchedTemplateName,
         templateVariables: dispatchedTemplateVariables,
+        dispatchProbe: runImplementationDispatchProbeV1,
         ...(sourceReviewStageForRun ? { editActionKey: "applyReviewEdit.v1" } : {}),
         ...(dispatchedBlockerIds ? { dispatchedBlockerIds } : {}),
       }
@@ -13983,6 +14589,7 @@ export async function runImplementationWithAI(
   }
   return implRoundRan === true || redirectDispatchedV1;
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, runImplementationDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
   }
 }
@@ -14052,20 +14659,48 @@ export async function applyReviewEditWithAI(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but may not be SAFE the first time it
+  // is tried — a deadline/cancellation outcome can leave a recorded provider
+  // process mid-exit. Releasing anyway would let a retry be admitted beside a
+  // process that might still touch the workspace. The shared helper checks
+  // the round's recorded processes for this handle's claim, only unlinks the
+  // marker once every one of them is confirmed gone, and durably records the
+  // outstanding reason next to the marker so a different process's retry
+  // refusal can name it too; until then the marker stays held and this
+  // re-checks on every heartbeat tick instead of blocking the caller on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Item 2 / Step 57a completion fix (2026-09-29 review): out-param passed to
+  // applyImplementationReviewWithAI (which forwards it into
+  // executeImplementationRun's own dispatchProbe option) so this function's
+  // terminal recordAdmissionReleaseTriggerV1 call below can settle the held
+  // marker's operationId/trigger against this round's ACTUAL coordinator
+  // outcome instead of leaving them unset — see ApplyReviewOptions
+  // .dispatchProbe's doc comment. Declared here, OUTSIDE the try block below
+  // (not beside `runApply`'s definition inside it), so it is still visible
+  // from the try's own `finally`.
+  const applyReviewEditDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
 
   try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): before
@@ -14122,7 +14757,7 @@ export async function applyReviewEditWithAI(
       return false;
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   // Admission is now guaranteed live for this exact target (or the caller's
@@ -14314,10 +14949,23 @@ export async function applyReviewEditWithAI(
             // ExecuteImplementationRunOptions.chatViewProvider doc comment.
             chatViewProvider: options.chatViewProvider,
             roundProcessClaimId: handle?.claimId,
+            dispatchProbe: applyReviewEditDispatchProbeV1,
           }
         )
     );
     if (implementSucceeded) {
+      // Item 2 / Step 57a (review fix): this chained re-review runs its own
+      // `coordinator.executeAction` inside `runReviewForFolder` — a second
+      // invocation after the edit round above. Without its own dispatchProbe,
+      // a timeout/cancellation here would settle after
+      // `applyReviewEditDispatchProbeV1.coordinatorOutcome` was already set
+      // from the edit step, and the outer `finally` would release admission
+      // against the stale "edit succeeded" outcome while this later
+      // invocation's process could still be running. Mirrors the identical
+      // fix in the apply-review (plan) branch above at `reReviewDispatchProbe`.
+      const reReviewDispatchProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+        dispatched: false,
+      };
       await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
@@ -14333,6 +14981,7 @@ export async function applyReviewEditWithAI(
               operation: op,
               operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
+              dispatchProbe: reReviewDispatchProbe,
               // This re-review is a chained continuation of the implementation
               // round just above, not a fresh human click — nobody is
               // synchronously attached to answer a modal if the round above
@@ -14342,6 +14991,14 @@ export async function applyReviewEditWithAI(
             }
           )
       );
+      // The re-review's own coordinator.executeAction call is strictly the
+      // later of this function's two invocations; when it dispatched, its
+      // outcome (not the earlier edit's) is what the outer `finally` must
+      // feed to recordAdmissionReleaseTriggerV1 so a timeout/cancellation
+      // here is not masked by the edit step's already-settled outcome.
+      if (reReviewDispatchProbe.dispatched) {
+        applyReviewEditDispatchProbeV1.coordinatorOutcome = reReviewDispatchProbe.coordinatorOutcome;
+      }
     } else if (!options.parentOperation) {
       // Part 4 (item 8) review fix, 2026-09-24: the implementation-round
       // dispatch above genuinely ran (that is what `return true` below
@@ -14400,6 +15057,7 @@ export async function applyReviewEditWithAI(
   }
   return dispatchedV1;
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, applyReviewEditDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
   }
 }
@@ -15340,9 +15998,9 @@ export async function resumeReviewInteractionV1(
         : undefined;
 
     if (settlement === undefined) {
-      return { ok: false, reason: "Resume failed to settle the interaction" };
+      return { ok: false, reason: "Resume failed to settle the interaction", coordinatorOutcome: outcome };
     }
-    return { ok: true, settlement };
+    return { ok: true, settlement, coordinatorOutcome: outcome };
   } finally {
     void clearRoundLiveV1(reviewAttemptId);
   }
@@ -15458,9 +16116,9 @@ export async function resumeApplyReviewInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: "Resume failed to settle the interaction" };
+    return { ok: false, reason: "Resume failed to settle the interaction", coordinatorOutcome: outcome };
   }
-  return { ok: true, settlement };
+  return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 /**

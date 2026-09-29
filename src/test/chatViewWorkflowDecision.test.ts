@@ -60,7 +60,18 @@ import {
   notifyPendingWorkflowDecision,
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
-import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
+import {
+  applyReviewerVerifiedTicksConfirmedV1,
+  postApplyReviewerVerifiedTicksDecisionV1,
+} from "../commands/applyReviewerVerifiedTicks";
+import {
+  applyReconciliationReviewVerifiedTicksConfirmedV1,
+  postReconcilePlanChecklistDecisionV1,
+} from "../commands/reconcilePlanChecklist";
+import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { makeOwnedTaskFolder, bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
 import { safeRemoveDir } from "./testFsUtils";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
@@ -958,6 +969,229 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       assert.ok(applyingAck, "expected the immediate 'applying now' acknowledgement before the command resolves");
       const failureAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /did not complete/i.test(e.text));
       assert.ok(failureAck, "expected a follow-up acknowledgement that the command did not actually complete");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  /**
+   * RC2 item 9: `WorkflowDecisionCommandResultV1` lets a command answer
+   * "refused" on the SAME card's own thread instead of the generic
+   * "did not complete" line — and, critically, without posting a new card
+   * (the "Run now" bug: every refused press used to hand back an identical
+   * fresh card).
+   */
+  void it("resolving a command-effect decision whose command returns a structured 'refused' result renders that message, not the generic failure line, and posts no new decision", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture({ outcome: "refused", message: "Still claimed until 3:00:00 PM." });
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      assert.equal(lastDecisions(fake).length, 1, "the one card is pending before it is answered");
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
+
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const refusalAck = entries.find((e) => e.text.includes("Still claimed until 3:00:00 PM."));
+      assert.ok(refusalAck, "expected the structured refusal message in the transcript");
+      const genericFailure = entries.find((e) => /did not complete/i.test(e.text));
+      assert.equal(genericFailure, undefined, "the generic failure line is reserved for a plain `false` return");
+      assert.equal(
+        lastDecisions(fake).length,
+        0,
+        "the answered card is resolved (no longer pending) and a refused structured result must never post a NEW pending decision either"
+      );
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("resolving a command-effect decision whose command returns a structured 'alreadyDone' result renders that message on the same card", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture({
+      outcome: "alreadyDone",
+      message: "Already done: the 2 reviewer-verified ticks are applied.",
+    });
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
+
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const alreadyDoneAck = entries.find((e) => e.text.includes("Already done: the 2 reviewer-verified ticks"));
+      assert.ok(alreadyDoneAck, "expected the 'already done' message in the transcript, not a bare information message");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  /**
+   * RC2 item 8, Step 34: resolving an option whose `resumeKind` is
+   * "continue" resumes the task via `resumePausedTask`, which withdraws
+   * every OTHER pending card whose `gating.holdsTaskPaused` is true
+   * (`ESCALATION_DECISION_KEYS_V1`) — this must be named on the SAME
+   * confirmation line the click produces, not only as a later separate
+   * "Withdrawn: …" line on the other card's own thread (the RC1 bug:
+   * choosing "Apply … and try again" silently made an unrelated plateau
+   * card vanish with no visible link between the two).
+   */
+  void it("RC2 item 8: an answer whose option resumes the task names, in its own confirmation, every other pending card the resume will close", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionId: "plateau-1",
+          decisionKey: "reviewPlateauEscalation",
+          whatHappened:
+            "The stage plateaued with 1 blocker outstanding and Low-Level Code Review has not run yet.",
+          options: [
+            {
+              optionId: "keepIterating",
+              label: "Keep iterating",
+              consequence: "Runs Apply Review once more.",
+              resumeKind: "continue",
+              effect: { kind: "command", command: "ensemble.keepIterating" },
+            },
+          ],
+          recommendation: { kind: "option", optionId: "keepIterating", reasoning: "The blocker may still clear." },
+          gating: { holdsTaskPaused: true, unblocksProgress: true, detail: "This is what holds the task paused." },
+        })
+      );
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionId: "apply-ticks-1",
+          // Deliberately NOT "applyReviewerVerifiedTicks": that key has its
+          // own render-time staleness predicate (re-derives against real
+          // disk via `deriveApplicableVerifiedTicksV1`) that would withdraw
+          // this synthetic card immediately — this test is about Step 34's
+          // "closes" note, not that predicate.
+          decisionKey: "exampleApplyTicksCard",
+          whatHappened: "impl-high-review.md named 2 plan item(s) as verified complete.",
+          options: [
+            {
+              optionId: "apply",
+              label: "Apply 2 Reviewer-Verified Ticks and resume the task",
+              consequence: "Ticks these items, then dispatches this stage's next action.",
+              resumeKind: "continue",
+              effect: { kind: "command", command: "ensemble.applyTicks" },
+            },
+          ],
+          recommendation: { kind: "option", optionId: "apply", reasoning: "The reviewer already verified these." },
+          gating: { holdsTaskPaused: false, unblocksProgress: true, detail: "This does not itself hold the task paused." },
+        })
+      );
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      assert.equal(lastDecisions(fake).length, 2, "both cards are pending before either is answered");
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "apply-ticks-1", optionId: "apply" });
+
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const ack = entries.find((e) => e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and resume the task"'));
+      assert.ok(ack, "expected the confirmation line for the Apply option");
+      assert.match(
+        ack.text,
+        /stage plateaued with 1 blocker outstanding/,
+        "the confirmation must name the other pending card the resume will close"
+      );
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  /**
+   * RC2 item 8, Step 34 (negative case): an option whose `resumeKind` is
+   * "unpause" (e.g. a plain "Leave it paused" choice) never resumes the
+   * task, so it must never claim to close anything even when another
+   * paused-gating card happens to be pending for the same task.
+   */
+  void it("RC2 item 8: an 'unpause' option's confirmation never claims to close another pending card", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionId: "plateau-1",
+          decisionKey: "reviewPlateauEscalation",
+          whatHappened: "The stage plateaued with 1 blocker outstanding.",
+          options: [
+            {
+              optionId: "keepIterating",
+              label: "Keep iterating",
+              consequence: "Runs Apply Review once more.",
+              resumeKind: "continue",
+              effect: { kind: "command", command: "ensemble.keepIterating" },
+            },
+          ],
+          recommendation: { kind: "option", optionId: "keepIterating", reasoning: "The blocker may still clear." },
+          gating: { holdsTaskPaused: true, unblocksProgress: true, detail: "This is what holds the task paused." },
+        })
+      );
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionId: "other-1",
+          decisionKey: "otherDecision",
+          whatHappened: "Something else needs a human decision.",
+          options: [
+            {
+              optionId: "leaveIt",
+              label: "Leave it paused — I'll fix it",
+              consequence: "Leaves the task paused; nothing is dispatched.",
+              resumeKind: "unpause",
+              effect: { kind: "doNothing" },
+            },
+          ],
+          recommendation: { kind: "option", optionId: "leaveIt", reasoning: "The human should decide." },
+          gating: { holdsTaskPaused: false, unblocksProgress: false, detail: "This leaves the task exactly as it was." },
+        })
+      );
+
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "other-1", optionId: "leaveIt" });
+
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const ack = entries.find((e) => e.text.includes('Recorded: "Leave it paused'));
+      assert.ok(ack, "expected the confirmation line for the doNothing option");
+      assert.doesNotMatch(
+        ack.text,
+        /closes:/,
+        "a resumeKind: 'unpause' doNothing option never resumes the task, so it must never claim to close anything"
+      );
     } finally {
       notify.restore();
       cmds.restore();
@@ -3489,6 +3723,569 @@ void describe("Chat With AI — render() drops a stale render across a same-task
       cmds.restore();
       provider.dispose();
       safeRemoveDir(folder);
+    }
+  });
+});
+
+/**
+ * RC2 item 8, Step 38: the literal three-card scenario observed live on RC1
+ * (2026-09-26 23:06) — a real `applyReviewerVerifiedTicks` card, a real
+ * `reconcilePlanChecklist` card (whose duplicate option Step 36 relabels
+ * because the ticks card is pending), and a plateau escalation card holding
+ * the task paused — all pending at once through ChatViewProvider's real
+ * `resolveWorkflowDecision` dispatch (no `_executeCommandOverride`, so the
+ * commands registered below via `vscode.commands.registerCommand` really
+ * run, exactly as production dispatch does). Only
+ * `vs-code-ai-helper.resumeAndApplyCurrentStageAction` is stubbed — the
+ * plateau card's own withdrawal by a resumed task is Part 3's concern, not
+ * this card-closing/already-done wiring's.
+ */
+void describe("Chat With AI — RC2 item 8, Step 38: the real three-card scenario", () => {
+  function step38WriteProgress(folder: string, progress: TaskProgress): void {
+    fs.writeFileSync(path.join(folder, TASK_PROGRESS_FILENAME), JSON.stringify(progress, undefined, 2), "utf8");
+  }
+
+  /**
+   * `makeFolder()`/`makeOwnedTaskFolder` above, not a bare mkdtemp folder:
+   * chat-history identity resolution (`identityForDecision`,
+   * `appendChatMessageV1`'s own binding lookup) requires the strict
+   * ownership-backed `task-progress.json` shape this fixture writes — a
+   * folder missing `ownership` silently resolves no identity, so every
+   * `append()` in `resolveWorkflowDecision` is skipped and the transcript
+   * stays empty (discovered live while writing this test: `entries` came
+   * back `[]` with a hand-rolled progress object).
+   */
+  function makeStep38Task(): { folder: string; canonicalId: string; progress: TaskProgress } {
+    const folder = makeFolder();
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Split the artifacts",
+      "- [ ] Wire the completeness gate",
+      "- [ ] Add the retry button",
+      "",
+    ].join("\n");
+    fs.writeFileSync(path.join(folder, "plan-final.md"), plan, "utf8");
+    const review = [
+      "Readiness: 9/10",
+      "",
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "- Add the retry button",
+      "<!-- verified-complete:end -->",
+      "",
+      "<!-- blockers:start -->",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    fs.writeFileSync(path.join(folder, "impl-high-review.md"), review, "utf8");
+    const progress: TaskProgress = {
+      taskFolder: path.basename(folder),
+      currentStage: "impl-high-review",
+      status: "active",
+      displayName: "Task A",
+      createdAt: "2026-09-26T00:00:00.000Z",
+      updatedAt: "2026-09-26T00:00:00.000Z",
+      ownership: fixtureOwnershipFor(folder),
+      // The reconcile card's render-time staleness predicate
+      // (chatView.ts's `reconcilePlanChecklist` entry) only treats the card
+      // as still current while this latch is set — matching the real RC1
+      // scenario this test reproduces ("This task's plan checklist is
+      // flagged unreliable").
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    step38WriteProgress(folder, progress);
+    return { folder, canonicalId: folder, progress };
+  }
+
+  function makeStep38Inventory(canonicalId: string, folder: string, progress: TaskProgress): TaskInventory {
+    const inv = Object.create(TaskInventory.prototype) as TaskInventory;
+    const task = {
+      canonicalId,
+      taskFolderPath: folder,
+      folderName: path.basename(folder),
+      sourceScopeKey: canonicalId,
+      progress,
+    };
+    // @ts-expect-error — direct field init on stub
+    inv.visibleTasks = [task];
+    // @ts-expect-error — direct field init on stub
+    inv.taskByCanonicalId = new Map([[canonicalId, task]]);
+    // @ts-expect-error — direct field init on stub
+    inv.suppressionAliasMap = new Map();
+    inv.refresh = (): Promise<void> => Promise.resolve();
+    inv.getTasks = (): Array<typeof task> => [task];
+    inv.getTaskById = (id: string): typeof task | undefined => (id === canonicalId ? task : undefined);
+    inv.getTaskByPath = (p: string): typeof task | undefined => (p === folder ? task : undefined);
+    inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+    inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
+    return inv;
+  }
+
+  function makeStep38Store(canonicalId: string): CurrentTaskStore {
+    const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
+    store.get = (): string | undefined => canonicalId;
+    store.set = (): Promise<void> => Promise.resolve();
+    store.clear = (): Promise<void> => Promise.resolve();
+    return store;
+  }
+
+  /** Real read AND write, unlike the file's own read-only `installRealFs()`
+   * above — the confirmed apply commands under test genuinely write
+   * plan-final.md through `writeTextFileIfUnchangedV1`. */
+  function installStep38RealReadWriteFs(): { restore: () => void } {
+    const fsApi = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const orig = { readFile: fsApi.readFile, writeFile: fsApi.writeFile, createDirectory: fsApi.createDirectory };
+    fsApi.readFile = async (uri: vscode.Uri): Promise<Uint8Array> =>
+      new TextEncoder().encode(await fs.promises.readFile(uri.fsPath, "utf8"));
+    fsApi.writeFile = async (uri: vscode.Uri, data: Uint8Array): Promise<void> => {
+      await fs.promises.writeFile(uri.fsPath, Buffer.from(data));
+    };
+    fsApi.createDirectory = async (uri: vscode.Uri): Promise<void> => {
+      await fs.promises.mkdir(uri.fsPath, { recursive: true });
+    };
+    return {
+      restore: (): void => {
+        fsApi.readFile = orig.readFile;
+        fsApi.writeFile = orig.writeFile;
+        fsApi.createDirectory = orig.createDirectory;
+      },
+    };
+  }
+
+  function installStep38WorkspaceFolders(folder: string): { restore: () => void } {
+    const orig = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
+      { uri: vscode.Uri.file(path.dirname(folder)), name: "step38-root", index: 0 },
+    ];
+    return {
+      restore: (): void => {
+        (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
+      },
+    };
+  }
+
+  void it(
+    "with the ticks, reconcile and plateau cards all pending: Apply on the ticks card names the plateau card it closes, then the reconcile card's duplicate Apply reports 'Already done'",
+    async () => {
+      const { folder, canonicalId, progress } = makeStep38Task();
+      const memento = makeMemento();
+      const context = {
+        subscriptions: [] as vscode.Disposable[],
+        extensionUri: vscode.Uri.file(folder),
+        workspaceState: memento,
+        globalState: memento,
+      } as unknown as vscode.ExtensionContext;
+      __extensionContextV1TestOnly.set(context);
+
+      const inventory = makeStep38Inventory(canonicalId, folder, progress);
+      const currentTaskStore = makeStep38Store(canonicalId);
+      const resumeCalls: unknown[] = [];
+      const disposeApplyTicks = vscode.commands.registerCommand(
+        "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
+        (arg?: unknown) => applyReviewerVerifiedTicksConfirmedV1(inventory, currentTaskStore, arg as never)
+      );
+      const disposeApplyRecon = vscode.commands.registerCommand(
+        "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
+        (arg?: unknown) => applyReconciliationReviewVerifiedTicksConfirmedV1(inventory, currentTaskStore, arg as never)
+      );
+      const disposeResume = vscode.commands.registerCommand(
+        "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+        (arg?: unknown) => {
+          resumeCalls.push(arg);
+        }
+      );
+      // `ChatViewProvider.open()` focuses the view via this command — not
+      // under test here (no `_executeCommandOverride` is installed in this
+      // suite, since that would swallow the real dispatch under test too).
+      const disposeFocus = vscode.commands.registerCommand(`${ChatViewProvider.viewType}.focus`, () => undefined);
+
+      const provider = new ChatViewProvider(memento);
+      const fake = makeFakeWebviewView();
+      const notify = installNotificationRouterCapture();
+      const realFs = installStep38RealReadWriteFs();
+      const workspace = installStep38WorkspaceFolders(folder);
+      try {
+        // Card 1: the real reviewer-verified-ticks card.
+        const ticksPost = await postApplyReviewerVerifiedTicksDecisionV1(
+          vscode.Uri.file(folder),
+          canonicalId,
+          folder,
+          "impl-high-review",
+          "Task A"
+        );
+        assert.equal(ticksPost.kind, "posted");
+
+        // Card 2: the real reconcile card, posted while card 1 is pending —
+        // Step 36 must relabel its duplicate option to point at card 1.
+        const reconcilePost = await postReconcilePlanChecklistDecisionV1(vscode.Uri.file(folder), canonicalId, folder, {
+          currentStage: "impl-high-review",
+          displayName: "Task A",
+        });
+        assert.equal(reconcilePost.kind, "posted");
+
+        // Card 3: the plateau escalation card holding the task paused —
+        // built the same way the Step 34/35 tests above construct a real
+        // pending `reviewPlateauEscalation` card (that card-building logic
+        // is reviewEscalation.ts's own, already covered by
+        // reviewEscalation.test.ts / escalationCardPairingV1.test.ts; what
+        // is under test here is ChatView's dispatch, not card construction).
+        const plateauPosted = await provider.workflowDecisionStore.post(
+          decisionInput(canonicalId, {
+            decisionId: "plateau-1",
+            decisionKey: "reviewPlateauEscalation",
+            stage: "impl-high-review",
+            whatHappened: "The stage plateaued with 1 blocker outstanding.",
+            options: [
+              {
+                optionId: "keepIterating",
+                label: "Keep iterating",
+                consequence: "Runs Apply Review once more.",
+                resumeKind: "continue",
+                effect: { kind: "command", command: "ensemble.keepIterating" },
+              },
+            ],
+            recommendation: { kind: "option", optionId: "keepIterating", reasoning: "The blocker may still clear." },
+            gating: { holdsTaskPaused: true, unblocksProgress: true, detail: "This is what holds the task paused." },
+          })
+        );
+        assert.ok(plateauPosted.ok, plateauPosted.ok ? undefined : plateauPosted.reason);
+
+        provider.resolveWebviewView(fake.view);
+        await provider.open({ canonicalId, taskFolderPath: folder, stage: "impl-high-review" });
+        await waitForStateMessage(fake);
+
+        const pending = provider.workflowDecisionStore.listPending(canonicalId);
+        assert.equal(pending.length, 3, "all three cards must be pending before either is answered");
+        const ticksDecision = pending.find((d) => d.decisionKey === "applyReviewerVerifiedTicks");
+        assert.ok(ticksDecision, "the reviewer-verified-ticks card must be pending");
+        const reconcileDecision = pending.find((d) => d.decisionKey === "reconcilePlanChecklist");
+        assert.ok(reconcileDecision, "the reconcile card must be pending");
+
+        // Step 36: the reconcile card's duplicate option must already point
+        // at the ticks card above, before either is answered.
+        const reconcileApplyOption = reconcileDecision.options.find((o) => o.optionId === "applyVerifiedTicks");
+        assert.ok(reconcileApplyOption, "the reconcile card must offer applyVerifiedTicks");
+        assert.match(
+          reconcileApplyOption.label,
+          /Same as the reviewer-verified ticks card above/,
+          "Step 36: the duplicate option must be relabeled to point at the pending ticks card"
+        );
+
+        // Click Apply on the ticks card.
+        await fake.send({ type: "resolveWorkflowDecision", decisionId: ticksDecision.decisionId, optionId: "apply" });
+
+        const entriesAfterTicks =
+          (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+        const ticksAck = entriesAfterTicks.find((e) =>
+          e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and resume the task"')
+        );
+        assert.ok(ticksAck, "expected the confirmation line for the ticks card's Apply option");
+        assert.match(
+          ticksAck.text,
+          /stage plateaued with 1 blocker outstanding/,
+          "Step 34: the confirmation must name the plateau card the resume will close"
+        );
+
+        const finalPlan = fs.readFileSync(path.join(folder, "plan-final.md"), "utf8");
+        assert.match(finalPlan, /- \[x\] Wire the completeness gate/);
+        assert.match(finalPlan, /- \[x\] Add the retry button/);
+        assert.equal(resumeCalls.length, 1, "the ticks card's Apply must dispatch resumeAndApplyCurrentStageAction once");
+
+        // Click Apply on the reconcile card's duplicate option — both items
+        // are already ticked via card 1 above, so this must report
+        // "Already done", not the generic failure line, and must not tick
+        // anything a second time or dispatch resume again.
+        await fake.send({
+          type: "resolveWorkflowDecision",
+          decisionId: reconcileDecision.decisionId,
+          optionId: "applyVerifiedTicks",
+        });
+
+        const entriesAfterReconcile =
+          (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+        const alreadyDoneAck = entriesAfterReconcile.find((e) =>
+          e.text.includes("Already done: the 2 reviewer-verified ticks are applied.")
+        );
+        assert.ok(alreadyDoneAck, "expected the structured 'Already done' message on the reconcile card's own thread");
+        assert.ok(
+          !entriesAfterReconcile.some((e) => e.text.includes("did not complete")),
+          "the duplicate Apply must never render the generic failure line"
+        );
+        assert.equal(
+          resumeCalls.length,
+          1,
+          "the already-done reconcile duplicate must not dispatch resumeAndApplyCurrentStageAction again"
+        );
+      } finally {
+        realFs.restore();
+        workspace.restore();
+        notify.restore();
+        disposeApplyTicks.dispose();
+        disposeApplyRecon.dispose();
+        disposeResume.dispose();
+        disposeFocus.dispose();
+        provider.dispose();
+        __extensionContextV1TestOnly.reset();
+        safeRemoveDir(folder);
+      }
+    }
+  );
+});
+
+void describe("Chat With AI — operations re-render gating (RC2 item 11, Steps 43-44)", () => {
+  void it("ignores another task's operations and coalesces same-task activity ticks that do not change what the panel shows", async () => {
+    const folder = makeFolder();
+    const otherFolder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    let op: ReturnType<typeof taskOperations.begin> = null;
+    let otherOp: ReturnType<typeof taskOperations.begin> = null;
+    const stateCount = (): number => fake.posted.filter((m) => m.type === "state").length;
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      const countAfterOpen = stateCount();
+
+      // Another task's operation (begin + an activity tick) must never
+      // re-render THIS panel — taskOperations.onDidChange carries no payload
+      // identifying which task changed, so without the Step 43 signature
+      // gate every task's every tick re-rendered every open chat panel.
+      otherOp = taskOperations.begin(otherFolder, { label: "Other task work", stage: "impl" });
+      assert.ok(otherOp, "expected the other task's operation to be admitted");
+      otherOp.reportActivity("doing something");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(stateCount(), countAfterOpen, "another task's operation must not re-render this panel");
+
+      // This task's own operation starting IS display-relevant (busy flips
+      // true) and must render.
+      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
+      assert.ok(op, "expected the exclusive operation lock to be acquired");
+      await waitForState(fake, (s) => s.busy === true);
+      const countAfterBusy = stateCount();
+      assert.ok(countAfterBusy > countAfterOpen, "starting this task's own operation must render");
+
+      // reportActivity ("step N" progress ticks, what a running round reports
+      // on every progress update) does not feed busy/busyDetail/busyText —
+      // only report()'s `detail` does — so repeating it must add zero
+      // further renders under the signature gate.
+      op.reportActivity("step 1");
+      op.reportActivity("step 2");
+      op.reportActivity("step 3");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(
+        stateCount(),
+        countAfterBusy,
+        "activity ticks that do not change busy/busyDetail/busyText/waitingForUser must not add a render"
+      );
+
+      // A genuine display-relevant change (report() sets `detail`, which
+      // busyDetail/busyText DO derive from) still renders immediately.
+      op.report("halfway there");
+      await waitForState(fake, (s) => typeof s.busyText === "string" && s.busyText.includes("halfway there"));
+      const countAfterDetail = stateCount();
+      assert.ok(countAfterDetail > countAfterBusy, "a changed operation detail must still render");
+
+      // Repeating the identical detail must not add a further render.
+      op.report("halfway there");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(stateCount(), countAfterDetail, "repeating the same detail must not add another render");
+    } finally {
+      if (op) taskOperations.end(op);
+      if (otherOp) taskOperations.end(otherOp);
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+      safeRemoveDir(otherFolder);
+    }
+  });
+});
+
+/**
+ * The local-append/state-post integration regression the implementation
+ * review required (2026-09-28, narrowed Step 44 blocker): the tests above
+ * drive the coalescing primitive's two branches directly (necessary for the
+ * exact in-flight/already-settled timing), but neither of them goes through
+ * the real public `append()` write path or observes an actual webview
+ * `state` post — so neither proves the production wiring (persistAppend ->
+ * appendChatMessageV1 -> persistDocument -> the synchronous
+ * onDidChangeChatHistoryV1 fire -> chatHistorySub -> scheduleReactiveRenderV1
+ * -> renderAfterOwnWriteV1) actually produces exactly one render per write.
+ * This test drives that whole chain for real, through a real `ChatViewProvider`
+ * and fake webview, and counts the posted "state" messages.
+ */
+void describe("Chat With AI — a single append() produces exactly one render (RC2 item 11, Step 44 local-append regression)", () => {
+  void it("append() through the real chatHistorySub signal posts exactly one 'state' message reflecting the new message", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const stateCount = (): number => fake.posted.filter((m) => m.type === "state").length;
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      // Let the panel's own startup renders (the direct render from open(),
+      // plus anything the initial subscriptions may have queued) settle
+      // completely before measuring — the assertions below are about the
+      // delta ONE subsequent append() adds, not about startup's own count.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const countBeforeAppend = stateCount();
+
+      // `append()` is the real, public production write path used by every
+      // chat-send/question/answer flow. It persists to chat-v1.json via
+      // `persistAppend` -> `appendChatMessageV1` -> `persistDocument`, which
+      // fires `onDidChangeChatHistoryV1` SYNCHRONOUSLY as part of that same
+      // write (chatHistoryStore.ts) — the exact in-process signal
+      // `chatHistorySub` (chatView.ts's constructor) reacts to by calling
+      // `scheduleReactiveRenderV1()`. `append()` then awaits
+      // `renderAfterOwnWriteV1`, which folds into (or recognizes the
+      // already-settled completion of) that very reactive render instead of
+      // starting a redundant second one — by the time `append()` resolves,
+      // the one render answering for this write has already posted.
+      await provider.append("assistant", "step44-local-append-marker-1", "impl");
+
+      assert.equal(
+        stateCount(),
+        countBeforeAppend + 1,
+        "a single append() must produce exactly one further 'state' post — not zero (a stale render) and not two (a redundant second render)"
+      );
+      const entriesAfterFirst = (lastState(fake)?.entries as Array<{ text?: string }> | undefined) ?? [];
+      assert.ok(
+        entriesAfterFirst.some((e) => e.text === "step44-local-append-marker-1"),
+        "the one render that happened must actually reflect the appended message, not a stale snapshot from before the write"
+      );
+
+      // A second, independent append() must likewise cost exactly one more
+      // render — proving the first result was not a one-off coincidence of
+      // startup timing.
+      const countAfterFirst = stateCount();
+      await provider.append("assistant", "step44-local-append-marker-2", "impl");
+      assert.equal(
+        stateCount(),
+        countAfterFirst + 1,
+        "a second append() must also produce exactly one further 'state' post"
+      );
+      const entriesAfterSecond = (lastState(fake)?.entries as Array<{ text?: string }> | undefined) ?? [];
+      assert.ok(
+        entriesAfterSecond.some((e) => e.text === "step44-local-append-marker-2"),
+        "the second render must reflect the second write"
+      );
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+});
+
+/**
+ * `ChatViewProvider`'s own-write render-coalescing primitive
+ * (`scheduleReactiveRenderV1`/`renderAfterOwnWriteV1`), reached into directly
+ * via a narrow internals interface — the implementation review's narrowed
+ * Step 44 blocker (2026-09-28) is about the EXACT timing relationship
+ * between a write's own synchronous `chatHistorySub`/`decisionsSub` fire and
+ * whichever call site later reaches `renderAfterOwnWriteV1`, which is not
+ * reliably reproducible by racing real async I/O through the public
+ * `append()` API. These tests drive that relationship directly instead.
+ */
+interface ChatViewProviderOwnWriteInternalsV1 {
+  render(): Promise<void>;
+  scheduleReactiveRenderV1(): void;
+  renderAfterOwnWriteV1(sinceGenerationV1: number): Promise<void>;
+  reactiveRenderRequestGenerationV1: number;
+  reactiveRenderSettledV1: Promise<void>;
+}
+
+void describe("Chat With AI — own-write render exactly-once (RC2 item 11, Step 44 narrowed blocker)", () => {
+  void it("does not start a second render while its own write's reactive render is still in flight", async () => {
+    const provider = new ChatViewProvider(makeMemento());
+    const internals = provider as unknown as ChatViewProviderOwnWriteInternalsV1;
+    let renderCalls = 0;
+    let releaseGate: (() => void) | undefined;
+    internals.render = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        renderCalls++;
+        releaseGate = resolve;
+      });
+    try {
+      // Captured BEFORE the write, exactly as every real call site does.
+      const sinceGenerationV1 = internals.reactiveRenderRequestGenerationV1;
+      // The write's own synchronous chatHistorySub/decisionsSub fire.
+      internals.scheduleReactiveRenderV1();
+      assert.equal(renderCalls, 1, "expected the reactive render to have started synchronously");
+
+      const ownWrite = internals.renderAfterOwnWriteV1(sinceGenerationV1);
+      let ownWriteSettled = false;
+      void ownWrite.then(() => {
+        ownWriteSettled = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(renderCalls, 1, "the own-write helper must not start a second, concurrent render() call");
+      assert.equal(ownWriteSettled, false, "renderAfterOwnWriteV1 must still be waiting on the in-flight render");
+
+      assert.ok(releaseGate, "expected a pending render to release");
+      releaseGate();
+      await ownWrite;
+      assert.equal(renderCalls, 1, "renderAfterOwnWriteV1 must not add a redundant render once the in-flight one lands");
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("does not render again when the reactive render for its own write already fully settled before the helper ran", async () => {
+    const provider = new ChatViewProvider(makeMemento());
+    const internals = provider as unknown as ChatViewProviderOwnWriteInternalsV1;
+    let renderCalls = 0;
+    internals.render = (): Promise<void> => {
+      renderCalls++;
+      return Promise.resolve();
+    };
+    try {
+      const sinceGenerationV1 = internals.reactiveRenderRequestGenerationV1;
+      // The write's own synchronous fire, allowed to fully settle BEFORE the
+      // write path reaches renderAfterOwnWriteV1 — the exact ordering a path
+      // like resolveWorkflowDecision can hit (it awaits further appends and a
+      // dispatched command between its own write and this call).
+      internals.scheduleReactiveRenderV1();
+      await internals.reactiveRenderSettledV1;
+      assert.equal(renderCalls, 1, "expected the reactive render to have completed");
+
+      await internals.renderAfterOwnWriteV1(sinceGenerationV1);
+      assert.equal(
+        renderCalls,
+        1,
+        "renderAfterOwnWriteV1 must recognize the already-settled render reflects this write, and not render again"
+      );
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("still renders directly when the write's own event never fired (fallback path)", async () => {
+    const provider = new ChatViewProvider(makeMemento());
+    const internals = provider as unknown as ChatViewProviderOwnWriteInternalsV1;
+    let renderCalls = 0;
+    internals.render = (): Promise<void> => {
+      renderCalls++;
+      return Promise.resolve();
+    };
+    try {
+      const sinceGenerationV1 = internals.reactiveRenderRequestGenerationV1;
+      // No scheduleReactiveRenderV1() call happened on this write's behalf
+      // (e.g. it failed before reaching persistDocument, or this instance
+      // wasn't showing the write's target) — a direct render is still owed.
+      await internals.renderAfterOwnWriteV1(sinceGenerationV1);
+      assert.equal(renderCalls, 1, "expected a direct fallback render when the write's own event never fired");
+    } finally {
+      provider.dispose();
     }
   });
 });

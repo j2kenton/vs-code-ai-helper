@@ -39,7 +39,7 @@ import {
 } from "../utils/notificationRouter";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
-import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { WorkflowDecisionCommandResultV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { safeRemoveDir } from "./testFsUtils";
 
 const ROOT = nodeFs.mkdtempSync(
@@ -276,9 +276,27 @@ function makeExtensionContext(): vscode.ExtensionContext {
 async function run(
   name: string,
   taskOptions: { plan?: string; review?: string; currentStage?: TaskProgress["currentStage"] },
-  confirmOptions: { confirm?: boolean; interference?: (folder: string) => void },
+  confirmOptions: {
+    confirm?: boolean;
+    interference?: (folder: string) => void;
+    /**
+     * RC2 item 8, Step 37 follow-up (narrowed blocker `bbd42447-…-1`): when
+     * true, confirm by re-dispatching through the "apply" option's OWN
+     * `effect.args` — the same args `chatView.ts`'s real dispatch passes to
+     * `vscode.commands.executeCommand` — instead of a hand-built
+     * `{ canonicalId, taskFolderPath }`. Needed to exercise `offeredItems`,
+     * which only exists on the real card's effect, not this shortcut.
+     */
+    useRealEffectArgs?: boolean;
+  },
   arg?: unknown
-): Promise<{ captured: Captured[]; folder: string; refreshes: number; decision?: WorkflowDecisionV1 }> {
+): Promise<{
+  captured: Captured[];
+  folder: string;
+  refreshes: number;
+  decision?: WorkflowDecisionV1;
+  confirmedResult?: WorkflowDecisionCommandResultV1 | void;
+}> {
   const { folder, progress } = makeTask(name, taskOptions);
   const canonicalId = `canonical-${name}`;
   const { inventory, refreshCount } = makeInventory(canonicalId, folder, progress);
@@ -305,16 +323,19 @@ async function run(
       });
     }
     confirmOptions.interference?.(folder);
+    let confirmedResult: WorkflowDecisionCommandResultV1 | void = undefined;
     if (confirmOptions.confirm && decision) {
       const resolved = await store.resolve(decision.decisionId, "apply");
       if (resolved.kind === "resolved") {
-        await applyReviewerVerifiedTicksConfirmedV1(inventory, makeStore(canonicalId), {
-          canonicalId,
-          taskFolderPath: folder,
-        });
+        const applyOption = decision.options.find((o) => o.optionId === "apply");
+        const confirmArg =
+          confirmOptions.useRealEffectArgs && applyOption?.effect.kind === "command"
+            ? (applyOption.effect.args?.[0] as never)
+            : ({ canonicalId, taskFolderPath: folder } as never);
+        confirmedResult = await applyReviewerVerifiedTicksConfirmedV1(inventory, makeStore(canonicalId), confirmArg);
       }
     }
-    return { captured: win.captured, folder, refreshes: refreshCount(), decision };
+    return { captured: win.captured, folder, refreshes: refreshCount(), decision, confirmedResult };
   } finally {
     win.restore();
     fs.restore();
@@ -530,4 +551,192 @@ void describe("applyReviewerVerifiedTicks — cancellation and races", () => {
       /Applied 1 reviewer-verified tick/
     );
   });
+
+  // RC2 item 8, Step 37: idempotent re-press. Something else (the
+  // duplicate option on a `reconcilePlanChecklist` card, or a second click)
+  // ticks the same item between the decision's posting and its confirm —
+  // the confirmed command must report `alreadyDone` structurally
+  // (`WorkflowDecisionCommandResultV1`) instead of silently doing nothing,
+  // so the card's own thread can say "Already done" rather than looking
+  // broken (RC1, 2026-09-26: the reconcile card's duplicate option "did
+  // nothing" when pressed after the other card had already applied it).
+  void it("reports 'alreadyDone' when the review's named item is ticked by something else before the confirm runs", async () => {
+    const result = await run(
+      "race-already-ticked",
+      { review: REVIEW_WITH_VERIFIED_ITEMS },
+      {
+        confirm: true,
+        interference: (folder): void => {
+          nodeFs.writeFileSync(
+            nodePath.join(folder, "plan-final.md"),
+            CHECKLIST_PLAN.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"),
+            "utf8"
+          );
+        },
+      }
+    );
+    assert.equal(result.confirmedResult?.outcome, "alreadyDone");
+    assert.match(result.confirmedResult?.message ?? "", /Already done: the 1 reviewer-verified tick is applied/);
+    assert.equal(readPlan(result.folder), CHECKLIST_PLAN.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"));
+  });
+
+  // RC2 item 8, Step 37 follow-up (implementation review, narrowed blocker
+  // `bbd42447-…-1`): the confirm-time "already applied" count must be scoped
+  // to what THIS card actually offered, not the review's raw named-item
+  // count — which can include an item this card never offered at all (one
+  // that was already ticked before the card was ever posted, named by the
+  // same review alongside the one this card DID offer).
+  void it(
+    "counts only what the card offered as 'already applied' — not an unrelated item the same review also names that was checked before this card ever existed",
+    async () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Split the artifacts",
+        "- [ ] Wire the completeness gate",
+        "- [ ] Add the retry button",
+        "",
+      ].join("\n");
+      // Names TWO items verified complete: one already ticked before this
+      // card is ever posted ("Split the artifacts" — unrelated pre-existing
+      // evidence), and one still unticked ("Wire the completeness gate" —
+      // this is the only thing the card will actually offer).
+      const review = [
+        "Readiness: 9/10",
+        "",
+        "<!-- verified-complete:start -->",
+        "- Wire the completeness gate",
+        "- Split the artifacts",
+        "<!-- verified-complete:end -->",
+        "",
+        "<!-- blockers:start -->",
+        "<!-- blockers:end -->",
+      ].join("\n");
+      const result = await run(
+        "offered-scope",
+        { plan, review },
+        {
+          confirm: true,
+          useRealEffectArgs: true,
+          interference: (folder): void => {
+            // Something else ticks the ONE item the card offered, between
+            // posting and confirming — the genuine race `alreadyDone` exists
+            // to report.
+            nodeFs.writeFileSync(
+              nodePath.join(folder, "plan-final.md"),
+              plan.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"),
+              "utf8"
+            );
+          },
+        }
+      );
+      const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
+      assert.match(applyOption?.label ?? "", /Apply 1 Reviewer-Verified Tick/, "the card only ever offered 1 item");
+      assert.equal(result.confirmedResult?.outcome, "alreadyDone");
+      // Must be 1 (only what the card offered), never 2 (the raw review
+      // count, which also swept in the unrelated pre-existing tick).
+      assert.match(result.confirmedResult?.message ?? "", /Already done: the 1 reviewer-verified tick is applied/);
+    }
+  );
+
+  // Same narrowed blocker, second half: an item a review names that matches
+  // NO real plan item at all (paraphrase/foreign text) must never be counted
+  // as "already applied" evidence.
+  void it("never counts a review-named item that matches nothing real in the plan as 'already applied'", async () => {
+    const review = [
+      "Readiness: 9/10",
+      "",
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "- Some paraphrased text that matches no real plan item",
+      "<!-- verified-complete:end -->",
+      "",
+      "<!-- blockers:start -->",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const result = await run(
+      "unmatched-not-counted",
+      { review },
+      {
+        confirm: true,
+        useRealEffectArgs: true,
+        interference: (folder): void => {
+          nodeFs.writeFileSync(
+            nodePath.join(folder, "plan-final.md"),
+            CHECKLIST_PLAN.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"),
+            "utf8"
+          );
+        },
+      }
+    );
+    assert.equal(result.confirmedResult?.outcome, "alreadyDone");
+    assert.match(result.confirmedResult?.message ?? "", /Already done: the 1 reviewer-verified tick is applied/);
+  });
+
+  // RC2 item 8, Step 37, second narrowing (implementation review,
+  // 2026-09-28): the first fix scoped only the "already applied" COUNT,
+  // leaving the actual apply operation unscoped — a card offering item A
+  // could still be confirmed into ticking a DIFFERENT item B, if the review
+  // file was rewritten between post and confirm to newly verify B while A
+  // stayed unticked (so the "nothing left to apply" branch never triggers
+  // and the confirm falls through to applying the review's CURRENT full set
+  // instead of what the card actually promised).
+  void it(
+    "applies only the item the card offered, never a different item the review newly verifies before confirm",
+    async () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [ ] Wire the completeness gate",
+        "- [ ] Add the retry button",
+        "",
+      ].join("\n");
+      const reviewAtPostTime = [
+        "Readiness: 9/10",
+        "",
+        "<!-- verified-complete:start -->",
+        "- Wire the completeness gate",
+        "<!-- verified-complete:end -->",
+        "",
+        "<!-- blockers:start -->",
+        "<!-- blockers:end -->",
+      ].join("\n");
+      const result = await run(
+        "offered-scope-race",
+        { plan, review: reviewAtPostTime },
+        {
+          confirm: true,
+          useRealEffectArgs: true,
+          interference: (folder): void => {
+            // A fresher review lands between posting and confirming, naming
+            // a DIFFERENT, still-unticked item verified complete. The card
+            // in hand never offered this item and must not apply it.
+            nodeFs.writeFileSync(
+              nodePath.join(folder, "impl-high-review.md"),
+              [
+                "Readiness: 9/10",
+                "",
+                "<!-- verified-complete:start -->",
+                "- Wire the completeness gate",
+                "- Add the retry button",
+                "<!-- verified-complete:end -->",
+                "",
+                "<!-- blockers:start -->",
+                "<!-- blockers:end -->",
+              ].join("\n"),
+              "utf8"
+            );
+          },
+        }
+      );
+      const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
+      assert.match(applyOption?.label ?? "", /Apply 1 Reviewer-Verified Tick/, "the card only ever offered 1 item");
+      assert.equal(result.confirmedResult, undefined, "a normal apply, not an alreadyDone re-press");
+      const finalPlan = readPlan(result.folder);
+      assert.match(finalPlan, /- \[x\] Wire the completeness gate/);
+      // The newly-surfaced item must stay unticked: it was never offered by
+      // this card.
+      assert.match(finalPlan, /- \[ \] Add the retry button/);
+    }
+  );
 });

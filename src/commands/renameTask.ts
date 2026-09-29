@@ -40,7 +40,14 @@ import {
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  createSafeAdmissionReleaseStateV1,
+  deriveAdmissionReleaseTriggerV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
@@ -288,9 +295,16 @@ type AiNameRequestResult =
    * or read back. `detail` names the concrete cause so the user-facing
    * warning can say what actually happened instead of blaming the model for
    * a reply it may well have produced correctly.
+   *
+   * `coordinatorOutcome`: Step 57a — the raw `coordinator.executeAction`
+   * outcome, when this attempt reached that call, carried back so the
+   * caller's terminal `recordAdmissionReleaseTriggerV1` (right before its
+   * safe release) can classify a deadline/cancellation settlement. Omitted
+   * on a `no-model`/pre-invocation failure (nothing to invoke, so nothing to
+   * classify).
    */
-  | { kind: "failed"; detail: string }
-  | { kind: "ok"; name: string };
+  | { kind: "failed"; detail: string; coordinatorOutcome?: TaskActionOutcomeV1 }
+  | { kind: "ok"; name: string; coordinatorOutcome?: TaskActionOutcomeV1 };
 
 /**
  * Ask the configured Description-stage model for a 6–8 word name via the
@@ -363,6 +377,7 @@ async function requestAiNameV1(
       return {
         kind: "failed",
         detail: `the action settled ${outcome.kind}${"code" in outcome ? ` (${outcome.code})` : ""}`,
+        coordinatorOutcome: outcome,
       };
     }
     const readResult = await getWorkflowFileStoreV1().readFileBounded(targetLocator, 16 * 1024);
@@ -372,12 +387,13 @@ async function requestAiNameV1(
         detail: `the suggestion artifact could not be read back (${readResult.kind}${
           "code" in readResult ? `: ${readResult.code}` : ""
         })`,
+        coordinatorOutcome: outcome,
       };
     }
     const name = normalizeAiNameReply(readResult.value.bytes.toString("utf8"));
     return name.length > 0
-      ? { kind: "ok", name }
-      : { kind: "failed", detail: "the reply was empty" };
+      ? { kind: "ok", name, coordinatorOutcome: outcome }
+      : { kind: "failed", detail: "the reply was empty", coordinatorOutcome: outcome };
   } catch (error) {
     console.error("renameTaskWithAI: provider/coordinator call threw", error);
     return {
@@ -481,7 +497,14 @@ export async function renameTaskWithAI(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let heartbeat = handle
+    ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  // Item 2 / Step 57: the pre-invocation candidate-switch release below is
+  // unconditional and immediate — nothing could have been spawned yet under
+  // that claim. Only the TERMINAL release in the outer `finally` (after a
+  // real provider invocation may have run) goes through the shared
+  // safe-release bookkeeping (`releaseAdmissionSafelyV1` below).
   const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
@@ -492,6 +515,27 @@ export async function renameTaskWithAI(
       handle = undefined;
       await toRelease.release();
     }
+  };
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    handle = undefined;
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionSafelyV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
   };
 
   // 2026-09-10 review architectural blocker fix (`d620c877...-1`): target-
@@ -511,6 +555,11 @@ export async function renameTaskWithAI(
   };
   let reconcileOutcomeCapturedV1: Awaited<ReturnType<typeof reconcileWatchdogPauseAgainstAdmissionV1>> | undefined;
   let lateAdmissionRefusalV1: Parameters<typeof describeWorkAdmissionRefusalV1>[0] | undefined;
+  // Step 57a: the last `requestAiNameV1` attempt's raw coordinator outcome
+  // (first, or the retry when one ran), declared outside the outer `try`
+  // below so its `finally`'s `recordAdmissionReleaseTriggerV1` call can read
+  // it — see draftTaskWithAI.ts's identical `result` hoist for why.
+  let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
 
   try {
     // Same activation-barrier contract as renameTask above (plan §1.4).
@@ -533,7 +582,7 @@ export async function renameTaskWithAI(
           });
           if (late.outcome === "acquired") {
             handle = late.handle;
-            heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+            heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
           } else {
             lateAdmissionRefusalV1 = late;
           }
@@ -614,6 +663,7 @@ export async function renameTaskWithAI(
       const token = op.token ?? fallbackCts.token;
       try {
         const first = await requestAiNameV1(context, task, sourceText, "", token);
+        coordinatorOutcomeForAdmissionV1 = first.kind === "no-model" ? undefined : first.coordinatorOutcome;
         if (first.kind === "no-model") {
           op.settleAs("refused", "no Description-stage model configured");
           NotificationRouter.showWarning(
@@ -634,9 +684,30 @@ export async function renameTaskWithAI(
           lastFailureDetail = first.detail;
         }
 
+        // Step 57 (2026-09-29 implementation review): a terminal
+        // invocation-boundary settlement — a wall-clock deadline or a
+        // cancellation that reached the provider, `deriveAdmissionReleaseTriggerV1`
+        // recognizing `invocationDeadlineExceeded`/`callerCancelled`/
+        // `providerCancelled` — must end this command's invocation cycle
+        // right here and flow to the failure branch below, which settles
+        // the operation and lets the outer `finally`'s safe release run.
+        // It must NEVER fall into the bounded re-prompt below: that starts a
+        // SECOND `coordinator.executeAction` invocation, which could still be
+        // racing a first invocation whose provider process may not have
+        // exited yet — exactly the retry-before-safe-release the watchdog
+        // containment forbids. `coordinatorOutcomeForAdmissionV1` already
+        // holds `first.coordinatorOutcome` from above, so the terminal
+        // trigger the outer `finally` records is this (first) attempt's, not
+        // overwritten by a retry that must not happen.
+        const firstWasTerminalV1 =
+          first.kind === "failed" &&
+          first.coordinatorOutcome !== undefined &&
+          deriveAdmissionReleaseTriggerV1(first.coordinatorOutcome) !== undefined;
+
         // At most one bounded re-prompt covers every failure combination
-        // (too-long, too-short, leading-substring, or an outright failure).
-        if (!validated || !validated.ok) {
+        // (too-long, too-short, leading-substring, or an outright failure) —
+        // never after a terminal deadline/cancellation settlement above.
+        if ((!validated || !validated.ok) && !firstWasTerminalV1) {
           const retry = await requestAiNameV1(
             context,
             task,
@@ -644,6 +715,7 @@ export async function renameTaskWithAI(
             strictnessNoteFor(validated?.reason),
             token
           );
+          coordinatorOutcomeForAdmissionV1 = retry.kind === "no-model" ? undefined : retry.coordinatorOutcome;
           if (retry.kind === "ok") {
             validated = validateAiNameReply(retry.name, sourceText);
             if (!validated.ok) {
@@ -697,7 +769,8 @@ export async function renameTaskWithAI(
     }
   );
   } finally {
-    await releaseCurrentAdmissionV1();
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, coordinatorOutcomeForAdmissionV1);
+    await releaseAdmissionSafelyV1();
   }
 }
 

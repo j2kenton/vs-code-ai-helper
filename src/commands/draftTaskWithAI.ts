@@ -53,7 +53,12 @@ import {
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  createSafeAdmissionReleaseStateV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
@@ -341,6 +346,12 @@ async function handleDraftOutcomeV1(
 
 interface DraftResultV1 {
   readonly succeeded: boolean;
+  /** Step 57a: the raw coordinator outcome from this invocation, when one was
+   * dispatched — carried back so the caller's terminal
+   * `recordAdmissionReleaseTriggerV1` call (right before its safe release)
+   * can classify a deadline/cancellation settlement. `undefined` on every
+   * early return before `coordinator.executeAction` ran. */
+  readonly coordinatorOutcome?: TaskActionOutcomeV1;
 }
 
 async function draftTaskWithAIForResolvedTask(
@@ -513,6 +524,7 @@ async function draftTaskWithAIForResolvedTask(
   const validatedInput: DraftActionInputV1 = { prompt, targetLocator, baselineRevision };
 
   let succeeded = false;
+  let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
 
   // No overwrite confirmation — user has deliberately triggered this run.
   await vscode.window.withProgress(
@@ -545,6 +557,7 @@ async function draftTaskWithAIForResolvedTask(
         } finally {
           linked.dispose();
         }
+        coordinatorOutcomeForAdmissionV1 = outcome;
 
         const handled = await handleDraftOutcomeV1(outcome, {
           taskRef: {
@@ -564,7 +577,7 @@ async function draftTaskWithAIForResolvedTask(
         }
       }
     );
-  return { succeeded };
+  return { succeeded, coordinatorOutcome: coordinatorOutcomeForAdmissionV1 };
     },
     resolvedTask.progress.currentStage
   );
@@ -684,7 +697,16 @@ export async function draftTaskWithAI(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let heartbeat = handle
+    ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  // Item 2 / Step 57: the pre-invocation candidate-switch release below
+  // (before `resolveTaskContext` has settled on the authoritative folder)
+  // stays an unconditional immediate release — nothing could have been
+  // spawned yet under that claim, so `decideAdmissionReleaseSafetyV1` would
+  // always report it safe anyway. Only the TERMINAL release in the outer
+  // `finally`, which can follow a real provider invocation, goes through the
+  // shared safe-release bookkeeping (`releaseAdmissionSafelyV1` below).
   const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
@@ -695,6 +717,27 @@ export async function draftTaskWithAI(
       handle = undefined;
       await toRelease.release();
     }
+  };
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    handle = undefined;
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionSafelyV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
   };
 
   // 2026-09-10 review completion blocker fix: `endTargetResolutionV1` was
@@ -715,6 +758,12 @@ export async function draftTaskWithAI(
     targetResolutionEnded = true;
     await endTargetResolutionV1(targetResolutionHandle);
   };
+
+  // Declared outside the `try` below (rather than as `const result = ...`
+  // inline) so the outer `finally`'s `recordAdmissionReleaseTriggerV1` call
+  // can read the invocation's coordinator outcome — a `try`-scoped `const`
+  // is not visible in its own `finally` block.
+  let result: DraftResultV1 | undefined;
 
   try {
     // ── Consent gate ─────────────────────────────────────────────────────────
@@ -766,7 +815,7 @@ export async function draftTaskWithAI(
             });
             if (late.outcome === "acquired") {
               handle = late.handle;
-              heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+              heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
             } else {
               lateAdmissionRefusalV1 = late;
             }
@@ -820,7 +869,7 @@ export async function draftTaskWithAI(
     }
 
     const lockKey = resolvedTask.taskFolderPath;
-    const result = await runTrackedOperation(
+    result = await runTrackedOperation(
       lockKey,
       // TASK_NAME_WRITE_CONFLICT_KEY: description generation never writes the
       // task's name (handleDraftOutcomeV1 leaves naming to the rename actions),
@@ -836,7 +885,8 @@ export async function draftTaskWithAI(
     // guaranteed to be a no-op on the normal path, where the inner `finally`
     // already ended target resolution.
     await endTargetResolutionOnceV1();
-    await releaseCurrentAdmissionV1();
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, result?.coordinatorOutcome);
+    await releaseAdmissionSafelyV1();
   }
 }
 
@@ -939,9 +989,9 @@ export async function resumeDraftInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome), coordinatorOutcome: outcome };
   }
-  return { ok: true, settlement };
+  return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 

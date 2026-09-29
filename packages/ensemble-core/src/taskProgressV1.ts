@@ -464,6 +464,18 @@ export interface ReviewScoreHistoryEntry {
    * `src/types/taskProgress.ts`). Absent when nothing was superseded this
    * round. */
   supersededBlockers?: ReviewBlockerIdentity[];
+  /** Stable identities of blockers this round reported that were EXCLUDED
+   * from `blockerCount`/`taskFixableCount`/`blockers` because this stage can
+   * structurally never satisfy them (RC2 item 4; mirror of
+   * `src/types/taskProgress.ts`). Absent when nothing was excluded this way
+   * this round. */
+  stageUnsatisfiableBlockers?: ReviewBlockerIdentity[];
+  /** Stable identities of blockers this round reclassified `environmental`
+   * because they match a removal a prior implementer round declined for
+   * lack of owner approval (RC2 item 7; mirror of `src/types/taskProgress.ts`).
+   * Unlike `stageUnsatisfiableBlockers`, these remain in `blockers`. Absent
+   * when nothing was reclassified this round. */
+  declinedBlockerReclassifications?: ReviewBlockerIdentity[];
   /** Every blocker this round re-raised that matches an Accepted Non-Goals
    * entry (mirror of `src/types/taskProgress.ts`). Absent when nothing
    * matched. */

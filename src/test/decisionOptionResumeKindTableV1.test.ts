@@ -114,6 +114,10 @@ interface InventoryRow {
 const INVENTORY: readonly InventoryRow[] = [
   // src/utils/reviewEscalation.ts
   { file: "utils/reviewEscalation.ts", optionId: "advance", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: Advance dispatches resumeAndSetTaskStage / restarts Fast Forward" },
+  // RC2 item 3, Step 13: offered instead of Advance whenever the plan of
+  // record still has open checklist items — moves the task to Implementation
+  // (and continues Fast Forward there when one was interrupted).
+  { file: "utils/reviewEscalation.ts", optionId: "buildRemaining", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: buildRemaining dispatches resumeAndSetTaskStage to impl" },
   { file: "utils/reviewEscalation.ts", optionId: "reconsiderRequirement", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: reconsiderRequirement opens Accepted Non-Goals, dispatches nothing" },
   { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (task-fixable branch) is continue" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself leaves task paused" },
@@ -130,6 +134,10 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "utils/reviewEscalation.ts", optionId: "publishAnyway", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: publishAnyway dispatches the publish continuation" },
   { file: "utils/reviewEscalation.ts", optionId: "acknowledgeAdvance", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: acknowledgeAdvance routes through the Step-3 Advance path, not doNothing" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 2, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself variant leaves task paused" },
+  // The generic (non-plateau) "reviewEscalation:${kind}" card's own
+  // keepIterating option, e.g. the implementation-side plateau case — third
+  // in document order after the two plateau-card branches above.
+  { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (generic escalation card, decisionKey reviewEscalation:plateau) dispatches resumeAndDispatchImplementation" },
 
   // src/commands/reconcilePlanChecklist.ts
   { file: "commands/reconcilePlanChecklist.ts", optionId: "applyVerifiedTicks", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: applyVerifiedTicks dispatches the stage's next action after ticking" },
@@ -335,6 +343,7 @@ type RowEvidenceV1 = RuntimeTestEvidenceV1 | TrivialNoDispatchEvidenceV1 | Known
 
 const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvidenceV1>([
   [rowKey("utils/reviewEscalation.ts", "advance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "commandArgNormalization.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "buildRemaining", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "reconsiderRequirement", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
@@ -344,6 +353,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "publishAnyway", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "acknowledgeAdvance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "keepIterating", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
 
   [rowKey("commands/reconcilePlanChecklist.ts", "applyVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
   [rowKey("commands/reconcilePlanChecklist.ts", "linkManualChecks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],

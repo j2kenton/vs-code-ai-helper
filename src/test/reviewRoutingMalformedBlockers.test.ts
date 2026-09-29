@@ -13,6 +13,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 import { dispatchDegenerateReviewBackupAdvanceV1, handleReviewRoutingOutcome } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
+import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { TaskProgress } from "../types/taskProgress";
 import { safeRemoveDir } from "./testFsUtils";
 
@@ -553,6 +554,528 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
     } finally {
       settings.restore();
       deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * RC2 item 4: "needs a passing test run" can never be satisfied at an
+ * implementation review — those reviews only ever see fast checks (lint,
+ * type-check), never the test suite. A blocker whose entire ask is a
+ * passing test run must never count toward `taskFixableCount`/`blockers`,
+ * or it becomes a permanent blocker no implementation round can ever clear.
+ *
+ * `patchTaskProgressStrictV1` writes through real `fs` (`writeAtomic`,
+ * `withTaskLock`'s on-disk lease files) even though it READS through
+ * `vscode.workspace.fs` — the in-memory `installMemStore` used by the rest
+ * of this file only satisfies the read half, so a round-trip check of
+ * `reviewScoreHistory` needs the real-disk bridge this block installs
+ * instead (mirrored from `roundLedgerV1.test.ts`'s `installFsBridge`).
+ */
+void describe("handleReviewRoutingOutcome — stage-unsatisfiable 'needs a passing test run' blocker (RC2 item 4)", () => {
+  function installFsBridge(): { restore: () => void } {
+    const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const orig = { ...target };
+    target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+    target.writeFile = async (uri: vscode.Uri, content: Uint8Array): Promise<void> => {
+      await fs.promises.mkdir(path.dirname(uri.fsPath), { recursive: true });
+      await fs.promises.writeFile(uri.fsPath, content);
+    };
+    target.rename = async (source: vscode.Uri, dest: vscode.Uri): Promise<void> => {
+      await fs.promises.rm(dest.fsPath, { force: true });
+      await fs.promises.rename(source.fsPath, dest.fsPath);
+    };
+    target.delete = (uri: vscode.Uri): Promise<void> =>
+      fs.promises.rm(uri.fsPath, { force: true, recursive: true });
+    target.createDirectory = (uri: vscode.Uri): Promise<void> =>
+      fs.promises.mkdir(uri.fsPath, { recursive: true }).then(() => undefined);
+    target.readDirectory = async (uri: vscode.Uri): Promise<Array<[string, number]>> => {
+      const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
+      return entries.map((entry) => [entry.name, entry.isDirectory() ? 2 : 1]);
+    };
+    target.stat = async (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
+      const stat = await fs.promises.stat(uri.fsPath);
+      return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs };
+    };
+    return {
+      restore: (): void => {
+        for (const key of ["readFile", "writeFile", "rename", "delete", "createDirectory", "readDirectory", "stat"]) {
+          target[key] = orig[key];
+        }
+      },
+    };
+  }
+
+  function makeRealTaskFolder(name: string, overrides: Partial<TaskProgress> = {}): { folderPath: string; folderUri: vscode.Uri } {
+    const folderPath = path.join(TEST_ROOT, "real-plans", name);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+      ensembleProgressVersion: 1,
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    return { folderPath, folderUri: vscode.Uri.file(folderPath) };
+  }
+
+  function readProgress(folderPath: string): TaskProgress {
+    return JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+  }
+
+  /**
+   * `readProgress` above parses with plain `JSON.parse`, which would never
+   * notice the strict decoder rejecting an unknown property (the review
+   * blocker found on this round's first pass: `stageUnsatisfiableBlockers`
+   * was written but absent from the decoder's allowed-key set, so the
+   * written file round-tripped through `JSON.parse` fine while
+   * `decodeTaskProgressTextV1` — the real reader every stage-transition and
+   * work-admission path uses — would reject it). Round-trip through the real
+   * decoder to prove the written file stays readable.
+   */
+  function assertProgressFileDecodesV1(folderPath: string): void {
+    const text = fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8");
+    const result = decodeTaskProgressTextV1(text);
+    assert.strictEqual(result.ok, true, !result.ok ? `decode failed: ${result.code}: ${result.reason}` : undefined);
+  }
+
+  void it("routes as zero blockers when the only finding is a passing-test-run ask, at impl-high-review", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-only-blocker");
+
+    const content = [
+      "Readiness: 9/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [task-fixable] The targeted stall regressions still need a passing test run",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-tr-1",
+        content,
+        score: 9,
+        threshold: 8,
+      });
+      assert.strictEqual(escalated, false);
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-1");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.taskFixableCount, 0, "the passing-test-run blocker must not count as task-fixable");
+      assert.strictEqual(entry.blockerCount, 0, "the passing-test-run blocker must not count toward blockerCount");
+      assert.strictEqual(entry.stageUnsatisfiableBlockers?.length, 1);
+      assert.match(entry.stageUnsatisfiableBlockers?.[0]?.subject ?? "", /passing test run|test run/i);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("routes as zero blockers when the only finding is declared needs-toolchain (the exact RC1 shape)", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-only-needs-toolchain");
+
+    const content = [
+      "Readiness: 8/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [needs-toolchain] The targeted stall regressions still need a passing test run",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-tr-nt-1",
+        content,
+        score: 8,
+        threshold: 8,
+      });
+      assert.strictEqual(escalated, false);
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-nt-1");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.blockerCount, 0, "a needs-toolchain-only 'passing test run' ask must not remain a blocker");
+      assert.strictEqual(entry.stageUnsatisfiableBlockers?.length, 1);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("routes as zero blockers when the only finding is declared environmental (not task-fixable or needs-toolchain)", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-only-environmental");
+
+    const content = [
+      "Readiness: 8/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [environmental] The targeted stall regressions still need a passing test run",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-tr-env-1",
+        content,
+        score: 8,
+        threshold: 8,
+      });
+      assert.strictEqual(escalated, false);
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-env-1");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.blockerCount, 0, "an environmental-only 'passing test run' ask must not remain a blocker");
+      assert.strictEqual(entry.stageUnsatisfiableBlockers?.length, 1);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("keeps a mixed finding whole when the same line also names a real, distinct defect", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-mixed-with-real-defect");
+
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [task-fixable] The targeted stall regressions still need a passing test run, and the `foo()` helper in src/utils/foo.ts throws on an empty array",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-tr-mixed-1",
+        content,
+        score: 6,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-mixed-1");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(
+        entry.taskFixableCount,
+        1,
+        "a compound finding naming a real defect alongside the test-run wording must not be discarded wholesale"
+      );
+      assert.strictEqual(entry.blockerCount, 1);
+      assert.strictEqual(entry.stageUnsatisfiableBlockers, undefined);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("still counts a real task-fixable blocker reported in the same review", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-plus-real-blocker");
+
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [task-fixable] The targeted stall regressions still need a passing test run",
+      "- [completion] [task-fixable] `src/utils/foo.ts` throws on an empty array",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-tr-2",
+        content,
+        score: 6,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-2");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.taskFixableCount, 1, "the real blocker must still count");
+      assert.strictEqual(entry.blockerCount, 1);
+      assert.strictEqual(entry.stageUnsatisfiableBlockers?.length, 1);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("does NOT strip the same wording at a Publish review, where the suite really does run", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("test-run-blocker-publish", { currentStage: "publish" });
+
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [shipping] [task-fixable] the suite still needs a passing test run before this ships",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "publish",
+        reviewAttemptId: "attempt-tr-3",
+        content,
+        score: 6,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-tr-3");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.taskFixableCount, 1, "at Publish, this blocker is real and must still count");
+      assert.strictEqual(entry.stageUnsatisfiableBlockers, undefined);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+});
+
+void describe("handleReviewRoutingOutcome — declined blocker reclassification (RC2 item 7)", () => {
+  function installFsBridge(): { restore: () => void } {
+    const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const orig = { ...target };
+    target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+    target.writeFile = async (uri: vscode.Uri, content: Uint8Array): Promise<void> => {
+      await fs.promises.mkdir(path.dirname(uri.fsPath), { recursive: true });
+      await fs.promises.writeFile(uri.fsPath, content);
+    };
+    target.rename = async (source: vscode.Uri, dest: vscode.Uri): Promise<void> => {
+      await fs.promises.rm(dest.fsPath, { force: true });
+      await fs.promises.rename(source.fsPath, dest.fsPath);
+    };
+    target.delete = (uri: vscode.Uri): Promise<void> =>
+      fs.promises.rm(uri.fsPath, { force: true, recursive: true });
+    target.createDirectory = (uri: vscode.Uri): Promise<void> =>
+      fs.promises.mkdir(uri.fsPath, { recursive: true }).then(() => undefined);
+    target.readDirectory = async (uri: vscode.Uri): Promise<Array<[string, number]>> => {
+      const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
+      return entries.map((entry) => [entry.name, entry.isDirectory() ? 2 : 1]);
+    };
+    target.stat = async (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
+      const stat = await fs.promises.stat(uri.fsPath);
+      return { type: stat.isDirectory() ? 2 : 1, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs };
+    };
+    return {
+      restore: (): void => {
+        for (const key of ["readFile", "writeFile", "rename", "delete", "createDirectory", "readDirectory", "stat"]) {
+          target[key] = orig[key];
+        }
+      },
+    };
+  }
+
+  function makeRealTaskFolder(name: string, overrides: Partial<TaskProgress> = {}): { folderPath: string; folderUri: vscode.Uri } {
+    const folderPath = path.join(TEST_ROOT, "real-plans-declined", name);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+      ensembleProgressVersion: 1,
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    return { folderPath, folderUri: vscode.Uri.file(folderPath) };
+  }
+
+  function readProgress(folderPath: string): TaskProgress {
+    return JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+  }
+
+  /** See the sibling stage-unsatisfiable block's identical helper: proves the
+   * written file stays readable by the REAL strict decoder, not just
+   * `JSON.parse` — the exact way this decoder's allowlist was found missing
+   * a new field before (`stageUnsatisfiableBlockers`, RC2 item 4). */
+  function assertProgressFileDecodesV1(folderPath: string): void {
+    const text = fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8");
+    const result = decodeTaskProgressTextV1(text);
+    assert.strictEqual(result.ok, true, !result.ok ? `decode failed: ${result.code}: ${result.reason}` : undefined);
+  }
+
+  const DECLINED_REMOVAL_TEXT =
+    "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting";
+
+  void it("reclassifies a task-fixable blocker matching a prior round's declined removal as environmental, bringing taskFixableCount to 0", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("declined-removal-only-blocker");
+
+    // The prior Apply Review round's own summary, declining the removal per
+    // rule 7 (no owner approval recorded in Task Description).
+    fs.writeFileSync(
+      path.join(folderPath, "impl-summary.md"),
+      "## Files Changed\n\n- src/foo.ts — unrelated fix\n\n" +
+        "## Remaining Blockers\n\n" +
+        `- ${DECLINED_REMOVAL_TEXT} — declined: needs a human decision — only the plan asks for this, not the owner's Task Description\n`,
+      "utf8"
+    );
+
+    const content = [
+      "Readiness: 7/10",
+      "",
+      "<!-- blockers:start -->",
+      `- [completion] [task-fixable] ${DECLINED_REMOVAL_TEXT}`,
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-declined-1",
+        content,
+        score: 7,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-declined-1");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(
+        entry.taskFixableCount,
+        0,
+        "the declined removal must not count as task-fixable, or the reviewer and implementer can never agree"
+      );
+      // Reclassified, not excluded: it still appears in blockers, just with a
+      // different resolver — unlike stageUnsatisfiableBlockers, which removes
+      // the blocker from blockers/blockerCount entirely.
+      assert.strictEqual(entry.blockerCount, 1);
+      assert.strictEqual(entry.blockers?.length, 1);
+      assert.strictEqual(entry.blockers?.[0]?.resolver, "environmental");
+      assert.strictEqual(entry.declinedBlockerReclassifications?.length, 1);
+      assert.match(entry.declinedBlockerReclassifications?.[0]?.subject ?? "", /hostrole/i);
+      // With every task-fixable blocker declined, this must not escalate as
+      // an ordinary task-fixable-remaining plateau either way — the routing
+      // decision itself is exercised by reviewEscalation.test.ts's card-level
+      // test; this asserts the underlying count that decision reads from.
+      assert.strictEqual(typeof escalated, "boolean");
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("leaves an unrelated task-fixable blocker alone even when a declined removal is also present", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("declined-removal-plus-real-blocker");
+
+    fs.writeFileSync(
+      path.join(folderPath, "impl-summary.md"),
+      "## Remaining Blockers\n\n" +
+        `- ${DECLINED_REMOVAL_TEXT} — declined: needs a human decision — only the plan asks for this\n`,
+      "utf8"
+    );
+
+    const content = [
+      "Readiness: 5/10",
+      "",
+      "<!-- blockers:start -->",
+      `- [completion] [task-fixable] ${DECLINED_REMOVAL_TEXT}`,
+      "- [completion] [task-fixable] `src/utils/foo.ts` throws on an empty array",
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-declined-2",
+        content,
+        score: 5,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-declined-2");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.taskFixableCount, 1, "the unrelated real blocker must still count as task-fixable");
+      assert.strictEqual(entry.blockerCount, 2);
+      assert.strictEqual(entry.declinedBlockerReclassifications?.length, 1);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
+    }
+  });
+
+  void it("does nothing when impl-summary.md has no declined-blocker entry", async () => {
+    const fsBridge = installFsBridge();
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const { folderPath, folderUri } = makeRealTaskFolder("no-declined-blocker");
+
+    fs.writeFileSync(
+      path.join(folderPath, "impl-summary.md"),
+      "## Files Changed\n\n- src/foo.ts — did a thing\n",
+      "utf8"
+    );
+
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      `- [completion] [task-fixable] ${DECLINED_REMOVAL_TEXT}`,
+      "<!-- blockers:end -->",
+    ].join("\n");
+
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-declined-3",
+        content,
+        score: 6,
+        threshold: 8,
+      });
+
+      const entry = readProgress(folderPath).reviewScoreHistory?.find((e) => e.attemptId === "attempt-declined-3");
+      assert.ok(entry, "a history entry must have been recorded");
+      assert.strictEqual(entry.taskFixableCount, 1, "with nothing declined, the blocker stays task-fixable");
+      assert.strictEqual(entry.declinedBlockerReclassifications, undefined);
+      assertProgressFileDecodesV1(folderPath);
+    } finally {
+      deactivateNotificationRouter();
+      fsBridge.restore();
     }
   });
 });

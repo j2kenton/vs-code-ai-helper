@@ -76,6 +76,8 @@ import { resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransfor
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
 import { STALE_DISPATCH_GRACE_MS } from "./taskWatchdogV1";
+import { getChatInteractionTransactionStoreV1 } from "../services/workflowRuntimeServicesV1";
+import { ChatTransactionStoreResultV1 } from "../services/chatInteractionTransactionStoreV1";
 
 function isTaskStage(value: unknown): value is TaskStage {
   return typeof value === "string" && (STAGE_ORDER as readonly string[]).includes(value);
@@ -267,7 +269,11 @@ export interface ReconcileOrphanedRoundLedgerRowsResultV1 {
  * neither identity retain the conservative historical rule: close only when
  * neither task-wide liveness signal holds. Safe to call repeatedly: rows
  * already closed are simply absent from the next read, and
- * `terminalizeRoundV1` is independently idempotent per row.
+ * `terminalizeRoundV1` is independently idempotent per row. A row whose
+ * `operationId` names a chat-transaction record that fails to settle
+ * durably (item 2 / Step 55) is left open rather than closed, so the next
+ * call retries the settlement instead of the record being stranded
+ * `invocationPending` forever behind an already-closed row.
  */
 export async function reconcileOrphanedRoundLedgerRowsV1(
   input: ReconcileOrphanedRoundLedgerRowsInputV1
@@ -283,6 +289,50 @@ export async function reconcileOrphanedRoundLedgerRowsV1(
   );
   const closed: string[] = [];
   for (const row of openRows) {
+    // Item 2 / Step 55: a row closed here as orphaned may still have its OWN
+    // chat-transaction record sitting `invocationPending` — the process that
+    // would have called `settleTerminalInvocationV1` (a deadline/cancellation
+    // settle) or the ordinary post-outcome discard died before either ran.
+    // Left alone, that record would read as an ordinary in-flight invocation
+    // forever instead of showing what actually happened. Settle it the same
+    // way a live settle would have (`"interrupted"`, added alongside
+    // `timedOut`/`cancelled` for exactly this) — BEFORE closing the ledger
+    // row, not after: `terminalizeRoundV1` removes the row from the
+    // `"scheduled"`/`"open"` set this function reads, so once the row is
+    // closed nothing would ever retry a settlement that failed. A
+    // `"storageFailure"`/`"unavailable"`/`"recoveryRequired"` result (or a
+    // thrown error) is therefore treated as retryable: this row is left open
+    // and simply reconsidered on the next sweep. `"ok"` (settled), `"missing"`
+    // (never a coordinator-driven operation, or the record was already
+    // cleaned up) and `"rejected"` (already terminal — e.g. a live settle won
+    // the race) are all legitimate, final outcomes with nothing left to
+    // retry, so the row proceeds to close normally. The store may be
+    // entirely unwired in a test/host context that never called
+    // `setChatInteractionTransactionStoreV1`, which is likewise final (no
+    // durable record could exist to strand).
+    if (row.operationId !== undefined) {
+      const transactionStore = getChatInteractionTransactionStoreV1();
+      if (transactionStore) {
+        let settleResult: ChatTransactionStoreResultV1 | undefined;
+        try {
+          settleResult = await transactionStore.settleInvocation(row.operationId, "interrupted");
+        } catch (error) {
+          console.error(
+            `reconcileOrphanedRoundLedgerRowsV1: settleInvocation(${row.operationId}, "interrupted") threw; ` +
+              `leaving round ${row.roundId} open to retry on the next sweep`,
+            error
+          );
+          continue;
+        }
+        if (settleResult.kind !== "ok" && settleResult.kind !== "missing" && settleResult.kind !== "rejected") {
+          console.error(
+            `reconcileOrphanedRoundLedgerRowsV1: settleInvocation(${row.operationId}, "interrupted") did not ` +
+              `durably settle (${settleResult.kind}); leaving round ${row.roundId} open to retry on the next sweep`
+          );
+          continue;
+        }
+      }
+    }
     // Step 14's own wording: "started HH:MM; no ending was recorded — the
     // extension host stopped or the round was lost" — otherwise this pass
     // would close the row silently, leaving the chat transcript's ending

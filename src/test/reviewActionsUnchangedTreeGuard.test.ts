@@ -137,6 +137,57 @@ async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: 
 }
 
 /**
+ * RC2 item 12, Step 25/26 completion blocker (2026-09-28 review): a task
+ * sitting ON the review stage itself (`currentStage: "impl-high-review"`,
+ * `REVIEW_TARGETS["impl-high-review"] === "impl-high-review"`), with a
+ * CURRENT, non-stale review already on disk — `stageReviewPasses` and the
+ * artifact's own `<!-- review-pass: N -->` marker agree, so
+ * `isReviewPassCurrentV1` and `reviewPredatesLatestImplementationRoundV1`
+ * both read it as fresh and `fastForwardReviewWithAI` never dispatches an
+ * initial review. This is the fixture the exhausted-resume-budget test below
+ * needs: a fast-forward call that can reach the budget check WITHOUT first
+ * needing a real provider round for the initial review.
+ */
+async function makeCurrentReviewTaskFolderV1(name: string): Promise<{ folderPath: string }> {
+  const folderPath = path.join(REAL_ROOT, "plans", name);
+  fs.mkdirSync(folderPath, { recursive: true });
+  const progress: TaskProgress = {
+    taskFolder: name,
+    currentStage: "impl-high-review",
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    stageReviewPasses: { "impl-high-review": 1 },
+    ownership: {
+      metaRoot: path.dirname(folderPath),
+      projectRoot: path.dirname(folderPath),
+      workspaceRoot: REAL_ROOT,
+      boundAt: "2026-01-01T00:00:00.000Z",
+      state: "resolved",
+    },
+  };
+  fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+  fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+  const reviewPath = path.join(folderPath, "impl-high-review.md");
+  const fingerprint =
+    (await computeWorkingTreeFingerprintV1(REAL_ROOT, {
+      excludeAbsolutePaths: [
+        reviewPath,
+        previousVersionUri(vscode.Uri.file(reviewPath)).fsPath,
+      ],
+    })) ?? "unknown";
+  fs.writeFileSync(
+    reviewPath,
+    `Readiness: 7/10\n\n- Looks fine.\n\n<!-- reviewed-commit: ${REAL_ROOT_HEAD_SHA} -->\n` +
+      `<!-- reviewed-tree-fingerprint: ${fingerprint} -->\n<!-- review-pass: 1 -->\n`,
+    "utf8"
+  );
+  return { folderPath };
+}
+
+/**
  * Writes a task folder with NO existing review artifact for the target stage
  * (so the unchanged-tree guard above has nothing to compare against and
  * never fires) whose `impl-summary.md` is the `IMPLEMENTATION_SUMMARY_
@@ -843,4 +894,87 @@ void describe("fastForwardReviewWithAI — a review stage with no review artifac
       fsBridge.restore();
     }
   });
+});
+
+/**
+ * RC2 item 12, Step 25/26 completion blocker (2026-09-28 review): a plateau
+ * can be raised on the interrupted Fast Forward run's own FINAL allowed
+ * attempt (`attemptNumber === maxAttempts`), or an owner can retry an already
+ * fully-spent run. Either way, `computeFastForwardResumeBudgetV1`'s
+ * `remainingBudgetExhausted` must be `true` and `fastForwardReviewWithAI`
+ * must make NO further apply/re-review cycle — running one more off the
+ * arithmetic value's `Math.max(1, …)` floor would silently exceed the
+ * interrupted run's own committed budget. This drives the real command
+ * (not just the pure arithmetic already covered in `activeFastForwardRunsV1.
+ * test.ts`) so a regression that skips the guard at the actual call site is
+ * caught, not just one in the helper function.
+ */
+void describe("fastForwardReviewWithAI — a resumed run whose captured offset already exhausted its budget (RC2 item 12, Step 25 completion blocker)", () => {
+  void it("makes no further attempt, dispatches no provider round, and leaves the existing review untouched", async () => {
+    const { folderPath } = await makeCurrentReviewTaskFolderV1(`ff-exhausted-${Math.floor(Math.random() * 1e9)}`);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+
+    // The §7.5 gate above the budget check legitimately resolves a model for
+    // its own availability probe (see resolveFreshModelForStage's call at
+    // reviewActions.ts:7898) — patched here exactly like the sibling tests
+    // above, NOT to prove it is unreached (it runs before the budget check),
+    // but so it never shells out to a real CLI/Copilot probe in this test.
+    const modelPatches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    ];
+    // The actual apply/review provider reservation — reached only from
+    // INSIDE improveReviewScore's loop — must never be consulted at all once
+    // the budget is exhausted. Throwing here turns any such call into a hard
+    // test failure instead of a silently-passing extra attempt.
+    const openerPatch = patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => {
+      throw new Error("must not resolve a provider when the resumed budget is already exhausted");
+    });
+
+    try {
+      await fastForwardReviewWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath, resumeFromAttemptV1: { attemptNumber: 10, maxAttempts: 10 } },
+        undefined
+      );
+
+      assert.ok(
+        recorder.notifications.some(
+          (n) => n.message.includes("already used all 10 attempt(s)") && n.message.includes("resuming it would exceed its own budget")
+        ),
+        `expected the exhausted-budget warning naming the spent total; got: ${JSON.stringify(recorder.notifications)}`
+      );
+
+      const artifactAfter = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
+      assert.ok(
+        artifactAfter.includes("Readiness: 7/10"),
+        "no apply/re-review cycle must have run — the existing review artifact must be untouched"
+      );
+    } finally {
+      openerPatch.restore();
+      for (const p of modelPatches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  // The complementary "budget NOT yet exhausted still runs its remaining
+  // attempt" boundary is covered at the arithmetic level in
+  // activeFastForwardRunsV1.test.ts ("a resume offset one short of the total
+  // … is not exhausted") — driving that case through this command's real
+  // edit-capable apply branch would require mocking a full implementation-
+  // runner CLI spawn (applyReviewEditWithAI's edit path, distinct from the
+  // review-only V1 runner selection stubbed above), which is out of
+  // proportion for what this boundary needs proven.
 });

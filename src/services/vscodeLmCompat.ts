@@ -163,9 +163,39 @@ export function createLmAssistantMessageWithPartsV1(
 }
 
 /**
+ * RC2 item 14: Copilot's `auto` router (`resolveAutoModeEndpoint`) resolves
+ * a `vscode.lm` request by reading the text of the LAST User message; if
+ * that message's `LanguageModelTextPart`s join to an empty string, `auto`
+ * throws "Auto mode needs a prompt or a command to route a request" unless a
+ * compatible cached route happens to apply. Ensemble's tool-results message
+ * (`createLmUserMessageWithPartsV1` below) previously carried only
+ * `LanguageModelToolResultPart`s, with no text part, so every tool-using
+ * round after the first could fail on `auto`. This text is appended
+ * alongside the tool results, never replacing them.
+ */
+export const TOOL_RESULTS_USER_TEXT_V1 = "Results of the tool calls above. Continue the task.";
+
+/**
+ * True when `part` is a `LanguageModelTextPart` (guarded `instanceof`) whose
+ * `.value` is a non-empty string.
+ */
+function isNonEmptyLmTextPartV1(vscodeModule: VscodeLmModuleV1, part: unknown): boolean {
+  if (!isLmTextPartV1(vscodeModule, part)) {
+    return false;
+  }
+  const value = (part as { value?: unknown }).value;
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
  * Build a user `LanguageModelChatMessage` whose content is an array of
- * tool-result parts. Same 1.93-vs-runtime rationale as
- * `createLmAssistantMessageWithPartsV1`.
+ * parts. Same 1.93-vs-runtime rationale as `createLmAssistantMessageWithPartsV1`.
+ *
+ * RC2 item 14: if none of `parts` is a non-empty `LanguageModelTextPart`,
+ * prepend one (`TOOL_RESULTS_USER_TEXT_V1`) so a Copilot `auto` request
+ * built from this message never has an empty-text last User message. This
+ * applies to every Copilot model (harmless for a named model, which does
+ * not route on message text).
  */
 export function createLmUserMessageWithPartsV1(
   vscodeModule: VscodeLmModuleV1,
@@ -174,7 +204,11 @@ export function createLmUserMessageWithPartsV1(
   const messageClass = vscodeModule.LanguageModelChatMessage as {
     User(content: unknown): vscodeTypes.LanguageModelChatMessage;
   };
-  return messageClass.User(parts);
+  const hasNonEmptyText = parts.some((part) => isNonEmptyLmTextPartV1(vscodeModule, part));
+  const content = hasNonEmptyText
+    ? parts
+    : [createLmTextPartV1(vscodeModule, TOOL_RESULTS_USER_TEXT_V1), ...parts];
+  return messageClass.User(content);
 }
 
 /**

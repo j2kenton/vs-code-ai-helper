@@ -254,14 +254,31 @@ test("result-envelope corpus: engine port and src parser agree on every accept a
         frame({ version: 1, correlation: CORRELATION, kind: "cancelled" }),
     },
     {
-      // 2026-08-12 field report, item 1: a complete unterminated frame (no
-      // closing marker) must be accepted, not rejected.
-      name: "unterminated frame with a complete single-line JSON payload accepts",
+      // 2026-08-12 field report, item 1 introduced acceptance of a complete
+      // unterminated frame (no closing marker); RC2 item 5's Step 1
+      // (2026-09-28) then required a missing marker to stay rejected. Item
+      // 5's Step 4b (2026-09-29, G1 run 4 field report) reopens exactly this
+      // shape: both parsers now accept it again, as an observable repair.
+      // Kept in the corpus (renamed) so a future drift between the two
+      // copies is still caught.
+      name: "unterminated frame with a complete single-line JSON payload repairs (item 5 Step 4b)",
       raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
         version: 1,
         correlation: CORRELATION,
         kind: "cancelled",
       })}`,
+    },
+    {
+      // G1 run 4 field report (`release-gate-g1-2026-09-29.md`): five of six
+      // rejected plan Apply Review replies put the CORRECT end marker
+      // directly onto the same line as a complete JSON body, with no line
+      // break before it. Item 5's Step 4b accepts this too, as a repair.
+      name: "end marker jammed onto the same line as the JSON repairs (item 5 Step 4b)",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
     },
     {
       name: "unterminated frame with a multiline payload rejects (invalidFrame)",
@@ -317,13 +334,65 @@ test("result-envelope corpus: engine port and src parser agree on every accept a
       })}\n<<<END_ENSEMBLE_RESULT_V1>>>`,
     },
     {
-      name: "arbitrary near-miss terminator still rejects",
+      // Superseded by Step 4a (2026-09-29): this terminator is a different
+      // length than FRAME_END_V1, but it still starts with "<<<END" and ends
+      // with ">>>", so both parsers now accept it as a repair rather than
+      // rejecting it — kept in the corpus (renamed) so the two parsers'
+      // agreement on this shape cannot silently drift.
+      name: "marker-shaped near-miss terminator now repairs (item 5 Step 4a)",
       raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
         version: 1,
         correlation: CORRELATION,
         kind: "cancelled",
       })}\n<<<END_ENSEMBLE_RESULT>>>`,
     },
+    {
+      // A closing line with no marker shape at all (does not start with
+      // "<<<END") must still be rejected by both parsers even after Step 4a.
+      name: "non-marker-shaped near-miss terminator still rejects (item 5 Step 4a)",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}\n<<<SOMETHING_ELSE_ENTIRELY>>>`,
+    },
+    {
+      // Item 5, 2026-09-26 field report: a Copilot response closed with
+      // `<<<END_ENSᗩMBLE_AI_RESULT_V1>>>` — one letter ("E") substituted for
+      // the lookalike Unicode character U+15E9 — and was rejected, discarding
+      // a finished answer. Pinned in both parsers so the repair cannot drift.
+      name: "lookalike Unicode end-marker terminator accepts (item 5)",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}\n${"<<<END_ENSEMBLE_AI_RESULT_V1>>>".replace("E", "ᗩ")}`,
+    },
+    {
+      // Same length, one ASCII character off — item 5's plan is unqualified
+      // ("differs in exactly one code point"), so this is repaired and
+      // accepted the same as the Unicode lookalike above, in both parsers.
+      name: "same-length single-ASCII-character near-miss terminator also repairs (item 5)",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}\n<<<END_ENSEMBLE_AI_RESULT_V2>>>`,
+    },
+    // Item 5 Step 4a (2026-09-29, `release-gate-g1-2026-09-29.md` run 1): the
+    // three closing lines a Copilot `gpt-6-luna` response actually returned,
+    // none a one-code-point substitution of FRAME_END_V1. Pinned in both
+    // parsers so the broader marker-attempt repair cannot drift between them.
+    ...["<<<END_OF ENSEMBLE_AI_RESULT_V1>>>", "<<<END_OF_AI_RESULT_V1>>>", "<<<END_OF_FINAL>>>"].map(
+      (ending) => ({
+        name: `G1 run 1 marker-attempt ending repairs (item 5 Step 4a): ${ending}`,
+        raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation: CORRELATION,
+          kind: "cancelled",
+        })}\n${ending}`,
+      })
+    ),
   ];
 
   for (const entry of corpus) {

@@ -20,8 +20,8 @@ import { createCliTextTransportV1 } from "../runners/cliAgentRunner";
 import type { CliProviderDefinition } from "../runners/providers";
 import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1";
 import {
+  hasRoundProcessRecordV1,
   listRoundProcessesV1,
-  recordedClaimIdForTaskV1,
   unconfirmedProcessSpawnCountV1,
 } from "../state/roundProcessRecordV1";
 import { acquireWorkAdmissionV1, type WorkAdmissionHandleV1 } from "../state/workAdmissionV1";
@@ -230,7 +230,7 @@ void test("a CLI spawned under an operation holding admission is recorded next t
     );
     assert.equal(exit.kind, "completed");
     const recorded = await waitFor(() => {
-      const list = listRoundProcessesV1(taskFolderPath);
+      const list = listRoundProcessesV1(taskFolderPath, handle.claimId);
       return list.length > 0 ? list : undefined;
     });
     assert.equal(recorded.length, 1);
@@ -238,12 +238,12 @@ void test("a CLI spawned under an operation holding admission is recorded next t
     assert.equal(recorded[0]!.providerLabel, "Fake V1 Transport CLI");
     assert.ok(Number.isInteger(recorded[0]!.pid) && recorded[0]!.pid > 0);
     assert.ok(recorded[0]!.command.includes("node"));
-    assert.equal(recordedClaimIdForTaskV1(taskFolderPath), handle.claimId);
+    assert.equal(hasRoundProcessRecordV1(taskFolderPath, handle.claimId), true);
   });
 });
 
 void test("a CLI spawned with no task context, or no held lock, is not recorded", async () => {
-  await withHeldAdmission(async ({ taskFolderPath }) => {
+  await withHeldAdmission(async ({ taskFolderPath, handle }) => {
     const transport = createCliTextTransportV1({ def: quickExitDef(), model: undefined, cwd: process.cwd() });
     const cts = new vscode.CancellationTokenSource();
     // No runWithRoundProcessTaskFolderV1 on the call path.
@@ -254,13 +254,16 @@ void test("a CLI spawned with no task context, or no held lock, is not recorded"
       (await runWithRoundProcessTaskFolderV1(other, () => transport.invoke(makeRequest(cts.token), nullWriter()))).kind,
       "completed"
     );
-    assert.equal(listRoundProcessesV1(taskFolderPath).length, 0);
-    assert.equal(listRoundProcessesV1(other).length, 0);
+    assert.equal(listRoundProcessesV1(taskFolderPath, handle.claimId).length, 0);
+    // "other" never had an admission acquired for it in this test, so there is
+    // no real claimId to check against — any id shows the same thing, since
+    // nothing was ever written under this taskFolderPath at all.
+    assert.equal(listRoundProcessesV1(other, "no-admission-held-for-this-task").length, 0);
   });
 });
 
 void test("Cancel settles the V1 attempt only after the CLI is confirmed gone, so the lock release cannot reopen admission over it", async () => {
-  await withHeldAdmission(async ({ taskFolderPath, root }) => {
+  await withHeldAdmission(async ({ taskFolderPath, handle, root }) => {
     const pidFile = path.join(root, "pid.txt");
     const transport = createCliTextTransportV1({ def: neverExitingDef(pidFile), model: undefined, cwd: process.cwd() });
     const cts = new vscode.CancellationTokenSource();
@@ -269,7 +272,7 @@ void test("Cancel settles the V1 attempt only after the CLI is confirmed gone, s
     );
     const pid = await waitFor(() => (fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : undefined));
     const recorded = await waitFor(() => {
-      const list = listRoundProcessesV1(taskFolderPath);
+      const list = listRoundProcessesV1(taskFolderPath, handle.claimId);
       return list.length > 0 ? list : undefined;
     });
     assert.equal(recorded[0]!.pid, pid);
@@ -401,7 +404,7 @@ void test(
         // earlier round's version of this test slept 500ms here and a review
         // correctly flagged that as not proving the required ordering.
         assert.equal(
-          listRoundProcessesV1(taskFolderPath).length,
+          listRoundProcessesV1(taskFolderPath, handle.claimId).length,
           0,
           "the failed write must not have landed a process entry"
         );
@@ -435,7 +438,7 @@ void test(
       if (exit.kind === "transportFailure") {
         assert.equal(exit.code, "cliSpawnFailed");
       }
-      assert.equal(listRoundProcessesV1(taskFolderPath).length, 0);
+      assert.equal(listRoundProcessesV1(taskFolderPath, handle.claimId).length, 0);
       // No post-completion sleep: this is exactly the ordering under test --
       // the abandonment write behind the synchronous catch must already be
       // durable by the time transport.invoke() itself resolves, not merely

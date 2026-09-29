@@ -811,6 +811,8 @@ function validateReviewScoreHistory(
       "blockers",
       "reviewer",
       "supersededBlockers",
+      "stageUnsatisfiableBlockers",
+      "declinedBlockerReclassifications",
       "reviewerChallengedNonGoal",
       "reviewPass",
       "scope",
@@ -858,6 +860,26 @@ function validateReviewScoreHistory(
       );
       if (supersededBlockersError) {
         return supersededBlockersError;
+      }
+    }
+    const stageUnsatisfiableBlockers = entry["stageUnsatisfiableBlockers"];
+    if (stageUnsatisfiableBlockers !== undefined) {
+      const stageUnsatisfiableBlockersError = validateBlockerIdentityListV1(
+        stageUnsatisfiableBlockers,
+        "reviewScoreHistory entry stageUnsatisfiableBlocker"
+      );
+      if (stageUnsatisfiableBlockersError) {
+        return stageUnsatisfiableBlockersError;
+      }
+    }
+    const declinedBlockerReclassifications = entry["declinedBlockerReclassifications"];
+    if (declinedBlockerReclassifications !== undefined) {
+      const declinedBlockerReclassificationsError = validateBlockerIdentityListV1(
+        declinedBlockerReclassifications,
+        "reviewScoreHistory entry declinedBlockerReclassification"
+      );
+      if (declinedBlockerReclassificationsError) {
+        return declinedBlockerReclassificationsError;
       }
     }
     const reviewerChallengedNonGoal = entry["reviewerChallengedNonGoal"];

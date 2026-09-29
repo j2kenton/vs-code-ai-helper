@@ -39,7 +39,28 @@ import {
   ClaimedReservationV1,
   openProviderSelectionSessionV1,
 } from "../services/providerSelectionPolicyV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { beginRoundProcessRecordingV1 } from "../state/roundProcessRecordV1";
 import { safeRemoveDir } from "./testFsUtils";
+
+function installFakeExtensionContextV1(): () => void {
+  const values = new Map<string, unknown>();
+  const memento = {
+    get<T>(key: string, defaultValue: T): T {
+      return (values.has(key) ? values.get(key) : defaultValue) as T;
+    },
+    update(key: string, value: unknown): Promise<void> {
+      if (value === undefined) {
+        values.delete(key);
+      } else {
+        values.set(key, value);
+      }
+      return Promise.resolve();
+    },
+  } as unknown as import("vscode").Memento;
+  __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as import("vscode").ExtensionContext);
+  return () => __extensionContextV1TestOnly.reset();
+}
 
 const TEST_ACTION_KEY = "brokerTestAction.v1";
 
@@ -225,24 +246,410 @@ void describe("agentExecutionBrokerV1", () => {
     assert.equal(state.processRunning, false, "the process must be gone before the broker reports the deadline");
   });
 
-  void it("a response a process-owning transport had already completed survives a late Cancel", async () => {
-    const fixture = makeFixture();
-    const { token, cancel } = controllableToken();
+  /** A process-owning transport whose process never confirms exit (e.g. `kill -STOP`, or a stuck kill escalation). */
+  function neverConfirmingProcessOwningTransport(): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      confirmsProcessExitBeforeSettling: true,
+      invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+    };
+  }
+
+  void it(
+    "item 2: a process-owning transport whose process never confirms exit still settles timedOut within deadline + grace",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const result = await executeAgentRequestV1(request, claimed, neverConfirmingProcessOwningTransport(), {
+        invocationTimeoutMs: 10,
+        processExitGraceMs: 20,
+      });
+      assert.deepEqual(result, {
+        kind: "transportFailure",
+        code: "invocationDeadlineExceeded",
+        responseStarted: false,
+        detail: "provider invocation exceeded 10ms",
+      });
+    }
+  );
+
+  void it(
+    "item 2: a process-owning transport whose process never confirms exit settles callerCancelled within the grace after a caller cancellation, well before the deadline",
+    async () => {
+      const fixture = makeFixture();
+      const { token, cancel } = controllableToken();
+      const running = executeAgentRequestV1(
+        { ...fixture.request, cancellationToken: token },
+        fixture.claimed,
+        neverConfirmingProcessOwningTransport(),
+        { invocationTimeoutMs: 10 * 60_000, processExitGraceMs: 20 }
+      );
+      cancel();
+      const result = await running;
+      assert.deepEqual(result, { kind: "callerCancelled" });
+    }
+  );
+
+  void it("item 2: bytes a never-confirming process-owning transport writes after the grace elapses are dropped", async () => {
+    const { request, claimed } = makeFixture();
+    let writerRef: BoundedResultWriterV1 | undefined;
+    let writeAfterGiveUp: boolean | undefined;
     const result = await executeAgentRequestV1(
-      { ...fixture.request, cancellationToken: token },
-      fixture.claimed,
+      request,
+      claimed,
       {
         runnerId: "scripted-transport",
         confirmsProcessExitBeforeSettling: true,
-        invoke: (_request, output): Promise<AgentTransportExitV1> => {
-          output.write("done");
-          cancel();
+        invoke: (_req, output): Promise<AgentTransportExitV1> => {
+          writerRef = output;
+          output.write("before deadline");
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              writeAfterGiveUp = output.write("after the broker gave up");
+              resolve({ kind: "completed" });
+            }, 60);
+          });
+        },
+      },
+      { invocationTimeoutMs: 10, processExitGraceMs: 20 }
+    );
+    assert.deepEqual(result, {
+      kind: "transportFailure",
+      code: "invocationDeadlineExceeded",
+      responseStarted: true,
+      detail: "provider invocation exceeded 10ms",
+    });
+    // The broker already returned above (at ~deadline + grace); the
+    // transport's own promise is still running in the background and only
+    // attempts its late write at 60ms. Wait for it before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(writeAfterGiveUp, false, "a write after the broker gave up must be refused");
+    assert.equal(writerRef?.overflowed, false, "sealing after giving up is not the same as overflow");
+  });
+
+  void it(
+    "item 2 / Step 56: a dropped late write after termination is logged exactly once, naming the operation",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]): void => {
+        warnings.push(args.map(String).join(" "));
+      };
+      try {
+        const result = await executeAgentRequestV1(
+          request,
+          claimed,
+          {
+            runnerId: "scripted-transport",
+            confirmsProcessExitBeforeSettling: true,
+            invoke: (_req, output): Promise<AgentTransportExitV1> => {
+              output.write("before deadline");
+              return new Promise((resolve) => {
+                setTimeout(() => {
+                  // Two late writes after the broker already gave up: only
+                  // one log line should result, not one per chunk.
+                  output.write("late chunk 1");
+                  output.write("late chunk 2");
+                  resolve({ kind: "completed" });
+                }, 60);
+              });
+            },
+          },
+          { invocationTimeoutMs: 10, processExitGraceMs: 20 }
+        );
+        assert.equal(result.kind, "transportFailure");
+        assert.equal(warnings.length, 0, "no late write has landed yet; nothing to log before it arrives");
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(warnings.length, 1, "a late write after termination must be logged exactly once");
+        const warning = warnings[0] ?? "";
+        assert.match(warning, /a transport write arrived/);
+        assert.match(warning, new RegExp(`operationId=${request.correlation.operationId}`));
+        assert.match(warning, new RegExp(`attemptId=${request.correlation.attemptId}`));
+      } finally {
+        console.warn = originalWarn;
+      }
+    }
+  );
+
+  void it("item 2 / Step 56: an ordinary completion within the deadline never logs a late-write warning", async () => {
+    const { request, claimed } = makeFixture();
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]): void => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      const result = await executeAgentRequestV1(request, claimed, {
+        runnerId: "scripted-transport",
+        invoke: (_req, output): Promise<AgentTransportExitV1> => {
+          output.write("normal output");
           return Promise.resolve({ kind: "completed" });
         },
-      }
-    );
-    assert.equal(result.kind, "response");
+      });
+      assert.equal(result.kind, "response");
+      assert.equal(warnings.length, 0, "a normal completion must never log a dropped-late-write warning");
+    } finally {
+      console.warn = originalWarn;
+    }
   });
+
+  void it(
+    "item 2 / Step 56: a process-owning transport that settles late with no further write is still logged once",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]): void => {
+        warnings.push(args.map(String).join(" "));
+      };
+      try {
+        const result = await executeAgentRequestV1(
+          request,
+          claimed,
+          {
+            runnerId: "scripted-transport",
+            confirmsProcessExitBeforeSettling: true,
+            invoke: (_req, output): Promise<AgentTransportExitV1> => {
+              // Writes its body well before the grace expires, then the
+              // transport's own `invoke` promise resolves only after the
+              // broker has already given up (deadline + grace) — with no
+              // further write, so `write()`'s own late-arrival log never
+              // fires. This is the exact gap Step 56 closes.
+              output.write("body written before grace expires");
+              return new Promise((resolve) => {
+                setTimeout(() => resolve({ kind: "completed" }), 60);
+              });
+            },
+          },
+          { invocationTimeoutMs: 10, processExitGraceMs: 20 }
+        );
+        assert.equal(result.kind, "transportFailure");
+        assert.equal(warnings.length, 0, "the transport has not settled yet; nothing to log before it does");
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(
+          warnings.length,
+          1,
+          "a late settlement with no further write must still be logged exactly once"
+        );
+        const warning = warnings[0] ?? "";
+        assert.match(warning, /a transport invocation resolved/);
+        assert.match(warning, new RegExp(`operationId=${request.correlation.operationId}`));
+        assert.match(warning, new RegExp(`attemptId=${request.correlation.attemptId}`));
+      } finally {
+        console.warn = originalWarn;
+      }
+    }
+  );
+
+  void it(
+    "item 2 / Step 56: an in-host transport that settles late with no further write after the deadline is still logged once",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]): void => {
+        warnings.push(args.map(String).join(" "));
+      };
+      try {
+        const result = await executeAgentRequestV1(
+          request,
+          claimed,
+          {
+            runnerId: "scripted-transport",
+            invoke: (): Promise<AgentTransportExitV1> =>
+              new Promise((resolve) => {
+                setTimeout(() => resolve({ kind: "completed" }), 60);
+              }),
+          },
+          { invocationTimeoutMs: 10 }
+        );
+        assert.equal(result.kind, "transportFailure");
+        assert.equal(warnings.length, 0, "the transport has not settled yet; nothing to log before it does");
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(
+          warnings.length,
+          1,
+          "a late settlement with no further write must still be logged exactly once"
+        );
+        assert.match(warnings[0] ?? "", /a transport invocation resolved/);
+      } finally {
+        console.warn = originalWarn;
+      }
+    }
+  );
+
+  void it(
+    "item 2: a process-owning transport that finishes 'completed' after the deadline already fired is reported as timedOut, not a false success",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const result = await executeAgentRequestV1(
+        request,
+        claimed,
+        {
+          runnerId: "scripted-transport",
+          confirmsProcessExitBeforeSettling: true,
+          invoke: (req, output): Promise<AgentTransportExitV1> =>
+            new Promise((resolve) => {
+              // Ignores the cancellation it is asked for and finishes the
+              // work anyway, well within the grace window.
+              req.cancellationToken.onCancellationRequested(() => {
+                setTimeout(() => {
+                  output.write("late but complete output");
+                  resolve({ kind: "completed" });
+                }, 5);
+              });
+            }),
+        },
+        { invocationTimeoutMs: 10, processExitGraceMs: 200 }
+      );
+      assert.deepEqual(result, {
+        kind: "transportFailure",
+        code: "invocationDeadlineExceeded",
+        responseStarted: true,
+        detail: "provider invocation exceeded 10ms",
+      });
+    }
+  );
+
+  void it("item 2: an in-host transport still writing after the deadline has bytes dropped, not folded into a later result", async () => {
+    const { request, claimed } = makeFixture();
+    let writeAfterGiveUp: boolean | undefined;
+    const result = await executeAgentRequestV1(
+      request,
+      claimed,
+      {
+        runnerId: "scripted-transport",
+        invoke: (_req, output): Promise<AgentTransportExitV1> => {
+          output.write("before deadline");
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              writeAfterGiveUp = output.write("after the broker gave up");
+              resolve({ kind: "completed" });
+            }, 60);
+          });
+        },
+      },
+      { invocationTimeoutMs: 10 }
+    );
+    assert.deepEqual(result, {
+      kind: "transportFailure",
+      code: "invocationDeadlineExceeded",
+      responseStarted: true,
+      detail: "provider invocation exceeded 10ms",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(writeAfterGiveUp, false, "a write after the broker gave up must be refused");
+  });
+
+  void it(
+    "item 2: an in-host transport that never settles within the cancellation grace has its late bytes dropped",
+    async () => {
+      const fixture = makeFixture();
+      const { token, cancel } = controllableToken();
+      let writeAfterGiveUp: boolean | undefined;
+      const running = executeAgentRequestV1(
+        { ...fixture.request, cancellationToken: token },
+        fixture.claimed,
+        {
+          runnerId: "scripted-transport",
+          invoke: (_req, output): Promise<AgentTransportExitV1> =>
+            new Promise((resolve) => {
+              setTimeout(() => {
+                writeAfterGiveUp = output.write("after the broker gave up");
+                resolve({ kind: "completed" });
+              }, 60);
+            }),
+        },
+        { processExitGraceMs: 20 }
+      );
+      cancel();
+      const result = await running;
+      assert.deepEqual(result, { kind: "callerCancelled" });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(
+        writeAfterGiveUp,
+        false,
+        "a write after the broker gave up on a caller cancellation must be refused"
+      );
+    }
+  );
+
+  void it(
+    "item 2: an in-host transport that settles 'completed' within the cancellation grace is still reported callerCancelled, not a false success",
+    async () => {
+      const fixture = makeFixture();
+      const { token, cancel } = controllableToken();
+      const running = executeAgentRequestV1(
+        { ...fixture.request, cancellationToken: token },
+        fixture.claimed,
+        {
+          runnerId: "scripted-transport",
+          invoke: (_req, output): Promise<AgentTransportExitV1> =>
+            new Promise((resolve) => {
+              // Ignores the cancellation it is asked for and finishes the
+              // work anyway, well within the grace window.
+              setTimeout(() => {
+                output.write("finished despite being asked to stop");
+                resolve({ kind: "completed" });
+              }, 5);
+            }),
+        },
+        { processExitGraceMs: 200 }
+      );
+      cancel();
+      const result = await running;
+      assert.deepEqual(result, { kind: "callerCancelled" });
+    }
+  );
+
+  void it(
+    "item 2: an in-host transport's deadline give-up is immediate, not delayed by the cancellation grace",
+    async () => {
+      const { request, claimed } = makeFixture();
+      const start = Date.now();
+      const result = await executeAgentRequestV1(
+        request,
+        claimed,
+        {
+          runnerId: "scripted-transport",
+          invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+        },
+        { invocationTimeoutMs: 5, processExitGraceMs: 10 * 60_000 }
+      );
+      assert.deepEqual(result, {
+        kind: "transportFailure",
+        code: "invocationDeadlineExceeded",
+        responseStarted: false,
+        detail: "provider invocation exceeded 5ms",
+      });
+      assert.ok(
+        Date.now() - start < 5_000,
+        "the deadline must give up right away for an in-host transport, never waiting for the cancellation grace"
+      );
+    }
+  );
+
+  void it(
+    "item 2: a process-owning transport that settles 'completed' after Cancel was already requested is reported callerCancelled, not a false success",
+    async () => {
+      const fixture = makeFixture();
+      const { token, cancel } = controllableToken();
+      const result = await executeAgentRequestV1(
+        { ...fixture.request, cancellationToken: token },
+        fixture.claimed,
+        {
+          runnerId: "scripted-transport",
+          confirmsProcessExitBeforeSettling: true,
+          invoke: (_request, output): Promise<AgentTransportExitV1> => {
+            output.write("done");
+            cancel();
+            return Promise.resolve({ kind: "completed" });
+          },
+        }
+      );
+      assert.deepEqual(result, { kind: "callerCancelled" });
+    }
+  );
 
   void it("rejects an unmigrated action key at the V1 boundary", async () => {
     const key = "unmigratedAction.v1";
@@ -626,5 +1033,104 @@ void describe("agentExecutionBrokerV1", () => {
     assert.equal(writer.overflowed, false);
     assert.equal(writer.write("!"), false);
     assert.equal(writer.overflowed, true);
+  });
+
+  void describe("item 2 / Step 54: processState attached from a request's processIdentity", () => {
+    const TASK_FOLDER = "/tasks/.ensemble/2026-01-01_task_1";
+    const CLAIM_ID = "claim-1";
+
+    void it("a deadline timeout with no process recorded for the claim reports processState confirmedGone", async () => {
+      const restore = installFakeExtensionContextV1();
+      try {
+        const { request, claimed } = makeFixture();
+        const result = await executeAgentRequestV1(
+          { ...request, processIdentity: { taskFolderPath: TASK_FOLDER, claimId: CLAIM_ID } },
+          claimed,
+          {
+            runnerId: "scripted-transport",
+            invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+          },
+          { invocationTimeoutMs: 5 }
+        );
+        assert.deepEqual(result, {
+          kind: "transportFailure",
+          code: "invocationDeadlineExceeded",
+          responseStarted: false,
+          detail: "provider invocation exceeded 5ms",
+          processState: "confirmedGone",
+        });
+      } finally {
+        restore();
+      }
+    });
+
+    void it(
+      "a deadline timeout with recording begun but nothing spawned for the claim reports processState confirmedGone",
+      async () => {
+        const restore = installFakeExtensionContextV1();
+        try {
+          await beginRoundProcessRecordingV1(TASK_FOLDER, CLAIM_ID);
+          const { request, claimed } = makeFixture();
+          const result = await executeAgentRequestV1(
+            { ...request, processIdentity: { taskFolderPath: TASK_FOLDER, claimId: CLAIM_ID } },
+            claimed,
+            {
+              runnerId: "scripted-transport",
+              invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+            },
+            { invocationTimeoutMs: 5 }
+          );
+          assert.equal(result.kind, "transportFailure");
+          assert.equal(
+            (result as { readonly processState?: string }).processState,
+            "confirmedGone"
+          );
+        } finally {
+          restore();
+        }
+      }
+    );
+
+    void it("a caller cancellation with a processIdentity attaches processState to the callerCancelled outcome", async () => {
+      const restore = installFakeExtensionContextV1();
+      try {
+        const fixture = makeFixture();
+        const { token, cancel } = controllableToken();
+        const running = executeAgentRequestV1(
+          { ...fixture.request, cancellationToken: token, processIdentity: { taskFolderPath: TASK_FOLDER, claimId: CLAIM_ID } },
+          fixture.claimed,
+          {
+            runnerId: "scripted-transport",
+            invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+          },
+          { processExitGraceMs: 5 }
+        );
+        cancel();
+        const result = await running;
+        assert.deepEqual(result, { kind: "callerCancelled", processState: "confirmedGone" });
+      } finally {
+        restore();
+      }
+    });
+
+    void it("a request with no processIdentity gets no processState field, exactly as before it existed", async () => {
+      const { request, claimed } = makeFixture();
+      const result = await executeAgentRequestV1(
+        request,
+        claimed,
+        {
+          runnerId: "scripted-transport",
+          invoke: (): Promise<AgentTransportExitV1> => new Promise(() => undefined),
+        },
+        { invocationTimeoutMs: 5 }
+      );
+      assert.deepEqual(result, {
+        kind: "transportFailure",
+        code: "invocationDeadlineExceeded",
+        responseStarted: false,
+        detail: "provider invocation exceeded 5ms",
+      });
+      assert.ok(!("processState" in result));
+    });
   });
 });

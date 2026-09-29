@@ -28,6 +28,7 @@ import {
   acquireOrAdoptWorkAdmissionV1,
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
+  deriveAdmissionReleaseTriggerV1,
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
 import type { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
@@ -560,6 +561,106 @@ void describe("resumeGeneratePlanInteractionV1 auto-review admission handoff (v1
       for (const p of patches) { p.restore(); }
       rf.restore();
       await outer.handle.release();
+      deactivateNotificationRouter();
+    }
+  });
+
+  /**
+   * RC2 item 2 / Step 57a: chatView.ts's `resumeInteraction` (and extension.ts's
+   * `relayedResume`) call `recordAdmissionReleaseTriggerV1(state, result.coordinatorOutcome)`
+   * right before their own safe release, exactly like the already-covered
+   * initial-dispatch flows (renameTaskWithAIRegression.test.ts). That is only
+   * correct if `resumeGeneratePlanInteractionV1` (and the sibling Resume
+   * handlers wired the same way this round) actually hands back the raw
+   * coordinator outcome on `coordinatorOutcome`, so a caller-observed
+   * `invocationDeadlineExceeded`/`callerCancelled`/`providerCancelled` on a
+   * Resume drive is classified and settled exactly as a fresh invocation's is,
+   * instead of the marker being unconditionally unlinked underneath a CLI a
+   * deadline/cancellation left possibly still running.
+   */
+  void it("resumeGeneratePlanInteractionV1 carries the coordinator's outcome back as coordinatorOutcome, classified by deriveAdmissionReleaseTriggerV1", async () => {
+    const taskFolderPath = makeTaskFolder("resume-coordinator-outcome-v1");
+    const taskBindingId = "binding-coordinator-outcome";
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, { currentStage: "plan", status: "active" }));
+
+    initNotificationRouter(new RecordingSurface());
+    const rf = installReadFileBridge();
+
+    const terminalOutcome = {
+      kind: "failed" as const,
+      code: "invocationDeadlineExceeded" as const,
+      correlation: {
+        taskBindingId,
+        chatDocumentId: "chat-doc-under-test",
+        actionKey: "generatePlan.v1",
+        operationId: "op-under-test",
+        attemptId: "attempt-under-test",
+      },
+    };
+    const fakeRecord = {
+      inputSnapshot: { canonicalJson: JSON.stringify({ prompt: "do the thing" }), sha256: "deadbeef" },
+      state: "settled",
+      settlement: "resumed",
+    };
+    const patches = [
+      patchV1(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
+      patchV1(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })
+      ),
+      patchV1(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
+        Promise.resolve({
+          availability: { available: true },
+          providerLabel: "Stub Provider",
+          provider: "stub",
+          modelId: "stub:model",
+          nativeModelId: "stub-native",
+        })
+      ),
+      patchV1(productionTaskActionRuntimeModule, "createProductionTaskActionCoordinatorV1", () => ({
+        resumeAction: () => Promise.resolve(terminalOutcome),
+      })),
+      patchV1(productionTaskActionRuntimeModule, "getProductionActionConversationOrchestratorV1", () => ({
+        loadInteraction: () => Promise.resolve({ kind: "ok", record: fakeRecord }),
+      })),
+      patchV1(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+    ];
+
+    const inventory = {
+      getTaskByBindingId: (id: string) =>
+        id === taskBindingId
+          ? ({
+              taskFolderPath,
+              workspaceFolder: vscode.Uri.file(REAL_ROOT),
+              canonicalId: taskFolderPath,
+              progress: { status: "active", currentStage: "plan" },
+            } as unknown as ReturnType<TaskInventory["getTaskByBindingId"]>)
+          : undefined,
+    } as unknown as TaskInventory;
+
+    try {
+      const result = await resumeGeneratePlanInteractionV1(
+        inventory,
+        dummyChatViewProvider,
+        makeRef(taskBindingId),
+        "resume-idempotency-under-test",
+        new vscode.CancellationTokenSource().token
+      );
+
+      assert.equal(result.ok, true, "the fake record reports a settled resume regardless of the coordinator outcome's own kind");
+      assert.deepEqual(
+        result.coordinatorOutcome,
+        terminalOutcome,
+        "the Resume handler must hand back the exact coordinator outcome for the caller's recordAdmissionReleaseTriggerV1 call"
+      );
+      const derived = result.coordinatorOutcome && deriveAdmissionReleaseTriggerV1(result.coordinatorOutcome);
+      assert.deepEqual(
+        derived,
+        { operationId: "op-under-test", trigger: "timedOut" },
+        "an invocationDeadlineExceeded coordinator outcome must classify as a Step 57a 'timedOut' trigger, not be silently dropped"
+      );
+    } finally {
+      for (const p of patches) { p.restore(); }
+      rf.restore();
       deactivateNotificationRouter();
     }
   });

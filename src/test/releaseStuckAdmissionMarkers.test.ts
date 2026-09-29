@@ -11,12 +11,57 @@ import { describe, it } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
+  buildHeldAdmissionMarkerCardInputV1,
+  confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1,
+  findHeldAdmissionMarkersForReleaseV1,
   findStaleAdmissionMarkersForReleaseV1,
   isAdmissionMarkerBasenameForReleaseV1,
+  stopHeldAdmissionMarkerAndReleaseCommandV1,
 } from "../commands/releaseStuckAdmissionMarkers";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 
 function markerNameV1(token: string, generation: number, epoch: string): string {
   return `admission.${token}.g${generation}.${epoch}`;
+}
+
+/** Writes a valid marker + claim-info body directly to disk, mirroring the
+ * real writer's shape closely enough for `readClaimInfoSyncV1` (internal to
+ * `workAdmissionV1.ts`) to accept it — this test file exercises the release
+ * command's own scan, not the acquisition path, so it builds the fixture by
+ * hand rather than going through `acquireWorkAdmissionV1`. */
+function writeAdmissionMarkerV1(admissionDir: string, claimId: string, token: string, generation: number, epoch: string): string {
+  const markerPath = path.join(admissionDir, markerNameV1(token, generation, epoch));
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      claimId,
+      purpose: "admission",
+      ownerToken: token,
+      pid: 1,
+      processStartTime: Date.now(),
+      hostId: "host-1",
+      commandId: "test",
+      startedAt: new Date().toISOString(),
+    })
+  );
+  return markerPath;
+}
+
+function writeHeldReasonSidecarV1(
+  admissionDir: string,
+  claimId: string,
+  overrides: { readonly processState?: string; readonly pids?: readonly number[] } = {}
+): void {
+  fs.writeFileSync(
+    path.join(admissionDir, `admission-held.${claimId}.json`),
+    JSON.stringify({
+      claimId,
+      outstandingReason: "The provider process (pid 4242) did not exit.",
+      since: new Date().toISOString(),
+      processState: overrides.processState ?? "stillRunning",
+      pids: overrides.pids ?? [4242],
+    })
+  );
 }
 
 void describe("releaseStuckAdmissionMarkers — finding and removing stale markers", () => {
@@ -224,6 +269,226 @@ void describe("releaseStuckAdmissionMarkers — finding and removing stale marke
 
       assert.equal(stale.length, 0);
       assert.ok(fs.existsSync(linkPath), "symlink should be ignored, not treated as a marker file");
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("releaseStuckAdmissionMarkers — Step 57a held markers", () => {
+  void it("findHeldAdmissionMarkersForReleaseV1: finds a held marker even when freshly renewed, well under the 20-minute stale threshold", async () => {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_1", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+
+    try {
+      const claimId = "claim-held-1";
+      const markerPath = writeAdmissionMarkerV1(admissionDir, claimId, "held-token", 1, "mugheld0001");
+      // 1 minute old — nowhere near the 20-minute staleness threshold.
+      const oneMinuteAgo = (Date.now() - 60 * 1000) / 1000;
+      fs.utimesSync(markerPath, oneMinuteAgo, oneMinuteAgo);
+      writeHeldReasonSidecarV1(admissionDir, claimId, { processState: "stillRunning", pids: [4242] });
+
+      const held = findHeldAdmissionMarkersForReleaseV1(tmpDir);
+      assert.equal(held.length, 1);
+      assert.equal(held[0]!.info.claimId, claimId);
+      assert.equal(held[0]!.info.processState, "stillRunning");
+      assert.deepEqual(held[0]!.info.pids, [4242]);
+      assert.equal(held[0]!.taskFolderPath, path.dirname(admissionDir));
+
+      // The stale-marker scan (the blind bulk "Delete All" path) must never
+      // consider this marker on its own, or its 1-minute renewal would make
+      // it fall out anyway — but the point of `findHeldAdmissionMarkersForReleaseV1`
+      // is that it is checked independently, before that filter matters.
+      assert.equal(findStaleAdmissionMarkersForReleaseV1(tmpDir).length, 0);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("findHeldAdmissionMarkersForReleaseV1: an unconfirmed-spawn hold reports no pids, distinct from stillRunning", async () => {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_2", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+
+    try {
+      const claimId = "claim-held-2";
+      writeAdmissionMarkerV1(admissionDir, claimId, "held-token-2", 1, "mugheld0002");
+      writeHeldReasonSidecarV1(admissionDir, claimId, { processState: "unconfirmedSpawn", pids: [] });
+
+      const held = findHeldAdmissionMarkersForReleaseV1(tmpDir);
+      assert.equal(held.length, 1);
+      assert.equal(held[0]!.info.processState, "unconfirmedSpawn");
+      assert.deepEqual(held[0]!.info.pids, []);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("findHeldAdmissionMarkersForReleaseV1: an ordinary marker with no held-reason sidecar is not reported", async () => {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_3", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+
+    try {
+      writeAdmissionMarkerV1(admissionDir, "claim-ordinary", "ordinary-token", 1, "mugordinary1");
+      assert.equal(findHeldAdmissionMarkersForReleaseV1(tmpDir).length, 0);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("findStaleAdmissionMarkersForReleaseV1 alone still reports a held-but-stale marker: the command layer is responsible for excluding it, not the pure stale scan", async () => {
+    // Documents the fix's actual mechanism (releaseStuckAdmissionMarkers()
+    // subtracts findHeldAdmissionMarkersForReleaseV1's file paths from the
+    // stale list before the blind bulk delete) rather than changing what
+    // `findStaleAdmissionMarkersForReleaseV1` itself reports.
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_4", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+
+    try {
+      const claimId = "claim-held-stale";
+      const markerPath = writeAdmissionMarkerV1(admissionDir, claimId, "held-stale-token", 1, "mugheldstale1");
+      const now = Date.now();
+      fs.utimesSync(markerPath, (now - 25 * 60 * 1000) / 1000, (now - 25 * 60 * 1000) / 1000);
+      writeHeldReasonSidecarV1(admissionDir, claimId);
+
+      const stale = findStaleAdmissionMarkersForReleaseV1(tmpDir, now);
+      assert.equal(stale.length, 1, "the pure stale scan does not itself know about held markers");
+
+      const held = findHeldAdmissionMarkersForReleaseV1(tmpDir);
+      assert.equal(held.length, 1);
+      const heldFilePaths = new Set(held.map((h) => h.info.filePath));
+      const staleExcludingHeld = stale.filter((m) => !heldFilePaths.has(m.filePath));
+      assert.equal(staleExcludingHeld.length, 0, "releaseStuckAdmissionMarkers() excludes held markers before its bulk delete");
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("buildHeldAdmissionMarkerCardInputV1 — Step 57a's proactive card content", () => {
+  const baseInput = {
+    taskFolderPath: "/tasks/.ensemble/2026-09-29_task_1",
+    taskCanonicalId: "/tasks/.ensemble/2026-09-29_task_1",
+    stage: "impl" as const,
+    displayName: "My Task",
+    claimId: "claim-1",
+    outstandingReason: "The provider process (pid 4242) did not exit.",
+    createdAt: "2026-09-29T00:00:00.000Z",
+  };
+
+  void it("stillRunning: offers Stop it and release, and Keep waiting, recommends stopping", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: "stillRunning", pids: [4242] });
+    assert.equal(input.decisionKey, "providerProcessMayStillBeRunning");
+    assert.equal(input.options.length, 2);
+    const optionIds = input.options.map((o) => o.optionId);
+    assert.deepEqual(optionIds, ["stopAndRelease", "keepWaiting"]);
+    assert.ok(input.options[0]!.consequence.includes("4242"));
+    assert.equal(input.options[0]!.effect.kind, "command");
+    assert.equal(
+      (input.options[0]!.effect as { command: string }).command,
+      "vs-code-ai-helper.stopHeldAdmissionMarkerAndRelease"
+    );
+    assert.equal(input.recommendation.kind, "option");
+    assert.equal((input.recommendation as { optionId: string }).optionId, "stopAndRelease");
+    assert.equal(input.gating?.holdsTaskPaused, false);
+  });
+
+  void it("an older sidecar with no recorded processState fails open to the stillRunning branch", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: undefined, pids: [] });
+    const optionIds = input.options.map((o) => o.optionId);
+    assert.deepEqual(optionIds, ["stopAndRelease", "keepWaiting"]);
+  });
+
+  void it("unconfirmedSpawn: offers only the owner-confirmed release and Keep waiting, with no recommendation", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: "unconfirmedSpawn", pids: [] });
+    const optionIds = input.options.map((o) => o.optionId);
+    assert.deepEqual(optionIds, ["confirmNoProcess", "keepWaiting"]);
+    assert.equal(
+      (input.options[0]!.effect as { command: string }).command,
+      "vs-code-ai-helper.confirmNoProcessAndReleaseHeldAdmissionMarker"
+    );
+    assert.equal(input.recommendation.kind, "none");
+  });
+
+  void it("unconfirmedSpawn: names the recorded provider and command for the owner to check (Step 57a's explicit requirement)", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({
+      ...baseInput,
+      processState: "unconfirmedSpawn",
+      pids: [],
+      providerLabel: "Codex CLI",
+      command: "codex exec --json <prompt omitted>",
+    });
+    assert.match(input.whatHappened, /Codex CLI/);
+    assert.match(input.whatHappened, /codex exec --json <prompt omitted>/);
+  });
+
+  void it("unconfirmedSpawn: an older sidecar with no recorded provider/command omits the identity line rather than showing 'undefined'", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: "unconfirmedSpawn", pids: [] });
+    assert.doesNotMatch(input.whatHappened, /undefined/);
+  });
+
+  void it("every command option's args carry taskFolderPath, claimId and displayName", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: "stillRunning", pids: [4242] });
+    const effect = input.options[0]!.effect as { command: string; args?: readonly unknown[] };
+    assert.deepEqual(effect.args, [{ taskFolderPath: baseInput.taskFolderPath, claimId: baseInput.claimId, displayName: baseInput.displayName }]);
+  });
+
+  void it("Keep waiting never dispatches anything", () => {
+    const input = buildHeldAdmissionMarkerCardInputV1({ ...baseInput, processState: "stillRunning", pids: [4242] });
+    const keepWaiting = input.options.find((o) => o.optionId === "keepWaiting");
+    assert.equal(keepWaiting?.effect.kind, "doNothing");
+  });
+});
+
+void describe("stopHeldAdmissionMarkerAndReleaseCommandV1 / confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1", () => {
+  void it("stopHeldAdmissionMarkerAndReleaseCommandV1 refuses when args are missing", async () => {
+    const result = await stopHeldAdmissionMarkerAndReleaseCommandV1(undefined);
+    assert.deepEqual(result, { outcome: "refused", message: "Missing task or claim information." });
+  });
+
+  void it("confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1 refuses when args are missing", async () => {
+    const result = await confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1({ taskFolderPath: "", claimId: "" });
+    assert.deepEqual(result, { outcome: "refused", message: "Missing task or claim information." });
+  });
+
+  void it("stopHeldAdmissionMarkerAndReleaseCommandV1: a claim with no recorded processes releases the marker, then reports already done", async () => {
+    __extensionContextV1TestOnly.reset();
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_stop", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+    const taskFolderPath = path.dirname(admissionDir);
+    const claimId = "claim-stop-1";
+    try {
+      writeAdmissionMarkerV1(admissionDir, claimId, "stop-token", 1, "mugstop0001");
+      const first = await stopHeldAdmissionMarkerAndReleaseCommandV1({ taskFolderPath, claimId, displayName: "T" });
+      assert.equal(first.outcome, "done");
+      assert.ok(first.message?.includes("Stopped the provider process and released"));
+
+      const second = await stopHeldAdmissionMarkerAndReleaseCommandV1({ taskFolderPath, claimId, displayName: "T" });
+      assert.equal(second.outcome, "alreadyDone");
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1: releases the marker, then reports already done", async () => {
+    __extensionContextV1TestOnly.reset();
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
+    const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-29_task_confirm", "admission-v1");
+    fs.mkdirSync(admissionDir, { recursive: true });
+    const taskFolderPath = path.dirname(admissionDir);
+    const claimId = "claim-confirm-1";
+    try {
+      writeAdmissionMarkerV1(admissionDir, claimId, "confirm-token", 1, "mugconfirm01");
+      const first = await confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1({ taskFolderPath, claimId, displayName: "T" });
+      assert.equal(first.outcome, "done");
+      assert.ok(first.message?.includes("Released"));
+
+      const second = await confirmNoProcessAndReleaseHeldAdmissionMarkerCommandV1({ taskFolderPath, claimId, displayName: "T" });
+      assert.equal(second.outcome, "alreadyDone");
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

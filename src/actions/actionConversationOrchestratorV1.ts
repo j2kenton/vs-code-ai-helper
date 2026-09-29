@@ -292,6 +292,22 @@ export interface ActionConversationOrchestratorV1 {
    */
   discardInvocation(operationId: string): Promise<void>;
   /**
+   * Item 2 / Step 55: settle an admitted `invocationPending` record
+   * explicitly as `timedOut` or `interrupted` (or `cancelled`) instead of
+   * deleting it via `discardInvocation` — for the specific moment a bounded
+   * invocation deadline, a caller/provider cancellation, or orphaned-round
+   * reconciliation ends the invocation, so the record's history shows what
+   * happened rather than reading identically to an ordinary silent
+   * completion. Returns whether the durable write actually succeeded — the
+   * caller MUST observe this: unlike `discardInvocation`, a caller that
+   * calls `settleInvocation` and then still runs an unconditional
+   * `discardInvocation` cleanup on a `false` result would delete the still-
+   * `invocationPending` record instead of leaving it for later
+   * reconciliation, which is exactly the silent-loss outcome this method
+   * exists to prevent. Never throws.
+   */
+  settleInvocation(operationId: string, settlement: "timedOut" | "cancelled" | "interrupted"): Promise<boolean>;
+  /**
    * Record a `questions` result as a new unresolved interaction backed by
    * exactly one durable Chat interaction transaction. The record is written
    * through — and self-verified by the store's strict decoder — before this
@@ -539,6 +555,18 @@ export function createActionConversationOrchestratorV1(options: {
       } catch {
         // Best-effort cleanup (see the interface doc comment): a leftover
         // pending record is harmless and expires within 24h.
+      }
+    },
+
+    async settleInvocation(
+      operationId: string,
+      settlement: "timedOut" | "cancelled" | "interrupted"
+    ): Promise<boolean> {
+      try {
+        const settled = await store.settleInvocation(operationId, settlement);
+        return settled.kind === "ok";
+      } catch {
+        return false;
       }
     },
 

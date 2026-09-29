@@ -38,6 +38,16 @@ export interface AgentExecutionRequestV1 {
   readonly prompt: string;
   readonly maxResponseBytes: number;
   readonly cancellationToken: vscode.CancellationToken;
+  /**
+   * The invoking round's admission-lock identity, so the broker can attach a
+   * {@link RoundProcessStateV1} to a timeout or cancellation outcome (item 2
+   * / Step 54). Optional: a caller that does not supply it gets outcomes
+   * with no `processState` field, exactly as before this was added.
+   */
+  readonly processIdentity?: {
+    readonly taskFolderPath: string;
+    readonly claimId: string;
+  };
 }
 
 /**
@@ -72,10 +82,29 @@ export type SealedResultPayloadV1 =
       readonly spoolRef: ResultSpoolRefV1;
     };
 
+/**
+ * Whether a provider CLI recorded against the invoking round's admission
+ * claim can still be running, read from `roundProcessRecordV1.ts` /
+ * `recordedCliStopV1.ts` at the moment the broker stops waiting on (or is
+ * told the outcome of) an invocation (item 2 / Step 54). Only ever attached
+ * when the request carries `processIdentity` — a caller with no identity to
+ * check against gets no field, not a guessed value.
+ *
+ *  - `confirmedGone`: no CLI was ever recorded as spawned under this claim,
+ *    or every recorded pid is confirmed gone.
+ *  - `stillRunning`: at least one recorded pid is confirmed alive, or could
+ *    not be confirmed gone (fail open — never reported gone on an
+ *    inconclusive read).
+ *  - `unconfirmedSpawn`: a spawn attempt was begun under this claim whose
+ *    outcome (pid or abandonment) was never durably recorded — there is no
+ *    pid to check, so it cannot be proven either way.
+ */
+export type RoundProcessStateV1 = "confirmedGone" | "stillRunning" | "unconfirmedSpawn";
+
 export type RawAgentExecutionResultV1 =
   | { readonly kind: "response"; readonly payload: SealedResultPayloadV1 }
-  | { readonly kind: "providerCancelled" }
-  | { readonly kind: "callerCancelled" }
+  | { readonly kind: "providerCancelled"; readonly processState?: RoundProcessStateV1 }
+  | { readonly kind: "callerCancelled"; readonly processState?: RoundProcessStateV1 }
   | {
       readonly kind: "transportFailure";
       readonly code: string;
@@ -94,6 +123,8 @@ export type RawAgentExecutionResultV1 =
       readonly detail?: string;
       /** Carried through from `AgentTransportExitV1.networkFault` — see its doc comment. */
       readonly networkFault?: boolean;
+      /** Only ever set for `code === "invocationDeadlineExceeded"` — see {@link RoundProcessStateV1}. */
+      readonly processState?: RoundProcessStateV1;
     }
   | { readonly kind: "overflow" };
 

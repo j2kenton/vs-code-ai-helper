@@ -101,4 +101,93 @@ void describe("copilotImplementationRunner host capability gate", () => {
       lm.selectChatModels = originalSelectChatModels;
     }
   });
+
+  void it("every User message across a full tool-call round trip carries non-empty text (RC2 item 14, Step 10)", async () => {
+    // This runner's tool loop (runImplementationRounds) builds its own User
+    // messages independently of languageModelToolSessionV1's — the shared
+    // fix (createLmUserMessageWithPartsV1) covers the tool-results message at
+    // its one call site here, but this is the end-to-end proof for THIS
+    // loop: Copilot's `auto` router fails outright if the LAST User message
+    // it sees has no non-empty text part.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rawVscode = require("vscode") as {
+      LanguageModelToolCallPart: new (callId: string, name: string, input: object) => object;
+      LanguageModelTextPart: new (value: string) => object;
+    };
+    const lm = (vscode as unknown as { lm: { selectChatModels: () => Promise<unknown[]> } }).lm;
+    const originalSelectChatModels = lm.selectChatModels;
+    const sent: Array<Array<{ role: string; content: unknown }>> = [];
+    let round = 0;
+    const rounds: readonly (readonly object[])[] = [
+      [new rawVscode.LanguageModelToolCallPart("call-1", "read_file", { path: "missing.txt" })],
+      [new rawVscode.LanguageModelTextPart("Done implementing.")],
+    ];
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          sendRequest: (messages: ReadonlyArray<{ role: string; content: unknown }>) => {
+            sent.push([...messages]);
+            const parts = rounds[Math.min(round, rounds.length - 1)]!;
+            round += 1;
+            return Promise.resolve({
+              stream: (function* (): Generator<object> {
+                for (const part of parts) {
+                  yield part;
+                }
+              })(),
+            });
+          },
+        },
+      ] as unknown[]);
+
+    try {
+      const tokenSource = new vscode.CancellationTokenSource();
+      const result = await runImplementationWithCopilot({
+        prompt: "Implement the plan.",
+        modelId: "gpt-test",
+        // safeResolve realpath-checks the workspace root, so this must be a
+        // real, existing directory — the read_file call below targets a
+        // nonexistent file under it, which is safe (returns an error string,
+        // touches nothing).
+        workspaceUri: vscode.Uri.file(process.cwd()),
+        token: tokenSource.token,
+        onProgress: () => undefined,
+      });
+
+      assert.equal(result.status, "completed");
+      assert.ok(sent.length >= 2, `expected at least 2 requests, got ${sent.length}`);
+
+      const textOf = (message: { role: string; content: unknown }): string | undefined => {
+        if (typeof message.content === "string") {
+          return message.content;
+        }
+        if (!Array.isArray(message.content)) {
+          return undefined;
+        }
+        const textPart = (message.content as Array<{ value?: unknown }>).find(
+          (part) => typeof part.value === "string"
+        );
+        return textPart?.value as string | undefined;
+      };
+
+      for (const request of sent) {
+        for (const message of request) {
+          if (message.role !== "user") {
+            continue;
+          }
+          const text = textOf(message);
+          assert.ok(
+            typeof text === "string" && text.length > 0,
+            `every User message must carry non-empty text, got: ${JSON.stringify(message)}`
+          );
+        }
+      }
+    } finally {
+      lm.selectChatModels = originalSelectChatModels;
+    }
+  });
 });

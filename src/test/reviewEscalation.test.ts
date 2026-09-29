@@ -888,6 +888,141 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  // RC2 item 3: a plateau whose only remaining blockers are non-task-fixable
+  // must never recommend (or let the user casually pick) "Advance" while the
+  // plan of record still has open checklist items — advancing would leave
+  // them unbuilt behind a stage that treats implementation as done. It must
+  // instead recommend building them, and Advance's own consequence text must
+  // name how many items are open and that they will not be built there.
+  void it("recommends building the open plan items instead of Advance when only non-task-fixable blockers remain and the plan is unfinished", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-open-items-no-advance");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    const checklist = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] item 1",
+      "- [ ] item 2",
+      "- [ ] item 3",
+    ].join("\n");
+    store.set(planFinalUri.toString(), checklist);
+
+    const blockers: ReviewBlocker[] = [
+      { category: "review-confidence", resolver: "unverifiable", description: "Evidence for the retry path could not be confirmed" },
+    ];
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 8/10\n", blockers, taskFixableCount: 0 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.equal(decision.recommendation.kind, "option");
+      assert.strictEqual(
+        decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined,
+        "buildRemaining",
+        "must recommend building the open items, not Advance or 'leave it paused'"
+      );
+      const buildRemaining = decision.options.find((o) => o.optionId === "buildRemaining");
+      assert.ok(buildRemaining, "must offer a 'build the open items' option");
+      assert.deepEqual(buildRemaining?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "impl",
+            resumeFastForward: false,
+            expectedSourceStage: "impl-high-review",
+          },
+        ],
+      });
+      const advance = decision.options.find((o) => o.optionId === "advance");
+      assert.ok(advance, "Advance must stay on the card as an option");
+      assert.match(
+        advance.consequence,
+        /2 plan items are still open and will not be built at Low-Level Code Review/,
+        "Advance's consequence must name the open count and that they will not be built at the next stage"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC2 item 3: with every plan item settled, the plateau card must still
+  // recommend Advance exactly as before — this rule only changes behavior
+  // while genuine work remains open.
+  void it("still recommends Advance when every plan item is settled", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-all-settled-still-advance");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    const checklist = ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [x] item 2"].join("\n");
+    store.set(planFinalUri.toString(), checklist);
+
+    const blockers: ReviewBlocker[] = [
+      { category: "review-confidence", resolver: "unverifiable", description: "Evidence for the retry path could not be confirmed" },
+    ];
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 8/10\n", blockers, taskFixableCount: 0 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.equal(decision.recommendation.kind, "option");
+      assert.strictEqual(
+        decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined,
+        "advance"
+      );
+      assert.strictEqual(
+        decision.options.some((o) => o.optionId === "buildRemaining"),
+        false,
+        "no open items — the build-remaining option must not appear"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // wf10 review fix (2026-08-25, new architectural blocker): the ORIGINAL
   // version of this test asserted the opposite — that a recorded
   // `blockerSupersessions` entry suppressed the plateau decision even when
@@ -1076,6 +1211,15 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
         args: [{ taskFolderPath: folderUri.fsPath }],
       });
+      // RC2 item 12, Step 24 completion blocker (2026-09-28 review): outside
+      // Fast Forward (no live run active for this folder, as here) the option
+      // must say explicitly that it runs exactly one Apply Review and one
+      // re-review, per the requirement — not just dispatch the right command.
+      assert.match(
+        keepIterating.consequence,
+        /runs one Apply Review and one re-review/,
+        "outside Fast Forward, Keep Iterating's consequence must state it runs one Apply Review and one re-review"
+      );
 
       // Regression: gating.detail previously said every option except "Leave
       // it paused — I'll fix it" resumes or advances immediately — false for
@@ -1106,6 +1250,181 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       __extensionContextV1TestOnly.reset();
     }
   });
+
+  // RC2 item 7, Step 29: when the ONLY blocker left was reclassified out of
+  // task-fixable because a prior implementer round already declined it (rule
+  // 7 — no owner approval recorded in Task Description), the plateau card
+  // must recommend "Change the plan instead", never "Keep iterating" —
+  // iterating again would just dispatch the same round that already
+  // declined it, reproducing the identical stuck loop RC2 item 7 reported.
+  void it("recommends 'Change the plan instead', not Keep iterating, when the only blocker was already declined as needing a human decision", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-declined-blocker");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    // By the time this evidence reaches escalateReviewToHuman, the blocker
+    // has ALREADY been reclassified `environmental` by reclassifyDeclinedBlockersV1
+    // — taskFixableCount reflects that (0), and declinedBlockerCount records
+    // why.
+    const blockers: ReviewBlocker[] = [
+      {
+        category: "completion",
+        resolver: "environmental",
+        description: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting",
+      },
+    ];
+
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 6/10\n", blockers, taskFixableCount: 0, declinedBlockerCount: 1 }
+      );
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.strictEqual(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.strictEqual(decision.recommendation.optionId, "reconsiderRequirement");
+      }
+      assert.match(decision.whatHappened + " " + decision.whyUserNeeded, /declined/);
+      assert.match(decision.whatHappened + " " + decision.whyUserNeeded, /human decision/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("keeps recommending Keep Iterating when a SEPARATE task-fixable blocker remains alongside a declined one", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-declined-plus-real");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "task-fixable", description: "The retry loop still swallows the second failure" },
+      {
+        category: "completion",
+        resolver: "environmental",
+        description: "Hide or remove the deprecated `vs-code-ai-helper.hostRole` setting",
+      },
+    ];
+
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 5/10\n", blockers, taskFixableCount: 1, declinedBlockerCount: 1 }
+      );
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.strictEqual(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.strictEqual(
+          decision.recommendation.optionId,
+          "keepIterating",
+          "a genuinely separate task-fixable blocker means real work remains, regardless of the declined one"
+        );
+      }
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC2 item 12: a plateau raised while Fast Forward is genuinely mid-run
+  // must offer a "Keep iterating" that RESUMES FAST FORWARD from Apply
+  // Review — carrying the run's own live iteration counters — instead of the
+  // single Apply-Review-then-re-review cycle every other plateau gets. Mirrors
+  // the existing Advance/resumeFastForward boundary test above exactly:
+  // `markFastForwardRunActiveV1` (now with live counters) is set BEFORE
+  // escalating, simulating the plateau firing from deep inside
+  // `fastForwardReviewWithAI`'s own call stack.
+  void it(
+    "resumes Fast Forward from Apply Review (carrying its live iteration counters) when 'Keep iterating' is " +
+      "chosen on a plateau raised while Fast Forward is genuinely mid-run",
+    async () => {
+      const store = new Map<string, string>();
+      installMemStore(store);
+      const surface = new RecordingSurface();
+      initNotificationRouter(surface);
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      const folderUri = makeTaskFolderUri("plateau-decision-ff-keep-iterating");
+      seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+      const blockers: ReviewBlocker[] = [
+        { category: "completion", resolver: "task-fixable", description: "The retry loop still swallows the second failure" },
+      ];
+
+      markFastForwardRunActiveV1(folderUri.fsPath, { attemptNumber: 4, maxAttempts: 10 });
+      try {
+        await escalateReviewToHuman(
+          folderUri,
+          "impl-high-review",
+          "plateau",
+          "stuck",
+          "attempt-1",
+          undefined,
+          false,
+          undefined,
+          { content: "Readiness: 5/10\n", blockers, taskFixableCount: 1 }
+        );
+        const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+        const decision = decisionStore
+          .listPending()
+          .find((d) => d.decisionKey === "reviewPlateauEscalation");
+        assert.ok(decision);
+
+        const keepIterating = decision.options.find((o) => o.optionId === "keepIterating");
+        assert.ok(keepIterating);
+        assert.match(
+          keepIterating.label,
+          /Keep iterating: resume Fast Forward \(iteration 4 of 10\) from Apply Review/
+        );
+        assert.deepEqual(keepIterating.effect, {
+          kind: "command",
+          command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+          args: [
+            {
+              taskFolderPath: folderUri.fsPath,
+              resumeFastForwardV1: { attemptNumber: 4, maxAttempts: 10 },
+            },
+          ],
+        });
+      } finally {
+        clearFastForwardRunActiveV1(folderUri.fsPath);
+        deactivateNotificationRouter();
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+  );
 
   void it("never contradicts itself on the task-fixable count when only a subset of blockers are fixable (2026-09-04 review follow-up)", async () => {
     const store = new Map<string, string>();
@@ -1446,6 +1765,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
     __extensionContextV1TestOnly.set(context);
     try {
       const posted = await postEnvironmentalAdvanceNoticeV1(
+        vscode.Uri.file("/tmp/task1"),
         "impl-high-review",
         [{ category: "completion", resolver: "task-fixable", description: "still needs a null check" }],
         { canonicalId: "c1", taskFolderPath: "/tmp/task1" }
@@ -1473,7 +1793,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       },
     ];
     try {
-      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+      const posted = await postEnvironmentalAdvanceNoticeV1(vscode.Uri.file("/tmp/task1"), "impl-high-review", blockers, {
         canonicalId: "c1",
         taskFolderPath: "/tmp/task1",
         taskName: "jester",
@@ -1531,6 +1851,165 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
     }
   });
 
+  // RC2 item 3: same rule as the plateau card — this route only fires when
+  // the score already met threshold, so it is exactly the shape that would
+  // otherwise recommend advancing over an unfinished plan. With open
+  // checklist items it must offer a "build the rest" exit and recommend it
+  // instead of "Continue — advance anyway", and the advance option's own
+  // consequence must name the open count.
+  void it("recommends building the open plan items instead of advancing anyway when the plan is unfinished", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("advance-notice-open-items");
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    store.set(
+      planFinalUri.toString(),
+      ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2", "- [ ] item 3"].join("\n")
+    );
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "some environmental failure" },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1(folderUri, "impl-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: folderUri.fsPath,
+      });
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
+      assert.equal(decision.recommendation.kind, "option");
+      assert.strictEqual(
+        decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined,
+        "buildRemaining"
+      );
+      const buildRemaining = decision.options.find((o) => o.optionId === "buildRemaining");
+      assert.ok(buildRemaining, "must offer a 'build the open items' option");
+      const acknowledgeAdvance = decision.options.find((o) => o.optionId === "acknowledgeAdvance");
+      assert.ok(acknowledgeAdvance);
+      assert.match(
+        acknowledgeAdvance.consequence,
+        /2 plan items are still open and will not be built at Low-Level Code Review/
+      );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Review fix (2026-09-28, completion blocker): a task rolled back from
+  // Implementation to a plan review stage keeps its half-finished
+  // plan-final.md on disk. Before this fix, `postEnvironmentalAdvanceNoticeV1`
+  // read that stale checklist unconditionally (unlike the plateau card's own
+  // `!isPlanReviewStage(stage)` guard) and could recommend "Build the N open
+  // plan items", whose effect jumps straight to `impl` — skipping the
+  // ordered Plan Low-Level Review stage between Plan High-Level Review and
+  // Implementation.
+  void it("ignores a stale plan-final.md checklist at a plan-review stage and never offers buildRemaining", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("advance-notice-plan-review-stale-checklist");
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    store.set(
+      planFinalUri.toString(),
+      ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2", "- [ ] item 3"].join("\n")
+    );
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "some environmental failure" },
+    ];
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1(folderUri, "plan-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: folderUri.fsPath,
+      });
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
+      const optionIds = decision.options.map((option) => option.optionId);
+      assert.ok(
+        !optionIds.includes("buildRemaining"),
+        "a plan-review stage's stale implementation checklist must never produce a 'build the rest' option"
+      );
+      assert.strictEqual(
+        decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined,
+        "acknowledgeAdvance",
+        "with no genuinely open plan items at this stage, the recommendation must stay Advance"
+      );
+      const acknowledgeAdvance = decision.options.find((o) => o.optionId === "acknowledgeAdvance");
+      assert.ok(acknowledgeAdvance);
+      assert.doesNotMatch(
+        acknowledgeAdvance.consequence,
+        /plan items are still open/,
+        "must not claim open plan items exist based on a checklist this stage does not own"
+      );
+      assert.deepEqual(acknowledgeAdvance.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "plan-low-review",
+            resumeFastForward: false,
+            expectedSourceStage: "plan-high-review",
+          },
+        ],
+      });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Review fix (2026-09-28, completion blocker): at an implementation-side
+  // stage, `effectiveReviewProgressV1` reconciles the score against the
+  // checklist (reviewActions.ts's own `progress`/`meetsThreshold`
+  // derivation), so with open plan items the real auto-advance gate cannot
+  // fire regardless of the auto-advance setting. Claiming "auto-advance may
+  // move the task on its own" here directly contradicted the card's own
+  // `buildRemaining` recommendation just above it.
+  void it("never claims auto-advance may preempt the card while plan items are open, even with auto-advance on", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("advance-notice-open-items-no-preempt");
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    store.set(
+      planFinalUri.toString(),
+      ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2"].join("\n")
+    );
+    const blockers: ReviewBlocker[] = [
+      { category: "completion", resolver: "environmental", description: "some environmental failure" },
+    ];
+    const original = settingsModule.isAutoAdvanceEnabled;
+    try {
+      settingsModule.isAutoAdvanceEnabled = (): boolean => true;
+      const posted = await postEnvironmentalAdvanceNoticeV1(folderUri, "impl-high-review", blockers, {
+        canonicalId: "c1",
+        taskFolderPath: folderUri.fsPath,
+      });
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
+      assert.match(
+        decision.whyUserNeeded,
+        /stays on .* until you choose/,
+        "with plan items open, the real gate cannot advance regardless of the auto-advance setting"
+      );
+      assert.doesNotMatch(decision.gating?.detail ?? "", /auto-advance may move/i);
+    } finally {
+      settingsModule.isAutoAdvanceEnabled = original;
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // Review fix, 2026-09-2x: `acknowledgeAdvance` used to dispatch
   // `resumeAndApplyCurrentStageAction` unconditionally — reproducing the
   // CURRENT stage's action, not a genuine advance — because its doc comment
@@ -1547,7 +2026,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       { category: "completion", resolver: "environmental", description: "publish-stage environmental failure" },
     ];
     try {
-      const posted = await postEnvironmentalAdvanceNoticeV1("publish", blockers, {
+      const posted = await postEnvironmentalAdvanceNoticeV1(vscode.Uri.file("/tmp/task1"), "publish", blockers, {
         canonicalId: "c1",
         taskFolderPath: "/tmp/task1",
       });
@@ -1585,7 +2064,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       { category: "completion", resolver: "environmental", description: "some environmental failure" },
     ];
     try {
-      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+      const posted = await postEnvironmentalAdvanceNoticeV1(vscode.Uri.file("/tmp/task1"), "impl-high-review", blockers, {
         canonicalId: "c1",
         taskFolderPath: "/tmp/task1",
       });
@@ -1630,10 +2109,15 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
     const original = settingsModule.isAutoAdvanceEnabled;
     try {
       settingsModule.isAutoAdvanceEnabled = (): boolean => true;
-      const postedWithAutoAdvance = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
-        canonicalId: "c-auto",
-        taskFolderPath: "/tmp/task-auto",
-      });
+      const postedWithAutoAdvance = await postEnvironmentalAdvanceNoticeV1(
+        vscode.Uri.file("/tmp/task-auto"),
+        "impl-high-review",
+        blockers,
+        {
+          canonicalId: "c-auto",
+          taskFolderPath: "/tmp/task-auto",
+        }
+      );
       assert.strictEqual(postedWithAutoAdvance, true);
       const autoAdvanceDecision = new WorkflowDecisionStoreV1(context.workspaceState)
         .listPending()
@@ -1647,10 +2131,15 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       assert.match(autoAdvanceDecision.gating?.detail ?? "", /auto-advance may move/i);
 
       settingsModule.isAutoAdvanceEnabled = (): boolean => false;
-      const postedWithoutAutoAdvance = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
-        canonicalId: "c-manual",
-        taskFolderPath: "/tmp/task-manual",
-      });
+      const postedWithoutAutoAdvance = await postEnvironmentalAdvanceNoticeV1(
+        vscode.Uri.file("/tmp/task-manual"),
+        "impl-high-review",
+        blockers,
+        {
+          canonicalId: "c-manual",
+          taskFolderPath: "/tmp/task-manual",
+        }
+      );
       assert.strictEqual(postedWithoutAutoAdvance, true);
       const manualDecision = new WorkflowDecisionStoreV1(context.workspaceState)
         .listPending()
@@ -1679,7 +2168,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       { category: "completion", resolver: "unverifiable", description: "second blocker: unverifiable detail B" },
     ];
     try {
-      const posted = await postEnvironmentalAdvanceNoticeV1("impl-high-review", blockers, {
+      const posted = await postEnvironmentalAdvanceNoticeV1(vscode.Uri.file("/tmp/task1"), "impl-high-review", blockers, {
         canonicalId: "c1",
         taskFolderPath: "/tmp/task1",
       });

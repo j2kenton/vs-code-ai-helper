@@ -7,6 +7,7 @@ import * as vscode from "vscode";
 import { CopilotLanguageModelRunner, copilotIgnoredVariantNoteV1, createCopilotLmTextTransportV1 } from "../runners/copilotLanguageModelRunner";
 import { buildCopilotRequestOptions, resolveCopilotModel } from "../runners/copilotModelResolution";
 import { createBoundedResultWriterV1 } from "../services/agentExecutionBrokerV1";
+import { buildStageResponsePrompt } from "../commands/chatWithStage";
 import type { AgentExecutionRequestV1 } from "../types/agentExecutionV1";
 import type { AgentRunResult } from "../types/agentRunner";
 import { safeRemoveDir } from "./testFsUtils";
@@ -220,6 +221,69 @@ void describe("CopilotLanguageModelRunner", () => {
       );
     } finally {
       lm.selectChatModels = originalSelectChatModels;
+    }
+  });
+});
+
+void describe("Copilot stage-chat request text (RC2 item 14, Step 10)", () => {
+  // Stage chat (chatWithStage.ts) sends its prompt through this SAME shared
+  // text transport (createCopilotLmTextTransportV1, also exercised directly
+  // above) rather than a transport of its own. This drives a real
+  // buildStageResponsePrompt output all the way through the transport into a
+  // fake Copilot model and inspects the actual User message the model
+  // receives — the "auto" router fails outright when that message's last
+  // User text is empty, so a prompt-builder-only check (which this
+  // supersedes) cannot prove the transport wiring is safe.
+  void it("dispatches a stage-chat prompt through a fake Copilot model with non-empty User text", async () => {
+    const lm = (vscode as unknown as {
+      lm: { selectChatModels: () => Promise<vscode.LanguageModelChat[]> };
+    }).lm;
+    const original = lm.selectChatModels;
+    const sent: Array<ReadonlyArray<{ role: string; content: unknown }>> = [];
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: (messages: ReadonlyArray<{ role: string; content: unknown }>) => {
+            sent.push([...messages]);
+            return Promise.resolve({
+              text: (async function* () {
+                await Promise.resolve();
+                yield "Answer.";
+              })(),
+            });
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+    try {
+      // Worst case for stage chat's own prompt: empty conversation, no
+      // artifacts, no context pack — the same starvation case
+      // stageChatActions.test.ts covers for the builder alone, driven here
+      // through the actual transport stage chat uses to reach the model.
+      const prompt = buildStageResponsePrompt("Plan", "demo-task", "", "", "hi");
+      const source = new vscode.CancellationTokenSource();
+      const writer = createBoundedResultWriterV1(1024);
+      const exit = await createCopilotLmTextTransportV1({ model: undefined }).invoke(
+        { prompt, cancellationToken: source.token } as unknown as AgentExecutionRequestV1,
+        writer
+      );
+      assert.equal(exit.kind, "completed");
+      assert.ok(sent.length >= 1, "expected at least one request to the fake model");
+      for (const request of sent) {
+        for (const message of request) {
+          if (message.role !== "user") {
+            continue;
+          }
+          const text = typeof message.content === "string" ? message.content : undefined;
+          assert.ok(
+            typeof text === "string" && text.length > 0,
+            `every User message the model receives must carry non-empty text, got: ${JSON.stringify(message)}`
+          );
+        }
+      }
+    } finally {
+      lm.selectChatModels = original;
     }
   });
 });

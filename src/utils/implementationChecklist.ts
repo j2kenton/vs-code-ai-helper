@@ -2,12 +2,14 @@
  * Carries a round's checkbox progress back into the implementation plan of
  * record (plan-final.md).
  *
- * `run-implementation.md` requires a completed round to reproduce the
- * `<!-- ensemble:implementation-checklist -->` checklist as its response's
- * first section, with only the checkbox state changed: "This is the only
- * persistent record of overall plan progress across rounds: if you omit it
- * here, the next round will not know what remains, and will incorrectly treat
- * the plan as finished."
+ * `run-implementation.md` and `apply-impl-review-code.md` prefer a completed
+ * round to reproduce the `<!-- ensemble:implementation-checklist -->`
+ * checklist as its response's first section, with only the checkbox state
+ * changed. That full echo is not the only way to record progress (RC2 #10):
+ * a round may instead quote a finished item verbatim, with evidence, as its
+ * own entry in the response's `## Plan Item Checklist` section — the merge
+ * below matches items by exact text wherever it finds them, echo or per-item
+ * entry — and a round with neither ticks nothing rather than being rejected.
  *
  * That record used to survive because the run summary was written straight
  * over plan-final.md, so the reproduced checklist became the next round's
@@ -66,10 +68,13 @@ const STANDALONE_MARKER_LINE = new RegExp(
 /**
  * A round that legitimately fixed a review blocker without ticking any plan
  * checkbox (the work was a defect fix, not an unbuilt step) may state so
- * explicitly with this marker instead of reproducing the checklist echo. Used
- * by `describeImplementationSummaryShapeIssue` to accept the response without
- * requiring `echoesPlanChecklist` to find an overlapping item, since a round
- * that changed no checkbox state has nothing to echo.
+ * explicitly with this marker instead of reproducing the checklist echo.
+ * `describeImplementationSummaryShapeIssue` no longer requires an echo at all
+ * (RC2 #10), so this marker is not what makes a missing echo acceptable —
+ * it is one of several signals (alongside a `## Plan Item Checklist` claim)
+ * `describeIncompleteImplementationRoundV1` uses to tell a round that
+ * deliberately reported no checkbox change from one whose response was cut
+ * short with nothing recorded at all.
  */
 export const NO_CHECKLIST_CHANGE_MARKER_V1 = "<!-- ensemble:no-checklist-change -->";
 
@@ -98,6 +103,75 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
   return walkLinesV1(response).some(
     (line) => !line.fenced && NO_CHECKLIST_CHANGE_STANDALONE_LINE.test(line.text)
   );
+}
+
+/**
+ * One blocker an implementer round declined to act on, recorded under its own
+ * `## Remaining Blockers` section — RC2 item 7's contract (rule 7 of
+ * `apply-impl-review-code.md` / `run-implementation.md`): a removal named
+ * only in the plan or a review, with no approval in the owner's own `## Task
+ * Description`, is declined rather than made, and the round records it here
+ * so the NEXT review can recognize the decline and stop counting it as
+ * task-fixable (see `reclassifyDeclinedBlockersV1`, reviewReadiness.ts).
+ */
+export interface DeclinedBlockerV1 {
+  /** The blocker text as the declining round quoted it — matched, not
+   * exactly, against a reviewer's own description text (reviews reword). */
+  readonly blockerText: string;
+  readonly reason: string;
+}
+
+/**
+ * Matches a line of the exact shape rule 7 asks a declining round to write:
+ * `<blocker> — declined: needs a human decision — <why>`.
+ */
+const DECLINED_BLOCKER_LINE_RE =
+  /^[ \t]*[-*][ \t]+(.+?)[ \t]+—[ \t]+declined:[ \t]+needs a human decision[ \t]+—[ \t]+(.+?)[ \t]*\r?$/i;
+
+/**
+ * Parses every declined-blocker line out of `summary`'s own `## Remaining
+ * Blockers` section (the LAST such heading, mirroring `findLastHeadingV1`'s
+ * rationale for `## Plan Item Checklist` — an echoed prior response can carry
+ * its own copy of the same heading). Fenced code and any other heading's
+ * content is never scanned. Returns an empty list when the section is absent
+ * or carries no matching line — a round with no declined blocker writes
+ * nothing here, which is the common case, not an error.
+ */
+export function parseDeclinedBlockersV1(summary: string): DeclinedBlockerV1[] {
+  const all = headingsV1(summary);
+  const index = findLastHeadingV1(all, "Remaining Blockers");
+  if (index === -1) {
+    return [];
+  }
+  const lines = walkLinesV1(summary);
+  const heading = all[index];
+  const start = (heading?.line ?? -1) + 1;
+  let end = lines.length;
+  for (let h = index + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= (heading?.level ?? 1)) {
+      end = candidate.line;
+      break;
+    }
+  }
+  const results: DeclinedBlockerV1[] = [];
+  for (let i = start; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const match = DECLINED_BLOCKER_LINE_RE.exec(line.text);
+    if (!match) {
+      continue;
+    }
+    const blockerText = (match[1] ?? "").trim();
+    const reason = (match[2] ?? "").trim();
+    if (blockerText.length === 0) {
+      continue;
+    }
+    results.push({ blockerText, reason });
+  }
+  return results;
 }
 
 /**
@@ -554,6 +628,262 @@ export function collectPartLevelTickClaimsV1(ownSummary: string): PartLevelTickC
     }
   }
   return claims;
+}
+
+/** One open plan item's reason, as the round itself reported it. RC2 #13. */
+export interface PlanItemReasonV1 {
+  /** The plan item's identity text, matched the same way an echoed tick is. */
+  readonly itemText: string;
+  /** The round's own status field verbatim (e.g. "deferred", "not reached"). */
+  readonly status: string;
+  /** The round's own evidence/reason field verbatim; empty when it gave none. */
+  readonly reason: string;
+}
+
+/**
+ * Every entry in `summary`'s `## Plan Item Checklist` section whose status
+ * does NOT start with "done" — the open items a round reported by name,
+ * together with whatever reason it gave for each (RC2 #13, Step 49).
+ *
+ * `mergeChecklistProgressV1`'s own scan of this section only ever looks for
+ * `done` claims (see {@link collectRetroactiveTickClaimsV1}) and silently
+ * skips every other status; that is correct for ticking, but it is exactly
+ * the information a "nothing more to build" decision card needs, so this is
+ * a second, independent read of the same section rather than a change to
+ * the ticking path.
+ *
+ * `planItemKeys` (optional) is forwarded to the shared line parser so a
+ * plan item whose own text contains an em dash (` — `) is still split
+ * correctly; omitting it falls back to the naive first-dash split, which is
+ * still enough to recover `itemText` for matching against open items by
+ * {@link normalizeChecklistItemTextV1}.
+ */
+export function collectPlanItemReasonsV1(
+  summary: string,
+  planItemKeys: ReadonlySet<string> = new Set()
+): PlanItemReasonV1[] {
+  const reasons: PlanItemReasonV1[] = [];
+  const all = headingsV1(summary);
+  const at = findLastHeadingV1(all, "Plan Item Checklist");
+  if (at === -1) {
+    return reasons;
+  }
+  const heading = all[at];
+  if (!heading) {
+    return reasons;
+  }
+  const lines = walkLinesV1(summary);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced || PART_CLAIM_LINE.test(line.text)) {
+      continue;
+    }
+    const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
+    if (!parsed || parsed.status.toLowerCase().startsWith("done")) {
+      continue;
+    }
+    reasons.push({
+      itemText: parsed.itemText,
+      status: parsed.status,
+      reason: parsed.evidence,
+    });
+  }
+  return reasons;
+}
+
+/** One item the owner settled via {@link appendAcceptedNonGoalV1}. RC2 #13. */
+export interface AcceptedNonGoalItemV1 {
+  /** The plan item's own text, matching {@link settleChecklistItemV1}'s `itemText`. */
+  readonly itemText: string;
+  /** The one-line reason the owner gave (or confirmed) for excluding it. */
+  readonly reason: string;
+}
+
+/**
+ * Append one dated entry to `planOfRecord`'s `## Accepted Non-Goals` section
+ * naming every item the owner settled in a single owner-decision card (RC2
+ * #13, Step 52) — the write companion to {@link parseAcceptedNonGoalsV1}
+ * (`reviewEvidenceNormalizerV1.ts`), which reads entries back by sub-heading.
+ * Creates the `## Accepted Non-Goals` section itself when the plan has none
+ * yet (most plans predate this feature). `items` empty is a no-op: returns
+ * `planOfRecord` unchanged rather than writing an empty entry.
+ *
+ * When the section already has sub-headings, the new entry is inserted ahead
+ * of them and each survives as its own entry. When the section instead holds
+ * flat prose with no sub-heading of its own (also common — most plans predate
+ * this feature and never got a second entry), that prose is first wrapped in
+ * a `### Prior entries` heading of its own before the new entry is added.
+ * Skipping this step would silently fold the old prose into the new dated
+ * entry: once ANY sub-heading exists in the section,
+ * {@link parseAcceptedNonGoalsV1} attributes all content up to the next
+ * same-or-higher-level heading to whichever sub-heading precedes it, so
+ * flat text left sitting ahead of a freshly inserted sub-heading would read
+ * back as part of it — misattributing an older non-goal to this decision.
+ *
+ * This applies even when the section is a MIX of the two shapes: flat prose
+ * followed by one or more existing sub-headings (e.g. a plan whose first
+ * non-goal predates sub-headings and whose second one added them). That
+ * leading flat prose is not "inside" the first existing sub-heading — it sits
+ * ahead of it — so it gets the same `### Prior entries` treatment as the
+ * fully-flat case before the new entry is inserted.
+ */
+export function appendAcceptedNonGoalV1(
+  planOfRecord: string,
+  items: readonly AcceptedNonGoalItemV1[],
+  date: string
+): string {
+  if (items.length === 0) {
+    return planOfRecord;
+  }
+  const heading = `### Open items settled by the owner (owner decision, ${date})`;
+  const body = items.map((item) => `- ${item.itemText} — ${item.reason}`).join("\n");
+  const entry = `${heading}\n\n${body}\n`;
+
+  const headings = headingsV1(planOfRecord);
+  const topIndex = headings.findIndex(
+    (h) => h.title.trim().toLowerCase() === "accepted non-goals"
+  );
+  if (topIndex === -1) {
+    const sep = planOfRecord.endsWith("\n") ? "" : "\n";
+    return `${planOfRecord}${sep}\n## Accepted Non-Goals\n\n${entry}`;
+  }
+  const top = headings[topIndex]!;
+  let sectionEndLine: number | undefined;
+  for (let i = topIndex + 1; i < headings.length; i++) {
+    if (headings[i]!.level <= top.level) {
+      sectionEndLine = headings[i]!.line;
+      break;
+    }
+  }
+  const firstSubHeading = headings.find(
+    (h, idx) =>
+      idx > topIndex &&
+      h.level > top.level &&
+      (sectionEndLine === undefined || h.line < sectionEndLine)
+  );
+
+  const lines = walkLinesV1(planOfRecord);
+  const lineStartOffsets: number[] = [];
+  let runningOffset = 0;
+  for (const l of lines) {
+    lineStartOffsets.push(runningOffset);
+    runningOffset += l.raw.length;
+  }
+  const headingLineEnd =
+    (lineStartOffsets[top.line] ?? 0) + (lines[top.line]?.raw.length ?? 0);
+  const sectionEnd =
+    sectionEndLine !== undefined
+      ? (lineStartOffsets[sectionEndLine] ?? planOfRecord.length)
+      : planOfRecord.length;
+
+  const beforeSection = planOfRecord.slice(0, headingLineEnd);
+  const sectionBody = planOfRecord.slice(headingLineEnd, sectionEnd);
+  const afterSection = planOfRecord.slice(sectionEnd);
+
+  if (sectionBody.trim() === "") {
+    return `${beforeSection}\n\n${entry}${sectionBody}${afterSection}`;
+  }
+
+  if (!firstSubHeading) {
+    const preserved = `### Prior entries\n\n${sectionBody.trim()}\n`;
+    return `${beforeSection}\n\n${preserved}\n${entry}${afterSection}`;
+  }
+
+  const firstSubHeadingOffset = lineStartOffsets[firstSubHeading.line] ?? headingLineEnd;
+  const leadingFlat = planOfRecord.slice(headingLineEnd, firstSubHeadingOffset);
+  const restWithHeadings = planOfRecord.slice(firstSubHeadingOffset, sectionEnd);
+
+  if (leadingFlat.trim() === "") {
+    return `${beforeSection}\n\n${entry}${sectionBody}${afterSection}`;
+  }
+
+  const preserved = `### Prior entries\n\n${leadingFlat.trim()}\n`;
+  return `${beforeSection}\n\n${preserved}\n${entry}\n${restWithHeadings}${afterSection}`;
+}
+
+/** One owner decision for one open plan item (RC2 #13, Step 51's per-item QuickPick). */
+export interface OpenPlanItemDecisionV1 {
+  /** The plan item's own text, matching {@link settleChecklistItemV1}'s `itemText`. */
+  readonly itemText: string;
+  readonly mode: "tick" | "exclude" | "leave";
+  /** Required (non-empty) for `"tick"` and `"exclude"`; ignored for `"leave"`. */
+  readonly reason?: string;
+}
+
+/** Result of {@link applyOpenPlanItemDecisionsV1}. */
+export interface ApplyOpenPlanItemDecisionsResultV1 {
+  /** The updated plan text — `planOfRecord` unchanged if nothing matched. */
+  readonly content: string;
+  readonly ticked: readonly string[];
+  readonly excluded: readonly string[];
+  /** Decisions whose `itemText` no longer matches an open, unsettled item. */
+  readonly notFound: readonly string[];
+}
+
+/**
+ * Applies every owner decision from the "nothing more to build" card's
+ * per-item QuickPick flow (RC2 #13, Step 52) in ONE pass over the plan and
+ * returns updated content for a single write — never one write per item, so a
+ * concurrent edit is caught (or not) atomically for the whole batch rather
+ * than leaving it half-applied.
+ *
+ * Reuses {@link settleChecklistItemV1} for both `"tick"` and `"exclude"` (so
+ * an excluded item gets the same inline `Excluded by you: …` note and
+ * {@link EXCLUDED_CHECKLIST_ITEM_MARKER_V1} it would from the existing
+ * single-item command), then appends ONE dated
+ * `## Accepted Non-Goals` entry via {@link appendAcceptedNonGoalV1} naming
+ * every excluded item together — not one entry per item — matching the
+ * requirement's "one Accepted Non-Goal entry naming each excluded item and
+ * reason". `"leave"` decisions are a no-op, kept in the input only so a
+ * caller can pass every item's decision uniformly.
+ */
+export function applyOpenPlanItemDecisionsV1(
+  planOfRecord: string,
+  decisions: readonly OpenPlanItemDecisionV1[],
+  date: string
+): ApplyOpenPlanItemDecisionsResultV1 {
+  let content = planOfRecord;
+  const ticked: string[] = [];
+  const excludedItems: AcceptedNonGoalItemV1[] = [];
+  const notFound: string[] = [];
+  for (const decision of decisions) {
+    if (decision.mode === "leave") {
+      continue;
+    }
+    const { content: next, settledItemText } = settleChecklistItemV1(
+      content,
+      decision.itemText,
+      decision.mode,
+      decision.reason ?? ""
+    );
+    if (settledItemText === undefined) {
+      notFound.push(decision.itemText);
+      continue;
+    }
+    content = next;
+    if (decision.mode === "tick") {
+      ticked.push(settledItemText);
+    } else {
+      excludedItems.push({ itemText: settledItemText, reason: decision.reason ?? "" });
+    }
+  }
+  if (excludedItems.length > 0) {
+    content = appendAcceptedNonGoalV1(content, excludedItems, date);
+  }
+  return {
+    content,
+    ticked,
+    excluded: excludedItems.map((item) => item.itemText),
+    notFound,
+  };
 }
 
 /**
@@ -1723,6 +2053,44 @@ export function filterUncheckedPlanItemsV1(
   for (const candidate of candidateTexts) {
     const key = normalizeChecklistItemTextV1(candidate);
     const planText = uncheckedByKey.get(key);
+    if (planText !== undefined && !seen.has(key)) {
+      seen.add(key);
+      result.push(planText);
+    }
+  }
+  return result;
+}
+
+/**
+ * Of `candidateTexts`, return the plan of record's own item text for each
+ * candidate that resolves to an ALREADY-CHECKED, non-excluded plan item —
+ * the mirror image of {@link filterUncheckedPlanItemsV1}. RC2 item 8, Step 37
+ * (implementation-review follow-up, 2026-09-28): distinguishes "a review
+ * named this item verified complete, and the plan already shows it done"
+ * from "a review named text that matches nothing real in the plan" — the
+ * latter is never legitimate evidence of already-done work, so it must not
+ * be counted as one. A candidate matching an unchecked item, or matching
+ * nothing, is silently dropped, same as `filterUncheckedPlanItemsV1`.
+ */
+export function filterAlreadyCheckedPlanItemsV1(
+  planOfRecord: string,
+  candidateTexts: readonly string[]
+): string[] {
+  const checkedByKey = new Map<string, string>();
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.excluded || !item.checked) {
+      continue;
+    }
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (!checkedByKey.has(key)) {
+      checkedByKey.set(key, item.text);
+    }
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const candidate of candidateTexts) {
+    const key = normalizeChecklistItemTextV1(candidate);
+    const planText = checkedByKey.get(key);
     if (planText !== undefined && !seen.has(key)) {
       seen.add(key);
       result.push(planText);

@@ -74,10 +74,15 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
+  createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import type { TaskInventory } from "../state/taskInventory";
@@ -527,6 +532,18 @@ export interface RunTwoPhaseEditOptionsV1 {
   readonly roundId?: string;
   /** The task's display name, for notification labels — see `taskFolderUri`. */
   readonly taskDisplayName?: string;
+  /**
+   * Item 2 / Step 57a: an out-param a caller that manages its own admission
+   * release can supply to read back this dispatch's LATEST coordinator
+   * outcome once it settles, mirroring `continueSealedEditExecutionV1`'s own
+   * `dispatchProbe` (which this function now forwards to it) — set from the
+   * preflight `coordinator.executeAction` call first, then overwritten by the
+   * later edit-execution call when the sealed plan actually runs, so a caller
+   * always reads the most recent (and therefore authoritative) terminal
+   * outcome, never a stale "completed" preflight while the edit itself is
+   * still timing out or mid-cancellation.
+   */
+  readonly dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
 }
 
 /** SHA-256 the plan must echo (§7.3): digest of the exact prompt bytes. */
@@ -612,6 +629,9 @@ export async function runTwoPhaseEditActionV1(
       capturedAssembledPromptAttempts.push(info);
     },
   });
+  if (options.dispatchProbe) {
+    options.dispatchProbe.coordinatorOutcome = preflightOutcome;
+  }
   const capturedAssembledPrompt =
     capturedAssembledPromptAttempts.length > 0
       ? capturedAssembledPromptAttempts[capturedAssembledPromptAttempts.length - 1]
@@ -670,7 +690,8 @@ export async function runTwoPhaseEditActionV1(
   const executionResult = await continueSealedEditExecutionV1(
     coordinator,
     preflightOutcome.correlation.operationId,
-    options
+    options,
+    options.dispatchProbe
   );
   return executionResult.kind === "completed"
     ? {
@@ -693,7 +714,20 @@ export async function continueSealedEditExecutionV1(
   options: Pick<
     RunTwoPhaseEditOptionsV1,
     "taskBinding" | "taskStatus" | "taskStage" | "cancellationToken"
-  >
+  >,
+  /**
+   * Item 2 / Step 57a: an out-param a caller that manages its own admission
+   * release (currently only the Resume drive below) can supply to read back
+   * THIS invocation's coordinator outcome once it settles — mirroring
+   * `runReviewForFolder`'s and `applyReviewWithAI`'s own `dispatchProbe`.
+   * This function is Phase 2 of a two-phase dispatch: the caller's own
+   * preflight/resumeAction call already settled an earlier outcome, and this
+   * call's `coordinator.executeAction` is a SECOND, later invocation — a
+   * caller that only records the first outcome would release admission
+   * against a stale "completed" preflight while this later invocation could
+   * still be timing out or mid-cancellation.
+   */
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 }
 ): Promise<TwoPhaseEditResultV1> {
   const broker = getEditPlanBrokerV1();
   const sealed = broker.sealedExecutionForOperation(preflightOperationId);
@@ -722,6 +756,9 @@ export async function continueSealedEditExecutionV1(
     rawInput: { executionId: sealed.executionId },
     cancellationToken: options.cancellationToken,
   });
+  if (dispatchProbe) {
+    dispatchProbe.coordinatorOutcome = editOutcome;
+  }
 
   // FILE paths only (created/replaced/deleted) — directory-only steps are
   // not "files changed" in the ImplementationRunResult sense.
@@ -907,6 +944,17 @@ export interface RunSealedImplementationOptionsV1 {
   readonly roundProcessClaimId?: string;
   /** The task's display name, for notification labels — see `taskFolderUri`. */
   readonly taskDisplayName?: string;
+  /**
+   * Item 2 / Step 57a: an out-param a caller that manages its own admission
+   * release can supply to read back this dispatch's coordinator outcome once
+   * it settles. Forwarded unchanged into `runTwoPhaseEditActionV1` — see that
+   * option's own doc comment. Only ever set on the Copilot-resolved sealed
+   * pipeline branch below; the CLI branch (`runImplementationForModel`) never
+   * reaches the coordinator at all (see this function's own "Residual gap"
+   * note), so a caller reading this back after a CLI-resolved dispatch finds
+   * it unset — correctly, since there is no coordinator invocation to report.
+   */
+  readonly dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
 }
 
 /**
@@ -1070,6 +1118,7 @@ export async function runSealedImplementationV1(
     taskFolderUri: options.taskFolderUri,
     roundId: options.roundId,
     taskDisplayName: options.taskDisplayName,
+    dispatchProbe: options.dispatchProbe,
   });
 
   const runnerId = "copilot-lm";
@@ -1713,20 +1762,40 @@ export async function resumeEditPreflightInteractionV1(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
-  let released = false;
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    if (released) {
-      return;
-    }
-    released = true;
+  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
+  // release is requested at most once, but only actually unlinks the marker
+  // once the round's recorded processes are all confirmed gone; until then
+  // the marker stays held (and the reason is written durably next to it so a
+  // different process's retry refusal can name it too) and the heartbeat
+  // keeps re-checking instead of blocking this command's `finally` on the
+  // process actually exiting.
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
     if (heartbeat) {
       clearInterval(heartbeat);
-    }
-    if (handle) {
-      await handle.release();
+      heartbeat = undefined;
     }
   };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+  };
+  // Step 57a: hoisted above the `try` (a `let` inside `try { }` is not
+  // visible from its paired `finally { }`) so the `finally` below can
+  // classify a deadline/cancellation settlement from `coordinator.resumeAction`
+  // before the safe release. Stays `undefined` on every early return before
+  // that call.
+  let capturedResumeOutcomeV1: TaskActionOutcomeV1 | undefined;
 
   try {
   // §7.5, applied to Resume drives too — but unlike a fresh invocation,
@@ -1773,7 +1842,7 @@ export async function resumeEditPreflightInteractionV1(
       return { ok: false, reason: describeWorkAdmissionRefusalV1(late) };
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   // Admission is now guaranteed live for this exact target — reconcile a
@@ -1848,6 +1917,7 @@ export async function resumeEditPreflightInteractionV1(
     resumeIdempotencyId,
     cancellationToken,
   });
+  capturedResumeOutcomeV1 = outcome;
 
   if (outcome.kind === "questions") {
     // The resumed attempt asked again — mirror the NEW persisted interaction
@@ -1893,6 +1963,10 @@ export async function resumeEditPreflightInteractionV1(
     const resumedSealedReasoning = takePreflightPlanReasoningV1(outcome.correlation.operationId);
     // A sealed plan exists for the resumed attempt: continue into the
     // mutation-only session exactly like a fresh two-phase run.
+    // Item 2 / Step 57a: this second, later coordinator.executeAction call
+    // is the authoritative one for admission-release purposes — see
+    // continueSealedEditExecutionV1's dispatchProbe doc comment.
+    const executionDispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
     const execution = await continueSealedEditExecutionV1(
       coordinator,
       outcome.correlation.operationId,
@@ -1901,8 +1975,12 @@ export async function resumeEditPreflightInteractionV1(
         taskStatus: effectiveTaskStatus,
         taskStage: ownedTask.progress.currentStage,
         cancellationToken,
-      }
+      },
+      executionDispatchProbe
     );
+    if (executionDispatchProbe.coordinatorOutcome) {
+      capturedResumeOutcomeV1 = executionDispatchProbe.coordinatorOutcome;
+    }
     const logContent =
       `# Resumed ${actionKey} run\n\nResult: ${execution.kind}\n\n` +
       ("changedPaths" in execution && execution.changedPaths.length > 0
@@ -1956,10 +2034,15 @@ export async function resumeEditPreflightInteractionV1(
     (after.record.settlement === "resumed" ||
       after.record.settlement === "supersededByReplacementOperation")
   ) {
-    return { ok: true, settlement: after.record.settlement };
+    return { ok: true, settlement: after.record.settlement, coordinatorOutcome: capturedResumeOutcomeV1 };
   }
-  return { ok: false, reason: "the interaction did not settle for this Resume — it may already be settled or still awaiting answers" };
+  return {
+    ok: false,
+    reason: "the interaction did not settle for this Resume — it may already be settled or still awaiting answers",
+    coordinatorOutcome: capturedResumeOutcomeV1,
+  };
   } finally {
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, capturedResumeOutcomeV1);
     await releaseAdmissionV1();
   }
 }

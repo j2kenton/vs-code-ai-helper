@@ -285,6 +285,30 @@ void describe("buildVerifiedChecksSection — monorepo rendering", () => {
     assert.match(section, /packages\/bad.*FAILED/);
   });
 
+  // RC2 item 15, Step 41: a member package whose check failed on EVERY
+  // attempt (retried, still failing — `code !== 0` after the retry) still
+  // carries a non-zero `retryCount` (the retry was attempted), but must read
+  // "**FAILED**" alone, never "**FAILED** (passed on retry N)" — a check
+  // that never passed cannot have "passed on retry" attached to it.
+  void it("never labels a check that failed on every attempt as 'passed on retry'", () => {
+    const section = buildVerifiedChecksSection({
+      runAt: "2026-01-01T00:00:00.000Z",
+      passed: false,
+      summary: "1 completion check(s) failed.",
+      issueCount: 1,
+      failedChecks: [{ command: "[packages/bad] pnpm run test", exitCode: 1, output: "boom", retryCount: 2 }],
+      missingScripts: [],
+      commandsRun: ["[packages/bad] pnpm run test"],
+      monorepoDetected: true,
+      monorepoChecks: [
+        { packageDir: "packages/bad", command: "[packages/bad] pnpm run test", exitCode: 1, passed: false, retryCount: 2 },
+      ],
+    });
+
+    assert.match(section, /packages\/bad.*\*\*FAILED\*\*/);
+    assert.doesNotMatch(section, /passed on retry/);
+  });
+
   void it("explains a monorepo with zero recursive-pass commands rather than rendering an empty section", () => {
     const section = buildVerifiedChecksSection({
       runAt: "2026-01-01T00:00:00.000Z",

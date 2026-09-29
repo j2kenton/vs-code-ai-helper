@@ -131,24 +131,41 @@ export type CompletedContentV1 =
   | PreflightPlanCompletedV1
   | EditExecutionCompletedV1;
 
+/**
+ * Reported when the frame's closing marker was accepted despite differing
+ * from {@link FRAME_END_V1} by exactly one code point (item 5, 2026-09-28
+ * field report: a Copilot model substituted a lookalike Unicode character for
+ * one letter). `index` is the code-point offset within the marker where the
+ * two differ. Kept byte-identical to the extension's copy in
+ * `src/types/aiResultEnvelope.ts`.
+ */
+export interface FrameRepairV1 {
+  readonly expected: string;
+  readonly actual: string;
+  readonly index: number;
+}
+
 export type AiResultEnvelopeV1 =
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "completed";
       readonly content: CompletedContentV1;
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "questions";
       readonly questions: readonly StructuredQuestionV1[];
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
       readonly correlation: ActionCorrelationV1;
       readonly kind: "cancelled";
       readonly reason?: "provider" | "user";
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly version: 1;
@@ -157,6 +174,7 @@ export type AiResultEnvelopeV1 =
       readonly code: string;
       readonly message: string;
       readonly retryable: boolean;
+      readonly frameRepairV1?: FrameRepairV1;
     };
 
 export interface MalformedAiResultV1 {
@@ -264,6 +282,183 @@ function recordLegacyFrameEndV1(): void {
   } catch {
     // Observation is a side channel; parsing correctness cannot depend on it.
   }
+}
+
+/**
+ * Notified when a frame's end marker was repaired (item 5): see
+ * {@link FrameRepairV1}. Kept byte-identical to the extension's copy in
+ * `src/types/aiResultEnvelope.ts`.
+ */
+export type RepairedFrameEndObserverV1 = (repair: FrameRepairV1) => void;
+
+let repairedFrameEndObserverV1: RepairedFrameEndObserverV1 | undefined;
+
+/** Same seam as {@link setLegacyFrameEndObserverV1}, for the lookalike-marker repair. */
+export function setRepairedFrameEndObserverV1(observer: RepairedFrameEndObserverV1 | undefined): void {
+  repairedFrameEndObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change parse behaviour. */
+function recordRepairedFrameEndV1(repair: FrameRepairV1): void {
+  try {
+    repairedFrameEndObserverV1?.(repair);
+  } catch {
+    // Observation is a side channel; parsing correctness cannot depend on it.
+  }
+}
+
+/**
+ * Does `candidate` differ from `expected` in exactly one code point — the
+ * rest identical and the same code-point length? Compared by code point (not
+ * UTF-16 code unit) so a lookalike character outside the BMP cannot be
+ * miscounted as two units differing.
+ *
+ * Item 5's plan is unqualified: "differs in exactly one code point", with no
+ * carve-out for the differing point being plain ASCII. A deliberately
+ * different same-length ASCII marker (e.g. a hypothetical `V2` terminator)
+ * is therefore repaired the same as a Unicode lookalike; only a two-or-more
+ * code point difference, or a length mismatch, falls through to the
+ * unterminated-frame path. Kept byte-identical to the extension's copy in
+ * `src/types/aiResultEnvelope.ts`.
+ *
+ * Returns the code-point index of the single difference, or `undefined` when
+ * the lengths differ, nothing differs, or more than one code point differs.
+ */
+function singleCodePointSubstitutionV1(candidate: string, expected: string): number | undefined {
+  const candidatePoints = Array.from(candidate);
+  const expectedPoints = Array.from(expected);
+  if (candidatePoints.length !== expectedPoints.length) {
+    return undefined;
+  }
+  let diffIndex: number | undefined;
+  for (let i = 0; i < expectedPoints.length; i++) {
+    if (candidatePoints[i] !== expectedPoints[i]) {
+      if (diffIndex !== undefined) {
+        return undefined;
+      }
+      diffIndex = i;
+    }
+  }
+  return diffIndex;
+}
+
+/**
+ * Is `candidate` clearly an attempt at an end marker — as opposed to trailing
+ * narration or anything else a model might put on the frame's last line?
+ * Item 5's Step 4a (2026-09-29, G1 run 1 field report), ported verbatim from
+ * `src/types/aiResultEnvelope.ts`: three separate responses each ended with a
+ * differently garbled marker, none a one-code-point substitution of
+ * FRAME_END_V1, so `singleCodePointSubstitutionV1` rejected all three. This
+ * is deliberately shape-only: it does not require the candidate to resemble
+ * FRAME_END_V1 beyond this envelope, because everything else about the frame
+ * (single JSON line, strictly parseable, and nothing after this line — since
+ * it consumes the body's remainder verbatim) still has to check out for the
+ * repair to be accepted.
+ */
+function looksLikeEndMarkerAttemptV1(candidate: string): boolean {
+  return candidate.startsWith("<<<END") && candidate.endsWith(">>>");
+}
+
+/**
+ * Code-point index of the first place `a` and `b` diverge, or the shorter
+ * string's length when one is a prefix of the other. Used to give Step 4a's
+ * broader marker-attempt repair the same `{ expected, actual, index }` shape
+ * as the narrower single-code-point repair, even though the two markers may
+ * differ in length and in more than one place.
+ */
+function firstDivergingCodePointIndexV1(a: string, b: string): number {
+  const aPoints = Array.from(a);
+  const bPoints = Array.from(b);
+  const len = Math.min(aPoints.length, bPoints.length);
+  for (let i = 0; i < len; i++) {
+    if (aPoints[i] !== bPoints[i]) {
+      return i;
+    }
+  }
+  return len;
+}
+
+/**
+ * Structural detection only, for item 5's Step 4b (2026-09-29, G1 run 4
+ * field report), ported verbatim from `src/types/aiResultEnvelope.ts`: the
+ * model produced its whole reply as ONE line — the JSON and the end marker
+ * (exact, legacy, or omitted altogether) with no line break between them.
+ * Applies only when the content right after the start marker's own line
+ * ending has NO further line break at all; only the EXACT or legacy marker
+ * text, jammed on with nothing before it, is split off here. Makes no claim
+ * about the JSON itself: callers still have to parse `jsonLine`.
+ */
+function trySingleLineFrameShapeV1(
+  body: string
+): { readonly jsonLine: string; readonly markerFound: string | undefined } | undefined {
+  const afterStart = body.slice(FRAME_START_V1.length);
+  const startEol = afterStart.startsWith("\r\n") ? "\r\n" : afterStart.startsWith("\n") ? "\n" : undefined;
+  if (startEol === undefined) {
+    return undefined;
+  }
+  const rest = afterStart.slice(startEol.length);
+  if (rest.length === 0 || rest.includes("\n") || rest.includes("\r")) {
+    return undefined;
+  }
+  let jsonLine = rest;
+  let markerFound: string | undefined;
+  if (rest.endsWith(FRAME_END_V1)) {
+    jsonLine = rest.slice(0, rest.length - FRAME_END_V1.length);
+    markerFound = FRAME_END_V1;
+  } else if (rest.endsWith(LEGACY_FRAME_END_V1)) {
+    jsonLine = rest.slice(0, rest.length - LEGACY_FRAME_END_V1.length);
+    markerFound = LEGACY_FRAME_END_V1;
+  }
+  if (jsonLine.length === 0) {
+    return undefined;
+  }
+  return { jsonLine, markerFound };
+}
+
+/**
+ * Full repair attempt for the single-line shape above, ported verbatim from
+ * `src/types/aiResultEnvelope.ts`: parses `jsonLine` as a complete JSON
+ * value and decodes the envelope, reporting a {@link FrameRepairV1} on
+ * success since a real frame boundary still had to be fixed — either a
+ * missing line break before the marker, or a missing marker entirely.
+ *
+ * Deliberately returns `undefined` (never a `malformed` of its own) on any
+ * failure, so every established rejection message for this body shape is
+ * completely unchanged: only genuine success is new here. The caller falls
+ * through to the ordinary multi-line checks below.
+ */
+function trySingleLineFrameRepairV1(
+  raw: string,
+  body: string,
+  expectedCorrelation: ActionCorrelationV1 | undefined
+): AiResultParseOutcomeV1 | undefined {
+  const shape = trySingleLineFrameShapeV1(body);
+  if (shape === undefined) {
+    return undefined;
+  }
+  const { jsonLine, markerFound } = shape;
+  if (utf8ByteLength(jsonLine) > MAX_PREFLIGHT_BYTES_V1) {
+    return undefined;
+  }
+  const parsed = parseStrictJsonV1(jsonLine);
+  if (!parsed.ok) {
+    return undefined;
+  }
+  const decoded = decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  if (decoded.kind === "malformed") {
+    return undefined;
+  }
+  if (parsed.inertTrailing.length > 0) {
+    recordInertTrailingV1(parsed.inertTrailing);
+  }
+  const actual = markerFound ?? "";
+  const frameRepair: FrameRepairV1 = {
+    expected: FRAME_END_V1,
+    actual,
+    index: firstDivergingCodePointIndexV1(actual, FRAME_END_V1),
+  };
+  recordRepairedFrameEndV1(frameRepair);
+  return { ...decoded, frameRepairV1: frameRepair };
 }
 
 function utf8ByteLength(text: string): number {
@@ -1245,53 +1440,6 @@ function decodeEnvelopeV1(
  * it invoked: a cross-task/cross-operation/stale-attempt result rejects
  * (resultCorrelationMismatch) BEFORE any content is decoded.
  */
-/**
- * Accept a frame whose payload is complete but whose `FRAME_END_V1`
- * terminator never arrived (2026-08-12 field report, item 1) — ported
- * verbatim from `src/types/aiResultEnvelope.ts`'s own copy; see that file's
- * doc comment for the full rationale. `body` is known NOT to end with
- * `FRAME_END_V1`.
- */
-function parseUnterminatedFrameV1(
-  raw: string,
-  body: string,
-  expectedCorrelation?: ActionCorrelationV1
-): AiResultParseOutcomeV1 {
-  const missingTerminatorReason = `expected the frame to end with ${FRAME_END_V1}`;
-  const afterStart = body.slice(FRAME_START_V1.length);
-
-  let eol: "\n" | "\r\n";
-  if (afterStart.startsWith("\r\n")) {
-    eol = "\r\n";
-  } else if (afterStart.startsWith("\n")) {
-    eol = "\n";
-  } else {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-
-  const candidateLine = afterStart.slice(eol.length);
-  if (candidateLine.length === 0 || candidateLine.includes("\n") || candidateLine.includes("\r")) {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-  if (utf8ByteLength(candidateLine) > MAX_PREFLIGHT_BYTES_V1) {
-    return malformed(
-      "resultLimitExceeded",
-      raw,
-      `payload exceeds the absolute ${MAX_PREFLIGHT_BYTES_V1}-byte ceiling`
-    );
-  }
-
-  const parsed = parseStrictJsonV1(candidateLine);
-  if (!parsed.ok) {
-    return malformed("invalidFrame", raw, missingTerminatorReason);
-  }
-  if (parsed.inertTrailing.length > 0) {
-    recordInertTrailingV1(parsed.inertTrailing);
-  }
-
-  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
-}
-
 export function parseAiResultEnvelopeV1(
   raw: string,
   expectedCorrelation?: ActionCorrelationV1
@@ -1320,13 +1468,59 @@ export function parseAiResultEnvelopeV1(
   }
   const body = trimmedForTrailingNewline.slice(frameStartIndex);
 
+  // Step 4b (2026-09-29): try the single-line shape before the ordinary
+  // multi-line marker search below — it only ever applies when there is no
+  // further line break after the start marker's own, so it can never steal
+  // a well-formed multi-line frame away from the checks that follow.
+  const singleLineResult = trySingleLineFrameRepairV1(raw, body, expectedCorrelation);
+  if (singleLineResult !== undefined) {
+    return singleLineResult;
+  }
+
   let frameEnd: string = FRAME_END_V1;
+  let frameRepair: FrameRepairV1 | undefined;
   if (!body.endsWith(FRAME_END_V1)) {
     if (body.endsWith(LEGACY_FRAME_END_V1)) {
       frameEnd = LEGACY_FRAME_END_V1;
       recordLegacyFrameEndV1();
     } else {
-      return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
+      // One more shape to try before giving up: the final line differs from
+      // FRAME_END_V1 by exactly one code point (a lookalike/substituted
+      // character) — item 5 (2026-09-28), ported verbatim from
+      // `src/types/aiResultEnvelope.ts`. Anything looser — no final line, a
+      // length mismatch, more than one differing code point, or no closing
+      // marker at all — is rejected as `invalidFrame`. This used to fall
+      // through to a separate unterminated-payload path that accepted a
+      // complete single-line JSON body with no closing marker at all (RC1
+      // 2026-08-12 field report, item 1); RC2 item 5 requires a missing
+      // marker to stay rejected rather than be recovered as if a terminator
+      // had arrived, so that fallback was removed from both parsers.
+      const lastNewlineIndex = body.lastIndexOf("\n");
+      const candidateLine = lastNewlineIndex === -1 ? undefined : body.slice(lastNewlineIndex + 1);
+      const diffIndex =
+        candidateLine !== undefined ? singleCodePointSubstitutionV1(candidateLine, FRAME_END_V1) : undefined;
+      if (candidateLine !== undefined && diffIndex !== undefined) {
+        frameEnd = candidateLine;
+        frameRepair = { expected: FRAME_END_V1, actual: candidateLine, index: diffIndex };
+      } else if (candidateLine !== undefined && looksLikeEndMarkerAttemptV1(candidateLine)) {
+        // Step 4a (2026-09-29, G1 run 1 field report), ported verbatim from
+        // `src/types/aiResultEnvelope.ts`: a closing line that is clearly an
+        // end-marker attempt — starts with "<<<END", ends with ">>>" — but is
+        // not a one-code-point substitution of FRAME_END_V1 is also accepted
+        // as a repair, PROVIDED everything else about the frame still checks
+        // out below: the line-ending, single-line and strict JSON checks that
+        // follow still reject a missing closing line, a body that does not
+        // parse completely, or any text after the body, exactly as they do
+        // for the narrower repair above.
+        frameEnd = candidateLine;
+        frameRepair = {
+          expected: FRAME_END_V1,
+          actual: candidateLine,
+          index: firstDivergingCodePointIndexV1(candidateLine, FRAME_END_V1),
+        };
+      } else {
+        return malformed("invalidFrame", raw, `expected the frame to end with ${FRAME_END_V1}`);
+      }
     }
   }
   if (body.length < FRAME_START_V1.length + frameEnd.length) {
@@ -1377,5 +1571,10 @@ export function parseAiResultEnvelopeV1(
     recordInertTrailingV1(parsed.inertTrailing);
   }
 
-  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  const decoded = decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+  if (frameRepair && decoded.kind !== "malformed") {
+    recordRepairedFrameEndV1(frameRepair);
+    return { ...decoded, frameRepairV1: frameRepair };
+  }
+  return decoded;
 }

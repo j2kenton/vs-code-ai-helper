@@ -18,8 +18,8 @@ import { execCliAgent } from "../runners/cliAgentRunner";
 import { CliProviderDefinition } from "../runners/providers";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import {
+  hasRoundProcessRecordV1,
   listRoundProcessesV1,
-  recordedClaimIdForTaskV1,
   unconfirmedProcessSpawnCountV1,
 } from "../state/roundProcessRecordV1";
 import { acquireWorkAdmissionV1, hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
@@ -183,11 +183,12 @@ function makeFastExitProvider(): CliProviderDefinition {
  * spawned. */
 async function waitForRecordedProcessesV1(
   taskFolderPath: string,
+  claimId: string,
   timeoutMs = 2000
 ): Promise<ReturnType<typeof listRoundProcessesV1>> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const recorded = listRoundProcessesV1(taskFolderPath);
+    const recorded = listRoundProcessesV1(taskFolderPath, claimId);
     if (recorded.length > 0 || Date.now() >= deadline) {
       return recorded;
     }
@@ -215,13 +216,13 @@ void test("execCliAgent records a spawned process next to the lock when taskFold
 
     assert.strictEqual(result.status, "completed");
 
-    const recorded = await waitForRecordedProcessesV1(taskFolderPath);
+    const recorded = await waitForRecordedProcessesV1(taskFolderPath, claimId);
     assert.strictEqual(recorded.length, 1);
     assert.strictEqual(recorded[0]!.providerId, "claude-cli");
     assert.strictEqual(recorded[0]!.providerLabel, "Fake Round-Record CLI");
     assert.ok(Number.isInteger(recorded[0]!.pid) && recorded[0]!.pid > 0);
     assert.ok(recorded[0]!.command.includes("node"));
-    assert.strictEqual(recordedClaimIdForTaskV1(taskFolderPath), claimId);
+    assert.strictEqual(hasRoundProcessRecordV1(taskFolderPath, claimId), true);
   } finally {
     fakeContext.restore();
   }
@@ -264,7 +265,7 @@ void test("execCliAgent never persists the raw argv prompt into the process reco
       roundProcessClaimId: claimId,
     });
 
-    const recorded = await waitForRecordedProcessesV1(taskFolderPath);
+    const recorded = await waitForRecordedProcessesV1(taskFolderPath, claimId);
     assert.strictEqual(recorded.length, 1);
     assert.ok(!recorded[0]!.command.includes(secretPrompt));
     assert.ok(recorded[0]!.command.includes("<prompt omitted>"));
@@ -292,7 +293,9 @@ void test("execCliAgent skips recording entirely when no taskFolderPath/roundPro
     // Give any (unexpected) fire-and-forget write a chance to land before
     // asserting its absence.
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+    // No roundProcessClaimId was given, so nothing was ever written under
+    // this taskFolderPath at all — any claimId string shows the same "empty".
+    assert.deepEqual(listRoundProcessesV1(taskFolderPath, "no-claim-given"), []);
   } finally {
     fakeContext.restore();
   }
@@ -320,7 +323,7 @@ void test("execCliAgent refuses to spawn when the pre-spawn process record canno
     assert.strictEqual(result.status, "failed");
     assert.match(result.errorMessage ?? "", /bookkeeping/);
     assert.match(result.errorMessage ?? "", /not started/);
-    assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+    assert.deepEqual(listRoundProcessesV1(taskFolderPath, claimId), []);
   } finally {
     fakeContext.restore();
   }
@@ -352,7 +355,7 @@ void test("execCliAgent refuses to spawn when the pre-spawn per-attempt spawn-re
     assert.strictEqual(result.status, "failed");
     assert.match(result.errorMessage ?? "", /bookkeeping/);
     assert.match(result.errorMessage ?? "", /not started/);
-    assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+    assert.deepEqual(listRoundProcessesV1(taskFolderPath, claimId), []);
   } finally {
     fakeContext.restore();
   }
@@ -389,7 +392,7 @@ void test("execCliAgent stops and fails a spawned process whose post-spawn proce
     assert.strictEqual(await waitForPidGoneV1(pid), true, `expected pid ${pid} to have been stopped`);
     assert.match(result.errorMessage ?? "", /stopped before it could keep editing the workspace unrecorded/);
     // The failed append must not have left a partial/incorrect record behind.
-    assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+    assert.deepEqual(listRoundProcessesV1(taskFolderPath, claimId), []);
   } finally {
     fakeContext.restore();
   }
@@ -434,7 +437,7 @@ void test(
       // pass an assertion taken after a sleep, which is why an earlier
       // round's version of this test slept 500ms here and a review
       // correctly flagged that as not proving the required ordering.
-      assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+      assert.deepEqual(listRoundProcessesV1(taskFolderPath, claimId), []);
       assert.strictEqual(
         unconfirmedProcessSpawnCountV1(taskFolderPath, claimId),
         0,
@@ -469,7 +472,7 @@ void test(
 
       assert.strictEqual(result.status, "failed");
       assert.match(result.errorMessage ?? "", /Could not start/);
-      assert.deepEqual(listRoundProcessesV1(taskFolderPath), []);
+      assert.deepEqual(listRoundProcessesV1(taskFolderPath, claimId), []);
       // No post-completion sleep: this is exactly the ordering under test --
       // the abandonment write behind the synchronous catch must already be
       // durable by the time execCliAgent() itself resolves, not merely
@@ -518,7 +521,7 @@ void test("execCliAgent settles an ordinary recorded Cancel promptly once the ch
     // Wait for the process to actually be recorded (proving it was spawned
     // and its record write succeeded -- the ordinary, non-failure path)
     // before cancelling it.
-    const recorded = await waitForRecordedProcessesV1(taskFolderPath);
+    const recorded = await waitForRecordedProcessesV1(taskFolderPath, claimId);
     assert.strictEqual(recorded.length, 1);
     const pid = recorded[0]!.pid;
     assert.ok(Number.isInteger(pid) && pid > 0);
@@ -585,7 +588,7 @@ void test("Cancel on a real, recorded work-admission lock actually frees admissi
       roundProcessClaimId: claimId,
     });
 
-    const recorded = await waitForRecordedProcessesV1(taskFolderPath);
+    const recorded = await waitForRecordedProcessesV1(taskFolderPath, claimId);
     assert.strictEqual(recorded.length, 1);
     const pid = recorded[0]!.pid;
 

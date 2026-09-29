@@ -24,10 +24,12 @@ function context(overrides: Partial<EscalationPlateauContextV1>): EscalationPlat
     progressNote: "12 of 20 plan steps verified.",
     taskFixableCount: 3,
     hasSpecDefect: false,
+    hasDeclinedBlocker: false,
     hasNonFixableBlocker: true,
     nextStageHasRun: false,
     clearingNote: "Fix the blockers.",
     dispatchModeEvidence: [],
+    planItemsOpen: 0,
     ...overrides,
   };
 }

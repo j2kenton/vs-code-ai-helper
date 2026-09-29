@@ -75,7 +75,13 @@ import {
   revokeWorkAdmissionHandoffV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
+  createSafeAdmissionReleaseStateV1,
+  recordAdmissionReleaseTriggerV1,
+  requestSafeAdmissionReleaseV1,
+  trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 
@@ -536,7 +542,15 @@ export async function chatWithStage(
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+  let heartbeat = handle
+    ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1)
+    : undefined;
+  // Item 2 / Step 57: the pre-invocation candidate-switch release below is
+  // unconditional and immediate — nothing could have been spawned yet under
+  // that claim. Only the TERMINAL release(s) (after `chatWithStageSendV1`'s
+  // `admitAndContinueWithMalformedResultRetryV1` provider invocation may
+  // have run) go through the shared safe-release bookkeeping
+  // (`releaseAdmissionSafelyV1` below).
   const releaseCurrentAdmissionV1 = async (): Promise<void> => {
     if (heartbeat) {
       clearInterval(heartbeat);
@@ -547,6 +561,27 @@ export async function chatWithStage(
       handle = undefined;
       await toRelease.release();
     }
+  };
+  const safeReleaseStateV1 = createSafeAdmissionReleaseStateV1();
+  const onAdmissionHeldV1 = createAdmissionHeldNotifierV1();
+  const onAdmissionReleasedV1 = (): void => {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    handle = undefined;
+  };
+  async function heartbeatTickV1(): Promise<void> {
+    if (!handle) {
+      return;
+    }
+    await handle.heartbeat();
+    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
+      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
+    }
+  }
+  const releaseAdmissionSafelyV1 = async (): Promise<void> => {
+    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
   };
 
   // 2026-09-10 review completion blocker fix (`d620c877...-2`): resolution
@@ -615,7 +650,7 @@ export async function chatWithStage(
         return;
       }
       handle = late.handle;
-      heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
     }
 
     // Per-task admission is now live for the authoritative target — the
@@ -659,7 +694,8 @@ export async function chatWithStage(
     // never sees this call's marker as a live foreign `busy` owner.
     const proposedActionNeedsAdmissionHandoffV1 = dispatch?.proposedAction?.id === "triggerStageAI";
     if (!proposedActionNeedsAdmissionHandoffV1) {
-      await releaseCurrentAdmissionV1();
+      recordAdmissionReleaseTriggerV1(safeReleaseStateV1, dispatch?.coordinatorOutcome);
+      await releaseAdmissionSafelyV1();
     }
     if (dispatch?.proposedAction) {
       await dispatchProposedStageActionV1(
@@ -691,7 +727,8 @@ export async function chatWithStage(
     // outer-finally safety net. Admission itself is released only now, after
     // both dispatch calls above have settled.
     await endTargetResolutionOnceV1();
-    await releaseCurrentAdmissionV1();
+    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, dispatch?.coordinatorOutcome);
+    await releaseAdmissionSafelyV1();
   }
 }
 
@@ -701,6 +738,13 @@ interface ChatSendDispatchV1 {
   readonly proposedAction: StageChatActionProposal | undefined;
   readonly proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
   readonly proposedBlockerSupersessionEditAt: string | undefined;
+  /** Step 57a: the raw coordinator outcome from this send, when one was
+   * dispatched — carried back so `chatWithStage`'s terminal
+   * `recordAdmissionReleaseTriggerV1` calls (right before its safe releases)
+   * can classify a deadline/cancellation settlement. `undefined` on a send
+   * that never reached `admitAndContinueWithMalformedResultRetryV1` (a
+   * validation failure, or a thrown error before the coordinator call). */
+  readonly coordinatorOutcome?: TaskActionOutcomeV1;
 }
 
 /**
@@ -731,6 +775,7 @@ async function chatWithStageSendV1(
   // block below reports it as a notification instead of an assistant
   // reply to a message that was never shown.
   let userMessagePersisted = false;
+  let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
   try {
     await runTrackedOperation(lockKey, {
       label: "Chat",
@@ -843,6 +888,7 @@ async function chatWithStageSendV1(
         }
       },
     });
+    coordinatorOutcomeForAdmissionV1 = outcome;
 
     if (outcome.kind === "completed") {
       // Completed message has already been written to chat-v1.json by
@@ -913,7 +959,14 @@ async function chatWithStageSendV1(
     return;
   }
 
-  return { task, targetStage, proposedAction, proposedBlockerSupersessionEdit, proposedBlockerSupersessionEditAt };
+  return {
+    task,
+    targetStage,
+    proposedAction,
+    proposedBlockerSupersessionEdit,
+    proposedBlockerSupersessionEditAt,
+    coordinatorOutcome: coordinatorOutcomeForAdmissionV1,
+  };
 }
 
 /**
@@ -1200,7 +1253,7 @@ export async function resumeChatSendInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: "Resume failed to settle the interaction" };
+    return { ok: false, reason: "Resume failed to settle the interaction", coordinatorOutcome: outcome };
   }
   if (proposedAction) {
     await dispatchProposedStageActionV1(
@@ -1224,7 +1277,7 @@ export async function resumeChatSendInteractionV1(
       proposedBlockerSupersessionEditAt
     );
   }
-  return { ok: true, settlement };
+  return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 

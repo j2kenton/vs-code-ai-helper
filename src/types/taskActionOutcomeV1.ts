@@ -14,11 +14,28 @@
  * store, Commit/Push early gate) are written against.
  */
 import { ActionCorrelationV1, InteractionIdV1, isActionCorrelationV1 } from "./actionCorrelationV1";
-import { MalformedAiResultV1 } from "./aiResultEnvelope";
+import { FrameRepairV1, MalformedAiResultV1 } from "./aiResultEnvelope";
 import { WorkflowUnavailableCodeV1 } from "./workflowAvailabilityV1";
 
 /** Malformed-result codes are shared verbatim with the envelope parser. */
 export type MalformedResultCodeV1 = MalformedAiResultV1["code"];
+
+/**
+ * One attempt a malformed-result candidate-advancement chain rejected before
+ * the attempt its owning `malformedResult` outcome itself reports (item 6,
+ * 2026-09-26 field report: two earlier attempts in the same round were each
+ * rejected for their own reason, but only the LAST attempt's code/detail
+ * survived to the run file once it overwrote the single in-memory
+ * `lastMalformedOutcomeV1`). `code` mirrors `MalformedResultCodeV1` but is
+ * left as `string` here since a future non-malformedResult rejection kind in
+ * the same chain (e.g. a content-contract failure) may also want to record
+ * itself this way without widening this union.
+ */
+export interface MalformedResultAttemptRecordV1 {
+  readonly attemptId: string;
+  readonly code: string;
+  readonly detail?: string;
+}
 
 export type RecoveryRequiredCodeV1 =
   | "taskProgressRecoveryRequired"
@@ -104,6 +121,8 @@ export type TaskActionOutcomeV1 =
        */
       readonly code: "completed" | "noChanges" | "roundDeferredIncomplete" | "roundIncomplete";
       readonly provider?: TaskActionOutcomeProviderV1;
+      /** Set when the response's frame end marker was repaired (item 5): see {@link FrameRepairV1}. */
+      readonly frameRepairV1?: FrameRepairV1;
     }
   | {
       readonly kind: "questions";
@@ -158,6 +177,28 @@ export type TaskActionOutcomeV1 =
        * blamed for a backup candidate's failure.
        */
       readonly provider?: TaskActionOutcomeProviderV1;
+      /**
+       * This outcome's own attempt id (item 6, 2026-09-26 field report
+       * follow-up: the implementation-review pass that added
+       * {@link MalformedResultAttemptRecordV1} listed every EARLIER
+       * attempt's own id next to its reason, but the run log then had no id
+       * for the FINAL attempt this outcome itself reports — the one detail
+       * readers most often need is exactly the one left out). Optional and
+       * additive: outcomes built before this field existed remain valid.
+       */
+      readonly attemptId?: string;
+      /**
+       * Every attempt a content-contract candidate-advancement chain
+       * rejected before this outcome's own attempt (item 6 follow-up: a
+       * schema-valid envelope that still fails a row's own content rule,
+       * e.g. review.v1's required `Readiness: N/10` line, used to lose its
+       * earlier attempts' reasons the same way a malformed-envelope chain
+       * once did — see {@link MalformedResultAttemptRecordV1}'s own doc
+       * comment, which anticipated this). Ordered oldest first. Absent when
+       * this outcome's attempt is the only one the chain tried, or the
+       * outcome is not from that chain.
+       */
+      readonly priorRejectedAttemptsV1?: readonly MalformedResultAttemptRecordV1[];
     }
   | {
       readonly kind: "malformedResult";
@@ -195,6 +236,19 @@ export type TaskActionOutcomeV1 =
        * outer wrapper's pre-existing fixed-attempt behavior unchanged.
        */
       readonly malformedInvocationsUsedV1?: number;
+      /**
+       * Every OTHER attempt this operation's malformed-result
+       * candidate-advancement loop rejected before this outcome's own
+       * attempt — see {@link MalformedResultAttemptRecordV1}. Ordered oldest
+       * first. Absent when this outcome's attempt is the only one the chain
+       * tried, or the row is not malformed-retry-eligible.
+       */
+      readonly priorRejectedAttemptsV1?: readonly MalformedResultAttemptRecordV1[];
+      /**
+       * This outcome's own attempt id — see the `failed` kind's identical
+       * field doc comment above (item 6 follow-up).
+       */
+      readonly attemptId?: string;
     }
   | {
       readonly kind: "unavailable";
@@ -375,6 +429,71 @@ function decodeOptionalProviderV1(raw: unknown): TaskActionOutcomeProviderV1 | u
   return { providerLabel: raw.providerLabel, storedModelId: raw.storedModelId };
 }
 
+/** Decode an optional `frameRepairV1` field (item 5); absent decodes to `undefined`. */
+function decodeOptionalFrameRepairV1(raw: unknown): FrameRepairV1 | undefined | string {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!isPlainRecordV1(raw)) {
+    return "\"frameRepairV1\" is not an object";
+  }
+  const unknown = unknownOutcomeField(raw, new Set(["expected", "actual", "index"]), "frameRepairV1");
+  if (unknown) {
+    return unknown;
+  }
+  if (typeof raw.expected !== "string" || raw.expected.length === 0) {
+    return "\"frameRepairV1.expected\" must be a non-empty string";
+  }
+  if (typeof raw.actual !== "string" || raw.actual.length === 0) {
+    return "\"frameRepairV1.actual\" must be a non-empty string";
+  }
+  if (typeof raw.index !== "number" || !Number.isInteger(raw.index) || raw.index < 0) {
+    return "\"frameRepairV1.index\" must be a non-negative integer";
+  }
+  return { expected: raw.expected, actual: raw.actual, index: raw.index };
+}
+
+/**
+ * Decode an optional `priorRejectedAttemptsV1` field, shared by the
+ * `malformedResult` and `failed` kinds (item 6 follow-up: a content-contract
+ * candidate-advancement chain reports `failed`/`contentContractFailed`, not
+ * `malformedResult`, but needs the exact same per-attempt history shape).
+ * Absent decodes to `undefined`.
+ */
+function decodeOptionalPriorRejectedAttemptsV1(
+  raw: unknown,
+  fieldLabel: string
+): MalformedResultAttemptRecordV1[] | undefined | string {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    return `invalid ${fieldLabel} "priorRejectedAttemptsV1": ${JSON.stringify(raw)}`;
+  }
+  const decoded: MalformedResultAttemptRecordV1[] = [];
+  for (const entry of raw) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      typeof (entry as Record<string, unknown>).attemptId !== "string" ||
+      (entry as Record<string, unknown>).attemptId === "" ||
+      typeof (entry as Record<string, unknown>).code !== "string" ||
+      (entry as Record<string, unknown>).code === "" ||
+      (((entry as Record<string, unknown>).detail !== undefined) &&
+        typeof (entry as Record<string, unknown>).detail !== "string")
+    ) {
+      return `invalid ${fieldLabel} "priorRejectedAttemptsV1" entry: ${JSON.stringify(entry)}`;
+    }
+    const record = entry as { attemptId: string; code: string; detail?: string };
+    decoded.push({
+      attemptId: record.attemptId,
+      code: record.code,
+      ...(record.detail !== undefined ? { detail: record.detail } : {}),
+    });
+  }
+  return decoded;
+}
+
 /** Bound on one candidate's `reason` — a diagnostic sentence, never a transcript. */
 const MAX_CHAIN_CANDIDATE_REASON_CHARS_V1 = 500;
 /** Bound on the candidate list — a ranked chain is a handful of models. */
@@ -473,7 +592,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "completed": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "provider"]),
+        new Set(["kind", "correlation", "code", "provider", "frameRepairV1"]),
         "completed outcome"
       );
       if (unknown) {
@@ -495,6 +614,10 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof provider === "string") {
         return fail(provider);
       }
+      const frameRepairV1 = decodeOptionalFrameRepairV1(raw.frameRepairV1);
+      if (typeof frameRepairV1 === "string") {
+        return fail(frameRepairV1);
+      }
       return {
         ok: true,
         outcome: {
@@ -502,6 +625,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           correlation,
           code: raw.code,
           ...(provider !== undefined ? { provider } : {}),
+          ...(frameRepairV1 !== undefined ? { frameRepairV1 } : {}),
         },
       };
     }
@@ -568,7 +692,16 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "failed": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "retryable", "detail", "provider"]),
+        new Set([
+          "kind",
+          "correlation",
+          "code",
+          "retryable",
+          "detail",
+          "provider",
+          "attemptId",
+          "priorRejectedAttemptsV1",
+        ]),
         "failed outcome"
       );
       if (unknown) {
@@ -587,9 +720,19 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.detail !== undefined && typeof raw.detail !== "string") {
         return fail(`invalid failed outcome "detail": ${JSON.stringify(raw.detail)}`);
       }
+      if (raw.attemptId !== undefined && (typeof raw.attemptId !== "string" || raw.attemptId === "")) {
+        return fail(`invalid failed outcome "attemptId": ${JSON.stringify(raw.attemptId)}`);
+      }
       const provider = decodeOptionalProviderV1(raw.provider);
       if (typeof provider === "string") {
         return fail(provider);
+      }
+      const priorRejectedAttemptsV1 = decodeOptionalPriorRejectedAttemptsV1(
+        raw.priorRejectedAttemptsV1,
+        "failed outcome"
+      );
+      if (typeof priorRejectedAttemptsV1 === "string") {
+        return fail(priorRejectedAttemptsV1);
       }
       return {
         ok: true,
@@ -600,13 +743,24 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           retryable: raw.retryable,
           ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
           ...(provider !== undefined ? { provider } : {}),
+          ...(raw.attemptId !== undefined ? { attemptId: raw.attemptId } : {}),
+          ...(priorRejectedAttemptsV1 !== undefined ? { priorRejectedAttemptsV1 } : {}),
         },
       };
     }
     case "malformedResult": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "detail", "provider", "malformedInvocationsUsedV1"]),
+        new Set([
+          "kind",
+          "correlation",
+          "code",
+          "detail",
+          "provider",
+          "malformedInvocationsUsedV1",
+          "priorRejectedAttemptsV1",
+          "attemptId",
+        ]),
         "malformedResult outcome"
       );
       if (unknown) {
@@ -622,6 +776,9 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.detail !== undefined && typeof raw.detail !== "string") {
         return fail(`invalid malformedResult outcome "detail": ${JSON.stringify(raw.detail)}`);
       }
+      if (raw.attemptId !== undefined && (typeof raw.attemptId !== "string" || raw.attemptId === "")) {
+        return fail(`invalid malformedResult outcome "attemptId": ${JSON.stringify(raw.attemptId)}`);
+      }
       const provider = decodeOptionalProviderV1(raw.provider);
       if (typeof provider === "string") {
         return fail(provider);
@@ -636,6 +793,13 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           `invalid malformedResult outcome "malformedInvocationsUsedV1": ${JSON.stringify(raw.malformedInvocationsUsedV1)}`
         );
       }
+      const priorRejectedAttemptsV1 = decodeOptionalPriorRejectedAttemptsV1(
+        raw.priorRejectedAttemptsV1,
+        "malformedResult outcome"
+      );
+      if (typeof priorRejectedAttemptsV1 === "string") {
+        return fail(priorRejectedAttemptsV1);
+      }
       return {
         ok: true,
         outcome: {
@@ -647,6 +811,8 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           ...(raw.malformedInvocationsUsedV1 !== undefined
             ? { malformedInvocationsUsedV1: raw.malformedInvocationsUsedV1 }
             : {}),
+          ...(priorRejectedAttemptsV1 !== undefined ? { priorRejectedAttemptsV1 } : {}),
+          ...(raw.attemptId !== undefined ? { attemptId: raw.attemptId } : {}),
         },
       };
     }
