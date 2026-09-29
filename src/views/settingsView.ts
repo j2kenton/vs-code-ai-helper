@@ -728,6 +728,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             gap: var(--ensemble-space-2);
             margin-top: var(--ensemble-space-4);
           }
+          #model-settings-buttons[hidden] {
+            display: none;
+          }
           #loading-indicator {
             color: var(--vscode-descriptionForeground);
             padding: var(--ensemble-space-3) 0;

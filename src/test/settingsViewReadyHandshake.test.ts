@@ -1281,3 +1281,87 @@ void describe("SettingsViewProvider webview — provider selection Discard Unsav
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// AI Models panel: Save/Discard Changes buttons must stay hidden while the
+// panel is loading (before "init" arrives), not just visually beside the
+// loading indicator. The markup already starts the container with the
+// `hidden` attribute, but `.btn-container { display: flex }` in the
+// stylesheet previously overrode the `[hidden]` user-agent rule, so the
+// buttons stayed visible during loading despite the attribute being set.
+// The fix scopes the override to #model-settings-buttons specifically,
+// since .btn-container is also used by unrelated confirmation dialogs and
+// provider action rows that never carry the `hidden` attribute.
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider webview — model buttons stay hidden while loading", () => {
+  void it("renders the model-settings-buttons container with the hidden attribute before init", () => {
+    const html = extractWebviewHtml();
+
+    assert.match(
+      html,
+      /<div class="btn-container" id="model-settings-buttons" hidden>/,
+      "the Save/Discard Changes container must start with the hidden attribute, before any script runs"
+    );
+  });
+
+  void it("styles #model-settings-buttons[hidden] as display: none so the hidden attribute actually hides it", () => {
+    const html = extractWebviewHtml();
+
+    assert.match(
+      html,
+      /#model-settings-buttons\[hidden\]\s*\{\s*display:\s*none;\s*\}/,
+      "without this rule, .btn-container's own `display: flex` overrides the [hidden] user-agent style " +
+        "and the buttons stay visible during loading"
+    );
+    assert.doesNotMatch(
+      html,
+      /\.btn-container\[hidden\]/,
+      "the override must be scoped to #model-settings-buttons, not the shared .btn-container class used by " +
+        "unrelated confirmation dialogs and provider action rows"
+    );
+  });
+
+  void it("reveals the buttons with their normal enabled/disabled state once init arrives with models", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    // Seed the pre-init hidden state (the fake DOM does not parse the real
+    // HTML's `hidden` attribute) so this test actually exercises the
+    // init-driven true -> false transition, not just the FakeNode default.
+    session.byId("model-settings-buttons").hidden = true;
+
+    const init = initMessage();
+    init.settings = { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } };
+    await session.deliver(init);
+
+    assert.equal(
+      session.byId("model-settings-buttons").hidden,
+      false,
+      "the button container must be revealed once init is processed"
+    );
+    assert.equal(session.byId("save-btn").disabled, true, "nothing unsaved right after init");
+    assert.equal(session.byId("discard-btn").disabled, true, "discard has nothing to discard right after init");
+  });
+
+  void it("reveals the buttons with their normal enabled/disabled state once init arrives with an empty model list", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    session.byId("model-settings-buttons").hidden = true;
+
+    const init = initMessage();
+    init.models = [];
+    await session.deliver(init);
+
+    assert.equal(
+      session.byId("model-settings-buttons").hidden,
+      false,
+      "the button container must be revealed once init is processed, even with no models available"
+    );
+    assert.equal(session.byId("save-btn").disabled, true, "nothing unsaved right after init");
+    assert.equal(session.byId("discard-btn").disabled, true, "discard has nothing to discard right after init");
+  });
+});
