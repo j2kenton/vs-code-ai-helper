@@ -68,7 +68,6 @@ void describe("chat webview — info/disabled text contrast tokens", () => {
   void it("colours the informational helper blocks with the info token", () => {
     const html = chatHtml();
     for (const selector of [
-      "#scheduling-posture",
       ".interaction-help",
       ".decision-option-consequence",
       ".decision-recommendation",

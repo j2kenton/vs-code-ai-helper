@@ -12,6 +12,7 @@ All notable changes to Ensemble (formerly VS Code AI Helper) are documented here
 
 ### Changed
 
+- **Chat With AI no longer shows run status.** The busy banner ("Running Implementation since …") and the "What happens next" scheduling-posture footer ("running — a round is running now") are gone from the chat panel — that is operational status, not conversation. Progress remains visible in the Tasks pane, the Notifications pane, and the status bar; chat still shows a "Waiting for your answer" banner when a round is genuinely paused on you.
 - **A plateau card never recommends Advance, and nothing auto-advances, while the plan still has open items.** It recommends building the remaining items instead; Advance stays available, but its consequence now says how many items are still open and that they won't be built at the next stage.
 - **"Keep iterating" on a Fast Forward plateau resumes Fast Forward itself** (from Apply Review, keeping its iteration count), instead of running one Apply Review cycle and then silently stopping. Outside Fast Forward, the option still says plainly that it runs one Apply Review and one re-review.
 - **A removal named in the owner's own Task Description is now recognized as the owner's approval** to make it; a plan step or review alone still isn't. When an implementer declines a blocker for needing a human decision, the next review classifies it the same way instead of re-raising it as task-fixable, and a plateau card no longer recommends "Keep iterating" when that's the only blocker left.

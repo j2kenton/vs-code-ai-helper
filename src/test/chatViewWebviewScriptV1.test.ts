@@ -148,14 +148,12 @@ function runPanel(): PanelHarness {
   const elements = new Map<string, FakeElement>();
   for (const id of [
     "context",
-    "scheduling-posture",
     "messages",
     "interaction",
     "decisions",
     "empty-notice",
     "error",
     "busy-indicator",
-    "busy-spinner",
     "busy-text",
     "steering-note",
     "form",
@@ -163,12 +161,10 @@ function runPanel(): PanelHarness {
   ]) {
     elements.set(id, makeElement("div", id));
   }
-  // The shipped HTML is not blank: #context holds the loading placeholder and
-  // #busy-text a default sentence. A stub that starts everything empty hid a
-  // first-paint failure that leaves the placeholder on screen (verification
-  // review, 2026-09-18).
+  // The shipped HTML is not blank: #context holds the loading placeholder. A
+  // stub that starts everything empty hid a first-paint failure that leaves
+  // the placeholder on screen (verification review, 2026-09-18).
   elements.get("context")!.textContent = "Loading chat…";
-  elements.get("busy-text")!.textContent = "No task is running.";
   const windowListeners = new Map<string, ((event: unknown) => void)[]>();
   const outbound: unknown[] = [];
   const clipboardWrites: string[] = [];
@@ -265,8 +261,6 @@ function stateMessage(overrides: Record<string, unknown> = {}): Record<string, u
     entries: [{ role: "user", text: "please implement it", atLabel: "10:00" }],
     interactions: [],
     decisions: [],
-    busy: true,
-    busyText: "running",
     waitingForUser: false,
     ...overrides,
   };
@@ -381,13 +375,22 @@ void describe("the chat panel's inline script", () => {
     assert.match(html, /Loading chat/, "the placeholder it replaces must still be there");
   });
 
-  void it("paints a state message: the transcript, the header and the busy banner", () => {
+  void it("paints a state message: the transcript and the header, with no run-status banner", () => {
     const panel = runPanel();
     panel.post(stateMessage());
     assert.match(panel.byId("messages").text(), /please implement it/);
     assert.equal(panel.byId("context").textContent, "My Task — Implementation");
-    assert.equal(panel.byId("busy-indicator").style.display, "block");
+    assert.equal(panel.byId("busy-indicator").style.display, "none", "no run status without waitingForUser");
     assert.equal(panel.byId("error").style.display, "none");
+  });
+
+  void it("shows a 'Waiting for your answer' banner only while waitingForUser is true, and hides it otherwise", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ waitingForUser: true }));
+    assert.equal(panel.byId("busy-indicator").style.display, "block");
+    assert.equal(panel.byId("busy-text").textContent, "Waiting for your answer");
+    panel.post(stateMessage({ waitingForUser: false }));
+    assert.equal(panel.byId("busy-indicator").style.display, "none");
   });
 
   void it("shows the non-steering note on a task chat and hides it on the global chat", () => {
@@ -398,13 +401,13 @@ void describe("the chat panel's inline script", () => {
     assert.equal(panel.byId("steering-note").style.display, "none");
   });
 
-  void it("a failed paint shows a banner and KEEPS the conversation and the busy banner", () => {
+  void it("a failed paint shows a banner and KEEPS the conversation and the waiting banner", () => {
     // The regression this guards: the failure state used to be sent as a
     // full, empty `state` message, so any error while refreshing wiped the
-    // transcript, the busy banner and a pending decision card — a round
+    // transcript, the waiting banner and a pending decision card — a round
     // waiting on an answer could then no longer be answered at all.
     const panel = runPanel();
-    const state = stateMessage();
+    const state = stateMessage({ waitingForUser: true });
     panel.post(state);
     panel.post({
       type: "renderFailed",
@@ -416,7 +419,7 @@ void describe("the chat panel's inline script", () => {
     assert.match(panel.byId("error").textContent, /could not be refreshed/);
     assert.equal(panel.byId("error").style.display, "block");
     assert.match(panel.byId("messages").text(), /please implement it/, "the transcript must survive");
-    assert.equal(panel.byId("busy-indicator").style.display, "block", "the busy banner must survive");
+    assert.equal(panel.byId("busy-indicator").style.display, "block", "the waiting banner must survive");
   });
 
   void it("a failed paint for ANOTHER task never leaves the previous task's conversation on screen", () => {
@@ -425,7 +428,7 @@ void describe("the chat panel's inline script", () => {
     // transcript up while the target had already moved to task B meant the
     // user could answer B's round while reading A's conversation.
     const panel = runPanel();
-    panel.post(stateMessage());
+    panel.post(stateMessage({ waitingForUser: true }));
     panel.post({
       type: "renderFailed",
       target: { kind: "task", taskName: "Other Task", canonicalId: "/w/t2", taskFolderPath: "/w/t2" },
