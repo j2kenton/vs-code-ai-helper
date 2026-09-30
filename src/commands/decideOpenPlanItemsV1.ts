@@ -7,10 +7,19 @@ import {
 } from "../types/workflowDecisionV1";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
+import { createHash, randomBytes } from "crypto";
 import {
-  applyOpenPlanItemDecisionsV1,
+  appendOpenPlanItemsFormV1,
+  OpenPlanItemsFormItemV1,
+  readOpenPlanItemsFormsV1,
+  setOpenPlanItemsFormStateV1,
+} from "../utils/chatHistoryStore";
+import {
+  applyOpenPlanItemsFormV1,
   countChecklistProgressV1,
-  OpenPlanItemDecisionV1,
+  listOpenPlanItemRecordsV1,
+  normalizeChecklistItemTextV1,
+  OpenPlanItemsFormAnswerV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -48,15 +57,12 @@ export interface DecideOpenPlanItemsArgV1 {
 }
 
 /**
- * RC2 item 13, Step 51: the "Decide item by item" option's effect. One
- * QuickPick per open item — Exclude (with a one-line reason, prefilled from
- * the round's own reason when it gave one), "I did it — tick it", or "Leave
- * open" — applied in one atomic write via
- * {@link applyOpenPlanItemDecisionsV1}. There is deliberately no bulk-exclude:
- * the owner sees and confirms every item on its own, per the requirement.
- * Cancelling anywhere in the flow (Escape on a QuickPick or an input box, or
- * leaving the reason blank on Exclude) applies nothing — a half-decided flow
- * is not committed.
+ * RC3 item 5, Step 10: the "Decide item by item" option's effect. It posts a
+ * form into the task's chat (the `openPlanItemsFormV1` entry) — every open
+ * item with its reason, Exclude / "I did it — tick it" / Leave open, and a
+ * note field — and returns; nothing waits on a pop-up. The answers are
+ * applied by {@link applyOpenPlanItemsFormSubmissionV1} when the owner
+ * presses Apply in the chat.
  */
 export async function decideOpenPlanItemsV1(
   arg?: DecideOpenPlanItemsArgV1
@@ -65,83 +71,137 @@ export async function decideOpenPlanItemsV1(
     return false;
   }
   const taskName = formatNotificationTaskLabelV1(arg.displayName, arg.taskFolderPath);
-  const decisions: OpenPlanItemDecisionV1[] = [];
-  for (const item of arg.items) {
-    const truncated = truncateChecklistItemTextV1(item.itemText, 100);
-    const choice = await vscode.window.showQuickPick(
-      [
-        {
-          label: "Exclude",
-          detail: item.reason
-            ? `Reason from the round: ${item.reason}`
-            : "No reason given by the round — you will need to type one.",
-          mode: "exclude" as const,
-        },
-        { label: "I did it — tick it", detail: "Ticks the box and records your note.", mode: "tick" as const },
-        { label: "Leave open", detail: "No change to this item.", mode: "leave" as const },
-      ],
-      { title: truncated, placeHolder: "Decide this plan item", ignoreFocusOut: true }
-    );
-    if (!choice) {
-      return false;
-    }
-    if (choice.mode === "leave") {
-      continue;
-    }
-    if (choice.mode === "exclude") {
-      const typed = await vscode.window.showInputBox({
-        title: "Exclude this item",
-        prompt: "Why does it not apply? Recorded beside the item.",
-        value: item.reason.length > 0 ? item.reason : undefined,
-        ignoreFocusOut: true,
-      });
-      if (typed === undefined) {
-        return false;
-      }
-      if (typed.trim().length === 0) {
-        NotificationRouter.showWarning(
-          `${taskName}: a reason is required to exclude "${truncated}". Nothing was applied.`
-        );
-        return false;
-      }
-      decisions.push({ itemText: item.itemText, mode: "exclude", reason: typed });
-      continue;
-    }
-    const typed = await vscode.window.showInputBox({
-      title: "Tick this item",
-      prompt: "What did you see? Recorded beside the item.",
-      ignoreFocusOut: true,
-    });
-    if (typed === undefined) {
-      return false;
-    }
-    decisions.push({ itemText: item.itemText, mode: "tick", reason: typed });
-  }
-  if (decisions.length === 0) {
-    // Implementation review round 2 (review commit c66cbc9): completing the
-    // whole flow with "Leave open" chosen for every item is a valid,
-    // deliberate no-op — the owner looked at each item and decided none of
-    // them need a change — not a cancellation or a refusal. Only an actual
-    // Escape (handled above, before `decisions` is ever populated) or a
-    // blank Exclude reason (also handled above) is a real "did not
-    // complete"; returning bare `false` here made ChatView render this valid
-    // choice as a command failure (`"${option.label}" did not complete`).
-    NotificationRouter.showInformation(`${taskName}: no items were changed — everything was left open.`);
-    return { outcome: "done" };
-  }
   const planUri = getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath));
   const plan = await readTextIfExists(planUri);
   if (plan === undefined) {
-    NotificationRouter.showWarning(`${taskName}: plan-final.md could not be read, so nothing was applied.`);
+    NotificationRouter.showWarning(`${taskName}: plan-final.md could not be read, so no form was posted.`);
     return false;
   }
-  const applied = applyOpenPlanItemDecisionsV1(plan, decisions, new Date().toISOString().slice(0, 10));
-  if (!(await writeTextFileIfUnchangedV1(planUri, plan, applied.content))) {
-    NotificationRouter.showWarning(
-      `${taskName}: plan-final.md changed while this was being applied — nothing was written. Try again.`
+  // Resolve each item the round named to the plan's own occurrence-aware
+  // record, so two items with identical text get distinct ids.
+  const records = listOpenPlanItemRecordsV1(plan);
+  const used = new Set<string>();
+  const formItems: OpenPlanItemsFormItemV1[] = [];
+  for (const item of arg.items) {
+    const key = normalizeChecklistItemTextV1(item.itemText);
+    const record = records.find(
+      (r) => !r.settled && !used.has(r.itemId) && normalizeChecklistItemTextV1(r.itemText) === key
     );
-    return false;
+    if (!record) {
+      continue;
+    }
+    used.add(record.itemId);
+    formItems.push({
+      itemId: record.itemId,
+      itemText: record.itemText,
+      occurrence: record.occurrence,
+      reason: item.reason,
+    });
   }
+  if (formItems.length === 0) {
+    NotificationRouter.showInformation(`${taskName}: none of these items is still open in the plan.`);
+    return { outcome: "done" };
+  }
+  await appendOpenPlanItemsFormV1(arg.taskFolderPath, arg.taskFolderPath, {
+    formId: randomBytes(16).toString("hex"),
+    stage: arg.stage,
+    items: formItems,
+    planFingerprint: fingerprintPlanV1(plan),
+    ...(arg.resumeFastForwardV1
+      ? {
+          resumeFastForwardV1: {
+            attemptNumber: arg.resumeFastForwardV1.attemptNumber,
+            maxAttempts: arg.resumeFastForwardV1.maxAttempts,
+          },
+        }
+      : {}),
+  });
+  return { outcome: "done" };
+}
+
+function fingerprintPlanV1(plan: string): string {
+  return createHash("sha256").update(plan, "utf8").digest("hex");
+}
+
+export type OpenPlanItemsFormSubmissionResultV1 =
+  /** Validation or write failure: the form stays open and the webview keeps every selection. */
+  | { readonly kind: "rejected"; readonly message: string }
+  /** The form was already applied (or is gone): a repeat submit is a no-op. */
+  | { readonly kind: "ignored"; readonly message: string }
+  | { readonly kind: "applied"; readonly message: string };
+
+function decodeFormAnswersV1(raw: unknown): OpenPlanItemsFormAnswerV1[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const answers: OpenPlanItemsFormAnswerV1[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) {
+      return undefined;
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.itemId !== "string" || typeof e.choice !== "string") {
+      return undefined;
+    }
+    if (e.note !== undefined && typeof e.note !== "string") {
+      return undefined;
+    }
+    answers.push({
+      itemId: e.itemId,
+      choice: e.choice as OpenPlanItemsFormAnswerV1["choice"],
+      ...(typeof e.note === "string" ? { note: e.note } : {}),
+    });
+  }
+  return answers;
+}
+
+/**
+ * RC3 item 5, Step 10: applies one submission of an in-chat open-items form.
+ * Answers already given are never lost — an item left as "Leave open" stays
+ * open and the rest are written in ONE atomic plan write. A rejected
+ * submission (validation or a plan that changed under the write) leaves the
+ * form `open`, so the owner can press Apply again.
+ */
+export async function applyOpenPlanItemsFormSubmissionV1(input: {
+  readonly taskFolderPath: string;
+  readonly canonicalId: string;
+  readonly displayName?: string;
+  readonly formId: string;
+  readonly answers: unknown;
+}): Promise<OpenPlanItemsFormSubmissionResultV1> {
+  const forms = await readOpenPlanItemsFormsV1(input.taskFolderPath, input.canonicalId);
+  const form = forms.find((f) => f.formId === input.formId);
+  if (!form) {
+    return { kind: "ignored", message: "This form is no longer available." };
+  }
+  if (form.state !== "open") {
+    return { kind: "ignored", message: "This form was already applied." };
+  }
+  const answers = decodeFormAnswersV1(input.answers);
+  if (!answers) {
+    return { kind: "rejected", message: "Could not apply: the submitted answers were malformed." };
+  }
+  const taskName = formatNotificationTaskLabelV1(input.displayName, input.taskFolderPath);
+  const planUri = getCanonicalImplementationUri(vscode.Uri.file(input.taskFolderPath));
+  const plan = await readTextIfExists(planUri);
+  if (plan === undefined) {
+    return { kind: "rejected", message: "plan-final.md could not be read, so nothing was applied. Try Apply again." };
+  }
+  const applied = applyOpenPlanItemsFormV1(
+    plan,
+    new Set(form.items.map((item) => item.itemId)),
+    answers,
+    new Date().toISOString().slice(0, 10)
+  );
+  if (!applied.ok) {
+    return { kind: "rejected", message: applied.rejectionReason };
+  }
+  const changed = applied.ticked.length + applied.excluded.length > 0;
+  if (changed && !(await writeTextFileIfUnchangedV1(planUri, plan, applied.content))) {
+    return { kind: "rejected", message: "plan changed, try Apply again." };
+  }
+  await setOpenPlanItemsFormStateV1(input.taskFolderPath, input.canonicalId, form.formId, "applied");
+  const textById = new Map(form.items.map((item) => [item.itemId, item.itemText]));
   const parts: string[] = [];
   if (applied.ticked.length > 0) {
     parts.push(`ticked ${applied.ticked.length}`);
@@ -149,19 +209,29 @@ export async function decideOpenPlanItemsV1(
   if (applied.excluded.length > 0) {
     parts.push(`excluded ${applied.excluded.length}`);
   }
-  NotificationRouter.showInformation(
-    parts.length > 0 ? `${taskName}: ${parts.join(", ")} in plan-final.md.` : `${taskName}: no items were changed.`
+  const skippedLines = applied.skipped.map(
+    (s) => `"${truncateChecklistItemTextV1(textById.get(s.itemId) ?? s.itemText, 60)}" — ${s.reason}`
   );
-  // RC2 item 13, Step 52: the write above is not the end of the story — the
-  // task was left active with nothing further arranged when this card was
-  // raised (its own gating: "dispatches nothing on its own"). Now that the
-  // owner has settled every item they were going to settle, either there is
-  // still open work (arrange the stage's continuing action — Fast Forward's
-  // own remaining budget when it raised this round, an ordinary dispatch
-  // otherwise) or there is none left (offer Advance instead of leaving the
-  // task to stall again on the same empty-round path that raised this card).
-  await continueAfterOpenPlanItemDecisionsV1(arg, taskName);
-  return true;
+  const summary =
+    (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed.") +
+    (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "");
+  NotificationRouter.showInformation(`${taskName}: ${summary}`);
+  if (changed) {
+    // RC2 item 13, Step 52: arrange whatever comes next (Fast Forward's own
+    // remaining budget when it raised this round, an ordinary dispatch
+    // otherwise, or the Advance offer once nothing is left open).
+    await continueAfterOpenPlanItemDecisionsV1(
+      {
+        taskFolderPath: input.taskFolderPath,
+        displayName: input.displayName,
+        items: [],
+        stage: form.stage,
+        ...(form.resumeFastForwardV1 ? { resumeFastForwardV1: form.resumeFastForwardV1 } : {}),
+      },
+      taskName
+    );
+  }
+  return { kind: "applied", message: summary };
 }
 
 /**
@@ -322,9 +392,10 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
     label: "Decide item by item",
     resumeKind: "unpause",
     consequence:
-      "Opens one QuickPick per open item — exclude it with a reason, tick it because you already did it, or " +
-      "leave it open — and writes your choices to plan-final.md in one pass, with a dated Accepted Non-Goals " +
-      "entry for anything excluded. Then builds whatever is still open, or offers Advance once nothing is.",
+      "Shows a form in this chat with every open item — exclude it with a reason, tick it because you already " +
+      "did it, or leave it open — and writes your choices to plan-final.md in one pass when you press Apply, " +
+      "with a dated Accepted Non-Goals entry for anything excluded. Items you leave open stay open. Then " +
+      "builds whatever is still open, or offers Advance once nothing is.",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.decideOpenPlanItems",

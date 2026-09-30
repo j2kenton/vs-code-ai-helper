@@ -31,6 +31,7 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
+import { FastForwardResumeStateV1, isFastForwardResumeStateTrustedV1 } from "./fastForwardResumeSuffixV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -1088,7 +1089,7 @@ export async function resumeAndApplyCurrentStageActionV1(
      * `fastForwardReviewWithAI` itself) is what actually governs this
      * dispatch, not the single-cycle plan below.
      */
-    resumeFastForwardV1?: { attemptNumber: number; maxAttempts: number };
+    resumeFastForwardV1?: FastForwardResumeStateV1;
   }
 ): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
@@ -1101,7 +1102,31 @@ export async function resumeAndApplyCurrentStageActionV1(
   if (!target) {
     return;
   }
-  const resumeFastForward = explicitArg?.resumeFastForwardV1;
+  // RC3 item 4, Step 3 completion fix: a card's captured provenance is
+  // re-checked HERE, at the moment the option is actually chosen, not merely
+  // trusted because it was present at post time — see
+  // `isFastForwardResumeStateTrustedV1`'s doc comment for why a stale record
+  // (a window restart, or a different run since started for this task) must
+  // fall through to the single-cycle dispatch below instead of starting an
+  // unrequested Fast Forward run.
+  const resumeFastForwardCandidate = explicitArg?.resumeFastForwardV1;
+  const resumeFastForwardTrusted =
+    resumeFastForwardCandidate !== undefined &&
+    isFastForwardResumeStateTrustedV1(resumeFastForwardCandidate, target.taskFolderPath);
+  const resumeFastForward = resumeFastForwardTrusted ? resumeFastForwardCandidate : undefined;
+  if (resumeFastForwardCandidate !== undefined && !resumeFastForwardTrusted) {
+    // Review-flagged completion fix, round 2 (2026-09-30): the option's own
+    // label was baked in as "... and resume Fast Forward" when the card was
+    // posted — it cannot know at post time that the record will later go
+    // stale, so the label alone would mislead the owner into thinking Fast
+    // Forward resumed when it silently fell back to one cycle. This is the
+    // only point where the truth is available, so it is said here instead.
+    NotificationRouter.showInformation(
+      `"${target.progress.displayName ?? target.folderName}": this card's captured Fast Forward run is no longer valid ` +
+        "(the run has since ended, a different run started, or the window restarted) — ran one cycle instead of " +
+        "resuming Fast Forward."
+    );
+  }
   if (resumeFastForward) {
     const ffTaskName = target.progress.displayName ?? target.folderName;
     const dispatchedFf = await resumeThenDispatchV1(
@@ -1593,7 +1618,7 @@ export function registerResumeTaskCommand(
   // something to offer in the command palette.
   const resumeAndApplyCurrentStageAction = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-    (arg?: ResumeTaskArg & { resumeFastForwardV1?: { attemptNumber: number; maxAttempts: number } }) =>
+    (arg?: ResumeTaskArg & { resumeFastForwardV1?: FastForwardResumeStateV1 }) =>
       resumeAndApplyCurrentStageActionV1(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(resumeAndApplyCurrentStageAction);

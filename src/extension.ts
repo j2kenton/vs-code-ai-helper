@@ -108,6 +108,7 @@ import {
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
 import { registerGoToReviewAndApplyCommandV1 } from "./commands/goToReviewAndApplyV1";
 import { registerRetryReviewWithBackupCommandV1 } from "./commands/retryReviewWithBackupV1";
+import { registerRerunReviewAfterUnchangedTreeCardCommandV1 } from "./commands/rerunReviewAfterUnchangedTreeCardV1";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
@@ -1329,6 +1330,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerGoToReviewAndApplyCommandV1(context);
   registerRetryReviewWithBackupCommandV1(context);
+  registerRerunReviewAfterUnchangedTreeCardCommandV1(context, chatViewProvider);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);

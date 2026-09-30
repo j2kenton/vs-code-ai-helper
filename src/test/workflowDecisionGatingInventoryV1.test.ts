@@ -43,15 +43,19 @@ async function readSrc(relativePath: string): Promise<string> {
 /**
  * Returns the source slice from `decisionKey: "<key>"` through the next
  * top-level `postWorkflowDecisionV1(...)` call's closing — approximated as
- * the next 4000 characters, generous enough to cover every known decision
- * object literal in this repo (the largest, `reconcilePlanChecklist`'s, is
- * under 2500) without accidentally spilling into an unrelated later call.
+ * the next 8000 characters, cut short at the next `decisionKey:` so it never
+ * spills into an unrelated later call. 8000 is generous enough for every
+ * known decision object literal in this repo (the largest,
+ * `reconcilePlanChecklist`'s, grew past 4000 with RC3 item 1's plain-language
+ * opening).
  */
 function sliceAroundDecisionKey(source: string, decisionKey: string): string {
   const marker = `decisionKey: "${decisionKey}"`;
   const index = source.indexOf(marker);
   assert.ok(index >= 0, `expected to find ${marker} in source`);
-  return source.slice(index, index + 4000);
+  const nextKey = source.indexOf("decisionKey:", index + marker.length);
+  const end = nextKey >= 0 ? Math.min(nextKey, index + 8000) : index + 8000;
+  return source.slice(index, end);
 }
 
 void describe("WorkflowDecisionV1 creation-site inventory — gating field", () => {

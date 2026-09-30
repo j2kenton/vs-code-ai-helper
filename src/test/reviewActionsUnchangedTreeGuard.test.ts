@@ -23,6 +23,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewActions";
+import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
 import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import {
   initNotificationRouter,
@@ -45,6 +46,8 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -502,7 +505,7 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
     }
   });
 
-  void it("shows a cancellable modal for an INTERACTIVE dispatch against an unchanged tree from a MAPPED SOURCE STAGE, and refuses on cancel without touching model resolution", async () => {
+  void it("RC3 item 13: posts a local-only chat card for an INTERACTIVE dispatch against an unchanged tree from a MAPPED SOURCE STAGE, and opens no modal", async () => {
     const { folderPath } = await makeUnchangedTreeTaskFolder(`interactive-unchanged-${Math.floor(Math.random() * 1e9)}`);
     const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
     const fsBridge = installFsBridge();
@@ -511,11 +514,19 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
 
     const windowTarget = vscode.window as unknown as Record<string, unknown>;
     const origShowWarning = windowTarget.showWarningMessage;
-    const warningCalls: unknown[][] = [];
-    windowTarget.showWarningMessage = (...args: unknown[]): Promise<string | undefined> => {
-      warningCalls.push(args);
-      return Promise.resolve(undefined); // simulate dismiss/cancel
+    let modalCalls = 0;
+    windowTarget.showWarningMessage = (): Promise<string | undefined> => {
+      modalCalls += 1;
+      return Promise.resolve(undefined);
     };
+
+    const askInteractionCalls: unknown[] = [];
+    const fakeChatViewProvider = {
+      askInteraction: (question: unknown): Promise<void> => {
+        askInteractionCalls.push(question);
+        return Promise.resolve();
+      },
+    } as unknown as import("../views/chatView").ChatViewProvider;
 
     let modelResolutionCalled = false;
     const patches: Patched[] = [
@@ -541,23 +552,35 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
         workspaceRoot,
         "impl" as TaskStage,
         true,
-        {}
+        { chatViewProvider: fakeChatViewProvider }
       );
 
-      assert.equal(warningCalls.length, 1, "exactly one confirmation modal must be shown");
-      const [message, opts, ...buttons] = warningCalls[0] as [string, { modal?: boolean }, ...string[]];
-      assert.ok(message.includes("nothing has changed"), "the modal must explain why re-running would be pointless");
-      assert.equal(opts?.modal, true, "the confirmation must be a blocking modal, not a dismissable toast");
-      assert.deepEqual(buttons, ["I've made changes — re-check"], "the only bypass option must be the explicit re-check button");
+      assert.equal(modalCalls, 0, "no modal must ever be shown for the unchanged-tree case");
+      assert.equal(askInteractionCalls.length, 1, "exactly one chat card must be posted");
+      const posted = askInteractionCalls[0] as {
+        questions: readonly { prompt: string; options: readonly { optionId: string; label: string }[] }[];
+        optionEffects?: Record<string, { kind: string; command?: string; args?: readonly unknown[] }>;
+      };
+      const question = posted.questions[0];
+      assert.ok(question, "the card must carry a question");
+      assert.match(question.prompt, /nothing has changed/i);
+      const optionIds = question.options.map((o) => o.optionId);
+      assert.deepEqual(optionIds, ["keepLastReview", "reviewAgainAnyway"]);
+      assert.deepEqual(posted.optionEffects?.keepLastReview, { kind: "doNothing" });
+      assert.deepEqual(posted.optionEffects?.reviewAgainAnyway, {
+        kind: "command",
+        command: "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
+        args: [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "impl-high-review" }],
+      });
 
       assert.equal(
         modelResolutionCalled,
         false,
-        "cancelling the modal must refuse the dispatch before any provider work starts"
+        "posting the card must refuse the dispatch before any provider work starts — nothing awaits the answer"
       );
 
       const artifactAfter = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
-      assert.ok(artifactAfter.includes("Readiness: 7/10"), "the existing review artifact must be untouched on cancel");
+      assert.ok(artifactAfter.includes("Readiness: 7/10"), "the existing review artifact must be untouched while the card is unanswered");
     } finally {
       windowTarget.showWarningMessage = origShowWarning;
       for (const p of patches.reverse()) { p.restore(); }
@@ -567,11 +590,65 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
     }
   });
 
-  void it("proceeds with a real dispatch when the interactive bypass is chosen, even though the tree is unchanged", async () => {
-    const { folderPath } = await makeUnchangedTreeTaskFolder(`interactive-bypass-${Math.floor(Math.random() * 1e9)}`);
+  void it("RC3 item 13: a plain re-dispatch without going through the card's bypass command remains guarded (posts the card again)", async () => {
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`interactive-still-guarded-${Math.floor(Math.random() * 1e9)}`);
+    const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+
+    const askInteractionCalls: unknown[] = [];
+    const fakeChatViewProvider = {
+      askInteraction: (question: unknown): Promise<void> => {
+        askInteractionCalls.push(question);
+        return Promise.resolve();
+      },
+    } as unknown as import("../views/chatView").ChatViewProvider;
+
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () =>
+        Promise.reject(new Error("must not reach context-pack write when the unchanged-tree guard refuses"))),
+    ];
+
+    try {
+      for (let i = 0; i < 2; i += 1) {
+        // A plain re-dispatch (no `skipUnchangedTreeGuard`) — simulating the
+        // owner clicking Review again without having answered the card —
+        // must hit the guard again each time, not remember an earlier visit.
+        // eslint-disable-next-line no-await-in-loop
+        await runReviewForFolder(
+          vscode.Uri.file(REAL_ROOT),
+          vscode.Uri.file(folderPath),
+          workspaceRoot,
+          "impl" as TaskStage,
+          true,
+          { chatViewProvider: fakeChatViewProvider }
+        );
+      }
+
+      assert.equal(askInteractionCalls.length, 2, "the guard must post the card again on every un-bypassed dispatch, not just the first");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+void describe("rerunReviewAfterUnchangedTreeCardV1 — the unchanged-tree card's sole bypass (RC3 item 13)", () => {
+  void it("dispatches exactly one real review, bypassing the guard, when invoked with the card's args", async () => {
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`bypass-command-${Math.floor(Math.random() * 1e9)}`);
     // A review with zero changed files now refuses on its own (RC1 item 5).
-    // The task tracks one changed file, so the interactive bypass of the
-    // unchanged-tree guard is what decides whether the dispatch runs.
+    // The task tracks one changed file, so the bypass command's own dispatch
+    // is what decides whether the review runs.
     const progressPath = path.join(folderPath, "task-progress.json");
     const trackedProgress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
     fs.writeFileSync(
@@ -579,46 +656,81 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       JSON.stringify({ ...trackedProgress, implReviewFiles: ["src/a.ts"] }, null, 2),
       "utf8"
     );
-    const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     const recorder = installNotificationRecorder();
 
-    const windowTarget = vscode.window as unknown as Record<string, unknown>;
-    const origShowWarning = windowTarget.showWarningMessage;
-    windowTarget.showWarningMessage = (): Promise<string> => Promise.resolve("I've made changes — re-check");
-
+    let transportInvokeCount = 0;
+    const countingTransport: AgentTransportV1 = {
+      runnerId: "stub-review-runner",
+      invoke: (request, output) => {
+        transportInvokeCount += 1;
+        return markdownTransportV1("Readiness: 3/10\n\n- New blockers found.\n").invoke(request, output);
+      },
+    };
     const patches: Patched[] = [
       patch(modelSelectionModule, "resolveModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
       patch(modelSelectionModule, "resolveFreshModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
-      stubV1RunnerSelection([markdownTransportV1("Readiness: 3/10\n\n- New blockers found.\n")]),
+      stubV1RunnerSelection([countingTransport]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
     ];
 
     try {
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl" as TaskStage,
-        true,
-        {}
-      );
+      await rerunReviewAfterUnchangedTreeCardV1(vscode.Uri.file(REAL_ROOT), {
+        taskFolderPath: folderPath,
+        stage: "impl-high-review" as TaskStage,
+      });
 
+      assert.equal(transportInvokeCount, 1, "the bypass command must dispatch exactly one review");
       const artifactAfter = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
       assert.ok(
         artifactAfter.includes("Readiness: 3/10"),
-        `bypassing the guard must let a real re-review overwrite the artifact; got: ${artifactAfter}; ` +
+        `the bypass must let a real re-review overwrite the artifact; got: ${artifactAfter}; ` +
           `notifications: ${JSON.stringify(recorder.notifications)}`
       );
     } finally {
-      windowTarget.showWarningMessage = origShowWarning;
+      for (const p of patches.reverse()) { p.restore(); }
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("refuses without dispatching when the task has since moved past the card's stage", async () => {
+    const { folderPath } = await makeUnchangedTreeTaskFolder(`bypass-stale-${Math.floor(Math.random() * 1e9)}`);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+
+    let promptRenderCount = 0;
+    const patches: Patched[] = [
+      patch(promptTemplatesModule, "renderPromptTemplate", () => {
+        promptRenderCount += 1;
+        return Promise.resolve("stub prompt");
+      }),
+    ];
+
+    try {
+      // The card was posted for "impl-plan-review" (say), but the task's
+      // current stage no longer maps to it — a stale card from before the
+      // task advanced.
+      await rerunReviewAfterUnchangedTreeCardV1(vscode.Uri.file(REAL_ROOT), {
+        taskFolderPath: folderPath,
+        stage: "plan-high-review" as TaskStage,
+      });
+
+      assert.equal(promptRenderCount, 0, "a stale card must never dispatch a review");
+      assert.ok(
+        recorder.notifications.some((n) => n.message.includes("moved past the stage")),
+        `expected a warning naming the stale card; got: ${JSON.stringify(recorder.notifications)}`
+      );
+    } finally {
       for (const p of patches.reverse()) { p.restore(); }
       recorder.restore();
       wsStub.restore();
@@ -886,6 +998,232 @@ void describe("fastForwardReviewWithAI — a review stage with no review artifac
         `expected the initial-review branch to have run; got: ${JSON.stringify(recorder.notifications)}`
       );
     } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+/**
+ * RC3 item 6 (Step 8): a task reaching Publish with no Publish Checks
+ * freshness stamp on disk (mirrors `publishOwnershipMatrix.test.ts`'s
+ * "no-checks-" fixture, but driven through Fast Forward rather than a direct
+ * review dispatch).
+ */
+function makePublishTaskFolderNoChecksV1(name: string): { folderPath: string } {
+  const folderPath = path.join(REAL_ROOT, "plans", name);
+  fs.mkdirSync(folderPath, { recursive: true });
+  const progress: TaskProgress = {
+    taskFolder: name,
+    currentStage: "publish",
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ownership: {
+      metaRoot: path.dirname(folderPath),
+      projectRoot: path.dirname(folderPath),
+      workspaceRoot: REAL_ROOT,
+      boundAt: "2026-01-01T00:00:00.000Z",
+      state: "resolved",
+    },
+  };
+  fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+  fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+  fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+  return { folderPath };
+}
+
+/**
+ * RC2 item 13, 2026-09-28: Fast Forward reaching Publish with Publish Checks
+ * not yet run used to call `runReviewForFolder` first, which refused on the
+ * freshness gate (`requirePublishChecksFreshnessOrWarnV1`) leaving no review
+ * artifact written; Fast Forward's OWN "no initial review yet" branch then
+ * read that same absence and reported a SECOND, misleading warning — "the
+ * initial review did not produce usable output. Try running Review
+ * manually" — for a dispatch that was never attempted, and no round the
+ * ledger could ever legitimately call completed. Step 8 makes Fast Forward
+ * run Publish Checks itself first, through the same command the Publish
+ * row's own button uses, before ever calling `runReviewForFolder`.
+ */
+void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Step 8)", () => {
+  void it("runs Publish Checks first, never attempts the Publish review, and never reports the refusal as 'did not produce usable output'", async () => {
+    const { folderPath } = makePublishTaskFolderNoChecksV1(
+      `ff-publish-no-checks-${Math.floor(Math.random() * 1e9)}`
+    );
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    ];
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const priorOverride = commandsObj._executeCommandOverride;
+    const executed: { id: string; args: unknown[] }[] = [];
+    commandsObj._executeCommandOverride = (id: string, ...args: unknown[]): Promise<unknown> => {
+      executed.push({ id, args });
+      // Simulate a real `runPublishChecks` invocation that ran but left the
+      // checks still not fresh (e.g. a real lint failure) — proving this
+      // never gets misreported as an unusable review output.
+      return Promise.resolve(undefined);
+    };
+
+    try {
+      await fastForwardReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+
+      assert.equal(
+        executed.some((c) => c.id === "vs-code-ai-helper.runPublishChecks"),
+        true,
+        `expected Fast Forward to run Publish Checks before attempting the Publish review; got: ${JSON.stringify(executed)}`
+      );
+      assert.equal(
+        recorder.notifications.some((n) => /did not produce usable output/.test(n.message)),
+        false,
+        `a Publish-Checks-not-fresh refusal must never be reported as "did not produce usable output"; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      assert.equal(
+        fs.existsSync(path.join(folderPath, "publish-review.md")),
+        false,
+        "the Publish review must never be attempted (and so never write its artifact) before Publish Checks have passed"
+      );
+      const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as {
+        roundLedger?: unknown[];
+      };
+      assert.equal(
+        (progress.roundLedger ?? []).length,
+        0,
+        "a refused dispatch must never write a completed (or any) round to the ledger"
+      );
+    } finally {
+      commandsObj._executeCommandOverride = priorOverride;
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  /**
+   * 2026-09-30 review follow-up (RC3 item 6 / Step 8 completion blocker):
+   * Publish Checks freshness passing is not the only way `runReviewForFolder`
+   * can refuse a Publish dispatch before ever claiming a review attempt —
+   * Step 6's own changed-file-record refusal ("no changed-file record for
+   * this task... shows no changed files") fires INSIDE `runReviewForFolder`,
+   * after the freshness gate passes, and already reports its own specific
+   * reason via NotificationRouter. Before this fix, `fastForwardReviewWithAI`
+   * unconditionally fell through to `describeUnusableReviewBlockV1`'s generic
+   * "did not produce usable output. Try running Review manually" warning
+   * whenever `initialContent` stayed empty — a second, wrong message on top
+   * of the real one, plus an inapplicable "Run Implementation"/"Restore"
+   * action. This fixture has FRESH Publish Checks (so it clears the
+   * freshness gate cleanly) but no `implReviewFiles`, no round ledger and no
+   * baseline sidecar, so Step 6's rebuild is refused with no changed-file
+   * record — proving the fix is scoped to the actual gap, not merely to the
+   * freshness-refusal case the sibling test above already covers.
+   */
+  void it("a Publish refusal from Step 6's changed-file-record check (not the freshness gate) is never re-reported as 'did not produce usable output'", async () => {
+    const name = `ff-publish-no-scope-${Math.floor(Math.random() * 1e9)}`;
+    const folderPath = path.join(REAL_ROOT, "plans", name);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const progress: TaskProgress = {
+      taskFolder: name,
+      currentStage: "publish",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      implReviewFiles: undefined,
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+    // A fresh Publish Checks stamp against the REAL_ROOT repo's actual HEAD —
+    // mirrors publishOwnershipMatrix.test.ts's stampPublishChecksFreshnessV1
+    // — so this fixture clears the freshness gate and reaches Step 6's own
+    // changed-file-record rebuild, not the freshness refusal.
+    const stampSection = renderPublishChecksFreshnessStamp({
+      formatVersion: 1,
+      runId: "00000000-0000-4000-8000-000000000000",
+      verifiedCommitSha: REAL_ROOT_HEAD_SHA,
+      completedAt: "2026-01-01T00:00:00.000Z",
+      // Matches resolvePublishScopeFolder's own resolution for this fixture:
+      // ownership.projectRoot is path.dirname(folderPath) below, and that
+      // (not REAL_ROOT itself) is what the freshness check will hash.
+      scopeId: computePublishScopeId(path.dirname(folderPath)),
+    });
+    fs.writeFileSync(
+      path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME),
+      `${stampSection}\n`,
+      "utf8"
+    );
+
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    ];
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const priorOverride = commandsObj._executeCommandOverride;
+    commandsObj._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+
+    try {
+      await fastForwardReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+
+      assert.equal(
+        recorder.notifications.some((n) => /did not produce usable output/.test(n.message)),
+        false,
+        `Step 6's own changed-file-record refusal must never be re-reported as "did not produce usable output"; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      assert.equal(
+        recorder.notifications.some((n) => n.actionCommand?.title === "Run Implementation" || n.actionCommand?.title === "Restore Last Usable Summary"),
+        false,
+        "a missing-changed-file-record refusal must never offer Run Implementation/Restore — those actions do not apply to it"
+      );
+      const refusal = recorder.notifications.find((n) => /no changed-file record for this task/.test(n.message));
+      assert.ok(
+        refusal,
+        `expected Step 6's own specific refusal reason to reach the owner; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      const progressAfter = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as {
+        roundLedger?: unknown[];
+      };
+      assert.equal(
+        (progressAfter.roundLedger ?? []).length,
+        0,
+        "a refused dispatch must never write a completed (or any) round to the ledger"
+      );
+    } finally {
+      commandsObj._executeCommandOverride = priorOverride;
       for (const p of patches.reverse()) { p.restore(); }
       for (const p of gatePatches.reverse()) { p.restore(); }
       admissionPatch.restore();

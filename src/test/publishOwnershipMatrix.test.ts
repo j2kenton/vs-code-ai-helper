@@ -34,10 +34,11 @@ import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { isUnusableAsExistingReview, nextStage, resumeReviewInteractionV1, runReviewForFolder } from "../commands/reviewActions";
+import { isUnusableAsExistingReview, nextStage, PUBLISH_SCOPE_REFUSAL_REASON_V1, resumeReviewInteractionV1, runReviewForFolder } from "../commands/reviewActions";
+import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
 import { setTaskStage } from "../commands/setTaskStage";
 import { commitAndPushTask, completeCommitAndPushTask } from "../commands/commitAndPushTask";
-import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
+import { MAX_ROUND_LEDGER_ENTRIES, REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentRunResult } from "../types/agentRunner";
 import {
   buildUnusableImplementationSummaryV1,
@@ -169,7 +170,15 @@ function stampPublishChecksFreshnessV1(folderPath: string): void {
 
 function makeTaskFolder(
   name: string,
-  currentStage: TaskProgress["currentStage"] = "impl-low-review"
+  currentStage: TaskProgress["currentStage"] = "impl-low-review",
+  // A tracked file set by default: a review with none falls back to the open
+  // editors and (v1 fixes 2, item 21) never auto-advances, which is not what
+  // this matrix is exercising. RC3 item 10 (Step 6) tests pass the literal
+  // "none" to exercise the Publish-stage rebuild-from-ledger/baseline path
+  // instead — a default parameter cannot distinguish "omitted" from an
+  // explicit `undefined` argument (both trigger the same default), so a
+  // distinct sentinel is required here.
+  implReviewFilesOverride: string[] | "none" = ["src/tracked.ts"]
 ): { folderPath: string } {
   const folderPath = path.join(REAL_ROOT, "plans", name);
   fs.mkdirSync(folderPath, { recursive: true });
@@ -179,10 +188,7 @@ function makeTaskFolder(
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
-    // A tracked file set: a review with none falls back to the open editors
-    // and (v1 fixes 2, item 21) never auto-advances, which is not what this
-    // matrix is exercising.
-    implReviewFiles: ["src/tracked.ts"],
+    implReviewFiles: implReviewFilesOverride === "none" ? undefined : implReviewFilesOverride,
     ownership: {
       metaRoot: path.dirname(folderPath),
       projectRoot: path.dirname(folderPath),
@@ -1094,6 +1100,481 @@ void describe("Publish review — genuine provider failure and cancellation outc
   });
 });
 
+void describe("Publish review — rebuilding the changed-file scope when implReviewFiles is missing (RC3 item 10 / Step 6)", () => {
+  void it("no changed-file record (no ledger, no baseline sidecar): refuses the Publish review, never falls back to open editors, and writes no round", async () => {
+    const { folderPath } = makeTaskFolder(`no-scope-${Math.floor(Math.random() * 1e9)}`, "publish", "none");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    try {
+      await runReviewWithOutcome(
+        folderPath,
+        dispatches,
+        { runnerId: "stub-runner", status: "failed", errorMessage: "must never be reached — the rebuild refusal must return before any dispatch" },
+        "publish"
+      );
+
+      assert.equal(dispatches.length, 0, "a refused scope rebuild must never schedule the publish chain");
+      const warning = provider.getEntries().find((entry) => entry.message.includes(PUBLISH_SCOPE_REFUSAL_REASON_V1));
+      assert.ok(warning, "expected the explicit no-changed-file-record refusal notification, not an open-editor fallback");
+
+      const progressAfter = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+      assert.equal(progressAfter.roundLedger, undefined, "a refused rebuild must write no round to the ledger");
+      assert.equal(progressAfter.implReviewFiles, undefined, "a refusal never writes a fabricated scope back");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("established-but-empty change record (one terminal implementation round with no files changed): skips the Publish review, records an empty scope, and writes no round", async () => {
+    const { folderPath } = makeTaskFolder(`empty-scope-${Math.floor(Math.random() * 1e9)}`, "publish", "none");
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+    progress.roundLedger = [
+      {
+        roundId: "r1",
+        attemptIds: ["r1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        state: "completed",
+        outcome: { filesChanged: [] },
+      },
+    ];
+    fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const dispatches: AutomationDispatch[] = [];
+    try {
+      await runReviewWithOutcome(
+        folderPath,
+        dispatches,
+        { runnerId: "stub-runner", status: "failed", errorMessage: "must never be reached — an established-empty scope must skip the review entirely" },
+        "publish"
+      );
+
+      assert.equal(dispatches.length, 0, "an empty-scope Publish review must never schedule the publish chain");
+      const warning = provider
+        .getEntries()
+        .find((entry) => entry.message.includes("Publish review was not run: this task's change record shows no changed files."));
+      assert.ok(warning, "expected the established-but-empty notification, distinct from the no-record refusal");
+
+      const progressAfter = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+      assert.deepEqual(progressAfter.implReviewFiles, [], "the empty set is written back so it is not re-derived every time");
+      assert.equal(progressAfter.roundLedger?.length, 1, "no new round is written for an established-but-empty outcome");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a full ledger at the retention cap is never trusted end-to-end through runReviewForFolder: falls back to the baseline diff, persists the rebuilt scope, and logs the retention-cap reason (2026-09-30 review, Step 6 test-matrix gap: only unit- and rebuildPublishImplReviewFilesV1-level coverage existed for this case)", async () => {
+    // Deliberately its own isolated git repo, disjoint from the task folder
+    // (mirrors publishScopeRebuildProvenanceV1.test.ts / reviewInputLimitV1.test.ts's
+    // pattern) rather than REAL_ROOT/plans/<name>: REAL_ROOT accumulates every
+    // other test's fixture files as untracked entries in the SAME git tree, so
+    // a real `git ls-files --others` there would pick them all up.
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-cap-e2e-"));
+    cp.execSync("git init", { cwd: isolatedRoot, stdio: "ignore" });
+    // The task folder must live INSIDE this repo (gitignored) — the Publish
+    // freshness gate resolves the "current commit" from the task's own
+    // ownership.projectRoot (path.dirname(folderPath)), which must therefore
+    // be a readable git repo itself, matching production's real layout
+    // (`.ensemble/...` gitignored inside the workspace). ".gitignore"-ing
+    // "plans/" keeps the task's own fixture files (task-progress.json etc.)
+    // out of `git ls-files --others`, so only the real changed file below is
+    // ever seen by the baseline diff.
+    fs.writeFileSync(path.join(isolatedRoot, ".gitignore"), "plans/\n", "utf8");
+    cp.execSync("git add .gitignore", { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execSync(
+      'git -c user.email=test@example.invalid -c user.name=test commit -q -m "init"',
+      { cwd: isolatedRoot, stdio: "ignore" }
+    );
+    const baselineSha = cp.execSync("git rev-parse HEAD", { cwd: isolatedRoot }).toString().trim();
+    // A real change since baseline that only the baseline-diff fallback can
+    // see — the padded ledger below never names this file, so if the
+    // dispatch used the ledger (or a partial union) instead of the baseline,
+    // this file would be missing from the persisted scope.
+    fs.writeFileSync(path.join(isolatedRoot, "changed-after-baseline.ts"), "export const x = 1;\n", "utf8");
+
+    const folderPath = path.join(isolatedRoot, "plans", `cap-e2e-${Math.floor(Math.random() * 1e9)}`);
+    fs.mkdirSync(folderPath, { recursive: true });
+    fs.writeFileSync(path.join(folderPath, ".impl-baseline-commit"), baselineSha, "utf8");
+
+    const paddedLedger: NonNullable<TaskProgress["roundLedger"]> = Array.from(
+      { length: MAX_ROUND_LEDGER_ENTRIES },
+      (_, i) => ({
+        roundId: `pad-${i}`,
+        attemptIds: [`pad-${i}`],
+        stage: "impl" as TaskStage,
+        mode: "implementation" as const,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        state: "completed" as const,
+        outcome: { filesChanged: [] as string[] },
+      })
+    );
+
+    const progress: TaskProgress = {
+      taskFolder: path.basename(folderPath),
+      currentStage: "publish",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      implReviewFiles: undefined,
+      roundLedger: paddedLedger,
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: isolatedRoot,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+    const scopeFolder = path.dirname(folderPath);
+    const stampSection = renderPublishChecksFreshnessStamp({
+      formatVersion: 1,
+      runId: "00000000-0000-4000-8000-0000000000ce",
+      verifiedCommitSha: baselineSha,
+      completedAt: "2026-01-01T00:00:00.000Z",
+      scopeId: computePublishScopeId(scopeFolder),
+    });
+    fs.writeFileSync(
+      path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME),
+      `${stampSection}\n`,
+      "utf8"
+    );
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const ws = vscode.workspace as unknown as Record<string, unknown>;
+    const origWorkspaceFolders = ws.workspaceFolders;
+    ws.workspaceFolders = [{ uri: vscode.Uri.file(isolatedRoot), name: "root", index: 0 }];
+    const workspaceRoot = { uri: vscode.Uri.file(isolatedRoot), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+    const dispatches: AutomationDispatch[] = [];
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+    try {
+      // writeRunLog is deliberately NOT stubbed here (unlike runPassingReview/
+      // runReviewWithOutcome above) — this test reads the real log file to
+      // confirm the retention-cap reason actually reaches the round log, not
+      // just the in-memory rebuild result.
+      await runReviewForFolder(
+        vscode.Uri.file(isolatedRoot),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "publish",
+        true,
+        {}
+      );
+
+      const progressAfter = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+      assert.deepEqual(
+        progressAfter.implReviewFiles,
+        ["changed-after-baseline.ts"],
+        "a ledger at the retention cap must never be trusted, even end-to-end through the real dispatch — the persisted scope must be the baseline diff, not a partial (here: empty) ledger union"
+      );
+
+      const runsDir = path.join(folderPath, "runs");
+      const logFiles = fs.readdirSync(runsDir).filter((name) => name.includes("publish-scope-rebuild"));
+      assert.equal(logFiles.length, 1, "expected exactly one publish-scope-rebuild run log");
+      const logContent = fs.readFileSync(path.join(runsDir, logFiles[0]!), "utf8");
+      assert.match(logContent, /retention cap/, "the round log must name the retention-cap reason, not silently swap sources");
+      assert.match(logContent, /task-start baseline diff/);
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      ws.workspaceFolders = origWorkspaceFolders;
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  /**
+   * Shared rig for the three "sub-cap ledger, but one implementation row
+   * can't be vouched for" end-to-end cases below (2026-09-30 review,
+   * architectural blocker: only `resolveLedgerImplReviewFilesV1`-level unit
+   * coverage existed for a live or change-list-less row — never proven
+   * end-to-end through the real dispatch that the fallback actually fires,
+   * persists the baseline diff rather than a partial ledger union, and logs
+   * the offending row). Mirrors the retention-cap rig above: an isolated git
+   * repo (so `git ls-files --others` never picks up other tests' fixtures),
+   * one real file changed since the baseline that only the baseline-diff
+   * fallback can see, and a ledger the caller supplies directly.
+   */
+  async function runLedgerFallbackCaseV1(
+    namePrefix: string,
+    extraLedgerRows: NonNullable<TaskProgress["roundLedger"]>
+  ): Promise<{ progressAfter: TaskProgress; logContent: string }> {
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `ensemble-publish-${namePrefix}-`));
+    cp.execSync("git init", { cwd: isolatedRoot, stdio: "ignore" });
+    fs.writeFileSync(path.join(isolatedRoot, ".gitignore"), "plans/\n", "utf8");
+    cp.execSync("git add .gitignore", { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execSync(
+      'git -c user.email=test@example.invalid -c user.name=test commit -q -m "init"',
+      { cwd: isolatedRoot, stdio: "ignore" }
+    );
+    const baselineSha = cp.execSync("git rev-parse HEAD", { cwd: isolatedRoot }).toString().trim();
+    // Only the baseline-diff fallback can see this file — a padded/partial
+    // ledger union would never name it, so its presence in the persisted
+    // scope proves the fallback (not the ledger) actually ran.
+    fs.writeFileSync(path.join(isolatedRoot, "changed-after-baseline.ts"), "export const x = 1;\n", "utf8");
+
+    const folderPath = path.join(isolatedRoot, "plans", `${namePrefix}-${Math.floor(Math.random() * 1e9)}`);
+    fs.mkdirSync(folderPath, { recursive: true });
+    fs.writeFileSync(path.join(folderPath, ".impl-baseline-commit"), baselineSha, "utf8");
+
+    const progress: TaskProgress = {
+      taskFolder: path.basename(folderPath),
+      currentStage: "publish",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      implReviewFiles: undefined,
+      roundLedger: extraLedgerRows,
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: isolatedRoot,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
+    };
+    fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+    fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+    const scopeFolder = path.dirname(folderPath);
+    const stampSection = renderPublishChecksFreshnessStamp({
+      formatVersion: 1,
+      runId: "00000000-0000-4000-8000-0000000000cf",
+      verifiedCommitSha: baselineSha,
+      completedAt: "2026-01-01T00:00:00.000Z",
+      scopeId: computePublishScopeId(scopeFolder),
+    });
+    fs.writeFileSync(
+      path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME),
+      `${stampSection}\n`,
+      "utf8"
+    );
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const ws = vscode.workspace as unknown as Record<string, unknown>;
+    const origWorkspaceFolders = ws.workspaceFolders;
+    ws.workspaceFolders = [{ uri: vscode.Uri.file(isolatedRoot), name: "root", index: 0 }];
+    const workspaceRoot = { uri: vscode.Uri.file(isolatedRoot), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+    const dispatches: AutomationDispatch[] = [];
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+    try {
+      // writeRunLog is deliberately NOT stubbed — these tests read the real
+      // log file to confirm the specific skipped-row reason actually reaches
+      // the round log, not just the in-memory rebuild result.
+      await runReviewForFolder(
+        vscode.Uri.file(isolatedRoot),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "publish",
+        true,
+        {}
+      );
+
+      const progressAfter = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+
+      const runsDir = path.join(folderPath, "runs");
+      const logFiles = fs.readdirSync(runsDir).filter((name) => name.includes("publish-scope-rebuild"));
+      assert.equal(logFiles.length, 1, "expected exactly one publish-scope-rebuild run log");
+      const logContent = fs.readFileSync(path.join(runsDir, logFiles[0]!), "utf8");
+
+      return { progressAfter, logContent };
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      ws.workspaceFolders = origWorkspaceFolders;
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  }
+
+  void it("a sub-cap ledger with a live 'open' implementation row falls through to the baseline diff end-to-end: not a partial ledger union, and the live row is named in the log (2026-09-30 review, Step 6 test-matrix gap)", async () => {
+    const { progressAfter, logContent } = await runLedgerFallbackCaseV1("open-row-e2e", [
+      {
+        roundId: "settled-1",
+        attemptIds: ["settled-1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        state: "completed",
+        // A non-empty union here would prove the test is actually exercising
+        // the ledger path if the fallback failed to trigger — it must NOT
+        // appear alone in the persisted scope.
+        outcome: { filesChanged: ["settled-file.ts"] },
+      },
+      {
+        roundId: "live-open-1",
+        attemptIds: ["live-open-1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:10:00.000Z",
+        state: "open",
+      },
+    ]);
+
+    assert.deepEqual(
+      progressAfter.implReviewFiles,
+      ["changed-after-baseline.ts"],
+      "an open (live) implementation row must force the baseline-diff fallback, never a partial ledger union (settled-file.ts must not leak in)"
+    );
+    assert.match(logContent, /live-open-1/, "the round log must name the live row that made the ledger unavailable");
+    assert.match(logContent, /is still open/, "the round log must state why the ledger was skipped");
+    assert.match(logContent, /task-start baseline diff/);
+  });
+
+  void it("a sub-cap ledger with a live 'scheduled' implementation row falls through to the baseline diff end-to-end: not a partial ledger union, and the live row is named in the log (2026-09-30 review, Step 6 test-matrix gap)", async () => {
+    const { progressAfter, logContent } = await runLedgerFallbackCaseV1("scheduled-row-e2e", [
+      {
+        roundId: "settled-2",
+        attemptIds: ["settled-2"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        state: "completed",
+        outcome: { filesChanged: ["settled-file-2.ts"] },
+      },
+      {
+        roundId: "live-scheduled-1",
+        attemptIds: ["live-scheduled-1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:10:00.000Z",
+        state: "scheduled",
+      },
+    ]);
+
+    assert.deepEqual(
+      progressAfter.implReviewFiles,
+      ["changed-after-baseline.ts"],
+      "a scheduled (live) implementation row must force the baseline-diff fallback, never a partial ledger union (settled-file-2.ts must not leak in)"
+    );
+    assert.match(logContent, /live-scheduled-1/, "the round log must name the live row that made the ledger unavailable");
+    assert.match(logContent, /is still scheduled/, "the round log must state why the ledger was skipped");
+    assert.match(logContent, /task-start baseline diff/);
+  });
+
+  void it("a sub-cap ledger with a terminal implementation row whose filesChanged is omitted falls through to the baseline diff end-to-end, with 'has no change list' logged (2026-09-30 review, Step 6 test-matrix gap)", async () => {
+    const { progressAfter, logContent } = await runLedgerFallbackCaseV1("no-change-list-e2e", [
+      {
+        roundId: "interrupted-1",
+        attemptIds: ["interrupted-1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        // Terminal, but the round ended (window closed) before its change
+        // set could be enumerated — no `outcome.filesChanged` at all.
+        state: "interrupted",
+        outcome: {},
+      },
+    ]);
+
+    assert.deepEqual(
+      progressAfter.implReviewFiles,
+      ["changed-after-baseline.ts"],
+      "a terminal row with no change list must force the baseline-diff fallback rather than treating the ledger as an empty-but-established union"
+    );
+    assert.match(logContent, /interrupted-1/, "the round log must name the row that made the ledger unavailable");
+    assert.match(logContent, /has no change list/, "the round log must state why the ledger was skipped");
+    assert.match(logContent, /task-start baseline diff/);
+  });
+
+  void it("a sub-cap ledger with a terminal implementation row marked filesChangedUnknown falls through to the baseline diff end-to-end, with 'has no change list' logged (2026-09-30 review, Step 6 test-matrix gap: this case was previously proven only at the resolveLedgerImplReviewFilesV1 unit level, never through the real Publish dispatch)", async () => {
+    const { progressAfter, logContent } = await runLedgerFallbackCaseV1("unknown-changes-e2e", [
+      {
+        roundId: "unknown-1",
+        attemptIds: ["unknown-1"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:05:00.000Z",
+        // Terminal, but the round itself could not enumerate its change set
+        // (filesChangedUnknown), distinct from the "omitted filesChanged"
+        // case above — both must force the same baseline-diff fallback.
+        state: "completed",
+        outcome: { filesChangedUnknown: true },
+      },
+    ]);
+
+    assert.deepEqual(
+      progressAfter.implReviewFiles,
+      ["changed-after-baseline.ts"],
+      "a filesChangedUnknown round must force the baseline-diff fallback rather than treating the ledger as an empty-but-established union"
+    );
+    assert.match(logContent, /unknown-1/, "the round log must name the row that made the ledger unavailable");
+    assert.match(logContent, /has no change list/, "the round log must state why the ledger was skipped");
+    assert.match(logContent, /task-start baseline diff/);
+  });
+});
+
 void describe("Fast Forward Review — a checks-only publish-review.md is not mistaken for an existing review", () => {
   // Historical shape, kept covered because tasks created before the artifact
   // split still have it on disk: publish-review.md holding ONLY a Completion
@@ -1545,6 +2026,11 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
         boundAt: "2026-01-01T00:00:00.000Z",
         state: "resolved",
       },
+      // RC3 item 10: this test is about the freshness-stamp import, not
+      // changed-file scope — a tracked (already-established) set here keeps
+      // the Publish review dispatching without exercising the ledger/
+      // baseline rebuild this fixture never sets up for.
+      implReviewFiles: [],
     };
     fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
     fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
@@ -2648,7 +3134,11 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
   async function runGuardedReview(
     name: string,
     reviewMarkerSha: string,
-    options: { automationDispatch?: boolean; showWarningResult?: string | undefined }
+    // RC3 item 13: the old modal (`showWarningResult`) was replaced by a
+    // local-only chat card; `reviewAgainViaCard` simulates the owner
+    // choosing that card's "Review again anyway" option through the same
+    // bypass command the card's effect dispatches — never a modal.
+    options: { automationDispatch?: boolean; reviewAgainViaCard?: boolean }
   ): Promise<{ invokeCount: number; folderPath: string }> {
     const { folderPath } = makeTaskFolder(name, "impl-low-review");
     const contextPack = path.join(folderPath, "context-pack.md");
@@ -2694,8 +3184,23 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
     ];
     const windowTarget = vscode.window as unknown as Record<string, unknown>;
     const origShowWarning = windowTarget.showWarningMessage;
-    windowTarget.showWarningMessage = (): Promise<string | undefined> =>
-      Promise.resolve(options.showWarningResult);
+    let modalCalls = 0;
+    windowTarget.showWarningMessage = (): Promise<string | undefined> => {
+      modalCalls += 1;
+      return Promise.resolve(undefined);
+    };
+    let capturedBypassArgs: { taskFolderPath: string; stage: TaskStage } | undefined;
+    const fakeChatViewProvider = {
+      askInteraction: (question: {
+        optionEffects?: Record<string, { kind: string; command?: string; args?: readonly unknown[] }>;
+      }): Promise<void> => {
+        const effect = question.optionEffects?.reviewAgainAnyway;
+        if (effect?.kind === "command") {
+          capturedBypassArgs = (effect.args?.[0] as { taskFolderPath: string; stage: TaskStage } | undefined);
+        }
+        return Promise.resolve();
+      },
+    } as unknown as import("../views/chatView").ChatViewProvider;
     try {
       const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
       await runReviewForFolder(
@@ -2704,8 +3209,13 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
         workspaceRoot,
         "impl-low-review",
         true,
-        { automationDispatch: options.automationDispatch }
+        { automationDispatch: options.automationDispatch, chatViewProvider: fakeChatViewProvider }
       );
+      assert.equal(modalCalls, 0, "the unchanged-tree case must never show a modal");
+      if (options.reviewAgainViaCard) {
+        assert.ok(capturedBypassArgs, "the card must have offered a 'Review again anyway' bypass to simulate");
+        await rerunReviewAfterUnchangedTreeCardV1(vscode.Uri.file(REAL_ROOT), capturedBypassArgs, fakeChatViewProvider);
+      }
     } finally {
       windowTarget.showWarningMessage = origShowWarning;
       for (const p of patches.reverse()) { p.restore(); }
@@ -2721,27 +3231,27 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
     const { invokeCount } = await runGuardedReview(
       `unchanged-auto-${Math.floor(Math.random() * 1e9)}`,
       REAL_ROOT_HEAD_SHA,
-      { automationDispatch: true, showWarningResult: undefined }
+      { automationDispatch: true }
     );
     assert.equal(invokeCount, 0, "automation must never dispatch a review against an unchanged tree");
   });
 
-  void it("an interactive dispatch against an unchanged tree is refused when the modal's bypass is not chosen", async () => {
+  void it("an interactive dispatch against an unchanged tree posts a chat card and is refused until answered", async () => {
     const { invokeCount } = await runGuardedReview(
       `unchanged-interactive-decline-${Math.floor(Math.random() * 1e9)}`,
       REAL_ROOT_HEAD_SHA,
-      { automationDispatch: false, showWarningResult: undefined }
+      { automationDispatch: false }
     );
-    assert.equal(invokeCount, 0, "declining the modal must refuse dispatch");
+    assert.equal(invokeCount, 0, "an unanswered card must refuse dispatch, with no modal ever shown");
   });
 
-  void it("an interactive dispatch against an unchanged tree proceeds once the bypass is chosen", async () => {
+  void it("an interactive dispatch against an unchanged tree proceeds once 'Review again anyway' is chosen on the card", async () => {
     const { invokeCount } = await runGuardedReview(
       `unchanged-interactive-bypass-${Math.floor(Math.random() * 1e9)}`,
       REAL_ROOT_HEAD_SHA,
-      { automationDispatch: false, showWarningResult: "I've made changes — re-check" }
+      { automationDispatch: false, reviewAgainViaCard: true }
     );
-    assert.equal(invokeCount, 1, "choosing the explicit bypass must dispatch exactly one review");
+    assert.equal(invokeCount, 1, "choosing the card's explicit bypass must dispatch exactly one review");
   });
 
   void it("a review behind HEAD (real changes since) dispatches regardless of automationDispatch — the guard never fires", async () => {

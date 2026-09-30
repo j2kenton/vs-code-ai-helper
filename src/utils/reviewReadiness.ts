@@ -513,6 +513,8 @@ const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:
 const VERIFIED_COMPLETE_BLOCK_RE =
   /<!--\s*verified-complete:start\s*-->([\s\S]*?)<!--\s*verified-complete:end\s*-->/i;
 const VERIFIED_COMPLETE_LINE_RE = /^\s*[-*]\s+(.+?)\s*$/;
+/** RC3 item 1, Step 2c: an item's optional `  evidence: <sentence>` continuation line. */
+const VERIFIED_COMPLETE_EVIDENCE_LINE_RE = /^\s+evidence:\s*(.+?)\s*$/;
 /**
  * The category bracket is OPTIONAL. Reviewers do sometimes emit only the
  * resolver — `- [needs-toolchain] baseline drifted…` instead of
@@ -1372,6 +1374,16 @@ export interface ReviewVerifiedCompleteEvidence {
   readonly blockPresent: boolean;
   /** Plan-item texts the reviewer asserted it personally verified against the tree, in the order listed. */
   readonly items: readonly string[];
+  /**
+   * RC3 item 1, Step 2c: same items, paired with the reviewer's own
+   * `  evidence: <sentence>` continuation line when the reviewer supplied
+   * one (see resources/prompts/review-scoring-rubric.md's `## Verified
+   * Complete` grammar). `evidence` is `undefined` for an older review that
+   * predates this grammar, or an item whose evidence line was omitted —
+   * callers show a fixed "older review format" fallback in that case, never
+   * a sentence pulled from anywhere else in the review.
+   */
+  readonly entries: readonly { readonly text: string; readonly evidence?: string }[];
 }
 
 /**
@@ -1400,10 +1412,12 @@ export interface ReviewVerifiedCompleteEvidence {
 export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCompleteEvidence {
   const match = VERIFIED_COMPLETE_BLOCK_RE.exec(content);
   if (!match) {
-    return { blockPresent: false, items: [] };
+    return { blockPresent: false, items: [], entries: [] };
   }
   const body = match[1] ?? "";
   const items: string[] = [];
+  const entries: { text: string; evidence?: string }[] = [];
+  let lastEntry: { text: string; evidence?: string } | undefined;
   for (const line of body.split(/\r?\n/)) {
     if (!line.trim()) {
       continue;
@@ -1411,9 +1425,20 @@ export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCo
     const lineMatch = VERIFIED_COMPLETE_LINE_RE.exec(line);
     if (lineMatch?.[1]) {
       items.push(lineMatch[1]);
+      lastEntry = { text: lineMatch[1], evidence: undefined };
+      entries.push(lastEntry);
+      continue;
+    }
+    // RC3 item 1, Step 2c: an indented `evidence: <sentence>` continuation
+    // line attaches to the preceding item only — a stray evidence line
+    // before any item, or any other non-item line, is ignored exactly as
+    // before this grammar existed.
+    const evidenceMatch = VERIFIED_COMPLETE_EVIDENCE_LINE_RE.exec(line);
+    if (evidenceMatch?.[1] && lastEntry && lastEntry.evidence === undefined) {
+      lastEntry.evidence = evidenceMatch[1].trim();
     }
   }
-  return { blockPresent: true, items };
+  return { blockPresent: true, items, entries };
 }
 
 /**

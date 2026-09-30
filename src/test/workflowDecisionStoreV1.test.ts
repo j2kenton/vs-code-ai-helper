@@ -19,6 +19,14 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MAX_WORKFLOW_DECISIONS_V1, WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import {
+  clearFastForwardRunActiveV1,
+  clearFastForwardRunPausedProvenanceV1,
+  getFastForwardRunStateV1,
+  markFastForwardRunActiveV1,
+  stampFastForwardResumeProvenanceV1,
+} from "../utils/activeFastForwardRunsV1";
+import { fastForwardResumeSuffixV1 } from "../commands/fastForwardResumeSuffixV1";
 
 /** Minimal in-memory stand-in for `vscode.Memento`. */
 class FakeMemento {
@@ -433,5 +441,196 @@ void describe("WorkflowDecisionStoreV1 — resumeKind compatibility normalizer (
     const store = new WorkflowDecisionStoreV1(memento as unknown as import("vscode").Memento);
 
     assert.equal(store.get("pre-existing-2")?.options[0]?.resumeKind, "unpause");
+  });
+});
+
+/**
+ * RC3 item 4, Step 3 completion fix, round 3 (review-flagged 2026-09-30,
+ * narrowed blocker `62a487ef-0d12-4476-a39f-abc4016bf4d4-0`): a reconcile or
+ * reviewer-verified-ticks card's "…and resume Fast Forward" option text was
+ * baked in at post time and never revisited, so a card that went stale AFTER
+ * posting (the run it captured later ended for an unrelated reason) kept
+ * claiming a resume it could no longer deliver, right up until the moment of
+ * choosing it. `WorkflowDecisionStoreV1.all()` — the single read boundary
+ * every viewer goes through — now re-evaluates that provenance on every read
+ * via `refreshFastForwardResumeOptionLabelsV1`, so the card itself says
+ * "try again (one cycle)" as soon as the next read can tell, not only via a
+ * post-selection notification.
+ */
+void describe("WorkflowDecisionStoreV1 — Fast Forward resume label freshness (RC3 item 4, Step 3 completion fix, round 3)", () => {
+  void it("keeps the trusted 'resume Fast Forward' label/consequence while the captured run's pause is still on record", async () => {
+    const folder = "/tmp/tasks/task-ff-label-trusted";
+    markFastForwardRunActiveV1(folder, { attemptNumber: 2, maxAttempts: 6 });
+    try {
+      // Production ordering (review-flagged completion fix, round 3,
+      // 2026-09-30): no manual `recordFastForwardRunPausedV1` call — this
+      // single `fastForwardResumeSuffixV1` call (the same one every real
+      // caller makes while building the card) already records the pause
+      // itself via `stampFastForwardResumeProvenanceV1`, synchronously,
+      // before the card is ever posted.
+      const ffResume = fastForwardResumeSuffixV1(folder, getFastForwardRunStateV1(folder));
+      const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+      const posted = await store.post(
+        decisionInput({
+          taskCanonicalId: folder,
+          options: [
+            option({
+              optionId: "reconcile",
+              label: `Mark reconciled${ffResume.labelSuffix}`,
+              consequence: `Clears the flag.${ffResume.consequenceSuffix}`,
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+                args: [{ taskFolderPath: folder, ...ffResume.extraArgs }],
+              },
+            }),
+          ],
+          recommendation: { kind: "option", optionId: "reconcile", reasoning: "Clears the flag." },
+        })
+      );
+      assert.equal(posted.ok, true);
+      const pending = store.listPending(folder);
+      const reconcileOption = pending[0]!.options.find((o) => o.optionId === "reconcile");
+      assert.equal(reconcileOption!.label, "Mark reconciled and resume Fast Forward (iteration 2 of 6)");
+      assert.match(reconcileOption!.consequence, /Resumes Fast Forward at iteration 2 of 6/);
+    } finally {
+      clearFastForwardRunActiveV1(folder);
+      clearFastForwardRunPausedProvenanceV1(folder);
+    }
+  });
+
+  void it("downgrades the label/consequence to 'try again (one cycle)' once the captured run ends for an unrelated reason", async () => {
+    const folder = "/tmp/tasks/task-ff-label-stale";
+    markFastForwardRunActiveV1(folder, { attemptNumber: 2, maxAttempts: 6 });
+    // Production ordering: the pause is recorded by this call itself (see
+    // the test above), not by a manual step — proving the downgrade below
+    // is driven by the run genuinely ending unrelated, not by provenance
+    // that was never established in the first place.
+    const ffResume = fastForwardResumeSuffixV1(folder, getFastForwardRunStateV1(folder));
+    const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+    const posted = await store.post(
+      decisionInput({
+        taskCanonicalId: folder,
+        options: [
+          option({
+            optionId: "reconcile",
+            label: `Mark reconciled${ffResume.labelSuffix}`,
+            consequence: `Clears the flag.${ffResume.consequenceSuffix}`,
+            effect: {
+              kind: "command",
+              command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+              args: [{ taskFolderPath: folder, ...ffResume.extraArgs }],
+            },
+          }),
+        ],
+        recommendation: { kind: "option", optionId: "reconcile", reasoning: "Clears the flag." },
+      })
+    );
+    assert.equal(posted.ok, true);
+    // The run this card was raised from now ends for a reason unrelated to
+    // the card (success, stall, exhausted attempts, error) — not because it
+    // paused to raise this same card again.
+    clearFastForwardRunActiveV1(folder);
+    clearFastForwardRunPausedProvenanceV1(folder);
+
+    const pending = store.listPending(folder);
+    const reconcileOption = pending[0]!.options.find((o) => o.optionId === "reconcile");
+    assert.equal(reconcileOption!.label, "Mark reconciled and try again (one cycle)");
+    assert.match(reconcileOption!.consequence, /This runs one cycle and stops there/);
+    // Purely cosmetic: the dispatch args (the actual safety re-check's input)
+    // are untouched by the label refresh.
+    const args = (reconcileOption!.effect as { args?: readonly unknown[] }).args;
+    assert.ok((args?.[0] as { resumeFastForwardV1?: unknown } | undefined)?.resumeFastForwardV1);
+  });
+
+  void it("does not rewrite a RESOLVED decision's recorded option text, even once the captured run later ends unrelated", async () => {
+    const folder = "/tmp/tasks/task-ff-label-resolved";
+    markFastForwardRunActiveV1(folder, { attemptNumber: 1, maxAttempts: 4 });
+    // Production ordering: no manual `recordFastForwardRunPausedV1` call.
+    const ffResume = fastForwardResumeSuffixV1(folder, getFastForwardRunStateV1(folder));
+    const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+    const posted = await store.post(
+      decisionInput({
+        taskCanonicalId: folder,
+        options: [
+          option({
+            optionId: "reconcile",
+            label: `Mark reconciled${ffResume.labelSuffix}`,
+            consequence: `Clears the flag.${ffResume.consequenceSuffix}`,
+            effect: {
+              kind: "command",
+              command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+              args: [{ taskFolderPath: folder, ...ffResume.extraArgs }],
+            },
+          }),
+        ],
+        recommendation: { kind: "option", optionId: "reconcile", reasoning: "Clears the flag." },
+      })
+    );
+    assert.equal(posted.ok, true);
+    if (!posted.ok) {return;}
+    await store.resolve(posted.decision.decisionId, "reconcile");
+    clearFastForwardRunActiveV1(folder);
+    clearFastForwardRunPausedProvenanceV1(folder);
+
+    const resolved = store.get(posted.decision.decisionId);
+    const reconcileOption = resolved!.options.find((o) => o.optionId === "reconcile");
+    assert.equal(reconcileOption!.label, "Mark reconciled and resume Fast Forward (iteration 1 of 4)");
+  });
+
+  void it("leaves an option with no resumeFastForwardV1 payload untouched", async () => {
+    const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+    const posted = await store.post(decisionInput());
+    assert.equal(posted.ok, true);
+    const doItOption = store.listPending()[0]!.options.find((o) => o.optionId === "doIt");
+    assert.equal(doItOption!.label, "Do it");
+  });
+
+  void it("a card is trusted the instant it is posted, with no separate 'the run has ended' step ever run (production ordering)", async () => {
+    // Reproduces the exact narrowed blocker (2026-09-30): a card raised by a
+    // genuinely active Fast Forward run used to be misclassified as
+    // untrusted for as long as `fastForwardReviewWithAI`'s own `finally` had
+    // not yet run — which, in production, happens well AFTER the card is
+    // posted and already answerable (the review round that follows the
+    // apply() attempt still has to complete first). This test never calls
+    // `recordFastForwardRunPausedV1` — the only "pause" fact in play is the
+    // one `stampFastForwardResumeProvenanceV1` itself records, exactly as
+    // `reviewEscalation.ts`'s plateau option builds it (that caller does not
+    // go through `fastForwardResumeSuffixV1` at all) — proving the trust
+    // does not depend on a later, separate write this test omits.
+    const folder = "/tmp/tasks/task-ff-production-ordering";
+    markFastForwardRunActiveV1(folder, { attemptNumber: 3, maxAttempts: 5 });
+    try {
+      const provenance = stampFastForwardResumeProvenanceV1(folder);
+      const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+      const posted = await store.post(
+        decisionInput({
+          taskCanonicalId: folder,
+          options: [
+            option({
+              optionId: "keepIterating",
+              label: "Keep iterating and resume Fast Forward (iteration 3 of 5)",
+              consequence: "Resumes Fast Forward at iteration 3 of 5.",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+                args: [{ taskFolderPath: folder, resumeFastForwardV1: { attemptNumber: 3, maxAttempts: 5, ...provenance } }],
+              },
+            }),
+          ],
+          recommendation: { kind: "option", optionId: "keepIterating", reasoning: "Continue." },
+        })
+      );
+      assert.equal(posted.ok, true);
+      // Read it back immediately — this is the moment the review-flagged
+      // defect fired: an immediate read used to see it as not-yet-trusted.
+      const pending = store.listPending(folder);
+      const keepIteratingOption = pending[0]!.options.find((o) => o.optionId === "keepIterating");
+      assert.equal(keepIteratingOption!.label, "Keep iterating and resume Fast Forward (iteration 3 of 5)");
+      assert.match(keepIteratingOption!.consequence, /Resumes Fast Forward at iteration 3 of 5/);
+    } finally {
+      clearFastForwardRunActiveV1(folder);
+      clearFastForwardRunPausedProvenanceV1(folder);
+    }
   });
 });

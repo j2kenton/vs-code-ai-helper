@@ -698,7 +698,14 @@ export function filterUncheckedPlanItemsV1(
 export type MergeChecklistProgressResultV1 =
   | { readonly kind: "unchanged" }
   | { readonly kind: "no-report" }
-  | { readonly kind: "no-match"; readonly unmatchedSample: readonly string[] }
+  | {
+      readonly kind: "no-match";
+      /** First two unmatched claims, for a short human-facing message. */
+      readonly unmatchedSample: readonly string[];
+      /** Every unmatched claim (not sliced); mirrors the extension's
+       * `mergeChecklistProgressV1` result byte for byte. */
+      readonly unmatchedAll: readonly string[];
+    }
   | {
       readonly kind: "merged";
       readonly content: string;
@@ -778,7 +785,11 @@ export function mergeChecklistProgressV1(
 
   if (reported.size === 0) {
     if (missingEvidenceSamples.length > 0) {
-      return { kind: "no-match", unmatchedSample: missingEvidenceSamples.slice(0, 2) };
+      return {
+        kind: "no-match",
+        unmatchedSample: missingEvidenceSamples.slice(0, 2),
+        unmatchedAll: missingEvidenceSamples,
+      };
     }
     return { kind: "no-report" };
   }
@@ -836,17 +847,14 @@ export function mergeChecklistProgressV1(
     };
   }
 
-  const unmatchedSample: string[] = [...missingEvidenceSamples];
+  const unmatchedAll: string[] = [...missingEvidenceSamples];
   for (const key of reported.keys()) {
-    if (!planItemKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
-      unmatchedSample.push(reportedRawText.get(key) ?? key);
-    }
-    if (unmatchedSample.length >= 2) {
-      break;
+    if (!planItemKeys.has(key) && !unmatchedAll.includes(reportedRawText.get(key) ?? key)) {
+      unmatchedAll.push(reportedRawText.get(key) ?? key);
     }
   }
-  if (unmatchedSample.length > 0) {
-    return { kind: "no-match", unmatchedSample: unmatchedSample.slice(0, 2) };
+  if (unmatchedAll.length > 0) {
+    return { kind: "no-match", unmatchedSample: unmatchedAll.slice(0, 2), unmatchedAll };
   }
   return { kind: "unchanged" };
 }

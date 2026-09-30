@@ -22,13 +22,16 @@ import {
   LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
   loadTranscriptWithMigration,
   onDidChangeChatHistoryV1,
+  OpenPlanItemsFormV1,
   readChatDocumentIdentityV1,
   readChatInteractions,
+  readOpenPlanItemsFormsV1,
   recordChatInteractionAnswers,
   resetChatHistoryV1,
   resolveOrPrepareChatDocumentIdentityV1,
   settleChatInteraction,
 } from "../utils/chatHistoryStore";
+import { applyOpenPlanItemsFormSubmissionV1 } from "../commands/decideOpenPlanItemsV1";
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
 import {
@@ -308,6 +311,19 @@ interface LocalInteractionPendingEffectV1 {
   readonly stage: TaskStage;
   readonly option: QuestionOptionV1;
   readonly effect: WorkflowDecisionOptionEffectV1;
+}
+
+/** RC3 item 5, Step 10: the open-items form's single Apply message. */
+interface SubmitOpenPlanItemsFormMessage {
+  type: "submitOpenPlanItemsForm";
+  formId: string;
+  answers: unknown;
+}
+
+function isSubmitOpenPlanItemsFormMessage(value: unknown): value is SubmitOpenPlanItemsFormMessage {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return v.type === "submitOpenPlanItemsForm" && typeof v.formId === "string" && v.formId.length > 0;
 }
 
 function isInteractionActionMessage(value: unknown): value is InteractionActionMessage {
@@ -718,7 +734,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * The last `taskOperations` signature this panel rendered for its current
    * target (RC2 item 11, Step 43) — everything `render()` actually reads off
    * `taskOperations.getTaskOperations(target.canonicalId)` to compute `busy`,
-   * `busyDetail`, `busyText` and `waitingForUser`. `taskOperations.onDidChange`
+   * `busyLabel` (RC3 item 8) and `waitingForUser`. `taskOperations.onDidChange`
    * fires for every task's every activity tick with no payload identifying
    * which task changed, so without this the panel re-ran its full render
    * pipeline (transcript read, interaction read, webview repaint) on every
@@ -976,6 +992,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (this.target) {
           await this.answerQuestion(this.target, message.questionAt, message.text, this.target.stage);
         }
+        return;
+      }
+      if (isSubmitOpenPlanItemsFormMessage(message)) {
+        await this.submitOpenPlanItemsForm(message.formId, message.answers);
         return;
       }
       if (isInteractionActionMessage(message)) {
@@ -1539,6 +1559,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Returns whether the answers were accepted, so a combined Confirm can
    * decide whether resuming is safe — resuming an action whose answer never
    * landed would run it against a question it has no answer for. */
+  /** Forms whose Apply is being processed, so a fast double click is one submit. */
+  private readonly openFormsInFlightV1 = new Set<string>();
+
+  /**
+   * RC3 item 5, Step 10: Apply on an in-chat open-items form. Deliberately NOT
+   * run inside `runQueued`: applying can dispatch the stage's next action, and
+   * holding the chat write queue for that would block every chat append.
+   */
+  private async submitOpenPlanItemsForm(formId: string, answers: unknown): Promise<void> {
+    const identity = this.target;
+    if (!identity || identity.kind === "global" || this.openFormsInFlightV1.has(formId)) return;
+    this.openFormsInFlightV1.add(formId);
+    try {
+      const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
+      const result = await applyOpenPlanItemsFormSubmissionV1({
+        taskFolderPath: identity.taskFolderPath,
+        canonicalId: identity.canonicalId,
+        displayName: identity.taskName,
+        formId,
+        answers,
+      });
+      if (result.kind === "rejected") {
+        NotificationRouter.showWarning(`${taskLabel} — ${result.message}`);
+        await this.append("assistant", `Could not apply: ${result.message} Your selections are kept.`, identity.stage, identity);
+      } else if (result.kind === "applied") {
+        await this.append("assistant", `Recorded: ${result.message}`, identity.stage, identity);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      NotificationRouter.showWarning(
+        `${formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath)} — Could not apply the form. (${message})`
+      );
+    } finally {
+      this.openFormsInFlightV1.delete(formId);
+      if (sameIdentity(this.target, identity)) {
+        await this.render();
+      }
+    }
+  }
+
   private async submitInteractionAnswers(
     clientRef: ChatInteractionClientRefV1,
     rawAnswers: unknown,
@@ -2710,6 +2770,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const target = this.target;
     let entries: ChatMessage[] = [];
     let interactions: readonly ChatDocumentInteractionV1[] = [];
+    let openPlanItemsForms: readonly OpenPlanItemsFormV1[] = [];
     let errorMessage: string | undefined;
     let emptyNotice: string | undefined;
     // A completed/archived task's conversation is hidden, not deleted: skip
@@ -2743,6 +2804,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           target.canonicalId,
           target.kind === "global" ? undefined : target.stage
         ).catch(() => [] as ChatDocumentInteractionV1[])).filter((i) => i.state === "unresolved");
+        if (target.kind !== "global") {
+          openPlanItemsForms = (
+            await readOpenPlanItemsFormsV1(target.taskFolderPath, target.canonicalId, target.stage).catch(
+              () => [] as OpenPlanItemsFormV1[]
+            )
+          ).filter((f) => f.state === "open");
+        }
       } catch (error) {
         // A transcript that fails to read (e.g. corrupt and unquarantinable —
         // see chatHistoryStore's readChatHistory) must not crash render(), or
@@ -2856,6 +2924,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ? "liveOperation"
       : undefined;
     const waitingForUser = waitingForUserSource !== undefined;
+    // RC3 item 8: Send is disabled while this task's round is running. This is
+    // the only use of run status in this panel — the busy banner itself moved
+    // to the Tasks pane, the Notifications pane and the status bar (ui14) —
+    // so only a short label for the Send-disabled reason ("Available when
+    // Apply Review finishes") is derived, from the newest live operation that
+    // is not waiting on the user.
+    const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
+    const busyOperation = busy
+      ? [...targetOps].filter((op) => !op.waitingForUser).sort((a, b) => b.startedAt - a.startedAt)[0]
+      : undefined;
+    const busyLabel = !busy
+      ? undefined
+      : busyOperation?.stage
+        ? STAGE_DISPLAY_NAMES[busyOperation.stage]
+        : (busyOperation?.label ?? "the current action");
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -3105,7 +3188,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       entries: displayEntries,
       timeline: buildChatTimelineV1(displayEntries, displayDecisions),
       interactions: displayInteractions,
+      openPlanItemsForms,
       decisions: displayDecisions,
+      busy,
+      busyLabel,
       waitingForUser,
       waitingForUserSource,
       errorMessage,
@@ -3341,6 +3427,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
         .interaction-actions + .msg-meta { margin-top: var(--ensemble-space-2); }
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
+        #send-reason { display: none; margin-left: var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
@@ -3349,9 +3436,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
-      <div id="steering-note" role="note">Messages here are not passed to the next round. To change what a round does, edit <code>plan-final.md</code> &mdash; rounds read it.</div>
-      <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message');
+      <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
+      <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -3529,6 +3616,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           renderInteraction(interactions[index],index>0);
         }
       }
+      // RC3 item 5: the open-items form. Every open plan item with its reason,
+      // three choices and a note; ONE Apply posts every answer. Nothing is
+      // disabled on press: a rejected Apply repaints with the owner's
+      // selections restored (captureDrafts/restoreDrafts), and the host
+      // ignores a repeat submit of an already-applied form.
+      function renderOpenPlanItemsForms(forms){
+        if(!forms || !forms.length) return;
+        ic.style.display='block';
+        for(const form of forms){
+          const box=document.createElement('div'); box.className='interaction-question';
+          const title=document.createElement('div'); title.className='interaction-title';
+          title.textContent='Decide the open plan items';
+          box.appendChild(title);
+          const intro=document.createElement('div'); intro.className='interaction-help';
+          intro.textContent='Choose what to do with each item. Items left open stay open. Nothing is written until you press Apply.';
+          box.appendChild(intro);
+          const rows=[];
+          form.items.forEach((item,index)=>{
+            const row=document.createElement('div'); row.className='interaction-question';
+            const label=document.createElement('div'); label.className='interaction-prompt';
+            label.textContent=item.itemText;
+            row.appendChild(label);
+            if(item.reason){
+              const help=document.createElement('div'); help.className='interaction-help';
+              help.textContent='Reason from the round: '+item.reason;
+              row.appendChild(help);
+            }
+            const name='opf-'+form.formId+'-'+item.itemId;
+            const radios={};
+            for(const choice of [['exclude','Exclude'],['tick','I did it — tick it'],['leave','Leave open']]){
+              const lab=document.createElement('label'); lab.style.display='block';
+              const r=document.createElement('input'); r.type='radio'; r.name=name; r.value=choice[0];
+              if(choice[0]==='leave') r.checked=true;
+              radios[choice[0]]=r;
+              const span=document.createElement('span'); span.textContent=' '+choice[1];
+              lab.appendChild(r); lab.appendChild(span); row.appendChild(lab);
+            }
+            const ta=document.createElement('textarea'); ta.rows=2; ta.maxLength=${DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1};
+            ta.setAttribute('aria-label','Reason or note for item '+(index+1)+': '+item.itemText);
+            ta.placeholder='Reason (needed to exclude) or note';
+            ta.value=item.reason||''; ta.setAttribute('data-prefill','1');
+            row.appendChild(ta);
+            box.appendChild(row);
+            rows.push({itemId:item.itemId,radios,ta});
+          });
+          const actions=document.createElement('div'); actions.className='interaction-actions';
+          const apply=document.createElement('button'); apply.type='button'; apply.textContent='Apply';
+          apply.title='Writes every answer to plan-final.md in one step. Items left open stay open.';
+          apply.addEventListener('click',()=>{
+            const answers=rows.map((r)=>({itemId:r.itemId,choice:r.radios.exclude.checked?'exclude':(r.radios.tick.checked?'tick':'leave'),note:r.ta.value}));
+            v.postMessage({type:'submitOpenPlanItemsForm',formId:form.formId,answers});
+          });
+          actions.appendChild(apply); box.appendChild(actions);
+          ic.appendChild(box);
+        }
+      }
       // Renders every pending WorkflowDecisionV1 for this task/stage as an
       // explained choice: what happened, why the user is needed, evidence
       // (case-4 decisions), enumerated options each with its own consequence
@@ -3553,7 +3696,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         for(const el of draftControls()){
           if(el.disabled) continue;
           if((el.type==='radio'||el.type==='checkbox')&&el.name&&el.checked){ checked.push({type:el.type,name:el.name,value:el.value}); }
-          else if(el.tagName==='TEXTAREA'&&el.value&&el.getAttribute('aria-label')){ texts.push({label:el.getAttribute('aria-label'),value:el.value}); }
+          else if(el.tagName==='TEXTAREA'&&(el.value||el.getAttribute('data-prefill')==='1')&&el.getAttribute('aria-label')){ texts.push({label:el.getAttribute('aria-label'),value:el.value}); }
         }
         const unchecked=[];
         for(const el of draftControls()){
@@ -3575,7 +3718,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         for(const saved of d.texts){
           for(const el of controls){
-            if(!el.disabled&&el.tagName==='TEXTAREA'&&!el.value&&el.getAttribute('aria-label')===saved.label){ el.value=saved.value; }
+            if(!el.disabled&&el.tagName==='TEXTAREA'&&(!el.value||el.getAttribute('data-prefill')==='1')&&el.getAttribute('aria-label')===saved.label){ el.value=saved.value; }
           }
         }
       }
@@ -3796,6 +3939,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         }
         renderInteractions(s.interactions);
+        renderOpenPlanItemsForms(s.openPlanItemsForms);
         if(drafts){ restoreDrafts(drafts); }
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
@@ -3804,6 +3948,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           b.title=s.waitingForUserSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
         }
         else{b.style.display='none';b.title='';}
+        // RC3 item 8: Send is disabled only while THIS panel's own task is
+        // busy (never while waiting for an answer in this chat, and never
+        // for the Global Assistant, which is not tied to one task's run
+        // lock) — s.busy is already false whenever s.waitingForUser is true
+        // (see the busy derivation server-side), so no separate check is
+        // needed here.
+        const sendDisabled = !!s.busy && !(s.target && s.target.kind==='global');
+        sb.disabled = sendDisabled;
+        if(sendDisabled){ sr.textContent='Available when '+(s.busyLabel||'the current action')+' finishes'; sr.style.display='inline'; }
+        else{ sr.textContent=''; sr.style.display='none'; }
         currentKey=nextKey;
         requestAnimationFrame(()=>{
           if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}
@@ -3811,8 +3965,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           else if(switchedChat){window.scrollTo(0,document.documentElement.scrollHeight);}
         });
       });
-      f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
-      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});
+      f.addEventListener('submit',e=>{e.preventDefault();if(sb.disabled){return;}v.postMessage({type:'send',text:i.value});i.value='';});
+      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();if(!sb.disabled){f.requestSubmit();}}else if(e.key==='Escape'){i.blur();}});
       v.postMessage({type:'ready'});</script>
     </body></html>`;
   }

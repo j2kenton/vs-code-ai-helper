@@ -7,6 +7,7 @@ import {
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
+import { refreshFastForwardResumeOptionLabelsV1 } from "../commands/fastForwardResumeSuffixV1";
 
 const STORAGE_KEY = "workflowDecisions";
 /** The Memento key holding every decision (hostDecisionMirrorV1.ts mirrors it into viewers). */
@@ -213,7 +214,16 @@ export class WorkflowDecisionStoreV1 {
     // to the safe `"unpause"` default, for both this window's own records
     // and — when `state` is the mirrored memento — the runner's mirrored
     // ones combined into the same read.
-    return this.state.get<WorkflowDecisionV1[]>(STORAGE_KEY, []).map(normalizeWorkflowDecisionV1);
+    //
+    // RC3 item 4, Step 3 completion fix, round 3: the same read boundary
+    // also re-evaluates any "…and resume Fast Forward" option's provenance
+    // on every read, downgrading its text to "…and try again (one cycle)"
+    // the moment that provenance goes stale — see
+    // `refreshFastForwardResumeOptionLabelsV1`'s doc comment.
+    return this.state
+      .get<WorkflowDecisionV1[]>(STORAGE_KEY, [])
+      .map(normalizeWorkflowDecisionV1)
+      .map(refreshFastForwardResumeOptionLabelsV1);
   }
 
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {

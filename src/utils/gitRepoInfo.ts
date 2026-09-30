@@ -365,3 +365,63 @@ export async function checkGitPublishReadiness(
 
   return { ok: true, repoRoot, currentBranch, pushDestination, hasUpstream, singleRemote };
 }
+
+/**
+ * RC3 item 10 (Step 6): changed files since a task's implementation baseline
+ * commit, for rebuilding `TaskProgress.implReviewFiles` at Publish when the
+ * round ledger cannot establish the set on its own (see
+ * `taskImplementationBaselineV1.ts` for where `baselineSha` comes from).
+ *
+ * Combines `git diff --name-only <baselineSha>` (committed and uncommitted
+ * tracked changes since the baseline) with `git ls-files --others
+ * --exclude-standard` (untracked files) — the same two calls
+ * `commitAndPushTask.ts` already issues to characterize the working tree.
+ * Git reports paths relative to `repoRoot`; each is resolved to a real path
+ * and kept only when it falls inside the real `workspaceRoot` (the same
+ * containment check `contextPack.ts` applies to tracked paths) — a workspace
+ * opened as a subdirectory of a larger repository must never pull a sibling
+ * package's files into this task's review scope. Returned paths are
+ * workspace-relative, forward-slashed, and de-duplicated; `droppedCount` is
+ * how many resolved paths were outside the workspace and therefore excluded,
+ * so a caller can log why the returned set may be smaller than the raw diff.
+ */
+export async function listChangedFilesSinceShaV1(
+  repoRoot: string,
+  baselineSha: string,
+  workspaceRoot: string
+): Promise<{ files: string[]; droppedCount: number }> {
+  const [diffResult, untrackedResult] = await Promise.all([
+    runGitCommand(repoRoot, "diff", ["--name-only", baselineSha]),
+    runGitCommand(repoRoot, "ls-files", ["--others", "--exclude-standard"]),
+  ]);
+  const rawPaths = [
+    ...diffResult.stdout.trim().split(/\r?\n/).filter(Boolean),
+    ...untrackedResult.stdout.trim().split(/\r?\n/).filter(Boolean),
+  ];
+
+  const realWorkspaceRoot = await fsPromises.realpath(workspaceRoot).catch(() => workspaceRoot);
+  const seen = new Set<string>();
+  const files: string[] = [];
+  let droppedCount = 0;
+
+  for (const rawPath of rawPaths) {
+    const absolute = path.join(repoRoot, rawPath);
+    const real = await fsPromises.realpath(absolute).catch(() => absolute);
+    const relativeToWorkspace = path.relative(realWorkspaceRoot, real);
+    const isInsideWorkspace =
+      relativeToWorkspace !== "" &&
+      !relativeToWorkspace.startsWith("..") &&
+      !path.isAbsolute(relativeToWorkspace);
+    if (!isInsideWorkspace) {
+      droppedCount += 1;
+      continue;
+    }
+    const workspaceRelative = relativeToWorkspace.split(path.sep).join("/");
+    if (!seen.has(workspaceRelative)) {
+      seen.add(workspaceRelative);
+      files.push(workspaceRelative);
+    }
+  }
+
+  return { files, droppedCount };
+}

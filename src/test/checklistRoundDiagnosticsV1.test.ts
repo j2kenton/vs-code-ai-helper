@@ -24,6 +24,10 @@ import {
   buildChecklistMergeDiagnosticsNoteV1,
   computeSyntheticRoundChecklistLatchV1,
 } from "../commands/reviewActions";
+import {
+  areAllUnmatchedChecklistClaimsAlreadySettledV1,
+  mergeChecklistProgressV1,
+} from "../utils/implementationChecklist";
 
 void describe("computeSyntheticRoundChecklistLatchV1", () => {
   void it("latches a synthetic round that changed files", () => {
@@ -90,6 +94,84 @@ void describe("computeSyntheticRoundChecklistLatchV1", () => {
       checklistClaimedButUnmerged: false,
     });
     assert.equal(latched, false);
+  });
+});
+
+/**
+ * RC3 item 1 (Step 2a) — execution-path coverage: a round's REAL echoed
+ * checklist text runs through the actual {@link mergeChecklistProgressV1}
+ * merge and the actual {@link areAllUnmatchedChecklistClaimsAlreadySettledV1}
+ * resolver, and the resulting `checklistClaimedButUnmerged` feeds the real
+ * latch decision — the exact composition `reviewActions.ts` performs at its
+ * one flag-computation site — rather than asserting on hand-built booleans
+ * or a hand-built `unmatchedAll` array. This is what proves a round that
+ * reports "Steps 1–33" in shorthand raises no flag/card when those items are
+ * already settled, and still raises one when they are not — the two
+ * outcomes the acceptance criteria name.
+ */
+void describe("computeSyntheticRoundChecklistLatchV1 end-to-end via the numbered-claim resolver (RC3 item 1, Step 2a)", () => {
+  // Four top-level items: #1-#3 already ticked, #4 still open.
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] First step",
+    "- [x] Second step",
+    "- [x] Third step",
+    "- [ ] Fourth step",
+  ].join("\n");
+
+  function latchFor(summaryEcho: string): boolean {
+    const mergeResult = mergeChecklistProgressV1(PLAN, summaryEcho);
+    const checklistNoMatchAlreadySettled =
+      mergeResult.kind === "no-match" && areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, mergeResult.unmatchedAll);
+    const checklistClaimedButUnmerged = mergeResult.kind === "no-match" && !checklistNoMatchAlreadySettled;
+    return computeSyntheticRoundChecklistLatchV1({
+      planChecklistPresent: true,
+      roundMayHaveChangedFiles: false,
+      summaryIsSynthetic: false,
+      summaryIssuePresent: false,
+      checklistClaimedButUnmerged,
+    });
+  }
+
+  void it("raises no flag/card when the round echoes a numbered range that is fully settled", () => {
+    const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] Steps 1-3"].join("\n");
+    // Sanity: this is genuinely the "no-match" merge outcome the resolver is
+    // meant to rescue, not an ordinary tick the merge itself applied.
+    assert.equal(mergeChecklistProgressV1(PLAN, echo).kind, "no-match");
+    assert.equal(latchFor(echo), false);
+  });
+
+  void it("raises no flag/card for the task's own acceptance-criteria example, 'Steps 1–33 — done', when every named item is settled", () => {
+    // The literal example from RC3 item 1's own verification bullet, echoed
+    // exactly as a checklist-block line: the "— done" status suffix survives
+    // into the raw item text here (unlike a "## Plan Item Checklist" claim
+    // line, where ` — ` splitting strips it before this parser ever sees
+    // it), so this is the path that actually needs the status-suffix
+    // grammar `parseNumberedChecklistClaimV1` accepts.
+    const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] Steps 1–3 — done"].join("\n");
+    assert.equal(mergeChecklistProgressV1(PLAN, echo).kind, "no-match");
+    assert.equal(latchFor(echo), false);
+  });
+
+  void it("still raises the flag/card when the echoed numbered range includes an open item", () => {
+    const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] Steps 1-4"].join("\n");
+    assert.equal(mergeChecklistProgressV1(PLAN, echo).kind, "no-match");
+    assert.equal(latchFor(echo), true);
+  });
+
+  void it("still raises the flag/card for a single numbered claim naming an open item", () => {
+    const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] Step 4"].join("\n");
+    assert.equal(mergeChecklistProgressV1(PLAN, echo).kind, "no-match");
+    assert.equal(latchFor(echo), true);
+  });
+
+  void it("still raises the flag/card for an ordinary reworded claim matching no item text", () => {
+    const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] A reworded claim matching nothing"].join(
+      "\n"
+    );
+    assert.equal(mergeChecklistProgressV1(PLAN, echo).kind, "no-match");
+    assert.equal(latchFor(echo), true);
   });
 });
 

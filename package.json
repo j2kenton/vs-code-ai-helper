@@ -388,7 +388,7 @@
       },
       {
         "command": "vs-code-ai-helper.checkAndReviewPublish",
-        "title": "Check and Review (Publish)",
+        "title": "Run Publish Checks, Then Review",
         "category": "Ensemble",
         "icon": "$(checklist)"
       },

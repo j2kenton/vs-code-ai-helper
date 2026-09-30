@@ -4,7 +4,6 @@ import {
   IMPL_REVIEW_STAGES,
   ImplementationDispatchModeV1,
   isPlanReviewStage,
-  PLAN_FILENAME,
   RoundOutcomeEntryV1,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -17,7 +16,11 @@ import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
 import { isAutoAdvanceEnabled } from "../config/settings";
 import { normalizePath } from "./taskRoot";
-import { getFastForwardRunStateV1, isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
+import {
+  getFastForwardRunStateV1,
+  isFastForwardRunActiveV1,
+  stampFastForwardResumeProvenanceV1,
+} from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
@@ -440,6 +443,7 @@ function buildPlateauKeepIteratingOptionV1(
             resumeFastForwardV1: {
               attemptNumber: fastForwardState.attemptNumber,
               maxAttempts: fastForwardState.maxAttempts,
+              ...stampFastForwardResumeProvenanceV1(taskFolderPath),
             },
           },
         ],
@@ -1177,82 +1181,20 @@ function extractNamedCommandV1(description: string): string | undefined {
   return undefined;
 }
 
-const CLEARING_COMMAND_STOPWORDS_V1 = new Set([
-  "about", "after", "again", "against", "always", "before", "being", "between",
-  "cannot", "could", "every", "having", "however", "never", "other", "record",
-  "recorded", "should", "still", "their", "there", "these", "those", "through",
-  "under", "unless", "until", "which", "while", "with", "would",
-]);
-
-function significantWordsV1(text: string): Set<string> {
-  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-  return new Set(words.filter((w) => w.length >= 5 && !CLEARING_COMMAND_STOPWORDS_V1.has(w)));
-}
-
 /**
- * Item 7b review fix (Step 27, 2026-08-25): `extractNamedCommandV1` alone
- * only sees a command the reviewer happened to quote INSIDE the blocker's
- * own one-line description. The task's richer evidence — the rest of the
- * SAME review round's markdown (a "Verified Checks" / "How to verify"
- * section, a named poll command, etc.) — may name the actual clearing
- * command for this blocker even when the blocker line itself does not quote
- * one. Falls back to scanning `reviewContent` line by line for a
- * command-like backtick span, keeping the one whose own line shares the most
- * significant vocabulary with the blocker description (at least one
- * five-plus-letter word in common) — a coarse correlation, not proof, but the
- * same standard `sharesSignificantOverlapV1` (reconcilePlanChecklist.ts) uses
- * elsewhere in this codebase for "these two are about the same thing".
- * Returns `undefined`, exactly as before, when nothing correlates.
- *
- * Review-narrowed (2026-08-25): scanning only the current round's review
- * markdown missed a command the APPROVED PLAN itself names — e.g. a plan's
- * own "How to verify" step quoting the exact poll command for an external
- * status this blocker is about. `additionalSources` lets a caller thread in
- * further markdown documents (currently: `plan.md`, the plan of record) to
- * search the same way, in the order given, without duplicating this scoring
- * logic per source. No task/project action-metadata registry exists
- * elsewhere in this codebase to search beyond these two document sources —
- * the four stage-chat actions (`STAGE_CHAT_ACTIONS`) are lifecycle
- * operations (complete stage, set stage, …), not clearing commands for an
- * external-status or infra blocker, so there is nothing further to add here
- * without inventing a metadata source that does not exist.
+ * RC3 item 3 review fix: a command is attached only when the BLOCKER'S OWN
+ * description names it — never one found elsewhere in the review round's
+ * markdown or in the approved plan. The earlier cross-document scanning
+ * (matching a backtick-quoted command on some other line against the
+ * blocker's vocabulary) attached commands that had nothing to do with this
+ * specific blocker (the RC2 "Step 49 started before Step 48/G2" blocker was
+ * given the plan's unrelated "Round check: lint, …" command this way). This
+ * is now a thin alias for `extractNamedCommandV1` kept so call sites read as
+ * "the command this blocker correlates with", which today can only ever be
+ * a command the blocker itself quotes.
  */
-function extractCorrelatedCommandV1(
-  description: string,
-  reviewContent: string | undefined,
-  additionalSources: readonly (string | undefined)[] = []
-): string | undefined {
-  const direct = extractNamedCommandV1(description);
-  if (direct) {
-    return direct;
-  }
-  const blockerWords = significantWordsV1(description);
-  if (blockerWords.size === 0) {
-    return undefined;
-  }
-  let best: { command: string; score: number } | undefined;
-  for (const source of [reviewContent, ...additionalSources]) {
-    if (!source) {
-      continue;
-    }
-    for (const line of source.split(/\r?\n/)) {
-      const command = extractNamedCommandV1(line);
-      if (!command) {
-        continue;
-      }
-      const lineWords = significantWordsV1(line);
-      let score = 0;
-      for (const word of blockerWords) {
-        if (lineWords.has(word)) {
-          score += 1;
-        }
-      }
-      if (score > 0 && (!best || score > best.score)) {
-        best = { command, score };
-      }
-    }
-  }
-  return best?.command;
+function extractCorrelatedCommandV1(description: string): string | undefined {
+  return extractNamedCommandV1(description);
 }
 
 /**
@@ -1266,18 +1208,32 @@ function extractCorrelatedCommandV1(
  * classified `environmental` (no further automated round can move either
  * one) but neither is an infrastructure/sandbox/OS defect, and both DO have
  * a concrete human action, just not a code fix.
+ *
+ * RC3 item 3 review fix: a blocker about plan ORDER (a step started before a
+ * predecessor it depends on) or about a step no round can complete (a human
+ * gate, a hand-off, a measurement) is also an owner decision, not a code fix
+ * — recognised explicitly here so the RC2 "Round 3.2 Step 49 was started
+ * before the required Step 48/G2 predecessor completed" blocker lands in the
+ * same bucket. Anything else this classifier cannot place is ALSO now an
+ * owner decision by default, not the old blanket "infrastructure, sandbox,
+ * or OS-level fix" guess — that guess was routinely wrong (it sent the owner
+ * to unrelated infra work for a plan-ordering conflict only a human can
+ * resolve), and the product has no way to tell a genuine infra defect apart
+ * from an unclassified one without guessing.
  */
-function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" | "generic" {
-  const OWNER_RE = /\bowners?\b/i;
-  const APPROVAL_WORD_RE = /\b(approv\w*|decid\w*|decision|sign[- ]?off\w*)\b/i;
-  if (OWNER_RE.test(description) && APPROVAL_WORD_RE.test(description)) {
+const PLAN_ORDER_BLOCKER_RE =
+  /\bstarted before\b[\s\S]*\bpredecessor\b|\bpredecessor\b[\s\S]*\bstarted before\b|\bout of order\b|\bdepends on step \d+/i;
+const ROUND_CANNOT_COMPLETE_RE = /\b(human gate|hand[- ]?off|a measurement)\b/i;
+
+function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" {
+  if (PLAN_ORDER_BLOCKER_RE.test(description) || ROUND_CANNOT_COMPLETE_RE.test(description)) {
     return "owner-decision";
   }
   const EXTERNAL_STATUS_RE = /\b(pending|awaiting|third[- ]?party|external (service|system|review|api))\b/i;
   if (EXTERNAL_STATUS_RE.test(description)) {
     return "external-status";
   }
-  return "generic";
+  return "owner-decision";
 }
 
 /**
@@ -1289,31 +1245,20 @@ function classifyEnvironmentalBlockerV1(description: string): "owner-decision" |
  * these — this derives the concrete clearing action from THAT classification
  * AND the blocker's own description text (not the resolver class alone,
  * which the review found conflates an owner-approval or third-party-status
- * case with a generic infra/sandbox/OS fix), naming an inline command when
- * the blocker itself quotes one, or (Step 27) elsewhere in the same round's
- * review markdown when it does not.
+ * case with a generic infra/sandbox/OS fix), naming an inline command only
+ * when the blocker's OWN description quotes one (RC3 item 3 — a command
+ * found only elsewhere in the review or in the plan is never attached, since
+ * it may have nothing to do with this specific blocker).
  */
 function describeResolverClearingActionV1(
   resolver: BlockerResolver,
   description: string,
-  stageName: string,
-  reviewContent?: string,
-  /** Review-narrowed (Step 27, 2026-08-25): the approved plan (`plan.md`),
-   * searched the same way as `reviewContent` when the blocker itself and the
-   * current review round's markdown name no command — see
-   * `extractCorrelatedCommandV1`'s doc comment. */
-  planContent?: string
+  stageName: string
 ): string {
-  const namedCommand = extractCorrelatedCommandV1(description, reviewContent, [planContent]);
+  const namedCommand = extractCorrelatedCommandV1(description);
   switch (resolver) {
     case "environmental": {
       const kind = classifyEnvironmentalBlockerV1(description);
-      if (kind === "owner-decision") {
-        return (
-          "an owner decision on the point described above — state it in this task's stage chat (it can record " +
-          `the decision into the plan for you), then use "Keep iterating" to have ${stageName} re-verify.`
-        );
-      }
       if (kind === "external-status") {
         return (
           "a status change at an external system this task does not control — " +
@@ -1324,9 +1269,10 @@ function describeResolverClearingActionV1(
         );
       }
       return (
-        "an infrastructure, sandbox, or OS-level fix outside this task's code" +
-        (namedCommand ? ` — run \`${namedCommand}\`, then ` : " — no command in this product can run it; address the underlying environment directly, then ") +
-        `use "Keep iterating" to have ${stageName} re-verify.`
+        "an owner decision on the point described above — " +
+        (namedCommand ? `run \`${namedCommand}\` to gather what you need, then ` : "") +
+        "state it in this task's stage chat (it can record " +
+        `the decision into the plan for you), then use "Keep iterating" to have ${stageName} re-verify.`
       );
     }
     case "unverifiable":
@@ -1491,12 +1437,6 @@ async function postReviewPlateauDecisionV1(
   // Publish-consequence note and "publish over it" exit appear here under
   // the identical condition, not a narrower one.
   const hasNonFixableBlocker = normalized.blockers.some((b) => b.resolver !== "task-fixable");
-  // Review-narrowed (Step 27, 2026-08-25): read the approved plan alongside
-  // the review markdown so `describeResolverClearingActionV1` can also find
-  // a clearing command the PLAN itself names (e.g. a "How to verify" step)
-  // when neither the blocker line nor this round's review content quotes
-  // one — see `extractCorrelatedCommandV1`'s doc comment.
-  const planContentForClearingNote = await readTextIfExists(vscode.Uri.joinPath(folderUri, PLAN_FILENAME));
   // Item 7b rule 5, "name what would clear the blocker, with the command if
   // one exists": when something is task-fixable, the clearing action IS
   // re-running the review (which "Keep iterating" now genuinely does — see
@@ -1516,7 +1456,7 @@ async function postReviewPlateauDecisionV1(
         `editing the workspace to address ${evidence.taskFixableCount === 1 ? "it" : "them"}, then re-reviews ` +
         `${stageName} for a fresh verdict.`
       : primaryBlocker
-        ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName, evidence.content, planContentForClearingNote)}`
+        ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName)}`
         : "Clears via: an action outside this task — no command in this product can resolve it. Once done, " +
           `"Keep iterating" resumes the task and re-runs ${stageName} to confirm.`;
 

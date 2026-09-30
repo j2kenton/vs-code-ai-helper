@@ -30,7 +30,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     // on the still-stable `outcome.stalled &&` clause opener instead.
     const stalledBranch = source.indexOf("outcome.stalled &&");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
-    const branchSlice = source.slice(stalledBranch, stalledBranch + 2000);
+    const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
     assert.match(
       branchSlice,
@@ -49,7 +49,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
   void it("derives the rendered stalled-round count from outcome.buildRoundsWithoutProgress, not a hardcoded or unrelated value", () => {
     const stalledBranch = source.indexOf("outcome.stalled &&");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
-    const branchSlice = source.slice(stalledBranch, stalledBranch + 2000);
+    const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
     assert.match(
       branchSlice,
@@ -61,5 +61,65 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
       /\$\{buildRoundsStalled\} consecutive build round\(s\) ran without landing a new plan-checklist tick/,
       "the rendered count must interpolate the same buildRoundsStalled variable derived from outcome.buildRoundsWithoutProgress, not a separate or hardcoded figure"
     );
+  });
+
+  /**
+   * RC3 item 9 (Step 7), 2026-09-30 review follow-up: a genuine Apply Review
+   * dispatch failure (every attempt rejected as malformed, unavailable,
+   * etc.) must name the real cause — "Apply Review failed: <reason>" — not
+   * collapse into the generic "the review did not produce a new, comparable
+   * result" wording, which reads as a non-event and sends the owner to check
+   * a run log that (for a genuine dispatch failure) does exist and does name
+   * the cause, but which the owner had no reason to suspect existed. The
+   * integration test in reviewActionsApplyReviewActivityIntegration.test.ts
+   * drives the actual malformed-reply dispatch and asserts the run log,
+   * ledger row and chat outcome line; this asserts the rendering site itself
+   * — the same source-scan convention this file already uses for the
+   * sibling `outcome.stalled` branch, because the property under test is the
+   * precedence and wording of the rendered notification, not the dispatch
+   * machinery that produces `ffCoordinatorOutcomeForAdmissionV1`.
+   */
+  void it("names 'Apply Review failed: <reason>' for a genuine dispatch failure, ahead of the generic 'did not produce a new, comparable result' fallback", () => {
+    const stalledBranch = source.indexOf("outcome.stalled &&");
+    assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
+    const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
+
+    // The dispatch-failure kind set must cover a malformed-reply exhaustion
+    // (RC3 item 9's own trigger) alongside the other genuine-failure kinds.
+    assert.match(
+      branchSlice,
+      /const ffDispatchFailureKindsV1 = new Set<TaskActionOutcomeV1\["kind"\]>\(\[/,
+      "the stalled branch must classify genuine dispatch-failure outcome kinds separately from a normal stall"
+    );
+    assert.match(
+      branchSlice,
+      /"malformedResult"/,
+      "an all-malformed Apply Review dispatch (RC3 item 9's own trigger) must be classified as a dispatch failure"
+    );
+
+    // The ternary must pick the named-cause branch BEFORE the generic
+    // fallback text — i.e. the "Apply Review failed: ..." interpolation
+    // must appear earlier in the branch than the generic non-event wording,
+    // proving the fallback is reached only when the failure-kind check does
+    // not match, not the other way around.
+    const namedCauseIndex = branchSlice.indexOf(
+      "`Apply Review failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`"
+    );
+    const genericFallbackIndex = branchSlice.indexOf(
+      '"the review did not produce a new, comparable result"'
+    );
+    assert.ok(namedCauseIndex >= 0, "the branch must interpolate describeTaskActionFailureV1's actual cause");
+    assert.ok(genericFallbackIndex >= 0, "the branch must still keep the generic fallback for a true stall with no dispatch-failure outcome");
+    assert.ok(
+      namedCauseIndex < genericFallbackIndex,
+      "the named-cause wording must be checked (and win) ahead of the generic 'did not produce a new, comparable result' fallback, never the reverse"
+    );
+
+    // The named-cause branch is gated on the failure-kind set, not applied
+    // unconditionally — otherwise a true stall (no dispatch failure at all)
+    // would wrongly render "Apply Review failed" instead of the generic text.
+    const gateIndex = branchSlice.indexOf("ffDispatchFailureKindsV1.has(ffCoordinatorOutcomeForAdmissionV1.kind)");
+    assert.ok(gateIndex >= 0 && gateIndex < namedCauseIndex,
+      "the named-cause wording must be gated on ffDispatchFailureKindsV1.has(...), not rendered unconditionally");
   });
 });

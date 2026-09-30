@@ -359,6 +359,7 @@ void describe("taskProgressFieldPolicyV1", () => {
       lintPayload: { runAt: NOW, passed: true },
       reviewAttemptId: "attempt-3",
       fallbackActive: { impl: true, publish: true },
+      implReviewFiles: ["src/a.ts"],
     });
     const result = applyMarkTaskDonePolicyV1(input, { now: NOW });
     assert.equal(result.ok, true);
@@ -373,6 +374,9 @@ void describe("taskProgressFieldPolicyV1", () => {
     assert.deepEqual(done.completedStages?.at(-1), "publish");
     assert.equal(done.lintPayload, undefined);
     assert.equal(done.reviewAttemptId, undefined);
+    // RC3 item 10: markTaskDone now clears implReviewFiles — a completed
+    // task has no further review that could still need the tracked set.
+    assert.equal(done.implReviewFiles, undefined);
     // The current-stage entry flips to false where it exists; earlier
     // entries are retained untouched.
     assert.deepEqual(done.fallbackActive, { impl: true, publish: false });

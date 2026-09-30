@@ -1123,6 +1123,20 @@ export class StageNode extends vscode.TreeItem {
     if (task.progress.escalation?.stage === stage) {
       tooltipStr += `\n\nAutomated review iteration is stuck and needs your input: ${task.progress.escalation.reason}`;
     }
+    // RC3 item 7: the Publish row's single inline button replaced separate
+    // checks/review/fix buttons — say what it does and where the rest went,
+    // and say why the wand is absent whenever it is (it only shows on a
+    // failed check, via the `-lint-failed` context token above).
+    if (stage === "publish") {
+      tooltipStr +=
+        "\n\nRuns Publish Checks, then the Publish review. \"Fix Linting & Code Errors\" appears here if the " +
+        "checks fail. The separate Run Publish Checks and Review with AI actions are in this row's right-click menu.";
+      if (task.progress.lintPayload === undefined) {
+        tooltipStr += "\n\nRun Publish Checks first.";
+      } else if (task.progress.lintPayload.passed) {
+        tooltipStr += "\n\nNo fixes needed: Publish Checks passed.";
+      }
+    }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
     // Use the computed stage context for stage-specific buttons. A revoked

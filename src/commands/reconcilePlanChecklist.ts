@@ -53,8 +53,11 @@ import {
   parseChecklistItemCoversV1,
   parseChecklistItemPriorityV1,
   parseChecklistItemStepNumberV1,
+  areAllUnmatchedChecklistClaimsAlreadySettledV1,
 } from "../utils/implementationChecklist";
 import { ReviewBlocker } from "../utils/reviewReadiness";
+import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
+import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
 
 /** Glyph for a genuinely open (unticked, non-excluded) checklist item — every
  * item this file's evidence blocks name is drawn from an unticked-items list,
@@ -80,6 +83,10 @@ type ReconcileArg =
        * unrelated to this card or newly surfaced after it was posted.
        */
       offeredItems?: readonly string[];
+      /** RC3 item 4, Step 3 — see {@link fastForwardResumeSuffixV1}'s doc
+       * comment: captured at post time, forwarded verbatim to the final
+       * `resumeAndApplyCurrentStageAction` dispatch. */
+      resumeFastForwardV1?: FastForwardResumeStateV1;
     };
 
 function normalizeArg(arg: ReconcileArg | undefined):
@@ -88,6 +95,7 @@ function normalizeArg(arg: ReconcileArg | undefined):
       taskFolderPath?: string;
       decisionId?: string;
       offeredItems?: readonly string[];
+      resumeFastForwardV1?: FastForwardResumeStateV1;
     }
   | undefined {
   if (!arg) {
@@ -101,6 +109,7 @@ function normalizeArg(arg: ReconcileArg | undefined):
     taskFolderPath?: string;
     decisionId?: string;
     offeredItems?: readonly string[];
+    resumeFastForwardV1?: FastForwardResumeStateV1;
   };
   if (explicit.canonicalId || explicit.taskFolderPath) {
     return {
@@ -108,6 +117,7 @@ function normalizeArg(arg: ReconcileArg | undefined):
       taskFolderPath: explicit.taskFolderPath,
       decisionId: explicit.decisionId,
       offeredItems: explicit.offeredItems,
+      resumeFastForwardV1: explicit.resumeFastForwardV1,
     };
   }
   if ("task" in arg && arg.task?.folderUri) {
@@ -1515,6 +1525,17 @@ export async function postReconcilePlanChecklistDecisionV1(
   // silently falling into the "no basis" wording meant for case (a).
   const noUncheckedItemsRemain = counted.remaining === 0;
 
+  // RC3 item 1, Step 2b: a third check the "Mark reconciled" recommendation
+  // must pass — `pendingImplReviewFiles` non-empty means a round changed
+  // files whose checklist state was never recorded, so the checklist's
+  // counts can understate what is actually done even when every currently
+  // *unticked* item is otherwise accounted for (`noUncheckedItemsRemain`).
+  // Previously this evidence was only ever displayed (the
+  // "pendingImplReviewFiles" evidence block above), never consulted by the
+  // recommendation itself — a case (b) task with unrecorded files got the
+  // same unconditional "Mark reconciled" recommendation as one with none.
+  const pendingFilesCount = progress.pendingImplReviewFiles?.length ?? 0;
+
   // Item 18: when case (a) — unticked items exist and none are review-
   // verified — narrow the decline to a specific recommendation whenever the
   // sole outstanding item coincides with the sole remaining blocker on the
@@ -1549,39 +1570,182 @@ export async function postReconcilePlanChecklistDecisionV1(
       ? [...soleBlockerGuidance.highPriorityItems, ...soleBlockerGuidance.lowPriorityItems]
       : [];
 
+  // RC3 item 1, Step 2b, check (1): when the triggering round's own claim is
+  // why the checklist was flagged unreliable (`kind === "no-match"`), reuse
+  // Step 2a's resolver against that SAME claim. `checklistNoMatchAlreadySettled`
+  // (reviewActions.ts) already filters this at the flag-raising moment for the
+  // round that just ran — so by the time this decision is posted for THAT
+  // round, `unmatchedClaimAllSettled` is normally false. It is still worth
+  // computing here because the third call site (the unconditional latched-
+  // task repost) can surface a LATER round's claim while an OLDER round's
+  // flag is what set the latch, and the manual "Mark Plan Checklist
+  // Reconciled" command can re-post this same decision on a later day once
+  // more of the plan has been ticked by other means. In both cases a claim
+  // that now resolves entirely to already-settled items means the mismatch
+  // that raised the flag was a text-matching artifact, not a false progress
+  // report — even though OTHER, unrelated items may still be genuinely
+  // unticked (RC2's observed "38/71 settled" case). This never ticks
+  // anything; it only lets the recommendation say so once checks (2) and (3)
+  // also hold.
+  const unmatchedClaimAllSettled =
+    roundSummaryChecklistClaim?.kind === "no-match" &&
+    areAllUnmatchedChecklistClaimsAlreadySettledV1(plan.text, roundSummaryChecklistClaim.unmatchedAll);
+
+  // Completion-review fix (round 8): `unmatchedClaimAllSettled` is only ever
+  // computed FOR a `"no-match"` claim, so its negation conflates two
+  // different situations — "there IS a no-match claim and it genuinely fails
+  // to resolve" (malformed, out of range, or otherwise unparseable; a real
+  // check-1 failure) versus "there is no no-match claim in scope at all"
+  // (check 1 is simply moot here, and the routes below decide on their own
+  // terms, exactly as they did before check 1 existed). The review found two
+  // branches below that treated the FIRST situation as though it were the
+  // second: `0 outstanding` recommending "Mark reconciled" even when the very
+  // claim that flagged this checklist unreliable was itself malformed or out
+  // of range, and a same-item-count environmental blocker preempting a "Mark
+  // reconciled" recommendation even when the round's own claim cleanly
+  // resolved to already-settled items. This flag exists to gate both of
+  // those spots explicitly, ahead of the checks that used to run unguarded.
+  const hasUnresolvedNoMatchClaim =
+    roundSummaryChecklistClaim?.kind === "no-match" && !unmatchedClaimAllSettled;
+
   // NINTH review round: tier-1 (review-verified) evidence is a candidate for
   // explicit selection, never an automatic tick (see
   // `runAutomaticChecklistReconciliationV1`'s doc comment) — so whenever any
-  // exists, the actionable recommendation is to apply it (monotonic, and
-  // text-matched against the plan of record exactly like
-  // `applyReviewerVerifiedTicks` already is), not to blindly mark reconciled
-  // while leaving verified-complete items sitting unticked.
+  // exists, "Apply Reviewer-Verified Ticks" stays offered as an option, and
+  // is text-matched against the plan of record exactly like
+  // `applyReviewerVerifiedTicks` already is.
+  //
+  // RC3 item 1, Step 2b, check (2): this is that check failing. The
+  // approved three-check contract is that a failed check keeps "Not yet"
+  // recommended and names the failed check plus its next action — an
+  // unticked item a review already names verified complete means the
+  // checklist does not yet match the work, so recommending "Mark
+  // reconciled" (or silently defaulting to a different action button as the
+  // *recommended* one) would recommend past that mismatch rather than
+  // surfacing it. A prior round recommended `applyVerifiedTicks` itself
+  // here; a review found that recommending an action other than "notYet"
+  // when a check fails is itself the plan violation, regardless of which
+  // action — the fix is "notYet", naming the failed check and pointing at
+  // the "Apply Reviewer-Verified Tick(s)" option above as the next action,
+  // not silently picking that option as the recommendation.
   const recommendation: WorkflowDecisionRecommendationV1 =
     coveredItemsCount > 0
       ? {
           kind: "option",
-          optionId: "applyVerifiedTicks",
+          optionId: "notYet",
           reasoning:
-            `${coveredItemsCount} unticked item(s) are named verified complete by an implementation review ` +
-            "already on file — applying records that verification as ticks, which cannot untick or misapply " +
-            "anything." +
-            (allUncheckedCovered
-              ? " This covers every currently outstanding item, so reconciling afterward is safe too."
-              : ""),
+            `The review-verified check fails: ${coveredItemsCount} unticked item(s) are named verified ` +
+            "complete by an implementation review already on file, so the checklist does not yet match the " +
+            `work. Next action: use "Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"}" ` +
+            "above instead of marking reconciled — it records that verification as ticks and cannot untick or " +
+            "misapply anything." +
+            (pendingFilesCount > 0
+              ? ` Separately, ${pendingFilesCount} changed file(s) are also unrecorded: run Apply Review first ` +
+                "so the round's changes are captured in the checklist."
+              : allUncheckedCovered
+                ? " This covers every currently outstanding item, so applying the tick(s) will leave the " +
+                  "checklist fully accounted for."
+                : ""),
         }
       : noUncheckedItemsRemain
-        ? {
-            kind: "option",
-            optionId: "reconcile",
-            reasoning:
-              `plan-final.md currently reads ${counted.settled}/${counted.total} items settled ` +
-              `(${counted.checked} completed` +
-              (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
-              "), with 0 outstanding — the checklist is fully accounted for, so there is nothing left for any " +
-              "review to vouch for. Marking reconciled simply confirms that and restores completeness gating.",
-          }
-        : soleBlockerGuidance
+        ? hasUnresolvedNoMatchClaim
           ? {
+              // Completion-review fix (round 8), bug 1: "0 outstanding" is
+              // read directly off plan-final.md and is trustworthy on its
+              // own terms, but it does not excuse check (1) — the round's
+              // own claim that flagged this checklist unreliable in the
+              // first place still has to resolve. A malformed or
+              // out-of-range claim never resolves, no matter what the
+              // current counts read, so it cannot be the thing that
+              // licenses "Mark reconciled" here.
+              kind: "option",
+              optionId: "notYet",
+              reasoning:
+                `plan-final.md currently reads ${counted.settled}/${counted.total} items settled with 0 ` +
+                "outstanding, but the round's own numbered claim that flagged this checklist unreliable does not " +
+                "resolve to a specific settled item — it may be malformed, out of range, or otherwise " +
+                "unparseable — so it cannot itself confirm the checklist matches the work. The options are not " +
+                'equal — "Not yet" changes nothing and can be revisited later, while "Mark reconciled" re-arms ' +
+                "the completeness gate before that claim has actually been checked. Under that uncertainty, " +
+                "keeping the gate down is the safe choice until you have inspected the round's claim yourself.",
+            }
+          : pendingFilesCount > 0
+            ? {
+                // RC3 item 1, Step 2b: the third check fails — recorded ticks
+                // cover every currently unticked item, but files a round
+                // changed were never reflected in the checklist at all, so
+                // "0 outstanding" does not mean the checklist matches the
+                // work. "Mark reconciled" here would re-arm completeness
+                // gating on counts that may still understate what is done.
+                kind: "option",
+                optionId: "notYet",
+                reasoning:
+                  `${pendingFilesCount} changed file(s) are unrecorded: a round changed them but the checklist ` +
+                  "was never updated to reflect that work, so plan-final.md's counts may not match the workspace " +
+                  "even though nothing is currently unticked. Run Apply Review first so the round's changes are " +
+                  "captured in the checklist, then reconsider marking reconciled.",
+              }
+            : {
+                kind: "option",
+                optionId: "reconcile",
+                reasoning:
+                  `plan-final.md currently reads ${counted.settled}/${counted.total} items settled ` +
+                  `(${counted.checked} completed` +
+                  (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
+                  "), with 0 outstanding — the checklist is fully accounted for, so there is nothing left for " +
+                  "any review to vouch for. Marking reconciled simply confirms that and restores completeness " +
+                  "gating.",
+              }
+        : unmatchedClaimAllSettled
+          ? pendingFilesCount > 0
+            ? {
+                // RC3 item 1, Step 2b, check (1) passes but check (3) fails:
+                // the claim naming already-settled items is not itself a
+                // reason to distrust the checklist, but unrecorded files
+                // still are — name that specific remaining gap rather than
+                // the generic "no basis" wording, which would obscure that
+                // this is the ONLY thing left to resolve.
+                kind: "option",
+                optionId: "notYet",
+                reasoning:
+                  "The last round's claim, once resolved by step number, names only item(s) already settled " +
+                  "in plan-final.md — that part of the checklist matches the work. But " +
+                  `${pendingFilesCount} changed file(s) are unrecorded: a round changed them but the ` +
+                  "checklist was never updated to reflect that work, so plan-final.md's counts may still not " +
+                  "match the workspace. Run Apply Review first so the round's changes are captured in the " +
+                  "checklist, then reconsider marking reconciled.",
+              }
+            : {
+                // Completion-review fix (round 8), bug 2: all three checks
+                // pass — the round's own claim resolves to items already
+                // settled (1), no review names an unticked item as verified
+                // complete (2, coveredItemsCount === 0 here), and no changed
+                // files are unrecorded (3, pendingFilesCount === 0) — so
+                // "Mark reconciled" is the required recommendation even when
+                // a DIFFERENT, unrelated item happens to be the checklist's
+                // sole remaining one and coincides with an environmental
+                // blocker (`soleBlockerGuidance`, checked only below, once
+                // this branch has already been ruled out): that item is
+                // real unfinished work, not evidence the round's own claim
+                // is false, and "Mark reconciled" here does not tick it or
+                // assert it is done — it only confirms the checklist's
+                // counts are trustworthy, exactly like the 0-outstanding
+                // case above.
+                kind: "option",
+                optionId: "reconcile",
+                reasoning:
+                  `The last round's claim, once resolved by step number, names ${roundSummaryChecklistClaim && roundSummaryChecklistClaim.kind === "no-match" ? roundSummaryChecklistClaim.unmatchedAll.length : 0} item(s) that are already ` +
+                  "settled in plan-final.md — the mismatch that flagged this checklist unreliable was a " +
+                  "text-matching shorthand, not a false progress report, and no changed files are unrecorded. " +
+                  (counted.remaining > 0
+                    ? `${counted.remaining} item(s) remain genuinely outstanding and unaffected by this claim — ` +
+                      "marking reconciled confirms the checklist's own counts are accurate and restores " +
+                      "completeness gating; those items will still hold the task open until they are done."
+                    : "Marking reconciled confirms the checklist's own counts are accurate and restores " +
+                      "completeness gating."),
+              }
+          : soleBlockerGuidance
+            ? {
               // Review-narrowed blocker 57e9485f-…-0: this recommendation
               // used to point at "reconcile" itself — an immediately
               // executable button that clears the latch — while the
@@ -1657,7 +1821,7 @@ export async function postReconcilePlanChecklistDecisionV1(
                       "performed the checks — before ticking the item in plan-final.md; this evidence alone " +
                       "does not establish that THIS blocker's checks were among them."),
             }
-          : {
+            : {
               // v1 fixes 2, item 4: "no basis to recommend reconciling" is what
               // was computed, but it is not the same as "no recommendation" —
               // the two options are not symmetric. "Not yet" changes nothing
@@ -1716,6 +1880,12 @@ export async function postReconcilePlanChecklistDecisionV1(
       .some((d) => d.decisionKey === "applyReviewerVerifiedTicks");
   })();
 
+  // RC3 item 4, Step 3: captured now, at post time — see
+  // `fastForwardResumeSuffixV1`'s doc comment for why this can't be
+  // re-derived when an option is later chosen.
+  const fastForwardState = getFastForwardRunStateV1(taskFolderPath);
+  const ffResume = fastForwardResumeSuffixV1(taskFolderPath, fastForwardState);
+
   const decision = await postWorkflowDecisionV1(
     {
       decisionId,
@@ -1730,13 +1900,38 @@ export async function postReconcilePlanChecklistDecisionV1(
         conditionFingerprint: `latched:${progress.checklistProgressUnreliableReason ?? "unrecorded"}`,
         answeredOptionIds: ["notYet"],
       },
+      // RC3 item 1, Step 2b: the plain-language opening now names what the
+      // last round actually claimed (when the claim is why the flag was
+      // raised — `roundSummaryChecklistClaim.kind === "no-match"`) and
+      // whether anything is unrecorded (`pendingFilesCount`), instead of
+      // the one fixed "a round changed work the checklist could not
+      // record" sentence regardless of cause.
       whatHappened:
         (rejectionLeadNote ? `${rejectionLeadNote} Separately, this` : "This") +
         ` task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
         `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +
         (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
-        `), with ${counted.remaining} outstanding, but a round changed work the checklist could not record, ` +
-        "so its counts may understate what is actually done.",
+        `), with ${counted.remaining} outstanding. ` +
+        (roundSummaryChecklistClaim?.kind === "no-match"
+          ? `The last round's own report claimed ${roundSummaryChecklistClaim.unmatchedAll.length} item(s) that ` +
+            `the checklist could not match by text (for example, "${roundSummaryChecklistClaim.unmatchedSample[0] ?? ""}")` +
+            (pendingFilesCount > 0
+              ? `, and separately ${pendingFilesCount} changed file(s) are unrecorded`
+              : "") +
+            (unmatchedClaimAllSettled
+              ? // RC3 item 1, Step 2b: resolved by step number, that claim
+                // names only items already ticked — the mismatch was a
+                // text-matching shorthand, not missing verification, so this
+                // says so plainly instead of leaving "unclear" standing.
+                (pendingFilesCount > 0
+                  ? ", but those items are already ticked in plan-final.md, so only the unrecorded files are in question."
+                  : " — but those items are already ticked in plan-final.md, so the checklist matches what was claimed.")
+              : " — so it is unclear whether the checklist matches the work.")
+          : pendingFilesCount > 0
+            ? `${pendingFilesCount} changed file(s) are unrecorded by the checklist, so it is unclear whether the ` +
+              "checklist matches the work."
+            : "A round changed work the checklist could not record, so its counts may understate what is " +
+              "actually done."),
       whyUserNeeded:
         "Ticking a box cannot be distinguished from ticking the LAST box, so no automatic check can tell a " +
         "partial edit from a finished reconciliation — only a human confirming the checklist now matches the " +
@@ -1767,8 +1962,8 @@ export async function postReconcilePlanChecklistDecisionV1(
               {
                 optionId: "applyVerifiedTicks",
                 label: pendingApplyTicksCardV1
-                  ? "Same as the reviewer-verified ticks card above — apply and resume the task"
-                  : `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"} and resume the task`,
+                  ? `Same as the reviewer-verified ticks card above — apply${ffResume.labelSuffix}`
+                  : `Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"}${ffResume.labelSuffix}`,
                 resumeKind: "continue" as const,
                 consequence:
                   (pendingApplyTicksCardV1
@@ -1778,11 +1973,12 @@ export async function postReconcilePlanChecklistDecisionV1(
                   `Ticks ${coveredItemsCount} item(s) in plan-final.md that an implementation review already ` +
                   "on file names verified complete, then dispatches this stage's next action. Does not by " +
                   "itself clear the unreliable-checklist flag — mark reconciled directly once every outstanding " +
-                  "item is accounted for.",
+                  "item is accounted for." +
+                  ffResume.consequenceSuffix,
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
-                  args: [{ taskFolderPath, canonicalId, offeredItems: coveredItems }],
+                  args: [{ taskFolderPath, canonicalId, offeredItems: coveredItems, ...ffResume.extraArgs }],
                 },
               },
             ]
@@ -1791,7 +1987,7 @@ export async function postReconcilePlanChecklistDecisionV1(
           ? [
               {
                 optionId: "linkManualChecks",
-                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"} and resume the task`,
+                label: `Link ${linkableManualItems.length} Outstanding Check${linkableManualItems.length === 1 ? "" : "s"}${ffResume.labelSuffix}`,
                 resumeKind: "continue" as const,
                 consequence:
                   `Records a durable "Covers: Step ${soleItemStepNumberForLink}" note on each of the ` +
@@ -1801,7 +1997,8 @@ export async function postReconcilePlanChecklistDecisionV1(
                   "soundly) — then dispatches this stage's next action. Does not tick or complete anything by " +
                   "itself — do the checks, then tick the item and mark reconciled. Once recorded, this same " +
                   "decision will show the confirmed recommendation instead of the pooled one, for this plan and " +
-                  "any future round.",
+                  "any future round." +
+                  ffResume.consequenceSuffix,
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.linkManualChecksToBlockerConfirmed",
@@ -1812,6 +2009,7 @@ export async function postReconcilePlanChecklistDecisionV1(
                       decisionId,
                       stepNumber: soleItemStepNumberForLink,
                       itemTexts: linkableManualItems,
+                      ...ffResume.extraArgs,
                       blockerStage: soleBlockerGuidance.stage,
                       blockerDescription: soleBlockerGuidance.blocker.description,
                     },
@@ -1822,16 +2020,17 @@ export async function postReconcilePlanChecklistDecisionV1(
           : []),
         {
           optionId: "reconcile",
-          label: "Mark reconciled and resume the task",
+          label: `Mark reconciled${ffResume.labelSuffix}`,
           resumeKind: "continue",
           consequence:
             "Clears the unreliable-checklist flag, then dispatches this stage's next action. Plan completeness " +
             "will gate stage advancement again from these counts, so an item left unticked will hold the task " +
-            "open, and one ticked in error can let unfinished work advance.",
+            "open, and one ticked in error can let unfinished work advance." +
+            ffResume.consequenceSuffix,
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
-            args: [{ taskFolderPath, canonicalId, decisionId }],
+            args: [{ taskFolderPath, canonicalId, decisionId, ...ffResume.extraArgs }],
           },
         },
         {
@@ -2031,8 +2230,11 @@ export async function reconcilePlanChecklistConfirmedV1(
   // it"): the option that clears the latch is the only reason to clear it, so
   // it also tries the stage's next action again rather than leaving the task
   // sitting on the now-cleared gate with nothing running.
+  // RC3 item 4, Step 3: forwards the provenance baked into this card at post
+  // time — present only when Fast Forward was genuinely active then.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
     taskFolderPath: folderUri.fsPath,
+    resumeFastForwardV1: normalized?.resumeFastForwardV1,
   });
 }
 
@@ -2237,8 +2439,10 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
   );
   // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
+  // RC3 item 4, Step 3 — see that same note.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
     taskFolderPath: folderUri.fsPath,
+    resumeFastForwardV1: normalized?.resumeFastForwardV1,
   });
 }
 
@@ -2261,6 +2465,10 @@ interface LinkManualChecksArg {
    * re-checked against a fresh read of the review artifact at write time. */
   readonly blockerStage?: TaskStage;
   readonly blockerDescription?: string;
+  /** RC3 item 4, Step 3 — see {@link fastForwardResumeSuffixV1}'s doc
+   * comment: captured at post time, forwarded verbatim to the final
+   * `resumeAndApplyCurrentStageAction` dispatch. */
+  readonly resumeFastForwardV1?: FastForwardResumeStateV1;
 }
 
 /**
@@ -2482,8 +2690,10 @@ export async function linkManualChecksToBlockerConfirmedV1(
   // Linking alone does not resolve the blocker (a human still has to do the
   // checks and tick/reconcile), but "try again" is honest either way: a
   // dispatch that finds the same blocker still open changes nothing new.
+  // RC3 item 4, Step 3 — see that same note.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
     taskFolderPath: folderUri.fsPath,
+    resumeFastForwardV1: explicitArg?.resumeFastForwardV1,
   });
 }
 
