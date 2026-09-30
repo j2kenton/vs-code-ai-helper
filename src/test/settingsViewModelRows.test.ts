@@ -174,7 +174,8 @@ interface InitOverrides {
   models?: Array<{ id: string; name: string; providerLabel: string }>;
   stages?: string[];
   providers?: Array<Record<string, unknown>>;
-  showProviderAccountActions?: boolean;
+  showProviderSignInButtons?: boolean;
+  showProviderUsageButtons?: boolean;
   settings?: Record<string, unknown>;
   enabledProviders?: Record<string, boolean>;
 }
@@ -196,7 +197,8 @@ function initMessage(overrides: InitOverrides = {}): Record<string, unknown> {
     stageHints: STAGE_ROLE_HINTS,
     enabledProviders: overrides.enabledProviders ?? {},
     providers: overrides.providers ?? [],
-    showProviderAccountActions: overrides.showProviderAccountActions ?? false,
+    showProviderSignInButtons: overrides.showProviderSignInButtons ?? false,
+    showProviderUsageButtons: overrides.showProviderUsageButtons ?? false,
     warnUnsavedSettings: true,
   };
 }
@@ -263,7 +265,7 @@ void describe("AI Models view — general model presentation", () => {
   });
 });
 
-void describe("AI Models view — provider account-action gating (ensemble.showProviderAccountActions)", () => {
+void describe("AI Models view — provider sign-in / usage button gating (ensemble.showProviderSignInButtons, ensemble.showProviderUsageButtons)", () => {
   void it("hides the Sign in / Check usage buttons by default while keeping checkbox, save, and warning", async () => {
     const session = runWebviewSession(extractWebviewScript());
     await session.deliver(
@@ -279,14 +281,59 @@ void describe("AI Models view — provider account-action gating (ensemble.showP
     assert.ok(html.includes("Antigravity warning text."), "permissionWarning renders regardless");
   });
 
-  void it("renders both buttons when the setting is enabled", async () => {
+  void it("renders only the sign-in button when only that flag is on", async () => {
     const session = runWebviewSession(extractWebviewScript());
     await session.deliver(
-      initMessage({ providers: [CLAUDE_PROVIDER], showProviderAccountActions: true })
+      initMessage({ providers: [CLAUDE_PROVIDER], showProviderSignInButtons: true })
+    );
+    const html = session.byId("provider-selection").innerHTML;
+    assert.ok(html.includes("provider-signin"), "sign-in button must render");
+    assert.ok(!html.includes("Check usage"), "usage button must stay hidden");
+  });
+
+  void it("renders only the usage button when only that flag is on", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({ providers: [CLAUDE_PROVIDER], showProviderUsageButtons: true })
+    );
+    const html = session.byId("provider-selection").innerHTML;
+    assert.ok(!html.includes("provider-signin"), "sign-in button must stay hidden");
+    assert.ok(html.includes("Check usage"), "usage button must render");
+  });
+
+  void it("renders both buttons when both flags are on", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        providers: [CLAUDE_PROVIDER],
+        showProviderSignInButtons: true,
+        showProviderUsageButtons: true,
+      })
     );
     const html = session.byId("provider-selection").innerHTML;
     assert.ok(html.includes("provider-signin"));
     assert.ok(html.includes("Check usage"));
+  });
+
+  void it("updates the two flags independently on providersRefreshed", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        providers: [CLAUDE_PROVIDER],
+        showProviderSignInButtons: true,
+        showProviderUsageButtons: true,
+      })
+    );
+    await session.deliver({
+      type: "providersRefreshed",
+      providers: [CLAUDE_PROVIDER],
+      enabledProviders: {},
+      models: [],
+      showProviderSignInButtons: false,
+    });
+    const html = session.byId("provider-selection").innerHTML;
+    assert.ok(!html.includes("provider-signin"), "sign-in flag updated independently to off");
+    assert.ok(html.includes("Check usage"), "usage flag untouched by the refresh message stays on");
   });
 });
 

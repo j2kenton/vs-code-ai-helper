@@ -191,7 +191,7 @@ import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
-import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
+import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateProviderAccountActionsSetting, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
 import {
   configureWorkflowDecisionStateV1,
@@ -1189,6 +1189,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     .then(() => migrateEnabledProvidersForExistingModels())
     .catch(error => console.error("Provider settings migration failed", error))
     .then(() => refreshModelsConfiguredContext());
+  void migrateProviderAccountActionsSetting().catch(error =>
+    console.error("Provider account-actions settings migration failed", error)
+  );
   if (!viewerHost) {
     context.subscriptions.push(installAutoImplementConfirmation(context));
   }
