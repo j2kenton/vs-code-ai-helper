@@ -489,6 +489,34 @@ interface ChatCompactionStateV1 {
   readonly lastCompactionDigest?: string;
 }
 
+/** RC3 item 5, Step 10: one open plan item on an open-items form. */
+export interface OpenPlanItemsFormItemV1 {
+  readonly itemId: string;
+  readonly itemText: string;
+  /** 1-based count of this exact text among the plan's checklist items, in plan order. */
+  readonly occurrence: number;
+  readonly reason: string;
+}
+
+export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale";
+
+/**
+ * RC3 item 5, Step 10: the chat-document entry behind the in-chat "Decide item
+ * by item" form. Deliberately not a `StructuredQuestionV1` interaction: it has
+ * no provider-resume channel and never routes through `resumeInteraction`.
+ */
+export interface OpenPlanItemsFormV1 {
+  readonly formId: string;
+  readonly taskBindingId: string;
+  readonly stage: TaskStage;
+  readonly items: readonly OpenPlanItemsFormItemV1[];
+  /** Hash of plan-final.md when the form was posted. */
+  readonly planFingerprint: string;
+  readonly resumeFastForwardV1?: { readonly attemptNumber: number; readonly maxAttempts: number };
+  readonly state: OpenPlanItemsFormStateV1;
+  readonly postedAt: string;
+}
+
 interface ChatDocumentV1 {
   readonly schemaVersion: 1;
   readonly documentId: string;
@@ -496,6 +524,7 @@ interface ChatDocumentV1 {
   readonly taskBindingSource: ChatTaskBindingSourceV1;
   readonly messages: ChatMessage[];
   readonly interactions: ChatDocumentInteractionV1[];
+  readonly openPlanItemsForms?: OpenPlanItemsFormV1[];
   readonly migration?: ChatMigrationMarkerV1;
   readonly resetEpoch: number;
   readonly compaction: ChatCompactionStateV1;
@@ -883,6 +912,64 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
   return messages;
 }
 
+/** Decoder for the `openPlanItemsFormV1` entry kind; undefined when malformed. */
+export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] | undefined {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) return undefined;
+  const forms: OpenPlanItemsFormV1[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) return undefined;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.formId !== "string" || !HEX128_RE.test(e.formId)) return undefined;
+    if (typeof e.taskBindingId !== "string" || e.taskBindingId.length === 0) return undefined;
+    if (typeof e.stage !== "string" || !VALID_STAGES.has(e.stage)) return undefined;
+    if (typeof e.planFingerprint !== "string" || typeof e.postedAt !== "string") return undefined;
+    if (e.state !== "open" && e.state !== "applied" && e.state !== "stale") return undefined;
+    if (!Array.isArray(e.items)) return undefined;
+    const items: OpenPlanItemsFormItemV1[] = [];
+    for (const rawItem of e.items) {
+      if (typeof rawItem !== "object" || rawItem === null) return undefined;
+      const i = rawItem as Record<string, unknown>;
+      if (
+        typeof i.itemId !== "string" ||
+        i.itemId.length === 0 ||
+        typeof i.itemText !== "string" ||
+        typeof i.occurrence !== "number" ||
+        !Number.isInteger(i.occurrence) ||
+        i.occurrence < 1 ||
+        typeof i.reason !== "string"
+      ) {
+        return undefined;
+      }
+      items.push({ itemId: i.itemId, itemText: i.itemText, occurrence: i.occurrence, reason: i.reason });
+    }
+    let resume: { attemptNumber: number; maxAttempts: number } | undefined;
+    if (e.resumeFastForwardV1 !== undefined) {
+      const r = e.resumeFastForwardV1 as Record<string, unknown> | null;
+      if (
+        typeof r !== "object" ||
+        r === null ||
+        typeof r.attemptNumber !== "number" ||
+        typeof r.maxAttempts !== "number"
+      ) {
+        return undefined;
+      }
+      resume = { attemptNumber: r.attemptNumber, maxAttempts: r.maxAttempts };
+    }
+    forms.push({
+      formId: e.formId,
+      taskBindingId: e.taskBindingId,
+      stage: e.stage as TaskStage,
+      items,
+      planFingerprint: e.planFingerprint,
+      ...(resume ? { resumeFastForwardV1: resume } : {}),
+      state: e.state,
+      postedAt: e.postedAt,
+    });
+  }
+  return forms;
+}
+
 function validateInteractions(raw: unknown): ChatDocumentInteractionV1[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const interactions: ChatDocumentInteractionV1[] = [];
@@ -978,6 +1065,8 @@ function decodeChatDocument(raw: unknown, taskFolderPath: string, canonicalId: s
   if (!messages) return undefined;
   const interactions = validateInteractions(record.interactions);
   if (!interactions) return undefined;
+  const openPlanItemsForms = decodeOpenPlanItemsFormsV1(record.openPlanItemsForms);
+  if (!openPlanItemsForms) return undefined;
   if (typeof record.resetEpoch !== "number" || !Number.isInteger(record.resetEpoch) || record.resetEpoch < 0) {
     return undefined;
   }
@@ -999,6 +1088,7 @@ function decodeChatDocument(raw: unknown, taskFolderPath: string, canonicalId: s
     taskBindingSource: (record.taskBindingSource as ChatTaskBindingSourceV1 | undefined) ?? "localDigest",
     messages,
     interactions,
+    ...(openPlanItemsForms.length > 0 ? { openPlanItemsForms } : {}),
     ...(migrationRaw !== undefined
       ? {
           migration: {
@@ -2077,6 +2167,108 @@ export async function settleChatInteraction(
     interactions[index] = { ...interactions[index]!, state: settlement };
     await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Open-items forms (RC3 item 5, Step 10)
+// ---------------------------------------------------------------------------
+
+/** Post a new open-items form into the task's chat document (created if absent). */
+export async function appendOpenPlanItemsFormV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  input: Omit<OpenPlanItemsFormV1, "taskBindingId" | "state" | "postedAt"> & { readonly postedAt?: string }
+): Promise<OpenPlanItemsFormV1> {
+  if (!HEX128_RE.test(input.formId)) {
+    throw new Error("formId must be a 128-bit lowercase-hex identity");
+  }
+  if (!VALID_STAGES.has(input.stage)) {
+    throw new Error(`unrecognized stage: ${String(input.stage)}`);
+  }
+  let posted: OpenPlanItemsFormV1 | undefined;
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document: existing, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    let base: ChatDocumentV1;
+    if (existing) {
+      base = existing;
+    } else {
+      const defaultBinding = resolveDefaultTaskBindingV1(taskFolderPath, canonicalId);
+      base = {
+        schemaVersion: 1,
+        documentId: newDocumentId(),
+        taskBindingId: defaultBinding.taskBindingId,
+        taskBindingSource: defaultBinding.taskBindingSource,
+        messages: [],
+        interactions: [],
+        resetEpoch: 0,
+        compaction: { compactedMessageCount: 0 },
+      };
+    }
+    const forms = base.openPlanItemsForms ?? [];
+    // A new form for the same stage supersedes any still-open one: two open
+    // forms over the same plan would let the older one's answers land late.
+    const superseded = forms.map((f) =>
+      f.stage === input.stage && f.state === "open" ? { ...f, state: "stale" as const } : f
+    );
+    posted = {
+      formId: input.formId,
+      taskBindingId: base.taskBindingId,
+      stage: input.stage,
+      items: input.items,
+      planFingerprint: input.planFingerprint,
+      ...(input.resumeFastForwardV1 ? { resumeFastForwardV1: input.resumeFastForwardV1 } : {}),
+      state: "open",
+      postedAt: input.postedAt ?? new Date().toISOString(),
+    };
+    await persistDocument(
+      taskFolderPath,
+      { ...base, openPlanItemsForms: [...superseded, posted] },
+      revision,
+      canonicalId
+    );
+    // Local writes do not notify on their own; the panel must repaint to show the form.
+    chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+  });
+  return posted!;
+}
+
+/** Read the task's open-items forms, optionally for one stage. */
+export async function readOpenPlanItemsFormsV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  stage?: TaskStage
+): Promise<OpenPlanItemsFormV1[]> {
+  return withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document } = await readChatDocument(taskFolderPath, canonicalId);
+    const forms = document?.openPlanItemsForms ?? [];
+    return stage === undefined ? [...forms] : forms.filter((f) => f.stage === stage);
+  });
+}
+
+/** Move a form to `state`. Returns false when no such form exists. */
+export async function setOpenPlanItemsFormStateV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  formId: string,
+  state: OpenPlanItemsFormStateV1
+): Promise<boolean> {
+  let found = false;
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    const forms = document?.openPlanItemsForms;
+    if (!document || !forms || !forms.some((f) => f.formId === formId)) {
+      return;
+    }
+    found = true;
+    await persistDocument(
+      taskFolderPath,
+      { ...document, openPlanItemsForms: forms.map((f) => (f.formId === formId ? { ...f, state } : f)) },
+      revision,
+      canonicalId
+    );
+    chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+  });
+  return found;
 }
 
 // ---------------------------------------------------------------------------

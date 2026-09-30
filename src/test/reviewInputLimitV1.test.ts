@@ -13,7 +13,9 @@ import {
 import {
   boundTaskDescriptionForReviewV1,
   describeOversizedInputRemedyV1,
+  type ImplReviewLedgerRowV1,
   isImplReviewOnZeroFilesV1,
+  resolveLedgerImplReviewFilesV1,
   REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1,
   shouldClearImplReviewFilesAfterReviewV1,
 } from "../utils/implReviewFileSelection";
@@ -100,26 +102,40 @@ void describe("review pre-dispatch abort (source wiring)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// RC1 item 5 — a clean review leaves the next review its files
+// RC1 item 5 / RC3 item 10 — a clean review leaves the next review its files;
+// only a clean PUBLISH review (the last of the three) may clear the set.
 // ---------------------------------------------------------------------------
 
 void describe("shouldClearImplReviewFilesAfterReviewV1", () => {
-  void it("a clean HIGH-level review does not clear the set the low-level review still needs", () => {
+  void it("a clean HIGH-level review does not clear the set later stages still need", () => {
     assert.equal(shouldClearImplReviewFilesAfterReviewV1("impl-high-review", 0), false);
   });
 
-  void it("a clean LOW-level review (the last one) clears it", () => {
-    assert.equal(shouldClearImplReviewFilesAfterReviewV1("impl-low-review", 0), true);
+  void it("a clean LOW-level review does not clear the set Publish still needs", () => {
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("impl-low-review", 0), false);
   });
 
-  void it("a review that still has task-fixable blockers never clears it", () => {
+  void it("a clean PUBLISH review (the last one) clears it", () => {
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 0), true);
+  });
+
+  void it("a Publish review with any remaining blocker never clears it", () => {
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 2), false);
     assert.equal(shouldClearImplReviewFilesAfterReviewV1("impl-low-review", 2), false);
     assert.equal(shouldClearImplReviewFilesAfterReviewV1("impl-high-review", 2), false);
   });
 
-  void it("non-implementation stages never clear it", () => {
-    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 0), false);
+  void it("non-implementation, non-publish stages never clear it", () => {
     assert.equal(shouldClearImplReviewFilesAfterReviewV1("plan-high-review", 0), false);
+  });
+
+  void it("a clean Publish review scoped to open editors never clears it (2026-09-30 review)", () => {
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 0, "open-editors"), false);
+  });
+
+  void it("a clean Publish review scoped to the tracked set, or with no scope recorded, clears it", () => {
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 0, "tracked"), true);
+    assert.equal(shouldClearImplReviewFilesAfterReviewV1("publish", 0, undefined), true);
   });
 });
 
@@ -149,7 +165,127 @@ void describe("zero-file refusal and clearing (source wiring)", () => {
     assert.match(block, /return;/);
   });
 
-  void it("the clearing decision goes through the shared predicate", () => {
-    assert.match(source, /shouldClearImplReviewFilesAfterReviewV1\(targetStage, historyEntry\.taskFixableCount\)/);
+  void it("the clearing decision goes through the shared predicate, using the total blocker count and the review's scope", () => {
+    assert.match(source, /shouldClearImplReviewFilesAfterReviewV1\(targetStage, historyEntry\.blockerCount, reviewScope\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RC3 item 10 (Step 6) — rebuild implReviewFiles from the round ledger
+// ---------------------------------------------------------------------------
+
+void describe("resolveLedgerImplReviewFilesV1", () => {
+  const implRow = (
+    overrides: Partial<ImplReviewLedgerRowV1> & { roundId: string }
+  ): ImplReviewLedgerRowV1 => ({
+    mode: "implementation",
+    state: "completed",
+    outcome: { filesChanged: [] },
+    ...overrides,
+  });
+
+  void it("unions filesChanged across all three implementation modes, most-recent round first", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [
+        implRow({ roundId: "r1", mode: "implementation", outcome: { filesChanged: ["src/a.ts"] } }),
+        implRow({ roundId: "r2", mode: "apply-review", outcome: { filesChanged: ["src/b.ts", "src/a.ts"] } }),
+        implRow({ roundId: "r3", mode: "continuation", outcome: { filesChanged: [] } }),
+      ],
+      200
+    );
+    assert.deepEqual(result, { established: true, files: ["src/b.ts", "src/a.ts"] });
+  });
+
+  void it("ignores review rows entirely, live or terminal", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [
+        implRow({ roundId: "r1", outcome: { filesChanged: ["src/a.ts"] } }),
+        implRow({ roundId: "r2", mode: "review", state: "open", outcome: undefined }),
+        { roundId: "r3", mode: "review", state: "completed", outcome: { filesChanged: ["src/should-not-appear.ts"] } },
+      ],
+      200
+    );
+    assert.deepEqual(result, { established: true, files: ["src/a.ts"] });
+  });
+
+  void it("a filesChangedUnknown round makes the ledger unavailable", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [implRow({ roundId: "r1", outcome: { filesChangedUnknown: true } })],
+      200
+    );
+    assert.equal(result.established, false);
+    if (!result.established) {
+      assert.match(result.reason, /r1/);
+      assert.match(result.reason, /no change list/);
+    }
+  });
+
+  void it("an open implementation row makes the ledger unavailable, naming the row", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [
+        implRow({ roundId: "r1", outcome: { filesChanged: ["src/a.ts"] } }),
+        implRow({ roundId: "r2", state: "open", outcome: undefined }),
+      ],
+      200
+    );
+    assert.equal(result.established, false);
+    if (!result.established) {
+      assert.match(result.reason, /r2/);
+      assert.match(result.reason, /open/);
+    }
+  });
+
+  void it("a scheduled implementation row makes the ledger unavailable, naming the row", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [implRow({ roundId: "r9", state: "scheduled", outcome: undefined })],
+      200
+    );
+    assert.equal(result.established, false);
+    if (!result.established) {
+      assert.match(result.reason, /r9/);
+      assert.match(result.reason, /scheduled/);
+    }
+  });
+
+  void it("a terminal row with filesChanged omitted (e.g. interrupted) makes the ledger unavailable", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [implRow({ roundId: "r1", state: "interrupted", outcome: {} })],
+      200
+    );
+    assert.equal(result.established, false);
+    if (!result.established) {
+      assert.match(result.reason, /r1/);
+      assert.match(result.reason, /no change list/);
+    }
+  });
+
+  void it("a ledger at the retention cap is never trusted, whatever it contains", () => {
+    const rows = [implRow({ roundId: "r1", outcome: { filesChanged: ["src/a.ts"] } })];
+    const result = resolveLedgerImplReviewFilesV1(rows, 1);
+    assert.equal(result.established, false);
+    if (!result.established) {
+      assert.match(result.reason, /retention cap/);
+    }
+  });
+
+  void it("no implementation-mode rows at all is unavailable", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [{ roundId: "r1", mode: "review", state: "completed", outcome: { filesChanged: ["x"] } }],
+      200
+    );
+    assert.equal(result.established, false);
+  });
+
+  void it("an empty ledger is unavailable", () => {
+    assert.equal(resolveLedgerImplReviewFilesV1(undefined, 200).established, false);
+    assert.equal(resolveLedgerImplReviewFilesV1([], 200).established, false);
+  });
+
+  void it("an established result can legitimately be an empty file set (no changes)", () => {
+    const result = resolveLedgerImplReviewFilesV1(
+      [implRow({ roundId: "r1", outcome: { filesChanged: [] } })],
+      200
+    );
+    assert.deepEqual(result, { established: true, files: [] });
   });
 });

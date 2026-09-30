@@ -656,18 +656,128 @@ export function describeOversizedInputRemedyV1(
 }
 
 /**
- * Whether a published implementation review should reset the task's shared
- * changed-file set (`TaskProgress.implReviewFiles`). The set feeds BOTH
- * implementation review stages, and `impl-low-review` runs AFTER
- * `impl-high-review`: only a clean review of the LAST stage may clear it,
- * otherwise a clean high-level review leaves the low-level review with no
- * files to review (RC1 item 5).
+ * Whether a published review should reset the task's shared changed-file set
+ * (`TaskProgress.implReviewFiles`). The set feeds BOTH implementation review
+ * stages AND the Publish review, which runs LAST: only a clean review of the
+ * Publish stage may clear it — otherwise a clean high- or low-level review
+ * would wipe the set before the Publish review ever uses it (RC1 item 5
+ * fixed the impl-high/impl-low ordering; RC3 item 10 extends the same rule
+ * to Publish, since RC1's fix cleared after impl-low-review, one stage too
+ * early for Publish to ever see a tracked set).
+ *
+ * "Clean" means zero blockers of ANY classification, not just the
+ * task-fixable subset — a Publish review with a remaining environmental or
+ * review-confidence blocker still needs the same files available if the
+ * task is reopened at Publish, so `totalBlockerCount` (the review's full
+ * `blockerCount`, not `taskFixableCount`) is what callers must pass.
+ *
+ * A Publish verdict scoped to open editors (`reviewScope === "open-editors"`,
+ * carried from `handleReviewRoutingOutcome`'s own `reviewScope` option — see
+ * `REVIEW_SCOPE_FALLBACK_VARIABLE`) never clears it either: that verdict says
+ * nothing about the task's tracked changes as a whole, including when it is
+ * reached by resuming a legacy interaction whose persisted input snapshot was
+ * open-editor scoped (2026-09-30 review, completion blocker) — clearing the
+ * set on that verdict would discard the task's real change record on the
+ * strength of a review that never looked at it.
  */
 export function shouldClearImplReviewFilesAfterReviewV1(
   targetStage: string,
-  taskFixableCount: number
+  totalBlockerCount: number,
+  reviewScope?: "open-editors" | "tracked"
 ): boolean {
-  return targetStage === "impl-low-review" && taskFixableCount === 0;
+  return targetStage === "publish" && totalBlockerCount === 0 && reviewScope !== "open-editors";
+}
+
+/**
+ * Minimal shape this module needs from a `RoundLedgerEntryV1` row — kept
+ * local (rather than importing the full type from taskProgress.ts) so this
+ * stays a pure, VS-Code-free module callers can unit test without pulling in
+ * the whole progress type graph.
+ */
+export interface ImplReviewLedgerRowV1 {
+  roundId: string;
+  mode: "implementation" | "apply-review" | "continuation" | "review";
+  state: "scheduled" | "open" | "completed" | "rejected" | "cancelled" | "failed" | "quota-blocked" | "dropped" | "interrupted";
+  outcome?: {
+    filesChanged?: readonly string[];
+    filesChangedUnknown?: boolean;
+  };
+}
+
+const IMPLEMENTATION_LEDGER_MODES = new Set(["implementation", "apply-review", "continuation"]);
+const LIVE_LEDGER_STATES = new Set(["scheduled", "open"]);
+
+/** RC3 item 10 (Step 6): result of trying to rebuild `implReviewFiles` from
+ * `TaskProgress.roundLedger` alone, without reading the working tree. */
+export type ImplReviewLedgerRebuildResultV1 =
+  | { established: true; files: string[] }
+  | { established: false; reason: string };
+
+/**
+ * Rebuild the task's changed-file set from the union of every
+ * implementation-mode round's `outcome.filesChanged`, when the ledger can
+ * PROVE it has seen every implementation round's edits. See RC3 item 10's
+ * plan for the full rationale; summarized:
+ *
+ *  - the ledger is capped at `maxEntries` (its oldest TERMINAL rows evicted
+ *    first, with no truncation record) — once the cap was reached, the
+ *    ledger cannot prove completeness, so it is never trusted;
+ *  - at least one implementation-mode row must exist;
+ *  - every implementation-mode row must be terminal (not `scheduled`/`open`)
+ *    — a live row's edits are not yet recorded here at all;
+ *  - every implementation-mode row must carry a KNOWN change list —
+ *    `outcome.filesChanged` present as an array and `filesChangedUnknown`
+ *    not true (an empty array is a known "no changes" result).
+ *
+ * `review` rows are ignored entirely, whatever their state. The union is
+ * order-preserving-deduplicated (first occurrence wins), most-recent round
+ * first, matching `updateImplReviewFiles`'s own ordering convention.
+ */
+export function resolveLedgerImplReviewFilesV1(
+  ledger: readonly ImplReviewLedgerRowV1[] | undefined,
+  maxEntries: number
+): ImplReviewLedgerRebuildResultV1 {
+  const rows = ledger ?? [];
+  if (rows.length >= maxEntries) {
+    return {
+      established: false,
+      reason: `ledger skipped: at retention cap (${rows.length} of ${maxEntries} rows — the ledger cannot prove nothing was evicted)`,
+    };
+  }
+
+  const implRows = rows.filter((row) => IMPLEMENTATION_LEDGER_MODES.has(row.mode));
+  if (implRows.length === 0) {
+    return { established: false, reason: "ledger skipped: no implementation-mode rounds recorded" };
+  }
+
+  for (const row of implRows) {
+    if (LIVE_LEDGER_STATES.has(row.state)) {
+      return {
+        established: false,
+        reason: `ledger skipped: round ${row.roundId} (${row.mode}) is still ${row.state}`,
+      };
+    }
+    if (row.outcome?.filesChangedUnknown === true || !Array.isArray(row.outcome?.filesChanged)) {
+      return {
+        established: false,
+        reason: `ledger skipped: round ${row.roundId} (${row.mode}, ${row.state}) has no change list`,
+      };
+    }
+  }
+
+  const seen = new Set<string>();
+  const files: string[] = [];
+  // Most-recent round first, mirroring updateImplReviewFiles's convention —
+  // `implRows` is in ledger (chronological, oldest-first) order, so reverse.
+  for (const row of [...implRows].reverse()) {
+    for (const file of row.outcome!.filesChanged!) {
+      if (!seen.has(file)) {
+        seen.add(file);
+        files.push(file);
+      }
+    }
+  }
+  return { established: true, files };
 }
 
 /**

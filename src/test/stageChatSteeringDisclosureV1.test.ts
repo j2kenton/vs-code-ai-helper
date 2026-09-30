@@ -16,10 +16,11 @@ import { buildStageResponsePrompt } from "../commands/chatWithStage";
 void describe("stage chat non-steering disclosure", () => {
   const source = fs.readFileSync("src/views/chatView.ts", "utf8");
 
-  void it("renders a note saying messages are not passed to the next round and naming plan-final.md", () => {
+  void it("renders a note saying rounds don't read the chat, and explains recording a plan change in chat or editing plan-final.md", () => {
     const note = /<div id="steering-note"[^>]*>([^<]*(?:<code>[^<]*<\/code>[^<]*)*)<\/div>/.exec(source);
     assert.ok(note, "the chat view must render a #steering-note element");
-    assert.match(note[1]!, /not passed to the next round/);
+    assert.match(note[1]!, /Rounds don't read this chat/);
+    assert.match(note[1]!, /ask here to record it in the plan/);
     assert.match(note[1]!, /plan-final\.md/);
   });
 

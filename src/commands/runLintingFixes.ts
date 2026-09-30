@@ -406,7 +406,7 @@ export async function runLintingFixes(
       kind: "lint-fixes",
       parent: parentOperation,
     },
-    async () => {
+    async (op) => {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Window,
@@ -577,6 +577,7 @@ export async function runLintingFixes(
                     fixedCount > 0
                       ? " The deterministic autofixes above were still applied."
                       : "";
+                  op.settleAs("failed", "AI final fixes unavailable; checks still fail");
                   NotificationRouter.showWarning(
                     `AI final fixes are unavailable: ${editAvailability.reason}${autofixNote}${stillFailingNote}`
                   );
@@ -716,10 +717,25 @@ export async function runLintingFixes(
                     });
                   });
                   if (result?.status === "completed") {
-                    await runCompletionLint(taskFolderUri, relevantFiles);
+                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
                     await inventory.refresh();
-                    NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
+                    if (!rerunLint.passed) {
+                      // RC3 item 11 (Step 9): fixes were applied, but the
+                      // checks the fixes were meant to satisfy still fail —
+                      // "completed" is reserved for a run whose fixes were
+                      // actually applied AND left the checks passing.
+                      const stillFailingNote =
+                        rerunLint.failedChecks.length > 0
+                          ? ` The failing checks are unchanged: ${rerunLint.failedChecks.map((check) => check.command).join(", ")}.`
+                          : "";
+                      op.settleAs("failed", "checks still fail after the AI fixes were applied");
+                      NotificationRouter.showWarning(
+                        `AI final fixes were applied, but checks still fail.${stillFailingNote}`
+                      );
+                    } else {
+                      NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
+                    }
                   } else {
                     // RC2 item 15, Step 40: this branch already ran the AI
                     // pass and re-ran completion lint against its (possibly
@@ -737,12 +753,17 @@ export async function runLintingFixes(
                         : "";
                     // A `status: "failed"` result with an empty/missing
                     // `errorMessage` must still be reported as a failure,
-                    // never mistaken for `"cancelled"` (Step 40).
+                    // never mistaken for `"cancelled"` (Step 40). RC3 item 11
+                    // (Step 9): neither sub-case leaves the fixes actually
+                    // applied, so neither may report "completed" at the
+                    // operation level.
                     if (result?.status === "failed") {
+                      op.settleAs("failed", result.errorMessage ?? "no reason was reported");
                       NotificationRouter.showWarning(
                         `AI final fixes failed: ${result.errorMessage ?? "no reason was reported"}.${stillFailingNote}`
                       );
                     } else {
+                      op.settleAs("failed", "AI final fixes were cancelled before completing");
                       NotificationRouter.showWarning(
                         `AI final fixes were cancelled; completion lint was rerun.${stillFailingNote}`
                       );
@@ -772,6 +793,11 @@ export async function runLintingFixes(
               );
             } else {
               const stillFailingChecks = postFixLint.failedChecks;
+              if (stillFailingChecks.length > 0) {
+                // RC3 item 11 (Step 9): checks are still failing here, so the
+                // operation-level notification must not read "completed".
+                op.settleAs("failed", "no automatic fixes were available; checks still fail");
+              }
               NotificationRouter.showWarning(
                 stillFailingChecks.length > 0
                   ? `No automatic fixes were available. The failing checks are unchanged: ${stillFailingChecks.map((check) => check.command).join(", ")}.`

@@ -168,7 +168,8 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     migration:
       "Validate bounded task-local review references; map absence only where its historical family permits.",
     nextStage: "Preserve.",
-    markTaskDone: "Preserve.",
+    markTaskDone:
+      "Clear — RC3 item 10: a completed task has no further review that could still need this task's tracked changed-file set (Publish, the last consumer, already cleared it on a clean verdict; a completion via missing-artifact override leaves nothing standing to rebuild it for).",
     reopen:
       "Preserve only when its owner stage (impl) is strictly before selected stage; otherwise [].",
   },
@@ -646,7 +647,10 @@ export function applyMarkTaskDonePolicyV1(
       input.missingArtifacts,
       input.artifactOverride
     ),
-    implReviewFiles: progress.implReviewFiles,
+    // RC3 item 10: markTaskDone now clears this — Publish (the last
+    // consumer) already clears it on a clean verdict, and a completed task
+    // has no further review that could need the set rebuilt.
+    implReviewFiles: undefined,
     taskMdSizeBandAnnounced: progress.taskMdSizeBandAnnounced,
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,

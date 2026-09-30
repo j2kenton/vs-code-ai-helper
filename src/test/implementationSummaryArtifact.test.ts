@@ -46,6 +46,7 @@ import { verifyPlanItems } from "../utils/completionLint";
 import {
   AcceptedNonGoalItemV1,
   appendAcceptedNonGoalV1,
+  areAllUnmatchedChecklistClaimsAlreadySettledV1,
   collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
   collectPlanItemReasonsV1,
@@ -64,6 +65,7 @@ import {
   NO_CHECKLIST_CHANGE_MARKER_V1,
   normalizeChecklistItemTextV1,
   parseChecklistItemPriorityV1,
+  parseNumberedChecklistClaimV1,
   RETROACTIVE_TICK_MARKER_V1,
   scopeToLatestChecklistV1,
   splitSummaryAtEchoV1,
@@ -2239,7 +2241,7 @@ void describe("mergeChecklistProgressV1 distinguishes no-op from no-match", () =
     }
   });
 
-  void it("samples up to two unmatched items when several reported ticks miss", () => {
+  void it("samples up to two unmatched items when several reported ticks miss, but unmatchedAll keeps every one", () => {
     const echo = [
       "<!-- ensemble:implementation-checklist -->",
       "- [x] Totally foreign item one",
@@ -2250,7 +2252,197 @@ void describe("mergeChecklistProgressV1 distinguishes no-op from no-match", () =
     assert.equal(result.kind, "no-match");
     if (result.kind === "no-match") {
       assert.equal(result.unmatchedSample.length, 2);
+      assert.deepEqual(result.unmatchedAll, [
+        "Totally foreign item one",
+        "Totally foreign item two",
+        "Totally foreign item three",
+      ]);
     }
+  });
+});
+
+void describe("parseNumberedChecklistClaimV1 (RC3 item 1, Step 2a)", () => {
+  void it("resolves a single 'Step N' claim", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 34"), { kind: "resolved", indices: [34] });
+  });
+
+  void it("resolves 'Step N (…)' — a number reference followed by parenthetical context", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 1 (lookalike-marker acceptance…)"), {
+      kind: "resolved",
+      indices: [1],
+    });
+  });
+
+  void it("resolves a hyphenated 'Steps N-M' range", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-33"), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("resolves an en-dash 'Steps N–M' range", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1–33"), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("resolves a 'Steps N to M' range", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1 to 33"), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("treats an ordinary item-text claim as not-a-number-claim, left for the existing unresolved path", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Wire the completeness gate"), { kind: "not-a-number-claim" });
+  });
+
+  void it("treats a dangling range ('Steps 5–') as malformed, not resolved", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 5–"), { kind: "malformed" });
+  });
+
+  void it("treats a non-numeric target ('Step x') as malformed", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step x"), { kind: "malformed" });
+  });
+
+  void it("treats an inverted range ('Steps 10-5') as malformed", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 10-5"), { kind: "malformed" });
+  });
+
+  void it("treats a range with an unparsed trailing step reference as malformed, not silently truncated", () => {
+    // Regression: the un-anchored regex used to match only the "Steps 1-2"
+    // prefix and silently drop " and Step 83", resolving to [1, 2] as if
+    // Step 83 had never been mentioned — a false-suppression risk if 1 and 2
+    // are settled but 83 is not.
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-2 and Step 83"), { kind: "malformed" });
+  });
+
+  void it("treats a single-step claim with an unparsed trailing step reference as malformed", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 1 and Step 83"), { kind: "malformed" });
+  });
+
+  void it("still resolves 'Step N (…)' when the parenthetical runs to the end of the claim", () => {
+    // The parenthetical form stays allowed — only a reference AFTER it (or
+    // outside any parenthetical) is rejected.
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 34 (final polish pass)"), {
+      kind: "resolved",
+      indices: [34],
+    });
+  });
+
+  void it("still resolves a range with a trailing period", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-33."), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("treats a range whose span exceeds the sanity bound as malformed, never expanding it", () => {
+    // Regression: an unbounded loop from `start` to `end` let a claim like
+    // "Steps 1-999999999" build an enormous array before anything checked it
+    // against the plan. The bound is a fixed sanity cap (this function never
+    // consults the plan), so a real plan's steps are always far under it.
+    const result = parseNumberedChecklistClaimV1("Steps 1-999999999");
+    assert.deepEqual(result, { kind: "malformed" });
+  });
+
+  void it("resolves the task's own acceptance-criteria example, 'Steps 1–33 — done', with the en-dash range and em-dash status suffix", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1–33 — done"), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("resolves a hyphenated range with a plain-hyphen ' - done' status suffix", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-33 - done"), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("resolves a single-step claim with a ' — done' status suffix", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 34 — done"), { kind: "resolved", indices: [34] });
+  });
+
+  void it("resolves a single-step claim whose parenthetical is followed by a ' — done' status suffix", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Step 34 (final polish pass) — done"), {
+      kind: "resolved",
+      indices: [34],
+    });
+  });
+
+  void it("resolves a range with both a trailing ' — done' suffix and a trailing period", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-33 — done."), {
+      kind: "resolved",
+      indices: Array.from({ length: 33 }, (_, i) => i + 1),
+    });
+  });
+
+  void it("still treats a range with an unparsed trailing reference as malformed even when it ends in 'done'", () => {
+    // The status-suffix grammar whitelists exactly the literal word "done"
+    // after a dash — it must not reopen the general "allow any trailing
+    // text" bug the whole-string anchoring fixed.
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-2 and Step 83 — done"), { kind: "malformed" });
+  });
+
+  void it("still treats 'done' without a preceding dash as malformed, not silently accepted", () => {
+    assert.deepEqual(parseNumberedChecklistClaimV1("Steps 1-33 done"), { kind: "malformed" });
+  });
+});
+
+void describe("areAllUnmatchedChecklistClaimsAlreadySettledV1 (RC3 item 1, Step 2a)", () => {
+  // Five top-level items: #1 and #2 ticked, #3 excluded, #4 and #5 unticked.
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] First step",
+    "- [x] Second step",
+    `- [ ] Third step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    "- [ ] Fourth step",
+    "- [ ] Fifth step",
+  ].join("\n");
+
+  void it("is true for an empty claim list (nothing left unresolved)", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, []), true);
+  });
+
+  void it("is true for a fully-settled range naming only ticked items", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Steps 1-2"]), true);
+  });
+
+  void it("is true for the task's own acceptance-criteria example, 'Steps 1–33 — done', once every named item is settled", () => {
+    // Reuses the 5-item PLAN's settled prefix ([x] items 1-2, excluded item
+    // 3) so the claim's range only ever names already-settled items.
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Steps 1–3 — done"]), true);
+  });
+
+  void it("is true when the range includes an excluded (not ticked) item — excluded still counts as settled", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Steps 1-3"]), true);
+  });
+
+  void it("is false for a mixed range with one unticked item still open", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Steps 1-4"]), false);
+  });
+
+  void it("is true for duplicate numbers naming the same already-settled item twice", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Step 1", "Step 1"]), true);
+  });
+
+  void it("is false for an out-of-range item number", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Step 100"]), false);
+  });
+
+  void it("is false for a malformed range, never guessed at", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Steps 5–"]), false);
+  });
+
+  void it("is false when any one claim among several is unresolved, even if the rest settle", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["Step 1", "Step 4"]), false);
+  });
+
+  void it("is false for an ordinary item-text claim that matched nothing — left to the existing paths", () => {
+    assert.equal(areAllUnmatchedChecklistClaimsAlreadySettledV1(PLAN, ["A reworded claim matching nothing"]), false);
   });
 });
 

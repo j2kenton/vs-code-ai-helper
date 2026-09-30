@@ -877,6 +877,13 @@ import { setExtensionContextV1 } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import type { CreateWorkflowDecisionInputV1 } from "../types/workflowDecisionV1";
+import {
+  markFastForwardRunActiveV1,
+  clearFastForwardRunActiveV1,
+  getFastForwardSessionIdV1,
+  getFastForwardRunEpochV1,
+  recordFastForwardRunPausedV1,
+} from "../utils/activeFastForwardRunsV1";
 
 void describe("pauseTask integration (full command path)", () => {
   void it("TaskNode-shaped arg pauses the exact named task", async () => {
@@ -2637,12 +2644,27 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
         // never reach that logic at all, so its absence here is itself part
         // of the proof.
 
+        // Review-flagged completion fix, round 2 (2026-09-30): every real
+        // caller now stamps provenance and the run's ending is recorded as a
+        // pause (see `stampFastForwardResumeProvenanceV1` /
+        // `recordFastForwardRunPausedV1`) — a bare, unprovenanced state (this
+        // test's shape before this fix) is no longer something any real
+        // caller produces, and is covered separately as untrusted by the
+        // "no provenance fields at all" test below.
+        markFastForwardRunActiveV1(folderPath, { attemptNumber: 7, maxAttempts: 10 });
+        const provenance = {
+          fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+          fastForwardRunEpochV1: getFastForwardRunEpochV1(folderPath),
+        };
+        recordFastForwardRunPausedV1(folderPath);
+        clearFastForwardRunActiveV1(folderPath);
+
         const inv = makeInventoryStub(folderPath, folderPath, "paused");
         const currentStore = makeCurrentTaskStoreStub(undefined);
 
         await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
           taskFolderPath: folderPath,
-          resumeFastForwardV1: { attemptNumber: 7, maxAttempts: 10 },
+          resumeFastForwardV1: { attemptNumber: 7, maxAttempts: 10, ...provenance },
         });
 
         const stored = await readStoredProgress(store, folderUri);
@@ -2664,13 +2686,328 @@ void describe("resumeAndApplyCurrentStageActionV1 (production code)", () => {
           | {
               taskFolderPath?: string;
               admissionHandoffTokenV1?: string;
-              resumeFromAttemptV1?: { attemptNumber: number; maxAttempts: number };
+              resumeFromAttemptV1?: {
+                attemptNumber: number;
+                maxAttempts: number;
+                fastForwardSessionIdV1?: string;
+                fastForwardRunEpochV1?: number;
+              };
             }
           | undefined;
         assert.equal(dispatchArg?.taskFolderPath, folderPath);
         assert.equal(typeof dispatchArg?.admissionHandoffTokenV1, "string");
-        assert.deepEqual(dispatchArg?.resumeFromAttemptV1, { attemptNumber: 7, maxAttempts: 10 });
+        assert.deepEqual(dispatchArg?.resumeFromAttemptV1, { attemptNumber: 7, maxAttempts: 10, ...provenance });
       } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // RC3 item 4, Step 3 completion fix (review-flagged 2026-09-30): a
+  // `resumeFastForwardV1` that carries provenance matching the CURRENT
+  // session/run-epoch for the task folder is trusted and resumes Fast
+  // Forward exactly like the legacy (no-provenance) case above.
+  void it(
+    "dispatches fastForwardReviewWithAI when resumeFastForwardV1's provenance still matches the current " +
+      "session and run epoch",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      const folderUri = makeTaskFolderUri("resume-and-apply-ff-provenance-trusted");
+      const folderPath = folderUri.fsPath;
+      try {
+        await seedProgress(store, folderUri, {
+          taskFolder: "resume-and-apply-ff-provenance-trusted",
+          currentStage: "impl-high-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+
+        markFastForwardRunActiveV1(folderPath, { attemptNumber: 2, maxAttempts: 5 });
+        const trustedProvenance = {
+          attemptNumber: 2,
+          maxAttempts: 5,
+          fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+          fastForwardRunEpochV1: getFastForwardRunEpochV1(folderPath),
+        };
+        // Review-flagged completion fix, round 2 (2026-09-30): provenance
+        // alone is not enough — the folder's most recent recorded pause must
+        // also still name this exact session/epoch, matching what
+        // `fastForwardReviewWithAI`'s own `finally` records when a run ends
+        // because it paused to raise this very card.
+        recordFastForwardRunPausedV1(folderPath);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          resumeFastForwardV1: trustedProvenance,
+        });
+
+        const dispatch = execCmd.captured.find(
+          (e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"
+        );
+        assert.ok(dispatch !== undefined, "matching provenance must still resume Fast Forward");
+      } finally {
+        clearFastForwardRunActiveV1(folderPath);
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // RC3 item 4, Step 3 completion fix (review-flagged 2026-09-30): the review
+  // found that a card's captured `resumeFastForwardV1` was trusted forever,
+  // so answering it after the extension host restarted (a fresh session id)
+  // or after a different Fast Forward run had since started for the same
+  // task (a different run epoch) still resumed Fast Forward with stale
+  // counters — an unrequested run the plan explicitly forbids. Both cases
+  // must fall back to the single-cycle dispatch instead.
+  void it(
+    "falls back to the single-cycle dispatch, never fastForwardReviewWithAI, when resumeFastForwardV1's " +
+      "session id no longer matches (simulates a window/extension-host restart since the card was posted)",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      const folderUri = makeTaskFolderUri("resume-and-apply-ff-stale-session");
+      const folderPath = folderUri.fsPath;
+      try {
+        await seedProgress(store, folderUri, {
+          taskFolder: "resume-and-apply-ff-stale-session",
+          currentStage: "impl-high-review",
+          status: "paused",
+          stageReviewPasses: { "impl-high-review": 1 },
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+        seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          resumeFastForwardV1: {
+            attemptNumber: 3,
+            maxAttempts: 8,
+            fastForwardSessionIdV1: "a-session-id-from-before-a-restart",
+            fastForwardRunEpochV1: 1,
+          },
+        });
+
+        assert.equal(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "a stale session id must never start Fast Forward"
+        );
+        assert.ok(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+          "it must still fall through to the ordinary single-cycle dispatch"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  void it(
+    "falls back to the single-cycle dispatch, never fastForwardReviewWithAI, when resumeFastForwardV1's " +
+      "run epoch no longer matches (simulates a different Fast Forward run having since started for this task)",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      const folderUri = makeTaskFolderUri("resume-and-apply-ff-stale-epoch");
+      const folderPath = folderUri.fsPath;
+      try {
+        await seedProgress(store, folderUri, {
+          taskFolder: "resume-and-apply-ff-stale-epoch",
+          currentStage: "impl-high-review",
+          status: "paused",
+          stageReviewPasses: { "impl-high-review": 1 },
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+        seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
+
+        // A DIFFERENT Fast Forward run for this same folder starts (and, as a
+        // real one would, ends) between the stale card's post time and now —
+        // this bumps the folder's run epoch, so the card's own captured
+        // epoch (captured before this happened) is one behind.
+        markFastForwardRunActiveV1(folderPath, { attemptNumber: 1, maxAttempts: 4 });
+        const staleEpoch = getFastForwardRunEpochV1(folderPath);
+        clearFastForwardRunActiveV1(folderPath);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          resumeFastForwardV1: {
+            attemptNumber: 1,
+            maxAttempts: 4,
+            fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+            fastForwardRunEpochV1: staleEpoch - 1,
+          },
+        });
+
+        assert.equal(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "a superseded run epoch must never start Fast Forward"
+        );
+        assert.ok(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+          "it must still fall through to the ordinary single-cycle dispatch"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // Review-flagged completion fix, round 2 (2026-09-30, narrowed blocker
+  // 62a487ef-0d12-4476-a39f-abc4016bf4d4-0): a matching session id and run
+  // epoch are not enough on their own — the originating run must also still
+  // be on record as having ended BECAUSE it paused to raise this exact card,
+  // not for an unrelated reason (it succeeded, stalled, ran out of attempts,
+  // or errored) with no other run having started since. Simulated here by
+  // marking the run active and then ending it WITHOUT ever recording a
+  // pause, exactly as `fastForwardReviewWithAI`'s own `finally` does for
+  // every non-paused outcome.
+  void it(
+    "falls back to the single-cycle dispatch, never fastForwardReviewWithAI, when the matching session/epoch's " +
+      "run ended for an unrelated reason (no pause was ever recorded for it)",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      const folderUri = makeTaskFolderUri("resume-and-apply-ff-ended-unrelated");
+      const folderPath = folderUri.fsPath;
+      try {
+        await seedProgress(store, folderUri, {
+          taskFolder: "resume-and-apply-ff-ended-unrelated",
+          currentStage: "impl-high-review",
+          status: "paused",
+          stageReviewPasses: { "impl-high-review": 1 },
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+        seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
+
+        markFastForwardRunActiveV1(folderPath, { attemptNumber: 2, maxAttempts: 5 });
+        const capturedProvenance = {
+          attemptNumber: 2,
+          maxAttempts: 5,
+          fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+          fastForwardRunEpochV1: getFastForwardRunEpochV1(folderPath),
+        };
+        // The run ends here for a reason unrelated to raising this card
+        // (success, stalled, exhausted attempts, an error) — no
+        // recordFastForwardRunPausedV1 call, only the liveness clear, exactly
+        // as the real `finally`'s non-paused branch does.
+        clearFastForwardRunActiveV1(folderPath);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          resumeFastForwardV1: capturedProvenance,
+        });
+
+        assert.equal(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "a run that ended for an unrelated (non-paused) reason must never resume Fast Forward, even with a " +
+            "matching session and epoch"
+        );
+        assert.ok(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+          "it must still fall through to the ordinary single-cycle dispatch"
+        );
+      } finally {
+        execCmd.restore();
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    }
+  );
+
+  // Review-flagged completion fix, round 2 (2026-09-30): an older card built
+  // before this fix existed carries neither provenance field at all — that
+  // shape must never be trusted (it is indistinguishable from a legitimate
+  // card except by the absence this fix specifically closes), even though a
+  // Fast Forward run is currently, genuinely active for the same folder.
+  void it(
+    "falls back to the single-cycle dispatch when resumeFastForwardV1 carries no provenance fields at all " +
+      "(an older, pre-fix card), even while a real Fast Forward run is active for the same folder",
+    async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+      const folderUri = makeTaskFolderUri("resume-and-apply-ff-no-provenance");
+      const folderPath = folderUri.fsPath;
+      try {
+        await seedProgress(store, folderUri, {
+          taskFolder: "resume-and-apply-ff-no-provenance",
+          currentStage: "impl-high-review",
+          status: "paused",
+          stageReviewPasses: { "impl-high-review": 1 },
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        });
+        seedImplReviewArtifacts(store, folderUri, "Readiness: 6/10\n\nProse.\n\n<!-- review-pass: 1 -->\n");
+
+        markFastForwardRunActiveV1(folderPath, { attemptNumber: 2, maxAttempts: 5 });
+        recordFastForwardRunPausedV1(folderPath);
+
+        const inv = makeInventoryStub(folderPath, folderPath, "paused");
+        const currentStore = makeCurrentTaskStoreStub(undefined);
+
+        await resumeAndApplyCurrentStageActionV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          // Legacy shape: no fastForwardSessionIdV1 / fastForwardRunEpochV1.
+          resumeFastForwardV1: { attemptNumber: 2, maxAttempts: 5 },
+        });
+
+        assert.equal(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
+          false,
+          "a provenance-free record must never resume Fast Forward"
+        );
+        assert.ok(
+          execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyCurrentStageAction"),
+          "it must still fall through to the ordinary single-cycle dispatch"
+        );
+      } finally {
+        clearFastForwardRunActiveV1(folderPath);
         execCmd.restore();
         msgs.restore();
         fs.restore();

@@ -50,8 +50,11 @@ When the implementation notes below include a plan checklist (`<!-- ensemble:imp
 ```
 <!-- verified-complete:start -->
 - <exact plan item text, copied verbatim from the plan checklist>
+  evidence: <one sentence naming the file or symbol you opened and what you saw>
 <!-- verified-complete:end -->
 ```
+
+The `evidence:` line is optional but strongly encouraged: it is the one sentence that lets the person reading the resulting card see WHY the tick is safe, without re-deriving your reasoning. Put it on its own indented line directly under the item it supports — one line per item, naming the specific file/symbol you opened and what confirmed the item. An item with no `evidence:` line is still ticked (older reviews never had this grammar), it just shows as unexplained to the person applying it.
 
 This drives a one-click action that ticks exactly these items in plan-final.md on the strength of your verification alone — so only list an item here when you actually checked it against the tree yourself, never because it merely seems likely to be done. Omit an item you did not personally verify. Skip this block entirely when there is no checklist to check items against (e.g. a plan review), or emit it with the two markers and no entries when a checklist exists but you verified nothing beyond what is already ticked.
 

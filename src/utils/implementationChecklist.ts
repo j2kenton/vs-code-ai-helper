@@ -25,11 +25,13 @@
  * replaced, and progress through it still accumulates.
  */
 
+import { createHash } from "crypto";
 import {
   findLastHeadingV1,
   headingsV1,
   walkLinesV1,
 } from "./markdownStructure";
+import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
 
 /**
  * One checklist line, split so a merge can rewrite only the checkbox glyph and
@@ -883,6 +885,276 @@ export function applyOpenPlanItemDecisionsV1(
     ticked,
     excluded: excludedItems.map((item) => item.itemText),
     notFound,
+  };
+}
+
+/**
+ * RC3 item 5, Step 10 (engine slice): one top-level checklist item's stable
+ * identity, independent of its current checked/excluded state. `occurrence`
+ * is the 1-based count of that exact (normalized) text among every
+ * top-level checklist item in plan order — computed over ALL items, settled
+ * or not, so it never shifts as items get ticked or excluded, and two items
+ * that happen to share text still resolve to distinct plan lines.
+ */
+export interface OpenPlanItemRecordV1 {
+  readonly itemId: string;
+  readonly itemText: string;
+  readonly occurrence: number;
+  /** True when this line is already ticked or carries the excluded marker. */
+  readonly settled: boolean;
+}
+
+/**
+ * A stable id for one checklist item occurrence: a hash of its normalized
+ * text plus its 1-based occurrence count, so a duplicate-text item and a
+ * later occurrence of the same wording never collide. Deliberately opaque
+ * and independent of plan-wide numbering (Step numbers/line numbers), which
+ * change as the plan is edited.
+ */
+function exactItemKeyV1(text: string): string {
+  // Exact identity: only unescape and trim; case and inner whitespace are
+  // significant, so an edited line is never mistaken for the original.
+  return unescapeChecklistItemTextV1(text).trim();
+}
+
+function occurrenceKeyV1(text: string, settled: boolean): string {
+  if (!settled) {
+    return exactItemKeyV1(text);
+  }
+  // A line this flow settled carries an appended annotation (and the excluded
+  // marker); strip it so the line keeps the id it had while open and is
+  // reported as "already settled" rather than "no longer in the plan".
+  const withoutMarker = text.replace(/[ \t]*<!-- ensemble:excluded -->[ \t]*$/, "");
+  return exactItemKeyV1(withoutMarker.replace(/\s+— (?:Checked|Excluded by you): [\s\S]*$/, ""));
+}
+
+export function computeOpenPlanItemIdV1(itemText: string, occurrence: number): string {
+  return createHash("sha256")
+    .update(`${exactItemKeyV1(itemText)}\u0000${occurrence}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/**
+ * Every top-level checklist item in `planOfRecord`'s latest rendering, in
+ * plan order, each carrying the stable {@link computeOpenPlanItemIdV1} id
+ * for its own text+occurrence. The basis for both assigning ids when an
+ * open-items form is built and for resolving a submitted answer back to a
+ * plan line later, since re-running this over a possibly-edited plan is the
+ * only way to tell "still there, same occurrence" from "no longer in the
+ * plan as written" without trusting a caller-supplied line number.
+ */
+export function listOpenPlanItemRecordsV1(planOfRecord: string): readonly OpenPlanItemRecordV1[] {
+  const seen = new Map<string, number>();
+  const records: OpenPlanItemRecordV1[] = [];
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.nested) {
+      continue;
+    }
+    const settled = item.checked || item.excluded;
+    const key = occurrenceKeyV1(item.text, settled);
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    const itemText = unescapeChecklistItemTextV1(item.text);
+    records.push({
+      itemId: computeOpenPlanItemIdV1(key, occurrence),
+      itemText,
+      occurrence,
+      settled: item.checked || item.excluded,
+    });
+  }
+  return records;
+}
+
+/** One answer to one item on an open-items form (RC3 item 5, Step 10). */
+export interface OpenPlanItemsFormAnswerV1 {
+  readonly itemId: string;
+  readonly choice: "exclude" | "tick" | "leave";
+  /** The reason (Exclude) or note (tick); ignored for "leave". */
+  readonly note?: string;
+}
+
+export interface OpenPlanItemsFormSkippedV1 {
+  readonly itemId: string;
+  readonly itemText: string;
+  readonly reason: string;
+}
+
+export type ApplyOpenPlanItemsFormResultV1 =
+  | {
+      readonly ok: true;
+      readonly content: string;
+      readonly ticked: readonly string[];
+      readonly excluded: readonly string[];
+      readonly skipped: readonly OpenPlanItemsFormSkippedV1[];
+    }
+  | {
+      /** A validation failure against the form itself — nothing was applied, the form stays open. */
+      readonly ok: false;
+      readonly rejectionReason: string;
+    };
+
+/**
+ * RC3 item 5, Step 10 (engine slice): applies one open-items form submission
+ * to `planOfRecord` in a single pass, the same one-write contract
+ * {@link applyOpenPlanItemDecisionsV1} already gives its QuickPick-flow
+ * caller, extended to be occurrence-aware so duplicate-text items resolve to
+ * distinct lines.
+ *
+ * Two validation layers, matching the plan's contract:
+ *  - Submission-level (any one bad answer rejects the WHOLE submission, so
+ *    the caller can report one message and the form stays `open` with every
+ *    selection intact): an `itemId` absent from `formItemIds`, an
+ *    unrecognized `choice`, a `note` over
+ *    {@link DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1}, or `exclude` with a blank
+ *    note.
+ *  - Per-item (a stale item is skipped, not rejected): resolved against
+ *    `currentPlanRecords` — {@link listOpenPlanItemRecordsV1} over the plan
+ *    text being applied to, RE-READ fresh rather than trusted from
+ *    card-post time — by `itemId` only, never by position, text alone, or
+ *    plan step number. An id with no match (edited, removed, or renumbered
+ *    since the form was posted) or one already settled is skipped with a
+ *    visible reason; the rest still apply.
+ */
+export function applyOpenPlanItemsFormV1(
+  planOfRecord: string,
+  formItemIds: ReadonlySet<string>,
+  answers: readonly OpenPlanItemsFormAnswerV1[],
+  date: string
+): ApplyOpenPlanItemsFormResultV1 {
+  for (const answer of answers) {
+    if (!formItemIds.has(answer.itemId)) {
+      return { ok: false, rejectionReason: "One of the submitted answers does not match an item on this form." };
+    }
+    if (answer.choice !== "exclude" && answer.choice !== "tick" && answer.choice !== "leave") {
+      return { ok: false, rejectionReason: "One of the submitted answers has an unrecognized choice." };
+    }
+    if ((answer.note?.length ?? 0) > DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1) {
+      return { ok: false, rejectionReason: "One of the submitted notes is too long." };
+    }
+    if (answer.choice === "exclude" && (answer.note ?? "").trim().length === 0) {
+      return { ok: false, rejectionReason: "Excluding an item needs a reason — one of the submitted answers left it blank." };
+    }
+  }
+  const currentRecords = listOpenPlanItemRecordsV1(planOfRecord);
+  const currentById = new Map(currentRecords.map((record) => [record.itemId, record]));
+  let content = planOfRecord;
+  const ticked: string[] = [];
+  const excludedItems: AcceptedNonGoalItemV1[] = [];
+  const skipped: OpenPlanItemsFormSkippedV1[] = [];
+  for (const answer of answers) {
+    if (answer.choice === "leave") {
+      continue;
+    }
+    const current = currentById.get(answer.itemId);
+    if (!current) {
+      skipped.push({
+        itemId: answer.itemId,
+        itemText: "",
+        reason: "skipped: this item is no longer in the plan as written",
+      });
+      continue;
+    }
+    if (current.settled) {
+      skipped.push({
+        itemId: answer.itemId,
+        itemText: current.itemText,
+        reason: "skipped: this item was already settled",
+      });
+      continue;
+    }
+    const mode = answer.choice === "tick" ? "tick" : "exclude";
+    const { content: next, settledItemText } = settleChecklistItemAtOccurrenceV1(
+      content,
+      current.itemText,
+      current.occurrence,
+      mode,
+      answer.note ?? ""
+    );
+    if (settledItemText === undefined) {
+      // The plan changed between the lookup above and this write within the
+      // same pass (only possible if two answers collide on the same
+      // occurrence, which formItemIds/currentById already rule out) — treat
+      // as stale rather than silently dropping the answer.
+      skipped.push({
+        itemId: answer.itemId,
+        itemText: current.itemText,
+        reason: "skipped: this item is no longer in the plan as written",
+      });
+      continue;
+    }
+    content = next;
+    if (mode === "tick") {
+      ticked.push(settledItemText);
+    } else {
+      excludedItems.push({ itemText: settledItemText, reason: answer.note ?? "" });
+    }
+  }
+  if (excludedItems.length > 0) {
+    content = appendAcceptedNonGoalV1(content, excludedItems, date);
+  }
+  return {
+    ok: true,
+    content,
+    ticked,
+    excluded: excludedItems.map((item) => item.itemText),
+    skipped,
+  };
+}
+
+/**
+ * Occurrence-aware sibling of {@link settleChecklistItemV1}: settles the
+ * `occurrence`-th top-level item (1-based, counted over every top-level item
+ * regardless of state — the same counting {@link listOpenPlanItemRecordsV1}
+ * uses) whose normalized text matches `itemText`, instead of the first open
+ * match. Returns `settledItemText: undefined` when that occurrence does not
+ * exist or is not currently open (already ticked/excluded) — callers that
+ * already checked `settled` via {@link listOpenPlanItemRecordsV1} should not
+ * normally hit the latter case, but this stays fail-closed rather than
+ * mutating a line the caller did not mean to touch.
+ */
+function settleChecklistItemAtOccurrenceV1(
+  planOfRecord: string,
+  itemText: string,
+  occurrence: number,
+  mode: "tick" | "exclude",
+  note: string
+): SettleChecklistItemResultV1 {
+  const key = exactItemKeyV1(itemText);
+  const cleanNote = note.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+  let settledItemText: string | undefined;
+  let seen = 0;
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  const mergedRegion = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced || settledItemText !== undefined) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          if (
+            /^[ \t]/.test(open) ||
+            occurrenceKeyV1(text, state !== " " || isExcludedChecklistItemText(text)) !== key
+          ) {
+            return whole;
+          }
+          seen += 1;
+          if (seen !== occurrence || state !== " " || isExcludedChecklistItemText(text)) {
+            return whole;
+          }
+          settledItemText = unescapeChecklistItemTextV1(text);
+          if (mode === "tick") {
+            return `${open}x${close}${text}${cleanNote ? ` — Checked: ${cleanNote}.` : ""}${trailing}`;
+          }
+          return `${open}${state}${close}${text}${cleanNote ? ` — Excluded by you: ${cleanNote}.` : ""} ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}${trailing}`;
+        }
+      );
+    })
+    .join("");
+  return {
+    content: settledItemText !== undefined ? `${prefix}${mergedRegion}` : planOfRecord,
+    settledItemText,
   };
 }
 
@@ -2128,7 +2400,16 @@ export function filterAlreadyCheckedPlanItemsV1(
 export type MergeChecklistProgressResultV1 =
   | { readonly kind: "unchanged" }
   | { readonly kind: "no-report" }
-  | { readonly kind: "no-match"; readonly unmatchedSample: readonly string[] }
+  | {
+      readonly kind: "no-match";
+      /** First two unmatched claims, for a short human-facing message. */
+      readonly unmatchedSample: readonly string[];
+      /** Every unmatched claim (not sliced) — the numbered-claim resolver
+       * (see {@link areAllUnmatchedChecklistClaimsAlreadySettledV1}) needs the
+       * complete set, since a single unresolved claim among many resolved
+       * ones must still raise the unreliable-checklist flag. */
+      readonly unmatchedAll: readonly string[];
+    }
   | {
       readonly kind: "merged";
       readonly content: string;
@@ -2247,7 +2528,11 @@ export function mergeChecklistProgressV1(
 
   if (reported.size === 0) {
     if (missingEvidenceSamples.length > 0) {
-      return { kind: "no-match", unmatchedSample: missingEvidenceSamples.slice(0, 2) };
+      return {
+        kind: "no-match",
+        unmatchedSample: missingEvidenceSamples.slice(0, 2),
+        unmatchedAll: missingEvidenceSamples,
+      };
     }
     return { kind: "no-report" };
   }
@@ -2314,17 +2599,156 @@ export function mergeChecklistProgressV1(
   // reported key never appears among the plan's item keys at all (a genuine
   // mismatch worth surfacing). Distinguish by re-checking membership rather
   // than threading a second flag through the loop above.
-  const unmatchedSample: string[] = [...missingEvidenceSamples];
+  const unmatchedAll: string[] = [...missingEvidenceSamples];
   for (const key of reported.keys()) {
-    if (!planItemKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
-      unmatchedSample.push(reportedRawText.get(key) ?? key);
-    }
-    if (unmatchedSample.length >= 2) {
-      break;
+    if (!planItemKeys.has(key) && !unmatchedAll.includes(reportedRawText.get(key) ?? key)) {
+      unmatchedAll.push(reportedRawText.get(key) ?? key);
     }
   }
-  if (unmatchedSample.length > 0) {
-    return { kind: "no-match", unmatchedSample: unmatchedSample.slice(0, 2) };
+  if (unmatchedAll.length > 0) {
+    return { kind: "no-match", unmatchedSample: unmatchedAll.slice(0, 2), unmatchedAll };
   }
   return { kind: "unchanged" };
+}
+
+/** Result of {@link parseNumberedChecklistClaimV1}. */
+export type NumberedChecklistClaimParseV1 =
+  | { readonly kind: "not-a-number-claim" }
+  | { readonly kind: "malformed" }
+  | { readonly kind: "resolved"; readonly indices: readonly number[] };
+
+/**
+ * RC3 item 1 (Step 2a): a round sometimes reports its own progress in
+ * shorthand — "Steps 1–33", "Step 34", "Step 1 (lookalike-marker
+ * acceptance…)" — naming plan items by their 1-based ordinal position among
+ * the plan's TOP-LEVEL checklist items (the same denominator
+ * {@link countChecklistProgressV1} reports as `total`/`<!-- progress: N/M
+ * -->`) instead of quoting the item's own text. `mergeChecklistProgressV1`
+ * cannot match that against any item text, so it reports the claim as
+ * unmatched — which used to always raise the unreliable-checklist flag, even
+ * when every one of those numbered items was already settled and the round
+ * simply described real, already-recorded progress in the wrong shape.
+ *
+ * This parses ONE unmatched claim string into the item-index range it names,
+ * recognizing exactly: `Step N`, `Step N (<anything>)`, `Steps N-M` / `Steps
+ * N–M` / `Steps N to M` (case-insensitive, en-dash or hyphen), each anchored
+ * to the WHOLE claim string (only trailing whitespace, a trailing period, or
+ * — for the single-step form — one trailing parenthetical is allowed after
+ * the number(s)). Anything that does not start with `Step`/`Steps` at all is
+ * `"not-a-number-claim"` — an ordinary (mismatched) item-text claim, left to
+ * the existing unresolved path. Anything that DOES start with `Step`/`Steps`
+ * but fails to parse as one of those complete, whole-string forms —
+ * `"Steps 5–"`, `"Step x"`, an inverted range like `"Steps 10-5"`, a range
+ * whose span exceeds {@link MAX_NUMBERED_CLAIM_RANGE_SPAN_V1}, or a claim
+ * carrying an extra, unparsed reference after the recognized number(s)
+ * (`"Steps 1-2 and Step 83"`, `"Step 1 and Step 83"`) — is `"malformed"` —
+ * also left unresolved, never guessed at. Requiring the whole string to
+ * match (rather than only a matching prefix) is what stops a claim like
+ * `"Steps 1-2 and Step 83"` from silently resolving to just `[1, 2]` while
+ * quietly dropping its reference to Step 83. The range span is capped
+ * (rather than left to expand to whatever two numbers the round wrote) so a
+ * claim like `"Steps 1-999999999"` cannot build an unbounded array; this
+ * function never consults the plan, so the cap is a fixed sanity bound, not
+ * the plan's own item count. This function never consults the plan: it only
+ * parses the claim's shape.
+ *
+ * A trailing status suffix — ` — done`, `- done`, or `– done` (any of the
+ * three dash characters, case-insensitive `done`), optionally followed by a
+ * trailing period — is also accepted after the number(s) (and, for the
+ * single-step form, after the parenthetical), for both forms. This is a
+ * narrow whitelist of exactly that one word, not a general "allow trailing
+ * prose" carve-out: `"Steps 1-33 — done"` resolves, but `"Steps 1-2 and Step
+ * 83"` (an unparsed reference, not the literal word "done") still does not,
+ * because the suffix group only ever matches the literal text `done` and
+ * nothing else. The normal path into this parser (a round's `## Plan Item
+ * Checklist` claim line) already splits the status off via ` — ` before the
+ * text reaches here, but a claim reported inside the ECHOED checklist block
+ * itself (`- [x] Steps 1-33 — done`) carries its status suffix as part of
+ * the raw item text with no such split, so this parser sees it directly.
+ */
+const MAX_NUMBERED_CLAIM_RANGE_SPAN_V1 = 5000;
+const NUMBERED_CLAIM_STATUS_SUFFIX = "(?:\\s*[-–—]\\s*done)?";
+
+export function parseNumberedChecklistClaimV1(claimText: string): NumberedChecklistClaimParseV1 {
+  const trimmed = claimText.trim();
+  const rangeMatch = new RegExp(
+    `^Steps\\s+(\\d+)\\s*(?:-|–|to)\\s*(\\d+)${NUMBERED_CLAIM_STATUS_SUFFIX}\\s*\\.?\\s*$`,
+    "i"
+  ).exec(trimmed);
+  if (rangeMatch) {
+    const start = Number(rangeMatch[1]);
+    const end = Number(rangeMatch[2]);
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 1 ||
+      end < start ||
+      end - start > MAX_NUMBERED_CLAIM_RANGE_SPAN_V1
+    ) {
+      return { kind: "malformed" };
+    }
+    const indices: number[] = [];
+    for (let n = start; n <= end; n++) {
+      indices.push(n);
+    }
+    return { kind: "resolved", indices };
+  }
+  const singleMatch = new RegExp(
+    `^Step\\s+(\\d+)(?:\\s*\\([\\s\\S]*\\))?${NUMBERED_CLAIM_STATUS_SUFFIX}\\s*\\.?\\s*$`,
+    "i"
+  ).exec(trimmed);
+  if (singleMatch) {
+    const n = Number(singleMatch[1]);
+    return Number.isFinite(n) && n >= 1 ? { kind: "resolved", indices: [n] } : { kind: "malformed" };
+  }
+  if (/^Steps?\b/i.test(trimmed)) {
+    // Started as a numbered-step claim but did not parse as one of the
+    // recognized whole-string forms — a dangling range, a non-numeric
+    // target, an inverted or oversized range, or trailing text/extra
+    // references the forms above do not account for.
+    return { kind: "malformed" };
+  }
+  return { kind: "not-a-number-claim" };
+}
+
+/**
+ * Whether the plan's top-level checklist item at 1-based ordinal `index` is
+ * already settled (ticked, or closed via {@link EXCLUDED_CHECKLIST_ITEM_MARKER_V1}).
+ * An out-of-range index (0, negative, or past the plan's `total`) is never
+ * settled — this is the guard that keeps an out-of-range claim unresolved
+ * rather than vacuously "true".
+ */
+function isTopLevelChecklistIndexSettledV1(planOfRecord: string, index: number): boolean {
+  if (!Number.isInteger(index) || index < 1) {
+    return false;
+  }
+  const topLevel = itemsInLatestRendering(planOfRecord).filter((item) => !item.nested);
+  const item = topLevel[index - 1];
+  return item !== undefined && (item.checked || item.excluded);
+}
+
+/**
+ * RC3 item 1 (Step 2a): true only when every claim in `unmatchedClaimTexts`
+ * (the FULL unmatched set — see {@link MergeChecklistProgressResultV1}'s
+ * `unmatchedAll`, never just the two-item `unmatchedSample`) is a numbered
+ * claim ({@link parseNumberedChecklistClaimV1}) whose every referenced item
+ * is already settled. A single ordinary item-text claim, a single malformed
+ * numbered claim, or a single numbered claim naming even one unsettled or
+ * out-of-range item, makes the whole result `false` — this only ever
+ * SUPPRESSES a false-alarm flag/card for progress the plan already records;
+ * it never ticks anything, and an unsettled numbered reference is left for
+ * the existing review / reviewer-verified-ticks paths to resolve. An empty
+ * `unmatchedClaimTexts` (nothing left unresolved) is vacuously true.
+ */
+export function areAllUnmatchedChecklistClaimsAlreadySettledV1(
+  planOfRecord: string,
+  unmatchedClaimTexts: readonly string[]
+): boolean {
+  return unmatchedClaimTexts.every((claimText) => {
+    const parsed = parseNumberedChecklistClaimV1(claimText);
+    return (
+      parsed.kind === "resolved" &&
+      parsed.indices.every((index) => isTopLevelChecklistIndexSettledV1(planOfRecord, index))
+    );
+  });
 }

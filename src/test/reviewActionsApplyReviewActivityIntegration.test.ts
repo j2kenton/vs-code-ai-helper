@@ -27,6 +27,7 @@ import * as vscode from "vscode";
 
 import { applyReviewWithAI } from "../commands/reviewActions";
 import { runTrackedOperation, taskOperations, TaskOperationHandle } from "../utils/taskOperations";
+import { readChatHistory } from "../utils/chatHistoryStore";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,
@@ -273,6 +274,45 @@ function installApplyReviewPatches(contextPackPath: string): Patched[] {
   ];
 }
 
+/**
+ * Same as `installApplyReviewPatches`, but leaves the real `writeRunLog` in
+ * place — for RC3 item 9 (Step 7)'s "a failed plan Apply Review writes a run
+ * log like any other round" requirement, which can only be proven by reading
+ * an actual log file on disk, not a stubbed no-op.
+ */
+function installApplyReviewPatchesWithRealRunLogV1(contextPackPath: string): Patched[] {
+  fs.writeFileSync(contextPackPath, "# Context\n", "utf8");
+  return [
+    patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+    patch(modelSelectionModule, "resolveModelForStage", () =>
+      Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+      Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+    patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+    patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPackPath))),
+  ];
+}
+
+/** A transport whose reply carries the frame START marker but breaks the
+ * frame contract (invalid JSON payload) — the coordinator classifies this as
+ * a genuine `malformedResult`/`invalidFrame`. A reply with NO frame markers
+ * at all is deliberately NOT used here: `tryFramelessContentFallbackV1`
+ * leniently accepts frameless text as the result content itself (see
+ * taskActionCoordinatorV1's own doc comment, "only `invalidFrame`, and only
+ * when `FRAME_START_V1` does not appear" — meaning frameless text gets the
+ * fallback, not a rejection), which would make this transport a `completed`
+ * outcome instead of the failure this test needs. Once the start marker is
+ * present, that leniency no longer applies. */
+function malformedTransportV1(runnerId: string): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (_request, output): Promise<{ kind: "completed" }> => {
+      output.write("<<<ENSEMBLE_AI_RESULT_V1>>>\nthis is not valid json\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n");
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
 void describe("applyReviewWithAI — real in-flight activity through the production coordinator", () => {
   void it("reports starting -> model -> running through a real (controllable, still in-flight) apply dispatch, then clears the row once the automatic re-review also completes", async () => {
     const { folderPath } = makeTaskFolder(`applyreview-activity-live-${Math.floor(Math.random() * 1e9)}`);
@@ -449,6 +489,198 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       );
     } finally {
       endSub.dispose();
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("2026-09-30 review follow-up (RC3 item 9): a cancelled apply dispatch is recorded as a cancelled round, never a failed one", async () => {
+    const { folderPath } = makeTaskFolder(`applyreview-activity-cancel-${Math.floor(Math.random() * 1e9)}`);
+    const contextPack = path.join(folderPath, "context-pack.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    // A provider-declared "cancelled" envelope frame (the response content
+    // itself says `kind: "cancelled"`, as a provider legitimately does for a
+    // user-initiated stop) maps onto a genuine `outcome.kind === "cancelled"`
+    // coordinator outcome — see taskActionCoordinatorV1.test.ts's "maps
+    // provider-declared failure and cancellation envelopes onto stable
+    // outcomes". This is distinct from a `providerCancelled` TRANSPORT EXIT
+    // reached after the provider was actually invoked, which the coordinator
+    // deliberately settles as `kind: "failed", code: "providerCancelled"`
+    // instead (taskActionCoordinatorV1.ts ~line 2208's documented contract:
+    // "a provider-invoked cancellation always settles failed... rather than
+    // reading as an unremarkable cancel"), so it flows through the ordinary
+    // failed-outcome handling every stage caller already has — recording
+    // THAT case as "failed" is correct, not the bug this test targets.
+    const cancelledTransport: AgentTransportV1 = {
+      runnerId: "stub-runner-cancel",
+      invoke: (request, output): Promise<{ kind: "completed" }> => {
+        output.write(frame({ version: 1, correlation: request.correlation, kind: "cancelled", reason: "user" }));
+        return Promise.resolve({ kind: "completed" as const });
+      },
+    };
+    const patches = [
+      ...installApplyReviewPatches(contextPack),
+      stubV1RunnerSelection([cancelledTransport]),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      await runTrackedOperation(
+        folderPath,
+        {
+          label: "Apply Review",
+          stage: "plan-high-review",
+          taskName: "Apply Review Activity Cancel Test",
+          kind: "apply-review",
+          cancellable: true,
+        },
+        async (op) => {
+          await applyReviewWithAI(
+            vscode.Uri.file(REAL_ROOT),
+            context,
+            { taskFolderPath: folderPath },
+            { parentOperation: op }
+          );
+        }
+      );
+
+      assert.deepEqual(
+        taskOperations.getTaskOperations(folderPath),
+        [],
+        "a cancelled dispatch must still clear the live row"
+      );
+
+      const progress = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as { roundLedger?: Array<{ mode: string; state: string; outcome?: { rejectionReason?: string } }> };
+      const applyReviewRows = (progress.roundLedger ?? []).filter((row) => row.mode === "apply-review");
+      assert.equal(applyReviewRows.length, 1, "expected exactly one apply-review round recorded");
+      assert.equal(
+        applyReviewRows[0]!.state,
+        "cancelled",
+        "a cancelled coordinator outcome must terminalize as 'cancelled', not 'failed' — describeTaskActionFailureV1's own doc comment disclaims cancelled outcomes"
+      );
+      assert.equal(
+        applyReviewRows[0]!.outcome?.rejectionReason,
+        undefined,
+        "a cancelled round carries no rejectionReason — that field is reserved for genuine dispatch failures"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("2026-09-30 review (RC3 item 9 / Step 7): a plan Apply Review whose every attempt is rejected as malformed writes a real run log naming each attempt's reason, and records a failed round in the ledger — not a silent non-event", async () => {
+    const { folderPath } = makeTaskFolder(`applyreview-activity-malformed-${Math.floor(Math.random() * 1e9)}`);
+    const contextPack = path.join(folderPath, "context-pack.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    // Four malformed replies: comfortably more than the coordinator's own
+    // malformed-result retry budget plus its candidate chain, so the
+    // dispatch is proven to exhaust every attempt rather than merely being
+    // lucky with a short transport list.
+    const patches = [
+      ...installApplyReviewPatchesWithRealRunLogV1(contextPack),
+      stubV1RunnerSelection([
+        malformedTransportV1("stub-runner-malformed-1"),
+        malformedTransportV1("stub-runner-malformed-2"),
+        malformedTransportV1("stub-runner-malformed-3"),
+        malformedTransportV1("stub-runner-malformed-4"),
+      ]),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      await runTrackedOperation(
+        folderPath,
+        {
+          label: "Apply Review",
+          stage: "plan-high-review",
+          taskName: "Apply Review Activity Malformed Test",
+          kind: "apply-review",
+          cancellable: true,
+        },
+        async (op) => {
+          await applyReviewWithAI(
+            vscode.Uri.file(REAL_ROOT),
+            context,
+            { taskFolderPath: folderPath },
+            { parentOperation: op }
+          );
+        }
+      );
+
+      assert.deepEqual(
+        taskOperations.getTaskOperations(folderPath),
+        [],
+        "an exhausted-malformed dispatch must still clear the live row"
+      );
+
+      // Run log: a real file under runs/ naming the failure, not a stubbed
+      // no-op — RC3 item 9's "writes a run log like any other round".
+      const runsDir = path.join(folderPath, "runs");
+      const logFiles = fs.readdirSync(runsDir).filter((name) => name.includes("apply-review"));
+      assert.equal(logFiles.length, 1, "expected exactly one apply-review run log");
+      const logContent = fs.readFileSync(path.join(runsDir, logFiles[0]!), "utf8");
+      assert.match(logContent, /# Apply Review/);
+      assert.match(logContent, /malformed result \(invalidJson/, "the run log must name the actual final-attempt rejection reason, not a generic non-event");
+      assert.match(logContent, /Attempt \S+ rejected \(invalidJson/, "the run log must name each PRIOR attempt's own rejection reason, per RC2 item 6's per-attempt reasons");
+
+      // Round ledger: a failed round, not a silently dropped one.
+      const progress = JSON.parse(
+        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+      ) as { roundLedger?: Array<{ mode: string; state: string; outcome?: { rejectionReason?: string } }> };
+      const applyReviewRows = (progress.roundLedger ?? []).filter((row) => row.mode === "apply-review");
+      assert.equal(applyReviewRows.length, 1, "expected exactly one apply-review round recorded");
+      assert.equal(
+        applyReviewRows[0]!.state,
+        "failed",
+        "every attempt rejected as malformed must terminalize as a genuine 'failed' round"
+      );
+      assert.match(
+        applyReviewRows[0]!.outcome?.rejectionReason ?? "",
+        /invalidJson/,
+        "the ledger's own rejectionReason must name the actual cause, matching the run log"
+      );
+
+      // Chat outcome line: the failure must appear in the task's chat
+      // transcript like any other terminalized round (RC3 item 9's "show the
+      // failure as an outcome line in the chat"), not only in the run log
+      // and the ledger.
+      const chatMessages = await readChatHistory(folderPath);
+      const outcomeMessages = chatMessages.filter((m) => m.text.startsWith("_Ended:"));
+      assert.equal(outcomeMessages.length, 1, "expected exactly one round-outcome chat message");
+      assert.match(
+        outcomeMessages[0]!.text,
+        /Apply Review/,
+        "the chat outcome line must name the round that failed"
+      );
+      assert.match(
+        outcomeMessages[0]!.text,
+        /failed/,
+        "the chat outcome line must show the round's real terminal state, not a silent non-event"
+      );
+      assert.match(
+        outcomeMessages[0]!.text,
+        /invalidJson/,
+        "the chat outcome line must carry the actual rejection reason"
+      );
+    } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
       fsBridge.restore();

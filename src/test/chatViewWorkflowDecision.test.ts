@@ -276,6 +276,64 @@ async function waitForState(fake: FakeWebviewView, predicate: (state: Record<str
   throw new Error("timed out waiting for the expected state");
 }
 
+/**
+ * Deterministically tracks every `render()` call a `ChatViewProvider`
+ * instance makes — both the direct, un-coalesced calls (`open()`,
+ * `resolveWebviewView`'s "ready" handler) and the ones
+ * `scheduleReactiveRenderV1`'s coalescing loop drives (RC2 item 11, Steps
+ * 43-44) — by shadowing the instance's own `render` with a wrapper that
+ * keeps every in-flight call's promise, the same "reach into the instance"
+ * technique the own-write coalescing tests below use directly on
+ * `ChatViewProviderOwnWriteInternalsV1`.
+ *
+ * `settle()` waits for every render that either already started OR is still
+ * one `taskOperations.onDidChange` fire away from starting. That fire is
+ * itself coalesced through `queueMicrotask`, not a real timer
+ * (`TaskOperationRegistry.triggerChange`) — so `ChatViewProvider`'s render
+ * coalescing has no timer, real or mocked, for a caller to advance; letting
+ * a queued microtask actually run (`flushMicrotasksV1`) is the deterministic
+ * equivalent for this specific coalescing path. This replaces waiting on
+ * wall-clock quiescence (a fixed "quiet window" can never prove a render
+ * will not still land after the window closes, and either wastes time or,
+ * under load, misattributes a late render to the wrong action) with the
+ * real completion of the actual promises involved, so it takes exactly as
+ * long as the pending work does — no more, no less — and cannot be flaky
+ * under load.
+ */
+interface ChatViewProviderRenderTrackerInternalsV1 {
+  render(): Promise<void>;
+}
+
+function flushMicrotasksV1(): Promise<void> {
+  return new Promise((resolve) => queueMicrotask(resolve));
+}
+
+function installRenderTrackerV1(provider: ChatViewProvider): { settle(): Promise<void> } {
+  const internals = provider as unknown as ChatViewProviderRenderTrackerInternalsV1;
+  const originalRender = internals.render.bind(internals);
+  let pending: Promise<void>[] = [];
+  internals.render = (): Promise<void> => {
+    const result = originalRender();
+    pending.push(result);
+    return result;
+  };
+  return {
+    settle: async (): Promise<void> => {
+      for (;;) {
+        // A taskOperations.onDidChange fire queued just before this call
+        // (every begin/reportActivity/report/end call queues one) may not
+        // have run yet — let it run: if it calls scheduleReactiveRenderV1,
+        // that pushes a new render() call onto `pending` synchronously.
+        await flushMicrotasksV1();
+        const batch = pending;
+        pending = [];
+        if (batch.length === 0) return;
+        await Promise.allSettled(batch);
+      }
+    },
+  };
+}
+
 void describe("Chat With AI — stage-chat posture footer", () => {
   void it("uses the five posture vocabulary and names the next continuation attempt", () => {
     assert.equal(formatChatSchedulingPostureLineV1({ kind: "running" }), "running — a round is running now");
@@ -3977,7 +4035,7 @@ void describe("Chat With AI — RC2 item 8, Step 38: the real three-card scenari
         const entriesAfterTicks =
           (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
         const ticksAck = entriesAfterTicks.find((e) =>
-          e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and resume the task"')
+          e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and try again (one cycle)"')
         );
         assert.ok(ticksAck, "expected the confirmation line for the ticks card's Apply option");
         assert.match(
@@ -4043,11 +4101,18 @@ void describe("Chat With AI — operations re-render gating (RC2 item 11, Steps 
     let op: ReturnType<typeof taskOperations.begin> = null;
     let otherOp: ReturnType<typeof taskOperations.begin> = null;
     const stateCount = (): number => fake.posted.filter((m) => m.type === "state").length;
+    const renders = installRenderTrackerV1(provider);
     try {
       provider.resolveWebviewView(fake.view);
       const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      // `open()` fires render() without awaiting it, and that render can
+      // itself leave a follow-up reactive render queued (Steps 43-44's
+      // coalescing loop) — settle() (deterministic: it tracks the actual
+      // render() calls and their promises, not wall-clock quiescence) fully
+      // before taking the baseline count, or that trailing render could land
+      // during the next step's check and be misattributed to it.
       await provider.open(target);
-      await waitForStateMessage(fake);
+      await renders.settle();
       const countAfterOpen = stateCount();
 
       // Another task's operation (begin + an activity tick) must never
@@ -4057,14 +4122,15 @@ void describe("Chat With AI — operations re-render gating (RC2 item 11, Steps 
       otherOp = taskOperations.begin(otherFolder, { label: "Other task work", stage: "impl" });
       assert.ok(otherOp, "expected the other task's operation to be admitted");
       otherOp.reportActivity("doing something");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renders.settle();
       assert.equal(stateCount(), countAfterOpen, "another task's operation must not re-render this panel");
 
       // This task's own operation starting IS display-relevant (busy flips
       // true) and must render.
       op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
       assert.ok(op, "expected the exclusive operation lock to be acquired");
-      await waitForState(fake, (s) => s.busy === true);
+      await renders.settle();
+      assert.equal(lastState(fake)?.busy, true, "starting this task's own operation must flip busy true");
       const countAfterBusy = stateCount();
       assert.ok(countAfterBusy > countAfterOpen, "starting this task's own operation must render");
 
@@ -4075,7 +4141,7 @@ void describe("Chat With AI — operations re-render gating (RC2 item 11, Steps 
       op.reportActivity("step 1");
       op.reportActivity("step 2");
       op.reportActivity("step 3");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renders.settle();
       assert.equal(
         stateCount(),
         countAfterBusy,
@@ -4085,13 +4151,18 @@ void describe("Chat With AI — operations re-render gating (RC2 item 11, Steps 
       // A genuine display-relevant change (report() sets `detail`, which
       // busyDetail/busyText DO derive from) still renders immediately.
       op.report("halfway there");
-      await waitForState(fake, (s) => typeof s.busyText === "string" && s.busyText.includes("halfway there"));
+      await renders.settle();
+      const busyTextAfterDetail = lastState(fake)?.busyText;
+      assert.ok(
+        typeof busyTextAfterDetail === "string" && busyTextAfterDetail.includes("halfway there"),
+        "a changed operation detail must render with the new busyText"
+      );
       const countAfterDetail = stateCount();
       assert.ok(countAfterDetail > countAfterBusy, "a changed operation detail must still render");
 
       // Repeating the identical detail must not add a further render.
       op.report("halfway there");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renders.settle();
       assert.equal(stateCount(), countAfterDetail, "repeating the same detail must not add another render");
     } finally {
       if (op) taskOperations.end(op);

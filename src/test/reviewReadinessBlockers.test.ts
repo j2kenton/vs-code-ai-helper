@@ -158,6 +158,64 @@ void describe("parseReviewVerifiedCompleteV1", () => {
       "Item using a star bullet",
     ]);
   });
+
+  // RC3 item 1, Step 2c: `entries` pairs each item with its optional
+  // `  evidence: <sentence>` continuation line.
+  void it("parses entries with an evidence line attached to each item", () => {
+    const content = [
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "  evidence: src/utils/foo.ts:42 wires the gate to the new flag.",
+      "- Split the artifacts into impl-summary.md",
+      "  evidence: src/commands/bar.ts:10 writes impl-summary.md separately.",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.deepStrictEqual(result.entries, [
+      { text: "Wire the completeness gate", evidence: "src/utils/foo.ts:42 wires the gate to the new flag." },
+      {
+        text: "Split the artifacts into impl-summary.md",
+        evidence: "src/commands/bar.ts:10 writes impl-summary.md separately.",
+      },
+    ]);
+  });
+
+  void it("leaves evidence undefined for entries with no evidence line", () => {
+    const content = [
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.deepStrictEqual(result.entries, [{ text: "Wire the completeness gate", evidence: undefined }]);
+  });
+
+  void it("handles a mix of items with and without an evidence line", () => {
+    const content = [
+      "<!-- verified-complete:start -->",
+      "- Item one",
+      "  evidence: item one's own evidence sentence.",
+      "- Item two",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.deepStrictEqual(result.entries, [
+      { text: "Item one", evidence: "item one's own evidence sentence." },
+      { text: "Item two", evidence: undefined },
+    ]);
+  });
+
+  void it("ignores a stray evidence line that appears before any item", () => {
+    const content = [
+      "<!-- verified-complete:start -->",
+      "  evidence: this has no preceding item to attach to.",
+      "- Item one",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.deepStrictEqual(result.entries, [{ text: "Item one", evidence: undefined }]);
+    assert.deepStrictEqual(result.items, ["Item one"]);
+  });
 });
 
 void describe("parseReviewBlockersDetailed / hasZeroTaskFixableEvidence", () => {

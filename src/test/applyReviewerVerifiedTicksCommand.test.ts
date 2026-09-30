@@ -41,6 +41,14 @@ import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionCommandResultV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { safeRemoveDir } from "./testFsUtils";
+import {
+  markFastForwardRunActiveV1,
+  clearFastForwardRunActiveV1,
+  getFastForwardSessionIdV1,
+  getFastForwardRunEpochV1,
+  __resetFastForwardRunsForTestV1,
+  clearFastForwardRunPausedProvenanceV1,
+} from "../utils/activeFastForwardRunsV1";
 
 const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-apply-verified-ticks-test-")
@@ -370,7 +378,102 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     assert.match(modal, /Wire the completeness gate/);
     // Part 3, Step 5: applying succeeds, so it also tries the stage's next
     // action again.
-    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), { taskFolderPath: result.folder });
+    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+      taskFolderPath: result.folder,
+      resumeFastForwardV1: undefined,
+    });
+  });
+
+  // RC3 item 4, Step 3: when a Fast Forward run was genuinely active at the
+  // moment this card was posted, "Apply" resumes Fast Forward (via the same
+  // `resumeFastForwardV1` path RC2 item 12 wired up for the plateau card)
+  // instead of running a single cycle — captured then, forwarded verbatim
+  // through the option's own effect args to the confirm command.
+  void it("resumes Fast Forward on Apply when a Fast Forward run is active at post time", async () => {
+    const folder = nodePath.join(ROOT, ".ensemble", "ff-active");
+    markFastForwardRunActiveV1(folder, { attemptNumber: 1, maxAttempts: 3 });
+    // Production ordering (review-flagged completion fix, round 3,
+    // 2026-09-30): no manual `recordFastForwardRunPausedV1` call here —
+    // production never calls it before the card is built either.
+    // `stampFastForwardResumeProvenanceV1` (activeFastForwardRunsV1.ts) now
+    // records the pause itself, synchronously, at the exact moment
+    // `postApplyReviewerVerifiedTicksDecisionV1`'s "apply" option is built
+    // below — the SAME call this test exercises — so the card is trusted
+    // the instant it is posted, with no separate setup step required.
+    try {
+      const result = await run(
+        "ff-active",
+        { review: REVIEW_WITH_VERIFIED_ITEMS },
+        { confirm: true, useRealEffectArgs: true }
+      );
+      const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
+      assert.ok(applyOption, "the apply option must be offered");
+      assert.equal(applyOption.label, "Apply 1 Reviewer-Verified Tick and resume Fast Forward (iteration 1 of 3)");
+      assert.match(applyOption.consequence, /Resumes Fast Forward at iteration 1 of 3/);
+      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+        taskFolderPath: result.folder,
+        resumeFastForwardV1: {
+          attemptNumber: 1,
+          maxAttempts: 3,
+          fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+          fastForwardRunEpochV1: getFastForwardRunEpochV1(folder),
+        },
+      });
+    } finally {
+      clearFastForwardRunActiveV1(folder);
+      clearFastForwardRunPausedProvenanceV1(folder);
+    }
+  });
+
+  void it("keeps the single-cycle Apply option when no Fast Forward run is active at post time", async () => {
+    const result = await run(
+      "ff-inactive",
+      { review: REVIEW_WITH_VERIFIED_ITEMS },
+      { confirm: true, useRealEffectArgs: true }
+    );
+    const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
+    assert.ok(applyOption, "the apply option must be offered");
+    assert.equal(applyOption.label, "Apply 1 Reviewer-Verified Tick and try again (one cycle)");
+    assert.match(applyOption.consequence, /does not start or resume Fast Forward/);
+    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+      taskFolderPath: result.folder,
+      resumeFastForwardV1: undefined,
+    });
+  });
+
+  // RC3 item 1, Step 2c: the card shows the reviewer's own evidence sentence
+  // under each item when the review carries one.
+  void it("shows the reviewer's own evidence sentence under an item that has one", async () => {
+    const review = [
+      "Readiness: 9/10",
+      "",
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "  evidence: src/utils/foo.ts:42 wires the gate to the new flag.",
+      "<!-- verified-complete:end -->",
+      "",
+      "<!-- blockers:start -->",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const result = await run("evidence-present", { review }, { confirm: false });
+    const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
+    assert.match(modal, /Wire the completeness gate/);
+    assert.match(modal, /evidence: src\/utils\/foo\.ts:42 wires the gate to the new flag\./);
+    assert.doesNotMatch(modal, /older review format/);
+  });
+
+  // Same case, but the review predates the evidence-line grammar entirely —
+  // the card must show the fixed fallback, never a sentence pulled from
+  // elsewhere in the review.
+  void it("shows the 'older review format' fallback when the review has no evidence line", async () => {
+    const result = await run(
+      "evidence-absent",
+      { review: REVIEW_WITH_VERIFIED_ITEMS },
+      { confirm: false }
+    );
+    const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
+    assert.match(modal, /Wire the completeness gate/);
+    assert.match(modal, /evidence: No evidence line in this review \(older review format\)/);
   });
 
   // Task "Actionable Hand-offs" PART 5: every decision this task's plan asks

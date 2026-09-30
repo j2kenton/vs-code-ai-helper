@@ -51,6 +51,7 @@ import {
   isReviewStage,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   MAX_REVIEW_BLOCKER_IDENTITIES,
+  MAX_ROUND_LEDGER_ENTRIES,
   PLAN_FILENAME,
   PLAN_REVIEW_STAGES,
   REVIEW_STAGES,
@@ -103,6 +104,8 @@ import {
   clearFastForwardRunActiveV1,
   updateFastForwardRunStateV1,
   getFastForwardRunStateV1,
+  recordFastForwardRunPausedV1,
+  clearFastForwardRunPausedProvenanceV1,
 } from "../utils/activeFastForwardRunsV1";
 import {
   deriveCurrentDispatchModeV1,
@@ -185,6 +188,7 @@ import {
   writeTextFileIfUnchangedV1,
 } from "../utils/fileUtils";
 import {
+  areAllUnmatchedChecklistClaimsAlreadySettledV1,
   ChecklistProgressV1,
   classifyUncheckedChecklistItemsV1,
   collectPlanItemReasonsV1,
@@ -274,7 +278,11 @@ import {
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
-import { appendChatMessageV1, readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import {
+  appendChatMessageV1,
+  LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+  readChatDocumentIdentityV1,
+} from "../utils/chatHistoryStore";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -311,10 +319,17 @@ import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../uti
 import {
   describeOversizedInputRemedyV1,
   IMPL_REVIEW_MAX_TOTAL_CHARS,
+  ImplReviewLedgerRowV1,
   isImplReviewOnZeroFilesV1,
+  resolveLedgerImplReviewFilesV1,
   shouldClearImplReviewFilesAfterReviewV1,
 } from "../utils/implReviewFileSelection";
-import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
+import {
+  WorkflowDecisionOptionEffectV1,
+  WorkflowDecisionOptionV1,
+  WorkflowDecisionRecommendationV1,
+} from "../types/workflowDecisionV1";
+import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
   hasZeroTaskFixableEvidence,
@@ -379,6 +394,8 @@ import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
   computeWorkingTreeFingerprintV1,
   countCommitsSinceSha,
+  listChangedFilesSinceShaV1,
+  resolveGitRepo,
   resolveHeadCommitSha,
 } from "../utils/gitRepoInfo";
 import {
@@ -3435,8 +3452,16 @@ export async function handleReviewRoutingOutcome(options: {
       // set. `implReviewFiles` is shared by both impl-review stages, and the
       // low-level review comes AFTER the high-level one — a clean high-level
       // review used to wipe it, so the low-level review ran on nothing (the
-      // pack fell back to open editors, or listed no files at all).
-      if (shouldClearImplReviewFilesAfterReviewV1(targetStage, historyEntry.taskFixableCount)) {
+      // pack fell back to open editors, or listed no files at all). RC3
+      // item 10: Publish runs LAST of all three, so only a clean Publish
+      // review (zero blockers of any classification) may clear it now — and
+      // `reviewScope` (this same destructured option, echoed onto the
+      // history entry as `scope` just above) must also not be
+      // "open-editors": that verdict never assessed the task's tracked
+      // changes, including one reached by resuming a legacy interaction
+      // whose persisted input snapshot was open-editor scoped (2026-09-30
+      // review, completion blocker).
+      if (shouldClearImplReviewFilesAfterReviewV1(targetStage, historyEntry.blockerCount, reviewScope)) {
         withHistory = clearImplReviewFiles(withHistory);
       }
       return withHistory;
@@ -5308,6 +5333,116 @@ async function isPlanChecklistFullySettledV1(folderUri: vscode.Uri): Promise<boo
   return plan.hasChecklist && plan.counts !== undefined && plan.counts.remaining === 0;
 }
 
+/**
+ * RC3 item 10 (Step 6): rebuild the Publish review's changed-file scope when
+ * the task reaches Publish with no tracked `implReviewFiles` set (RC1 item 5
+ * cleared it one stage too early — see `shouldClearImplReviewFilesAfterReviewV1`'s
+ * updated doc comment). Tries the round ledger first (it can prove nothing
+ * was missed only under the conditions `resolveLedgerImplReviewFilesV1`
+ * checks), then the task-start baseline diff (reads the working tree, so it
+ * also covers a live/unenumerated round the ledger could not vouch for).
+ * Never falls back to open editors — that fallback is for the two
+ * implementation-review stages only (RC1 item 5's original scope).
+ */
+/** @internal exported for testing */
+export const PUBLISH_SCOPE_REFUSAL_REASON_V1 =
+  "Publish review was not run: no changed-file record for this task. Run an Implementation round, " +
+  "or reopen the task at Implementation.";
+
+export type PublishImplReviewFilesRebuildV1 =
+  | { kind: "established"; files: string[]; source: "ledger" | "baseline"; note?: string }
+  // `reason` is the fixed, exact user-facing refusal text (never varies —
+  // both the notification and this record show the same sentence to the
+  // owner). `skipReasons` is the durable provenance the run log needs and
+  // the notification does not: WHY each source was unavailable (the
+  // ledger's own reason plus which baseline step failed), so a refusal never
+  // collapses every possible cause into one indistinguishable line
+  // (2026-09-30 review, completion blocker: "refused rebuilds still discard
+  // the ledger reason and the specific baseline failure").
+  | { kind: "refused"; reason: string; skipReasons: string[] };
+
+/** @internal exported for testing */
+export async function rebuildPublishImplReviewFilesV1(
+  folderUri: vscode.Uri,
+  workspaceRootUri: vscode.Uri,
+  roundLedger: readonly ImplReviewLedgerRowV1[] | undefined
+): Promise<PublishImplReviewFilesRebuildV1> {
+  const ledgerResult = resolveLedgerImplReviewFilesV1(roundLedger, MAX_ROUND_LEDGER_ENTRIES);
+  if (ledgerResult.established) {
+    return { kind: "established", files: ledgerResult.files, source: "ledger" };
+  }
+
+  const baselineSha = await readTaskImplementationBaselineShaV1(folderUri);
+  if (!baselineSha) {
+    return {
+      kind: "refused",
+      reason: PUBLISH_SCOPE_REFUSAL_REASON_V1,
+      skipReasons: [ledgerResult.reason, "baseline skipped: sidecar missing (.impl-baseline-commit not found)"],
+    };
+  }
+  const repoRoot = await resolveGitRepo(workspaceRootUri.fsPath);
+  if (!repoRoot) {
+    return {
+      kind: "refused",
+      reason: PUBLISH_SCOPE_REFUSAL_REASON_V1,
+      skipReasons: [ledgerResult.reason, "baseline skipped: this workspace is not inside a git repository"],
+    };
+  }
+  // The baseline SHA may no longer resolve in the repository (rewritten
+  // history, a shallow clone) and either git command can fail for reasons
+  // outside this task's control — either must become the same explicit
+  // refusal, never an unhandled rejection that aborts the review dispatch
+  // outright (2026-09-30 review, completion blocker).
+  let gitResult: { files: string[]; droppedCount: number };
+  try {
+    gitResult = await listChangedFilesSinceShaV1(repoRoot, baselineSha, workspaceRootUri.fsPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      kind: "refused",
+      reason: PUBLISH_SCOPE_REFUSAL_REASON_V1,
+      skipReasons: [
+        ledgerResult.reason,
+        `baseline skipped: git diff against ${baselineSha} failed (${message})`,
+      ],
+    };
+  }
+  const { files, droppedCount } = gitResult;
+  const notes = [
+    ledgerResult.reason,
+    ...(droppedCount > 0 ? [`${droppedCount} changed path(s) outside the workspace were dropped`] : []),
+  ];
+  return { kind: "established", files, source: "baseline", note: notes.join("; ") };
+}
+
+/**
+ * RC3 item 10 (Step 6): the Publish scope rebuild's source, file count, and
+ * any skipped-source reason must land in a durable per-task record the owner
+ * can actually open, not just in code comments — this is that record's
+ * content, written to `runs/` alongside every other round log (2026-09-30
+ * review, completion blocker). A refusal's `skipReasons` are listed in full
+ * here even though the shorter, fixed `reason` is all the owner-facing
+ * notification shows — this file is where the specific cause (which source
+ * was skipped, and why) is meant to be found.
+ */
+/** @internal exported for testing */
+export function describePublishScopeRebuildForLogV1(
+  rebuild: PublishImplReviewFilesRebuildV1
+): string {
+  if (rebuild.kind === "refused") {
+    const skipLines = rebuild.skipReasons.length
+      ? `\n\nSkipped sources:\n${rebuild.skipReasons.map((line) => `- ${line}`).join("\n")}`
+      : "";
+    return `# Publish Review Scope Rebuild\n\nRefused: ${rebuild.reason}${skipLines}\n`;
+  }
+  const sourceLabel = rebuild.source === "ledger" ? "round ledger" : "task-start baseline diff";
+  const noteLine = rebuild.note ? `\n\nNotes: ${rebuild.note}` : "";
+  return (
+    `# Publish Review Scope Rebuild\n\n` +
+    `Source: ${sourceLabel}. ${rebuild.files.length} file(s).${noteLine}\n`
+  );
+}
+
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -5463,15 +5598,74 @@ export async function runReviewForFolder(
         );
         return;
       }
-      const choice = await vscode.window.showWarningMessage(
-        "This review already assessed the current workspace — nothing has changed since the last review, " +
-          "so running it again would produce the same verdict. If you've made changes since, re-check instead.",
-        { modal: true },
-        "I've made changes — re-check"
-      );
-      if (choice !== "I've made changes — re-check") {
-        return;
+      // RC3 item 13: a review the owner starts must never open a modal —
+      // owner rule (2026-09-29), everything Ensemble asks belongs in the
+      // chat with the chat's own controls. Post a local-only decision
+      // question the same way reviewEscalation.ts does (`askInteraction`,
+      // `actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`, `optionEffects`)
+      // and return immediately — nothing awaits the answer here. "Keep the
+      // last review" is the default and dispatches nothing; "Review again
+      // anyway" re-enters this same function with `skipUnchangedTreeGuard`
+      // through a dedicated internal command that exists ONLY as that
+      // option's effect (never bound to a button or menu), so an ordinary
+      // owner-started review on a still-unchanged tree hits this guard again
+      // rather than being silently bypassed.
+      if (options.chatViewProvider) {
+        const stageDisplayName = STAGE_DISPLAY_NAMES[targetStage] ?? targetStage;
+        const unchangedTreeOptions: QuestionOptionV1[] = [
+          {
+            optionId: "keepLastReview",
+            label: "Keep the last review",
+            description: `Dispatches nothing — ${stageDisplayName}'s existing verdict stands.`,
+          },
+          {
+            optionId: "reviewAgainAnyway",
+            label: "Review again anyway",
+            description: `Runs ${stageDisplayName} again against the same, unchanged workspace.`,
+          },
+        ];
+        const unchangedTreeQuestion: StructuredQuestionV1 = {
+          questionId: allocateHex128IdV1(),
+          kind: "singleChoice",
+          prompt:
+            `Nothing has changed in the workspace since the last review of ${stageDisplayName} — running it ` +
+            "again would produce the same verdict, so that verdict stands unless you choose to re-check.",
+          required: true,
+          options: unchangedTreeOptions,
+        };
+        const unchangedTreeOptionEffects: Record<string, WorkflowDecisionOptionEffectV1> = {
+          keepLastReview: { kind: "doNothing" },
+          reviewAgainAnyway: {
+            kind: "command",
+            command: "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
+            args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage }],
+          },
+        };
+        await options.chatViewProvider.askInteraction(
+          {
+            canonicalId: normalizePath(folderUri.fsPath),
+            taskFolderPath: folderUri.fsPath,
+            stage: targetStage,
+            taskName: runReviewForFolderProgress?.displayName,
+            interactionId: allocateHex128IdV1(),
+            operationId: allocateHex128IdV1(),
+            actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+            sourceAttemptId: allocateHex128IdV1(),
+            questions: [unchangedTreeQuestion],
+            optionEffects: unchangedTreeOptionEffects,
+          },
+          true,
+          false
+        );
+      } else {
+        // No chat surface wired up — fall back to a notification so this is
+        // never silent, still never a modal.
+        NotificationRouter.showInformation(
+          `${STAGE_DISPLAY_NAMES[targetStage] ?? targetStage}: not re-reviewed — nothing has changed in the ` +
+            "workspace since the last review of this stage. No chat is available to ask whether to re-check anyway."
+        );
       }
+      return;
     }
   }
 
@@ -5793,7 +5987,75 @@ export async function runReviewForFolder(
       await vscode.workspace.fs.readFile(contextPackUri)
     );
   } else {
-    const taskProgress = await readTaskProgressAdvisoryV1(folderUri);
+    let taskProgress = await readTaskProgressAdvisoryV1(folderUri);
+    // RC3 item 10 (Step 6): Publish runs after both implementation reviews,
+    // which used to clear implReviewFiles before Publish ever consulted it
+    // (see shouldClearImplReviewFilesAfterReviewV1's updated doc comment) —
+    // when that has left no tracked set, rebuild it from the task's own
+    // change record instead of falling back to whatever editors happen to
+    // be open (the fallback below stays reachable only for the two
+    // implementation-review stages). A task with no readable progress record
+    // at Publish must refuse the same way: falling through with `taskProgress`
+    // undefined would hand the open-editor fallback the ball below, which
+    // Step 6 forbids at this stage (2026-09-30 review, completion blocker).
+    if (targetStage === "publish") {
+      if (taskProgress === undefined) {
+        // Same durable provenance record as the rebuild's own refusals below
+        // — a missing/unreadable progress file is itself a "why" the owner
+        // should be able to find in this task's runs/ log, not only in the
+        // one-line notification (2026-09-30 review, completion blocker: "the
+        // absent-progress refusal also returns without writing a scope-
+        // rebuild log").
+        await writeRunLog(
+          folderUri,
+          "publish-scope-rebuild",
+          targetStage,
+          describePublishScopeRebuildForLogV1({
+            kind: "refused",
+            reason: PUBLISH_SCOPE_REFUSAL_REASON_V1,
+            skipReasons: ["task progress record is missing or unreadable for this task"],
+          })
+        ).catch(() => undefined);
+        NotificationRouter.showWarning(PUBLISH_SCOPE_REFUSAL_REASON_V1);
+        return;
+      }
+      if (taskProgress.implReviewFiles === undefined) {
+        const rebuild = await rebuildPublishImplReviewFilesV1(
+          folderUri,
+          workspaceRoot.uri,
+          taskProgress.roundLedger
+        );
+        // Best-effort: the durable record of which source was used (or why
+        // none could be) belongs in this task's runs/ log regardless of
+        // which branch below the caller takes next; a failure to write it
+        // must never block the outcome it is merely describing.
+        await writeRunLog(
+          folderUri,
+          "publish-scope-rebuild",
+          targetStage,
+          describePublishScopeRebuildForLogV1(rebuild)
+        ).catch(() => undefined);
+        if (rebuild.kind === "refused") {
+          NotificationRouter.showWarning(rebuild.reason);
+          return;
+        }
+        if (rebuild.files.length === 0) {
+          // Established but empty is a real, distinct result from "no
+          // record" — write it back (so this is not re-derived every time)
+          // and skip the review rather than producing a verdict about
+          // nothing. No round is written for either outcome.
+          await patchTaskProgressStrictV1(folderUri, (current) => updateImplReviewFiles(current, []));
+          NotificationRouter.showWarning(
+            "Publish review was not run: this task's change record shows no changed files."
+          );
+          return;
+        }
+        const patched = await patchTaskProgressStrictV1(folderUri, (current) =>
+          updateImplReviewFiles(current, rebuild.files)
+        );
+        taskProgress = patched ?? { ...taskProgress, implReviewFiles: rebuild.files };
+      }
+    }
     // Item 15 fix 4: prioritise files a standing blocker on the review being
     // re-run actually names, so the pack's size caps (which spend budget in
     // list order — applyContentCaps) truncate or omit them last rather than
@@ -7674,6 +7936,51 @@ export async function applyReviewWithAI(
           });
         }
       }
+    } else {
+      // RC3 item 9: neither "completed" nor "questions" — the coordinator
+      // exhausted its retries (malformedResult, failed, unavailable, ...)
+      // and this plan Apply Review produced no artifact at all. Previously
+      // this fell straight through to `return true` below with nothing
+      // durable recorded anywhere: no run log, no round-ledger row, no chat
+      // outcome line — a failure reported as a non-event. Record it the
+      // same way every other dispatch failure is recorded (mirrors the
+      // oversized-input abort a few hundred lines below, and
+      // `terminalizeUnclosedReviewRoundV1`'s identical pattern for reviews).
+      try {
+        await writeRunLog(
+          resolved.folderUri,
+          "apply-review",
+          stage,
+          `# Apply Review\n\n${describeTaskActionOutcomeForLogV1(outcome, PLAN_FILENAME)}`
+        );
+      } catch {
+        // Best-effort — a failed run-log write must never mask the outcome
+        // it was merely trying to record.
+      }
+      // 2026-09-30 review follow-up: `outcome.kind === "cancelled"` reached
+      // this branch too (it is neither "completed" nor "questions") and was
+      // being recorded as a "failed" round with a rejectionReason built by
+      // `describeTaskActionFailureV1`, whose own doc comment disclaims
+      // "non-completed, non-cancelled, non-questions" outcomes. A
+      // cancellation (the user/provider aborted the attempt) is not a
+      // dispatch failure — mirror `terminalStateForUnclosedReviewOutcomeV1`
+      // above, which already gives "cancelled" its own terminal state
+      // distinct from "failed" for the exact same reason.
+      const roundId = crypto.randomUUID();
+      const terminalState: RoundLedgerTerminalStateV1 = outcome.kind === "cancelled" ? "cancelled" : "failed";
+      try {
+        await terminalizeRoundV1(
+          roundId,
+          terminalState,
+          terminalState === "failed" ? { rejectionReason: describeTaskActionFailureV1(outcome) } : undefined,
+          {
+            taskFolderUri: resolved.folderUri,
+            synthesizeIfMissing: () => ({ roundId, stage, mode: "apply-review" }),
+          }
+        );
+      } catch {
+        // Best-effort — see above.
+      }
     }
     // The coordinator dispatch above genuinely ran, regardless of its
     // settled outcome kind (completed/questions/anything else) — this
@@ -7917,6 +8224,16 @@ export async function fastForwardReviewWithAI(
   // see activeFastForwardRunsV1.ts's doc comment for why this must be
   // captured now rather than re-derived when a human later answers the card.
   let ffActiveFolderPath: string | undefined;
+  // Review-flagged completion fix, round 2 (2026-09-30): whether THIS call is
+  // ending because its own loop paused to raise a decision card (as opposed
+  // to succeeding, stalling, exhausting its attempts, or throwing) — read in
+  // the `finally` below to record (or invalidate) this run's pause
+  // provenance, so a card's "resume Fast Forward" option is trusted only
+  // while its own run's ending is still on record as this exact pause, not a
+  // later, unrelated one. Defaults to false so every early return (before
+  // the loop below ever runs) conservatively invalidates any stale pause
+  // record left by an earlier run for this same folder.
+  let ffEndedViaPauseV1 = false;
   // Item 2 / Step 57a: hoisted above `try` so the `finally` below can read
   // the most recent attempt's coordinator outcome before releasing this
   // run's own admission — updated from the initial review's dispatchProbe
@@ -8203,6 +8520,55 @@ export async function fastForwardReviewWithAI(
       );
       return;
     }
+
+    // RC3 item 6 (Step 8): a Publish review can never be dispatched while
+    // Publish Checks are stale or missing — `requirePublishChecksFreshnessOrWarnV1`
+    // inside `runReviewForFolder` below refuses it outright, leaving
+    // `reviewUri` untouched. Left unhandled, `initialContent` then stays
+    // empty and this function fell into the generic "did not produce usable
+    // output" branch further down — a false description of a review that was
+    // never attempted, on top of the freshness gate's own, more specific
+    // warning. Fast Forward is already running (this closure's own admission
+    // is what got us here), so it runs Publish Checks itself first, through
+    // the same command the Publish row's own button uses, rather than
+    // attempting a review it already knows will be refused.
+    if (targetStage === "publish") {
+      const publishScopeFolder = resolvePublishScopeFolder(resolved.folderUri, resolved.progress).folder;
+      const freshnessBeforeChecks = await checkPublishChecksFreshnessV1(
+        resolved.folderUri,
+        publishScopeFolder,
+        await resolveHeadCommitSha(publishScopeFolder)
+      );
+      if (freshnessBeforeChecks.status !== "valid") {
+        // Mint-before/revoke-after, mirroring this file's own redirect call
+        // above: `runPublishChecks` is itself admission-wired and would
+        // otherwise race this function's already-live marker and be refused
+        // `busy` rather than adopt it.
+        const publishChecksHandoffToken = authorizeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+        try {
+          await vscode.commands.executeCommand("vs-code-ai-helper.runPublishChecks", {
+            taskFolderPath: resolved.folderUri.fsPath,
+            admissionHandoffTokenV1: publishChecksHandoffToken,
+          });
+        } finally {
+          revokeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+        }
+        const freshnessAfterChecks = await checkPublishChecksFreshnessV1(
+          resolved.folderUri,
+          publishScopeFolder,
+          await resolveHeadCommitSha(publishScopeFolder)
+        );
+        if (freshnessAfterChecks.status !== "valid") {
+          // `runPublishChecks` already reported why (checks failed, was
+          // cancelled, no model configured, ...) with its own specific
+          // notification — this is a genuine refusal, never "did not
+          // produce usable output", and no review round was ever claimed,
+          // so there is nothing here to terminalize as completed.
+          return false;
+        }
+      }
+    }
+
     const ffInitialReviewProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
       dispatched: false,
     };
@@ -8243,6 +8609,24 @@ export async function fastForwardReviewWithAI(
       initialContent = undefined;
     }
     if (!initialContent) {
+      // RC3 item 6 (Step 8), 2026-09-30 review follow-up: at Publish, a
+      // `dispatched: false` probe means runReviewForFolder refused the
+      // dispatch on a guard clause before ever claiming a review attempt —
+      // Step 6's own changed-file-record refusal ("no changed-file record
+      // for this task" / "shows no changed files") already reported its own
+      // specific, correct reason via NotificationRouter at the point of
+      // refusal. Falling through to the generic unusable-review block below
+      // would show a SECOND, wrong message ("did not produce usable
+      // output... Try running Review manually") on top of the real one, and
+      // offer "Run Implementation"/"Restore" actions that do not apply to a
+      // missing changed-file record. The two implementation-review stages
+      // keep the generic block below unchanged — there, a `dispatched:
+      // false` probe reflects a different guard (e.g. the impl-summary
+      // rejected-round stamp) whose actionable next step IS Run
+      // Implementation / Restore.
+      if (targetStage === "publish" && !ffInitialReviewProbe.dispatched) {
+        return false;
+      }
       const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
       // Run Implementation takes priority as the toast one action button when
       // both it and Restore apply (2026-09-24 review, narrowed completion
@@ -8911,6 +9295,7 @@ export async function fastForwardReviewWithAI(
       );
     }
   } else if (outcome.paused) {
+    ffEndedViaPauseV1 = true;
     // The escalation that paused the task already showed its own
     // notification (and chat question) with the actual reason — this just
     // frames the Fast Forward stop correctly instead of falling through to
@@ -8949,10 +9334,29 @@ export async function fastForwardReviewWithAI(
     !consumeOpenItemsCardPostedSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1)
   ) {
     const buildRoundsStalled = outcome.buildRoundsWithoutProgress ?? 0;
+    // RC3 item 9: a genuine Apply Review dispatch failure (every attempt
+    // rejected as malformed, or otherwise unable to run) used to collapse
+    // into this same generic "did not produce a new, comparable result"
+    // wording as an actual plan-stalling plateau — the two have completely
+    // different remedies. `ffCoordinatorOutcomeForAdmissionV1` already holds
+    // the last apply attempt's real settlement; name the actual cause
+    // whenever it is a dispatch failure rather than a normal "nothing
+    // changed" settlement (`completed`/`questions`/`cancelled`).
+    const ffDispatchFailureKindsV1 = new Set<TaskActionOutcomeV1["kind"]>([
+      "malformedResult",
+      "failed",
+      "unavailable",
+      "recoveryRequired",
+      "duplicateRejected",
+      "stalePreflight",
+      "partialEditBlocked",
+    ]);
     const stalledDetail =
       buildRoundsStalled > 0
         ? `${buildRoundsStalled} consecutive build round(s) ran without landing a new plan-checklist tick`
-        : "the review did not produce a new, comparable result";
+        : ffCoordinatorOutcomeForAdmissionV1 && ffDispatchFailureKindsV1.has(ffCoordinatorOutcomeForAdmissionV1.kind)
+          ? `Apply Review failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`
+          : "the review did not produce a new, comparable result";
     NotificationRouter.showWarning(
       `Fast Forward Review stopped after ${outcome.attempts} attempt(s): ${stalledDetail}. ` +
         "Running Fast Forward again continues from here — if the review is clean and plan steps remain, run Implementation to build them; otherwise check the run log for a failed or blocked round." +
@@ -9015,6 +9419,28 @@ export async function fastForwardReviewWithAI(
   );
   } finally {
     if (ffActiveFolderPath) {
+      // Review-flagged completion fix, round 2 (2026-09-30): record which
+      // way this run ended BEFORE clearing liveness — a paused-for-a-card
+      // ending leaves this run's pause on record as resumable, while every
+      // other ending (success, stalled, exhausted attempts, a thrown error)
+      // invalidates any pause record this run (or an earlier one, if this
+      // call returned before ever reaching its own loop) might have left.
+      //
+      // Review-flagged completion fix, round 3 (2026-09-30): the `true`
+      // branch below is no longer the FIRST place a genuine pause gets
+      // recorded — `stampFastForwardResumeProvenanceV1` (activeFastForwardRunsV1.ts)
+      // now records it synchronously the moment a resumable card is actually
+      // built, closing the window between "the card is posted and
+      // answerable" and "the pause is on record" that used to exist while
+      // this `finally` was the sole writer. This call is kept as a harmless,
+      // idempotent re-confirmation for that same run (and remains the only
+      // place that plays the OTHER role: invalidating a pause when the run
+      // instead ends for an unrelated reason, via the `else` branch).
+      if (ffEndedViaPauseV1) {
+        recordFastForwardRunPausedV1(ffActiveFolderPath);
+      } else {
+        clearFastForwardRunPausedProvenanceV1(ffActiveFolderPath);
+      }
       clearFastForwardRunActiveV1(ffActiveFolderPath);
     }
     recordAdmissionReleaseTriggerV1(ffSafeReleaseStateV1, ffCoordinatorOutcomeForAdmissionV1);
@@ -11327,7 +11753,19 @@ async function executeImplementationRun(
       ? mergeChecklistProgressV1(planChecklist, summary)
       : undefined;
   const checklistAdvanced = checklistMergeResult?.kind === "merged";
-  const checklistClaimedButUnmerged = checklistMergeResult?.kind === "no-match";
+  // RC3 item 1 (Step 2a): a "no-match" outcome whose every unmatched claim is
+  // actually a numbered reference ("Step 34", "Steps 1-33", …) to plan items
+  // that are ALREADY settled is not a genuine mismatch — the round described
+  // real, already-recorded progress in the wrong shape. Treating that as
+  // "claimed but unmerged" used to always flag the checklist unreliable and
+  // raise the reconcile card even though nothing was actually wrong; this
+  // never ticks anything on its own, it only stops a false alarm.
+  const checklistNoMatchAlreadySettled =
+    checklistMergeResult?.kind === "no-match" &&
+    planChecklist !== undefined &&
+    areAllUnmatchedChecklistClaimsAlreadySettledV1(planChecklist, checklistMergeResult.unmatchedAll);
+  const checklistClaimedButUnmerged =
+    checklistMergeResult?.kind === "no-match" && !checklistNoMatchAlreadySettled;
 
   // The ONE durable recovery transition (Part 1): a detected incomplete
   // round, and equally a completed round whose summary will be stamped

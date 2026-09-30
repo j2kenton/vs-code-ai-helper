@@ -5,7 +5,7 @@ import { resolvePublishScopeFolder } from "../utils/completionLint";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { checkPublishChecksFreshnessV1 } from "../utils/publishChecksFreshness";
 
-/** The single Publish-row "Check and review" command (1.0 item 13). */
+/** The single Publish-row "Run Publish Checks, Then Review" command (1.0 item 13, retitled RC3 item 7). */
 export const CHECK_AND_REVIEW_PUBLISH_COMMAND_ID_V1 = "vs-code-ai-helper.checkAndReviewPublish";
 
 export type CheckAndReviewPublishArgV1 =

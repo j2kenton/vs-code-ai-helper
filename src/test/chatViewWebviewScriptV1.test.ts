@@ -75,7 +75,7 @@ function makeElement(tagName: string, id = ""): FakeElement {
   const attributes = new Map<string, string>();
   const classes = new Set<string>();
   const element: FakeElement = {
-    tagName,
+    tagName: tagName.toUpperCase(),
     id,
     textContent: "",
     value: "",
@@ -125,7 +125,18 @@ function makeElement(tagName: string, id = ""): FakeElement {
     remove: () => undefined,
     scrollIntoView: () => undefined,
     querySelector: () => null,
-    querySelectorAll: () => [],
+    querySelectorAll: () => {
+      // Only the 'input,textarea' form-control query the draft capture uses.
+      const found: FakeElement[] = [];
+      const walk = (node: FakeElement): void => {
+        for (const child of node.children) {
+          if (/^(input|textarea)$/i.test(child.tagName)) found.push(child);
+          walk(child);
+        }
+      };
+      walk(element);
+      return found;
+    },
     text() {
       return [element.textContent, ...element.children.map((child) => child.text())].join(" ").trim();
     },
@@ -160,6 +171,8 @@ function runPanel(): PanelHarness {
     "steering-note",
     "form",
     "message",
+    "send-btn",
+    "send-reason",
   ]) {
     elements.set(id, makeElement("div", id));
   }
@@ -357,6 +370,127 @@ void describe("the chat panel's interaction and decision cards", () => {
       assert.equal(time.title, "");
       assert.doesNotMatch(root.text(), /Invalid|NaN/);
     }
+  });
+});
+
+void describe("the open-items form card (RC3 item 5)", () => {
+  const collect = (root: FakeElement, tag: string): FakeElement[] => {
+    const found: FakeElement[] = [];
+    const visit = (element: FakeElement): void => {
+      if (element.tagName.toLowerCase() === tag) found.push(element);
+      element.children.forEach(visit);
+    };
+    visit(root);
+    return found;
+  };
+  const form = {
+    formId: "f".repeat(32),
+    items: [
+      { itemId: "id-1", itemText: "First open item", occurrence: 1, reason: "needs a human" },
+      { itemId: "id-2", itemText: "Second open item", occurrence: 1, reason: "" },
+    ],
+  };
+
+  void it("shows every item with its reason, three choices and a note, defaulting to Leave open", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));
+    const card = panel.byId("interaction");
+    assert.equal(card.style.display, "block");
+    assert.match(card.text(), /First open item/);
+    assert.match(card.text(), /Reason from the round: needs a human/);
+    assert.match(card.text(), /Exclude/);
+    assert.match(card.text(), /I did it — tick it/);
+    const radios = collect(card, "input");
+    assert.equal(radios.length, 6);
+    assert.deepEqual(
+      radios.filter((r) => (r as unknown as { checked?: boolean }).checked).map((r) => r.value),
+      ["leave", "leave"]
+    );
+    assert.equal(collect(card, "textarea").length, 2);
+    assert.equal((collect(card, "textarea")[0] as FakeElement).value, "needs a human");
+  });
+
+  void it("one Apply posts every answer, with the owner's choices and notes", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));
+    const card = panel.byId("interaction");
+    const radios = collect(card, "input") as unknown as { value: string; checked: boolean }[];
+    radios[0]!.checked = true; // item 1: exclude
+    radios[2]!.checked = false; // item 1: leave off
+    (collect(card, "textarea")[0] as FakeElement).value = "hand-off";
+    const apply = collect(card, "button").find((b) => b.textContent === "Apply");
+    assert.ok(apply, "the form has one Apply button");
+    assert.equal(collect(card, "button").filter((b) => b.textContent === "Apply").length, 1);
+    apply.listeners.get("click")![0]!({});
+    assert.deepEqual(JSON.parse(JSON.stringify(panel.outbound.at(-1))), {
+      type: "submitOpenPlanItemsForm",
+      formId: form.formId,
+      answers: [
+        { itemId: "id-1", choice: "exclude", note: "hand-off" },
+        { itemId: "id-2", choice: "leave", note: "" },
+      ],
+    });
+  });
+
+  void it("a repaint keeps a prefilled note the owner cleared", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));
+    (collect(panel.byId("interaction"), "textarea")[0] as FakeElement).value = "";
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));
+    assert.equal((collect(panel.byId("interaction"), "textarea")[0] as FakeElement).value, "");
+  });
+
+  void it("renders no form card when none is open", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [] }));
+    assert.equal(panel.byId("interaction").style.display, "none");
+  });
+});
+
+void describe("Send disabled while the panel's own task is busy (RC3 item 8)", () => {
+  void it("disables Send and shows a plain-language reason while busy on a task chat", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
+    assert.equal(panel.byId("send-btn").disabled, true);
+    assert.match(panel.byId("send-reason").textContent, /Available when Apply Review finishes/);
+  });
+
+  void it("re-enables Send and clears the reason once the task is idle", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
+    panel.post(stateMessage({ busy: false, busyText: undefined, busyLabel: undefined, waitingForUser: false }));
+    assert.equal(panel.byId("send-btn").disabled, false);
+    assert.equal(panel.byId("send-reason").textContent, "");
+    assert.equal(panel.byId("send-reason").style.display, "none");
+  });
+
+  void it("keeps Send enabled while the task is waiting for an answer in this chat", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, waitingForUser: true }));
+    assert.equal(panel.byId("send-btn").disabled, false);
+  });
+
+  void it("keeps Send enabled for the Global Assistant even while it is busy", () => {
+    const panel = runPanel();
+    panel.post(
+      stateMessage({ target: { kind: "global" }, busy: true, busyLabel: "something", waitingForUser: false })
+    );
+    assert.equal(panel.byId("send-btn").disabled, false);
+  });
+
+  void it("preserves typed text and refuses to send while Send is disabled, even via Enter", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
+    panel.byId("message").value = "hold this thought";
+    const outboundBefore = panel.outbound.length;
+    for (const handler of panel.byId("message").listeners.get("keydown") ?? []) {
+      handler({ key: "Enter", ctrlKey: false, metaKey: false, shiftKey: false, preventDefault: () => undefined });
+    }
+    assert.equal(panel.outbound.length, outboundBefore, "no message was sent while Send is disabled");
+    assert.equal(panel.byId("message").value, "hold this thought", "typed text survives");
+    panel.post(stateMessage({ busy: false, busyText: undefined, busyLabel: undefined, waitingForUser: false }));
+    assert.equal(panel.byId("send-btn").disabled, false);
+    assert.equal(panel.byId("message").value, "hold this thought", "still there once Send re-enables");
   });
 });
 

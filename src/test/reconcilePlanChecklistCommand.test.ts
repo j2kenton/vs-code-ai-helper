@@ -61,6 +61,13 @@ import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { writeTextFileIfUnchangedV1, registerConditionalWriteSaveGuardV1, withPlanFileWriteLockV1 } from "../utils/fileUtils";
 import { safeRemoveDir } from "./testFsUtils";
+import {
+  markFastForwardRunActiveV1,
+  clearFastForwardRunActiveV1,
+  getFastForwardSessionIdV1,
+  getFastForwardRunEpochV1,
+  clearFastForwardRunPausedProvenanceV1,
+} from "../utils/activeFastForwardRunsV1";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -518,7 +525,12 @@ void describe("reconcilePlanChecklist — confirmation", () => {
     );
     // Part 3, Step 5: clearing the latch succeeds, so it also tries the
     // stage's next action again.
-    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), { taskFolderPath: result.folder });
+    // RC3 item 4, Step 3: no Fast Forward run was active, so no provenance
+    // is forwarded.
+    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+      taskFolderPath: result.folder,
+      resumeFastForwardV1: undefined,
+    });
   });
 });
 
@@ -675,7 +687,10 @@ void describe("applyReconciliationReviewVerifiedTicksV1 / applyReconciliationRev
       );
       // Part 3, Step 5: applying succeeds, so it also tries the stage's next
       // action again.
-      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), { taskFolderPath: folder });
+      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+        taskFolderPath: folder,
+        resumeFastForwardV1: undefined,
+      });
     } finally {
       win.restore();
       fs.restore();
@@ -1033,16 +1048,26 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       const roundClaim = decision.evidence!.find((e) => e.label === "Round-summary checklist claims")!;
       assert.match(roundClaim.detail, /Not available for this invocation/);
 
-      // Every unchecked item is named verified complete by a review, but
-      // (2026-08-21 NINTH review round) that is a CANDIDATE for explicit
-      // selection, not an automatic tick — the recommendation must favor
-      // applying those ticks (monotonic, text-matched, reuses
-      // applyReviewerVerifiedTicks's own merge primitives), not "Mark
-      // reconciled" directly, which would clear the flag while leaving the
-      // verified-complete item sitting unticked.
+      // Every unchecked item is named verified complete by a review — RC3
+      // item 1, Step 2b, check (2) fails. The approved three-check contract
+      // keeps "Not yet" recommended and names the failed check plus its
+      // next action (applying the tick), rather than recommending a
+      // different action as the fix — even one as safe as this one — in
+      // place of "notYet". The option to apply those ticks (monotonic,
+      // text-matched, reuses applyReviewerVerifiedTicks's own merge
+      // primitives) is still offered and is what the reasoning points at;
+      // "Mark reconciled" is not recommended either, since it would clear
+      // the flag while leaving the verified-complete item sitting unticked.
+      // This task also has 2 unrecorded pendingImplReviewFiles (line ~975
+      // above) — check (3) fails at the same time as check (2), so the
+      // reasoning must name both failed checks, not only the first one it
+      // finds.
       assert.equal(decision.recommendation.kind, "option");
       if (decision.recommendation.kind === "option") {
-        assert.equal(decision.recommendation.optionId, "applyVerifiedTicks");
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /review-verified check fails/i);
+        assert.match(decision.recommendation.reasoning, /Apply 1 Reviewer-Verified Tick/);
+        assert.match(decision.recommendation.reasoning, /2 changed file\(s\) are also unrecorded/);
       }
       const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
       assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must be offered");
@@ -1133,12 +1158,12 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must still be offered");
       assert.equal(
         applyOption.label,
-        "Same as the reviewer-verified ticks card above — apply and resume the task"
+        "Same as the reviewer-verified ticks card above — apply and try again (one cycle)"
       );
       assert.match(
         applyOption.label,
-        /resume the task/,
-        "every resumeKind: 'continue' option's label must say it resumes the task, even when relabelled"
+        /and try again \(one cycle\)/,
+        "every resumeKind: 'continue' option's label must say what it does next, even when relabelled"
       );
       assert.match(
         applyOption.consequence,
@@ -1205,6 +1230,413 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       }
     } finally {
       win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC3 item 1, Step 2b, check (1): the triggering round's own claim is a
+  // numbered shorthand ("Steps 1-2 — done") whose targets are already ticked
+  // in plan-final.md — the observed RC2 shape ("38/71 settled", claims naming
+  // already-ticked items). Two OTHER items remain genuinely unticked with no
+  // review coverage, so this must not fall into the generic "no basis"
+  // branch: the claim's own mismatch was a text-matching artifact, not a
+  // false progress report, so "Mark reconciled" is the safe, correct
+  // recommendation even though real work remains outstanding.
+  void it("recommends Mark reconciled when the round's numbered claim resolves to already-settled items, even with other items genuinely outstanding", async () => {
+    const name = "evidence-numbered-claim-settled";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Step one",
+        "- [x] Step two",
+        "- [ ] Step three",
+        "- [ ] Step four",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        {
+          kind: "no-match",
+          unmatchedSample: ["Steps 1-2 — done"],
+          unmatchedAll: ["Steps 1-2 — done"],
+        }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.match(decision.recommendation.reasoning, /already/i);
+        assert.match(decision.recommendation.reasoning, /settled in plan-final\.md/i);
+        assert.match(decision.recommendation.reasoning, /2 item\(s\) remain genuinely outstanding/);
+      }
+      assert.match(
+        decision.whatHappened,
+        /already ticked in plan-final\.md, so the checklist matches what was claimed/
+      );
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Sibling of the test above with check (3) failing: the claim resolves
+  // cleanly, but a changed file is unrecorded, so "Mark reconciled" would
+  // re-arm completeness gating on counts that may still be wrong. This must
+  // recommend "Not yet" and name the unrecorded file as the specific gap —
+  // not the generic "no basis" wording, since the claim itself is not in
+  // question.
+  void it("recommends Not yet, naming unrecorded files, when the round's numbered claim resolves but files are unrecorded", async () => {
+    const name = "evidence-numbered-claim-settled-pending-files";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Step one",
+        "- [x] Step two",
+        "- [ ] Step three",
+        "- [ ] Step four",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+      pendingImplReviewFiles: ["src/foo.ts"],
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        {
+          kind: "no-match",
+          unmatchedSample: ["Steps 1-2 — done"],
+          unmatchedAll: ["Steps 1-2 — done"],
+        }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /already settled in plan-final\.md/i);
+        assert.match(decision.recommendation.reasoning, /1 changed file\(s\) are unrecorded/);
+      }
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Guards against the new branch over-firing: the claim's numbered range
+  // includes an item that is NOT settled, so the resolver must report false
+  // and the decision must fall through to the existing generic "no basis"
+  // wording rather than incorrectly recommending Mark reconciled.
+  void it("still recommends no basis when the round's numbered claim names an item that is not settled", async () => {
+    const name = "evidence-numbered-claim-partially-settled";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Step one",
+        "- [x] Step two",
+        "- [ ] Step three",
+        "- [ ] Step four",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        {
+          // Step 3 is NOT ticked — the range spills past the settled items.
+          kind: "no-match",
+          unmatchedSample: ["Steps 1-3 — done"],
+          unmatchedAll: ["Steps 1-3 — done"],
+        }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /no basis to recommend Mark reconciled/i);
+      }
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // Completion-review fix (round 8), bug 1: an out-of-range numbered claim
+  // never resolves to a settled item — no matter what plan-final.md's raw
+  // counts currently read. Before this fix, `noUncheckedItemsRemain` (0
+  // outstanding here) short-circuited straight to "Mark reconciled" without
+  // ever consulting whether the round's own claim (the thing that flagged
+  // this checklist unreliable in the first place) actually resolved. This
+  // must still recommend "Not yet", explaining that the claim itself does
+  // not resolve, even though the checklist reads 0 outstanding.
+  void it("still recommends Not yet when the checklist reads 0 outstanding but the round's own claim is out of range", async () => {
+    const name = "evidence-fully-settled-out-of-range-claim";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), FULLY_CHECKED_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        {
+          // FULLY_CHECKED_PLAN has only 2 top-level items — "Step 99" is
+          // out of range for either of them.
+          kind: "no-match",
+          unmatchedSample: ["Step 99"],
+          unmatchedAll: ["Step 99"],
+        }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /0 outstanding/);
+        assert.match(decision.recommendation.reasoning, /does not resolve to a specific settled item/);
+      }
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC3 item 4, Step 3: the "Mark reconciled" option resumes Fast Forward,
+  // via the exact same `resumeFastForwardV1` path RC2 item 12 already wired
+  // up for the plateau card's "Keep iterating" option, only when a Fast
+  // Forward run was genuinely active for this task at the moment the card
+  // was POSTED — captured then, never re-derived when the option is later
+  // chosen (see `fastForwardResumeSuffixV1`'s doc comment).
+  void it("recommends resuming Fast Forward on 'Mark reconciled' when a Fast Forward run is active at post time", async () => {
+    const name = "reconcile-ff-active";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      ["# Final Plan", "", "<!-- ensemble:implementation-checklist -->", "", "- [ ] Step one", ""].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    markFastForwardRunActiveV1(folder, { attemptNumber: 2, maxAttempts: 5 });
+    // Production ordering (review-flagged completion fix, round 3,
+    // 2026-09-30): no manual `recordFastForwardRunPausedV1` call here —
+    // production never calls it before the card is built either.
+    // `stampFastForwardResumeProvenanceV1` (activeFastForwardRunsV1.ts) now
+    // records the pause itself, synchronously, at the exact moment
+    // `postReconcilePlanChecklistDecisionV1`'s "reconcile" option is built
+    // below — the SAME call this test exercises — so the card is trusted
+    // the instant it is posted, with no separate setup step required.
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(vscode.Uri.file(folder), canonicalId, folder, progress);
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      const reconcileOption = decision.options.find((o) => o.optionId === "reconcile");
+      assert.ok(reconcileOption, "the reconcile option must be offered");
+      assert.equal(reconcileOption.label, "Mark reconciled and resume Fast Forward (iteration 2 of 5)");
+      assert.match(reconcileOption.consequence, /Resumes Fast Forward at iteration 2 of 5/);
+      assert.equal(reconcileOption.effect.kind, "command");
+      if (reconcileOption.effect.kind === "command") {
+        assert.deepEqual(reconcileOption.effect.args, [
+          {
+            taskFolderPath: folder,
+            canonicalId,
+            decisionId: decision.decisionId,
+            resumeFastForwardV1: {
+              attemptNumber: 2,
+              maxAttempts: 5,
+              fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+              fastForwardRunEpochV1: getFastForwardRunEpochV1(folder),
+            },
+          },
+        ]);
+      }
+    } finally {
+      clearFastForwardRunActiveV1(folder);
+      clearFastForwardRunPausedProvenanceV1(folder);
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("keeps the single-cycle 'Mark reconciled' option when no Fast Forward run is active at post time", async () => {
+    const name = "reconcile-ff-inactive";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      ["# Final Plan", "", "<!-- ensemble:implementation-checklist -->", "", "- [ ] Step one", ""].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    // Deliberately no markFastForwardRunActiveV1 call — this card was raised
+    // by a single owner-chosen action, not an active Fast Forward run.
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(vscode.Uri.file(folder), canonicalId, folder, progress);
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      const reconcileOption = decision.options.find((o) => o.optionId === "reconcile");
+      assert.ok(reconcileOption, "the reconcile option must be offered");
+      assert.equal(reconcileOption.label, "Mark reconciled and try again (one cycle)");
+      assert.match(reconcileOption.consequence, /does not start or resume Fast Forward/);
+      assert.equal(reconcileOption.effect.kind, "command");
+      if (reconcileOption.effect.kind === "command") {
+        assert.deepEqual(reconcileOption.effect.args, [
+          { taskFolderPath: folder, canonicalId, decisionId: decision.decisionId },
+        ]);
+      }
+    } finally {
       fs.restore();
       workspace.restore();
       __extensionContextV1TestOnly.reset();
@@ -1587,7 +2019,9 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       // once the human has actually done the checks and ticked the item,
       // clicking it is still the correct next step.
       assert.ok(
-        decision.options.some((o) => o.optionId === "reconcile" && o.label === "Mark reconciled and resume the task"),
+        decision.options.some(
+          (o) => o.optionId === "reconcile" && o.label === "Mark reconciled and try again (one cycle)"
+        ),
         "Mark reconciled must remain available as a non-recommended option"
       );
     } finally {
@@ -2031,7 +2465,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(decision, "a decision must be posted");
       const linkOption = decision.options.find((o) => o.optionId === "linkManualChecks");
       assert.ok(linkOption, "a Link Outstanding Checks option must be offered for the unconfirmed pooled case");
-      assert.match(linkOption.label, /Link 5 Outstanding Checks and resume the task/);
+      assert.match(linkOption.label, /Link 5 Outstanding Checks and try again \(one cycle\)/);
       assert.equal(linkOption.effect.kind, "command");
       if (linkOption.effect.kind !== "command") {
         throw new Error("unreachable — asserted above");
@@ -2053,7 +2487,10 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.match(updatedPlan, /Idle bastion is reclaimed after the linger window.*Covers: Step 26/);
       // Part 3, Step 5: linking succeeds, so it also tries the stage's next
       // action again.
-      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), { taskFolderPath: folder });
+      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
+        taskFolderPath: folder,
+        resumeFastForwardV1: undefined,
+      });
 
       // ...and a subsequent reconcile invocation must now read it as a
       // confirmed, not pooled, recommendation. `post` supersedes the prior
@@ -2704,6 +3141,103 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
     }
   });
 
+  // Completion-review fix (round 8), bug 2: the round's own numbered claim
+  // resolves cleanly to an already-settled item (check 1 passes), no review
+  // names an unticked item as verified complete (check 2 passes), and no
+  // files are unrecorded (check 3 passes) — so "Mark reconciled" is required,
+  // even though the checklist's *sole other* outstanding item happens to
+  // coincide with a sole environmental blocker on the relevant review. That
+  // item is real, unrelated unfinished work, not evidence the round's own
+  // claim is false, and must not preempt the three-check recommendation with
+  // the sole-blocker guidance's "Not yet".
+  void it("recommends Mark reconciled, not the sole-blocker guidance, when the round's claim resolves and a different item coincides with an environmental blocker", async () => {
+    const name = "evidence-settled-claim-with-unrelated-sole-blocker";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Step one",
+        "- [ ] The five live-AWS acceptance checks pass",
+        "",
+        "## Manual verification",
+        "",
+        "- [ ] Bastion stops after linger expires with no borrowers — Priority: HIGH <!-- ensemble:excluded -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      [
+        "Readiness: 9/10",
+        "",
+        "<!-- blockers:start -->",
+        "- [review-confidence] [environmental] The five live-AWS acceptance checks remain unexecuted",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        {
+          // Resolves entirely to "Step one", which is already ticked — the
+          // checklist's OTHER outstanding item (the live-AWS one) is left
+          // genuinely outstanding and untouched by this claim.
+          kind: "no-match",
+          unmatchedSample: ["Step 1 — done"],
+          unmatchedAll: ["Step 1 — done"],
+        }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.match(decision.recommendation.reasoning, /already/i);
+        assert.match(decision.recommendation.reasoning, /settled in plan-final\.md/i);
+        assert.match(decision.recommendation.reasoning, /1 item\(s\) remain genuinely outstanding/);
+        assert.doesNotMatch(
+          decision.recommendation.reasoning,
+          /classified environmental, so no further/,
+          "the sole-blocker guidance's own wording must not preempt the three-check recommendation"
+        );
+      }
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // wf10 item 6c: `coveredItemsCount === 0` is two unrelated situations — no
   // review vouches for an outstanding item (tested above), or there is no
   // outstanding item AT ALL. Observed live 2026-08-21 on jester task 3: the
@@ -2863,6 +3397,72 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
     }
   });
 
+  // RC3 item 1, Step 2b: the third check. Zero unticked items alone used to
+  // be unconditionally recommended "Mark reconciled" — but files a round
+  // changed with no checklist state recorded (`pendingImplReviewFiles`) mean
+  // the checklist may still not match the work, so this case must recommend
+  // "Not yet" naming the unrecorded files instead.
+  void it("recommends Not yet, not Mark reconciled, when 0 items are unticked but files are unrecorded", async () => {
+    const name = "evidence-fully-ticked-but-pending-files";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Split the artifacts",
+        "- [x] Wire the completeness gate",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+      pendingImplReviewFiles: ["src/foo.ts", "src/bar.ts"],
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "notYet");
+        assert.match(decision.recommendation.reasoning, /2 changed file\(s\) are unrecorded/);
+        assert.match(decision.recommendation.reasoning, /Run Apply Review first/);
+      }
+      assert.match(decision.whatHappened, /2 changed file\(s\) are unrecorded/);
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // Task "Actionable Hand-offs" PART 5: the reconciliation decision must cite
   // the recorded reason the checklist was flagged unreliable — the stronger
   // discriminating fact — not only the weaker unticked-item count, and must
@@ -2993,7 +3593,11 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         canonicalId,
         folder,
         progress,
-        { kind: "no-match", unmatchedSample: ["Wire the completness gate (typo)"] }
+        {
+          kind: "no-match",
+          unmatchedSample: ["Wire the completness gate (typo)"],
+          unmatchedAll: ["Wire the completness gate (typo)"],
+        }
       );
       assert.equal(result.kind, "posted");
       const store = new WorkflowDecisionStoreV1(context.workspaceState);

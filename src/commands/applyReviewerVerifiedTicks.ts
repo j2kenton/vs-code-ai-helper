@@ -24,6 +24,8 @@ import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../uti
 import { ChatTarget } from "../views/chatView";
 import { normalizePath } from "../utils/taskRoot";
 import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
+import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
+import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
 
 type ApplyArg =
   | { task?: IncompleteTask }
@@ -44,6 +46,16 @@ type ApplyArg =
        * verified after this card was posted.
        */
       offeredItems?: readonly string[];
+      /**
+       * RC3 item 4, Step 3: whether a Fast Forward run was genuinely active
+       * for this task at the moment this card was POSTED, captured then
+       * (`getFastForwardRunStateV1`) and baked into this option's own args —
+       * mirrors `reviewEscalation.ts`'s `buildPlateauKeepIteratingOptionV1`
+       * (RC2 item 12), the established "capture now, don't re-derive later"
+       * pattern this reuses rather than duplicating. Present only when the
+       * card should resume Fast Forward instead of running a single cycle.
+       */
+      resumeFastForwardV1?: FastForwardResumeStateV1;
     };
 
 function normalizeArg(arg: ApplyArg | undefined):
@@ -52,6 +64,7 @@ function normalizeArg(arg: ApplyArg | undefined):
       taskFolderPath?: string;
       reviewStage?: TaskStage;
       offeredItems?: readonly string[];
+      resumeFastForwardV1?: FastForwardResumeStateV1;
     }
   | undefined {
   if (!arg) {
@@ -65,6 +78,7 @@ function normalizeArg(arg: ApplyArg | undefined):
     taskFolderPath?: string;
     reviewStage?: TaskStage;
     offeredItems?: readonly string[];
+    resumeFastForwardV1?: FastForwardResumeStateV1;
   };
   if (explicit.canonicalId || explicit.taskFolderPath) {
     return {
@@ -72,6 +86,7 @@ function normalizeArg(arg: ApplyArg | undefined):
       taskFolderPath: explicit.taskFolderPath,
       reviewStage: explicit.reviewStage,
       offeredItems: explicit.offeredItems,
+      resumeFastForwardV1: explicit.resumeFastForwardV1,
     };
   }
   if ("task" in arg && arg.task?.folderUri) {
@@ -112,6 +127,15 @@ export interface VerifiedTicksDerivationV1 {
   readonly reviewStage: TaskStage;
   readonly reviewFilename: string;
   readonly applicable: readonly string[];
+  /**
+   * RC3 item 1, Step 2c: the reviewer's own `evidence:` sentence for each
+   * entry in `applicable`, same order/index, `undefined` when the review
+   * carries no evidence line for that item (an older review, or one where
+   * the reviewer omitted it) — the card shows the fixed "older review
+   * format" fallback in that case rather than inventing or searching for
+   * one.
+   */
+  readonly applicableEvidence: readonly (string | undefined)[];
 }
 
 export type DeriveVerifiedTicksResultV1 =
@@ -206,6 +230,14 @@ export async function deriveApplicableVerifiedTicksV1(
   const applicable = offeredKeys
     ? applicableFromReview.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
     : applicableFromReview;
+  // RC3 item 1, Step 2c: look each applicable (plan-text) item back up
+  // against the review's own entries by normalized key, so the card can
+  // show the reviewer's own evidence sentence rather than only the item
+  // text.
+  const evidenceByKeyV1 = new Map<string, string | undefined>(
+    verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
+  );
+  const applicableEvidence = applicable.map((item) => evidenceByKeyV1.get(normalizeChecklistItemTextV1(item)));
   if (applicable.length === 0) {
     // `verified.items` is the review's raw named text: it can include
     // entries that match no real plan item at all, which is never
@@ -223,7 +255,7 @@ export async function deriveApplicableVerifiedTicksV1(
     };
   }
 
-  return { kind: "ok", derivation: { reviewStage, reviewFilename, applicable } };
+  return { kind: "ok", derivation: { reviewStage, reviewFilename, applicable, applicableEvidence } };
 }
 
 export type ApplyTicksDecisionPostResultV1 =
@@ -253,7 +285,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
   if (derived.kind === "blocked") {
     return { kind: "blocked", message: derived.message, severity: derived.severity };
   }
-  const { reviewFilename, applicable } = derived.derivation;
+  const { reviewFilename, applicable, applicableEvidence } = derived.derivation;
 
   const target: ChatTarget = {
     canonicalId,
@@ -261,6 +293,12 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
     stage: reviewStage,
     taskName: displayName,
   };
+
+  // RC3 item 4, Step 3: captured now, at post time — see
+  // `fastForwardResumeSuffixV1`'s doc comment for why this can't be
+  // re-derived when the option is later chosen.
+  const fastForwardState = getFastForwardRunStateV1(taskFolderPath);
+  const ffResume = fastForwardResumeSuffixV1(taskFolderPath, fastForwardState);
 
   const decision = await postWorkflowDecisionV1(
     {
@@ -277,18 +315,29 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
       options: [
         {
           optionId: "apply",
-          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"} and resume the task`,
+          label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}${ffResume.labelSuffix}`,
           resumeKind: "continue",
           consequence:
             `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}, then ` +
             "dispatches this stage's next action:\n" +
             applicable
-              .map((item) => `- ${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}`)
-              .join("\n"),
+              .map((item, index) => {
+                const evidence = applicableEvidence[index];
+                // RC3 item 1, Step 2c: shows the reviewer's own evidence
+                // sentence under each item so the card carries WHY the tick
+                // is safe, never a sentence pulled from elsewhere in the
+                // review.
+                const evidenceLine = evidence
+                  ? `\n  evidence: ${evidence}`
+                  : "\n  evidence: No evidence line in this review (older review format)";
+                return `- ${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}${evidenceLine}`;
+              })
+              .join("\n") +
+            ffResume.consequenceSuffix,
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
-            args: [{ taskFolderPath, canonicalId, reviewStage, offeredItems: applicable }],
+            args: [{ taskFolderPath, canonicalId, reviewStage, offeredItems: applicable, ...ffResume.extraArgs }],
           },
         },
         {
@@ -491,8 +540,11 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   );
   // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
   // it") — same note as reconcilePlanChecklist.ts's identical dispatch.
+  // RC3 item 4, Step 3: forwards the provenance baked into this card at post
+  // time — present only when Fast Forward was genuinely active then.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
     taskFolderPath: folderUri.fsPath,
+    resumeFastForwardV1: normalized?.resumeFastForwardV1,
   });
 }
 

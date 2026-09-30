@@ -41,7 +41,12 @@ import { deactivateNotificationRouter, initNotificationRouter } from "../utils/n
 import { TaskProgress } from "../types/taskProgress";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
-import { markFastForwardRunActiveV1, clearFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
+import {
+  markFastForwardRunActiveV1,
+  clearFastForwardRunActiveV1,
+  getFastForwardSessionIdV1,
+  getFastForwardRunEpochV1,
+} from "../utils/activeFastForwardRunsV1";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { safeRemoveDir } from "./testFsUtils";
@@ -757,9 +762,13 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       // Review-narrowed blocker 57e9485f-…-1: "what clears this" must derive
       // the concrete action from the blocker's OWN resolver class, not
       // restate the whole non-task-fixable taxonomy every time.
+      // RC3 item 3: a blocker this classifier cannot otherwise place is now
+      // described as needing an owner decision, never the old blanket
+      // "infrastructure, sandbox, or OS-level fix" guess.
       const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
       assert.ok(clearsThis);
-      assert.match(clearsThis.detail, /infrastructure, sandbox, or OS-level fix/);
+      assert.match(clearsThis.detail, /an owner decision on the point described above/);
+      assert.doesNotMatch(clearsThis.detail, /infrastructure, sandbox, or OS-level fix/);
       assert.doesNotMatch(clearsThis.detail, /a human decision, an external system, or a toolchain step/);
 
       // The plain chat-question fallback must NOT also have fired.
@@ -1414,7 +1423,16 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
           args: [
             {
               taskFolderPath: folderUri.fsPath,
-              resumeFastForwardV1: { attemptNumber: 4, maxAttempts: 10 },
+              resumeFastForwardV1: {
+                attemptNumber: 4,
+                maxAttempts: 10,
+                // Review-flagged completion fix, round 2 (2026-09-30): the
+                // plateau card now stamps the same provenance the reconcile
+                // and reviewer-verified-ticks cards do, so it can never
+                // regress to the untrusted "no provenance at all" shape.
+                fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+                fastForwardRunEpochV1: getFastForwardRunEpochV1(folderUri.fsPath),
+              },
             },
           ],
         });
@@ -1628,12 +1646,119 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
-  // wf10 review fix (Step 27, 2026-08-25): the blocker line itself may not
-  // quote a command, but the SAME review round's own markdown can name the
-  // clearing command elsewhere (a "How to verify" / evidence section) — this
-  // must still be found and named, not just a command quoted inline on the
-  // blocker's own one-line description.
-  void it("derives an external-status clearing action from a command named elsewhere in the same review, not just inline on the blocker", async () => {
+  // RC3 item 3: the exact RC2 blocker that gave the wrong advice — a
+  // plan-ordering conflict inside the plan itself, not an infra/sandbox/OS
+  // defect and not something any round can resolve. Must land as an owner
+  // decision, with no command attached (the plan's unrelated "Round check:
+  // lint, …" text must never be picked up).
+  void it("derives owner-decision clearing action, with no command, for the RC2 plan-order blocker", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-plan-order");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+    store.set(
+      vscode.Uri.joinPath(folderUri, "plan.md").toString(),
+      "# Plan\n\n## Verification\n\nRound check: lint, then `pnpm lint`.\n"
+    );
+
+    const blockers: ReviewBlocker[] = [
+      {
+        category: "completion",
+        resolver: "environmental",
+        description: "Round 3.2 Step 49 was started before the required Step 48/G2 predecessor completed",
+      },
+    ];
+
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 6/10\n", blockers, taskFixableCount: 0 }
+      );
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
+      assert.ok(clearsThis);
+      assert.match(clearsThis.detail, /an owner decision on the point described above/);
+      assert.match(clearsThis.detail, /stage chat/);
+      assert.doesNotMatch(clearsThis.detail, /infrastructure, sandbox, or OS-level fix/);
+      assert.doesNotMatch(clearsThis.detail, /pnpm lint/);
+      assert.doesNotMatch(clearsThis.detail, /`pnpm/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC3 item 3: an owner-decision blocker that itself DOES quote a command
+  // keeps that command — the restriction to the blocker's own text must not
+  // suppress a command the blocker genuinely names.
+  void it("keeps a command the environmental blocker's own description names, even for an owner-decision blocker", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-decision-plan-order-with-command");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const blockers: ReviewBlocker[] = [
+      {
+        category: "completion",
+        resolver: "environmental",
+        description: "Step 49 was started before its predecessor completed — run `pnpm build` to confirm the artifact is current",
+      },
+    ];
+
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 6/10\n", blockers, taskFixableCount: 0 }
+      );
+      const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = decisionStore
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
+      assert.ok(clearsThis);
+      assert.match(clearsThis.detail, /an owner decision on the point described above/);
+      assert.match(clearsThis.detail, /`pnpm build`/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC3 item 3 review fix (superseding the wf10/Step 27 behavior below): a
+  // command named elsewhere in the SAME review round's markdown (a "How to
+  // verify" / evidence section) — but not quoted on the blocker's own
+  // description — must NOT be attached. The RC2 "Step 49 started before Step
+  // 48/G2" blocker was wrongly given the plan's unrelated "Round check:
+  // lint, …" command this way; a coarse vocabulary-overlap correlation is not
+  // proof the command actually clears THIS blocker.
+  void it("does not attach a command named elsewhere in the same review when the blocker itself names none", async () => {
     const store = new Map<string, string>();
     installMemStore(store);
     const surface = new RecordingSurface();
@@ -1676,25 +1801,23 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
       assert.ok(clearsThis);
       assert.match(clearsThis.detail, /external system/);
-      assert.match(
+      assert.doesNotMatch(
         clearsThis.detail,
         /`npm run check-competition-template-status`/,
-        "the command must be found even though it is not quoted inline on the blocker's own description"
+        "a command found only elsewhere in the review, not on the blocker's own description, must never be attached"
       );
+      assert.match(clearsThis.detail, /check its current status yourself/);
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();
     }
   });
 
-  // wf10 review fix (2026-08-25, narrowed task-fixable blocker
-  // 57e9485f-…-1): the two tests above prove discovery from the blocker line
-  // and the SAME review round's markdown; this proves discovery from the
-  // approved PLAN (`plan.md`) when neither the blocker nor this round's
-  // review content names a command at all — the review's own complaint was
-  // that command discovery "still cannot discover a known clearing command
-  // from the plan."
-  void it("derives an external-status clearing action from a command named only in the approved plan", async () => {
+  // RC3 item 3 review fix (superseding the wf10/Step 27 behavior below): a
+  // command named only in the approved PLAN — never mentioned by the blocker
+  // itself or by this round's review — must NOT be attached either, for the
+  // same reason as the "elsewhere in the same review" case above.
+  void it("does not attach a command named only in the approved plan when the blocker itself names none", async () => {
     const store = new Map<string, string>();
     installMemStore(store);
     const surface = new RecordingSurface();
@@ -1740,11 +1863,12 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
       assert.ok(clearsThis);
       assert.match(clearsThis.detail, /external system/);
-      assert.match(
+      assert.doesNotMatch(
         clearsThis.detail,
         /`npm run check-competition-template-status`/,
-        "the command must be found in the approved plan even though neither the blocker nor this round's review names one"
+        "a command found only in the plan, not on the blocker's own description, must never be attached"
       );
+      assert.match(clearsThis.detail, /check its current status yourself/);
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();
