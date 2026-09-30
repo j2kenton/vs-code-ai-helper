@@ -92,7 +92,6 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     assert.match(html, /color: var\(--vscode-inputValidation-errorForeground\)/);
     assert.match(html, /id="error" role="alert"/);
     assert.match(html, /errorMessage/);
-    assert.match(html, /prefers-reduced-motion/);
   });
 
   void it("styles the task/stage header as a distinct title and gives user/agent messages different, theme-safe treatments", () => {

@@ -30,17 +30,17 @@
  *    never renders as "awaiting your answer" again, even though its
  *    persisted `pending` flag is never rewritten (module comment on
  *    `ChatMessage.pending`).
- *  - `busy`, `waitingForUser`, AND the view badge are all tied to an actual
- *    in-flight task operation and nothing else — each goes true/set only
- *    while a live operation justifies it and clears the moment it ends. A
+ *  - `waitingForUser` AND the view badge are both tied to an actual in-flight
+ *    task operation and nothing else — each goes true/set only while a live
+ *    operation justifies it and clears the moment it ends. A
  *    persisted-but-not-live open question/interaction/decision is real and
  *    still renders its content and answer controls unconditionally, but does
- *    not by itself assert any of the three active-posture claims (round 5,
- *    2026-08-22: the badge was the last of the three still keyed off
- *    persisted-only state after the banner was fixed in round 4).
- *  - When genuinely busy, the panel names the running stage, start time and
- *    resolved model (when known), with any incremental `busyDetail` appended;
- *    it never mistakes missing detail for missing task status.
+ *    not by itself assert either active-posture claim (round 5, 2026-08-22:
+ *    the badge was the last of them still keyed off persisted-only state
+ *    after the banner was fixed in round 4).
+ *  - Run-status text ("a round is running", "Running Implementation since
+ *    …") is never posted to the chat panel at all — that belongs to the
+ *    Tasks pane, the Notifications pane, and the status bar, not chat.
  *  - The rendered entry count always equals the persisted transcript length
  *    (no entry is ever synthesized or silently dropped).
  */
@@ -56,7 +56,6 @@ import {
   ChatInteractionServicesV1,
   ChatTarget,
   ChatViewProvider,
-  formatChatSchedulingPostureLineV1,
   notifyPendingWorkflowDecision,
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
@@ -254,8 +253,8 @@ function lastState(fake: FakeWebviewView): Record<string, unknown> | undefined {
 }
 
 /** Polls for a condition against the most recently posted "state" message —
- * `busy` flips asynchronously via `taskOperations.onDidChange` -> `render()`,
- * not synchronously with `taskOperations.begin`/`end`. */
+ * state re-renders asynchronously via `taskOperations.onDidChange` ->
+ * `render()`, not synchronously with `taskOperations.begin`/`end`. */
 async function waitForState(fake: FakeWebviewView, predicate: (state: Record<string, unknown>) => boolean): Promise<void> {
   for (let i = 0; i < 200; i++) {
     const state = lastState(fake);
@@ -265,28 +264,46 @@ async function waitForState(fake: FakeWebviewView, predicate: (state: Record<str
   throw new Error("timed out waiting for the expected state");
 }
 
-void describe("Chat With AI — stage-chat posture footer", () => {
-  void it("uses the five posture vocabulary and names the next continuation attempt", () => {
-    assert.equal(formatChatSchedulingPostureLineV1({ kind: "running" }), "running — a round is running now");
-    assert.match(
-      formatChatSchedulingPostureLineV1(
-        { kind: "scheduled", trigger: "continuation" },
-        "2026-08-28T15:20:00.000Z"
-      ),
-      /^scheduled — next attempt /
-    );
-    assert.match(
-      formatChatSchedulingPostureLineV1({
-        kind: "owedWillNotRetry",
-        blocker: "quota",
-        surfacedAt: "2026-08-28T15:00:00.000Z",
-        quarantinedFiles: [],
-        willRetry: false,
-      }),
-      /^owed-but-will-not-retry/
-    );
-    assert.match(formatChatSchedulingPostureLineV1({ kind: "waitingForYou" }), /^waiting-for-you/);
-    assert.match(formatChatSchedulingPostureLineV1({ kind: "unknown" }), /^unknown/);
+void describe("Chat With AI — no run-status is posted to the chat panel", () => {
+  void it("a posted state for a running impl-stage round carries no busy/busyText/busyDetail/schedulingPostureLine field", async () => {
+    // Run status ("a round is running", "Running Implementation since …")
+    // belongs to the Tasks pane, the Notifications pane, and the status bar
+    // — never chat. This proves the posted "state" message itself carries
+    // none of the fields that used to drive that text, even while a live,
+    // ordinarily-busy (non-waiting) operation is running.
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    let op: ReturnType<typeof taskOperations.begin> = null;
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      const postedBefore = fake.posted.filter((m) => m.type === "state").length;
+
+      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
+      assert.ok(op, "expected the exclusive operation lock to be acquired");
+      await waitForState(fake, () => fake.posted.filter((m) => m.type === "state").length > postedBefore);
+
+      const state = lastState(fake) ?? {};
+      assert.equal(Object.prototype.hasOwnProperty.call(state, "busy"), false, "no busy field");
+      assert.equal(Object.prototype.hasOwnProperty.call(state, "busyText"), false, "no busyText field");
+      assert.equal(Object.prototype.hasOwnProperty.call(state, "busyDetail"), false, "no busyDetail field");
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(state, "schedulingPostureLine"),
+        false,
+        "no schedulingPostureLine field"
+      );
+      assert.equal(state.waitingForUser, false, "a live, non-waiting operation must not assert waitingForUser");
+    } finally {
+      if (op) taskOperations.end(op);
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
   });
 });
 
@@ -1536,36 +1553,6 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("busy tracks a real in-flight task operation exactly, never a stale posture", async () => {
-    const folder = makeFolder();
-    const provider = new ChatViewProvider(makeMemento());
-    const fake = makeFakeWebviewView();
-    const notify = installNotificationRouterCapture();
-    const cmds = installExecuteCommandCapture();
-    let op: ReturnType<typeof taskOperations.begin> = null;
-    try {
-      provider.resolveWebviewView(fake.view);
-      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
-      await waitForStateMessage(fake);
-      assert.equal(lastState(fake)?.busy, false, "nothing is running yet");
-
-      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
-      assert.ok(op, "expected the exclusive operation lock to be acquired");
-      op.setModel?.("claude-code");
-      await waitForState(fake, (s) => s.busy === true);
-
-      taskOperations.end(op);
-      op = null;
-      await waitForState(fake, (s) => s.busy === false);
-    } finally {
-      if (op) taskOperations.end(op);
-      notify.restore();
-      cmds.restore();
-      provider.dispose();
-      safeRemoveDir(folder);
-    }
-  });
-
   void it("the rendered entry count always equals the persisted transcript length", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
@@ -1978,17 +1965,16 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("a persisted-only pending question shows neither active posture, but its content still renders", async () => {
-    // Complements the "busy tracks a real in-flight task operation" test:
-    // proves that a genuinely pending, durably-persisted question with ZERO
-    // live `taskOperations` entries registered asserts NEITHER active
-    // posture banner (`busy` nor `waitingForUser`) — per AC3's own text,
-    // "The chat panel cannot show a pending posture without a live
-    // in-flight transaction," and the persisted record is not itself a
-    // transaction. The question's content is still real and must still
-    // render (`awaitingAnswer` on its transcript entry) — that is what
-    // satisfies Part 4.2's "settled renders settled... with or without
-    // controls" without asserting an unbacked active posture.
+  void it("a persisted-only pending question shows no active posture, but its content still renders", async () => {
+    // Proves that a genuinely pending, durably-persisted question with ZERO
+    // live `taskOperations` entries registered asserts no active posture
+    // banner (`waitingForUser`) — per AC3's own text, "The chat panel cannot
+    // show a pending posture without a live in-flight transaction," and the
+    // persisted record is not itself a transaction. The question's content
+    // is still real and must still render (`awaitingAnswer` on its
+    // transcript entry) — that is what satisfies Part 4.2's "settled renders
+    // settled... with or without controls" without asserting an unbacked
+    // active posture.
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -2007,11 +1993,6 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const askedEntry = entries.find((e) => e.text.includes("Which way?"));
       assert.ok(askedEntry, "the question's content must still render");
       assert.equal(askedEntry.awaitingAnswer, true, "the question's content must still show as awaiting an answer");
-      assert.equal(
-        lastState(fake)?.busy,
-        false,
-        "no task operation is registered — a persisted-only pending question must never show the busy spinner"
-      );
       assert.equal(
         lastState(fake)?.waitingForUser,
         false,
@@ -2185,18 +2166,18 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("neither active posture is shown for a persisted-only record, even with all three waiting sources open at once", async () => {
+  void it("no active posture is shown for a persisted-only record, even with all three waiting sources open at once", async () => {
     // Named to answer the review's second Part 4 blocker directly (rounds
     // 3-4): "Part 4 still lacks a conforming pending-requires-inflight/
-    // explicit-unknown invariant test." This proves BOTH `busy` and
-    // `waitingForUser` — the panel's only two active-posture banners — stay
-    // false under the hardest compound case: all three persisted "someone
-    // needs to look at this" sources (question, decision, interaction) open
-    // simultaneously, zero live task operations registered throughout. If
-    // either posture were ever derived from anything but a live
-    // `taskOperations` entry, this is where it would leak true. Their
-    // content (checked in the previous test, case by case) still renders —
-    // this test only asserts the two posture booleans.
+    // explicit-unknown invariant test." This proves `waitingForUser` — the
+    // panel's one remaining active-posture banner — stays false under the
+    // hardest compound case: all three persisted "someone needs to look at
+    // this" sources (question, decision, interaction) open simultaneously,
+    // zero live task operations registered throughout. If the posture were
+    // ever derived from anything but a live `taskOperations` entry, this is
+    // where it would leak true. Their content (checked in the previous test,
+    // case by case) still renders — this test only asserts the posture
+    // boolean.
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -2234,11 +2215,6 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       );
       await waitForState(fake, (s) => (s.interactions as unknown[] | undefined)?.length === 1);
 
-      assert.equal(
-        lastState(fake)?.busy,
-        false,
-        "no live task operation is registered anywhere — busy must stay false with all three persisted sources open"
-      );
       assert.equal(
         taskOperations.getTaskOperations(folder).length,
         0,
@@ -2391,18 +2367,18 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
   });
 
   void it("item 16 (2026-09-24 review): a live, ordinarily-busy operation suppresses the isWaitingForHumanV1 badge fallback", async () => {
-    // Review-flagged: `busy` (a live, non-waiting operation) is derived
-    // independently from `targetOps`, and the fallback below previously
-    // guarded only on `!waitingForUser` — not on there being no live
-    // operation at all. A task mid-round can still carry a not-yet-updated
-    // `nextActor: "human"` in `TaskProgress` (the write that would flip it
-    // to "automation" lands with the round's own progress patch, which a
-    // still-running round has not reached yet), and this operation has not
-    // opened a round-ledger row yet either, so `isWaitingForHumanV1` alone
-    // would still read true. The busy banner and the "Waiting for you"
-    // badge must not both claim the task's state at once — mirror the tree
-    // row's own gate (`taskOperations.getTaskOperations(tKey).length === 0`)
-    // rather than `!waitingForUser` alone.
+    // Review-flagged: a live, non-waiting operation is derived independently
+    // from `targetOps`, and the fallback below previously guarded only on
+    // `!waitingForUser` — not on there being no live operation at all. A
+    // task mid-round can still carry a not-yet-updated `nextActor: "human"`
+    // in `TaskProgress` (the write that would flip it to "automation" lands
+    // with the round's own progress patch, which a still-running round has
+    // not reached yet), and this operation has not opened a round-ledger row
+    // yet either, so `isWaitingForHumanV1` alone would still read true. The
+    // running round and the "Waiting for you" badge must not both claim the
+    // task's state at once — mirror the tree row's own gate
+    // (`taskOperations.getTaskOperations(tKey).length === 0`) rather than
+    // `!waitingForUser` alone.
     const folder = makeFolder();
     writeIsWaitingForHumanFixtureProgress(folder, { status: "active", nextActor: "human" });
     const provider = new ChatViewProvider(makeMemento());
@@ -2410,20 +2386,28 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     const notify = installNotificationRouterCapture();
     const cmds = installExecuteCommandCapture();
     const realFs = installRealFs();
-    const op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
-    assert.ok(op, "expected the exclusive operation lock to be acquired");
+    let op: ReturnType<typeof taskOperations.begin> = null;
     try {
       provider.resolveWebviewView(fake.view);
       const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
       await provider.open(target);
-      await waitForState(fake, (s) => s.busy === true);
+      await waitForStateMessage(fake);
+      assert.deepEqual(
+        (fake.view as unknown as { badge?: { value: number; tooltip: string } }).badge,
+        { value: 1, tooltip: "Waiting for you" },
+        "before any operation begins, isWaitingForHumanV1 alone must light the badge"
+      );
+      const postedBefore = fake.posted.filter((m) => m.type === "state").length;
+      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
+      assert.ok(op, "expected the exclusive operation lock to be acquired");
+      await waitForState(fake, () => fake.posted.filter((m) => m.type === "state").length > postedBefore);
       assert.equal(
         (fake.view as unknown as { badge?: unknown }).badge,
         undefined,
-        "a live, ordinarily-busy operation must suppress the isWaitingForHumanV1 badge fallback"
+        "starting a live, ordinarily-busy operation must suppress the isWaitingForHumanV1 badge fallback"
       );
     } finally {
-      taskOperations.end(op);
+      if (op) taskOperations.end(op);
       realFs.restore();
       notify.restore();
       cmds.restore();
@@ -2432,101 +2416,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
-  void it("busy status names the live operation even before it reports incremental detail", async () => {
-    const folder = makeFolder();
-    const provider = new ChatViewProvider(makeMemento());
-    const fake = makeFakeWebviewView();
-    const notify = installNotificationRouterCapture();
-    const cmds = installExecuteCommandCapture();
-    let op: ReturnType<typeof taskOperations.begin> = null;
-    try {
-      provider.resolveWebviewView(fake.view);
-      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
-      await provider.open(target);
-      await waitForStateMessage(fake);
-
-      // A live, genuinely busy operation that never reports a detail:
-      // `busy` is true but `busyDetail` stays undefined so the webview falls
-      // back to the explicit no-status statement rather than implying a
-      // narrated wait that isn't happening.
-      op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
-      assert.ok(op, "expected the exclusive operation lock to be acquired");
-      op.setModel?.("claude-code");
-      await waitForState(fake, (s) => s.busy === true);
-      assert.equal(
-        lastState(fake)?.busyDetail,
-        undefined,
-        "an operation that never called report(...) must not synthesize a detail"
-      );
-      assert.match(
-        String((lastState(fake) as { busyText?: string } | undefined)?.busyText ?? ""),
-        /^Running Implementation since .* — claude-code$/,
-        "a live operation without incremental detail must name its stage, start time, and resolved model"
-      );
-
-      // The same operation reports an incremental detail: it must now
-      // surface verbatim as `busyDetail`.
-      op.report("iteration 2/3");
-      await waitForState(fake, (s) => s.busyDetail === "iteration 2/3");
-      assert.equal(lastState(fake)?.busy, true, "still busy while the detail is reported");
-
-      // Clearing the detail (report(undefined)) returns to the explicit
-      // no-status statement rather than a stale leftover detail.
-      op.report(undefined);
-      await waitForState(fake, (s) => s.busyDetail === undefined);
-      assert.equal(lastState(fake)?.busy, true, "still busy after the detail is cleared");
-
-      taskOperations.end(op);
-      op = null;
-      await waitForState(fake, (s) => s.busy === false);
-      assert.equal(
-        lastState(fake)?.busyDetail,
-        undefined,
-        "busyDetail must not survive the operation it was reported on"
-      );
-    } finally {
-      if (op) taskOperations.end(op);
-      notify.restore();
-      cmds.restore();
-      provider.dispose();
-      safeRemoveDir(folder);
-    }
-  });
-
-  void it("the webview's busy-status renderer uses the informative busyText and never claims task status is unavailable", () => {
-    // The lifecycle test above ("busyDetail renders...") only proves the
-    // `busyDetail` field on the posted "state" message is computed
-    // correctly. It never inspects the webview's rendering script, so it
-    // would keep passing even if the busy-text branch in `chatView.ts`'s
-    // `html()` (around the `bt.textContent=` assignment) regressed to a bare
-    // "Waiting for the AI…" spinner that ignores `busyDetail` entirely — the
-    // exact review-flagged gap. This asserts the STRUCTURE of the real
-    // `bt.textContent=...` assignment pulled out of the actual generated
-    // webview HTML (not a hand-duplicated copy of it): a ternary keyed on
-    // `s.busyText`, which the host derives from the live operation's stage,
-    // start time, model, and optional detail. The webview must not recreate
-    // the old plumbing-centric "no status is available" fallback.
-    const provider = new ChatViewProvider(makeMemento());
-    const fake = makeFakeWebviewView();
-    try {
-      provider.resolveWebviewView(fake.view);
-      const html = fake.view.webview.html;
-      assert.match(
-        html,
-        /bt\.textContent=s\.busyText\|\|'cannot determine what this task is doing';b\.style\.display='block';b\.title='';\}/,
-        "the webview must render the host-derived informative busy text and reserve an explicit fallback for an unresolvable live operation"
-      );
-      assert.equal(
-        html.includes("no status is available until this finishes"),
-        false,
-        "the obsolete plumbing-centric busy message must not remain in the webview"
-      );
-    } finally {
-      provider.dispose();
-    }
-  });
-
-  void it("omits activity and outcome entries from the transcript, keeps untyped ones, and places posture after the transcript", () => {
+  void it("omits activity and outcome entries from the transcript, keeps untyped ones", () => {
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
     try {
@@ -2547,10 +2437,13 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         false,
         "an untyped entry counts as conversation; absence of a kind never means activity"
       );
-      assert.ok(
-        html.indexOf('<div id="messages"') < html.indexOf('<div id="scheduling-posture"'),
-        "the scheduling posture must be a footer after the transcript"
-      );
+      for (const goneMarker of ["scheduling-posture", "busy-spinner", "s.busyText"]) {
+        assert.equal(
+          html.includes(goneMarker),
+          false,
+          `run-status plumbing ("${goneMarker}") no longer belongs in Chat With AI`
+        );
+      }
     } finally {
       provider.dispose();
     }

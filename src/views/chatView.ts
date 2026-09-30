@@ -56,13 +56,8 @@ import {
 } from "../utils/effectiveReviewProgress";
 import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
-import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
-import {
-  deriveOwedContinuationRecordV1,
-  deriveSchedulingPostureV1,
-  SchedulingIntentStoreV1,
-  SchedulingPostureV1,
-} from "../state/schedulingIntentV1";
+import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
+import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 export type { ChatMessage };
@@ -443,29 +438,6 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
     }
   }
   return awaiting;
-}
-
-/** The transcript footer is a posture, not a hand-off essay. Keep its five
- * durable states explicit so the last line always answers whether this task
- * is alive, scheduled, waiting on the user, or genuinely unknown. */
-export function formatChatSchedulingPostureLineV1(
-  posture: SchedulingPostureV1,
-  leaseUntil?: string
-): string {
-  switch (posture.kind) {
-    case "running":
-      return "running — a round is running now";
-    case "scheduled": {
-      const next = leaseUntil ? ` — next attempt ${formatTimestampForDisplay(new Date(leaseUntil))}` : "";
-      return `scheduled${next}`;
-    }
-    case "owedWillNotRetry":
-      return "owed-but-will-not-retry — a continuation is owed but will not retry automatically";
-    case "waitingForYou":
-      return "waiting-for-you — no work is running; choose the next action";
-    case "unknown":
-      return "unknown — cannot determine this task's scheduling posture";
-  }
 }
 
 /** Plain text a decision card puts on the clipboard: everything the card
@@ -2340,7 +2312,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const message = `This conversation could not be refreshed. (${reason}) What you see may be out of date.`;
       // A banner, NOT a fresh empty state: see the webview's `renderFailed`
       // handler. Anything already painted for THIS conversation — the
-      // transcript, a pending decision card, the busy banner — stays usable.
+      // transcript, a pending decision card, the waiting banner — stays usable.
       // The target travels with it so the panel can tell "this conversation
       // could not be refreshed" from "this conversation was never shown",
       // and never leaves another task's transcript on screen.
@@ -2502,28 +2474,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               .filter((d) => !this.isAnswerInFlightV1(d))
           )
         : [];
-    // Distinguish genuinely-running work from an operation that is merely
-    // parked waiting on the user's answer (round-limit pause, a pending
-    // question, etc.) — the latter must never show the busy spinner, which
-    // reads as "the computer is working, leave it alone" and is exactly
-    // backwards when it's actually this chat that's waiting on the user.
     const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
     // A trailing pending question (no reply after it yet) drives only the
     // per-message "— awaiting your answer" label further down; it plays no
-    // part in busy/waitingForUser/badge, which are derived exclusively from
-    // live `taskOperations` entries below (a persisted-only question is real
-    // and still renders with that label, but does not by itself justify an
+    // part in waitingForUser/badge, which are derived exclusively from live
+    // `taskOperations` entries below (a persisted-only question is real and
+    // still renders with that label, but does not by itself justify an
     // ACTIVE posture claim — see the block below).
     const awaitingQuestionIndices = computeAwaitingQuestionIndices(entries);
-    // `busy` and `waitingForUser` are the panel's two ACTIVE POSTURE banners
-    // (the `b` element in the webview: "Waiting for the AI…" with a spinner,
-    // or "Waiting for your answer" without one). Both are held to the exact
-    // same rule, per AC3's own text verbatim: "The chat panel cannot show a
-    // pending posture without a live in-flight transaction." Neither may ever
-    // be sourced from a persisted, potentially-stale record — only a live
-    // `taskOperations` entry can set either one, and both fall the instant
-    // that entry ends, since nothing else survives to justify an ACTIVE claim
-    // once the round that created it has finished.
+    // `waitingForUser` is the panel's one remaining ACTIVE POSTURE banner
+    // (the `b` element in the webview: "Waiting for your answer"). Run status
+    // ("a round is running", "Running Implementation since …") belongs to the
+    // Tasks pane, the Notifications pane, and the status bar — never chat —
+    // so this panel no longer computes or shows it. The waiting banner is
+    // still held to AC3's own text verbatim: "The chat panel cannot show a
+    // pending posture without a live in-flight transaction." It may never be
+    // sourced from a persisted, potentially-stale record — only a live
+    // `taskOperations` entry can set it, and it falls the instant that entry
+    // ends, since nothing else survives to justify an ACTIVE claim once the
+    // round that created it has finished.
     //
     // Review-flagged (2026-08-22, rounds 2-3): an earlier version of this
     // code also set `waitingForUser` from a persisted-but-not-live
@@ -2543,39 +2512,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // carries is real and stays visible either way, but the posture claim is
     // not.
     //
-    // `waitingForUserSource` is therefore now `"liveOperation" | undefined`
-    // only — kept as a named/verifiable source (not a bare boolean) so a
-    // future addition can't quietly reintroduce an unbacked claim without
-    // updating this type. The invariant tests in
-    // chatViewWorkflowDecision.test.ts ("waitingForUser is only ever
-    // asserted from a live operation" and "neither active posture is shown
-    // for a persisted-only record, even with all three waiting sources open
-    // at once") verify both directions: `true` only ever traces to a live
-    // `taskOperations` entry, and all three persisted-only sources — alone or
-    // combined, with zero live operations — leave both `busy` and
-    // `waitingForUser` false while their content still renders in full.
+    // `waitingForUserSource` is therefore `"liveOperation" | undefined` only
+    // — kept as a named/verifiable source (not a bare boolean) so a future
+    // addition can't quietly reintroduce an unbacked claim without updating
+    // this type. The invariant tests in chatViewWorkflowDecision.test.ts
+    // ("waitingForUser is only ever asserted from a live operation" and
+    // "neither active posture is shown for a persisted-only record, even
+    // with all three waiting sources open at once") verify both directions:
+    // `true` only ever traces to a live `taskOperations` entry, and all
+    // three persisted-only sources — alone or combined, with zero live
+    // operations — leave `waitingForUser` false while their content still
+    // renders in full.
     const waitingForUserSource: "liveOperation" | undefined = targetOps.some((op) => op.waitingForUser)
       ? "liveOperation"
       : undefined;
     const waitingForUser = waitingForUserSource !== undefined;
-    const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
-    // The operation registry is the source of task status, not the panel's
-    // optional progress-detail plumbing. A live operation always supplies a
-    // label/stage and start time; its incremental detail and resolved model
-    // enrich that statement when available. Only an impossible busy-without-
-    // operation state renders an explicit "cannot determine" admission.
-    const busyOperation = busy
-      ? [...targetOps].filter((op) => !op.waitingForUser).sort((a, b) => b.startedAt - a.startedAt)[0]
-      : undefined;
-    const busyDetail = busyOperation?.detail;
-    const busyText = !busy
-      ? undefined
-      : !busyOperation
-        ? "cannot determine what this task is doing"
-        : `Running ${busyOperation.stage ? STAGE_DISPLAY_NAMES[busyOperation.stage] : busyOperation.label} since ` +
-          `${formatTimestampForDisplay(new Date(busyOperation.startedAt))}` +
-          `${busyOperation.modelId ? ` — ${busyOperation.modelId}` : ""}` +
-          `${busyDetail ? ` — ${busyDetail}` : ""}`;
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -2593,8 +2544,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // score, and neither stage's chat shows the other's number. Both reads
     // are async, so a target switch mid-read must drop the stale append
     // rather than tagging one task's number onto another's (or the global
-    // assistant's) header — the same rule the scheduling-posture read below
-    // is already held to.
+    // assistant's) header — the same rule the progress read below is
+    // already held to.
     //
     // 2026-09-06 review, completion blocker: this previously omitted the
     // review score entirely ("that stays on the review row alone"), which
@@ -2726,34 +2677,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ...formatDisplayTimestampPairV1(interaction.postedAt),
       copyText: buildInteractionCopyTextV1(interaction),
     }));
-    // "What happens next" — the chat panel's half of the always-present
-    // scheduling posture (task "Actionable Hand-offs", PART 6; the task-tree
-    // tooltip built in `taskTreeProvider.ts`'s `computeSchedulingPosture` is
-    // the other, structurally identical half). A failure deriving/rendering
-    // the posture must still render the contract's explicit-unknown line
-    // (review-flagged 2026-08-23: this used to leave the line unset on any
-    // exception, which the webview then hides entirely — silence, not the
-    // required "unknown" statement, exactly the "absence is never positive
-    // evidence" defect this contract exists to prevent).
-    let schedulingPostureLine: string | undefined;
-    // Hoisted out of the try block below so the badge (further down, after
-    // this block) can apply the same item-16 `isWaitingForHumanV1` fallback
-    // the footer line applies — `progress` itself stays block-scoped to the
-    // read that produced it. Left `undefined` for the global assistant, and
-    // for any render whose progress read failed or never ran, so the badge
-    // fallback only ever fires from a real, freshly read `TaskProgress`.
+    // The ledger read/write below still runs for the global assistant's
+    // consumers elsewhere (task tree, status bar): `recordOwedContinuation`
+    // keeps their "what happens next" surfaces fresh even though this panel
+    // no longer renders a scheduling-posture line of its own — that line,
+    // and the busy banner it accompanied, moved to the Tasks pane, the
+    // Notifications pane, and the status bar, which is where run status
+    // belongs. `progressForBadgeFallback` is hoisted out of the try block so
+    // the badge (further down) can apply the same item-16
+    // `isWaitingForHumanV1` fallback — left `undefined` for the global
+    // assistant, and for any render whose progress read failed or never ran,
+    // so the badge fallback only ever fires from a real, freshly read
+    // `TaskProgress`.
     let progressForBadgeFallback: TaskProgress | undefined;
     if (target && target.kind !== "global") {
+      // This ledger write is best-effort for OTHER panes' consumption (task
+      // tree, status bar) — it is not this panel's own render contract, so a
+      // rejection here (e.g. a `Memento.update` failure) must not abort this
+      // render and drop the transcript/state update behind the outer
+      // `renderFailed` fallback (2026-09-29 review). Swallow locally and
+      // leave the badge fallback unavailable for this render instead.
       try {
         const progressResult = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
-        // A failed/unreadable progress read is NOT evidence that no
-        // continuation is owed (review-flagged 2026-08-23) — it means this
-        // render cannot establish that fact at all, so it must not feed
-        // `owedContinuation: undefined` into the posture (which would read as
-        // a positive "nothing owed" and could fall through to the false
-        // `waitingForYou` posture). `owedContinuationUnknown` forces the
-        // explicit `unknown` fallback instead whenever the read did not
-        // succeed.
         const progress = progressResult.ok ? progressResult.decoded.progress : undefined;
         progressForBadgeFallback = progress;
         const owedSource = progress?.implRecovery
@@ -2765,49 +2710,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               dispatch: progress.implRecovery.dispatch,
             }
           : undefined;
-        // PART 6.5 (review-flagged 2026-08-23, resolved this round): every
-        // `implRecovery` mutation site now pushes through
+        // PART 6.5: every `implRecovery` mutation site pushes through
         // `syncOwedContinuationLedgerBestEffortV1` right after its own CAS
         // resolves (see `schedulingIntentV1.ts`'s `OwedContinuationRecordV1`
-        // doc comment for the full nine-site inventory) — the ledger is no
-        // longer a "some sites missing" degraded fallback. This render still
+        // doc comment for the full nine-site inventory) — this render still
         // performs its own fresh `TaskProgress` read (the one piece no other
         // site can substitute for: a DIFFERENT window's direct file mutation,
         // or a process that died between committing the CAS and running its
-        // ledger push) and writes it through here, but posture is now
-        // DERIVED FROM THE LEDGER's own read-back — never from `owedSource`
-        // directly — so this satisfies AC5's "rendered only from the ledger"
-        // contract while staying exactly as fresh as a live read (the
-        // ledger's value IS this read, one line earlier).
+        // ledger push) and writes it through here so the ledger's other
+        // consumers stay current.
         if (progressResult.ok) {
           await this.schedulingIntentStore.recordOwedContinuation(target.canonicalId, owedSource);
         }
-        const ledgerOwedSource = this.schedulingIntentStore.getOwedContinuation(target.canonicalId);
-        // A failed/unreadable progress read cannot establish the fact live —
-        // the ledger's last-recorded value (from this window's own most
-        // recent successful push, at this render or at any mutation site) is
-        // still positive evidence and is preferred over forcing `unknown`;
-        // only a ledger that has NEVER recorded anything for this task
-        // degrades to `unknown` via `owedContinuationUnknown` below.
-        const posture = withWaitingForHumanFallbackV1(
-          deriveSchedulingPostureV1({
-            entries: this.schedulingIntentStore.listForTask(target.canonicalId),
-            owedContinuation: deriveOwedContinuationRecordV1(target.canonicalId, ledgerOwedSource),
-            hasCoverage: this.schedulingIntentStore.hasCoverage(target.canonicalId),
-            inFlight: taskOperations.hasRootOperationForTask(target.canonicalId),
-            owedContinuationUnknown: !progressResult.ok && ledgerOwedSource === undefined,
-          }),
-          progress
-        );
-        schedulingPostureLine = formatChatSchedulingPostureLineV1(posture, progress?.implRecovery?.leaseUntil);
-      } catch {
-        // A failure deriving the posture is exactly the "cannot establish
-        // the fact" case the `unknown` posture exists for — never silence,
-        // never a guess at `waitingForYou`/`running`.
-        schedulingPostureLine = formatChatSchedulingPostureLineV1({ kind: "unknown" });
+      } catch (error) {
+        console.error("Ensemble chat panel could not refresh the owed-continuation ledger", error);
+        progressForBadgeFallback = undefined;
       }
       // The progress read above is async: a target switch mid-read must drop
-      // this stale render rather than painting one task's scheduling posture
+      // this stale render rather than painting one task's badge fallback
       // into another's (or the global assistant's) header — same rule the
       // transcript read above is already held to.
       if (!sameRenderTarget(target, this.target)) return;
@@ -2819,27 +2739,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // on a different widget, so it is held to the identical AC3 rule: only a
     // live `taskOperations` entry, OR item 16's `isWaitingForHumanV1` (the
     // register's "a task whose nextActor is human shows that where the user
-    // looks", implemented via `withWaitingForHumanFallbackV1` for the tree
-    // row/status bar/footer line above), may justify it. The latter is not
-    // the leak AC3's rework removed: it is not "any unresolved chat record",
-    // it is a narrower, independently-grounded fact read fresh from
-    // `TaskProgress` itself — `status === "active"`, `nextActor === "human"`,
-    // and nothing owed, scheduled or already running — so a pending
-    // question, open interaction, or pending decision with no live operation
-    // and no such task-level fact behind it still does not light this badge.
+    // looks", implemented for the tree row/status bar above), may justify
+    // it. The latter is not the leak AC3's rework removed: it is not "any
+    // unresolved chat record", it is a narrower, independently-grounded fact
+    // read fresh from `TaskProgress` itself — `status === "active"`,
+    // `nextActor === "human"`, and nothing owed, scheduled or already
+    // running — so a pending question, open interaction, or pending
+    // decision with no live operation and no such task-level fact behind it
+    // still does not light this badge.
     //
-    // 2026-09-24 review: `busy` (a live, non-waiting operation) is derived
-    // independently from `targetOps` above and was not excluded here — only
-    // `!waitingForUser` was checked — so a task with a live, ordinarily busy
-    // operation (one that has not yet, or never will, open a round-ledger
-    // row, which is what `isWaitingForHumanV1` itself checks) could still
-    // read `nextActor: human` from a not-yet-updated `TaskProgress` and light
-    // "Waiting for you" while the busy banner was also showing. The tree
-    // row's own use of this same fact (`taskTreeProvider.ts`, `StageNode`)
-    // gates it on there being no live operation for the task at all
-    // (`taskOperations.getTaskOperations(tKey).length === 0`); mirror that
-    // here via `targetOps`, the chat panel's equivalent list, rather than
-    // `!waitingForUser` alone.
+    // 2026-09-24 review: a live, non-waiting operation must suppress this
+    // fallback — a task with a live, ordinarily busy operation (one that has
+    // not yet, or never will, open a round-ledger row, which is what
+    // `isWaitingForHumanV1` itself checks) could still read
+    // `nextActor: human` from a not-yet-updated `TaskProgress` and light
+    // "Waiting for you" while the round was, in fact, still running. The
+    // tree row's own use of this same fact (`taskTreeProvider.ts`,
+    // `StageNode`) gates it on there being no live operation for the task at
+    // all (`taskOperations.getTaskOperations(tKey).length === 0`); mirror
+    // that here via `targetOps`, the chat panel's equivalent list.
     if (this.view) {
       const waitingForYouFallback =
         targetOps.length === 0 &&
@@ -2855,14 +2773,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       type: "state",
       target: this.target,
       label,
-      schedulingPostureLine,
       entries: displayEntries,
       timeline: buildChatTimelineV1(displayEntries, displayDecisions),
       interactions: displayInteractions,
       decisions: displayDecisions,
-      busy,
-      busyDetail,
-      busyText,
       waitingForUser,
       waitingForUserSource,
       errorMessage,
@@ -2904,15 +2818,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: 0 0 var(--ensemble-space-3);
           padding-bottom: var(--ensemble-space-2);
           border-bottom: var(--ensemble-border-width) solid var(--vscode-panel-border);
-        }
-        #scheduling-posture {
-          color: var(--ensemble-info-foreground);
-          font-size: 0.9em;
-          margin: 0 0 var(--ensemble-space-3);
-          display: none;
-        }
-        #scheduling-posture.visible {
-          display: block;
         }
         #messages {
           margin: 0 0 var(--ensemble-space-2);
@@ -2966,25 +2871,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           color: var(--vscode-editor-foreground);
           background-color: var(--vscode-sideBar-background);
           border: none;
-        }
-        .spinner {
-          display: inline-block;
-          width: 1em;
-          height: 1em;
-          border: var(--ensemble-focus-width) solid currentColor;
-          border-right-color: transparent;
-          border-radius: 50%;
-          animation: spin 1s linear infinite;
-          vertical-align: text-bottom;
-          margin-right: 0.5em;
-        }
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        @media (prefers-reduced-motion: reduce) {
-          .spinner {
-            animation: none;
-          }
         }
         #busy-indicator {
           display: none;
@@ -3128,15 +3014,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
       </style>
       </head><body>
-      <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div><div id="scheduling-posture" role="status"></div>
+      <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="interaction" role="form" aria-label="Question from the AI"></div>
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
-      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">No task is running.</span></div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
       <div id="steering-note" role="note">Messages here are not passed to the next round. To change what a round does, edit <code>plan-final.md</code> &mdash; rounds read it.</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), sp=document.getElementById('scheduling-posture'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -3453,7 +3339,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         // A failed paint is a BANNER over whatever is already on screen, not a
         // new state: the empty state it used to send removed the transcript,
-        // the busy banner and any pending decision card, so a round that was
+        // the waiting banner and any pending decision card, so a round that was
         // waiting on an answer could no longer be answered from here
         // (verification review, 2026-09-18).
         if(s.type==='renderFailed'){
@@ -3469,7 +3355,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             // (verification review, 2026-09-18).
             m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);
             en.textContent='';en.style.display='none';
-            b.style.display='none';bs.style.display='none';
+            b.style.display='none';
             c.textContent=s.label??'Chat';
             currentKey=failedKey;
             e.textContent=s.unpaintedMessage??s.errorMessage??'';
@@ -3484,7 +3370,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
         sn.style.display=(s.target&&s.target.kind!=='global')?'block':'none';
-        sp.textContent=s.schedulingPostureLine??'';sp.classList.toggle('visible',!!s.schedulingPostureLine);
         function renderMessage(x){
           const row=document.createElement('div');row.className='msg-row';
           const meta=buildMsgMeta(x.text,x.atLabel,x.atTitle);
@@ -3540,9 +3425,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         renderInteractions(s.interactions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
-        if(s.busy){bs.style.display='inline-block';bt.textContent=s.busyText||'cannot determine what this task is doing';b.style.display='block';b.title='';}
-        else if(s.waitingForUser){
-          bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';
+        if(s.waitingForUser){
+          bt.textContent='Waiting for your answer';b.style.display='block';
           b.title=s.waitingForUserSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
         }
         else{b.style.display='none';b.title='';}

@@ -14,6 +14,7 @@ All notable changes to Ensemble (formerly VS Code AI Helper) are documented here
 
 - **Helper text is fully readable in both themes.** Informational blocks are black on light themes and white on dark; disabled text uses the muted grey they used to have (no more opacity fade). The "What happens next" sentence in the task and status-bar hovers follows the same rule and re-colours when the theme changes.
 - **The Commit and Push button's tooltip reads just "Commit and Push"** — the shortcut still works, it is no longer advertised.
+- **Chat With AI no longer shows run status.** The busy banner ("Running Implementation since …") and the "What happens next" scheduling-posture footer ("running — a round is running now") are gone from the chat panel — that is operational status, not conversation. Progress remains visible in the Tasks pane, the Notifications pane, and the status bar; chat still shows a "Waiting for your answer" banner when a round is genuinely paused on you.
 
 ### Removed
 
