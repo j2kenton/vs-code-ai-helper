@@ -573,6 +573,18 @@ void describe("getAvailableModels", () => {
             ["max", "Max"],
           ]),
           {
+            id: "claude-cli:claude-sonnet-5-5",
+            name: "Sonnet 5.5",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants("claude-sonnet-5-5", "Sonnet 5.5", [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ]),
+          {
             id: "claude-cli:claude-fable-5-1",
             name: "Fable 5.1",
             providerLabel: "Claude Code (subscription CLI)",
@@ -1807,6 +1819,28 @@ void describe("GPT-6 / Opus 5.5 listed entries validate against the provider lad
     }
     const baseArgs = claude.buildArgs("text", "claude-opus-5-5");
     assert.strictEqual(baseArgs[baseArgs.indexOf("--model") + 1], "claude-opus-5-5");
+  });
+
+  void it("lists Claude Sonnet 5.5 with exactly low..max and sends each level via --effort", async () => {
+    const ids = await seededPickerIds("claude");
+    assert.ok(ids.includes("claude-cli:claude-sonnet-5-5"), "expected the base Sonnet 5.5 entry");
+    const ladder = ["low", "medium", "high", "xhigh", "max"];
+    assert.deepStrictEqual(ladderOf(ids, "claude-cli:claude-sonnet-5-5"), ladder);
+    const claude = getCliProvider("claude-cli");
+    assert.ok(claude, "expected the claude-cli provider");
+    for (const level of ladder) {
+      const args = claude.buildArgs("text", `claude-sonnet-5-5@${level}`);
+      assert.strictEqual(args[args.indexOf("--model") + 1], "claude-sonnet-5-5", level);
+      assert.strictEqual(args[args.indexOf("--effort") + 1], level, level);
+      assert.ok(!args.includes("--max-thinking-tokens"), `${level} must not set a token budget`);
+    }
+    for (const bad of ["none", "ultra", "minimal", "turbo"]) {
+      assert.throws(() => claude.buildArgs("text", `claude-sonnet-5-5@${bad}`), Error, bad);
+    }
+    const baseArgs = claude.buildArgs("text", "claude-sonnet-5-5");
+    assert.strictEqual(baseArgs[baseArgs.indexOf("--model") + 1], "claude-sonnet-5-5");
+    assert.ok(!baseArgs.includes("--effort"));
+    assert.ok(!baseArgs.includes("--max-thinking-tokens"));
   });
 
   void it("validates OpenCode Zen Opus 5.5 / GPT-6 variants against each model's own ladder", async () => {

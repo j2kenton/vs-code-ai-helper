@@ -483,8 +483,8 @@ void describe("automatic managed .gitignore maintenance", () => {
       assert.doesNotMatch(written, /chat-v1/);
       assert.deepEqual(
         state.get("ensemble.autoGitIgnoreApplied"),
-        { [gateKeyFor(repoRoot)]: ".ensemble" },
-        "the applied root is recorded per workspace folder so activation does not re-fight a manual edit"
+        { [gateKeyFor(repoRoot)]: "v2:.ensemble" },
+        "the applied root is recorded per workspace folder, under the versioned gate value, so activation does not re-fight a manual edit"
       );
     } finally {
       writeBridge.restore();
@@ -494,22 +494,20 @@ void describe("automatic managed .gitignore maintenance", () => {
     }
   });
 
-  void it("is a no-op once applied for the active root, even if the user hand-edited the file", async () => {
+  void it("is a no-op once applied for the active root under the current gate version, even if the user hand-edited the file", async () => {
     const repoRoot = makeGitFixture();
     const configStub = installConfigStub();
     const ws = installWorkspaceFoldersStub(repoRoot);
     const writeBridge = installWriteFileBridge();
     const { context, state } = makeContext();
-    // Legacy bare-string gate format (pre multi-root): it only ever targeted
-    // the first workspace folder and must still be honored for it.
-    state.set("ensemble.autoGitIgnoreApplied", ".ensemble");
+    state.set("ensemble.autoGitIgnoreApplied", { [gateKeyFor(repoRoot)]: "v2:.ensemble" });
 
     try {
       await ensureAutomaticMetaGitIgnore(context);
       assert.equal(
         fs.existsSync(path.join(repoRoot, ".gitignore")),
         false,
-        "a recorded application for the active root must not write again"
+        "a recorded application for the active root under the current gate version must not write again"
       );
     } finally {
       writeBridge.restore();
@@ -577,9 +575,9 @@ void describe("automatic managed .gitignore maintenance", () => {
         state.get("ensemble.autoGitIgnoreApplied"),
         {
           [gateKeyFor(firstRepo)]: ".ensemble",
-          [gateKeyFor(secondRepo)]: ".ensemble",
+          [gateKeyFor(secondRepo)]: "v2:.ensemble",
         },
-        "the legacy first-folder record must be preserved and the second folder recorded alongside it"
+        "the legacy first-folder record must be preserved untouched, and the freshly-applied second folder recorded under the versioned gate value"
       );
 
       // A second run for the same folder is gated off (record format).
@@ -596,6 +594,132 @@ void describe("automatic managed .gitignore maintenance", () => {
       configStub.restore();
       safeRemoveDir(firstRepo);
       safeRemoveDir(secondRepo);
+    }
+  });
+
+  void it("writes only the /.ensemble/ pattern when no artifacts/helper folder exists on disk", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context } = makeContext();
+
+    try {
+      await ensureAutomaticMetaGitIgnore(context);
+      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      const rootPatternLines = written
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("/"));
+      assert.deepEqual(rootPatternLines, ["/.ensemble/"]);
+    } finally {
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("still writes /artifacts/helper/ exactly once when that folder exists on disk", async () => {
+    const repoRoot = makeGitFixture();
+    fs.mkdirSync(path.join(repoRoot, "artifacts", "helper"), { recursive: true });
+    const configStub = installConfigStub();
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context } = makeContext();
+
+    try {
+      await ensureAutomaticMetaGitIgnore(context);
+      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      const lines = written.split(/\r?\n/).map((line) => line.trim());
+      const occurrences = lines.filter((line) => line === "/artifacts/helper/").length;
+      assert.equal(occurrences, 1, `expected "/artifacts/helper/" exactly once, got ${occurrences}:\n${written}`);
+      assert.match(written, /\/\.ensemble\//);
+    } finally {
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("rewrites an old-build's block to drop the stale /artifacts/helper/ pattern exactly once, then gates again under the new version", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context, state } = makeContext();
+
+    // Simulate a pre-trim build's on-disk state: the old (unversioned) gate
+    // value, and the four-pattern managed block older builds wrote
+    // unconditionally — /artifacts/helper/ (even though the folder does not
+    // exist here) plus the two chat-v1 transcript patterns that are now
+    // redundant under /.ensemble/ and dropped by isCoveredByIgnoredRoot.
+    state.set("ensemble.autoGitIgnoreApplied", { [gateKeyFor(repoRoot)]: ".ensemble" });
+    const oldBlock = [
+      "# BEGIN Ensemble managed meta resources",
+      "# Managed by Ensemble. Do not edit this block manually.",
+      "/artifacts/helper/",
+      "/.ensemble/",
+      "/.ensemble/**/chat-v1.json",
+      "/.ensemble/**/chat-v1.corrupt.json",
+      "# END Ensemble managed meta resources",
+      "",
+    ].join("\n");
+    fs.writeFileSync(path.join(repoRoot, ".gitignore"), oldBlock);
+
+    try {
+      await ensureAutomaticMetaGitIgnore(context);
+      const rewritten = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      assert.doesNotMatch(
+        rewritten,
+        /\/artifacts\/helper\//,
+        "the stale pattern is dropped once the folder is confirmed absent"
+      );
+      assert.doesNotMatch(
+        rewritten,
+        /chat-v1/,
+        "the chat-v1 transcript patterns are dropped as redundant under /.ensemble/"
+      );
+      assert.match(rewritten, /\/\.ensemble\//);
+      assert.deepEqual(
+        state.get("ensemble.autoGitIgnoreApplied"),
+        { [gateKeyFor(repoRoot)]: "v2:.ensemble" },
+        "the gate is re-stamped under the new version after the one-time rewrite"
+      );
+
+      await ensureAutomaticMetaGitIgnore(context);
+      const afterSecondCall = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      assert.equal(afterSecondCall, rewritten, "gated again once stamped under the new version");
+    } finally {
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("does not re-check artifacts/helper once gated under the current version, even if the folder appears afterward", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context, state } = makeContext();
+    state.set("ensemble.autoGitIgnoreApplied", { [gateKeyFor(repoRoot)]: "v2:.ensemble" });
+
+    try {
+      fs.mkdirSync(path.join(repoRoot, "artifacts", "helper"), { recursive: true });
+      await ensureAutomaticMetaGitIgnore(context);
+      assert.equal(
+        fs.existsSync(path.join(repoRoot, ".gitignore")),
+        false,
+        "the gate is keyed by task root alone; a folder appearing after the gate is stamped is intentionally not re-checked"
+      );
+    } finally {
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
+      safeRemoveDir(repoRoot);
     }
   });
 });

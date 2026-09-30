@@ -678,6 +678,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
+    { model: "claude-sonnet-5-5", name: "Sonnet 5.5" },
+    ...createVariants("claude-sonnet-5-5", "Sonnet 5.5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
     { model: "claude-fable-5-1", name: "Fable 5.1" },
     ...createVariants("claude-fable-5-1", "Fable 5.1", [
       ["low", "Low"],

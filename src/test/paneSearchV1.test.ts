@@ -266,4 +266,46 @@ void describe("pane search — package.json manifest", () => {
       if (contextKey) assert.ok(entry.when?.includes(contextKey), `${id} is gated on ${contextKey}`);
     }
   });
+
+  function navOrder(command: string): number {
+    const entry = titleBar.find((e) => e.command === command);
+    assert.ok(entry, `${command} has a view/title entry`);
+    const match = entry.group?.match(/^navigation@(\d+)$/);
+    assert.ok(match, `${command} declares a numeric navigation order`);
+    return Number(match[1]);
+  }
+
+  void it("places each pane's clear-search entry immediately after its search entry, with nothing between", () => {
+    const pairs: Array<[string, string]> = [
+      ["vs-code-ai-helper.searchTasks", "vs-code-ai-helper.clearTasksSearch"],
+      ["vs-code-ai-helper.searchNotifications", "vs-code-ai-helper.clearNotificationsSearch"],
+    ];
+    for (const [searchCommand, clearCommand] of pairs) {
+      const searchOrder = navOrder(searchCommand);
+      const clearOrder = navOrder(clearCommand);
+      assert.ok(clearOrder > searchOrder, `${clearCommand} sits after ${searchCommand}`);
+      const between = titleBar.filter((e) => {
+        const match = e.group?.match(/^navigation@(\d+)$/);
+        if (!match) {
+          return false;
+        }
+        const order = Number(match[1]);
+        return order > searchOrder && order < clearOrder;
+      });
+      assert.deepEqual(between, [], `nothing sits between ${searchCommand} and ${clearCommand}`);
+    }
+  });
+
+  void it("gives clearTasksSearch a clear-search icon, distinct from the generic close icon", () => {
+    const entry = manifest.contributes.commands.find((c) => c.command === "vs-code-ai-helper.clearTasksSearch") as
+      | (Entry & { icon?: string })
+      | undefined;
+    assert.equal(entry?.icon, "$(search-stop)");
+  });
+
+  void it("keeps openGeneralAssistant in the Tasks view title menu", () => {
+    const entry = titleBar.find((e) => e.command === "vs-code-ai-helper.openGeneralAssistant");
+    assert.ok(entry, "openGeneralAssistant still has a view/title entry");
+    assert.ok(entry.when?.includes("view == vs-code-ai-helper.tasksView"), "openGeneralAssistant still targets the Tasks view");
+  });
 });

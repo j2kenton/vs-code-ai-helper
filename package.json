@@ -252,7 +252,7 @@
         "command": "vs-code-ai-helper.clearTasksSearch",
         "title": "Clear Tasks Search",
         "category": "Ensemble",
-        "icon": "$(close)"
+        "icon": "$(search-stop)"
       },
       {
         "command": "vs-code-ai-helper.searchNotifications",
@@ -638,7 +638,7 @@
         {
           "command": "vs-code-ai-helper.openGeneralAssistant",
           "when": "view == vs-code-ai-helper.tasksView",
-          "group": "navigation@6"
+          "group": "navigation@7"
         },
         {
           "command": "vs-code-ai-helper.filterTasksByStatus",
@@ -653,7 +653,7 @@
         {
           "command": "vs-code-ai-helper.clearTasksSearch",
           "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.tasksSearchActive",
-          "group": "navigation@7"
+          "group": "navigation@6"
         },
         {
           "command": "vs-code-ai-helper.expandAllTasks",

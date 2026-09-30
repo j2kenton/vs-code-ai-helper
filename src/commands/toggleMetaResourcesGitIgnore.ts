@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
 import * as cp from "child_process";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
@@ -465,13 +466,28 @@ async function resolveTarget(
   const configuredPattern = configuredTaskRootPath
     ? toGitignorePattern(repoRoot, configuredTaskRootPath)
     : undefined;
+  // /artifacts/helper/ is dogfood-only scaffolding: only worth ignoring when
+  // it actually exists on disk (an older build, or a dogfooding checkout,
+  // left it behind), not written unconditionally into every repo's
+  // .gitignore. This check is a one-shot existence probe at write time, not
+  // a standing watch — ensureAutomaticMetaGitIgnore's gate is keyed by task
+  // root alone, so an artifacts/helper folder that appears AFTER the gate is
+  // already stamped for that root is intentionally not re-checked; it is
+  // picked up only the next time the gate is invalidated (e.g. by a task
+  // root change, or by the one-time versioned-gate rewrite below).
+  const artifactsHelperExists = fs.existsSync(path.join(repoRoot, ARTIFACTS_ROOT));
   // Both entries describe workspace-level roots. Task plans may be relocated
   // through settings, while artifacts always remain under /artifacts/helper/.
   // Neither pattern is task-specific. Dedupe: if the configured task root
   // resolves to the same path as the artifacts root, the two entries above
   // collapse to one pattern — without this, the managed block would render
   // that pattern twice (renderManagedBlock does not dedupe its input).
-  const patterns = [...new Set(["/artifacts/helper/", configuredPattern ?? "/plans/"])];
+  const patterns = [
+    ...new Set([
+      ...(artifactsHelperExists ? ["/artifacts/helper/"] : []),
+      configuredPattern ?? "/plans/",
+    ]),
+  ];
   const taskRootPattern = configuredPattern ?? "/plans/";
 
   return {
@@ -529,6 +545,18 @@ function toGateKey(fsPath: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+/**
+ * Bumped whenever a change to what the managed block writes (e.g. dropping
+ * an unconditional pattern) needs every already-gated folder to be rewritten
+ * once. A stored gate value from a prior version never matches
+ * `${GATE_VALUE_VERSION}:<activeRoot>`, so ensureAutomaticMetaGitIgnore
+ * rewrites the block exactly once and re-stamps the gate under the new
+ * version — after that it is a no-op again, same as before. The gate stays
+ * keyed by task root alone; it is not re-invalidated by unrelated disk state
+ * (e.g. an artifacts/helper folder appearing after the rewrite already ran).
+ */
+const GATE_VALUE_VERSION = "v2";
+
 export async function ensureAutomaticMetaGitIgnore(
   context: vscode.ExtensionContext,
   workspace?: vscode.WorkspaceFolder
@@ -559,12 +587,13 @@ export async function ensureAutomaticMetaGitIgnore(
 
   const gateKey = toGateKey(targetWorkspace.uri.fsPath);
   const activeRoot = getConfiguredTaskRoot();
-  if (appliedByFolder[gateKey] === activeRoot) {
+  const gateValue = `${GATE_VALUE_VERSION}:${activeRoot}`;
+  if (appliedByFolder[gateKey] === gateValue) {
     return;
   }
   const applied = await applyAutomaticMetaGitIgnore(targetWorkspace);
   if (applied) {
-    appliedByFolder[gateKey] = activeRoot;
+    appliedByFolder[gateKey] = gateValue;
     await context.workspaceState.update(APPLIED_KEY, appliedByFolder);
   }
 }
