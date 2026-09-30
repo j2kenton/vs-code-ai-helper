@@ -951,6 +951,23 @@ void describe("provider CLI contracts", () => {
     // (an unnoticed downgrade from the requested reasoning level).
     assert.throws(() => claude.buildArgs("text", "claude-opus-5-5@turbo"));
 
+    // Sonnet 5.5 is the one Claude model sent by name via --effort.
+    assert.deepStrictEqual(claude.buildArgs("text", "claude-sonnet-5-5@xhigh"), [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--permission-mode",
+      "plan",
+      "--append-system-prompt",
+      CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
+      "--model",
+      "claude-sonnet-5-5",
+      "--effort",
+      "xhigh",
+    ]);
+    assert.throws(() => claude.buildArgs("text", "claude-sonnet-5-5@turbo"));
+
     assert.strictEqual(claude.structuredEventStream, "claude");
   });
 

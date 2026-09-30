@@ -563,6 +563,13 @@ const CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS = new Map<
   ["max", 32768],
 ]);
 
+// Claude CLI base ids whose reasoning level is sent by name via `--effort`.
+// Owner probes 2026-09-30 (claude 2.1.283): `--effort` low/medium/high/xhigh/max
+// are accepted for claude-sonnet-5-5, `--max-thinking-tokens` is no longer
+// listed in `claude --help`, and the CLI ignores an unknown `--effort` value
+// with a warning instead of rejecting it, so the level is validated here.
+const CLAUDE_EFFORT_FLAG_MODELS = new Set<string>(["claude-sonnet-5-5"]);
+
 export interface ParsedCodexModelSelection {
   model: string | undefined;
   reasoningEffort: string | undefined;
@@ -663,6 +670,7 @@ export function parseCopilotModelSelection(
 interface ParsedClaudeCliModelSelection {
   model: string | undefined;
   maxThinkingTokens: number | undefined;
+  effort?: string;
 }
 
 function parseClaudeCliModelSelection(
@@ -679,6 +687,16 @@ function parseClaudeCliModelSelection(
 
   const maxThinkingTokens =
     CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS.get(split.suffix);
+  if (
+    maxThinkingTokens !== undefined &&
+    CLAUDE_EFFORT_FLAG_MODELS.has(split.model)
+  ) {
+    return {
+      model: split.model,
+      maxThinkingTokens: undefined,
+      effort: split.suffix,
+    };
+  }
   if (maxThinkingTokens === undefined) {
     // Reject closed, mirroring parseCodexModelSelection's contract: an
     // unrecognized suffix must never reach the CLI as a literal
@@ -1141,6 +1159,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       }
       if (parsedModel.model) {
         args.push("--model", parsedModel.model);
+      }
+      if (parsedModel.effort !== undefined) {
+        args.push("--effort", parsedModel.effort);
       }
       if (parsedModel.maxThinkingTokens !== undefined) {
         args.push(
