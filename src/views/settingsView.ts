@@ -8,7 +8,8 @@ import {
 import {
   getModelSettings,
   getEnabledProviders,
-  isProviderAccountActionsEnabled,
+  isProviderSignInButtonsEnabled,
+  isProviderUsageButtonsEnabled,
   isUnsavedSettingsWarningEnabled,
   setEnabledProviders,
   setModelSettings,
@@ -490,7 +491,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stageHints: STAGE_ROLE_HINTS,
       enabledProviders: getEnabledProviders(),
       providers: this._buildProviderViewModels(),
-      showProviderAccountActions: isProviderAccountActionsEnabled(),
+      showProviderSignInButtons: isProviderSignInButtonsEnabled(),
+      showProviderUsageButtons: isProviderUsageButtonsEnabled(),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
     });
   }
@@ -546,7 +548,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       models,
       enabledProviders: getEnabledProviders(),
       providers: this._buildProviderViewModels(),
-      showProviderAccountActions: isProviderAccountActionsEnabled(),
+      showProviderSignInButtons: isProviderSignInButtonsEnabled(),
+      showProviderUsageButtons: isProviderUsageButtonsEnabled(),
     });
   }
 
@@ -954,7 +957,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let providers = [];
           let stageTitleOverrides = {};
           let stageHints = {};
-          let showProviderAccountActions = false;
+          let showProviderSignInButtons = false;
+          let showProviderUsageButtons = false;
           let warnUnsavedSettings = true;
           let formDirty = false;
           let initialized = false;
@@ -1111,7 +1115,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers = message.providers || [];
               stageTitleOverrides = message.stageTitleOverrides || {};
               stageHints = message.stageHints || {};
-              showProviderAccountActions = message.showProviderAccountActions === true;
+              showProviderSignInButtons = message.showProviderSignInButtons === true;
+              showProviderUsageButtons = message.showProviderUsageButtons === true;
               warnUnsavedSettings = message.warnUnsavedSettings !== false;
 
               // Restore a draft preserved across a webview disposal.
@@ -1153,8 +1158,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers = message.providers || [];
               enabledProviders = message.enabledProviders || {};
               availableModels = message.models || [];
-              if (typeof message.showProviderAccountActions === 'boolean') {
-                showProviderAccountActions = message.showProviderAccountActions;
+              if (typeof message.showProviderSignInButtons === 'boolean') {
+                showProviderSignInButtons = message.showProviderSignInButtons;
+              }
+              if (typeof message.showProviderUsageButtons === 'boolean') {
+                showProviderUsageButtons = message.showProviderUsageButtons;
               }
               renderProviderSelection();
               if (!formDirty) {
@@ -1657,13 +1665,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers.map(provider =>
                 '<div class="provider-row">' +
                 '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (isProviderChecked(provider.id) ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
-                // The account-action buttons are hidden unless the
-                // ensemble.showProviderAccountActions setting (VS Code
-                // settings UI, default off) enables them. The enable
-                // checkbox, save button, and permission warning always render.
-                (showProviderAccountActions
-                  ? '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
-                    (provider.usageEnabled
+                // The Sign in / Switch account button is hidden unless the
+                // ensemble.showProviderSignInButtons setting (VS Code
+                // settings UI, default off) enables it; the Check usage
+                // button is gated independently by
+                // ensemble.showProviderUsageButtons. The enable checkbox,
+                // save button, and permission warning always render.
+                (showProviderSignInButtons
+                  ? '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>'
+                  : '') +
+                (showProviderUsageButtons
+                  ? (provider.usageEnabled
                       ? '<button type="button" class="secondary provider-usage" data-usage-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>'
                       : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>')
                   : '') +

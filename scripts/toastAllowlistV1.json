@@ -35,7 +35,7 @@
     },
     {
       "file": "src/extension.ts",
-      "line": 2047,
+      "line": 2050,
       "reason": "Activation-time recovery for an interrupted revert-journal swap found on disk — the plan's own named example of an expected allow-list entry ('revert-journal restore'). Resolves a durable mid-flight artifact, not a task review/round decision."
     },
     {
@@ -65,7 +65,7 @@
     },
     {
       "file": "src/views/settingsView.ts",
-      "line": 566,
+      "line": 569,
       "reason": "Settings-view notice about leftover per-task model overrides from a superseded configuration shape, offering to clear them — settings hygiene, not a task workflow decision."
     }
   ],

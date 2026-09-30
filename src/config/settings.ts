@@ -1054,17 +1054,82 @@ export function isDesktopNotificationsEnabled(): boolean {
   return readSetting(DESKTOP_NOTIFICATIONS_KEY, false);
 }
 
+/** Legacy combined key, kept only so migrateProviderAccountActionsSetting() can read and clear it. */
 const SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY = "showProviderAccountActions";
+const SHOW_PROVIDER_SIGNIN_BUTTONS_KEY = "showProviderSignInButtons";
+const SHOW_PROVIDER_USAGE_BUTTONS_KEY = "showProviderUsageButtons";
 
 /**
  * Whether the Provider Selection section of the AI Models view shows the
- * per-provider account-action buttons (Sign in / Switch account, Check
- * usage). Hidden by default; toggled only from the VS Code settings UI —
- * there is deliberately no in-view control, and no `vs-code-ai-helper.*`
- * twin for this key.
+ * per-provider Sign in / Switch account button. Hidden by default; toggled
+ * only from the VS Code settings UI — there is deliberately no in-view
+ * control, and no `vs-code-ai-helper.*` twin for this key.
  */
-export function isProviderAccountActionsEnabled(): boolean {
-  return readSetting<unknown>(SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY, false) === true;
+export function isProviderSignInButtonsEnabled(): boolean {
+  return readSetting<unknown>(SHOW_PROVIDER_SIGNIN_BUTTONS_KEY, false) === true;
+}
+
+/**
+ * Whether the Provider Selection section of the AI Models view shows the
+ * per-provider Check usage button. Hidden by default; toggled only from the
+ * VS Code settings UI — there is deliberately no in-view control, and no
+ * `vs-code-ai-helper.*` twin for this key.
+ */
+export function isProviderUsageButtonsEnabled(): boolean {
+  return readSetting<unknown>(SHOW_PROVIDER_USAGE_BUTTONS_KEY, false) === true;
+}
+
+/**
+ * One-time migration of the old combined `showProviderAccountActions` key
+ * into the two new keys it replaced. Runs at Global and Workspace scope only
+ * — this is a `window`-scoped setting, and VS Code rejects writing a
+ * `window`-scoped key at the `WorkspaceFolder` target, so folder scopes are
+ * deliberately not visited (matching how this key was always read: a single
+ * resource-less `getConfiguration()` call).
+ *
+ * For each scope where the old key holds an explicit boolean, that value is
+ * written to each new key at the same scope, but only where the new key has
+ * no explicit value there yet (an explicit value — including `false` — is
+ * left untouched). The old key is cleared at that scope only after both new
+ * writes succeed, so a failed write leaves the old key in place for the next
+ * activation to retry rather than silently losing the setting.
+ */
+export async function migrateProviderAccountActionsSetting(): Promise<void> {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  const old = config.inspect<unknown>(SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY);
+  const signIn = config.inspect<unknown>(SHOW_PROVIDER_SIGNIN_BUTTONS_KEY);
+  const usage = config.inspect<unknown>(SHOW_PROVIDER_USAGE_BUTTONS_KEY);
+
+  const scopes: Array<{
+    target: vscode.ConfigurationTarget;
+    oldValue: unknown;
+    signInValue: unknown;
+    usageValue: unknown;
+  }> = [
+    {
+      target: vscode.ConfigurationTarget.Global,
+      oldValue: old?.globalValue,
+      signInValue: signIn?.globalValue,
+      usageValue: usage?.globalValue,
+    },
+    {
+      target: vscode.ConfigurationTarget.Workspace,
+      oldValue: old?.workspaceValue,
+      signInValue: signIn?.workspaceValue,
+      usageValue: usage?.workspaceValue,
+    },
+  ];
+
+  for (const scope of scopes) {
+    if (typeof scope.oldValue !== "boolean") continue;
+    if (scope.signInValue === undefined) {
+      await config.update(SHOW_PROVIDER_SIGNIN_BUTTONS_KEY, scope.oldValue, scope.target);
+    }
+    if (scope.usageValue === undefined) {
+      await config.update(SHOW_PROVIDER_USAGE_BUTTONS_KEY, scope.oldValue, scope.target);
+    }
+    await config.update(SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY, undefined, scope.target);
+  }
 }
 
 /**
