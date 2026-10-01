@@ -958,7 +958,7 @@ export const GLOBAL_ASSISTANT_OPERATIONS: readonly GlobalAssistantOperation[] = 
   makeSingleTaskCommandOperation({
     id: "fastForwardReview",
     description:
-      'Run the review-and-apply-fixes loop for one task\'s current stage (same as the "Fast Forward Fixes" button — uses provider quota). Payload: {"taskFolder": "<folder name or task name>"}.',
+      'Run the review-and-apply-fixes loop for one task\'s current stage (same as the "Fast Forward" button — uses provider quota). Payload: {"taskFolder": "<folder name or task name>"}.',
     command: "vs-code-ai-helper.fastForwardReviewWithAI",
     summaryVerb: "Ran the review-and-fixes loop for",
     requiresConfirmation: true,

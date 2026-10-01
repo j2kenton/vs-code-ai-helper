@@ -16,6 +16,10 @@ do not constitute that approval.
 
 The plan of record may declare certain residual issues out of scope in an "## Accepted Non-Goals" section, reproduced below alongside any standing owner decisions — both are binding inputs to this review, not incidental prose. Do not report a blocker whose subject is covered by an Accepted Non-Goals entry or a recorded owner decision; those questions are already settled and are not this review's to reconsider. If you believe an entry is wrong or no longer applies, say so explicitly in your verdict — name the entry and why — rather than silently re-raising the same blocker with no acknowledgement that a decision already covers it.
 
+Owner evidence: when a round declined a step because it needs a web page, documentation, or a live provider CLI run, file `- [completion] [environmental] Owner evidence needed: <the exact evidence>` as the blocker — it is an owner decision, never `needs-toolchain`.
+
+Narrowing: when a ticked checklist item was only partly done and the round's evidence says the rest does not apply, only the owner may narrow the item. File `- [completion] [environmental] Narrowing needs an owner decision: `<the checklist item text, verbatim, in backticks>` — <what was not done>` as the blocker, never `task-fixable` (a round may not narrow the plan, so sending it back to a round cannot clear it). A plan whose tick is disputed is not complete: keep the score below the ready threshold while the narrowing is undecided, otherwise the blocker will not raise the owner card.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:

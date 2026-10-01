@@ -4,13 +4,18 @@
  * task whose next step is the human's — arranges nothing.
  */
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, before, describe, it } from "node:test";
+import * as vscode from "vscode";
 
 import type { TaskStage } from "../types/taskProgress";
 import {
   describeResumeOptionV1,
   describeRetryFailedReviewV1,
   planResumeActionV1,
+  preflightFixedDispatchV1,
   type ResumeActionFactsV1,
 } from "../utils/resumeActionPlanV1";
 
@@ -325,5 +330,86 @@ void describe("describeRetryFailedReviewV1", () => {
     assert.equal(option.disabled, true);
     assert.equal(option.disabledReason, "No plan found.");
     assert.match(option.label, /unavailable/);
+  });
+});
+
+void describe("preflightFixedDispatchV1 after a failed round (RC4 item 2)", () => {
+  const reviewBody = [
+    "Readiness: 6/10",
+    "",
+    "<!-- blockers:start -->",
+    "- [completion] [task-fixable] blocker",
+    "<!-- blockers:end -->",
+    "<!-- review-pass: 2 -->",
+  ].join("\n");
+
+  // The vscode stub's workspace.fs is unimplemented; back it with real disk so
+  // the artifact checks read the fixture folder instead of throwing.
+  const realFs = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const origFs = { readFile: realFs.readFile, stat: realFs.stat };
+  before(() => {
+    realFs.readFile = async (uri: vscode.Uri): Promise<Uint8Array> =>
+      new Uint8Array(await fs.promises.readFile(uri.fsPath));
+    realFs.stat = async (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
+      const st = await fs.promises.stat(uri.fsPath);
+      return { type: st.isDirectory() ? 2 : 1, size: st.size, ctime: st.ctimeMs, mtime: st.mtimeMs };
+    };
+  });
+  after(() => {
+    realFs.readFile = origFs.readFile;
+    realFs.stat = origFs.stat;
+  });
+
+  function folderWith(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rc4-preflight-"));
+    fs.writeFileSync(path.join(dir, "plan-final.md"), "# Plan\n");
+    fs.writeFileSync(path.join(dir, "impl-high-review.md"), reviewBody);
+    return dir;
+  }
+
+  const passes = (outcome: Record<string, unknown>) => ({
+    stageReviewPasses: { "impl-high-review": 2 },
+    reviewScoreHistory: [
+      {
+        stage: "impl-high-review" as const,
+        score: 6,
+        attemptId: "a2",
+        at: "2026-09-02T00:00:00.000Z",
+        blockerCount: 1,
+        taskFixableCount: 1,
+        reviewPass: 2,
+      },
+    ],
+    roundLedger: [
+      {
+        roundId: "r1",
+        attemptIds: [],
+        stage: "impl-high-review" as const,
+        mode: "apply-review" as const,
+        startedAt: "2026-09-03T00:00:00.000Z",
+        state: "failed" as const,
+        outcome,
+      },
+    ],
+  });
+
+  void it("does not refuse Apply Review after a failed round recorded with filesChanged: []", async () => {
+    const refusal = await preflightFixedDispatchV1(
+      folderWith(),
+      "impl-high-review",
+      "apply-review",
+      passes({ filesChanged: [], rejectionReason: "usage limit" })
+    );
+    assert.equal(refusal, undefined);
+  });
+
+  void it("still refuses Apply Review after a failed round whose change set is unknown", async () => {
+    const refusal = await preflightFixedDispatchV1(
+      folderWith(),
+      "impl-high-review",
+      "apply-review",
+      passes({ rejectionReason: "usage limit" })
+    );
+    assert.match(refusal?.precondition ?? "", /before the latest implementation round/);
   });
 });

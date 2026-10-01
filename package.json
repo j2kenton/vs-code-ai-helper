@@ -84,7 +84,7 @@
       },
       {
         "command": "vs-code-ai-helper.fastForwardReviewWithAI",
-        "title": "Fast Forward Fixes [Ctrl+Shift+Alt+F]",
+        "title": "Fast Forward (iteratively fix and review until done)",
         "category": "Ensemble",
         "icon": "$(run-all)"
       },
@@ -324,6 +324,11 @@
         "title": "Commit and Push",
         "category": "Ensemble",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "vs-code-ai-helper.acceptPlanItemNarrowingV1",
+        "title": "Accept Plan Item Narrowing",
+        "category": "Ensemble"
       },
       {
         "command": "vs-code-ai-helper.viewDisclaimer",
@@ -628,6 +633,10 @@
         },
         {
           "command": "vs-code-ai-helper.commitAndPushTaskInline",
+          "when": "false"
+        },
+        {
+          "command": "vs-code-ai-helper.acceptPlanItemNarrowingV1",
           "when": "false"
         }
       ],
@@ -1087,7 +1096,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Automatically advance the stage when a review meets the configured score. Off by default: a review runs exactly one round and stops. \"auto-fast-forward\" additionally runs Fast Forward Fixes when the destination is a review stage. Checked again immediately before each automatic dispatch, so turning it off also drops already-queued follow-ups."
+          "description": "Automatically advance the stage when a review meets the configured score. Off by default: a review runs exactly one round and stops. \"auto-fast-forward\" additionally runs Fast Forward when the destination is a review stage. Checked again immediately before each automatic dispatch, so turning it off also drops already-queued follow-ups."
         },
         "ensemble.completeAndMoveOnTriggersAI": {
           "type": [
@@ -1141,7 +1150,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Start a high-level review automatically after AI drafts a plan. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward Fixes until the configured stop level."
+          "description": "Start a high-level review automatically after AI drafts a plan. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward until the configured stop level."
         },
         "ensemble.autoReviewAfterImplementation": {
           "type": [
@@ -1157,7 +1166,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Start a high-level review automatically after AI completes an implementation run. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward Fixes until the configured stop level."
+          "description": "Start a high-level review automatically after AI completes an implementation run. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward until the configured stop level."
         },
         "ensemble.autoImplementAfterReview": {
           "type": "string",
@@ -1387,7 +1396,7 @@
           "enumDescriptions": [
             "Do not auto-advance.",
             "Automatically advance when the configured review score threshold is reached.",
-            "Auto-advance and run Fast Forward Fixes where applicable (when the destination is a review stage).",
+            "Auto-advance and run Fast Forward where applicable (when the destination is a review stage).",
             "Legacy value — same as \"off\".",
             "Legacy value — same as \"auto\"."
           ],
@@ -1411,7 +1420,7 @@
           "enumDescriptions": [
             "Do not start the destination stage's AI action.",
             "Automatically start the AI action for the destination stage.",
-            "Start the AI action and continue with Fast Forward Fixes once it reaches a review (directly for Publish, after plan generation or implementation for the other stages).",
+            "Start the AI action and continue with Fast Forward once it reaches a review (directly for Publish, after plan generation or implementation for the other stages).",
             "Legacy value — same as \"off\".",
             "Legacy value — same as \"auto\"."
           ],
@@ -1460,7 +1469,7 @@
           "enumDescriptions": [
             "Do not review automatically.",
             "Start high-level review after AI drafts a plan.",
-            "Start the review and run Fast Forward Fixes until the configured stop level.",
+            "Start the review and run Fast Forward until the configured stop level.",
             "Legacy value — same as \"off\".",
             "Legacy value — same as \"auto\"."
           ],
@@ -1484,7 +1493,7 @@
           "enumDescriptions": [
             "Do not review automatically.",
             "Start high-level review after AI completes initial implementation.",
-            "Start the review and run Fast Forward Fixes until the configured stop level.",
+            "Start the review and run Fast Forward until the configured stop level.",
             "Legacy value — same as \"off\".",
             "Legacy value — same as \"auto\"."
           ],

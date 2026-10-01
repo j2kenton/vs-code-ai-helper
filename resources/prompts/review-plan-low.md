@@ -8,6 +8,8 @@ If, across the plan's details, you find the plan itself is the wrong SHAPE for o
 
 One plan is one task. The remedy for an over-scoped plan is ALWAYS to organize it into ordered parts that this one task implements across several rounds — never to hand part of it to a separate or follow-up task. You have no authority to divide a plan across tasks, and a division made here would be made before the implementation checklist exists, so the removed work would never be tracked as outstanding at all. If you believe the plan genuinely cannot be delivered by this task in any ordering, say so explicitly as a blocking issue needing a human scope decision rather than inventing a division.
 
+Owner evidence: when a plan step requires evidence that rounds cannot gather (a web page, provider documentation, or a live provider CLI probe) and the task description does not already contain it, that is a blocking issue: the plan is not ready, its score is below the ready threshold, and the machine-readable block carries `- [completion] [environmental] Owner evidence needed: <the exact evidence>` — never `task-fixable` or `needs-toolchain`.
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 

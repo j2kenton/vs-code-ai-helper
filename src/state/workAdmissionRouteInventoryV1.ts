@@ -125,6 +125,14 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
       "src/commands/applyCurrentStageAction.ts — resolves the current stage's action and dispatches via " +
       "vscode.commands.executeCommand to an already-classified command, threading admissionHandoffTokenV1 for adoption",
   },
+  acceptPlanItemNarrowingV1: {
+    kind: "delegatesTo",
+    to: "runReviewWithAI",
+    evidence:
+      "src/commands/acceptPlanItemNarrowingV1.ts — records the owner decision in plan-final.md (no provider call), then " +
+      "re-runs the review through resumeAndRerunReviewV1, which resumes under admission and dispatches runReviewWithAI " +
+      "with admissionHandoffTokenV1",
+  },
   applyHighLevelReviewChanges: {
     kind: "delegatesTo",
     to: "applyReviewEditWithAI",

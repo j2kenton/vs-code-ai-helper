@@ -134,6 +134,9 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "utils/reviewEscalation.ts", optionId: "publishAnyway", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: publishAnyway dispatches the publish continuation" },
   { file: "utils/reviewEscalation.ts", optionId: "acknowledgeAdvance", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: acknowledgeAdvance routes through the Step-3 Advance path, not doNothing" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 2, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself variant leaves task paused" },
+  // RC4 item 3: the narrowing card's two options (plateau card, `narrowing` present).
+  { file: "utils/reviewEscalation.ts", optionId: "acceptNarrowing", occurrence: 0, resumeKind: "continue", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: the entry is appended once and the re-review is dispatched with skipUnchangedTreeGuard" },
+  { file: "utils/reviewEscalation.ts", optionId: "keepItemOpen", occurrence: 0, resumeKind: "unpause", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: keepItemOpen dispatches nothing" },
   // The generic (non-plateau) "reviewEscalation:${kind}" card's own
   // keepIterating option, e.g. the implementation-side plateau case — third
   // in document order after the two plateau-card branches above.
@@ -354,6 +357,8 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "acknowledgeAdvance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "acceptNarrowing", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "keepItemOpen", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
 
   [rowKey("commands/reconcilePlanChecklist.ts", "applyVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
   [rowKey("commands/reconcilePlanChecklist.ts", "linkManualChecks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],

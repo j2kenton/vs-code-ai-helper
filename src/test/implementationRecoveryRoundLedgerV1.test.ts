@@ -190,6 +190,41 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
     }
   });
 
+  void it("RC4 item 2: a known-empty source outcome carries filesChanged: [], an unknown one carries filesChangedUnknown only", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const known = makeTaskFolder("rc4_known_empty", undefined);
+      const knownBegun = await beginImplementationRecoveryV1(known.folderUri, {
+        trigger: "roundIncomplete",
+        reason: "the round ended without a usable report",
+        terminatedExternally: false,
+        filesChanged: [],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+      });
+      const knownRow = readProgress(known.folderPath).roundLedger?.find((r) => r.roundId === knownBegun.sourceAttemptId);
+      assert.deepEqual(knownRow?.outcome?.filesChanged, []);
+      assert.notEqual(knownRow?.outcome?.filesChangedUnknown, true);
+
+      const unknown = makeTaskFolder("rc4_unknown", undefined);
+      const unknownBegun = await beginImplementationRecoveryV1(unknown.folderUri, {
+        trigger: "roundIncomplete",
+        reason: "the round ended without a usable report",
+        terminatedExternally: false,
+        filesChanged: [],
+        filesChangedUnknown: true,
+        postRunReviewStage: "impl",
+      });
+      const unknownRow = readProgress(unknown.folderPath).roundLedger?.find((r) => r.roundId === unknownBegun.sourceAttemptId);
+      assert.equal(unknownRow?.outcome?.filesChangedUnknown, true);
+      assert.equal(unknownRow?.outcome?.filesChanged, undefined);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("terminalizes the task's existing live row instead of opening a second one", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

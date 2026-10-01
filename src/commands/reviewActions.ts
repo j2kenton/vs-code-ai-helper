@@ -924,6 +924,13 @@ type ReviewCommandArg =
        * `maxAttempts`-sized budget from attempt 1.
        */
       resumeFromAttemptV1?: { attemptNumber: number; maxAttempts: number };
+      /**
+       * RC4 item 3: set ONLY by `acceptPlanItemNarrowingV1`, whose plan write
+       * changed the review's input (Accepted Non-Goals) but not the working
+       * tree (`.ensemble/` is gitignored), so the unchanged-tree guard would
+       * wrongly refuse a re-review whose verdict can differ.
+       */
+      skipUnchangedTreeGuardV1?: true;
     }
   | undefined;
 
@@ -961,6 +968,16 @@ function chainedFollowUpReviewMode(
     : undefined;
 }
 
+/**
+ * RC4 item 1: the final failure of a runner-level Apply Review round (a CLI
+ * provider never reaches the coordinator, so `coordinatorOutcome` stays unset
+ * for it). Fast Forward reads it to name the real cause in its stop message.
+ */
+interface RunnerFailureProbeV1 {
+  providerLabel: string;
+  message: string;
+}
+
 interface ApplyReviewOptions {
   /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
   skipImplementationSafetyCheck?: boolean;
@@ -993,7 +1010,7 @@ interface ApplyReviewOptions {
    * preflight/edit-execution `coordinator.executeAction` calls. Still unset
    * after a CLI-resolved dispatch, which never reaches the coordinator.
    */
-  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 };
 }
 
 interface ExecuteImplementationRunOptions {
@@ -1090,7 +1107,7 @@ interface ExecuteImplementationRunOptions {
    * `dispatchProbe`. Forwarded into `runImplementationOrSealedV1`; left unset
    * after a CLI-resolved dispatch, which never reaches the coordinator.
    */
-  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
+  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 };
 }
 
 /**
@@ -7506,6 +7523,9 @@ export async function runReviewWithAI(
             // through — not just this command's entry — see that function's own
             // doc comment for the full rationale and the automation/manual split.
             automationDispatch: isAutomationDispatchV1(arg),
+            ...(arg !== undefined && "skipUnchangedTreeGuardV1" in arg && arg.skipUnchangedTreeGuardV1 === true
+              ? { skipUnchangedTreeGuard: true }
+              : {}),
           }
         );
         return dispatchProbe.dispatched;
@@ -8240,6 +8260,9 @@ export async function fastForwardReviewWithAI(
   // and each loop attempt's dispatchProbe (plan-review branch only; the
   // impl-review edit branch cannot supply one yet, see `ApplyReviewOptions`).
   let ffCoordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
+  // RC4 item 1: the last Apply Review attempt's runner-level failure, which a
+  // CLI dispatch reports instead of a coordinator outcome.
+  let ffRunnerFailureV1: RunnerFailureProbeV1 | undefined;
 
   try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
@@ -8894,15 +8917,19 @@ export async function fastForwardReviewWithAI(
               : applyReviewWithAI;
             // Item 2 / Step 57a: a fresh probe per attempt — `applyReviewWithAI`
             // (plan-review branch) fills in `.coordinatorOutcome`;
-            // `applyReviewEditWithAI` (impl-review edit branch) cannot yet
-            // (see `ApplyReviewOptions`'s doc comment), so it stays `undefined`
-            // and this attempt's contribution is simply skipped below.
-            const ffAttemptProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+            // `applyReviewEditWithAI` (impl-review edit branch) forwards its
+            // own probe back in its `finally`, and a CLI-resolved failure
+            // (which never reaches the coordinator) arrives as
+            // `.runnerFailure` (RC4 item 1).
+            const ffAttemptProbe: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 } = {};
             await applyForTarget(extensionUri, context, concreteArg, {
               ...buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider),
               dispatchProbe: ffAttemptProbe,
             });
             ffCoordinatorOutcomeForAdmissionV1 = ffAttemptProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
+            // RC4 item 1: a CLI-resolved failure never reaches the coordinator;
+            // keep this attempt's runner failure (cleared when it succeeded).
+            ffRunnerFailureV1 = ffAttemptProbe.runnerFailure;
           },
           // Escalation (see handleReviewRoutingOutcome) can now fire inside
           // Fast Forward and pause the task mid-loop. Without this check,
@@ -9354,7 +9381,9 @@ export async function fastForwardReviewWithAI(
     const stalledDetail =
       buildRoundsStalled > 0
         ? `${buildRoundsStalled} consecutive build round(s) ran without landing a new plan-checklist tick`
-        : ffCoordinatorOutcomeForAdmissionV1 && ffDispatchFailureKindsV1.has(ffCoordinatorOutcomeForAdmissionV1.kind)
+        : ffRunnerFailureV1
+          ? `Apply Review failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`
+          : ffCoordinatorOutcomeForAdmissionV1 && ffDispatchFailureKindsV1.has(ffCoordinatorOutcomeForAdmissionV1.kind)
           ? `Apply Review failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`
           : "the review did not produce a new, comparable result";
     NotificationRouter.showWarning(
@@ -11623,6 +11652,17 @@ async function executeImplementationRun(
     );
   }
 
+  // RC4 item 1: hand a failed round's provider and message back to a composite
+  // caller (Fast Forward) before any later branch can return. A CLI dispatch
+  // never reaches the coordinator, so this is the only way it learns the
+  // real cause (for example a usage limit) of a failed Apply Review.
+  if (options.dispatchProbe && result.status === "failed") {
+    options.dispatchProbe.runnerFailure = {
+      providerLabel: result.providerLabel ?? result.runnerId,
+      message: result.errorMessage ?? "unknown error",
+    };
+  }
+
   // 2026-08-28 review fix, blocker "coordinator allocation sites still do not
   // synchronously attach durable round identities before pre-prompt failures
   // can return": the sealed pipeline's `allocatedAttemptIds` (every
@@ -11932,7 +11972,7 @@ async function executeImplementationRun(
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
-  }\n\n${result.summary ?? result.errorMessage ?? ""}${
+  }\n\n${result.cascadeNoteV1 ? `${result.cascadeNoteV1}\n\n` : ""}${result.summary ?? result.errorMessage ?? ""}${
     incompleteRound && recovery
       ? `\n\n## Incomplete round\n\nThis round was recorded incomplete: ${incompleteRound.reason}.\n\n` +
         `Recovery record: \`${recovery.sourceAttemptId}\` (${
@@ -13938,6 +13978,27 @@ async function executeImplementationRun(
     if (result.timedOut === true && recovery) {
       await recovery.finishDispatch();
     } else {
+      // RC4 item 2: close the round as `failed` with its real change set so a
+      // zero-change failure does not stale the stage's review. This write
+      // must land first: `terminalizeRoundV1` is idempotent, so the later
+      // generic closers (operation settle / ledger reconciliation, which
+      // record an omitted = unknown change set) become no-ops for this row.
+      // `beginImplementationRecoveryV1` is the other writer and handles the
+      // timed-out / recovery-owed rounds above.
+      await terminalizeRoundV1(
+        implRoundId,
+        "failed",
+        {
+          rejectionReason: result.errorMessage ?? "unknown error",
+          ...(result.filesChangedUnknown
+            ? { filesChangedUnknown: true }
+            : { filesChanged: [...result.filesChanged] }),
+        },
+        {
+          taskFolderUri: folderUri,
+          ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
+        }
+      );
       NotificationRouter.showError(
         `Implementation failed: ${result.errorMessage ?? "unknown error"}`
       );
@@ -14105,7 +14166,7 @@ export async function runImplementationWithAI(
   // unset — see `ApplyReviewOptions.dispatchProbe`'s doc comment. Declared
   // here, OUTSIDE the try block below (not beside `providerInvokedThisRound`
   // inside it), so it is still visible from the try's own `finally`.
-  const runImplementationDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+  const runImplementationDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 } = {};
 
   try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): first
@@ -15138,7 +15199,7 @@ export async function applyReviewEditWithAI(
   // .dispatchProbe's doc comment. Declared here, OUTSIDE the try block below
   // (not beside `runApply`'s definition inside it), so it is still visible
   // from the try's own `finally`.
-  const applyReviewEditDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+  const applyReviewEditDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 } = {};
 
   try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): before
@@ -15495,6 +15556,14 @@ export async function applyReviewEditWithAI(
   }
   return dispatchedV1;
   } finally {
+    // RC4 item 1: hand this round's outcome and runner failure back to a
+    // composite caller (Fast Forward), which otherwise cannot see a CLI
+    // failure — a CLI dispatch never reaches the coordinator.
+    if (options.dispatchProbe) {
+      options.dispatchProbe.coordinatorOutcome =
+        applyReviewEditDispatchProbeV1.coordinatorOutcome ?? options.dispatchProbe.coordinatorOutcome;
+      options.dispatchProbe.runnerFailure = applyReviewEditDispatchProbeV1.runnerFailure;
+    }
     recordAdmissionReleaseTriggerV1(safeReleaseStateV1, applyReviewEditDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
   }

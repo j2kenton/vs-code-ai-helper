@@ -469,11 +469,14 @@ export async function beginImplementationRecoveryV1(
   const sourceOutcome: RoundLedgerOutcomeV1 = {
     rejectionReason: input.reason,
     continuationOwed: true,
+    // RC4 item 2: a known-empty change set is recorded explicitly
+    // (`filesChanged: []`), never omitted — an omitted set means "unknown"
+    // to `reviewPredatesLatestImplementationRoundV1`, which stales the review.
     ...(quarantinedPaths.length > 0
       ? { filesChanged: quarantinedPaths }
       : input.filesChangedUnknown
         ? { filesChangedUnknown: true }
-        : {}),
+        : { filesChanged: [] }),
   };
   // Part 4 / item 1 ("source/continuation linkage") + 2026-08-27 review fix
   // ("beginImplementationRecoveryV1 directly constructs/upserts a terminal

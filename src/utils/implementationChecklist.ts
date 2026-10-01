@@ -740,12 +740,14 @@ export interface AcceptedNonGoalItemV1 {
 export function appendAcceptedNonGoalV1(
   planOfRecord: string,
   items: readonly AcceptedNonGoalItemV1[],
-  date: string
+  date: string,
+  /** RC4 item 3: overrides the default sub-heading text (the narrowing entry names itself). */
+  headingText?: string
 ): string {
   if (items.length === 0) {
     return planOfRecord;
   }
-  const heading = `### Open items settled by the owner (owner decision, ${date})`;
+  const heading = `### ${headingText ?? `Open items settled by the owner (owner decision, ${date})`}`;
   const body = items.map((item) => `- ${item.itemText} — ${item.reason}`).join("\n");
   const entry = `${heading}\n\n${body}\n`;
 

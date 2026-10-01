@@ -115,6 +115,33 @@ void describe("reviewPredatesLatestImplementationRoundV1", () => {
     );
   });
 
+  void it("RC4 item 2: only a terminal round KNOWN to have changed nothing keeps the review current", () => {
+    const predates = (state: string, outcome?: Record<string, unknown>): boolean =>
+      reviewPredatesLatestImplementationRoundV1(
+        {
+          stageReviewPasses: { "impl-high-review": 2 },
+          reviewScoreHistory: [entry(2, "2026-09-02T00:00:00.000Z")],
+          roundLedger: [
+            {
+              ...round("apply-review", "2026-09-03T00:00:00.000Z"),
+              state,
+              ...(outcome ? { outcome } : {}),
+            } as RoundLedgerEntryV1,
+          ],
+        },
+        "impl-high-review"
+      );
+    assert.equal(predates("failed", { filesChanged: [] }), false);
+    assert.equal(predates("failed", {}), true);
+    assert.equal(predates("failed", { filesChanged: ["a.ts"] }), true);
+    assert.equal(predates("failed", { filesChangedUnknown: true }), true);
+    assert.equal(predates("cancelled", { filesChanged: [] }), false);
+    assert.equal(predates("open", { filesChanged: [] }), true);
+    assert.equal(predates("completed", { filesChanged: [] }), false);
+    assert.equal(predates("completed", {}), true);
+    assert.equal(predates("interrupted", { rejectionReason: "stopped" }), true);
+  });
+
   void it("is current when the round preceded the review, or the only later rows are reviews", () => {
     const base = {
       stageReviewPasses: { "impl-high-review": 2 },

@@ -158,6 +158,14 @@ export function chooseStopBehaviourV1(
  * backup exists for the hand-off (or the stage is `never-switch`, excluded
  * from reaching this branch at all).
  */
+export interface BackupAttemptRecordV1 {
+  /** Display label, e.g. "Copilot claude-sonnet-5.5". */
+  readonly label: string;
+  readonly outcome: "tried-and-failed" | "held-back" | "disabled";
+  /** The backup's own error, or the reason it was held back. */
+  readonly reason: string;
+}
+
 export type MidRoundStopOutcomeV1 =
   | {
       readonly kind: "cascadeWithheldDirtyTree";
@@ -165,6 +173,24 @@ export type MidRoundStopOutcomeV1 =
       readonly filesChangedCount: number;
       readonly remedyText: string;
       readonly affectedStagesClause: string;
+      /**
+       * RC4 item 1: label of the first enabled backup this withheld switch
+       * held back (whatever its provider kind), so the message can say which
+       * backup exists and how to use it.
+       */
+      readonly heldBackBackupLabel?: string;
+      /** Human name of the stage action to run again, e.g. "Apply Review". */
+      readonly rerunActionLabel?: string;
+    }
+  | {
+      /**
+       * RC4 item 1: the clean-tree cascade found backups configured for this
+       * stage, but none rescued the round. `backups` is one record per
+       * configured backup with the reason it did not.
+       */
+      readonly kind: "backupsExhausted";
+      readonly backups: readonly BackupAttemptRecordV1[];
+      readonly remedyText: string;
     }
   | {
       readonly kind: "handedToBackup";
@@ -208,7 +234,29 @@ export function describeMidRoundOutcomeV1(
         (errorMessage ? ` (${errorMessage})` : "") +
         `. This round already changed ${outcome.filesChangedCount} file(s), so Ensemble withheld the ` +
         "automatic switch to this stage's backup model — switching mid-round on a dirty working tree " +
-        `risks mixing two models' edits in one round. ${outcome.remedyText}${outcome.affectedStagesClause}`
+        `risks mixing two models' edits in one round. ${outcome.remedyText}${outcome.affectedStagesClause}` +
+        (outcome.heldBackBackupLabel
+          ? ` Backup ${outcome.heldBackBackupLabel} was held back because this round already changed ` +
+            `${outcome.filesChangedCount} file(s). Once the tree is settled, run ` +
+            `${outcome.rerunActionLabel ?? "this stage's action"} again: Ensemble will use ` +
+            `${outcome.heldBackBackupLabel} if ${primaryProviderLabel} is still limited.`
+          : "")
+      );
+    case "backupsExhausted":
+      return (
+        `${primaryProviderLabel} hit a usage limit` +
+        (errorMessage ? `: ${errorMessage}` : "") +
+        ". " +
+        outcome.backups
+          .map((backup) =>
+            backup.outcome === "tried-and-failed"
+              ? `Backup ${backup.label} was tried and failed: ${backup.reason}.`
+              : backup.outcome === "disabled"
+                ? `Backup ${backup.label} is disabled in the stage's chain; enable it to use it here.`
+                : `Backup ${backup.label} was held back: ${backup.reason}.`
+          )
+          .join(" ") +
+        ` ${outcome.remedyText}`
       );
     case "handedToBackup":
       return (

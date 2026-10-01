@@ -122,4 +122,33 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     assert.ok(gateIndex >= 0 && gateIndex < namedCauseIndex,
       "the named-cause wording must be gated on ffDispatchFailureKindsV1.has(...), not rendered unconditionally");
   });
+
+  /**
+   * RC4 item 1 (Step 7): a CLI runner failure (e.g. a provider usage limit)
+   * never reaches the coordinator outcome, so the stop message must prefer the
+   * per-attempt `runnerFailure` probe over the generic fallback.
+   */
+  void it("prefers the Apply Review runner failure (provider + message) over the generic fallback", () => {
+    const stalledBranch = source.indexOf("outcome.stalled &&");
+    assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
+    const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
+
+    assert.match(
+      source,
+      /ffRunnerFailureV1 = ffAttemptProbe\.runnerFailure;/,
+      "each attempt's probe runnerFailure must be kept for the stop message"
+    );
+    const runnerIndex = branchSlice.indexOf(
+      "`Apply Review failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`"
+    );
+    const genericIndex = branchSlice.indexOf('"the review did not produce a new, comparable result"');
+    assert.ok(runnerIndex >= 0, "the stalled branch must render the provider label and message");
+    assert.ok(genericIndex >= 0, "the generic fallback must remain for a true stall");
+    assert.ok(runnerIndex < genericIndex, "the runner-failure wording must win over the generic fallback");
+    assert.match(
+      branchSlice,
+      /:\s*ffRunnerFailureV1\s*\?\s*`Apply Review failed:/,
+      "the runner-failure wording must be gated on ffRunnerFailureV1 being set"
+    );
+  });
 });

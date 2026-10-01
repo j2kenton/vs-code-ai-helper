@@ -813,6 +813,21 @@ export function isReviewPassCurrentV1(
   return stamped !== undefined && current !== undefined && stamped === current;
 }
 
+function roundKnownToChangeNothingV1(
+  row: NonNullable<TaskProgress["roundLedger"]>[number]
+): boolean {
+  if (row.state === "scheduled" || row.state === "open") {
+    return false;
+  }
+  const outcome = row.outcome;
+  return (
+    outcome !== undefined &&
+    outcome.filesChangedUnknown !== true &&
+    Array.isArray(outcome.filesChanged) &&
+    outcome.filesChanged.length === 0
+  );
+}
+
 /**
  * Whether an implementation round STARTED after this stage's current-pass
  * review was published (v1 fixes 2, item 32: a review "predates the latest
@@ -827,6 +842,14 @@ export function isReviewPassCurrentV1(
  * carrying the CURRENT reservation is consulted; a review with no such entry
  * is already judged by {@link isReviewPassCurrentV1}, so this returns `false`
  * ("no evidence of predating") rather than double-counting it.
+ *
+ * RC4 item 2: a round that is terminal and KNOWN to have changed nothing
+ * (`outcome.filesChanged` an explicit empty array, `filesChangedUnknown` not
+ * set) does not stale the review — a failed or cancelled Apply Review that
+ * touched no files left the tree the review assessed. An omitted change set
+ * means unknown and stales. The explicit empty set is written by
+ * `beginImplementationRecoveryV1` and by `executeImplementationRun`'s
+ * plain-failure branch.
  */
 export function reviewPredatesLatestImplementationRoundV1(
   progress: Pick<TaskProgress, "stageReviewPasses" | "reviewScoreHistory" | "roundLedger">,
@@ -851,7 +874,10 @@ export function reviewPredatesLatestImplementationRoundV1(
       return false;
     }
     const started = Date.parse(row.startedAt);
-    return Number.isFinite(started) && started > published;
+    if (!Number.isFinite(started) || started <= published) {
+      return false;
+    }
+    return !roundKnownToChangeNothingV1(row);
   });
 }
 

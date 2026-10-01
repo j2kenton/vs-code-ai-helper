@@ -46,6 +46,7 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { candidateHasRecentZeroFileFailuresV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   describeStageSubstitutesV1,
+  listStageDisabledBackupsV1,
   resolveEffectiveStageChainV1,
 } from "../utils/modelSelection";
 import {
@@ -59,7 +60,11 @@ import {
   recordQuotaObservation,
 } from "../utils/quota";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
-import { chooseStopBehaviourV1, describeMidRoundOutcomeV1 } from "../utils/stopBehaviourV1";
+import {
+  chooseStopBehaviourV1,
+  describeMidRoundOutcomeV1,
+  type BackupAttemptRecordV1,
+} from "../utils/stopBehaviourV1";
 import { beginImplementationRecoveryV1 } from "../commands/implementationRecoveryV1";
 import { deriveNextRecoverySourceV1 } from "../utils/implementationDispatchModeV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -874,6 +879,23 @@ export async function checkImplementationAvailabilityForModel(
   return primary;
 }
 
+/** The user-facing action to rerun after a withheld cascade, by the edit
+ * cohort's action key (this generic path serves more than Apply Review). */
+function rerunActionLabelForActionKeyV1(actionKey: string): string | undefined {
+  switch (actionKey) {
+    case "implementation.v1":
+      return "Implementation";
+    case "applyReviewEdit.v1":
+      return "Apply Review";
+    case "lint.v1":
+      return "Fix Linting";
+    case "fastForward.v1":
+      return "Fast Forward";
+    default:
+      return undefined;
+  }
+}
+
 /**
  * Run an agentic implementation with whichever provider the stage's model
  * ID selects (or auto-detects): Copilot uses the LM API tool-calling loop;
@@ -930,13 +952,10 @@ export async function runImplementationForModel(options: {
    * (originally added per a Codex review finding: a CLI primary that passes
    * its pre-run availability probe but then fails at RUNTIME with a quota/
    * temporarily-unavailable error had no way to reach a configured Copilot
-   * backup). wf10 item 3 / Part 5 step 13: this cascade's automatic backup
-   * loop no longer calls this callback at all — every cross-kind (Copilot)
-   * backup is excluded from automatic selection entirely, since that path
-   * reliably reports "available" while reliably producing zero-file rounds
-   * (observed on wf9 and jester). The option and its plumbing at the
-   * `runImplementationOrSealedV1` call site are left in place, unused by
-   * this cascade, so the exclusion stays reversible without an API change.
+   * backup). RC4 item 1: the clean-tree cascade calls this for an enabled
+   * cross-kind (Copilot) backup after the usual availability and breaker
+   * checks, so a usage limit on a CLI primary reaches the backup the owner
+   * configured. When absent, cross-kind backups are skipped.
    */
   runCrossProviderBackup?: (modelId: string) => Promise<ImplementationRunResult & { runnerId: string }>;
   /** See execCliAgent's own doc (`cliAgentRunner.ts`) — forwarded to the CLI
@@ -1126,6 +1145,35 @@ export async function runImplementationForModel(options: {
   const leftTreeCleanV1 = (r: ImplementationRunResult): boolean =>
     r.filesChangedUnknown !== true && r.filesChanged.length === 0;
   const primaryLeftTreeClean = leftTreeCleanV1(result);
+  // RC4 item 1: the reset time this failure carries, from its own message
+  // first, then the session-observed value, then the durable cross-restart
+  // ledger. Shared by the clean-tree "backups exhausted" explanation and the
+  // dirty-tree withheld explanation. Only cascade-eligible kinds carry
+  // provider reset wording; `parseQuotaResetV1` stays conservative.
+  const resolveKnownResetAt = (): string | undefined => {
+    if (!isCascadeEligibleFailureKind(result.failureKind)) {
+      return undefined;
+    }
+    const ctx = getExtensionContextV1();
+    return (
+      parseQuotaResetV1(result.errorMessage, new Date()) ??
+      (options.stage ? getQuotaObservation(options.stage, options.modelId)?.resetAt : undefined) ??
+      (ctx
+        ? getQuotaLedgerEntry(ctx, primaryProviderId, primaryAccountKey, options.modelId ?? "(default)")?.resetAt
+        : undefined)
+    );
+  };
+  // RC4 item 1: one record per configured backup that did not rescue the
+  // round, filled by the clean-tree cascade loop below.
+  const backupRecords: BackupAttemptRecordV1[] = [];
+  const labelForBackup = (backupModel: string): string => {
+    const bare = backupModel.replace(/^[a-z][a-z0-9-]*:/i, "");
+    try {
+      return `${toResolvedRunner(resolveEffectiveProvider(backupModel)).providerLabel} ${bare}`;
+    } catch {
+      return bare;
+    }
+  };
   if (
     !authFailure &&
     primaryLeftTreeClean &&
@@ -1162,8 +1210,23 @@ export async function runImplementationForModel(options: {
         roundOutcomesForHealthCheck = undefined;
       }
     }
-    for (const backupModel of filterEnabledBackupModels(chain.backups)) {
+    for (const backupModel of chain.backups) {
+      // RC4 item 1: a configured-but-disabled backup is listed in the
+      // diagnostic inventory only; it is never dispatched.
+      if (isModelProviderDisabled(backupModel)) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "disabled",
+          reason: "disabled in the stage's chain",
+        });
+        continue;
+      }
       if (backupModel === options.modelId) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "held-back",
+          reason: "it is the same model as the primary",
+        });
         continue;
       }
       // wf10 review fix (Part 5 steps 13-14, narrowed blocker 1): resolved
@@ -1191,33 +1254,33 @@ export async function runImplementationForModel(options: {
           backupProviderId
         )
       ) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "held-back",
+          reason: `it produced no file changes in ${breakerRounds} recent round(s)`,
+        });
         continue;
       }
       // Captured before this backup's availability check/dispatch — same
       // rationale as `primaryAccountKey` above.
       const backupAccountKey = resolveQuotaAccountKeyV1(backupModel);
-      if (!options.allowCrossProviderBackups) {
-        if (backupKind !== effective.kind) {
-          // wf10 item 3 / Part 5 step 13: the sealed two-phase Copilot
-          // pipeline (runSealedImplementationV1, reached below via
-          // runCrossProviderBackup) is excluded from automatic backup
-          // selection entirely — the same reasoning as the preflight
-          // availability walk's exclusion above (~line 810). The earlier
-          // "Codex review finding" reasoning that justified reaching it here
-          // (a CLI primary's RUNTIME quota failure otherwise had no way to
-          // reach a configured Copilot backup) is superseded by the observed
-          // wf9/jester failure: that path reliably reports "available" while
-          // reliably producing zero-file rounds, which is worse than never
-          // reaching it. Since this cascade is only ever entered for a CLI
-          // winning candidate (a Copilot winning candidate routes through
-          // runSealedImplementationV1 directly, never through here), the
-          // only cross-kind backup this loop could ever reach is Copilot —
-          // so excluding backupKind === "copilot" here removes Copilot from
-          // automatic implementation fallback selection entirely, while an
-          // unresolvable backupKind (undefined) still always skips too,
-          // matching the pre-existing comment above.
-          continue;
-        }
+      // RC4 item 1: a cross-kind (Copilot) backup is reached at runtime ONLY
+      // through `options.runCrossProviderBackup` (the sealed two-phase
+      // pipeline), never through the unsealed `run` below. wf10 item 3 had
+      // excluded it outright, so a usage limit on a CLI primary never reached
+      // an enabled Copilot backup; the `fallbackProviderBreakerRounds` check
+      // above remains the protection against a backup that keeps producing
+      // zero-file rounds. Without the callback (or with an unresolvable
+      // backupKind) the backup is still skipped.
+      const crossKindBackup =
+        !options.allowCrossProviderBackups && backupKind !== effective.kind;
+      if (crossKindBackup && (!options.runCrossProviderBackup || backupKind === undefined)) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "held-back",
+          reason: "it cannot be used from this primary provider in this action",
+        });
+        continue;
       }
       const fallbackAvailability =
         await checkImplementationAvailabilityForModel(backupModel);
@@ -1235,15 +1298,18 @@ export async function runImplementationForModel(options: {
           await releaseReservation();
           return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
         }
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "held-back",
+          reason: `unavailable: ${fallbackFailure.errorMessage}`,
+        });
         continue;
       }
-      // wf10 item 3 / Part 5 step 13: `options.runCrossProviderBackup` is
-      // never invoked here — the `continue` above already excludes every
-      // cross-kind (i.e. Copilot) backup this loop could otherwise reach.
-      // The option stays on the type (see its header) so the exclusion
-      // remains reversible without an API change, but this cascade no
-      // longer calls it.
-      const fallbackResult = await run(resolveEffectiveProvider(backupModel));
+      // RC4 item 1: a cross-kind backup runs through the sealed pipeline
+      // callback; a same-kind backup runs through `run` as before.
+      const fallbackResult = crossKindBackup
+        ? await options.runCrossProviderBackup!(backupModel)
+        : await run(resolveEffectiveProvider(backupModel));
       await recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage, getExtensionContextV1(), undefined, backupAccountKey);
       if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(
@@ -1251,7 +1317,16 @@ export async function runImplementationForModel(options: {
           options.stage,
           backupModel
         );
-        return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
+        const rescueNote =
+          `${primaryProviderLabel} hit a usage limit` +
+          (result.errorMessage ? ` (${result.errorMessage})` : "") +
+          `; this round ran on ${labelForBackup(backupModel)}.`;
+        options.onProgress(rescueNote);
+        return withActualIdentity(
+          { ...fallbackResult, cascadeNoteV1: rescueNote },
+          fallbackAvailability.providerLabel,
+          backupModel
+        );
       }
       // A failed/cancelled backup cannot be the stage's sticky fallback.
       // In particular, this prevents an OpenCode 401 from routing every
@@ -1275,6 +1350,11 @@ export async function runImplementationForModel(options: {
         await releaseReservation();
         return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
       }
+      backupRecords.push({
+        label: labelForBackup(backupModel),
+        outcome: "tried-and-failed",
+        reason: fallbackResult.errorMessage ?? "it failed",
+      });
     }
     await releaseReservation();
   } else if (
@@ -1414,7 +1494,6 @@ export async function runImplementationForModel(options: {
     }
     const parkProviderId = primaryProviderId;
     const parkAccountKey = primaryAccountKey;
-    const extensionContext = getExtensionContextV1();
     // Known reset time, when this failure kind carries one at all. Workflow
     // 3 continuation, first item: a real Cline "monthly ... limit ... resets
     // in 8d 19h, please try again later" message classifies as
@@ -1440,19 +1519,7 @@ export async function runImplementationForModel(options: {
     // (recordQuotaObservation only ever caches a resetAt for "quota"), so
     // only the direct parse of this attempt's own message benefits from the
     // widened kind check.
-    const knownResetAt =
-      isCascadeEligibleFailureKind(result.failureKind)
-        ? parseQuotaResetV1(result.errorMessage, new Date()) ??
-          getQuotaObservation(options.stage, options.modelId)?.resetAt ??
-          (extensionContext
-            ? getQuotaLedgerEntry(
-                extensionContext,
-                parkProviderId,
-                parkAccountKey,
-                options.modelId ?? "(default)"
-              )?.resetAt
-            : undefined)
-        : undefined;
+    const knownResetAt = resolveKnownResetAt();
     const remedyText = buildQuotaRemedyTextV1(knownResetAt);
     // Review completion blocker (2026-09-01): `chooseStopBehaviourV1` used to
     // be consulted only in the final fallthrough further below, purely to
@@ -1495,6 +1562,15 @@ export async function runImplementationForModel(options: {
       filesChangedCount: result.filesChanged.length,
       remedyText,
       affectedStagesClause,
+      rerunActionLabel: rerunActionLabelForActionKeyV1(options.correlation.actionKey),
+      ...(chain
+        ? (() => {
+            const firstBackup = filterEnabledBackupModels(chain.backups).find(
+              (backupModel) => backupModel !== options.modelId
+            );
+            return firstBackup ? { heldBackBackupLabel: labelForBackup(firstBackup) } : {};
+          })()
+        : {}),
     });
     options.onProgress(withheldMessage);
     // Part 5 step 1: surface a "Rerun after reset" action alongside the
@@ -1675,6 +1751,20 @@ export async function runImplementationForModel(options: {
     // which is simply false for a `never-switch` stage that DOES have a
     // configured chain. Distinguish them from the resolved chain directly.
     const neverSwitchConfigured = chain !== undefined && chain.strategy === "never-switch";
+    // RC4 item 1: backups switched off on the stage's own chain never reach
+    // the effective chain, so list them here as disabled (never dispatched).
+    if (chain !== undefined && chain.strategy === "switch-to-backup") {
+      for (const disabledModel of listStageDisabledBackupsV1(chain.originStage)) {
+        const label = labelForBackup(disabledModel);
+        if (!backupRecords.some((record) => record.label === label)) {
+          backupRecords.push({
+            label,
+            outcome: "disabled",
+            reason: "disabled in the stage's chain",
+          });
+        }
+      }
+    }
     // Item 8: the explanation belongs on the returned/recorded failure
     // itself (as the dirty-tree branch above already does by rewriting
     // `errorMessage`), not only on the transient `onProgress` stream — a run
@@ -1699,7 +1789,7 @@ export async function runImplementationForModel(options: {
               kind: "neverSwitchConfigured",
               failureKind: result.failureKind,
             })
-          : !chainWantsBackup
+          : !chainWantsBackup && !(backupRecords.length > 0 && isCascadeEligibleFailureKind(result.failureKind))
             ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
                 kind: "noBackupConfigured",
                 failureKind: result.failureKind,
@@ -1709,7 +1799,13 @@ export async function runImplementationForModel(options: {
                   kind: "treeStateUnknown",
                   failureKind: result.failureKind,
                 })
-              : undefined;
+              : backupRecords.length > 0
+                ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+                    kind: "backupsExhausted",
+                    backups: backupRecords,
+                    remedyText: buildQuotaRemedyTextV1(resolveKnownResetAt()),
+                  })
+                : undefined;
     if (explanation !== undefined) {
       options.onProgress(explanation);
       return withActualIdentity(

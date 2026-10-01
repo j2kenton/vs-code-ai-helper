@@ -198,6 +198,48 @@ void describe("describeMidRoundOutcomeV1", () => {
     assert.match(text, /Sign in again/);
   });
 
+  void it("RC4 item 1: backupsExhausted names each backup, its outcome and the remedy", () => {
+    const text = describeMidRoundOutcomeV1("Claude Code (sonnet@high)", "You've hit your session limit", {
+      kind: "backupsExhausted",
+      backups: [
+        { label: "Copilot claude-sonnet-5.5", outcome: "tried-and-failed", reason: "model unavailable" },
+        { label: "Codex gpt-5", outcome: "held-back", reason: "it produced no file changes in 3 recent round(s)" },
+        { label: "Gemini pro", outcome: "disabled", reason: "disabled in the stage's chain" },
+      ],
+      remedyText: "Rerun this stage after 11:00.",
+    });
+    assert.match(text, /^Claude Code \(sonnet@high\) hit a usage limit: You've hit your session limit\./);
+    assert.match(text, /Backup Copilot claude-sonnet-5\.5 was tried and failed: model unavailable\./);
+    assert.match(text, /Backup Codex gpt-5 was held back: it produced no file changes/);
+    assert.match(text, /Backup Gemini pro is disabled in the stage's chain; enable it to use it here\./);
+    assert.match(text, /Rerun this stage after 11:00\.$/);
+  });
+
+  void it("RC4 item 1: backupsExhausted works with the unknown-reset remedy", () => {
+    const text = describeMidRoundOutcomeV1("Claude Code", undefined, {
+      kind: "backupsExhausted",
+      backups: [{ label: "Copilot x", outcome: "held-back", reason: "unavailable: not signed in" }],
+      remedyText: "Rerun this stage later, or switch the stage's model.",
+    });
+    assert.match(text, /^Claude Code hit a usage limit\. Backup Copilot x was held back: unavailable: not signed in\./);
+    assert.match(text, /switch the stage's model\.$/);
+  });
+
+  void it("RC4 item 1: a withheld dirty-tree message names the held-back backup", () => {
+    const base = {
+      kind: "cascadeWithheldDirtyTree" as const,
+      limitLabel: "a quota/rate limit",
+      filesChangedCount: 2,
+      remedyText: "Rerun after 11:00.",
+      affectedStagesClause: "",
+    };
+    const named = describeMidRoundOutcomeV1("Claude Code", "limit", { ...base, heldBackBackupLabel: "Copilot x" });
+    assert.match(named, /Backup Copilot x was held back because this round already changed 2 file\(s\)/);
+    assert.match(named, /Ensemble will use Copilot x if Claude Code is still limited/);
+    const plain = describeMidRoundOutcomeV1("Claude Code", "limit", base);
+    assert.doesNotMatch(plain, /was held back because/);
+  });
+
   void it("authFailureBackupWithheld on a clean tree makes no false claim about withheld files", () => {
     const text = describeMidRoundOutcomeV1("Claude Code", "403 Unable to verify organization membership", {
       kind: "authFailureBackupWithheld",

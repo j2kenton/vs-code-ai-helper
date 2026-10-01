@@ -101,3 +101,18 @@ void describe("manual-verification prompt contract", () => {
     });
   }
 });
+
+void describe("RC4 planning prompt rules (items 4 and 5)", () => {
+  void it("create-plan.md keeps fallbacks inside their item and leaves project checks to Publish Checks", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(prompt, /is never its own item/);
+    assert.match(prompt, /Publish Checks/);
+    assert.match(prompt, /never as a round step/);
+  });
+
+  void it("create-plan.md makes evidence rounds cannot gather an owner step", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(prompt, /Owner evidence:/);
+    assert.match(prompt, /live provider CLIs/);
+  });
+});

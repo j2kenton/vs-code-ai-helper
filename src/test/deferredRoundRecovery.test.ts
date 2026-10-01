@@ -3404,6 +3404,31 @@ void describe("a zero-change round with unticked plan items is refused without a
     );
   });
 
+  // RC4 item 2: the plain-failure branch records the round's known change set,
+  // so a zero-change failure does not make the stage's review out of date.
+  void it("a plain runner failure with an empty known change set leaves a failed row with filesChanged [] and the error as rejectionReason", async () => {
+    const { folderPath, progress } = makeTaskFolder("rc4_item2_failed_row_empty_set", {
+      reviewScoreHistory: qualifyingHistory,
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "failed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      errorMessage: "You've hit your session limit · resets 11am (Asia/Jerusalem)",
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    const failedRows = (readProgress(folderPath).roundLedger ?? []).filter(
+      (row) => row.mode === "implementation" && row.state === "failed"
+    );
+    assert.ok(failedRows.length > 0, "the failed round must be terminalized as failed");
+    const row = failedRows[failedRows.length - 1]!;
+    assert.deepEqual(row.outcome?.filesChanged, []);
+    assert.notEqual(row.outcome?.filesChangedUnknown, true);
+    assert.match(row.outcome?.rejectionReason ?? "", /session limit/);
+  });
+
   // Same completion gap, the other named shape: a malformed-result outcome.
   // At this boundary `runImplementationOrSealedV1`'s own
   // `describeEditActionOutcomeFailureV1` collapses a coordinator

@@ -2169,6 +2169,227 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // RC4 item 1: a CLI primary's usage limit on a clean tree reaches an enabled
+  // Copilot backup through the sealed-pipeline callback, and only through it.
+  void it("RC4 item 1: runs an enabled Copilot backup through runCrossProviderBackup when the CLI primary hits a usage limit", async () => {
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 4323 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              error: { name: "APIError", data: { message: "Rate limit exceeded, try again later." } },
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        { id: "auto", name: "Auto", sendRequest: () => Promise.reject(new Error("unsealed path must not run")) } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+
+    const metaRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-rc4-cross-backup-"));
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(taskFolder, "task-progress.json"),
+      JSON.stringify({ taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now }, null, 2),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: { primary: "opencode-cli:default", backup: "auto", strategy: "switch-to-backup" },
+      });
+      try {
+        const backupCalls: string[] = [];
+        // Every later scenario gets its own task folder: the rescue leaves the
+        // stage's fallback state behind, and rewriting one progress file in
+        // place can be served stale by the progress cache.
+        let folderCounter = 0;
+        const resetFolder = (extra: Record<string, unknown> = {}): void => {
+          const next = path.join(metaRoot, "tasks", `task-fresh-${folderCounter++}`);
+          fs.mkdirSync(next, { recursive: true });
+          childProcess.execSync("git init", { cwd: next, stdio: "ignore" });
+          fs.writeFileSync(
+            path.join(next, "task-progress.json"),
+            JSON.stringify(
+              // The decoder expects `taskFolder` to equal the folder's own name.
+              { taskFolder: path.basename(next), currentStage: "impl", status: "active", createdAt: now, updatedAt: now, ...extra },
+              null,
+              2
+            ),
+            "utf8"
+          );
+          common.workspaceUri = vscode.Uri.file(next);
+          common.taskFolderUri = vscode.Uri.file(next);
+        };
+        const common = {
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: false,
+          stage: "impl" as const,
+          taskFolderUri,
+        };
+        const result = await runImplementationForModel({
+          ...common,
+          runCrossProviderBackup: (modelId: string) => {
+            backupCalls.push(modelId);
+            return Promise.resolve({
+              status: "completed" as const,
+              runnerId: "copilot",
+              summary: "done by backup",
+              filesChanged: [],
+              filesChangedUnknown: false,
+            } as unknown as Awaited<ReturnType<NonNullable<Parameters<typeof runImplementationForModel>[0]["runCrossProviderBackup"]>>>);
+          },
+        });
+        assert.deepStrictEqual(backupCalls, ["auto"], "the sealed callback runs once with the backup's model id");
+        assert.strictEqual(result.status, "completed");
+        assert.match(result.cascadeNoteV1 ?? "", /hit a usage limit.*this round ran on .*auto/s);
+        // The rescuing backup is recorded as the stage's active fallback.
+        // Read before the progress file is rewritten further down.
+        const rescuedProgress = JSON.parse(fs.readFileSync(path.join(taskFolder, "task-progress.json"), "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+        };
+        assert.strictEqual(rescuedProgress.fallbackActive?.impl, true);
+        assert.strictEqual(rescuedProgress.fallbackModelId?.impl, "auto");
+
+        // Without the callback the cross-kind backup is still skipped, and the
+        // failure says which backup was held back and why.
+        // The rescue above left the stage's fallback reservation active (a
+        // completed backup is the sticky fallback), so start from a fresh
+        // progress file: `reserveFallback` refuses a second reservation.
+        resetFolder();
+        const skipped = await runImplementationForModel(common);
+        assert.strictEqual(skipped.status, "failed");
+        assert.deepStrictEqual(backupCalls, ["auto"]);
+        assert.match(skipped.errorMessage ?? "", /Backup .*auto was held back: it cannot be used/);
+
+        // A Copilot backup whose breaker has tripped is still skipped even
+        // with the callback supplied, and the message names the reason.
+        const tripped = Array.from({ length: 5 }, () => ({
+          stage: "impl",
+          classification: "provider-failure-empty",
+          at: now,
+          modelId: "auto",
+          providerId: "copilot-lm",
+        }));
+        resetFolder({ roundOutcomes: tripped });
+        const callsBefore = backupCalls.length;
+        const breakerHeld = await runImplementationForModel({
+          ...common,
+          runCrossProviderBackup: (modelId: string) => {
+            backupCalls.push(modelId);
+            return Promise.reject(new Error("a tripped backup must not run"));
+          },
+        });
+        assert.strictEqual(backupCalls.length, callsBefore, "tripped breaker skips the cross-kind backup");
+        assert.strictEqual(breakerHeld.status, "failed");
+        assert.match(breakerHeld.errorMessage ?? "", /no file changes/);
+
+        // A backup disabled in Provider Selection is listed in the exhausted
+        // message with its reason and is never dispatched.
+        resetFolder();
+        const disabledStub = installProviderSelection(
+          { "opencode-cli": true, copilot: false },
+          { impl: { primary: "opencode-cli:default", backup: "auto", strategy: "switch-to-backup" } }
+        );
+        try {
+          const disabledCallsBefore = backupCalls.length;
+          const disabledHeld = await runImplementationForModel({
+            ...common,
+            runCrossProviderBackup: (modelId: string) => {
+              backupCalls.push(modelId);
+              return Promise.reject(new Error("a disabled backup must not run"));
+            },
+          });
+          assert.strictEqual(backupCalls.length, disabledCallsBefore, "a disabled backup is never dispatched");
+          assert.strictEqual(disabledHeld.status, "failed");
+          assert.match(disabledHeld.errorMessage ?? "", /disabled in the stage's chain/);
+        } finally {
+          disabledStub.restore();
+        }
+
+        // A backup switched off on the stage row (backupsEnabled: false) with
+        // its provider enabled is also named as disabled and never dispatched.
+        resetFolder();
+        const rowStub = installProviderSelection(
+          { "opencode-cli": true, copilot: true },
+          {
+            impl: {
+              primary: "opencode-cli:default",
+              backups: ["auto"],
+              backupsEnabled: [false],
+              strategy: "switch-to-backup",
+            },
+          }
+        );
+        try {
+          const rowCallsBefore = backupCalls.length;
+          const rowHeld = await runImplementationForModel({
+            ...common,
+            runCrossProviderBackup: (modelId: string) => {
+              backupCalls.push(modelId);
+              return Promise.reject(new Error("a disabled backup must not run"));
+            },
+          });
+          assert.strictEqual(backupCalls.length, rowCallsBefore, "a row-disabled backup is never dispatched");
+          assert.match(rowHeld.errorMessage ?? "", /disabled in the stage's chain/);
+        } finally {
+          rowStub.restore();
+        }
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      safeRemoveDir(metaRoot);
+    }
+  });
+
   // (2e / plan step 17, superseded by Plan Part 15 / item 7b, review
   // completion blocker 2026-09-01) A quota-or-outage failure that left the
   // working tree DIRTY must never invoke a backup INLINE against that
@@ -2485,6 +2706,11 @@ void describe("runImplementationForModel", () => {
           result.errorMessage ?? "",
           /Rerun this stage.*switch the stage's model/,
           "expected the failure message to offer the two real choices: rerun or switch the model"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /was held back because this round already changed 1 file\(s\).*run Implementation again/s,
+          "RC4 item 1: the withheld message names the held-back backup and the action for THIS caller (implementation.v1), not Apply Review"
         );
         assert.ok(
           progressMessages.some((message) => message.includes("withheld the automatic switch")),

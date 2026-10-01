@@ -121,6 +121,7 @@ export interface RecommendationPreconditionProgressV1 {
 const RESUME_SAFE_COMMANDS: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.resumeTask",
   "vs-code-ai-helper.resumeAndRerunReview",
+  "vs-code-ai-helper.acceptPlanItemNarrowingV1",
   "vs-code-ai-helper.resumeAndDispatchImplementation",
   "vs-code-ai-helper.resumeAndSetTaskStage",
   "vs-code-ai-helper.resumeAndApplyCurrentStageAction",

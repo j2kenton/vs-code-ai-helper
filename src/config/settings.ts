@@ -117,7 +117,7 @@ export async function setLargeTokenRequestWarningEnabled(enabled: boolean): Prom
  *  - "off": no automatic action.
  *  - "auto": run the automatic action (a single review / advance / trigger).
  *  - "auto-fast-forward": run the automatic action and, where applicable
- *    (when it produces or lands on a review), run Fast Forward Fixes.
+ *    (when it produces or lands on a review), run Fast Forward.
  */
 export type AutoTriggerMode = "off" | "auto" | "auto-fast-forward";
 

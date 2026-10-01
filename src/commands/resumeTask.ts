@@ -946,8 +946,10 @@ async function resumeCompletedTask(
 export async function resumeAndRerunReviewV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
-  explicitArg?: ResumeTaskArg
-): Promise<void> {
+  explicitArg?: ResumeTaskArg,
+  /** RC4 item 3: only `acceptPlanItemNarrowingV1` passes this (review input changed, tree did not). */
+  reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }
+): Promise<boolean> {
   // Resolved BEFORE the resume, from the same (possibly-cached) `inventory`
   // resumePausedTask itself resolves against — this is the target folder,
   // not a status check, so cache staleness here is irrelevant.
@@ -959,10 +961,10 @@ export async function resumeAndRerunReviewV1(
     currentTaskStore
   );
   if (!target) {
-    return;
+    return false;
   }
   if (await refuseFixedDispatchV1(target, "review")) {
-    return;
+    return false;
   }
   // arrangeStageDispatch: false — this function dispatches its OWN specific
   // follow-up (runReviewWithAI, below) moments after resume; letting
@@ -977,12 +979,27 @@ export async function resumeAndRerunReviewV1(
   // refusal. Without the token, adoption would not happen at all (2026-09-08
   // review architectural blocker fix — see `pendingHandoffTokensV1`'s doc
   // comment in `workAdmissionV1.ts`).
-  await resumeThenDispatchV1(inventory, currentTaskStore, explicitArg, target.taskFolderPath, (admissionHandoffToken) =>
-    vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-      taskFolderPath: target.taskFolderPath,
-      admissionHandoffTokenV1: admissionHandoffToken,
-    })
+  // `started` records whether the review command confirmed a dispatch, so a
+  // caller (acceptPlanItemNarrowingV1) can tell a refused resume from a
+  // re-review. The dispatch closure itself still resolves void: a `false`
+  // result would make `resumeThenDispatchV1` pause the task again as a refused
+  // resume, which is wrong for a review that merely reported no dispatch.
+  let started = false;
+  await resumeThenDispatchV1(
+    inventory,
+    currentTaskStore,
+    explicitArg,
+    target.taskFolderPath,
+    async (admissionHandoffToken): Promise<void> => {
+      started =
+        (await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+          ...(reviewOptionsV1?.skipUnchangedTreeGuardV1 ? { skipUnchangedTreeGuardV1: true } : {}),
+        })) === true;
+    }
   );
+  return started;
 }
 
 /**

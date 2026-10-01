@@ -358,6 +358,15 @@ void describe("parseQuotaResetV1 — clock-time shape", () => {
     );
   });
 
+  void it("RC4 item 1: resolves an hour-only am/pm time, and still rejects a bare hour", () => {
+    const now = new Date("2026-01-01T00:00:00.000Z");
+    assert.strictEqual(parseQuotaResetV1("session limit · resets 11am (UTC)", now), "2026-01-01T11:00:00.000Z");
+    assert.strictEqual(parseQuotaResetV1("resets 11 pm (UTC)", now), "2026-01-01T23:00:00.000Z");
+    assert.strictEqual(parseQuotaResetV1("resets 11 (Asia/Jerusalem)", now), undefined);
+    // 11:00 in Asia/Jerusalem (UTC+2 in January) is 09:00Z.
+    assert.strictEqual(parseQuotaResetV1("resets 11am (Asia/Jerusalem)", now), "2026-01-01T09:00:00.000Z");
+  });
+
   void it("resolves a real IANA zone to a future instant within one day", () => {
     // Not asserting the exact instant here (that depends on DST rules this
     // test should not have to encode) — just that the real-zone path

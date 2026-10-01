@@ -109,6 +109,34 @@ function skipFilteredChainOf(
 }
 
 /**
+ * RC4 item 1: backups the owner configured on the stage's own chain but
+ * switched off (`backupsEnabled[i] === false`). `skipFilteredChainOf` drops
+ * them, so diagnostics read them from the raw setting. Never dispatched.
+ */
+export function listStageDisabledBackupsV1(stage: TaskStage): string[] {
+  const setting = getModelSettings()[stage];
+  if (!setting) {
+    return [];
+  }
+  const configured =
+    Array.isArray(setting.backups) && setting.backups.length > 0
+      ? setting.backups
+      : setting.backup
+        ? [setting.backup]
+        : [];
+  const flags = setting.backupsEnabled;
+  const out: string[] = [];
+  configured.forEach((model, index) => {
+    if (typeof model === "string" && model.trim().length > 0 && flags && flags[index] === false) {
+      if (!out.includes(model.trim())) {
+        out.push(model.trim());
+      }
+    }
+  });
+  return out;
+}
+
+/**
  * Whether a stage has any configured candidate at all — a primary or backup
  * model id present in settings, REGARDLESS of its enabled flag. Distinct from
  * `skipFilteredChainOf(...).primary`, which is undefined both when nothing

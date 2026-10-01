@@ -38,6 +38,12 @@ When a hand-off criterion verifies the work of exactly one specific numbered imp
 
 One plan is one task. A plan too large for a single round is delivered as ordered PARTS that this one task implements across several rounds — never divided across separate or follow-up tasks. Nothing here has authority to hand part of a plan to another task, and a division made at plan time happens before the implementation checklist exists, so the removed work would never be tracked as outstanding at all. If the plan genuinely cannot be delivered that way, say so plainly as a blocking issue needing a human scope decision rather than inventing a division.
 
+A fallback ("if X, do Y instead") is written inside the checklist item it qualifies and is never its own item: an item whose condition never holds can never be ticked and holds the task open.
+
+Implementation rounds cannot run the project's checks or test suites (type check, lint, unit tests, integration tests). Ensemble's Publish Checks run them, so a plan never contains a round step to run them; a suite Publish Checks do not run is written as an owner step (a hand-off criterion in the shape above), never as a round step.
+
+Rounds also cannot fetch web pages or documentation, and cannot run live provider CLIs (for example probing a model flag). Any step that needs such evidence is an owner step, written as "Owner evidence: <what to run or fetch> — record the result in the task description (task.md)", placed before the steps that depend on it, and never assigned to a round.
+
 Do not invent requirements that are not implied by the context. If the request is unclear, say so explicitly instead of guessing.
 
 ## Plan Revision

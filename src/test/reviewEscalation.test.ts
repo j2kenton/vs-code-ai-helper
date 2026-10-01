@@ -1751,6 +1751,79 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  // RC4 item 4: "Owner evidence needed" blockers ask for the evidence in
+  // task.md, whichever resolver the reviewer used; unprefixed toolchain
+  // blockers keep today's wording.
+  for (const scenario of [
+    {
+      name: "needs-toolchain with a quoted command",
+      resolver: "needs-toolchain" as const,
+      description: "Owner evidence needed: which flags `claude --model claude-sonnet-5-5 --effort high` accepts",
+      owner: true,
+      command: "claude --model claude-sonnet-5-5 --effort high",
+    },
+    {
+      name: "environmental without a command",
+      resolver: "environmental" as const,
+      description: "Owner evidence needed: which GPT-6 models Codex offers",
+      owner: true,
+      command: undefined,
+    },
+    {
+      name: "needs-toolchain without the prefix",
+      resolver: "needs-toolchain" as const,
+      description: "run `npm run build` to regenerate the client",
+      owner: false,
+      command: "npm run build",
+    },
+  ]) {
+    void it(`RC4 item 4: clears-via wording for ${scenario.name}`, async () => {
+      const store = new Map<string, string>();
+      installMemStore(store);
+      const surface = new RecordingSurface();
+      initNotificationRouter(surface);
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      const folderUri = makeTaskFolderUri(`rc4-owner-evidence-${scenario.resolver}-${scenario.owner}`);
+      seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+      const blockers: ReviewBlocker[] = [
+        { category: "completion", resolver: scenario.resolver, description: scenario.description },
+      ];
+      try {
+        await escalateReviewToHuman(
+          folderUri,
+          "impl-high-review",
+          "plateau",
+          "stuck",
+          "attempt-1",
+          undefined,
+          false,
+          undefined,
+          { content: "Readiness: 6/10\n", blockers, taskFixableCount: 0 }
+        );
+        const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
+        const decision = decisionStore.listPending().find((d) => d.decisionKey === "reviewPlateauEscalation");
+        assert.ok(decision);
+        const clearsThis = decision.evidence?.find((e) => e.label === "What clears this");
+        assert.ok(clearsThis);
+        if (scenario.owner) {
+          assert.match(clearsThis.detail, /task\.md/);
+          assert.doesNotMatch(clearsThis.detail, /infrastructure, sandbox, or OS-level fix/);
+          assert.doesNotMatch(clearsThis.detail, /stage chat/);
+          if (scenario.command) {
+            assert.ok(clearsThis.detail.includes(`\`${scenario.command}\``));
+          }
+        } else {
+          assert.doesNotMatch(clearsThis.detail, /task\.md/);
+          assert.ok(clearsThis.detail.includes(`\`${scenario.command}\``));
+        }
+      } finally {
+        deactivateNotificationRouter();
+        __extensionContextV1TestOnly.reset();
+      }
+    });
+  }
+
   // RC3 item 3 review fix (superseding the wf10/Step 27 behavior below): a
   // command named elsewhere in the SAME review round's markdown (a "How to
   // verify" / evidence section) — but not quoted on the blocker's own
@@ -1869,6 +1942,227 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         "a command found only in the plan, not on the blocker's own description, must never be attached"
       );
       assert.match(clearsThis.detail, /check its current status yourself/);
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // RC4 item 3: a narrowing blocker on a first, non-plateau review reaches the
+  // plateau card with the round's reason and evidence and both options.
+  const NARROW_ITEM = "Update `a.test.ts` and `b.test.ts` for the new policy";
+  const NARROW_PLAN = ["<!-- ensemble:implementation-checklist -->", `- [x] ${NARROW_ITEM}`, "- [ ] Another item"].join("\n");
+
+  async function postNarrowingCard(
+    name: string,
+    description: string,
+    seed: { summary?: string; proposals?: TaskProgress["checklistChangeProposals"] }
+  ): Promise<{ decision: ReturnType<WorkflowDecisionStoreV1["listPending"]>[number] | undefined }> {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri(name);
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({
+        status: "active",
+        currentStage: "impl-high-review",
+        reviewAttemptId: "attempt-1",
+        ...(seed.proposals ? { checklistChangeProposals: seed.proposals } : {}),
+      })
+    );
+    store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), NARROW_PLAN);
+    if (seed.summary !== undefined) {
+      store.set(vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(), seed.summary);
+    }
+    const blockers: ReviewBlocker[] = [{ category: "completion", resolver: "environmental", description }];
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 6/10\n", blockers, taskFixableCount: 0 }
+      );
+      return {
+        decision: new WorkflowDecisionStoreV1(context.workspaceState)
+          .listPending()
+          .find((d) => d.decisionKey === "reviewPlateauEscalation"),
+      };
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  }
+
+  void it("a prefix-form narrowing blocker carries the plan item, reason, evidence and both options", async () => {
+    const { decision } = await postNarrowingCard(
+      "narrowing-card-prefix",
+      `Narrowing needs an owner decision: \`${NARROW_ITEM}\` — b.test.ts was not updated`,
+      { summary: "`b.test.ts` never references the feature, so there was nothing to update.\n\nUnrelated paragraph." }
+    );
+    assert.ok(decision);
+    const labels = decision.evidence?.map((e) => e.label) ?? [];
+    assert.ok(labels.includes("Plan item"));
+    assert.ok(labels.includes("The round's reason"));
+    assert.ok(labels.includes("The round's evidence"));
+    assert.match(decision.evidence?.find((e) => e.label === "The round's evidence")?.detail ?? "", /never references the feature/);
+    assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing" && o.resumeKind === "continue"));
+    assert.ok(decision.options.some((o) => o.optionId === "keepItemOpen" && o.resumeKind === "unpause"));
+    const clears = decision.evidence?.find((e) => e.label === "What clears this");
+    assert.doesNotMatch(clears?.detail ?? "", /stage chat/);
+  });
+
+  void it("the RC3 fallback wording finds the item and uses the refused rewording as the reason", async () => {
+    const { decision } = await postNarrowingCard(
+      "narrowing-card-fallback",
+      "The item is ticked though `b.test.ts` was not updated and no owner decision approves narrowing it",
+      {
+        summary: "`b.test.ts` has no reference to the feature.",
+        proposals: [
+          {
+            at: "2026-09-30T10:00:00.000Z",
+            roundId: "round-narrowing",
+            stage: "impl",
+            kind: "removed",
+            removedItems: [NARROW_ITEM],
+            proposedItems: ["Update `a.test.ts` for the new policy"],
+            status: "discarded",
+          },
+        ],
+      }
+    );
+    assert.ok(decision);
+    assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
+    const reason = decision.evidence?.find((e) => e.label === "The round's reason");
+    assert.match(reason?.detail ?? "", /Update `a\.test\.ts` for the new policy/);
+  });
+
+  void it("a card with no narrowing carries neither the entries nor the options", async () => {
+    const { decision } = await postNarrowingCard("narrowing-card-none", "The docs are stale", {});
+    assert.ok(decision);
+    assert.equal(decision.evidence?.some((e) => e.label === "Plan item"), false);
+    assert.equal(decision.options.some((o) => o.optionId === "acceptNarrowing" || o.optionId === "keepItemOpen"), false);
+  });
+
+  void it("renders the no-reason and no-evidence texts when nothing is on file", async () => {
+    const { decision } = await postNarrowingCard(
+      "narrowing-card-nothing",
+      `Narrowing needs an owner decision: \`${NARROW_ITEM}\` — b.test.ts was not updated`,
+      {}
+    );
+    assert.ok(decision);
+    assert.match(decision.evidence?.find((e) => e.label === "The round's reason")?.detail ?? "", /left no reason on file/);
+    assert.match(decision.evidence?.find((e) => e.label === "The round's evidence")?.detail ?? "", /No evidence on file/);
+  });
+
+  void it("a first, non-plateau review with only the narrowing blocker is routed to escalate and posts the card", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("narrowing-first-review");
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-first" })
+    );
+    store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), NARROW_PLAN);
+    store.set(
+      vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
+      "`b.test.ts` never references the feature, so there was nothing to update."
+    );
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      `- [completion] [environmental] Narrowing needs an owner decision: \`${NARROW_ITEM}\` — b.test.ts was not updated`,
+      "<!-- blockers:end -->",
+    ].join("\n");
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-first",
+        content,
+        score: 6,
+        threshold: 9,
+      });
+      assert.strictEqual(escalated, true, "the first review escalates; no plateau is required");
+      assert.strictEqual(readProgress(store, folderUri).status, "paused");
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision, "the plateau card must be posted");
+      assert.ok(decision.evidence?.some((e) => e.label === "The round's reason"));
+      assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
+      assert.ok(decision.options.some((o) => o.optionId === "keepItemOpen"));
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("a first-review card resolves the intended item when another item shares its opening backticked span", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("narrowing-first-review-two-items");
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-two" })
+    );
+    store.set(
+      vscode.Uri.joinPath(folderUri, "plan-final.md").toString(),
+      [
+        "<!-- ensemble:implementation-checklist -->",
+        `- [x] ${NARROW_ITEM}`,
+        "- [x] Update `a.test.ts` for the other policy",
+      ].join("\n")
+    );
+    store.set(
+      vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
+      "`b.test.ts` never references the feature, so there was nothing to update."
+    );
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      `- [completion] [environmental] Narrowing needs an owner decision: \`${NARROW_ITEM}\` — b.test.ts was not updated`,
+      "<!-- blockers:end -->",
+    ].join("\n");
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-two",
+        content,
+        score: 6,
+        threshold: 9,
+      });
+      assert.strictEqual(escalated, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision, "the plateau card must be posted");
+      assert.equal(decision.evidence?.find((e) => e.label === "Plan item")?.detail, NARROW_ITEM);
+      assert.match(decision.evidence?.find((e) => e.label === "The round's evidence")?.detail ?? "", /b\.test\.ts/);
+      const reason = decision.evidence?.find((e) => e.label === "The round's reason")?.detail ?? "";
+      assert.match(reason, /nothing to update/);
+      assert.match(reason, /\(impl-summary\.md\)$/);
+      assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
+      assert.ok(decision.options.some((o) => o.optionId === "keepItemOpen"));
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();

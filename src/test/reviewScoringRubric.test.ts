@@ -203,6 +203,40 @@ void describe("review scoring rubric", () => {
     });
   });
 
+  // RC4 item 4: evidence only the owner can gather is an owner decision.
+  void describe("owner evidence is an owner decision (RC4 item 4)", () => {
+    const planTemplates = [
+      "review-plan-high.md",
+      "review-plan-low.md",
+      "review-plan-high-rereview.md",
+      "review-plan-low-rereview.md",
+    ];
+    for (const templateFile of [...planTemplates, ...IMPLEMENTATION_REVIEW_TEMPLATES]) {
+      void it(`${templateFile} files missing owner evidence as an environmental "Owner evidence needed" blocker`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /Owner evidence needed/);
+        assert.match(raw, /\[environmental\]/);
+      });
+    }
+    void it("the rubric classifies owner evidence as environmental, not needs-toolchain", () => {
+      assert.match(rubricText, /Owner evidence needed:/);
+    });
+    for (const templateFile of IMPLEMENTATION_REVIEW_TEMPLATES) {
+      void it(`${templateFile} files a narrowing as an environmental "Narrowing needs an owner decision" blocker`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /Narrowing needs an owner decision/);
+        assert.match(raw, /never `task-fixable`/);
+      });
+    }
+    void it("the rubric classifies a plan-item narrowing as an environmental owner decision", () => {
+      assert.match(rubricText, /Narrowing needs an owner decision:/);
+    });
+    void it("create-plan.md still carries no rubric", () => {
+      const raw = fs.readFileSync(path.join(PROMPTS_DIR, "create-plan.md"), "utf8");
+      assert.doesNotMatch(raw, /\{\{reviewScoringRubric\}\}/);
+    });
+  });
+
   void describe("staged-plan scoring exception mirrored into low-level review (4a)", () => {
     for (const templateFile of ["review-impl-low.md", "review-impl-low-rereview.md"]) {
       void it(`${templateFile} scores staged plans by executable-order progress, not raw completeness`, () => {

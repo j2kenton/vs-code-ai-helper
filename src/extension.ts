@@ -95,6 +95,7 @@ import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
 import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
 import { registerDecideOpenPlanItemsCommandV1 } from "./commands/decideOpenPlanItemsV1";
+import { registerAcceptPlanItemNarrowingCommandV1 } from "./commands/acceptPlanItemNarrowingV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -1325,6 +1326,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerOpenRetainedPromptCommand(context);
   registerOpenPlanNonGoalsCommand(context);
   registerDecideOpenPlanItemsCommandV1(context);
+  registerAcceptPlanItemNarrowingCommandV1(context, inventory, currentTaskStore);
   registerHeldAdmissionMarkerCommandsV1(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);

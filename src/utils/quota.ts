@@ -179,12 +179,15 @@ const DURATION_UNIT_MS: Record<string, number> = {
  * fail to roll the date forward.
  */
 function parseClockTimeReset(message: string, now: Date): string | undefined {
-  const match = /resets?\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?\s*\(([^)]+)\)/i.exec(message);
-  if (!match) {
+  const match = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*\(([^)]+)\)/i.exec(message);
+  // RC4 item 1: "resets 11am (Asia/Jerusalem)" carries no minutes. An hour is
+  // accepted without minutes only when an am/pm suffix is present; a bare
+  // "resets 11 (zone)" stays no match.
+  if (!match || (match[2] === undefined && !match[3])) {
     return undefined;
   }
   const hourRaw = Number(match[1]);
-  const minute = Number(match[2]);
+  const minute = match[2] === undefined ? 0 : Number(match[2]);
   const ampm = match[3];
   const timeZone = match[4]!.trim();
   if (!Number.isFinite(hourRaw) || !Number.isFinite(minute) || minute > 59) {

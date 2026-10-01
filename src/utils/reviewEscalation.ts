@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
+  IMPLEMENTATION_SUMMARY_FILENAME,
   ImplementationDispatchModeV1,
   isPlanReviewStage,
   RoundOutcomeEntryV1,
@@ -22,6 +23,10 @@ import {
   stampFastForwardResumeProvenanceV1,
 } from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
+import { hasNarrowingPrefixV1, findNarrowingBlockerV1 } from "./planItemNarrowingV1";
+import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import * as path from "path";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
 import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
@@ -544,6 +549,20 @@ export interface EscalationPlateauContextV1 {
    * plan were finished; see `buildEscalationDecisionV1`'s plateau branch.
    */
   readonly planItemsOpen: number;
+  /**
+   * RC4 item 3: set when a blocker asks the owner to narrow a plan item
+   * (`findNarrowingBlockerV1`). Adds the item, the round's reason and its
+   * evidence to the card, plus the "Accept this narrowing" / "Keep the item
+   * open" options.
+   */
+  readonly narrowing?: {
+    readonly itemText: string;
+    readonly blockerDescription: string;
+    readonly reason: string;
+    readonly reasonSource: string;
+    readonly evidence: string;
+    readonly evidenceSource: string;
+  };
 }
 
 /**
@@ -606,6 +625,7 @@ export function buildEscalationDecisionV1(
       clearingNote,
       dispatchModeEvidence,
       planItemsOpen,
+      narrowing,
     } = plateauContext;
     const options: WorkflowDecisionOptionV1[] = [
       ...(nextStage
@@ -659,6 +679,41 @@ export function buildEscalationDecisionV1(
       // owner to discover the override for the first time in a modal at
       // publish time. Only offered when such a blocker is actually present.
       ...(hasNonFixableBlocker ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
+      ...(narrowing
+        ? [
+            {
+              optionId: "acceptNarrowing",
+              label: "Accept this narrowing",
+              resumeKind: "continue" as const,
+              consequence:
+                "Records the owner decision under Accepted Non-Goals in plan-final.md, resumes the task and runs " +
+                `${stageName} again against the same workspace with that decision on record (the review's input ` +
+                "changed, so its verdict can differ); the blocker is treated as settled from then on.",
+              effect: {
+                kind: "command" as const,
+                command: "vs-code-ai-helper.acceptPlanItemNarrowingV1",
+                args: [
+                  {
+                    taskFolderPath: target.taskFolderPath,
+                    stage,
+                    itemText: narrowing.itemText,
+                    reason: narrowing.reason,
+                    blockerDescription: narrowing.blockerDescription,
+                  },
+                ],
+              },
+            },
+            {
+              optionId: "keepItemOpen",
+              label: "Keep the item open",
+              resumeKind: "unpause" as const,
+              consequence:
+                "Leaves the plan and the task paused as they are; the item stays outstanding. Resume the task or " +
+                "choose Keep iterating when ready.",
+              effect: { kind: "doNothing" as const },
+            },
+          ]
+        : []),
     ];
 
     // 2026-09-04 review follow-up (completion blocker, new): this label
@@ -761,7 +816,17 @@ export function buildEscalationDecisionV1(
           : ""),
       options,
       recommendation,
-      evidence: [{ label: "What clears this", detail: clearingNote }, ...dispatchModeEvidence],
+      evidence: [
+        { label: "What clears this", detail: clearingNote },
+        ...(narrowing
+          ? [
+              { label: "Plan item", detail: narrowing.itemText },
+              { label: "The round's reason", detail: `${narrowing.reason} (${narrowing.reasonSource})` },
+              { label: "The round's evidence", detail: `${narrowing.evidence} (${narrowing.evidenceSource})` },
+            ]
+          : []),
+        ...dispatchModeEvidence,
+      ],
       gating: {
         holdsTaskPaused: true,
         unblocksProgress: true,
@@ -1225,7 +1290,13 @@ const PLAN_ORDER_BLOCKER_RE =
   /\bstarted before\b[\s\S]*\bpredecessor\b|\bpredecessor\b[\s\S]*\bstarted before\b|\bout of order\b|\bdepends on step \d+/i;
 const ROUND_CANNOT_COMPLETE_RE = /\b(human gate|hand[- ]?off|a measurement)\b/i;
 
-function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" {
+/** RC4 item 4: the literal prefix plan/impl reviews use for evidence only the owner can gather. */
+const OWNER_EVIDENCE_PREFIX_RE = /^\W*owner evidence needed\b/i;
+
+function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" | "owner-evidence" {
+  if (OWNER_EVIDENCE_PREFIX_RE.test(description)) {
+    return "owner-evidence";
+  }
   if (PLAN_ORDER_BLOCKER_RE.test(description) || ROUND_CANNOT_COMPLETE_RE.test(description)) {
     return "owner-decision";
   }
@@ -1256,6 +1327,30 @@ function describeResolverClearingActionV1(
   stageName: string
 ): string {
   const namedCommand = extractCorrelatedCommandV1(description);
+  // RC4 item 3: a narrowing is an owner decision answered on the card itself.
+  if ((resolver === "environmental" || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
+    return (
+      'an owner decision on the plan item named above — choose "Accept this narrowing" or ' +
+      '"Keep the item open" on this card'
+    );
+  }
+  // RC4 item 4: a blocker filed with the literal "Owner evidence needed"
+  // prefix names evidence rounds cannot gather. It is an owner decision
+  // whichever resolver the reviewer used (needs-toolchain is the defensive
+  // case), and the record goes in task.md directly — never the stage chat,
+  // whose file write is confirmed by a modal.
+  if ((resolver === "environmental" || resolver === "needs-toolchain") && classifyEnvironmentalBlockerV1(description) === "owner-evidence") {
+    // Owner evidence is typically a live provider CLI probe (`claude --model …`),
+    // which the generic command-prefix list does not recognise, so the first
+    // backtick-quoted span in the blocker is offered instead.
+    const evidenceCommand = namedCommand ?? /`([^`]+)`/.exec(description)?.[1]?.trim();
+    return (
+      "evidence only you can gather (named above; rounds cannot fetch pages or run live provider CLIs) — " +
+      (evidenceCommand ? `run \`${evidenceCommand}\` to gather it, then ` : "gather it, then ") +
+      "record the result under an 'Owner evidence' heading in this task's task.md (the task description), " +
+      `then use "Keep iterating" to have ${stageName} re-verify.`
+    );
+  }
   switch (resolver) {
     case "environmental": {
       const kind = classifyEnvironmentalBlockerV1(description);
@@ -1449,6 +1544,31 @@ async function postReviewPlateauDecisionV1(
   // re-reviews. A prior revision said only "re-runs {stageName}", reading as
   // a review-only dispatch — the exact "review starts against an unchanged
   // tree" misdescription Part C, Step 4 exists to eliminate.
+  // RC4 item 3: best effort, never fails the escalation.
+  let narrowing: EscalationPlateauContextV1["narrowing"];
+  try {
+    const planFinal = await readTextIfExists(getCanonicalImplementationUri(folderUri));
+    // Not `STAGE_ARTIFACT_FILENAMES.impl`: that is the plan of record, not the round's summary.
+    const implSummary = await readTextIfExists(vscode.Uri.joinPath(folderUri, IMPLEMENTATION_SUMMARY_FILENAME));
+    let proposals: TaskProgress["checklistChangeProposals"];
+    const read = await readTaskProgressStrictV1(folderUri, { expectedTaskFolder: path.basename(target.taskFolderPath) });
+    if (read.ok) {
+      proposals = read.decoded.progress.checklistChangeProposals;
+    }
+    const found = findNarrowingBlockerV1(normalized.blockers, planFinal, proposals, implSummary);
+    if (found) {
+      narrowing = {
+        itemText: found.itemText,
+        blockerDescription: found.blocker,
+        reason: found.reason,
+        reasonSource: found.reasonSource,
+        evidence: found.evidence,
+        evidenceSource: found.evidenceSource,
+      };
+    }
+  } catch {
+    narrowing = undefined;
+  }
   const clearingNote =
     evidence.taskFixableCount > 0
       ? `Clears via: choose "Keep iterating" below — it resumes the task and runs Apply Review against the ` +
@@ -1510,6 +1630,7 @@ async function postReviewPlateauDecisionV1(
       clearingNote,
       dispatchModeEvidence,
       planItemsOpen,
+      ...(narrowing ? { narrowing } : {}),
     }),
     target
   );

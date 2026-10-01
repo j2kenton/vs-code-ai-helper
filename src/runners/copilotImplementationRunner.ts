@@ -594,6 +594,11 @@ export interface ImplementationRunResult {
    */
   filesChangedUnknown?: boolean;
   /**
+   * RC4 item 1: set when a backup rescued this round after the primary's
+   * usage limit, naming both attempts; the implementation run log carries it.
+   */
+  cascadeNoteV1?: string;
+  /**
    * The sealed edit pipeline's own per-step applied evidence (workflow 8,
    * item 2 / plan Part 4) — kind + path + a text excerpt of what the step
    * actually wrote (`contentExcerpt`, added 2026-08-21 THIRD review round —

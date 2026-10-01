@@ -100,6 +100,5 @@ playwright-report/
 
 # BEGIN Ensemble managed meta resources
 # Managed by Ensemble. Do not edit this block manually.
-/artifacts/helper/
 /.ensemble/
 # END Ensemble managed meta resources

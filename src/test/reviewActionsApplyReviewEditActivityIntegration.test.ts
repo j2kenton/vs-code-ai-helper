@@ -432,6 +432,95 @@ void describe("applyReviewEditWithAI — real in-flight activity through the pro
     }
   });
 
+  void it("RC4 item 1: a round rescued by a backup names both attempts in the impl run log", async () => {
+    const { folderPath } = makeImplReviewTaskFolder(`applyrevedit-activity-rescued-${Math.floor(Math.random() * 1e9)}`);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const logs: string[] = [];
+    const note = "Claude Code (sonnet@high) hit a usage limit (session limit); this round ran on Copilot claude-sonnet-5.5";
+    const patches = [
+      ...installApplyReviewEditPatches(),
+      patch(runLogModule, "writeRunLog", (_uri: unknown, _runner: unknown, _stage: unknown, content: string) => {
+        logs.push(content);
+        return Promise.resolve(undefined);
+      }),
+      patch(runnerRegistryModule, "runImplementationForModel", () =>
+        Promise.resolve({
+          status: "completed",
+          filesChanged: ["src/a.ts"],
+          summary: "backup ran the round",
+          summaryIsSynthetic: true,
+          runnerId: "copilot",
+          actualProviderLabel: "Copilot",
+          actualStoredModelId: "claude-sonnet-5.5",
+          cascadeNoteV1: note,
+        })),
+      stubV1RunnerSelection([markdownReviewTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+    ];
+
+    try {
+      await applyReviewEditWithAI(vscode.Uri.file(REAL_ROOT), makeExtensionContext(), { taskFolderPath: folderPath });
+      const implLog = logs.find((c) => c.startsWith("# Implementation Run"));
+      assert.ok(implLog, "an implementation run log must be written");
+      assert.ok(implLog.includes(note), "the run log must name the primary's limit and the backup that ran the round");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("RC4 item 1: a CLI runner failure is handed back through the dispatch probe with provider and message", async () => {
+    const { folderPath } = makeImplReviewTaskFolder(`applyrevedit-activity-limit-${Math.floor(Math.random() * 1e9)}`);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const limit = "Claude Code CLI failed: You've hit your session limit · resets 11am (Asia/Jerusalem)";
+    const patches = [
+      ...installApplyReviewEditPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", () =>
+        Promise.resolve({
+          status: "failed",
+          filesChanged: [],
+          filesChangedUnknown: false,
+          errorMessage: limit,
+          runnerId: "claude-cli",
+          providerLabel: "Claude Code",
+          actualProviderLabel: "Claude Code",
+        })),
+    ];
+    const probe: { runnerFailure?: { providerLabel: string; message: string } } = {};
+
+    try {
+      await applyReviewEditWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        makeExtensionContext(),
+        { taskFolderPath: folderPath },
+        { dispatchProbe: probe }
+      );
+      assert.ok(probe.runnerFailure, "the failure must be handed back to a composite caller such as Fast Forward");
+      assert.equal(probe.runnerFailure.providerLabel, "Claude Code");
+      assert.ok(probe.runnerFailure.message.includes("session limit"));
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("ends the standalone root operation as refused, never succeeded, when the dispatched implementation round declines without throwing (pre-1.0.0 fixes register item 8 / Part 4 review fix)", async () => {
     // Review blocker (2026-09-24): applyImplementationReviewWithAI warns and
     // returns false on its own guard-clause declines (host gate closed,

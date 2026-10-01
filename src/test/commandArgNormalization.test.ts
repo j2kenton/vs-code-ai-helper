@@ -1414,6 +1414,61 @@ void describe("resumeAndRerunReviewV1 (production code)", () => {
     }
   });
 
+  // RC4 item 3: the narrowing Accept path forwards the unchanged-tree bypass for
+  // this task, and only a confirmed `true` from runReviewWithAI counts as dispatched.
+  for (const [label, commandResult, expected] of [
+    ["true", true, true],
+    ["false", false, false],
+    ["undefined (pre-dispatch refusal)", undefined, false],
+  ] as const) {
+    void it(`forwards skipUnchangedTreeGuardV1 and reports ${String(expected)} when runReviewWithAI resolves ${label}`, async () => {
+      const store = new Map<string, string>();
+      const fs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const captured: Array<{ command: string; arg: unknown }> = [];
+      if (!(vscode as unknown as Record<string, unknown>).commands) {
+        (vscode as unknown as Record<string, unknown>).commands = {};
+      }
+      const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+      (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+        command: string,
+        arg?: unknown
+      ): Promise<boolean | undefined> => {
+        captured.push({ command, arg });
+        return Promise.resolve(commandResult);
+      };
+      try {
+        const folderUri = makeTaskFolderUri(`resume-rerun-skip-${label.slice(0, 3)}`);
+        seedImplReviewArtifacts(store, folderUri);
+        const folderPath = folderUri.fsPath;
+        await seedProgress(store, folderUri, {
+          taskFolder: `resume-rerun-skip-${label.slice(0, 3)}`,
+          currentStage: "impl-high-review",
+          status: "paused",
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        } as TaskProgress);
+        const result = await resumeAndRerunReviewV1(
+          makeInventoryStub(folderPath, folderPath, "paused"),
+          makeCurrentTaskStoreStub(undefined),
+          { taskFolderPath: folderPath },
+          { skipUnchangedTreeGuardV1: true }
+        );
+        assert.strictEqual(result, expected);
+        const dispatch = captured.find((e) => e.command === "vs-code-ai-helper.runReviewWithAI");
+        assert.ok(dispatch, "the review command must be dispatched");
+        assert.strictEqual((dispatch.arg as { taskFolderPath?: string }).taskFolderPath, folderPath);
+        assert.strictEqual((dispatch.arg as { skipUnchangedTreeGuardV1?: boolean }).skipUnchangedTreeGuardV1, true);
+      } finally {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+        msgs.restore();
+        fs.restore();
+        wsFolders.restore();
+      }
+    });
+  }
+
   // Completion blocker fix (2026-09-08 review, narrowed): resumeAndRerunReviewV1
   // used to release resumePausedTask's own admission BEFORE dispatching
   // runReviewWithAI at all, leaving a real gap — active task, no admission,
